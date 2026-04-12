@@ -565,7 +565,548 @@ This file is not imported by any GhostSpiral script but its presence on disk is 
 forensic gold mine linking the operator to specific tooling and API keys.
 **Status:** Should be securely deleted or moved out of the workspace.
 
-## 10. Remaining Items
+## 10. Idempotency & Crash-Resume Deep Trace (Round 5)
+
+Six adversarial scenarios traced line-by-line through the exact code.
+Each scenario documents the precise code path, whether it is handled or
+broken, and the user-facing impact.
+
+---
+
+### SCENARIO 1: Operator runs GhostSpiral twice (full pipeline mode)
+
+**Setup:** Run 1 creates plan, signs, broadcasts 20 of 40 TXs, then
+broadcast fails at TX 20. Operator reruns GhostSpiral.
+
+#### Run 1 trace
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Plan created | GhostSpiral:401 | `ufile = outdir / f"unsigned_{int(time.time())}.json"` → `unsigned/unsigned_1000.json` |
+| Stage 5 cleanup | GhostSpiral:419-423 | Cleans `signer_progress.json`, `broadcast_progress.json` |
+| Stage 5 cleanup | GhostSpiral:426-430 | `shutil.rmtree(signed_blobs)` removes old blob dir |
+| Sign | GhostSpiral:434-438 | Runs signer on `str(ufile)` → 40 blobs in `signed_blobs/` |
+| Broadcast | GhostSpiral:452-455 | Runs broadcaster on `signed_blobs/` → TX 0-19 succeed, TX 20 fails → process exits |
+
+#### Run 2 trace
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Balance re-fetch | GhostSpiral:329 | `xmr_balance()` reads CURRENT unlocked balance (lower, because some TXs from run 1 spent funds) |
+| New amounts | GhostSpiral:362 | `split_amt = usable / rounds` — different amounts from run 1 because balance changed |
+| New plan | GhostSpiral:401 | `unsigned/unsigned_1001.json` (new DAG, new amounts, new delays) |
+| Cleanup | GhostSpiral:419-423 | Cleans `signer_progress.json` and `broadcast_progress.json` ← **GOOD** |
+| Cleanup | GhostSpiral:426-430 | `shutil.rmtree(signed_blobs)` removes ALL old blobs ← **GOOD** |
+| Sign | GhostSpiral:434-438 | Signs new plan → fresh blobs |
+| Broadcast | GhostSpiral:452-455 | Broadcasts new plan's blobs |
+
+#### What about `unsigned/unsigned_1000.json`?
+
+GhostSpiral Stage 5 cleans `signer_progress.json`, `broadcast_progress.json`,
+and `signed_blobs/`, but it does **NOT** clean old unsigned plan files from
+`./unsigned/`.
+
+The stale file is not harmful to auto-mode (signer is passed the explicit
+path to the new plan), but it is:
+- **OPSEC risk**: contains full destination addresses in `txs[].dst`
+- **Confusion risk**: operator may accidentally reference it later
+
+#### What about run 1's partially-broadcast TXs and run 2's new plan?
+
+Run 1 broadcast TXs 0-19 from plan 1000. These spent specific key images.
+Run 2 creates a brand new plan with different amounts (because balance changed).
+Run 2's signer creates fresh signatures for plan 1001's TXs.
+
+**Can run 1's remaining unbroadcast TXs (20-39) cause issues?**
+No — their blobs were deleted by `shutil.rmtree(signed_blobs)`.
+
+**Can the already-mined TXs (0-19) from run 1 conflict with run 2?**
+Yes, but only in the form of a lower balance — which is correctly handled
+because run 2 re-fetches `xmr_balance()` at GhostSpiral:329.
+
+#### Verdict: **PARTIALLY HANDLED**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Balance correctness | **OK** | Re-fetched at GhostSpiral:329 |
+| Progress cleanup | **OK** | GhostSpiral:419-430 |
+| Signed blob cleanup | **OK** | `shutil.rmtree` at GhostSpiral:426-430 |
+| Old unsigned plans | **BUG (OPSEC)** | `unsigned/unsigned_1000.json` never cleaned |
+| Delay loading | **OK** | Broadcaster loads newest plan at broadcast_signed_xmr:117 |
+| Double-send risk | **NONE** | Key images prevent double-spend even if old TXs partially succeeded |
+
+**BUG 16: Old unsigned plan files never cleaned in auto-mode.**
+GhostSpiral Stage 5 (lines 419-430) cleans progress files and signed blobs
+but not `unsigned/*.json`. Over multiple runs, destination addresses from
+every plan accumulate on disk. `paranoia_mode` Phase 10 does clean these
+(paranoia_mode:237-288), but between runs they persist.
+
+---
+
+### SCENARIO 2: Operator runs signer manually twice on same plan
+
+**Setup:** Signer completes all 40 TXs. Operator accidentally reruns
+without `--resume`. Some blobs (0-19) were already broadcast.
+
+#### Sub-case A: `signer_progress.json` still exists (normal)
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Load progress | airgap_tx_signer:150-153 | `progress_file.exists()` → True → loads progress with `last=39` |
+| Verify integrity | airgap_tx_signer:82-111 | Plan fingerprint matches (same plan); all 40 blob hashes verified |
+| Sign loop | airgap_tx_signer:161-168 | `idx <= progress["last"]` → `idx <= 39` for all TXs → **ALL 40 SKIPPED** |
+| Output | airgap_tx_signer:229-230 | "0 signed, 40 resumed" |
+
+**Result:** Fully protected. No re-signing occurs.
+
+#### Sub-case B: `signer_progress.json` was deleted
+
+This happens when:
+- GhostSpiral auto-mode cleaned it (GhostSpiral:419-421)
+- Operator manually deleted it
+- It never existed (first run failed before any progress)
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| No progress | airgap_tx_signer:154-155 | Fresh progress: `{"last": -1, "manifest": [], "plan_fingerprint": plan_fp}` |
+| Re-sign all | airgap_tx_signer:161-223 | All 40 TXs signed with **NEW random nonces** |
+| Blob overwrite | airgap_tx_signer:173 | `blob_path = outdir / f"tx_{idx}.blob"` overwrites old blobs |
+| New manifest | airgap_tx_signer:227-228 | `signed_manifest_v1.json` overwritten with new hashes |
+
+**Are the new signatures identical?** NO. Monero uses random nonces per
+CLSAG ring signature. Each signing produces a **different valid transaction**
+for the same amount and destination.
+
+**Can both old and new versions get mined?** NO. Both versions spend the
+same inputs and produce the same key images. Monero nodes reject
+transactions with duplicate key images against both the chain and the
+mempool. Only one version can ever be accepted.
+
+**Broadcaster behavior with re-signed blobs (if broadcast_progress was also cleaned):**
+
+| Blob range | Status | Broadcaster action (broadcast_signed_xmr:267-340) |
+|------------|--------|---------------------------------------------------|
+| tx_0 – tx_19 | Old version already mined | Node returns `double_spend: true` → line 329-340: logged as `DOUBLE_SPEND`, skipped |
+| tx_20 – tx_39 | Old version never sent | New version accepted normally |
+
+**Broadcaster behavior with re-signed blobs (if broadcast_progress was NOT cleaned, `last=19`):**
+
+| Blob range | Status | Broadcaster action |
+|------------|--------|--------------------|
+| tx_0 – tx_19 | `idx <= 19` | Skipped by progress check (line 202-203) |
+| tx_20 – tx_39 | New signatures | Broadcast normally |
+
+#### Verdict: **HANDLED (with acceptable edge cases)**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Progress file exists | **OK** | All TXs skipped, no re-signing |
+| Progress deleted + broadcast done | **OK** | Double-spend rejected by node; broadcaster handles correctly at line 329-340 |
+| Wrong amounts/destinations | **NONE** | Same plan → same amounts and destinations |
+| Money loss | **NONE** | Key images prevent double-spend; one version eventually confirms |
+
+---
+
+### SCENARIO 3: Operator uses air-gap workflow
+
+**Step 1: Online machine**
+```
+GhostSpiral --cold --btc-entry bc1... --tor-proxy socks5h://...
+```
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Plan created | GhostSpiral:401 | `unsigned/unsigned_1000.json` written |
+| Cold exit | GhostSpiral:406-410 | `args.cold` → prints path, `sys.exit(0)` |
+| Stage 5 | — | **NEVER RUNS** (no cleanup, no signing, no broadcast) |
+
+**Step 2: Air-gap machine (offline)**
+```
+airgap_tx_signer unsigned_1000.json --wallet-file offline.wallet --outdir /media/usb/signed_blobs
+```
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Blob paths | airgap_tx_signer:173 | `blob_path = Path("/media/usb/signed_blobs") / f"tx_{idx}.blob"` |
+| Manifest entry | airgap_tx_signer:215 | `"file": "/media/usb/signed_blobs/tx_0.blob"` (absolute path from air-gap machine) |
+| Manifest file | airgap_tx_signer:227 | Written to `/media/usb/signed_blobs/signed_manifest_v1.json` |
+
+**Step 3: Back on online machine**
+```
+broadcast_signed_xmr /media/usb/signed_blobs --tor-proxy socks5h://...
+```
+
+#### 3a. Blob loading — OK
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Input path | broadcast_signed_xmr:132 | `input_path = Path("/media/usb/signed_blobs")` |
+| Glob blobs | broadcast_signed_xmr:142-152 | `input_path.is_dir()` → True → globs `*.blob` → finds all blobs ← **OK** |
+
+#### 3b. Manifest verification — OK
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Manifest path | broadcast_signed_xmr:161 | `input_path / "signed_manifest_v1.json"` → `/media/usb/signed_blobs/signed_manifest_v1.json` ← exists |
+| Hash lookup key | broadcast_signed_xmr:165 | `Path("/media/usb/signed_blobs/tx_0.blob").name` → `"tx_0.blob"` |
+| Blob comparison | broadcast_signed_xmr:168 | `blob.name` → `"tx_0.blob"` → matches manifest key ← **OK** |
+
+The `.name` extraction at line 165 correctly strips the absolute path from
+the air-gap machine. Hash verification works across machines.
+
+#### 3c. Delay loading — BROKEN
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Glob for plan | broadcast_signed_xmr:117 | `Path(".").glob("unsigned/unsigned_*.json")` |
+| CWD is... | — | Whatever directory the operator is in on the online machine |
+| Plan exists? | — | **PROBABLY NOT** — different machine, different directory, or plan is on a different path |
+| Result | broadcast_signed_xmr:116 | `tx_delays = {}` (empty) |
+| Per-TX delay | broadcast_signed_xmr:234 | `tx_delays.get(idx, 0)` → `0` for ALL TXs |
+| Timing | broadcast_signed_xmr:235-245 | `if planned_delay > 0:` → False → **NO planned delays applied** |
+
+**Impact:** All 40 TXs are broadcast with only NEWNYM rotation +
+`secure_delay(5, 15)` jitter (line 247) between them. The planned delays
+of 180-720 seconds (GhostSpiral:385) that decorrelate timing on the
+blockchain are **completely lost**. All TXs cluster within ~10 minutes
+instead of being spread over hours.
+
+This is a **critical OPSEC failure** — timing decorrelation is the primary
+privacy mechanism of the mixing pipeline. A blockchain observer sees 40
+transfers from related subaddresses within minutes, trivially linkable.
+
+**Root cause:** The broadcaster hardcodes `Path(".").glob("unsigned/unsigned_*.json")`
+(line 117) instead of accepting the plan path as a CLI argument or reading
+delays from the manifest/blobs.
+
+#### 3d. Edge case: Manifest loaded as path argument
+
+If operator passes the manifest directly:
+```
+broadcast_signed_xmr /media/usb/signed_blobs/signed_manifest_v1.json
+```
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Detect JSON | broadcast_signed_xmr:133 | `args.path.endswith(".json")` → True |
+| Load entries | broadcast_signed_xmr:134-141 | `blobs = [Path(e["file"]) ...]` → paths like `Path("/media/usb/signed_blobs/tx_0.blob")` |
+| On online machine | — | These paths may not exist (air-gap paths) |
+| Missing check | broadcast_signed_xmr:210-216 | `if not blob.exists()` → True → "skipping" → **ALL blobs skipped** |
+
+**Impact:** Zero TXs broadcast, all skipped as "missing." Operator must
+use the directory path, not the manifest JSON, for cross-machine workflows.
+
+#### Verdict: **BROKEN — 2 issues**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Blob discovery | **OK** | Directory glob works across machines |
+| Manifest hash verification | **OK** | `.name` extraction at broadcast_signed_xmr:165 handles cross-machine paths |
+| Delay loading | **BROKEN (CRITICAL)** | broadcast_signed_xmr:117 hardcodes CWD-relative glob; delays lost in airgap workflow |
+| Manifest-as-path | **BROKEN** | Absolute paths from air-gap machine don't resolve; all blobs skipped |
+
+**BUG 17: Broadcaster does not accept unsigned plan path as CLI argument.**
+The delay values are embedded in the unsigned plan JSON (`txs[i].delay` at
+GhostSpiral:385) but the broadcaster finds them only via
+`Path(".").glob("unsigned/unsigned_*.json")` (broadcast_signed_xmr:117).
+In any cross-directory or cross-machine workflow, delays are silently zero.
+Fix: add `--plan` argument to broadcaster CLI, or embed delays in the
+manifest, or read them from the blob directory.
+
+**BUG 18: Manifest-as-path mode uses absolute paths from signer machine.**
+When the broadcaster is given a manifest JSON file as its `path` argument
+(broadcast_signed_xmr:133-141), it constructs blob paths from
+`e["file"]` which contains the signer machine's absolute paths. These
+don't resolve on a different machine. Fix: resolve blob paths relative to
+the manifest's parent directory, or always use `.name` to find blobs in the
+same directory as the manifest.
+
+---
+
+### SCENARIO 4: Multiple unsigned plans in `./unsigned/` with stale blobs
+
+**Setup:**
+- Run 1: `unsigned/unsigned_1000.json` (40 TXs) → `signed_blobs/tx_0.blob` through `tx_39.blob`
+- Run 2: `unsigned/unsigned_1001.json` (30 TXs) → signer creates blobs 0-29
+
+#### In auto-mode (GhostSpiral Stage 5)
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Cleanup | GhostSpiral:426-430 | `shutil.rmtree(signed_blobs)` → **all old blobs deleted** |
+| Sign | GhostSpiral:434-438 | Only 30 blobs created (plan 1001) |
+
+**Result: Fully handled in auto-mode.** The `rmtree` removes everything.
+
+#### In manual mode (operator runs signer + broadcaster separately)
+
+**Signer behavior:**
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Create outdir | airgap_tx_signer:144-145 | `outdir.mkdir(parents=True, exist_ok=True)` — does NOT clean existing files |
+| Sign 30 TXs | airgap_tx_signer:161-223 | Writes `tx_0.blob` through `tx_29.blob` (overwrites old 0-29) |
+| Old blobs | — | `tx_30.blob` through `tx_39.blob` from run 1 **STILL EXIST** |
+| Manifest | airgap_tx_signer:227-228 | Contains entries for indices 0-29 only |
+
+After signing, `signed_blobs/` contains:
+```
+tx_0.blob  ... tx_29.blob   ← from plan 1001 (current)
+tx_30.blob ... tx_39.blob   ← from plan 1000 (STALE)
+signed_manifest_v1.json     ← covers only indices 0-29
+```
+
+**Broadcaster behavior:**
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Glob blobs | broadcast_signed_xmr:142-152 | Finds **40 blobs** (all `*.blob` files) |
+| Sort | broadcast_signed_xmr:144-152 | Sorted numerically: tx_0 through tx_39 |
+| Load delays | broadcast_signed_xmr:117-128 | Loads from plan 1001 → delays for indices 0-29 |
+| Manifest verify | broadcast_signed_xmr:161-178 | Loads manifest with 30 entries |
+
+**Manifest verification of stale blobs:**
+
+| Blob | File:Line | What happens |
+|------|-----------|--------------|
+| tx_0 – tx_29 | broadcast_signed_xmr:168 | `blob.name in manifest_hashes` → True → hash verified ← **OK** |
+| tx_30 – tx_39 | broadcast_signed_xmr:168 | `blob.name in manifest_hashes` → **False** → hash check **SKIPPED** |
+| Tamper list | broadcast_signed_xmr:172-173 | Stale blobs are NOT added to `tampered` (only mismatches are) |
+
+**The critical code path at broadcast_signed_xmr:167-171:**
+```python
+for blob in blobs:
+    if blob.name in manifest_hashes and blob.exists():
+        with open(blob, "rb") as bf:
+            actual = hashlib.sha256(bf.read()).hexdigest()
+        if actual != manifest_hashes[blob.name]:
+            tampered.append(blob.name)
+```
+
+Blobs NOT in the manifest silently pass through with no verification.
+
+**Broadcast of stale blobs:**
+
+| Blob | broadcast_signed_xmr:196-360 | What happens |
+|------|-------------------------------|--------------|
+| tx_0 – tx_29 | Line 234: `tx_delays.get(idx, 0)` | Delays from plan 1001 ← correct |
+| tx_30 – tx_39 | Line 234: `tx_delays.get(idx, 0)` → `0` | No delay entry → broadcast immediately |
+| tx_30 – tx_39 | Line 258-262 | Blob hex submitted to node |
+
+**What are blobs 30-39?** They are signed transactions from plan 1000 —
+**different destinations, different amounts, different DAG.** They are
+broadcast to addresses from the OLD mixing plan.
+
+**Impact:**
+- 10 extra TXs sent to **wrong destinations** (old plan's subaddresses)
+- **Wrong amounts** (old plan may have had different `split_amt`)
+- If old plan's addresses are operator-controlled: money not lost but mixing contaminated
+- If old plan's addresses were decoys or no longer controlled: **MONEY LOST**
+- No warning, no error — the stale blobs are broadcast silently
+
+#### Verdict: **BROKEN — CRITICAL**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Auto-mode | **OK** | `shutil.rmtree` at GhostSpiral:426-430 wipes all old blobs |
+| Manual-mode signer | **BUG** | airgap_tx_signer:144-145 does not clean outdir before signing |
+| Manifest verification | **BUG** | broadcast_signed_xmr:168 silently skips blobs not in manifest |
+| Blob count vs plan count | **BUG** | No check that blob count matches plan TX count |
+| Wrong destinations | **YES** | Stale blobs from prior plan have different dst addresses |
+| Wrong amounts | **YES** | Stale blobs from prior plan have different amounts |
+
+**BUG 19: Signer does not clean output directory before signing.**
+`airgap_tx_signer` creates the outdir with `mkdir(exist_ok=True)` at
+line 144-145 but does not remove stale blobs from prior runs. If the
+new plan has fewer TXs than the old plan, leftover blobs with higher
+indices persist and will be broadcast by the broadcaster.
+Fix: either `shutil.rmtree` + `mkdir` in the signer, or have the
+broadcaster reject blobs not present in the manifest.
+
+**BUG 20: Broadcaster does not reject unverified blobs.**
+At broadcast_signed_xmr:167-171, blobs whose names are not in the
+manifest are silently passed through without hash verification. The
+broadcaster should either: (a) skip/reject blobs not in the manifest,
+or (b) verify blob count matches manifest entry count and abort on
+mismatch.
+
+---
+
+### SCENARIO 5: Stale `broadcast_progress.json` from prior run (manual mode)
+
+**Setup:**
+- Prior run: `broadcast_progress.json` exists with `last=25`
+- New plan: 30 TXs signed, 30 blobs in `signed_blobs/`
+
+#### In auto-mode (GhostSpiral Stage 5)
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Clean progress | GhostSpiral:419-423 | `Path("broadcast_progress.json").unlink()` ← **GOOD** |
+| Broadcast starts fresh | broadcast_signed_xmr:188 | `prog = {"last": -1, "log": []}` |
+
+**Result: Fully handled in auto-mode.**
+
+#### In manual mode
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Default progress file | broadcast_signed_xmr:182 | `progF = Path("broadcast_progress.json")` (no `--resume` given) |
+| File exists | broadcast_signed_xmr:183-185 | Loads old progress: `last_idx = 25` |
+| Broadcast loop | broadcast_signed_xmr:196-203 | For `idx <= 25` → `continue` → **26 TXs SKIPPED** |
+| Remaining | broadcast_signed_xmr:196-360 | Only blobs 26-29 broadcast (4 out of 30) |
+
+**What the operator sees:**
+```
+  [+] TX 26 -> mempool | abcd1234...
+  [+] TX 27 -> mempool | ef567890...
+  [+] TX 28 -> mempool | 11223344...
+  [+] TX 29 -> mempool | 55667788...
+
+  [+] Broadcast complete: 4 sent, 0 failed.
+  [+] Progress: broadcast_progress.json
+```
+
+The operator has no way to know that 26 TXs were silently skipped.
+The output says "4 sent, 0 failed" which looks like a successful small
+batch. There is no "X skipped due to resume" message.
+
+**Does the broadcaster have plan fingerprint binding?**
+
+Checking the progress structure:
+- Signer progress (airgap_tx_signer:155): `{"last": -1, "manifest": [], "plan_fingerprint": plan_fp}` ← **HAS fingerprint**
+- Broadcaster progress (broadcast_signed_xmr:188): `{"last": -1, "log": []}` ← **NO fingerprint**
+
+The broadcaster has **zero protection** against loading a progress file
+from a different plan/run.
+
+#### Verdict: **BROKEN — CRITICAL**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Auto-mode | **OK** | GhostSpiral:419-423 cleans progress before broadcast |
+| Manual-mode default | **BROKEN** | Stale progress causes silent TX skipping |
+| Plan fingerprint | **MISSING** | broadcast_progress.json has no plan binding |
+| Skip reporting | **MISSING** | No output tells operator how many TXs were skipped |
+| Operator awareness | **NONE** | "4 sent, 0 failed" looks like success |
+
+**BUG 21: Broadcaster progress file has no plan fingerprint.**
+Unlike the signer (which binds progress to a plan via
+`_compute_plan_fingerprint` at airgap_tx_signer:74-79), the broadcaster
+progress file at broadcast_signed_xmr:188 contains only `last` and `log`
+with no plan binding. A stale progress file from any prior run causes
+TXs to be silently skipped.
+Fix: add a plan fingerprint (or manifest hash) to broadcast progress and
+verify it on load. Abort if the fingerprint doesn't match the current
+blob set.
+
+**BUG 22: Broadcaster does not report skipped-due-to-resume count.**
+When TXs are skipped by the progress check at broadcast_signed_xmr:202-203,
+no counter is incremented and no output is shown. The final summary at
+line 363 only reports `success_count` and `fail_count`, giving the operator
+a false impression that all TXs were handled.
+Fix: add a `skipped_count` counter (like the signer has at
+airgap_tx_signer:158) and report it in the summary.
+
+---
+
+### SCENARIO 6: Signed manifest path mismatch
+
+#### 6a. Relative outdir (`--outdir signed_blobs`)
+
+| Step | File:Line | Manifest entry |
+|------|-----------|----------------|
+| Signer writes | airgap_tx_signer:215 | `"file": "signed_blobs/tx_0.blob"` |
+| Broadcaster reads | broadcast_signed_xmr:165 | `Path("signed_blobs/tx_0.blob").name` → `"tx_0.blob"` |
+| Glob finds | broadcast_signed_xmr:142-152 | `blob.name` → `"tx_0.blob"` |
+| Hash lookup | broadcast_signed_xmr:168 | `"tx_0.blob" in manifest_hashes` → True |
+
+**Result: OK.**
+
+#### 6b. Absolute outdir (`--outdir /tmp/signed/`)
+
+| Step | File:Line | Manifest entry |
+|------|-----------|----------------|
+| Signer writes | airgap_tx_signer:215 | `"file": "/tmp/signed/tx_0.blob"` |
+| Broadcaster reads | broadcast_signed_xmr:165 | `Path("/tmp/signed/tx_0.blob").name` → `"tx_0.blob"` |
+| Broadcaster path arg | broadcast_signed_xmr:132 | `input_path = Path("/tmp/signed")` |
+| Glob | broadcast_signed_xmr:143 | `/tmp/signed/*.blob` → finds blobs |
+| Hash lookup | broadcast_signed_xmr:168 | `"tx_0.blob" in manifest_hashes` → True |
+
+**Result: OK.**
+
+#### 6c. Air-gap cross-machine paths
+
+| Step | File:Line | Value |
+|------|-----------|-------|
+| Signer (air-gap) | airgap_tx_signer:215 | `"file": "/media/usb/signed_blobs/tx_0.blob"` |
+| Broadcaster (online) | broadcast_signed_xmr:132 | `input_path = Path("/mnt/usb/signed")` (different mount point) |
+| Manifest load | broadcast_signed_xmr:165 | `Path("/media/usb/signed_blobs/tx_0.blob").name` → `"tx_0.blob"` |
+| Blob glob | broadcast_signed_xmr:143 | `/mnt/usb/signed/*.blob` → `blob.name` → `"tx_0.blob"` |
+| Hash lookup | broadcast_signed_xmr:168 | Match ← **OK** |
+
+**Result: OK** — the `.name` extraction handles cross-machine paths correctly.
+
+#### 6d. Edge case: Manifest passed directly as path argument
+
+```
+broadcast_signed_xmr /media/usb/signed_blobs/signed_manifest_v1.json
+```
+
+| Step | File:Line | What happens |
+|------|-----------|--------------|
+| Detect JSON | broadcast_signed_xmr:133 | `args.path.endswith(".json")` → True |
+| Load entries | broadcast_signed_xmr:134-141 | `blobs = [Path(e["file"]) ...]` |
+| Blob paths | — | `Path("/media/usb/signed_blobs/tx_0.blob")` (from air-gap machine) |
+| On online machine | broadcast_signed_xmr:210 | `if not blob.exists()` → **True** (paths don't resolve) |
+| Result | broadcast_signed_xmr:211-216 | All blobs logged as "missing" and skipped |
+
+**Impact:** Zero TXs broadcast. Operator must use directory path, not manifest.
+
+| Step | File:Line | What happens (even on same machine with different CWD) |
+|------|-----------|--------------------------------------------------------|
+| Relative paths | — | If manifest has `"file": "signed_blobs/tx_0.blob"` and CWD changed, `blob.exists()` → False |
+
+#### Verdict: **MOSTLY HANDLED**
+
+| Aspect | Status | Detail |
+|--------|--------|--------|
+| Directory mode + relative outdir | **OK** | `.name` extraction works at broadcast_signed_xmr:165 |
+| Directory mode + absolute outdir | **OK** | `.name` extraction works |
+| Directory mode + cross-machine | **OK** | `.name` extraction works |
+| JSON manifest mode (same machine) | **FRAGILE** | Depends on CWD matching signer's CWD |
+| JSON manifest mode (cross-machine) | **BROKEN** | Absolute paths from signer don't resolve |
+
+**BUG 18 (restated): Manifest-as-path mode uses absolute paths from signer.**
+(Already documented in Scenario 3 above.)
+
+---
+
+### Summary of all bugs found in Round 5
+
+| Bug | Severity | Scenario | Description | Auto-mode? | Manual-mode? |
+|-----|----------|----------|-------------|------------|--------------|
+| BUG 16 | Medium (OPSEC) | 1 | Old unsigned plans never cleaned in Stage 5 | Broken | Broken |
+| BUG 17 | **Critical (OPSEC)** | 3 | Broadcaster hardcodes CWD glob for delays; delays lost in airgap | N/A | Broken |
+| BUG 18 | Low | 3, 6 | Manifest-as-path mode fails cross-machine/cross-CWD | N/A | Broken |
+| BUG 19 | **Critical (money)** | 4 | Signer does not clean output directory; stale blobs persist | OK (rmtree) | Broken |
+| BUG 20 | **Critical (money)** | 4 | Broadcaster silently broadcasts blobs not in manifest | OK (rmtree) | Broken |
+| BUG 21 | **Critical (money)** | 5 | Broadcaster progress has no plan fingerprint | OK (cleanup) | Broken |
+| BUG 22 | High (UX) | 5 | Broadcaster does not report skipped-due-to-resume count | OK (cleanup) | Broken |
+
+### Pattern: Auto-mode is safe, manual-mode is dangerous
+
+Every critical bug is mitigated in auto-mode by GhostSpiral Stage 5's
+cleanup logic (lines 419-430). The danger surface is entirely in manual
+workflows:
+- Air-gap/cold wallet signing (`--airgap` / `--cold`)
+- Manual signer invocation
+- Manual broadcaster invocation
+- Any workflow where the operator runs components individually
+
+This means the most security-sensitive workflow (air-gap, which exists
+specifically for high-value operations) is the LEAST protected against
+state corruption bugs.
+
+## 11. Remaining Items
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -576,3 +1117,10 @@ forensic gold mine linking the operator to specific tooling and API keys.
 | Production RPC endpoints | PLACEHOLDER | Default endpoints are localhost/node.onion |
 | CLI args in /proc | KNOWN RISK | Sensitive args visible in /proc/PID/cmdline; consider env/config file approach |
 | `random` module in paranoia_mode | LOW RISK | `rand_mac()` uses `random.SystemRandom()` (CSPRNG wrapper), OK |
+| BUG 16 | UNFIXED | Clean old unsigned plans in Stage 5 |
+| BUG 17 | UNFIXED | Add `--plan` arg to broadcaster for delay loading |
+| BUG 18 | UNFIXED | Resolve manifest blob paths relative to manifest directory |
+| BUG 19 | UNFIXED | Clean signer output directory before signing (or reject extra blobs) |
+| BUG 20 | UNFIXED | Reject/skip blobs not present in manifest |
+| BUG 21 | UNFIXED | Add plan fingerprint to broadcast progress |
+| BUG 22 | UNFIXED | Report skipped-due-to-resume count in broadcaster |
