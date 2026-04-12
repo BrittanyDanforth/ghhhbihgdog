@@ -15,10 +15,8 @@ OPSEC hardening:
   - Resource sentinel
 """
 from __future__ import annotations
-import argparse, sys
+import argparse, sys, time
 from pathlib import Path
-from datetime import datetime, timezone
-import time
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,

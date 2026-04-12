@@ -45,9 +45,15 @@ PYCACHE_GLOBS = [
 
 
 def dns_check() -> None:
-    """Verify DNS works (post-spoof connectivity check)."""
+    """Verify basic network connectivity after MAC spoof.
+
+    OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
+    over clearnet DNS — that links the new MAC address to Tor usage in
+    ISP DNS logs. Instead, resolve a benign, high-traffic domain that
+    reveals nothing about the operator's intent.
+    """
     try:
-        res = socket.getaddrinfo("check.torproject.org", 443)
+        res = socket.getaddrinfo("www.google.com", 443)
         if not res:
             raise RuntimeError("DNS returned empty")
         integrity_log("paranoia", "dns_check_ok")
@@ -314,6 +320,88 @@ def wipe_tmp_files(dry: bool):
     integrity_log("paranoia", f"tmp_wiped:{count}" if not dry else f"tmp_dry:{count}")
 
 
+def wipe_clipboard(dry: bool):
+    """Clear clipboard contents from all common clipboard managers."""
+    count = 0
+    for cmd in [
+        ["xclip", "-selection", "clipboard", "-i", "/dev/null"],
+        ["xclip", "-selection", "primary", "-i", "/dev/null"],
+        ["xsel", "--clipboard", "--clear"],
+        ["xsel", "--primary", "--clear"],
+        ["wl-copy", "--clear"],
+    ]:
+        if dry:
+            print(f"  [dry] would run {' '.join(cmd)}")
+            count += 1
+            continue
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=5)
+            count += 1
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+    integrity_log("paranoia", f"clipboard:{'dry' if dry else 'wiped'}:{count}")
+
+
+def wipe_xdg_traces(dry: bool):
+    """Wipe XDG recently-used files, thumbnail caches, Trash, and bookmarks.
+
+    These are high-value forensic targets: recently-used.xbel records every
+    file opened by GUI apps (with timestamps), thumbnails cache previews of
+    files (including JSON plans), Trash retains 'deleted' files, and
+    bookmarks may reference working directories.
+    """
+    targets = [
+        Path.home() / ".local/share/recently-used.xbel",
+        Path.home() / ".local/share/recently-used.xbel.bak",
+        Path.home() / ".config/gtk-3.0/bookmarks",
+        Path.home() / ".local/share/tracker/data/tracker-store.journal",
+    ]
+    dir_targets = [
+        Path.home() / ".cache/thumbnails",
+        Path.home() / ".thumbnails",
+        Path.home() / ".local/share/Trash",
+        Path.home() / ".local/share/tracker",
+    ]
+    count = 0
+    for f in targets:
+        if f.exists():
+            if dry:
+                print(f"  [dry] would wipe {f}")
+            else:
+                _secure_delete_file(f)
+            count += 1
+    for d in dir_targets:
+        if d.is_dir():
+            if dry:
+                print(f"  [dry] would wipe dir {d}")
+            else:
+                _secure_delete_dir(d)
+            count += 1
+    integrity_log("paranoia", f"xdg_traces:{'dry' if dry else 'wiped'}:{count}")
+
+
+def scrub_env_vars(dry: bool):
+    """Remove GhostSpiral-related environment variables from the current process.
+
+    /proc/self/environ is immutable on Linux, so we can only clear the
+    variables in the current process. The parent shell's env persists until
+    the terminal is closed.
+    """
+    sensitive_prefixes = [
+        "GPT_KEYS", "MASTER_ENTROPY", "WG_CONF", "TOR_PROXY",
+        "MONERO_RPC", "XMR_", "BTC_", "GHOSTSPIRAL", "GS_",
+    ]
+    count = 0
+    for key in list(os.environ.keys()):
+        if any(key.upper().startswith(p) for p in sensitive_prefixes):
+            if dry:
+                print(f"  [dry] would unset env {key}")
+            else:
+                del os.environ[key]
+            count += 1
+    integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
+
+
 def main():
     install_signal_handlers()
 
@@ -361,6 +449,15 @@ def main():
 
     print("  [*] Phase 10: GhostSpiral artifacts")
     wipe_gs_artifacts(args.dry_run)
+
+    print("  [*] Phase 11: Clipboard")
+    wipe_clipboard(args.dry_run)
+
+    print("  [*] Phase 12: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
+    wipe_xdg_traces(args.dry_run)
+
+    print("  [*] Phase 13: Environment variables")
+    scrub_env_vars(args.dry_run)
 
     integrity_log("paranoia", f"complete:dry={args.dry_run}")
     print("\n  [+] paranoia_mode complete.")

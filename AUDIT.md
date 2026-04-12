@@ -433,12 +433,146 @@ Precise mathematical audit of fund flow through the pipeline.
 **Impact:** For 47.5 XMR the waste is 0.002 XMR (negligible). For small balances (e.g. 0.01 XMR), can lose 3%+ or cause false "insufficient balance" aborts.
 **Fix:** Changed to `fee_xmr * Decimal("1.5")` — 1 TX/round + 50% safety margin (GhostSpiral:359).
 
-## 9. Remaining Items
+## 9. Deanonymization Audit (Round 5 — Chain Analyst Perspective)
+
+Full trace of every network call, DNS resolution, and identity leak vector.
+
+### FINDING D1 (FIXED): SOCKS5 vs SOCKS5H DNS leak
+**File:** `gs_common.py` line 36 (old)
+**Bug:** `SOCKS_RE = re.compile(r"^socks5h?://...")` accepted both `socks5://` and `socks5h://`.
+With plain `socks5://`, the Python `requests` library resolves hostnames **locally** before sending
+through the proxy. Every domain (check.torproject.org, api.thorswap.net, api.coingecko.com,
+moneroblocks.info, xmrchain.net, bisq.markets, haveno.network) would appear in ISP DNS logs.
+**Impact:** CRITICAL — full list of contacted services visible to ISP, trivially correlating the
+operator to BTC→XMR mixing activity.
+**Fix:** Regex now only accepts `socks5h://`. Explicit error message if operator passes `socks5://`.
+
+### FINDING D2 (FIXED): safe_get/safe_post accept proxies=None silently
+**File:** `gs_common.py` lines 189-199 (old)
+**Bug:** `safe_get(url, proxies=None)` and `safe_post(url, payload, proxies=None)` default to None.
+Any caller that forgets to pass the proxy dict sends traffic clearnet without any warning.
+Same for `_single_post` in `broadcast_signed_xmr` line 33.
+**Impact:** HIGH — a single forgotten `proxy` argument anywhere in the codebase leaks the
+operator's real IP to the destination API.
+**Fix:** All three functions now `sys.exit()` if proxies is None.
+
+### FINDING D3 (FIXED): Four scripts had optional --tor-proxy
+**Files:**
+- `broadcast_signed_xmr` line 81: `--tor-proxy` was optional
+- `thor_swap_preparer` line 79: `--tor-proxy` was optional, only warned
+- `exit_strategy_simulator` line 69: `--tor-proxy` was optional
+- `create_receive_wallet` line 39: `--tor-proxy` was optional
+**Impact:** CRITICAL — each script could silently operate over clearnet. The operator might
+think Tor is in use (because GhostSpiral forced it) but subprocess scripts didn't enforce it.
+**Fix:** All four scripts now abort if `--tor-proxy` is not provided.
+
+### FINDING D4 (FIXED): JoinMarket subprocess missing Tor proxy
+**File:** `GhostSpiral` line 162 (old)
+**Bug:** `subprocess.run(["python3", "tumble.py", wallet, addr, "all"])` — no SOCKS proxy
+passed to JoinMarket. JM's tumble.py makes its own network connections to makers and
+directory nodes. Without explicit proxy config, JM may use clearnet for directory lookups
+and maker connections, leaking the operator's IP to every maker in the tumble.
+**Impact:** CRITICAL — every JoinMarket maker sees the operator's real IP.
+**Fix:** Now passes `--socks5-host` and `--socks5-port` extracted from `--tor-proxy`.
+
+### FINDING D5 (FIXED): MoneroRPC connection has no proxy support
+**File:** `gs_common.py` lines 205-239 (old)
+**Bug:** `JSONRPCWallet(host=host, port=port)` from monero-python uses a bare
+`requests.Session()` internally with no proxy configuration. If `--rpc-primary` points
+to any non-localhost host (e.g., a remote node, a `.onion` address), the HTTP connection
+goes clearnet. The operator's IP is leaked to the Monero node operator.
+**Impact:** HIGH — if RPC is remote, every wallet RPC call (get_balance, new_subaddress,
+get_height, transfer) leaks the operator's IP with correlation to specific wallet activity.
+**Fix:** MoneroRPC now validates that the host is localhost. Non-localhost hosts require
+external tunneling (socat/ssh through Tor) and trigger an abort with instructions.
+If the backend exposes `_session`, proxies are patched in as a defense-in-depth measure.
+
+### FINDING D6 (FIXED): Integrity log timestamps enable correlation
+**File:** `gs_common.py` line 64 (old)
+**Bug:** `ts = int(time.time())` — exact Unix second. Combined with blockchain timestamps
+(Monero block timestamps, ThorChain swap timestamps), an analyst can correlate the
+operation window to within seconds. The integrity log contains stage transitions that map
+to observable on-chain events (swap initiated → XMR received → mixing started → outputs).
+**Impact:** MEDIUM — narrows the anonymity set significantly when combined with chain data.
+**Fix:** Timestamps coarsened to 600-second (10-minute) buckets: `ts = int(time.time()) // 600 * 600`.
+
+### FINDING D7 (FIXED): Output files contain exact timestamps
+**Files and lines (old):**
+- `GhostSpiral` line 395: `"created": int(time.time())` in unsigned plan JSON
+- `GhostSpiral` line 401: `unsigned_{int(time.time())}.json` in filename
+- `thor_swap_preparer` line 160: `"ts": int(time.time())` per pair
+- `create_receive_wallet` line 68: `datetime.now(timezone.utc).isoformat()` (ISO format!)
+- `create_receive_wallet` line 76: `wallet_{int(time.time())}.json` in filename
+- `exit_strategy_simulator` line 106: `"timestamp": int(time.time())`
+**Impact:** MEDIUM — if files are transferred to air-gap machine (USB), recovered by forensics,
+or shared with any third party, the exact creation time is embedded in both content and filename.
+The ISO timestamp in `create_receive_wallet` was second-precise with timezone.
+**Fix:** All embedded timestamps coarsened to 10-minute buckets. Filenames now use
+`secure_hex(8)` random identifiers instead of timestamps.
+
+### FINDING D8 (FIXED): paranoia_mode dns_check() does clearnet DNS for Tor domain
+**File:** `paranoia_mode` line 50 (old)
+**Bug:** `socket.getaddrinfo("check.torproject.org", 443)` — after MAC spoofing, this
+immediately performs a clearnet DNS resolution for a Tor Project domain. This:
+1. Links the new spoofed MAC to Tor activity in ISP DNS logs
+2. Confirms to a network observer that the machine is Tor-aware
+3. Creates a timing marker (MAC spoof → immediate Tor DNS → operation start)
+**Impact:** HIGH — defeats the purpose of MAC spoofing by immediately fingerprinting
+the connection as Tor-related.
+**Fix:** Changed to resolve `www.google.com` — a benign, ubiquitous domain that reveals
+nothing about operator intent.
+
+### FINDING D9 (FIXED): paranoia_mode does not wipe clipboard, XDG traces, or env vars
+**File:** `paranoia_mode` (entire file)
+**Missing wipes:**
+- **Clipboard:** After copying XMR/BTC addresses for manual operations, clipboard contents
+  persist in X11/Wayland clipboard managers (xclip, xsel, wl-copy).
+- **recently-used.xbel:** `~/.local/share/recently-used.xbel` records every file opened by
+  GUI applications — including JSON plans, wallet files, and blob directories. Each entry
+  has an exact timestamp and full file path.
+- **Thumbnail cache:** `~/.cache/thumbnails/` stores rendered previews of files. If any
+  JSON plan was previewed in a file manager, the thumbnail persists.
+- **Trash:** `~/.local/share/Trash/` retains "deleted" files with original paths and timestamps.
+- **File manager bookmarks:** `~/.config/gtk-3.0/bookmarks` may reference working directories.
+- **Environment variables:** `GPT_KEYS`, `MASTER_ENTROPY`, `WG_CONF`, and other sensitive
+  env vars persist in the process environment.
+- **/proc/*/cmdline:** Command-line arguments (including addresses) are visible in
+  `/proc/PID/cmdline` while processes run. Cannot be wiped from userspace, but
+  operator should be aware.
+**Impact:** MEDIUM-HIGH — forensic investigator recovers complete operation timeline from
+`recently-used.xbel`, actual file contents from Trash, and visual previews from thumbnails.
+**Fix:** Added Phase 11 (clipboard wipe), Phase 12 (XDG traces), Phase 13 (env vars).
+
+### FINDING D10 (NOT FIXABLE IN USERSPACE): /proc/*/cmdline exposure
+**All scripts** accept command-line arguments containing BTC addresses (`--btc-entry`),
+XMR amounts, proxy URLs, wallet file paths, and RPC endpoints. While any GhostSpiral
+process is running, these are visible to any process on the system via `/proc/PID/cmdline`.
+A local adversary (another user, malware, or a compromised monitoring agent) can read
+full command-line arguments of running processes.
+**Mitigation:** Use environment variables or config files (read-then-wipe) instead of
+command-line arguments for sensitive parameters. Not implemented in this pass.
+
+### FINDING D11 (INFORMATIONAL): renamethis1 contains massive leak surface
+**File:** `renamethis1` (2400+ lines)
+This file appears to be a chat log concatenated with code from a different tool
+(`targ_graber_v13`). It contains:
+- `urllib.request.urlopen()` calls with no proxy (line 63)
+- OpenAI API calls via `curl`/`torsocks` (line 98-99)
+- References to `GPT_KEYS` environment variable
+- WireGuard tunnel setup (`wg-quick up`)
+- ANU QRNG API calls over clearnet
+This file is not imported by any GhostSpiral script but its presence on disk is a
+forensic gold mine linking the operator to specific tooling and API keys.
+**Status:** Should be securely deleted or moved out of the workspace.
+
+## 10. Remaining Items
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `renamethis1` | NOT FIXED | 2400-line chat/code mess. Needs owner decision. |
+| `renamethis1` | NOT FIXED | 2400-line chat/code mess. Needs owner decision. Should be securely deleted. |
 | Real JoinMarket UTXO parsing | STUB | stage1 returns placeholder; needs JM output format spec |
 | Real mempool monitoring | STUB | stage2 uses sleep-mock; needs ThorChain WS integration |
 | monero-wallet-cli batch format | NEEDS TESTING | --batch-file usage may vary by wallet-cli version |
 | Production RPC endpoints | PLACEHOLDER | Default endpoints are localhost/node.onion |
+| CLI args in /proc | KNOWN RISK | Sensitive args visible in /proc/PID/cmdline; consider env/config file approach |
+| `random` module in paranoia_mode | LOW RISK | `rand_mac()` uses `random.SystemRandom()` (CSPRNG wrapper), OK |

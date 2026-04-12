@@ -106,7 +106,7 @@ def main():
 
     plan = {
         "schema": "exitplan_v1",
-        "timestamp": int(time.time()),
+        "timestamp": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         "method": args.method,
         "kyc_required": cfg["kyc"],
         "amount_in_xmr": str(gross),
