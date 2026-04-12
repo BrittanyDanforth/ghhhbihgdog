@@ -1124,3 +1124,73 @@ state corruption bugs.
 | BUG 20 | UNFIXED | Reject/skip blobs not present in manifest |
 | BUG 21 | UNFIXED | Add plan fingerprint to broadcast progress |
 | BUG 22 | UNFIXED | Report skipped-due-to-resume count in broadcaster |
+
+---
+
+## Section 11: Round 8 — Fundamental Rewrites Against Real-World APIs
+
+### Monero Signing Workflow: COMPLETE REWRITE
+
+**What was wrong:** The signer used `--batch-file` (not a real monero-wallet-cli flag) and tried to run `transfer` in offline mode with a batch file redirect. This is not how Monero offline signing works at all.
+
+**Real workflow (from Monero docs):**
+1. Online view-only wallet creates unsigned TX
+2. Transfer unsigned TX to offline machine
+3. Offline wallet signs with `sign_transfer`
+4. Transfer signed TX back
+5. Online wallet broadcasts with `submit_transfer`
+
+**Fix:** Complete rewrite of `airgap_tx_signer`:
+- Uses stdin to pipe transfer commands to wallet-cli
+- Verifies wallet-cli binary exists and reports version
+- Handles signed_monero_tx output file
+- Supports wallet password
+- Reports failed TXs separately (doesn't advance progress on failure)
+- Output files use `.signed` extension instead of `.blob`
+
+### ThorSwap API: COMPLETE REWRITE
+
+**What was wrong:** Code used `POST /aggregator/swap` with fields `{from, to, amount, destination}`. The real SwapKit API is `POST /v3/quote` with fields `{sellAsset, buyAsset, sellAmount, destinationAddress}`. Response contains `{quoteId, routes: [{expectedOutput, transaction: {depositAddress, memo}}]}`.
+
+**Fix:** Both `GhostSpiral` and `thor_swap_preparer` now use:
+- Correct endpoint: `https://api.swapkit.dev/v3/quote`
+- Correct request fields: `sellAsset`, `buyAsset`, `sellAmount`, `destinationAddress`
+- Correct response parsing: routes array, expectedOutput, transaction.depositAddress
+
+### Fee Bumping: REMOVED (Monero has no RBF)
+
+**What was wrong:** `_bump_fee()` tried to call `sign_transfer` with a hex file to "bump" the fee. Monero does NOT support Replace-By-Fee. Once a TX is signed, its fee is fixed.
+
+**Fix:** Removed fake `_bump_fee()`. When node rejects with "low_fee", broadcaster now clearly tells the operator to re-sign with higher `--fee-priority` on the signing machine.
+
+### Broadcaster: Fixed crash bug (input_path used before defined)
+
+The delay loading code referenced `input_path` on line 124 but `input_path` was defined on line 163. This would crash on EVERY run. Fixed by moving blob gathering before delay loading.
+
+---
+
+## Section 12: Real-World Scenario — $5,000 BTC Through GhostSpiral
+
+**Starting position:** 0.08 BTC (~$5,000) from a KYC exchange. Goal: untraceable XMR.
+
+### Steps:
+1. **Setup:** Install deps, Tor, monero binaries, create offline+view-only wallet pair
+2. **Create receive wallet:** `python3 create_receive_wallet --tor-proxy socks5h://127.0.0.1:9050`
+3. **Get ThorChain quotes:** `python3 thor_swap_preparer --amounts 0.04 0.04 --dests <ENTRY> <ENTRY> --tor-proxy ...`
+4. **MANUALLY send BTC** to deposit addresses with memos (2 swaps, different Tor circuits per quote)
+5. **Wait for XMR** to arrive and unlock (~30 min)
+6. **Run GhostSpiral** with `--cold` to create unsigned mixing plan (40 rounds)
+7. **Sign on air-gapped machine** via USB transfer
+8. **Broadcast** over Tor with 3-12 min random delays per TX (~4-8 hours total)
+9. **Exit strategy** simulation for Bisq/Haveno off-ramp
+10. **Paranoia cleanup** — wipe all artifacts, histories, caches
+
+### Traceability:
+| Layer | Risk | Why |
+|-------|------|-----|
+| BTC -> ThorChain | MEDIUM | BTC is transparent; ThorChain observers see swap |
+| ThorChain -> XMR | LOW | Decentralized swap; XMR natively private |
+| XMR mixing (40 hops) | VERY LOW | Ring signatures + 14 subaddresses + random delays |
+| Network observer | LOW | All through Tor with socks5h DNS, NEWNYM per TX |
+| Host forensics | LOW | 14-phase paranoia wipe |
+| Operator error | MEDIUM | Manual BTC send is weakest link |

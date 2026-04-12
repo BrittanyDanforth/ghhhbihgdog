@@ -39,7 +39,7 @@ from gs_common import (
 
 DUST_XMR = Decimal("0.0001")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
-THOR_API = "https://api.thorswap.net/aggregator"
+SWAPKIT_API = "https://api.swapkit.dev"
 # Fee oracle endpoints (tried in order; LocalMonero is defunct since 2023)
 FEE_ORACLE_URLS = [
     "https://moneroblocks.info/api/get_stats",
@@ -192,57 +192,92 @@ def main():
     # Stage 2 - ThorChain swap definition
     ###########################################################################
 
-    def stage2_thor_swap(chunks: List[Decimal], xmr_dest: str) -> Decimal:
-        """Execute BTC->XMR swaps via ThorChain for each BTC chunk.
-        Returns total expected XMR received."""
-        received_total = Decimal(0)
+    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
+        """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
+
+        Uses the REAL SwapKit v3 API (https://docs.swapkit.dev):
+          POST /v3/quote
+          Body: {sellAsset, buyAsset, sellAmount, destinationAddress}
+          Response: {quoteId, routes: [{..., expectedOutput, depositAddress, memo}]}
+
+        Returns list of deposit instructions for the operator.
+        The operator must MANUALLY send BTC to each deposit address.
+        """
+        deposits = []
         for i, amt in enumerate(chunks):
             if shutdown_requested():
                 integrity_log("stage2", f"shutdown_at_chunk_{i}")
-                sys.exit("[!] Shutdown requested during ThorChain swaps.")
+                sys.exit("[!] Shutdown requested during quote fetch.")
 
             if amt <= Decimal(0):
-                integrity_log("stage2", f"skip_zero_chunk_{i}")
                 continue
 
             if i > 0:
                 newnym()
                 secure_delay(3.0, 10.0)
 
+            # SwapKit v3 API uses sellAsset/buyAsset not from/to
             payload = {
-                "from": "BTC.BTC",
-                "to": "XMR.XMR",
-                "amount": str(amt),
-                "destination": xmr_dest,
+                "sellAsset": "BTC.BTC",
+                "buyAsset": "XMR.XMR",
+                "sellAmount": str(amt),
+                "destinationAddress": xmr_dest,
             }
-            quote = safe_post(f"{THOR_API}/swap", payload, proxy)
 
-            deposit = quote.get("deposit")
-            memo = quote.get("memo", "")
-            expected = quote.get("expected_amount_out", "0")
+            try:
+                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+            except Exception as e:
+                newnym()
+                integrity_log("stage2", f"quote_api_error:{i}")
+                sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
 
-            if not deposit:
-                integrity_log("stage2", f"no_deposit_chunk_{i}")
-                sys.exit(f"[!] ThorChain returned no deposit address for chunk {i}")
+            # Parse the routes from the response
+            routes = quote_resp.get("routes", [])
+            if not routes:
+                error = quote_resp.get("error", "unknown")
+                provider_errors = quote_resp.get("providerErrors", [])
+                integrity_log("stage2", f"no_routes_chunk_{i}")
+                sys.exit(
+                    f"[!] No swap routes available for chunk {i}.\n"
+                    f"    Error: {str(error)[:80]}\n"
+                    f"    Provider errors: {str(provider_errors)[:120]}"
+                )
 
-            if not deposit.startswith(("bc1", "tb1")):
-                integrity_log("stage2", f"bad_deposit_format_{i}")
-                sys.exit(f"[!] Deposit address not bech32: {scrub_address(deposit)}")
+            # Use the first (best) route
+            route = routes[0]
+            expected_output = route.get("expectedOutput", "0")
+            # The actual deposit details come from executing the route
+            # For THORChain routes, the deposit info is in the route's transaction object
+            tx_info = route.get("transaction", route.get("calldata", {}))
+            deposit_addr = tx_info.get("depositAddress", tx_info.get("to", ""))
+            memo = tx_info.get("memo", tx_info.get("data", ""))
 
-            expected_dec = Decimal(str(expected))
-            if expected_dec <= 0:
-                integrity_log("stage2", f"zero_expected_chunk_{i}")
-                sys.exit(f"[!] ThorChain expects 0 XMR output for chunk {i} - likely bad rate")
+            if not deposit_addr:
+                integrity_log("stage2", f"no_deposit_in_route_{i}")
+                sys.exit(f"[!] Route has no deposit address for chunk {i}")
 
-            print(f"  [*] Chunk {i}/{len(chunks)-1}: send BTC to {scrub_address(deposit)}")
-            print(f"      Memo: {memo}")
-            print(f"      IMPORTANT: Manually send {amt} BTC to the above deposit address!")
-            integrity_log("stage2", f"deposit_ready:{i}")
+            expected_dec = Decimal(str(expected_output))
+
+            deposit_info = {
+                "chunk": i,
+                "btc_amount": str(amt),
+                "deposit_address": deposit_addr,
+                "memo": str(memo),
+                "expected_xmr": str(expected_dec),
+                "quote_id": quote_resp.get("quoteId", ""),
+            }
+            deposits.append(deposit_info)
+
+            print(f"  [*] Chunk {i}/{len(chunks)-1}:")
+            print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
+            if memo:
+                print(f"      With memo: {str(memo)[:40]}...")
+            print(f"      Expected: ~{expected_dec} XMR")
+            integrity_log("stage2", f"quote_ready:{i}")
 
             secure_delay(5.0, 15.0)
-            received_total += expected_dec
 
-        return received_total
+        return deposits
 
     ###########################################################################
     # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
@@ -297,9 +332,12 @@ def main():
         btc_chunks = []
 
     if btc_chunks:
-        xmr_expected = stage2_thor_swap(btc_chunks, ENTRY)
-        integrity_log("stage2", "swap_deposits_generated")
-        print(f"\n  [+] Expected total: ~{xmr_expected} XMR after swaps")
+        swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
+        integrity_log("stage2", "swap_quotes_generated")
+        total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+        print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+        print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+        print(f"  [!] YOU MUST manually send BTC to each deposit address above!")
         print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
     else:
         integrity_log("stage2", "manual_mode")
@@ -444,11 +482,12 @@ def main():
 
     try:
         print("  [*] Stage 5a: Signing...")
-        subprocess.run(
-            ["python3", "airgap_tx_signer", str(ufile),
-             "--wallet-file", "offline.wallet", "--outdir", "signed_blobs"],
-            check=True, timeout=1800,
-        )
+        sign_cmd = [
+            "python3", "airgap_tx_signer", str(ufile),
+            "--wallet-file", "offline.wallet",
+            "--outdir", "signed_blobs",
+        ]
+        subprocess.run(sign_cmd, check=True, timeout=1800)
         integrity_log("stage5", "signer_ok")
     except subprocess.TimeoutExpired:
         integrity_log("stage5", "signer_timeout")

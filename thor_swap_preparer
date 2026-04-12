@@ -33,7 +33,7 @@ try:
 except ImportError:
     sys.exit("[!] python-monero missing - pip install monero")
 
-THOR_API = "https://api.thorswap.net/aggregator"
+SWAPKIT_API = "https://api.swapkit.dev"
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
@@ -115,24 +115,33 @@ def main():
             newnym()
             secure_delay(3.0, 8.0)
 
+        # SwapKit v3 API (replaces defunct thorswap aggregator)
         payload = {
-            "from": "BTC.BTC",
-            "to": "XMR.XMR",
-            "amount": str(amt),
-            "destination": dest,
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": dest,
         }
 
         try:
-            quote = safe_post(f"{THOR_API}/swap", payload, proxy)
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
         except Exception as e:
             if proxy:
                 newnym()
             integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
             raise
 
-        deposit = quote.get("deposit", "")
-        memo = quote.get("memo", "")
-        expected_xmr = Decimal(str(quote.get("expected_amount_out", "0")))
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            error = quote_resp.get("error", "unknown")
+            integrity_log("thor", f"no_routes_{i}")
+            sys.exit(f"[!] No swap routes for pair {i}: {str(error)[:80]}")
+
+        route = routes[0]
+        tx_info = route.get("transaction", route.get("calldata", {}))
+        deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
+        memo = tx_info.get("memo", tx_info.get("data", ""))
+        expected_xmr = Decimal(str(route.get("expectedOutput", "0")))
 
         if not deposit:
             integrity_log("thor", f"no_deposit_{i}")

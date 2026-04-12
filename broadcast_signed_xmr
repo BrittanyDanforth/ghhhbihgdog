@@ -15,7 +15,7 @@ OPSEC hardening:
   - All progress files written 0600
 """
 from __future__ import annotations
-import argparse, json, time, sys, os, hashlib, subprocess, tempfile
+import argparse, json, time, sys, os, hashlib
 from pathlib import Path
 from typing import List
 
@@ -42,30 +42,10 @@ MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
 
-def _bump_fee(hex_tx: str, wallet_file: str) -> str:
-    """Attempt to re-sign TX with bumped fee. Returns original on failure."""
-    fd, tmp_path = tempfile.mkstemp(suffix=".hex", prefix="gs_bump_")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(hex_tx)
-        result = subprocess.run(
-            ["monero-wallet-cli", "--wallet-file", wallet_file,
-             "--offline", "--command", f"sign_transfer {tmp_path}"],
-            capture_output=True, text=True, check=True, timeout=60,
-        )
-        bumped = Path(tmp_path).read_text().strip()
-        if bumped and bumped != hex_tx:
-            integrity_log("broadcast", "fee_bump_ok")
-            return bumped
-        return hex_tx
-    except Exception as e:
-        integrity_log("broadcast", f"fee_bump_fail:{str(e)[:40]}")
-        return hex_tx
-    finally:
-        if os.path.exists(tmp_path):
-            with open(tmp_path, "w") as f:
-                f.write("\x00" * len(hex_tx))
-            os.unlink(tmp_path)
+    # NOTE: Monero does NOT support RBF (Replace-By-Fee). Once a TX is signed,
+    # its fee is fixed. If a node rejects with "low_fee", the TX must be
+    # re-created with higher priority on the signing machine and re-signed.
+    # There is no way to bump the fee of a pre-signed TX blob.
 
 
 def main():
@@ -115,12 +95,43 @@ def main():
         ]
     integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
+    # Gather blobs FIRST (input_path must be defined before delay loading uses it)
+    blobs: List[Path] = []
+    input_path = Path(args.path)
+    if args.path.endswith(".json"):
+        with open(input_path) as f:
+            entries = json.load(f)
+        if isinstance(entries, dict) and "manifest" in entries:
+            entries = entries["manifest"]
+        blobs = [
+            Path(e["file"]) if isinstance(e, dict) else Path(e)
+            for e in entries
+        ]
+    elif input_path.is_dir():
+        # Look for both .signed (new format) and .blob (legacy) files
+        raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
+        def _blob_sort_key(p: Path) -> int:
+            """Extract numeric index from tx_N.signed for correct numeric sort."""
+            stem = p.stem  # e.g. "tx_15"
+            parts = stem.split("_")
+            try:
+                return int(parts[-1])
+            except (ValueError, IndexError):
+                return 999999
+        blobs = sorted(raw_blobs, key=_blob_sort_key)
+    elif input_path.exists():
+        blobs = [input_path]
+
+    if not blobs:
+        sys.exit("[!] No blobs found to broadcast")
+    integrity_log("broadcast", f"blobs_found:{len(blobs)}")
+
     # Load per-TX delays. Primary source: signed manifest (travels with blobs
     # on USB for air-gap workflow). Fallback: unsigned plan in ./unsigned/.
     tx_delays: dict = {}
     delay_source = "none"
 
-    # Try manifest first (embedded by signer since Round 7)
+    # Try manifest first (embedded by signer)
     _manifest_for_delays = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
     if _manifest_for_delays and _manifest_for_delays.exists():
         try:
@@ -157,36 +168,6 @@ def main():
         integrity_log("broadcast", "WARNING:no_delays_found")
         print("  [!] WARNING: No TX delays found - all TXs will broadcast with minimal gap!")
         print("  [!] This creates a timing cluster visible to chain analysts.")
-
-    # Gather blobs
-    blobs: List[Path] = []
-    input_path = Path(args.path)
-    if args.path.endswith(".json"):
-        with open(input_path) as f:
-            entries = json.load(f)
-        if isinstance(entries, dict) and "manifest" in entries:
-            entries = entries["manifest"]
-        blobs = [
-            Path(e["file"]) if isinstance(e, dict) else Path(e)
-            for e in entries
-        ]
-    elif input_path.is_dir():
-        raw_blobs = list(input_path.glob("*.blob"))
-        def _blob_sort_key(p: Path) -> int:
-            """Extract numeric index from tx_N.blob for correct numeric sort."""
-            stem = p.stem  # e.g. "tx_15"
-            parts = stem.split("_")
-            try:
-                return int(parts[-1])
-            except (ValueError, IndexError):
-                return 999999
-        blobs = sorted(raw_blobs, key=_blob_sort_key)
-    elif input_path.exists():
-        blobs = [input_path]
-
-    if not blobs:
-        sys.exit("[!] No blobs found to broadcast")
-    integrity_log("broadcast", f"blobs_found:{len(blobs)}")
 
     # Verify blob integrity against signer manifest if available
     manifest_path = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
@@ -263,8 +244,8 @@ def main():
             fail_count += 1
             continue
 
-        raw_hex = blob.read_text().strip()
-        if not raw_hex:
+        raw_data = blob.read_bytes()
+        if not raw_data:
             integrity_log("broadcast", f"empty_blob:{blob.name}")
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
                                 "error": "empty_blob"})
@@ -272,6 +253,9 @@ def main():
             atomic_write_json(prog, progF)
             fail_count += 1
             continue
+
+        # Convert to hex for the daemon's send_raw_transaction endpoint
+        raw_hex = raw_data.hex()
 
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
@@ -385,9 +369,11 @@ def main():
                         sent = False
                         break
 
-                    if "low_fee" in str(err_msg).lower() and args.wallet_file:
-                        raw_hex = _bump_fee(raw_hex, args.wallet_file)
-                        print("  [+] Fee bumped, retrying...")
+                    if "low_fee" in str(err_msg).lower():
+                        integrity_log("broadcast", f"low_fee_rejected:idx={idx}")
+                        print("  [!] TX rejected: fee too low. Re-sign with higher --fee-priority.")
+                        print("  [!] Monero does NOT support RBF - cannot bump fee on signed TX.")
+                        break
             except Exception as e:
                 integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")
                 print(f"  [!] Error: {str(e)[:80]}")

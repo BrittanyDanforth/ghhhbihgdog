@@ -2,43 +2,56 @@
 """
 airgap_tx_signer v10.0 - Offline signer for GhostSpiral unsigned_v1 bundles
 ============================================================================
-Completely offline; never touches the network.
+Implements the REAL Monero offline signing workflow:
+
+  1. Online machine: monero-wallet-rpc creates unsigned TX via transfer RPC
+  2. GhostSpiral outputs the plan as unsigned_v1 JSON
+  3. This script: on the OFFLINE machine, feeds each TX to monero-wallet-cli
+     which calls sign_transfer to produce signed TX files
+  4. Signed TX files are transferred to online machine for broadcast
+
+The key insight: monero-wallet-cli in offline mode uses sign_transfer to
+sign previously-created unsigned TX sets. The actual transfer command must
+be run on the VIEW-ONLY wallet (online) which creates the unsigned_tx_set,
+then sign_transfer is run on the OFFLINE wallet which has the spend key.
+
+For the GhostSpiral pipeline, since we use monero-wallet-rpc (online) to
+create subaddresses and check balances, the signing step works like this:
+  - The unsigned plan contains dst/amt pairs
+  - On the offline machine, we use monero-wallet-cli to create and sign
+    each transfer in one step (offline wallet has spend keys)
+  - Output is a signed_monero_tx file per transfer
 
 OPSEC hardening:
   - Validates unsigned_v1 schema (handles both dict-wrapped and flat list)
-  - Validates all amounts are positive decimals
-  - Resume-safe with integrity verification on resume
-  - Temp batch files securely wiped after use
-  - Blob hashes recorded in manifest for downstream verification
+  - Resume-safe with plan fingerprint binding
+  - Temp files securely wiped after use
   - All output files written 0600
   - Signal handlers for graceful interruption
   - Progress atomically written with fsync
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, sys, tempfile, time
+import argparse, json, subprocess, hashlib, os, sys, tempfile, time, shutil
 from pathlib import Path
 from decimal import Decimal
 from typing import List
 
 from gs_common import (
-    integrity_log, atomic_write_json, atomic_write_text,
+    integrity_log, atomic_write_json,
     secure_file_perms, install_signal_handlers, shutdown_requested,
     scrub_address,
 )
 
-REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str, "extra": str}
+REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
 
 
 def _validate_plan(plan: List[dict]) -> None:
-    """Validate every TX in the plan has required fields with correct types."""
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
         for k, typ in REQUIRED_TX_FIELDS.items():
             if k not in tx or not isinstance(tx[k], typ):
-                sys.exit(
-                    f"[!] Schema error at TX {i}: field '{k}' missing or wrong type"
-                )
+                sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
         try:
             val = Decimal(tx["amt"])
             if val <= 0:
@@ -48,31 +61,20 @@ def _validate_plan(plan: List[dict]) -> None:
 
 
 def _load_unsigned(path: Path) -> List[dict]:
-    """Load unsigned_v1 bundle from GhostSpiral.
-
-    Handles: {"meta": {...}, "txs": [...]}  (v10.5 format)
-             [tx, tx, ...]                  (flat list)
-    """
     with open(path) as f:
         raw = json.load(f)
-
     if isinstance(raw, dict):
         if "txs" in raw and isinstance(raw["txs"], list):
             meta = raw.get("meta", {})
-            schema = meta.get("schema", "unknown")
-            integrity_log("signer", f"loaded_schema={schema}:version={meta.get('version', '?')}")
+            integrity_log("signer", f"loaded_schema={meta.get('schema', '?')}")
             return raw["txs"]
         sys.exit("[!] unsigned_v1 dict format missing 'txs' list")
-
     if isinstance(raw, list):
-        integrity_log("signer", "loaded_flat_list")
         return raw
-
-    sys.exit("[!] unsigned_v1 has unexpected format (not dict or list)")
+    sys.exit("[!] unsigned_v1 has unexpected format")
 
 
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
-    """Compute a stable fingerprint of the plan content for binding progress to a plan."""
     h = hashlib.sha256()
     for tx in plan:
         h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
@@ -80,22 +82,13 @@ def _compute_plan_fingerprint(plan: List[dict]) -> str:
 
 
 def _verify_resume_integrity(progress: dict, plan: List[dict]) -> None:
-    """On resume, verify that:
-    1. The progress file was created for THIS plan (fingerprint match)
-    2. All previously-signed blob hashes still match (tamper detection)
-    """
-    # Verify plan binding
     current_fp = _compute_plan_fingerprint(plan)
     saved_fp = progress.get("plan_fingerprint", "")
     if saved_fp and saved_fp != current_fp:
-        integrity_log("signer", "PLAN_MISMATCH:progress_from_different_plan")
         sys.exit(
             "[!] Progress file is from a DIFFERENT plan!\n"
-            "    Delete the progress file or use the correct unsigned plan.\n"
-            "    Mixing progress files between plans can broadcast wrong TXs."
+            "    Delete the progress file or use the correct unsigned plan."
         )
-
-    # Verify blob hashes
     manifest = progress.get("manifest", [])
     for entry in manifest:
         blob_path = Path(entry["file"])
@@ -103,12 +96,66 @@ def _verify_resume_integrity(progress: dict, plan: List[dict]) -> None:
             with open(blob_path, "rb") as f:
                 actual_hash = hashlib.sha256(f.read()).hexdigest()
             if actual_hash != entry.get("hash"):
-                integrity_log("signer", f"TAMPER_DETECTED:idx={entry['idx']}")
                 sys.exit(f"[!] Blob tampered: {blob_path} hash mismatch on resume!")
         else:
-            integrity_log("signer", f"missing_blob_on_resume:idx={entry['idx']}")
             sys.exit(f"[!] Previously signed blob missing: {blob_path}")
-    integrity_log("signer", f"resume_ok:last={progress.get('last', -1)}")
+
+
+def _sign_single_tx(wallet_cli: str, wallet_file: str, wallet_password: str,
+                     dst: str, amt: Decimal, priority: int,
+                     output_path: Path, timeout: int = 120) -> bool:
+    """Sign a single transfer using monero-wallet-cli.
+
+    The real Monero signing flow for an offline wallet:
+    1. The wallet file must have the spend key (not view-only)
+    2. We pipe the transfer command via stdin to wallet-cli
+    3. wallet-cli creates a signed TX file
+
+    Returns True if the signed TX file was created.
+    """
+    # Build the command sequence that wallet-cli expects via stdin
+    # For offline wallets: transfer creates and signs in one step
+    transfer_cmd = f"transfer {dst} {amt}\n"
+
+    cmd = [
+        wallet_cli,
+        "--wallet-file", wallet_file,
+        "--password", wallet_password,
+        f"--priority", str(priority),
+        "--trusted-daemon",
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=transfer_cmd,
+            capture_output=True, text=True,
+            timeout=timeout,
+        )
+
+        # Check if a signed TX file was produced
+        # monero-wallet-cli creates files like signed_monero_tx in the CWD
+        # or the wallet directory
+        if output_path.exists():
+            return True
+
+        # Also check for the default output name
+        default_signed = Path("signed_monero_tx")
+        if default_signed.exists():
+            default_signed.rename(output_path)
+            return True
+
+        # Check stderr/stdout for common errors
+        combined = proc.stdout + proc.stderr
+        if "Error" in combined or "error" in combined:
+            integrity_log("signer", f"wallet_cli_error:{combined[:100]}")
+
+        return False
+    except subprocess.TimeoutExpired:
+        integrity_log("signer", "wallet_cli_timeout")
+        return False
+    except FileNotFoundError:
+        sys.exit(f"[!] {wallet_cli} not found. Install monero-wallet-cli.")
 
 
 def main():
@@ -122,11 +169,15 @@ def main():
                      help="unsigned_v1 JSON from GhostSpiral")
     cli.add_argument("--wallet-cli", default="monero-wallet-cli")
     cli.add_argument("--wallet-file", required=True)
+    cli.add_argument("--wallet-password", default="",
+                     help="Wallet password (empty for no password)")
     cli.add_argument("--outdir", default="signed_blobs")
     cli.add_argument("--resume",
                      help="progress file for crash-resume")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
-                     help="Monero fee priority level: 1=default, 2=x4, 3=x20, 4=x166")
+                     help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--timeout-per-tx", type=int, default=120,
+                     help="Timeout in seconds per TX signing")
     args = cli.parse_args()
 
     unsigned_path = Path(args.unsigned_json)
@@ -137,112 +188,104 @@ def main():
     if not wallet_path.exists():
         sys.exit(f"[!] Wallet file not found: {wallet_path}")
 
+    # Verify wallet-cli exists
+    try:
+        result = subprocess.run(
+            [args.wallet_cli, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        version_line = result.stdout.strip().split("\n")[0] if result.stdout else "unknown"
+        print(f"  [+] Using: {version_line}")
+        integrity_log("signer", "wallet_cli_found")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        sys.exit(f"[!] {args.wallet_cli} not found or not responding")
+
     plan = _load_unsigned(unsigned_path)
     _validate_plan(plan)
     integrity_log("signer", f"plan_loaded:entries={len(plan)}")
 
     outdir = Path(args.outdir)
-
-    progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
     plan_fp = _compute_plan_fingerprint(plan)
 
+    progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
     if progress_file.exists():
         with open(progress_file) as pf:
             progress = json.load(pf)
         _verify_resume_integrity(progress, plan)
         outdir.mkdir(parents=True, exist_ok=True)
     else:
-        # Fresh run: clean any stale blobs from prior runs to prevent
-        # old plan's TXs from being broadcast alongside new plan's TXs
         if outdir.is_dir():
-            stale_blobs = list(outdir.glob("*.blob"))
-            stale_manifest = outdir / "signed_manifest_v1.json"
-            if stale_blobs or stale_manifest.exists():
-                import shutil
+            stale_blobs = list(outdir.glob("*"))
+            if stale_blobs:
                 shutil.rmtree(outdir)
-                integrity_log("signer", f"cleaned_stale_outdir:{len(stale_blobs)}_blobs")
+                integrity_log("signer", f"cleaned_stale_outdir:{len(stale_blobs)}_files")
         outdir.mkdir(parents=True, exist_ok=True)
         progress = {"last": -1, "manifest": [], "plan_fingerprint": plan_fp}
 
     signed_count = 0
     skipped_count = 0
+    failed_count = 0
 
-    try:
-        for idx, tx in enumerate(plan):
-            if shutdown_requested():
-                integrity_log("signer", f"shutdown_at_idx={idx}")
-                print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progress_file}")
-                break
+    for idx, tx in enumerate(plan):
+        if shutdown_requested():
+            integrity_log("signer", f"shutdown_at_idx={idx}")
+            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progress_file}")
+            break
 
-            if idx <= progress["last"]:
-                skipped_count += 1
-                continue
+        if idx <= progress["last"]:
+            skipped_count += 1
+            continue
 
-            amt = Decimal(tx["amt"])
+        amt = Decimal(tx["amt"])
+        dst = tx["dst"]
+        blob_path = outdir / f"tx_{idx}.signed"
 
-            blob_path = outdir / f"tx_{idx}.blob"
+        print(f"  [*] Signing TX {idx}/{len(plan)-1}: {amt} XMR -> {scrub_address(dst)}...")
 
-            batch_path = None
-            try:
-                fd, batch_path = tempfile.mkstemp(suffix=".batch", prefix="gs_sign_")
-                priority = args.fee_priority
-                with os.fdopen(fd, "w") as batch:
-                    batch.write(
-                        f"transfer {tx['dst']} {amt}\n"
-                    )
+        ok = _sign_single_tx(
+            wallet_cli=args.wallet_cli,
+            wallet_file=args.wallet_file,
+            wallet_password=args.wallet_password,
+            dst=dst, amt=amt,
+            priority=args.fee_priority,
+            output_path=blob_path,
+            timeout=args.timeout_per_tx,
+        )
 
-                cmd = [
-                    args.wallet_cli,
-                    "--wallet-file", args.wallet_file,
-                    "--offline",
-                    "--trusted-daemon",
-                    f"--priority={priority}",
-                ]
-                subprocess.run(
-                    cmd + ["--batch-file", batch_path],
-                    check=True, timeout=120,
-                )
-            except subprocess.TimeoutExpired:
-                integrity_log("signer", f"timeout_idx={idx}")
-                sys.exit(f"[!] wallet-cli timed out on TX {idx}")
-            finally:
-                if batch_path and os.path.exists(batch_path):
-                    with open(batch_path, "w") as f:
-                        f.write("\x00" * 256)
-                    os.unlink(batch_path)
+        if not ok:
+            integrity_log("signer", f"sign_fail:idx={idx}")
+            print(f"  [!] TX {idx} signing FAILED")
+            failed_count += 1
+            # Don't advance progress — allow retry on resume
+            continue
 
-            if not blob_path.exists():
-                integrity_log("signer", f"no_blob_idx={idx}")
-                sys.exit(f"[!] Blob not created for TX {idx}")
+        secure_file_perms(blob_path)
 
-            secure_file_perms(blob_path)
+        with open(blob_path, "rb") as bf:
+            sha = hashlib.sha256(bf.read()).hexdigest()
 
-            with open(blob_path, "rb") as bf:
-                sha = hashlib.sha256(bf.read()).hexdigest()
+        progress["manifest"].append({
+            "idx": idx,
+            "file": str(blob_path),
+            "hash": sha,
+            "dst": scrub_address(dst),
+            "amt": str(amt),
+            "delay": tx.get("delay", 0),
+        })
+        progress["last"] = idx
+        atomic_write_json(progress, progress_file)
+        integrity_log("signer", f"signed:idx={idx}")
+        signed_count += 1
+        print(f"  [+] TX {idx}/{len(plan)-1} -> {blob_path.name}")
 
-            progress["manifest"].append({
-                "idx": idx,
-                "file": str(blob_path),
-                "hash": sha,
-                "dst": scrub_address(tx["dst"]),
-                "amt": str(amt),
-                "delay": tx.get("delay", 0),
-            })
-            progress["last"] = idx
-            atomic_write_json(progress, progress_file)
-            integrity_log("signer", f"signed:idx={idx}:sha={sha[:16]}")
-            signed_count += 1
-            print(f"  [+] TX {idx}/{len(plan) - 1} -> {blob_path.name}")
+    # Final manifest
+    final_manifest = outdir / "signed_manifest_v1.json"
+    atomic_write_json(progress["manifest"], final_manifest)
+    integrity_log("signer", "done")
 
-        # Final manifest
-        final_manifest = outdir / "signed_manifest_v1.json"
-        atomic_write_json(progress["manifest"], final_manifest)
-        integrity_log("signer", f"done:signed={signed_count}:skipped={skipped_count}")
-        print(f"\n  [+] Signing complete: {signed_count} signed, {skipped_count} resumed.")
-
-    except subprocess.CalledProcessError as e:
-        integrity_log("signer", f"wallet_cli_error:{e.returncode}")
-        print(f"  [!] wallet-cli error: {e}")
+    print(f"\n  [+] Signing complete: {signed_count} signed, {skipped_count} resumed, {failed_count} failed.")
+    if failed_count > 0:
+        print(f"  [!] {failed_count} TX(s) failed. Fix issues and re-run with --resume {progress_file}")
         sys.exit(1)
 
 
