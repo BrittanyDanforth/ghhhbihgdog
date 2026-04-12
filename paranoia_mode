@@ -447,9 +447,6 @@ def main():
     print("  [*] Phase 9: Swap/RAM")
     wipe_swap_ram(args.dry_run)
 
-    print("  [*] Phase 10: GhostSpiral artifacts")
-    wipe_gs_artifacts(args.dry_run)
-
     print("  [*] Phase 11: Clipboard")
     wipe_clipboard(args.dry_run)
 
@@ -459,7 +456,13 @@ def main():
     print("  [*] Phase 13: Environment variables")
     scrub_env_vars(args.dry_run)
 
-    integrity_log("paranoia", f"complete:dry={args.dry_run}")
+    # Phase 10 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # integrity_chain.log. Any integrity_log() calls after this point
+    # would recreate the file, leaving forensic evidence.
+    print("  [*] Phase 14: GhostSpiral artifacts (runs last — wipes integrity log)")
+    wipe_gs_artifacts(args.dry_run)
+
+    # DO NOT call integrity_log() here — it would recreate the wiped log file
     print("\n  [+] paranoia_mode complete.")
 
 

@@ -142,7 +142,6 @@ def main():
     integrity_log("signer", f"plan_loaded:entries={len(plan)}")
 
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
 
     progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
     plan_fp = _compute_plan_fingerprint(plan)
@@ -151,7 +150,18 @@ def main():
         with open(progress_file) as pf:
             progress = json.load(pf)
         _verify_resume_integrity(progress, plan)
+        outdir.mkdir(parents=True, exist_ok=True)
     else:
+        # Fresh run: clean any stale blobs from prior runs to prevent
+        # old plan's TXs from being broadcast alongside new plan's TXs
+        if outdir.is_dir():
+            stale_blobs = list(outdir.glob("*.blob"))
+            stale_manifest = outdir / "signed_manifest_v1.json"
+            if stale_blobs or stale_manifest.exists():
+                import shutil
+                shutil.rmtree(outdir)
+                integrity_log("signer", f"cleaned_stale_outdir:{len(stale_blobs)}_blobs")
+        outdir.mkdir(parents=True, exist_ok=True)
         progress = {"last": -1, "manifest": [], "plan_fingerprint": plan_fp}
 
     signed_count = 0
@@ -216,6 +226,7 @@ def main():
                 "hash": sha,
                 "dst": scrub_address(tx["dst"]),
                 "amt": str(amt),
+                "delay": tx.get("delay", 0),
             })
             progress["last"] = idx
             atomic_write_json(progress, progress_file)

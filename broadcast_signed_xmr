@@ -115,22 +115,48 @@ def main():
         ]
     integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
-    # Load the unsigned plan to get per-TX delay values if available.
-    # Use the NEWEST plan (highest timestamp in filename) to match the
-    # most recent signing run.
+    # Load per-TX delays. Primary source: signed manifest (travels with blobs
+    # on USB for air-gap workflow). Fallback: unsigned plan in ./unsigned/.
     tx_delays: dict = {}
-    plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
-    if plan_files:
+    delay_source = "none"
+
+    # Try manifest first (embedded by signer since Round 7)
+    _manifest_for_delays = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
+    if _manifest_for_delays and _manifest_for_delays.exists():
         try:
-            with open(plan_files[0]) as pf:
-                plan_data = json.load(pf)
-            if isinstance(plan_data, dict) and "txs" in plan_data:
-                for i, tx in enumerate(plan_data["txs"]):
-                    if "delay" in tx:
-                        tx_delays[i] = int(tx["delay"])
-                integrity_log("broadcast", f"delays_loaded:plan={plan_files[0].name}")
-        except Exception as e:
-            integrity_log("broadcast", f"delay_load_fail:{str(e)[:40]}")
+            with open(_manifest_for_delays) as mf:
+                _mdata = json.load(mf)
+            for entry in _mdata:
+                if "delay" in entry and "idx" in entry:
+                    tx_delays[int(entry["idx"])] = int(entry["delay"])
+            if tx_delays:
+                delay_source = "manifest"
+        except Exception:
+            pass
+
+    # Fallback: unsigned plan (only works if same machine/directory)
+    if not tx_delays:
+        plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+        if plan_files:
+            try:
+                with open(plan_files[0]) as pf:
+                    plan_data = json.load(pf)
+                if isinstance(plan_data, dict) and "txs" in plan_data:
+                    for i, tx in enumerate(plan_data["txs"]):
+                        if "delay" in tx:
+                            tx_delays[i] = int(tx["delay"])
+                    if tx_delays:
+                        delay_source = "unsigned_plan"
+            except Exception:
+                pass
+
+    if tx_delays:
+        integrity_log("broadcast", f"delays_loaded:{delay_source}")
+        print(f"  [+] TX delays loaded from {delay_source} ({len(tx_delays)} entries)")
+    else:
+        integrity_log("broadcast", "WARNING:no_delays_found")
+        print("  [!] WARNING: No TX delays found - all TXs will broadcast with minimal gap!")
+        print("  [!] This creates a timing cluster visible to chain analysts.")
 
     # Gather blobs
     blobs: List[Path] = []
@@ -183,20 +209,34 @@ def main():
         integrity_log("broadcast", f"manifest_verified:{len(manifest_hashes)}_blobs_ok")
         print(f"  [+] Manifest verification: {len(manifest_hashes)} blobs OK")
 
+    # Compute blob fingerprint to bind progress to this specific set of blobs
+    blob_fp = hashlib.sha256(
+        "|".join(b.name for b in blobs).encode()
+    ).hexdigest()[:32]
+
     # Progress state
     progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
     if progF.exists():
         with open(progF) as f:
             prog = json.load(f)
+        saved_fp = prog.get("blob_fingerprint", "")
+        if saved_fp and saved_fp != blob_fp:
+            integrity_log("broadcast", "STALE_PROGRESS:blob_set_changed")
+            sys.exit(
+                "[!] Broadcast progress is from a DIFFERENT set of blobs!\n"
+                "    Delete the progress file or use the matching blob set.\n"
+                "    Stale progress would silently skip TXs."
+            )
         last_idx = prog.get("last", -1)
     else:
-        prog = {"last": -1, "log": []}
+        prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
         last_idx = -1
 
     import secrets as _secrets
     last_tor_check = time.time()
     success_count = 0
     fail_count = 0
+    skip_count = 0
 
     for idx, blob in enumerate(blobs):
         if shutdown_requested():
@@ -205,6 +245,7 @@ def main():
             break
 
         if idx <= last_idx:
+            skip_count += 1
             continue
 
         # Periodic Tor re-check
@@ -364,8 +405,10 @@ def main():
                                 "error": "exhausted_retries"})
             atomic_write_json(prog, progF)
 
-    integrity_log("broadcast", f"done:success={success_count}:fail={fail_count}")
-    print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed.")
+    integrity_log("broadcast", "done")
+    print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed, {skip_count} resumed.")
+    if skip_count > 0:
+        print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
     print(f"  [+] Progress: {progF}")
 
 
