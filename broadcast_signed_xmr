@@ -28,6 +28,14 @@ from gs_common import (
     secure_hex,
 )
 
+
+def _single_post(url: str, payload: dict, proxies=None) -> dict:
+    """Single-attempt POST without tenacity retry. Used for broadcast
+    submissions where the outer loop handles retries with NEWNYM rotation."""
+    r = requests.post(url, json=payload, timeout=30, proxies=proxies)
+    r.raise_for_status()
+    return r.json()
+
 MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
@@ -248,7 +256,7 @@ def main():
                 # send_raw_transaction is a daemon /sendrawtransaction endpoint,
                 # NOT a JSON-RPC method. It takes {tx_as_hex, do_not_relay}.
                 submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
-                res = safe_post(
+                res = _single_post(
                     submit_url,
                     {"tx_as_hex": raw_hex, "do_not_relay": False},
                     proxy,
@@ -263,8 +271,9 @@ def main():
                         print(f"  [!] TX {idx} accepted but no txid returned - cannot track confirmation")
                         # Still mark as sent since daemon accepted it
 
-                    print(f"  [+] TX {idx} -> mempool | {txid[:16]}...")
-                    integrity_log("broadcast", f"sent:idx={idx}:txid={txid[:16]}")
+                    txid_display = txid[:16] if txid else "no-txid"
+                    print(f"  [+] TX {idx} -> mempool | {txid_display}...")
+                    integrity_log("broadcast", f"sent:idx={idx}")
 
                     # Wait for mining confirmation (only if we have a real txid)
                     check_url = rpc_url.rstrip("/") + "/gettransactions"
@@ -320,6 +329,13 @@ def main():
                     if res.get("double_spend"):
                         integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
                         print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
+                        prog["log"].append({
+                            "idx": idx, "file": str(blob), "sent": False,
+                            "error": "double_spend",
+                        })
+                        prog["last"] = idx
+                        atomic_write_json(prog, progF)
+                        fail_count += 1
                         sent = False
                         break
 
@@ -335,14 +351,12 @@ def main():
                 newnym()
                 secure_delay(5.0, 15.0)
 
-        if sent:
-            # Progress already saved inside the success branch with txid
-            pass
-        else:
+        if not sent and not any(e.get("idx") == idx for e in prog["log"]):
             fail_count += 1
-            print(f"  [!] TX {idx} FAILED - manual action needed")
+            print(f"  [!] TX {idx} FAILED after {args.rebroadcast} attempts - manual action needed")
             prog["last"] = idx
-            prog["log"].append({"idx": idx, "file": str(blob), "sent": False})
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+                                "error": "exhausted_retries"})
             atomic_write_json(prog, progF)
 
     integrity_log("broadcast", f"done:success={success_count}:fail={fail_count}")

@@ -71,8 +71,31 @@ def _load_unsigned(path: Path) -> List[dict]:
     sys.exit("[!] unsigned_v1 has unexpected format (not dict or list)")
 
 
+def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    """Compute a stable fingerprint of the plan content for binding progress to a plan."""
+    h = hashlib.sha256()
+    for tx in plan:
+        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
+    return h.hexdigest()[:32]
+
+
 def _verify_resume_integrity(progress: dict, plan: List[dict]) -> None:
-    """On resume, verify that manifest hashes match expectations."""
+    """On resume, verify that:
+    1. The progress file was created for THIS plan (fingerprint match)
+    2. All previously-signed blob hashes still match (tamper detection)
+    """
+    # Verify plan binding
+    current_fp = _compute_plan_fingerprint(plan)
+    saved_fp = progress.get("plan_fingerprint", "")
+    if saved_fp and saved_fp != current_fp:
+        integrity_log("signer", "PLAN_MISMATCH:progress_from_different_plan")
+        sys.exit(
+            "[!] Progress file is from a DIFFERENT plan!\n"
+            "    Delete the progress file or use the correct unsigned plan.\n"
+            "    Mixing progress files between plans can broadcast wrong TXs."
+        )
+
+    # Verify blob hashes
     manifest = progress.get("manifest", [])
     for entry in manifest:
         blob_path = Path(entry["file"])
@@ -82,7 +105,10 @@ def _verify_resume_integrity(progress: dict, plan: List[dict]) -> None:
             if actual_hash != entry.get("hash"):
                 integrity_log("signer", f"TAMPER_DETECTED:idx={entry['idx']}")
                 sys.exit(f"[!] Blob tampered: {blob_path} hash mismatch on resume!")
-    integrity_log("signer", f"resume_integrity_ok:last={progress.get('last', -1)}")
+        else:
+            integrity_log("signer", f"missing_blob_on_resume:idx={entry['idx']}")
+            sys.exit(f"[!] Previously signed blob missing: {blob_path}")
+    integrity_log("signer", f"resume_ok:last={progress.get('last', -1)}")
 
 
 def main():
@@ -119,12 +145,14 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
+    plan_fp = _compute_plan_fingerprint(plan)
+
     if progress_file.exists():
         with open(progress_file) as pf:
             progress = json.load(pf)
         _verify_resume_integrity(progress, plan)
     else:
-        progress = {"last": -1, "manifest": []}
+        progress = {"last": -1, "manifest": [], "plan_fingerprint": plan_fp}
 
     signed_count = 0
     skipped_count = 0
