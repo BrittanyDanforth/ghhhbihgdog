@@ -149,8 +149,17 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
 #  NEWNYM (Tor circuit rotation)
 # ---------------------------------------------------------------------------
 
-def newnym(ctrl: str = "/var/run/tor/control") -> bool:
-    """Request new Tor circuit. Returns True on success."""
+_NEWNYM_CONSECUTIVE_FAILURES = 0
+_NEWNYM_MAX_FAILURES = 3
+
+
+def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
+    """Request new Tor circuit. Aborts after consecutive failures if required.
+
+    If NEWNYM fails _NEWNYM_MAX_FAILURES times in a row and required=True,
+    the process aborts to prevent all operations going over one circuit.
+    """
+    global _NEWNYM_CONSECUTIVE_FAILURES
     try:
         from stem import Signal as StemSignal
         from stem.control import Controller
@@ -158,9 +167,18 @@ def newnym(ctrl: str = "/var/run/tor/control") -> bool:
             c.authenticate()
             c.signal(StemSignal.NEWNYM)
         time.sleep(5)
+        _NEWNYM_CONSECUTIVE_FAILURES = 0
         return True
     except Exception as e:
-        integrity_log("tor", f"NEWNYM_fail:{str(e)[:60]}")
+        _NEWNYM_CONSECUTIVE_FAILURES += 1
+        integrity_log("tor", f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(e)[:40]}")
+        if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
+            msg = (f"[!] NEWNYM failed {_NEWNYM_MAX_FAILURES} consecutive times. "
+                   f"Tor circuit rotation is NOT working.")
+            if required:
+                sys.exit(msg + " Aborting for OPSEC safety.")
+            else:
+                print(f"  {msg}")
         return False
 
 # ---------------------------------------------------------------------------
@@ -184,14 +202,41 @@ def safe_post(url: str, payload: dict, proxies: Optional[Dict] = None) -> dict:
 #  RPC connection (monero-wallet-rpc)
 # ---------------------------------------------------------------------------
 
-def connect_rpc(url: str):
+class MoneroRPC:
+    """Wrapper around monero-python that exposes both high-level Wallet
+    methods and raw JSON-RPC calls via the backend."""
+
+    def __init__(self, url: str):
+        from monero.wallet import Wallet as XMRWallet
+        from monero.backends.jsonrpc import JSONRPCWallet
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 18083
+        self._backend = JSONRPCWallet(host=host, port=port)
+        self._wallet = XMRWallet(self._backend)
+
+    @property
+    def accounts(self):
+        return self._wallet.accounts
+
+    def new_account(self, **kwargs):
+        return self._wallet.new_account(**kwargs)
+
+    def raw_request(self, method: str, params: dict) -> dict:
+        """Send a raw JSON-RPC request to monero-wallet-rpc."""
+        return self._backend.raw_request(method, params)
+
+    def new_subaddress(self, account_index: int = 0, label: str = "") -> str:
+        """Create a new subaddress and return its string address.
+        Uses monero-python's Account.new_address() which returns (Address, index)."""
+        acct = self._wallet.accounts[account_index]
+        addr, _idx = acct.new_address(label=label)
+        return str(addr)
+
+
+def connect_rpc(url: str) -> MoneroRPC:
     """Connect to monero-wallet-rpc extracting host and port from URL."""
-    from monero.wallet import Wallet as XMRWallet
-    from monero.backends.jsonrpc import JSONRPCWallet
-    parsed = urlparse(url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 18083
-    return XMRWallet(JSONRPCWallet(host=host, port=port))
+    return MoneroRPC(url)
 
 # ---------------------------------------------------------------------------
 #  Resource sentinel

@@ -243,14 +243,14 @@ def main():
     newnym()
     tor_recheck(proxy, "stage3_pre")
 
-    def create_subs(wallet, n: int, decoys: int) -> List[str]:
+    def create_subs(rpc, n: int, decoys: int) -> List[str]:
         subs = []
         for i in range(n):
-            addr = wallet.accounts[0].new_subaddress(label=f"Mix_{i}")
-            subs.append(str(addr))
+            addr = rpc.new_subaddress(account_index=0, label=f"Mix_{i}")
+            subs.append(addr)
         for d in range(decoys):
-            addr = wallet.accounts[0].new_subaddress(label=f"Decoy_{d}")
-            subs.append(str(addr))
+            addr = rpc.new_subaddress(account_index=0, label=f"Decoy_{d}")
+            subs.append(addr)
         return subs
 
     subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS)
@@ -334,9 +334,18 @@ def main():
 
     bal = unlocked_bal
     if bal <= DUST_XMR:
-        print("[!] Balance too low or zero - using mock balance for dry demo")
-        bal = Decimal("10.0")
-        integrity_log("stage4", "using_mock_balance")
+        if args.cold or args.airgap:
+            print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
+            print("[!] DO NOT sign/broadcast this plan without real funds!")
+            bal = Decimal("10.0")
+            integrity_log("stage4", "mock_balance:dry_run_only")
+        else:
+            sys.exit(
+                f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
+                f"    Cannot create a real TX plan without funds.\n"
+                f"    Total balance: {total_bal} XMR (may be locked/unconfirmed).\n"
+                f"    Use --cold or --airgap for dry-run planning."
+            )
 
     rounds = args.wallets * 2 * args.deep
     per_round_fee = fee_xmr * Decimal("2")
@@ -405,6 +414,20 @@ def main():
     ###########################################################################
     newnym()
     tor_recheck(proxy, "stage5_pre")
+
+    # Clean stale progress files from prior runs to prevent poisoning
+    for stale in ["signer_progress.json", "broadcast_progress.json"]:
+        stale_path = Path(stale)
+        if stale_path.exists():
+            stale_path.unlink()
+            integrity_log("stage5", f"cleaned_stale:{stale}")
+
+    # Clean old signed blobs directory
+    signed_dir = Path("signed_blobs")
+    if signed_dir.is_dir():
+        import shutil
+        shutil.rmtree(signed_dir)
+        integrity_log("stage5", "cleaned_old_signed_blobs")
 
     try:
         print("  [*] Stage 5a: Signing...")

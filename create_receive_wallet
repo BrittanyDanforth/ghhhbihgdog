@@ -57,11 +57,9 @@ def main():
         integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
-    acct = (wallet_rpc.accounts[0]
-            if wallet_rpc.accounts
-            else wallet_rpc.new_account(label="GhostSpiral"))
-    subaddr = acct.new_subaddress(label=args.label)
-    addr_str = str(subaddr)
+    if not wallet_rpc.accounts:
+        wallet_rpc.new_account(label="GhostSpiral")
+    addr_str = wallet_rpc.new_subaddress(account_index=0, label=args.label)
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 

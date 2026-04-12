@@ -102,20 +102,22 @@ def main():
         ]
     integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
-    # Load the unsigned plan to get per-TX delay values if available
+    # Load the unsigned plan to get per-TX delay values if available.
+    # Use the NEWEST plan (highest timestamp in filename) to match the
+    # most recent signing run.
     tx_delays: dict = {}
-    unsigned_plan_path = Path("unsigned").glob("unsigned_*.json")
-    for plan_file in sorted(Path(".").glob("unsigned/unsigned_*.json")):
+    plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+    if plan_files:
         try:
-            with open(plan_file) as pf:
+            with open(plan_files[0]) as pf:
                 plan_data = json.load(pf)
             if isinstance(plan_data, dict) and "txs" in plan_data:
                 for i, tx in enumerate(plan_data["txs"]):
                     if "delay" in tx:
                         tx_delays[i] = int(tx["delay"])
-        except Exception:
-            pass
-        break  # only read the most recent plan
+                integrity_log("broadcast", f"delays_loaded:plan={plan_files[0].name}")
+        except Exception as e:
+            integrity_log("broadcast", f"delay_load_fail:{str(e)[:40]}")
 
     # Gather blobs
     blobs: List[Path] = []
@@ -130,7 +132,16 @@ def main():
             for e in entries
         ]
     elif input_path.is_dir():
-        blobs = sorted(input_path.glob("*.blob"))
+        raw_blobs = list(input_path.glob("*.blob"))
+        def _blob_sort_key(p: Path) -> int:
+            """Extract numeric index from tx_N.blob for correct numeric sort."""
+            stem = p.stem  # e.g. "tx_15"
+            parts = stem.split("_")
+            try:
+                return int(parts[-1])
+            except (ValueError, IndexError):
+                return 999999
+        blobs = sorted(raw_blobs, key=_blob_sort_key)
     elif input_path.exists():
         blobs = [input_path]
 
@@ -224,7 +235,7 @@ def main():
                     chunk = min(30, planned_delay - waited)
                     time.sleep(chunk)
                     waited += chunk
-            newnym()
+            newnym(required=True)
             secure_delay(5.0, 15.0)
 
         attempts = args.rebroadcast
@@ -246,21 +257,21 @@ def main():
                 status = res.get("status", "")
                 is_double = res.get("double_spend", False)
                 if status == "OK" and not is_double:
-                    txid = res.get("tx_hash", "unknown")
-                    if txid == "unknown":
-                        # Some daemons return tx hash differently
-                        txid = hashlib.sha256(raw_hex.encode()).hexdigest()[:64]
-                        integrity_log("broadcast", f"computed_txid:idx={idx}")
+                    txid = res.get("tx_hash", "")
+                    if not txid:
+                        integrity_log("broadcast", f"no_txid:idx={idx}")
+                        print(f"  [!] TX {idx} accepted but no txid returned - cannot track confirmation")
+                        # Still mark as sent since daemon accepted it
 
                     print(f"  [+] TX {idx} -> mempool | {txid[:16]}...")
                     integrity_log("broadcast", f"sent:idx={idx}:txid={txid[:16]}")
 
-                    # Wait for mining confirmation
+                    # Wait for mining confirmation (only if we have a real txid)
                     check_url = rpc_url.rstrip("/") + "/gettransactions"
                     mine_start = time.time()
                     confirmed = False
                     block_height = 0
-                    while (time.time() - mine_start) < args.mine_wait:
+                    while txid and (time.time() - mine_start) < args.mine_wait:
                         if shutdown_requested():
                             break
                         try:

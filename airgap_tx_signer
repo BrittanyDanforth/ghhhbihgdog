@@ -99,8 +99,8 @@ def main():
     cli.add_argument("--outdir", default="signed_blobs")
     cli.add_argument("--resume",
                      help="progress file for crash-resume")
-    cli.add_argument("--bump", type=float,
-                     help="fee bump percentage (e.g. --bump 15 for +15%%)")
+    cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
+                     help="Monero fee priority level: 1=default, 2=x4, 3=x20, 4=x166")
     args = cli.parse_args()
 
     unsigned_path = Path(args.unsigned_json)
@@ -141,23 +141,27 @@ def main():
                 continue
 
             amt = Decimal(tx["amt"])
-            if args.bump:
-                amt *= Decimal(1) + Decimal(args.bump) / Decimal(100)
 
             blob_path = outdir / f"tx_{idx}.blob"
 
             batch_path = None
             try:
                 fd, batch_path = tempfile.mkstemp(suffix=".batch", prefix="gs_sign_")
+                priority = args.fee_priority
                 with os.fdopen(fd, "w") as batch:
                     batch.write(
-                        f"transfer {tx['dst']} {amt} 0 "
-                        f"'{tx['extra']}' filename {blob_path}\n"
+                        f"transfer {tx['dst']} {amt}\n"
                     )
 
+                cmd = [
+                    args.wallet_cli,
+                    "--wallet-file", args.wallet_file,
+                    "--offline",
+                    "--trusted-daemon",
+                    f"--priority={priority}",
+                ]
                 subprocess.run(
-                    [args.wallet_cli, "--wallet-file", args.wallet_file,
-                     "--offline", "--batch-file", batch_path],
+                    cmd + ["--batch-file", batch_path],
                     check=True, timeout=120,
                 )
             except subprocess.TimeoutExpired:
