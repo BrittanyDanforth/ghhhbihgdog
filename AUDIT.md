@@ -1185,7 +1185,7 @@ The delay loading code referenced `input_path` on line 124 but `input_path` was 
 9. **Exit strategy** simulation for Bisq/Haveno off-ramp
 10. **Paranoia cleanup** — wipe all artifacts, histories, caches
 
-### Traceability:
+### Traceability (Sender Scenario):
 | Layer | Risk | Why |
 |-------|------|-----|
 | BTC -> ThorChain | MEDIUM | BTC is transparent; ThorChain observers see swap |
@@ -1194,3 +1194,199 @@ The delay loading code referenced `input_path` on line 124 but `input_path` was 
 | Network observer | LOW | All through Tor with socks5h DNS, NEWNYM per TX |
 | Host forensics | LOW | 14-phase paranoia wipe |
 | Operator error | MEDIUM | Manual BTC send is weakest link |
+
+---
+
+## Section 13: Receiver Scenario — Someone Sends YOU BTC
+
+**Scenario:** You are the RECEIVER. Someone else sends BTC on your behalf. You just provide a deposit address. The BTC->ThorChain leg is NOT your OPSEC problem.
+
+### Steps:
+1. **Setup:** Tor, monero-wallet-rpc on localhost, offline wallet pair
+2. **Create receive wallet:** `python3 create_receive_wallet --tor-proxy socks5h://127.0.0.1:9050`
+3. **Get ThorChain deposit address:** `python3 thor_swap_preparer --amounts 0.08 --dests <YOUR_XMR_ENTRY> --tor-proxy ...`
+4. **Give deposit address + memo to the sender** (over secure channel)
+5. **Sender sends BTC** — this is their risk, not yours
+6. **Wait for XMR to arrive** at your entry address (~20-40 min)
+7. **Run GhostSpiral in RECEIVER mode:** `python3 GhostSpiral --receive-wallet wallet_xxx.json --tor-proxy ... --cold`
+8. **Sign on air-gapped machine** -> **broadcast** -> **paranoia cleanup**
+
+### Traceability (Receiver Scenario):
+| Layer | Risk | Why |
+|-------|------|-----|
+| BTC -> ThorChain | NOT YOUR RISK | Sender's BTC, sender's problem |
+| ThorChain -> XMR | LOW | Decentralized swap; you just receive |
+| XMR receipt to entry addr | LOW | Monero natively private, one-time subaddress |
+| XMR mixing (40 hops) | VERY LOW | Ring sigs + 14 subaddrs + 3-12 min random delays |
+| Network observer | LOW | All through Tor, socks5h DNS, NEWNYM per TX |
+| Host forensics | LOW | 14-phase paranoia wipe (including renamethis1) |
+| Address linkage | LOW | Entry subaddress used once, then funds fanned out |
+| Timing correlation | LOW | Fan-out + DAG mixing with 180-720s random delays |
+
+### Key Difference: Receiver vs Sender
+The receiver's attack surface is much smaller. The sender has the hard
+part (BTC is transparent, exchange KYC trails lead to them). The receiver:
+- Never touches BTC directly
+- Receives XMR on a fresh one-time subaddress
+- Immediately mixes into 14+ subaddresses via the DAG
+- All network activity is through Tor
+- The only link between sender and receiver is the ThorChain deposit
+  address, which the receiver generates via Tor
+
+---
+
+## Section 14: Deep Wiring Fixes (Round 10)
+
+### BUG 23 (FIXED): Stage 5 only called --phase create, never --phase sign
+
+**File:** GhostSpiral Stage 5
+**What was wrong:** Auto-mode called `airgap_tx_signer --phase create` which creates
+unsigned TXs via wallet-rpc, but NEVER called `--phase sign` to actually sign them.
+The broadcaster was then pointed at `tx_staging/signed/` which didn't exist.
+**Impact:** CRITICAL — auto-mode pipeline produces unsigned TXs that can never be broadcast.
+The entire auto-mode is broken. Every operator using auto-mode gets a crash at broadcast.
+**Fix:** Stage 5 now has 4 phases:
+- 5a: Create unsigned TXs (`--phase create`)
+- 5b: Sign TXs (`--phase sign` with wallet file)
+- 5c: Broadcast signed TXs
+- 5d: Exit strategy simulation
+
+Also added `--wallet-file` and `--wallet-password` CLI args to GhostSpiral,
+and verification that unsigned/signed TX files actually exist before proceeding.
+
+### BUG 24 (FIXED): --split flag was dead code (never produced BTC chunks)
+
+**File:** GhostSpiral Stage 2
+**What was wrong:** `--split 5` parsed the number but `btc_chunks` was always set to `[]`
+because the code said "generating N deposits" but never created any. The `stage2_get_swap_quotes()`
+function was only called when `btc_chunks` was non-empty, which only happened with JoinMarket UTXOs.
+**Impact:** CRITICAL — operator thinks BTC is split into 5 ThorChain swaps for better mixing.
+Actually gets zero deposits. False sense of security.
+**Fix:** Added `--btc-amount` parameter. When provided with `--split N`, creates N equal chunks
+and calls `stage2_get_swap_quotes()` which generates real deposit addresses + memos.
+Also prints a copy-paste-ready SENDER INSTRUCTIONS block.
+
+### BUG 20 (FIXED): Broadcaster silently broadcast unmanifested blobs
+
+**File:** broadcast_signed_xmr
+**What was wrong:** Blobs not in the manifest silently passed through hash verification
+(the check was `if blob.name in manifest_hashes` — if not in manifest, no check at all).
+Stale blobs from prior runs with wrong destinations would be broadcast to wrong addresses.
+**Impact:** CRITICAL — money sent to wrong addresses silently.
+**Fix:** After manifest verification, blobs are filtered to ONLY those present in the manifest.
+Rejected blobs are logged and reported to operator.
+
+### BUG 18 (FIXED): Manifest-as-path mode failed cross-machine
+
+**File:** broadcast_signed_xmr
+**What was wrong:** When loading from a manifest JSON, blob paths like
+`/media/usb/signed/tx_0.signed` from the air-gap machine don't exist on the online machine.
+**Impact:** All blobs reported as "missing" and skipped. Zero TXs broadcast.
+**Fix:** When a blob path doesn't exist, try resolving by filename in the manifest's parent
+directory. Covers cross-machine USB workflows.
+
+### BUG 25 (FIXED): Fee oracle used fabricated API fields
+
+**File:** GhostSpiral fetch_fee()
+**What was wrong:** `moneroblocks.info/api/get_stats` doesn't return `fee_per_kb_median`.
+`xmrchain.net/api/emission` doesn't return `fee_per_byte`. Both calls always failed,
+silently falling back to a hardcoded value. The fee oracle was pure theater.
+**Impact:** Medium — fallback value (0.00005 XMR) is roughly correct, but operator
+thinks they have real-time fee data. If fees spike, TXs would be rejected.
+**Fix:** Replaced with `get_fee_estimate` RPC call to monero-wallet-rpc, which is
+the only reliable source. The RPC knows the actual mempool fee requirements.
+Uses typical TX weight (2000 bytes) to estimate per-TX cost.
+
+### BUG 26 (FIXED): exit_strategy_simulator crashed on CoinGecko failure
+
+**File:** exit_strategy_simulator
+**What was wrong:** `fetch_prices()` had no fallback. CoinGecko rate-limits Tor exit
+nodes aggressively. One failed call = script crash = no exit plan.
+**Impact:** High — exit strategy is the last step; a crash here wastes the entire
+pipeline run and forces the operator to retry.
+**Fix:** Added Bisq price oracle fallback (`price.bisq.wiz.biz/getAllMarketPrices`).
+If both fail, exits with a clear error instead of an unhandled exception.
+Price source is recorded in the output JSON.
+
+### BUG 27 (FIXED): Liquidity probes used invented API endpoints
+
+**File:** exit_strategy_simulator
+**What was wrong:** `bisq.markets/api/markets` and `haveno.network/api/markets` are not
+real APIs. Bisq is a P2P DEX with no centralized market data. Both calls always failed
+silently and returned `Decimal(0)`.
+**Impact:** Medium — "Liquidity depth validation" advertised in docstring was theater.
+**Fix:** Replaced with heuristic guidance based on method and amount. P2P DEXs don't
+have queryable order books — the honest answer is to guide the operator based on
+typical volume ranges.
+
+### BUG 16 (FIXED): Old unsigned plans never cleaned in auto-mode
+
+**File:** GhostSpiral Stage 5
+**What was wrong:** Stage 5 cleaned progress files and signed blobs, but NOT
+`unsigned/*.json` files. Over multiple runs, destination addresses from every plan
+accumulated on disk — a forensic goldmine.
+**Fix:** Stage 5 now cleans old unsigned plans, old tx_staging dir, and old signed_blobs.
+
+### Other fixes in this round:
+- **Lock file cleanup:** Wrapped Stage 5 in try/finally so `.ghostspiral.lock` is
+  always cleaned, even on error. Previously, a crash would leave the lock file,
+  preventing all future runs until manually deleted.
+- **paranoia dns_check in --dry-run:** DNS resolution now skipped in dry-run mode
+  to avoid leaking a real DNS query when the operator expects no network activity.
+- **renamethis1 in paranoia wipe:** Added to file patterns so paranoia_mode will
+  securely delete this forensic hazard file.
+- **Broadcaster --wallet-file removed:** Dead arg (Monero has no RBF). Cleaned up
+  help text to reference .signed files instead of .blob.
+- **Stale RBF comment removed:** Floating comment block between constants and main()
+  was invalid Python (indented at module scope). Removed.
+
+---
+
+## Section 15: Complete Bug Status Table
+
+| Bug | Description | Severity | Fixed? | Fix Location |
+|-----|-------------|----------|--------|--------------|
+| BUG 1 | Junk text before shebang | FATAL | YES | Round 1 |
+| BUG 2 | Spending locked/unconfirmed balance | HIGH | YES | Round 3 |
+| BUG 3 | Rounding dust loss | MEDIUM | YES | Round 3 |
+| BUG 4 | DAG operator precedence | MEDIUM | YES | Round 3 |
+| BUG 5 | Wrong broadcast endpoint | CRITICAL | YES | Round 3 |
+| BUG 6 | Double-spend detection missing | HIGH | YES | Round 3 |
+| BUG 7 | Progress log duplicate entries | MEDIUM | YES | Round 3 |
+| BUG 8 | Tor exit IP logged | HIGH | YES | Round 3 |
+| BUG 9 | BTC address logged | HIGH | YES | Round 3 |
+| BUG 10 | XMR balance logged | HIGH | YES | Round 3 |
+| BUG 11 | integrity_chain.log survives paranoia | HIGH | YES | Round 3 |
+| BUG 12 | --split flag accepted but unused | CRITICAL | YES | Round 10 |
+| BUG 13 | Stale progress in airgap/cold mode | MEDIUM | YES | Round 4 |
+| BUG 14 | Unsigned file name collision | LOW | YES | Round 4 |
+| BUG 15 | Fee estimation 2x over-budget | MEDIUM | YES | Round 4 |
+| BUG 16 | Old unsigned plans not cleaned | MEDIUM | YES | Round 10 |
+| BUG 17 | Broadcaster delays lost in airgap | CRITICAL | YES | Round 7 (manifest embeds delays) |
+| BUG 18 | Manifest paths fail cross-machine | MEDIUM | YES | Round 10 |
+| BUG 19 | Signer doesn't clean output dir | CRITICAL | YES | Round 7 |
+| BUG 20 | Broadcaster broadcasts unmanifested blobs | CRITICAL | YES | Round 10 |
+| BUG 21 | Broadcaster progress no fingerprint | CRITICAL | YES | Round 7 |
+| BUG 22 | Broadcaster no skip count | HIGH | YES | Round 7 |
+| BUG 23 | Stage 5 only creates, never signs | CRITICAL | YES | Round 10 |
+| BUG 24 | --split flag dead code | CRITICAL | YES | Round 10 |
+| BUG 25 | Fee oracle fake API fields | MEDIUM | YES | Round 10 |
+| BUG 26 | exit_sim crashes on CoinGecko fail | HIGH | YES | Round 10 |
+| BUG 27 | Liquidity URLs are invented | MEDIUM | YES | Round 10 |
+| D1 | socks5:// DNS leak | CRITICAL | YES | Round 5 |
+| D2 | safe_get/safe_post accept None proxy | HIGH | YES | Round 5 |
+| D3 | Four scripts had optional --tor-proxy | CRITICAL | YES | Round 5 |
+| D4 | JoinMarket missing Tor proxy | CRITICAL | YES | Round 5 |
+| D5 | MoneroRPC no proxy support | HIGH | YES | Round 5 |
+| D6 | Exact timestamps in integrity log | MEDIUM | YES | Round 5 |
+| D7 | Exact timestamps in output files | MEDIUM | YES | Round 5 |
+| D8 | dns_check resolves Tor domain | HIGH | YES | Round 5 |
+| D9 | paranoia missing clipboard/XDG/env | MEDIUM | YES | Round 5 |
+
+### Remaining Known Issues (not bugs, design limitations):
+| Item | Status | Notes |
+|------|--------|-------|
+| JoinMarket UTXO parsing | STUB | Returns empty; needs JM output format spec |
+| /proc/PID/cmdline exposure | KNOWN | Can't fix from userspace; consider env vars |
+| renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
+| CoinGecko rate limiting via Tor | KNOWN | Bisq fallback added; may still fail |

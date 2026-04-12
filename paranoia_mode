@@ -242,10 +242,13 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     file_patterns = [
         "unsigned_*.json", "signer_progress.json",
         "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
-        "thor_pairs_*.json.gpg", "exitplan_*.json", "integrity_chain.log",
-        "integrity.log", "*.blob", "*.signed", "*.unsigned",
+        "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+        "exitplan_*.json", "exitplan_v1.json",
+        "integrity_chain.log", "integrity.log",
+        "*.blob", "*.signed", "*.unsigned",
         "signed_manifest_v1.json", "unsigned_manifest.json",
         ".ghostspiral.lock",
+        "renamethis1",
     ]
     dir_patterns = [
         "signed_blobs", "unsigned", "tx_staging",
@@ -428,7 +431,10 @@ def main():
     spoof_mac(args.iface, args.dry_run)
 
     print("  [*] Phase 2: DNS check")
-    dns_check()
+    if args.dry_run:
+        print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
+    else:
+        dns_check()
 
     print("  [*] Phase 3: DNS cache flush")
     flush_dns_cache(args.dry_run)
