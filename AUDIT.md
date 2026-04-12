@@ -1382,6 +1382,47 @@ accumulated on disk — a forensic goldmine.
 | D7 | Exact timestamps in output files | MEDIUM | YES | Round 5 |
 | D8 | dns_check resolves Tor domain | HIGH | YES | Round 5 |
 | D9 | paranoia missing clipboard/XDG/env | MEDIUM | YES | Round 5 |
+| BUG 28 | Stage 5 cleanup deletes current plan | CRITICAL | YES | Round 10c |
+| BUG 29 | Signer hardcodes account_index=0 | CRITICAL | YES | Round 10b |
+| BUG 30 | Broadcaster default RPC is fake | HIGH | YES | Round 10b |
+| BUG 31 | Mock plans not guarded from signing | MEDIUM | YES | Round 10b |
+
+### BUG 28 (FIXED): Stage 5 cleanup deleted the CURRENT unsigned plan
+
+**File:** GhostSpiral Stage 5 cleanup
+**What was wrong:** Before calling `_stage5_run`, the cleanup code deleted ALL
+`unsigned_*.json` files in the output directory — including the one Stage 4 just
+created. When the signer subprocess tried to open `ufile`, it was gone.
+**Impact:** CRITICAL — auto-mode crashes at Stage 5a: "File not found" on the plan
+that was just written 2 seconds earlier. The entire auto pipeline is broken.
+**Fix:** Cleanup now skips the current plan file (`ufile.name`).
+
+### BUG 29 (FIXED): airgap_tx_signer account_index was hardcoded to 0
+
+**File:** airgap_tx_signer phase_create
+**What was wrong:** `transfer_split` always passed `"account_index": 0` regardless
+of the receive wallet's actual account. In receiver mode with a non-zero account,
+the signer would try to spend from the wrong (empty) account.
+**Impact:** CRITICAL — all TXs fail or spend from wrong funds.
+**Fix:** GhostSpiral embeds `account_index` in the plan metadata; signer reads it.
+
+### BUG 30 (FIXED): Broadcaster default RPC was fake placeholder
+
+**File:** broadcast_signed_xmr
+**What was wrong:** Default `--rpc` was `http://node.onion:18089` — a non-existent
+hostname. Every run without `--rpc` would fail at the first broadcast attempt.
+**Impact:** HIGH — operator has to figure out the correct RPC themselves.
+**Fix:** Changed to `http://127.0.0.1:18081` (standard monerod daemon port).
+Added clear help text distinguishing daemon RPC from wallet-rpc.
+
+### BUG 31 (FIXED): Mock plans could be accidentally signed
+
+**File:** GhostSpiral + airgap_tx_signer
+**What was wrong:** When `--cold` or `--airgap` is used with zero balance, a mock
+plan is created with fake 10 XMR. Nothing prevented the operator from running
+the signer on this plan and attempting to broadcast, causing confusing failures.
+**Impact:** MEDIUM — wasted time and confusing errors.
+**Fix:** Mock plans now have `meta.mock = true`. Signer refuses to process them.
 
 ### Remaining Known Issues (not bugs, design limitations):
 | Item | Status | Notes |
