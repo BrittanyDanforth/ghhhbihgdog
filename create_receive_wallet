@@ -60,7 +60,9 @@ def main():
 
     if not wallet_rpc.accounts:
         wallet_rpc.new_account(label="GhostSpiral")
-    addr_str = wallet_rpc.new_subaddress(account_index=0, label=args.label)
+    addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
+        account_index=0, label=args.label,
+    )
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
@@ -69,7 +71,9 @@ def main():
         "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         "address": addr_str,
         "account_index": 0,
+        "subaddress_index": sub_idx,
         "label": args.label,
+        "rpc_endpoint": args.rpc,
     }
 
     outdir = Path(args.output_dir)
@@ -78,7 +82,9 @@ def main():
     atomic_write_json(out, fname)
 
     print(f"  [+] Wallet saved -> {fname}")
-    print(f"  [+] Address: {scrub_address(addr_str)}")
+    print(f"  [+] Address (full): {addr_str}")
+    print(f"  [+] Subaddress index: {sub_idx} (account 0)")
+    print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
 
     integrity_log("wallet", f"saved:{fname.name}")
 
@@ -86,6 +92,19 @@ def main():
         newnym()
 
     print(f"  [+] Integrity chain updated.")
+    print()
+    print(f"  === RECEIVER FLOW: NEXT STEPS ===")
+    print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
+    print(f"       python3 thor_swap_preparer \\")
+    print(f"         --amounts <BTC_AMOUNT> \\")
+    print(f"         --dests {addr_str} \\")
+    print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print(f"  2. Give the BTC deposit address + memo to the sender")
+    print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")
+    print(f"  4. Run GhostSpiral in receive mode:")
+    print(f"       python3 GhostSpiral \\")
+    print(f"         --receive-wallet {fname} \\")
+    print(f"         --tor-proxy <SOCKS5H_PROXY>")
 
 
 if __name__ == "__main__":

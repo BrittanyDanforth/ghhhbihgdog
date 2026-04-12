@@ -181,6 +181,26 @@ def main():
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
     print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
 
+    print()
+    print("  ============================================================")
+    print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
+    print("  ============================================================")
+    for i, pair in enumerate(pairs):
+        print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
+        print(f"  Send exactly: {pair['btc_in']} BTC")
+        print(f"  To address:   {pair['deposit']}")
+        if pair.get("memo"):
+            print(f"  With memo:    {pair['memo']}")
+        else:
+            print(f"  Memo:         (none required)")
+        print(f"  Expected XMR: ~{pair['expected_xmr']}")
+    print()
+    print("  ============================================================")
+    print("  IMPORTANT: The sender must include the memo in the BTC")
+    print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
+    print("  route the swap. Quotes expire — send promptly.")
+    print("  ============================================================")
+
     if args.gpg_recipient:
         try:
             import gnupg

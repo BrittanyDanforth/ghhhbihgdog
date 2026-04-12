@@ -80,8 +80,14 @@ def main():
         "GhostSpiral v10.5",
         description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
     )
-    cli.add_argument("--btc-entry", required=True,
-                     help="BTC entry address (bech32)")
+
+    mode_group = cli.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--btc-entry",
+                            help="BTC entry address (bech32) — SENDER mode: you own the BTC")
+    mode_group.add_argument("--receive-wallet",
+                            help="gs_receive_wallet_v1 JSON from create_receive_wallet — "
+                                 "RECEIVER mode: XMR already arrived on this address")
+
     cli.add_argument("--tor-proxy", required=True,
                      help="SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050)")
     cli.add_argument("--joinmarket", action="store_true",
@@ -106,15 +112,37 @@ def main():
                      help="JoinMarket wallet file for tumbles")
     args = cli.parse_args()
 
+    # ---- Determine mode ----
+    receive_mode = bool(args.receive_wallet)
+    receive_entry_addr = None
+    receive_account_index = 0
+
+    if receive_mode:
+        rw_path = Path(args.receive_wallet)
+        if not rw_path.exists():
+            sys.exit(f"[!] Receive wallet file not found: {rw_path}")
+        with open(rw_path) as f:
+            rw_data = json.load(f)
+        if rw_data.get("schema") != "gs_receive_wallet_v1":
+            sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
+        receive_entry_addr = rw_data.get("address")
+        receive_account_index = rw_data.get("account_index", 0)
+        if not receive_entry_addr:
+            sys.exit("[!] Receive wallet JSON missing 'address' field")
+        integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
+        print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
+        if args.joinmarket:
+            sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
+    else:
+        if not BTC_RE.match(args.btc_entry):
+            sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
+        integrity_log("stage0", "btc_entry_validated")
+
     # ---- Validate inputs early ----
     args.wallets = max(args.wallets, MIN_WALLETS)
     args.deep = max(args.deep, MIN_DEEP)
 
     proxy = validate_proxy(args.tor_proxy)
-
-    if not BTC_RE.match(args.btc_entry):
-        sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
-    integrity_log("stage0", "btc_entry_validated")
 
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
@@ -185,7 +213,11 @@ def main():
             integrity_log("stage1", f"JM_fail:{e.returncode}")
             sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
 
-    jm_utxos = stage1_joinmarket(args.btc_entry)
+    if receive_mode:
+        jm_utxos = []
+        integrity_log("stage1", "skipped:receive_mode")
+    else:
+        jm_utxos = stage1_joinmarket(args.btc_entry)
     integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
 
     ###########################################################################
@@ -286,22 +318,32 @@ def main():
     newnym()
     tor_recheck(proxy, "stage3_pre")
 
-    def create_subs(rpc, n: int, decoys: int) -> List[str]:
+    sub_account = receive_account_index if receive_mode else 0
+
+    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> List[str]:
         subs = []
         for i in range(n):
-            addr = rpc.new_subaddress(account_index=0, label=f"Mix_{i}")
+            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Mix_{i}")
             subs.append(addr)
         for d in range(decoys):
-            addr = rpc.new_subaddress(account_index=0, label=f"Decoy_{d}")
+            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Decoy_{d}")
             subs.append(addr)
         return subs
 
-    subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS)
+    subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
     if len(subs) < MIN_WALLETS + 1:
         sys.exit("[!] Failed to create enough subaddresses")
 
-    ENTRY = subs[0]
-    integrity_log("stage3", "entry_created")
+    if receive_mode:
+        ENTRY = receive_entry_addr
+        if ENTRY in subs:
+            subs.remove(ENTRY)
+        subs.insert(0, ENTRY)
+        integrity_log("stage3", "entry_reused_from_receive_wallet")
+        print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
+    else:
+        ENTRY = subs[0]
+        integrity_log("stage3", "entry_created")
 
     import secrets as _secrets
     _secrets.SystemRandom().shuffle(subs)
@@ -312,38 +354,40 @@ def main():
     newnym()
     tor_recheck(proxy, "stage2_exec")
 
-    # Determine what BTC chunks to swap:
-    # - If JoinMarket produced UTXOs, use those
-    # - If --split > 1, operator plans to manually split their BTC
-    # - Otherwise this is a direct single-chunk flow
-    # NOTE: ThorChain swap produces deposit addresses for the operator
-    # to manually send BTC to. The operator must do the actual BTC send.
-    if jm_utxos:
-        btc_chunks = jm_utxos
-    elif args.split >= 1:
-        # Operator hasn't specified amounts per chunk, so we can't auto-split.
-        # Instead, generate deposit addresses for --split chunks and let
-        # the operator decide amounts. Use placeholder to get quotes.
-        print(f"\n  [!] No JoinMarket UTXOs. Generating {args.split} ThorChain deposit(s).")
-        print(f"  [!] You must manually send BTC to the deposit addresses below.")
-        print(f"  [!] XMR will arrive at ENTRY address after ThorChain processes.")
-        btc_chunks = []
+    if receive_mode:
+        integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
+        print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
+        print(f"  [+] Entry address: {scrub_address(ENTRY)}")
     else:
-        btc_chunks = []
+        # Determine what BTC chunks to swap:
+        # - If JoinMarket produced UTXOs, use those
+        # - If --split > 1, operator plans to manually split their BTC
+        # - Otherwise this is a direct single-chunk flow
+        # NOTE: ThorChain swap produces deposit addresses for the operator
+        # to manually send BTC to. The operator must do the actual BTC send.
+        if jm_utxos:
+            btc_chunks = jm_utxos
+        elif args.split >= 1:
+            print(f"\n  [!] No JoinMarket UTXOs. Generating {args.split} ThorChain deposit(s).")
+            print(f"  [!] You must manually send BTC to the deposit addresses below.")
+            print(f"  [!] XMR will arrive at ENTRY address after ThorChain processes.")
+            btc_chunks = []
+        else:
+            btc_chunks = []
 
-    if btc_chunks:
-        swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
-        integrity_log("stage2", "swap_quotes_generated")
-        total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
-        print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
-        print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
-        print(f"  [!] YOU MUST manually send BTC to each deposit address above!")
-        print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
-    else:
-        integrity_log("stage2", "manual_mode")
-        print(f"\n  [!] MANUAL MODE: Send BTC through ThorChain to your ENTRY address.")
-        print(f"  [!] Use thor_swap_preparer to generate deposit addresses.")
-        print(f"  [!] Then wait for XMR to arrive and confirm before proceeding.")
+        if btc_chunks:
+            swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
+            integrity_log("stage2", "swap_quotes_generated")
+            total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+            print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+            print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+            print(f"  [!] YOU MUST manually send BTC to each deposit address above!")
+            print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
+        else:
+            integrity_log("stage2", "manual_mode")
+            print(f"\n  [!] MANUAL MODE: Send BTC through ThorChain to your ENTRY address.")
+            print(f"  [!] Use thor_swap_preparer to generate deposit addresses.")
+            print(f"  [!] Then wait for XMR to arrive and confirm before proceeding.")
 
     dag = {}
     for a in subs:
@@ -363,10 +407,12 @@ def main():
     # Stage 4 - Balance, amounts, plan
     ###########################################################################
 
+    bal_account = receive_account_index if receive_mode else 0
+
     def xmr_balance() -> tuple[Decimal, Decimal]:
         """Returns (total_balance, unlocked_balance) in XMR."""
         res = rpc_primary.raw_request(
-            "get_balance", {"account_index": 0, "address_indices": []}
+            "get_balance", {"account_index": bal_account, "address_indices": []}
         )
         total = Decimal(str(res.get("balance", 0))) / Decimal(10 ** 12)
         unlocked = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
@@ -416,21 +462,61 @@ def main():
         integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
 
     plan = []
-    for r in range(rounds):
+
+    # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
+    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
+    # deposits to ENTRY. Either way, we must spread funds outward before
+    # the random DAG mixing can function (otherwise src addresses have no
+    # balance and every TX fails).
+    mix_targets = [s for s in subs if s != ENTRY]
+    fanout_count = min(len(mix_targets), args.wallets)
+    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+    if fanout_amt <= DUST_XMR:
+        sys.exit(
+            f"[!] Usable balance {usable} XMR too small to fan out across "
+            f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
+        )
+    for fi in range(fanout_count):
         if shutdown_requested():
-            integrity_log("stage4", f"shutdown_at_round_{r}")
+            integrity_log("stage4", f"shutdown_at_fanout_{fi}")
             break
-        src_idx = _secrets.randbelow(len(subs))
-        s = subs[src_idx]
-        dst_idx = _secrets.randbelow(len(dag[s]))
-        d = dag[s][dst_idx]
         plan.append({
-            "src": s,
-            "dst": d,
-            "amt": str(quantized_split),
-            "delay": _secrets.randbelow(540) + 180,  # 180-720s
+            "src": ENTRY,
+            "dst": mix_targets[fi],
+            "amt": str(fanout_amt),
+            "delay": _secrets.randbelow(540) + 180,
             "extra": secure_hex(16),
         })
+    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:amt_each={fanout_amt}")
+
+    # Phase B: DAG mixing — random hops between mix subaddresses.
+    # Recalculate per-round amount from the remaining balance after fan-out.
+    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    dag_rounds = max(rounds - fanout_count, args.wallets)
+    if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
+        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+        if dag_split <= DUST_XMR:
+            dag_split = DUST_XMR
+        for r in range(dag_rounds):
+            if shutdown_requested():
+                integrity_log("stage4", f"shutdown_at_round_{r}")
+                break
+            src_idx = _secrets.randbelow(len(mix_targets))
+            s = mix_targets[src_idx]
+            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+            if not dst_candidates:
+                continue
+            dst_idx = _secrets.randbelow(len(dst_candidates))
+            d = dst_candidates[dst_idx]
+            plan.append({
+                "src": s,
+                "dst": d,
+                "amt": str(dag_split),
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+            })
+    else:
+        integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
     meta = {
         "schema": "unsigned_v1",

@@ -283,6 +283,25 @@ class MoneroRPC:
         addr, _idx = acct.new_address(label=label)
         return str(addr)
 
+    def new_subaddress_indexed(self, account_index: int = 0, label: str = "") -> tuple:
+        """Create a new subaddress and return (address_str, subaddress_index)."""
+        acct = self._wallet.accounts[account_index]
+        addr, idx = acct.new_address(label=label)
+        return str(addr), idx
+
+    def get_subaddress_balance(self, account_index: int = 0,
+                               address_index: int = 0) -> tuple:
+        """Return (total, unlocked) balance for a specific subaddress in atomic units."""
+        res = self.raw_request("get_balance", {
+            "account_index": account_index,
+            "address_indices": [address_index],
+        })
+        per_sub = res.get("per_subaddress", [])
+        if per_sub:
+            entry = per_sub[0]
+            return entry.get("balance", 0), entry.get("unlocked_balance", 0)
+        return 0, 0
+
 
 def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     """Connect to monero-wallet-rpc extracting host and port from URL.
