@@ -450,11 +450,13 @@ def main():
         print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
 
     bal = unlocked_bal
+    is_mock_plan = False
     if bal <= DUST_XMR:
         if args.cold or args.airgap:
             print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
             print("[!] DO NOT sign/broadcast this plan without real funds!")
             bal = Decimal("10.0")
+            is_mock_plan = True
             integrity_log("stage4", "mock_balance:dry_run_only")
         else:
             sys.exit(
@@ -546,11 +548,14 @@ def main():
     meta = {
         "schema": "unsigned_v1",
         "version": VERSION,
-        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "created": int(time.time()) // 600 * 600,
         "rounds": len(plan),
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
+        "account_index": bal_account,
     }
+    if is_mock_plan:
+        meta["mock"] = True
     unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)

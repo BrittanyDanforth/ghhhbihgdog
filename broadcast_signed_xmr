@@ -54,8 +54,9 @@ def main():
                           "signed_manifest_v1.json")
     cli.add_argument("--tor-proxy",
                      help="SOCKS5 proxy for all network access")
-    cli.add_argument("--rpc", default="http://node.onion:18089",
-                     help="primary Monero RPC")
+    cli.add_argument("--rpc", default="http://127.0.0.1:18081",
+                     help="primary Monero daemon RPC (NOT wallet-rpc; "
+                          "this must be monerod's HTTP endpoint)")
     cli.add_argument("--rpc-alt", help="fallback RPC")
     cli.add_argument("--rpc-list",
                      help="file with RPC endpoints, one per line")
