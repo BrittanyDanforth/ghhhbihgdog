@@ -1,31 +1,27 @@
-exit_strategy_simulator.py
-
-
-
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 — Off‑Ramp Planner w/ Liquidity Probe
+exit_strategy_simulator v10.0 - Off-Ramp Planner w/ Liquidity Probe
 =================================================================
-Part of the GhostSpiral v10 tool‑chain.  Generates a *schema‑tagged*
-`exitplan_v1.json` bundle that records the user’s intended off‑ramp
-(XMR → BTC, USD, EUR…) together with current oracle prices, liquidity
-scores and KYC risk flags — and appends the same information to the
-system‑wide `integrity_chain.log`.
+Part of the GhostSpiral v10 tool-chain.  Generates a schema-tagged
+exitplan_v1.json bundle that records the user's intended off-ramp
+(XMR -> BTC, USD, EUR...) together with current oracle prices, liquidity
+scores and KYC risk flags -- and appends the same information to the
+system-wide integrity_chain.log.
 
 New in v10.0
-────────────
-1. **Live CoinGecko retry‑oracle** — Tor‑guarded; 4× exponential retry.
-2. **Bisq / Haveno liquidity probe** — warns if order book < 3× the
+------------
+1. Live CoinGecko retry-oracle - Tor-guarded; 4x exponential retry.
+2. Bisq / Haveno liquidity probe - warns if order book < 3x the
    requested size (very thin market).
-3. **Integrity logging** — every run writes a SHA‑256 hash‑chained line
+3. Integrity logging - every run writes a SHA-256 hash-chained line
    so later auditors can verify no tampering.
-4. **Atomic JSON output** — writes to `*.tmp` → fsync → rename to
-   `exitplan_v1.json` so a crash never corrupts the plan.
-5. **Schema tag** — the top‑level JSON includes `"schema":"exitplan_v1"`.
+4. Atomic JSON output - writes to *.tmp -> fsync -> rename to
+   exitplan_v1.json so a crash never corrupts the plan.
+5. Schema tag - the top-level JSON includes "schema":"exitplan_v1".
 
 Usage Example
-─────────────
-    python3 exit_strategy_simulator.py 21.2 \
+-------------
+    python3 exit_strategy_simulator 21.2 \
         --method bisq --currency usd \
         --tor-proxy socks5h://127.0.0.1:9050
 """
@@ -34,51 +30,53 @@ import argparse, json, os, sys, time, hashlib
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict
+
 import requests
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-# ───────────────────────── Globals & Constants ─────────────────────────
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
 BISQ_URL = "https://bisq.markets/api/markets?pair=XMR_BTC"
 HAVENO_URL = "https://haveno.network/api/markets/XMR_BTC"
 
 METHODS: Dict[str, Dict] = {
-    "bisq":        {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.01"),  "kyc": False},
-    "localmonero": {"fee_pct": Decimal("0.015"), "slippage": Decimal("0.015"), "kyc": False},
-    "azteco":      {"fee_pct": Decimal("0.05"),  "slippage": Decimal("0.00"),  "kyc": True},
-    "haveno":      {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.008"), "kyc": False},
-    "p2p":         {"fee_pct": Decimal("0.00"),  "slippage": Decimal("0.03"),  "kyc": False}
+    "bisq":    {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.01"),  "kyc": False},
+    "haveno":  {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.008"), "kyc": False},
+    "azteco":  {"fee_pct": Decimal("0.05"),  "slippage": Decimal("0.00"),  "kyc": True},
+    "p2p":     {"fee_pct": Decimal("0.00"),  "slippage": Decimal("0.03"),  "kyc": False},
 }
 
 INT_LOG = Path("integrity_chain.log")
 
-# ───────────────────────── Helper: hash‑chain logger ───────────────────
 
 def hash_line(msg: str):
+    prev = "0" * 64
     if INT_LOG.exists():
-        last = INT_LOG.read_text().splitlines()[-1].split(" | ")[0]
-    else:
-        last = "0" * 64
-    h = hashlib.sha256((last + msg).encode()).hexdigest()
-    INT_LOG.open("a").write(f"{h} | {msg}\n")
+        lines = INT_LOG.read_text().splitlines()
+        if lines:
+            prev = lines[-1].split(" | ")[0]
+    h = hashlib.sha256((prev + msg).encode()).hexdigest()
+    with INT_LOG.open("a") as f:
+        f.write(f"{h} | {msg}\n")
 
-# ───────────────────────── Retry‑safe GET wrapper ──────────────────────
+
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=30))
 def safe_get(url: str, proxies=None):
-    return requests.get(url, timeout=20, proxies=proxies).json()
+    r = requests.get(url, timeout=20, proxies=proxies)
+    r.raise_for_status()
+    return r.json()
 
-# ───────────────────────── Tor leak guard ──────────────────────────────
+
 CHECK_TOR = "https://check.torproject.org/api/ip"
+
 
 def ensure_tor(proxy: Dict[str, str]):
     try:
         info = safe_get(CHECK_TOR, proxy)
         if not info.get("IsTor"):
-            sys.exit("[exit‑sim] Tor proxy leaking — abort.")
+            sys.exit("[exit-sim] Tor proxy leaking - abort.")
     except Exception:
-        sys.exit("[exit‑sim] Could not verify Tor connectivity — abort.")
+        sys.exit("[exit-sim] Could not verify Tor connectivity - abort.")
 
-# ───────────────────────── Price & liquidity helpers ───────────────────
 
 def fetch_prices(proxy):
     j = safe_get(CG_URL, proxy)
@@ -86,17 +84,19 @@ def fetch_prices(proxy):
         "xmr_usd": Decimal(str(j["monero"]["usd"])),
         "xmr_eur": Decimal(str(j["monero"]["eur"])),
         "btc_usd": Decimal(str(j["bitcoin"]["usd"])),
-        "btc_eur": Decimal(str(j["bitcoin"]["eur"]))
+        "btc_eur": Decimal(str(j["bitcoin"]["eur"])),
     }
+
 
 def liquidity_score_bisq(proxy):
     try:
         book = safe_get(BISQ_URL, proxy)
         bids = Decimal(str(book["buy"][0]["amount"])) if book.get("buy") else Decimal(0)
         asks = Decimal(str(book["sell"][0]["amount"])) if book.get("sell") else Decimal(0)
-        return bids + asks  # simplified liquidity metric
+        return bids + asks
     except Exception:
         return Decimal(0)
+
 
 def liquidity_score_haveno(proxy):
     try:
@@ -107,19 +107,19 @@ def liquidity_score_haveno(proxy):
     except Exception:
         return Decimal(0)
 
-# ───────────────────────── Atomic JSON writer ─────────────────────────
 
 def atomic_write(obj, path: Path):
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
-        f.flush(); os.fsync(f.fileno())
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
-# ───────────────────────── Main CLI ────────────────────────────────────
-if __name__ == "__main__":
+
+def main():
     ap = argparse.ArgumentParser("exit_strategy_simulator v10.0")
-    ap.add_argument("amount", type=Decimal, help="XMR amount to off‑ramp")
+    ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
@@ -127,7 +127,8 @@ if __name__ == "__main__":
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
-    proxy = {"http": args.tor_proxy, "https": args.tor_proxy} if args.tor_proxy else None
+    proxy = ({"http": args.tor_proxy, "https": args.tor_proxy}
+             if args.tor_proxy else None)
     if args.tor_proxy:
         ensure_tor(proxy)
 
@@ -142,16 +143,14 @@ if __name__ == "__main__":
     fiat_rate = prices[f"xmr_{args.currency}"]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
-    # ── Liquidity probe (Bisq/Haveno only) ──
     liq_score = Decimal(0)
     if args.method == "bisq":
         liq_score = liquidity_score_bisq(proxy)
     elif args.method == "haveno":
         liq_score = liquidity_score_haveno(proxy)
 
-    thin_warn = liq_score < (gross * Decimal("3")) if liq_score else False
+    thin_warn = bool(liq_score and liq_score < (gross * Decimal("3")))
 
-    # ── Build output object ──
     plan = {
         "schema": "exitplan_v1",
         "timestamp": int(time.time()),
@@ -161,29 +160,33 @@ if __name__ == "__main__":
         "fee_pct": str(cfg["fee_pct"]),
         "slippage_pct": str(cfg["slippage"]),
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
-        f"amount_out_{args.currency}": str(fiat_val),
+        "currency": args.currency,
+        "amount_out_fiat": str(fiat_val),
         "oracle_prices": {k: str(v) for k, v in prices.items()},
         "liquidity_score": str(liq_score),
-        "liquidity_thin": thin_warn
+        "liquidity_thin": thin_warn,
     }
 
-    # ── Atomic save ──
     atomic_write(plan, Path(args.outfile))
 
-    # ── Integrity log ──
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     hash_line(f"exitplan|{args.method}|{kyc_tag}|{gross}|{net}|{fiat_val}|thin={thin_warn}")
 
-    # ── Terminal output ──
-    print(f"Method      : {args.method}  ({'⚠️ KYC' if cfg['kyc'] and not args.suppress_kyc else 'No‑KYC'})")
+    kyc_label = "KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"
+    print(f"Method      : {args.method}  ({kyc_label})")
     print(f"Gross       : {gross} XMR")
-    print(f"Fees (@{cfg['fee_pct']*100:.1f}%): {fee:.4f} XMR")
+    print(f"Fees (@{cfg['fee_pct'] * 100:.1f}%): {fee:.4f} XMR")
     print(f"Slippage    : {slip:.4f} XMR")
-    print("────────────────────────────────────────")
+    print("----------------------------------------")
     print(f"Net         : {net:.4f} XMR")
-    print(f"≈ {fiat_val} {args.currency.upper()}")
+    print(f"= {fiat_val} {args.currency.upper()}")
     if liq_score:
-        print(f"Liquidity score: {liq_score}  {'⚠️  THIN' if thin_warn else 'OK'}")
+        thin_label = "THIN" if thin_warn else "OK"
+        print(f"Liquidity score: {liq_score}  ({thin_label})")
     else:
-        print("⚠️  Liquidity probe unavailable (API fail)")
-    print(f"[+] Plan saved → {args.outfile}")
+        print("[!] Liquidity probe unavailable (API fail)")
+    print(f"[+] Plan saved -> {args.outfile}")
+
+
+if __name__ == "__main__":
+    main()
