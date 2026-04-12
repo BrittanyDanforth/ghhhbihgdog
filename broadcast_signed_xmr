@@ -102,6 +102,21 @@ def main():
         ]
     integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
+    # Load the unsigned plan to get per-TX delay values if available
+    tx_delays: dict = {}
+    unsigned_plan_path = Path("unsigned").glob("unsigned_*.json")
+    for plan_file in sorted(Path(".").glob("unsigned/unsigned_*.json")):
+        try:
+            with open(plan_file) as pf:
+                plan_data = json.load(pf)
+            if isinstance(plan_data, dict) and "txs" in plan_data:
+                for i, tx in enumerate(plan_data["txs"]):
+                    if "delay" in tx:
+                        tx_delays[i] = int(tx["delay"])
+        except Exception:
+            pass
+        break  # only read the most recent plan
+
     # Gather blobs
     blobs: List[Path] = []
     input_path = Path(args.path)
@@ -122,6 +137,27 @@ def main():
     if not blobs:
         sys.exit("[!] No blobs found to broadcast")
     integrity_log("broadcast", f"blobs_found:{len(blobs)}")
+
+    # Verify blob integrity against signer manifest if available
+    manifest_path = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
+    if manifest_path and manifest_path.exists():
+        with open(manifest_path) as mf:
+            manifest = json.load(mf)
+        manifest_hashes = {Path(e["file"]).name: e["hash"] for e in manifest}
+        tampered = []
+        for blob in blobs:
+            if blob.name in manifest_hashes and blob.exists():
+                with open(blob, "rb") as bf:
+                    actual = hashlib.sha256(bf.read()).hexdigest()
+                if actual != manifest_hashes[blob.name]:
+                    tampered.append(blob.name)
+        if tampered:
+            integrity_log("broadcast", f"TAMPER_DETECTED:{len(tampered)}_blobs")
+            for t in tampered:
+                print(f"  [!] TAMPERED: {t}")
+            sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
+        integrity_log("broadcast", f"manifest_verified:{len(manifest_hashes)}_blobs_ok")
+        print(f"  [+] Manifest verification: {len(manifest_hashes)} blobs OK")
 
     # Progress state
     progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
@@ -172,8 +208,22 @@ def main():
             fail_count += 1
             continue
 
-        # NEWNYM before each TX for circuit isolation
+        # NEWNYM + planned delay before each TX for circuit isolation and
+        # timing decorrelation. The delay comes from the unsigned plan and is
+        # critical for preventing timing-cluster analysis on the blockchain.
         if idx > 0:
+            planned_delay = tx_delays.get(idx, 0)
+            if planned_delay > 0:
+                print(f"  [*] Waiting {planned_delay}s (planned delay for TX {idx})...")
+                integrity_log("broadcast", f"delay:idx={idx}:secs={planned_delay}")
+                # Sleep in chunks so shutdown_requested() can be checked
+                waited = 0
+                while waited < planned_delay:
+                    if shutdown_requested():
+                        break
+                    chunk = min(30, planned_delay - waited)
+                    time.sleep(chunk)
+                    waited += chunk
             newnym()
             secure_delay(5.0, 15.0)
 
@@ -194,7 +244,8 @@ def main():
                 )
 
                 status = res.get("status", "")
-                if status == "OK" or res.get("double_spend", False) is False and status:
+                is_double = res.get("double_spend", False)
+                if status == "OK" and not is_double:
                     txid = res.get("tx_hash", "unknown")
                     if txid == "unknown":
                         # Some daemons return tx hash differently

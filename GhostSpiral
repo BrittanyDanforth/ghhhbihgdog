@@ -40,7 +40,11 @@ from gs_common import (
 DUST_XMR = Decimal("0.0001")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 THOR_API = "https://api.thorswap.net/aggregator"
-FEE_ORACLE_URL = "https://localmonero.co/blocks/api/get_stats"
+# Fee oracle endpoints (tried in order; LocalMonero is defunct since 2023)
+FEE_ORACLE_URLS = [
+    "https://moneroblocks.info/api/get_stats",
+    "https://xmrchain.net/api/emission",
+]
 
 # Minimum wallets/rounds to provide meaningful mixing
 MIN_WALLETS = 3
@@ -49,18 +53,24 @@ NUM_DECOYS = 4
 
 
 def fetch_fee(proxy: Dict[str, str]) -> Decimal:
-    """Fetch current median XMR fee from oracle."""
-    try:
-        j = safe_get(FEE_ORACLE_URL, proxy)
-        fee = Decimal(str(j["fee_per_kb_median"])) / Decimal(1024)
-        if fee <= 0:
-            raise ValueError("Fee oracle returned non-positive value")
-        return fee
-    except Exception as e:
-        integrity_log("fee", f"oracle_fail:{str(e)[:60]}")
-        fallback = Decimal("0.00005")
-        integrity_log("fee", f"using_fallback:{fallback}")
-        return fallback
+    """Fetch current median XMR fee from oracle. Tries multiple sources."""
+    for url in FEE_ORACLE_URLS:
+        try:
+            j = safe_get(url, proxy)
+            # Different APIs return fee in different fields
+            raw_fee = j.get("fee_per_kb_median") or j.get("fee_per_byte")
+            if raw_fee:
+                fee = Decimal(str(raw_fee)) / Decimal(1024)
+                if fee > 0:
+                    return fee
+        except Exception:
+            continue
+
+    # All oracles failed - use conservative fallback based on typical XMR fees
+    # (~0.00005 XMR per TX as of 2024-2025)
+    fallback = Decimal("0.00005")
+    integrity_log("fee", "all_oracles_failed:using_fallback")
+    return fallback
 
 
 def main():
@@ -112,7 +122,7 @@ def main():
     integrity_log("stage0", "tor_ok")
 
     fee_xmr = fetch_fee(proxy)
-    integrity_log("stage0", f"fee_xmr={fee_xmr}")
+    integrity_log("stage0", "fee_fetched")
 
     rpc_primary = connect_rpc(args.rpc_primary)
     rpc_alt = connect_rpc(args.rpc_alt) if args.rpc_alt else None
@@ -138,14 +148,14 @@ def main():
     integrity_log("stage0", f"rpc_sync_ok:height={h1}")
 
     ###########################################################################
-    # Stage 1 - JoinMarket
+    # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
     ###########################################################################
     newnym()
 
     def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
         if not args.joinmarket:
             integrity_log("stage1", "JM_skipped")
-            return [Decimal("0.0")]
+            return []
         if not args.joinmarket_wallet:
             sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
         try:
@@ -155,7 +165,8 @@ def main():
             )
             integrity_log("stage1", "JM_tumble_OK")
             # TODO: parse actual UTXO amounts from result.stdout
-            return [Decimal("0.0")]
+            # For now return empty - operator must check JM output manually
+            return []
         except subprocess.TimeoutExpired:
             integrity_log("stage1", "JM_timeout")
             sys.exit("[!] JoinMarket tumble timed out after 1 hour")
@@ -166,21 +177,25 @@ def main():
             integrity_log("stage1", f"JM_fail:{e.returncode}")
             sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
 
-    btc_chunks = stage1_joinmarket(args.btc_entry)
-    integrity_log("stage1", f"done:chunks={len(btc_chunks)}")
+    jm_utxos = stage1_joinmarket(args.btc_entry)
+    integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
 
     ###########################################################################
-    # Stage 2 - ThorChain swap
+    # Stage 2 - ThorChain swap definition
     ###########################################################################
-    newnym()
-    tor_recheck(proxy, "stage2_pre")
 
     def stage2_thor_swap(chunks: List[Decimal], xmr_dest: str) -> Decimal:
+        """Execute BTC->XMR swaps via ThorChain for each BTC chunk.
+        Returns total expected XMR received."""
         received_total = Decimal(0)
         for i, amt in enumerate(chunks):
             if shutdown_requested():
                 integrity_log("stage2", f"shutdown_at_chunk_{i}")
                 sys.exit("[!] Shutdown requested during ThorChain swaps.")
+
+            if amt <= Decimal(0):
+                integrity_log("stage2", f"skip_zero_chunk_{i}")
+                continue
 
             if i > 0:
                 newnym()
@@ -206,17 +221,24 @@ def main():
                 integrity_log("stage2", f"bad_deposit_format_{i}")
                 sys.exit(f"[!] Deposit address not bech32: {scrub_address(deposit)}")
 
-            print(f"  [*] Chunk {i}: {amt} BTC -> {scrub_address(deposit)}")
-            integrity_log("stage2", f"deposit_{i}:{scrub_address(deposit)}:memo={memo[:8]}")
+            expected_dec = Decimal(str(expected))
+            if expected_dec <= 0:
+                integrity_log("stage2", f"zero_expected_chunk_{i}")
+                sys.exit(f"[!] ThorChain expects 0 XMR output for chunk {i} - likely bad rate")
+
+            print(f"  [*] Chunk {i}/{len(chunks)-1}: send BTC to {scrub_address(deposit)}")
+            print(f"      Memo: {memo}")
+            print(f"      IMPORTANT: Manually send {amt} BTC to the above deposit address!")
+            integrity_log("stage2", f"deposit_ready:{i}")
 
             secure_delay(5.0, 15.0)
-            received_total += Decimal(str(expected))
+            received_total += expected_dec
 
         return received_total
 
     ###########################################################################
-    # Stage 3 - Build wallets & DAG (must run BEFORE stage2 so we have
-    # a receive address for the ThorChain swap destination)
+    # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
+    # the ENTRY receive address exists for ThorChain destination)
     ###########################################################################
     newnym()
     tor_recheck(proxy, "stage3_pre")
@@ -236,24 +258,46 @@ def main():
         sys.exit("[!] Failed to create enough subaddresses")
 
     ENTRY = subs[0]
-    integrity_log("stage3", f"entry:{scrub_address(ENTRY)}")
+    integrity_log("stage3", "entry_created")
 
     import secrets as _secrets
     _secrets.SystemRandom().shuffle(subs)
 
     ###########################################################################
-    # Stage 2 - ThorChain swap (runs AFTER stage3 so ENTRY address exists)
+    # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
     ###########################################################################
     newnym()
-    tor_recheck(proxy, "stage2_pre")
+    tor_recheck(proxy, "stage2_exec")
 
-    if args.joinmarket and any(c > 0 for c in btc_chunks):
-        xmr_received = stage2_thor_swap(btc_chunks, ENTRY)
-        integrity_log("stage2", f"swap_done:received={xmr_received}")
-    elif args.split > 1:
-        integrity_log("stage2", f"split_mode:chunks={args.split}")
+    # Determine what BTC chunks to swap:
+    # - If JoinMarket produced UTXOs, use those
+    # - If --split > 1, operator plans to manually split their BTC
+    # - Otherwise this is a direct single-chunk flow
+    # NOTE: ThorChain swap produces deposit addresses for the operator
+    # to manually send BTC to. The operator must do the actual BTC send.
+    if jm_utxos:
+        btc_chunks = jm_utxos
+    elif args.split >= 1:
+        # Operator hasn't specified amounts per chunk, so we can't auto-split.
+        # Instead, generate deposit addresses for --split chunks and let
+        # the operator decide amounts. Use placeholder to get quotes.
+        print(f"\n  [!] No JoinMarket UTXOs. Generating {args.split} ThorChain deposit(s).")
+        print(f"  [!] You must manually send BTC to the deposit addresses below.")
+        print(f"  [!] XMR will arrive at ENTRY address after ThorChain processes.")
+        btc_chunks = []
     else:
-        integrity_log("stage2", "swap_skipped:no_btc_chunks")
+        btc_chunks = []
+
+    if btc_chunks:
+        xmr_expected = stage2_thor_swap(btc_chunks, ENTRY)
+        integrity_log("stage2", "swap_deposits_generated")
+        print(f"\n  [+] Expected total: ~{xmr_expected} XMR after swaps")
+        print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
+    else:
+        integrity_log("stage2", "manual_mode")
+        print(f"\n  [!] MANUAL MODE: Send BTC through ThorChain to your ENTRY address.")
+        print(f"  [!] Use thor_swap_preparer to generate deposit addresses.")
+        print(f"  [!] Then wait for XMR to arrive and confirm before proceeding.")
 
     dag = {}
     for a in subs:
@@ -267,7 +311,7 @@ def main():
             idx = _secrets.randbelow(len(pool))
             chosen.append(pool.pop(idx))
         dag[a] = chosen
-    integrity_log("stage3", f"dag_built:nodes={len(dag)}:total_edges={sum(len(v) for v in dag.values())}")
+    integrity_log("stage3", "dag_built")
 
     ###########################################################################
     # Stage 4 - Balance, amounts, plan
@@ -307,7 +351,7 @@ def main():
         )
 
     split_amt = usable / Decimal(rounds)
-    integrity_log("stage4", f"rounds={rounds}:split={split_amt}:fees={total_fees}")
+    integrity_log("stage4", "plan_calculated")
 
     # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
     quantized_split = split_amt.quantize(Decimal("0.0001"))
@@ -347,7 +391,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     ufile = outdir / f"unsigned_{int(time.time())}.json"
     atomic_write_json(unsigned, ufile)
-    integrity_log("stage4", f"unsigned_dump:{ufile.name}:txs={len(plan)}")
+    integrity_log("stage4", "unsigned_dump_saved")
     print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
 
     if args.cold or args.airgap:

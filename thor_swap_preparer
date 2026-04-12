@@ -101,7 +101,7 @@ def main():
         _validate_xmr_addr(d)
 
     btc_per_xmr = _btc_per_xmr(proxy)
-    integrity_log("thor", f"oracle_rate={btc_per_xmr}")
+    integrity_log("thor", "oracle_fetched")
 
     pairs: List[dict] = []
 
@@ -160,7 +160,7 @@ def main():
             "ts": int(time.time()),
         }
         pairs.append(pair)
-        integrity_log("thor", f"pair_{i}:{scrub_address(deposit)}->xmr:{expected_xmr}")
+        integrity_log("thor", f"pair_{i}:ready")
         print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
               f"(expected {expected_xmr} XMR)")
 

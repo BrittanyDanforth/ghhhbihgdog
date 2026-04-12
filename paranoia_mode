@@ -207,46 +207,88 @@ def wipe_swap_ram(dry: bool):
         print(f"  [!] RAM wipe failed: {e}")
 
 
+def _secure_delete_file(path: Path):
+    """Overwrite file content with nulls before unlinking."""
+    try:
+        size = path.stat().st_size
+        with open(path, "wb") as f:
+            f.write(b"\x00" * min(size, 65536))
+            f.flush()
+            os.fsync(f.fileno())
+        path.unlink()
+    except (PermissionError, OSError):
+        pass
+
+
+def _secure_delete_dir(path: Path):
+    """Overwrite all files in a directory tree then remove it."""
+    if not path.is_dir():
+        return
+    for f in path.rglob("*"):
+        if f.is_file():
+            _secure_delete_file(f)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def wipe_gs_artifacts(dry: bool):
-    """Wipe GhostSpiral output files: unsigned plans, signed blobs, manifests,
-    wallet JSONs, integrity log, progress files, exit plans, thor pairs."""
-    patterns = [
-        "unsigned_*.json", "signed_blobs/", "signer_progress.json",
+    """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
+    and common subdirectories to catch artifacts regardless of where
+    the operator ran each script from."""
+    file_patterns = [
+        "unsigned_*.json", "signer_progress.json",
         "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
         "thor_pairs_*.json.gpg", "exitplan_*.json", "integrity_chain.log",
-        "*.blob",
+        "integrity.log", "*.blob", "signed_manifest_v1.json",
     ]
+    dir_patterns = [
+        "signed_blobs", "unsigned",
+    ]
+
+    search_roots = list(set([
+        Path("."),
+        Path.home(),
+        Path.home() / "ghostspiral",
+        Path.home() / "GhostSpiral",
+    ]))
+
     count = 0
-    cwd = Path(".")
-    for pattern in patterns:
-        if pattern.endswith("/"):
-            d = cwd / pattern.rstrip("/")
-            if d.is_dir():
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+
+        for pattern in file_patterns:
+            for f in root.glob(pattern):
                 if dry:
-                    print(f"  [dry] would remove dir {d}")
+                    print(f"  [dry] would securely delete {f}")
                 else:
-                    shutil.rmtree(d, ignore_errors=True)
+                    _secure_delete_file(f)
                 count += 1
-        else:
-            for f in cwd.glob(pattern):
+            # Also search one level of subdirectories
+            for f in root.glob(f"*/{pattern}"):
                 if dry:
-                    print(f"  [dry] would remove {f}")
+                    print(f"  [dry] would securely delete {f}")
                 else:
-                    try:
-                        f.write_bytes(b"\x00" * min(f.stat().st_size, 65536))
-                        f.unlink()
-                    except (PermissionError, OSError):
-                        pass
+                    _secure_delete_file(f)
                 count += 1
-    # Also check ./unsigned/ directory
-    unsigned_dir = cwd / "unsigned"
-    if unsigned_dir.is_dir():
-        if dry:
-            print(f"  [dry] would remove {unsigned_dir}")
-        else:
-            shutil.rmtree(unsigned_dir, ignore_errors=True)
-        count += 1
-    integrity_log("paranoia", f"gs_artifacts_wiped:{count}" if not dry else f"gs_artifacts_dry:{count}")
+
+        for dirname in dir_patterns:
+            for d in root.glob(dirname):
+                if d.is_dir():
+                    if dry:
+                        print(f"  [dry] would securely delete dir {d}")
+                    else:
+                        _secure_delete_dir(d)
+                    count += 1
+            for d in root.glob(f"*/{dirname}"):
+                if d.is_dir():
+                    if dry:
+                        print(f"  [dry] would securely delete dir {d}")
+                    else:
+                        _secure_delete_dir(d)
+                    count += 1
+
+    print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
+    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
 
 
 def wipe_tmp_files(dry: bool):
