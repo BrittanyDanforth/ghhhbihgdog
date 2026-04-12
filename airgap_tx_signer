@@ -1,125 +1,337 @@
-airgap tx signer
-
 #!/usr/bin/env python3
 """
-airgap_tx_signer.py v10.0 — Offline signer for GhostSpiral *unsigned_v1* bundles
-==========================================================================
-Focus: **deterministic, verifiable, crash‑resumable** signing with fee‑bump stub.
-Supersedes v2.x. Completely offline; never touches the network.
+airgap_tx_signer v10.5 - Two-phase Monero TX signer for GhostSpiral
+====================================================================
+Implements the CORRECT Monero cold-signing protocol:
 
-🔑 What’s new vs v2.0
-─────────────────────
-1. **unsigned_v1 schema parse + validation** — aborts if any field missing/wrong type.
-2. **Integrity‑chain journal** — rolling SHA‑256 hash for every action → `integrity_chain.log`.
-3. **Resume‑safe** — `--resume progress.json` stores last signed index + hash; pick up exactly where left.
-4. **Signature verification loop** — after signing each TX, runs `check_tx_key`; aborts on mismatch.
-5. **Fee‑bump stub** — `--bump +pct` rewrites fees in‑memory & re‑signs if node later rejects low_fee.
-6. **Atomic writes everywhere** — *.tmp → fsync → rename; data survives unexpected power loss.
+PHASE 1 (online machine, has view-only wallet + daemon):
+  - Creates unsigned TXs via monero-wallet-rpc's transfer_split RPC
+  - The RPC tracks committed outputs so TXs don't double-spend each other
+  - Outputs: unsigned_monero_tx files + plan manifest
 
-Quick Example
-────────────
-    # offline VM
-    python3 airgap_tx_signer.py unsigned_1718.json \
-        --wallet-file /mnt/usb/offline.wallet --resume signer_progress.json
+PHASE 2 (offline machine, has full wallet with spend key):
+  - Signs each unsigned TX file with monero-wallet-cli's sign_transfer
+  - Outputs: signed_monero_tx files + signed manifest
+
+This two-phase design solves the critical double-spend problem:
+monero-wallet-rpc internally tracks which outputs are "reserved" for
+pending unsigned TXs, so 40 sequential transfer_split calls won't
+select the same outputs twice.
+
+Usage:
+  # On online machine (view-only wallet):
+  python3 airgap_tx_signer unsigned_plan.json --phase create \
+      --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
+      --outdir unsigned_txs
+
+  # Transfer unsigned_txs/ to air-gapped machine via USB
+
+  # On offline machine (full wallet):
+  python3 airgap_tx_signer unsigned_plan.json --phase sign \
+      --wallet-file /path/to/full_wallet --outdir signed_txs
+
+  # Transfer signed_txs/ back to online machine for broadcast
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, sys, tempfile, time
+import argparse, json, subprocess, hashlib, os, sys, time, shutil
 from pathlib import Path
 from decimal import Decimal
-from typing import Dict, List
+from typing import List
 
-# ───────── Integrity helpers ─────────
-INT_LOG = Path("integrity_chain.log")
+from gs_common import (
+    integrity_log, atomic_write_json, secure_file_perms,
+    install_signal_handlers, shutdown_requested, scrub_address,
+    connect_rpc, validate_proxy, verify_tor,
+)
 
-def _hash_line(line: str):
-    last = INT_LOG.read_text().splitlines()[-1].split(" | ")[0] if INT_LOG.exists() else "0"*64
-    h = hashlib.sha256((last + line).encode()).hexdigest()
-    INT_LOG.open("a").write(f"{h} | {line}\n")
+REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
 
-# ───────── Atomic writer ─────────
 
-def _atomic_write(data: str | bytes, path: Path):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb" if isinstance(data, bytes) else "w") as f:
-        f.write(data)
-        f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-# ───────── unsigned_v1 schema check ─────────
-REQUIRED_FIELDS = {"src": str, "dst": str, "amt": str, "extra": str}
-
-def _validate_plan(plan: List[Dict]):
+def _validate_plan(plan: List[dict]) -> None:
+    if not plan:
+        sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
-        for k, typ in REQUIRED_FIELDS.items():
+        for k, typ in REQUIRED_TX_FIELDS.items():
             if k not in tx or not isinstance(tx[k], typ):
-                sys.exit(f"[!] unsigned_v1 schema error at index {i}: field '{k}' missing/type mismatch")
-        # quick amount sanity
+                sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
         try:
-            Decimal(tx["amt"])
+            val = Decimal(tx["amt"])
+            if val <= 0:
+                sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
         except Exception:
-            sys.exit(f"[!] Unsigned plan amount not decimal‑parsable at index {i}")
+            sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
 
-# ───────── CLI ─────────
-cli = argparse.ArgumentParser("airgap_tx_signer v10.0")
-cli.add_argument("unsigned_json", help="unsigned_v1 plan produced by GhostSpiral >= v10")
-cli.add_argument("--wallet-cli", default="monero-wallet-cli")
-cli.add_argument("--wallet-file", required=True)
-cli.add_argument("--outdir", default="signed_blobs")
-cli.add_argument("--resume", help="progress file to resume from if interrupted")
-cli.add_argument("--bump", type=float, help="fee bump percentage (e.g. --bump 15 for +15%)")
-args = cli.parse_args()
 
-unsigned_path = Path(args.unsigned_json)
-plan = json.load(open(unsigned_path))
-_validate_plan(plan)
-_ = _hash_line(f"loaded_unsigned | entries={len(plan)} | ts={int(time.time())}")
+def _load_unsigned(path: Path) -> List[dict]:
+    with open(path) as f:
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        if "txs" in raw and isinstance(raw["txs"], list):
+            return raw["txs"]
+        sys.exit("[!] unsigned_v1 dict format missing 'txs' list")
+    if isinstance(raw, list):
+        return raw
+    sys.exit("[!] unsigned_v1 has unexpected format")
 
-Path(args.outdir).mkdir(parents=True, exist_ok=True)
 
-progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
-if progress_file.exists():
-    progress = json.load(open(progress_file))
-else:
-    progress = {"last": -1, "manifest": []}
+def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    h = hashlib.sha256()
+    for tx in plan:
+        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
+    return h.hexdigest()[:32]
 
-try:
+
+def phase_create(args, plan: List[dict]):
+    """PHASE 1: Create unsigned TXs via monero-wallet-rpc.
+
+    The RPC's transfer_split method creates unsigned TXs and internally
+    tracks which outputs are reserved, preventing double-spend between
+    TXs in the same batch.
+    """
+    proxy_url = args.tor_proxy
+    if not proxy_url:
+        sys.exit("[!] --tor-proxy required for phase 'create' (online machine)")
+    proxy = validate_proxy(proxy_url)
+    verify_tor(proxy)
+
+    rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
+
+    outdir = Path(args.outdir)
+    if outdir.is_dir():
+        shutil.rmtree(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    manifest = []
+    created = 0
+    failed = 0
+
     for idx, tx in enumerate(plan):
-        if idx <= progress["last"]:
+        if shutdown_requested():
+            print(f"  [!] Shutdown at TX {idx}")
+            break
+
+        dst = tx["dst"]
+        amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
+
+        print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: "
+              f"{tx['amt']} XMR -> {scrub_address(dst)}...")
+
+        try:
+            # transfer_split creates the unsigned TX and reserves outputs
+            result = rpc.raw_request("transfer_split", {
+                "destinations": [{"amount": amt_atomic, "address": dst}],
+                "account_index": 0,
+                "priority": args.fee_priority,
+                "get_tx_hex": False,
+                "do_not_relay": True,
+            })
+
+            # The RPC returns unsigned_txset (base64-encoded)
+            unsigned_txset = result.get("unsigned_txset", "")
+            if not unsigned_txset:
+                integrity_log("signer", f"no_unsigned_txset:idx={idx}")
+                print(f"  [!] TX {idx}: RPC returned no unsigned_txset")
+                failed += 1
+                continue
+
+            # Save the unsigned TX set
+            tx_file = outdir / f"tx_{idx}.unsigned"
+            tx_file.write_text(unsigned_txset)
+            secure_file_perms(tx_file)
+
+            sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
+            manifest.append({
+                "idx": idx,
+                "file": str(tx_file),
+                "hash": sha,
+                "dst": scrub_address(dst),
+                "amt": tx["amt"],
+                "delay": tx.get("delay", 0),
+            })
+            created += 1
+            print(f"  [+] TX {idx} -> {tx_file.name}")
+
+        except Exception as e:
+            integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")
+            print(f"  [!] TX {idx} failed: {str(e)[:80]}")
+            failed += 1
+
+    # Write manifest
+    manifest_path = outdir / "unsigned_manifest.json"
+    atomic_write_json({
+        "plan_fingerprint": _compute_plan_fingerprint(plan),
+        "phase": "unsigned",
+        "entries": manifest,
+    }, manifest_path)
+
+    integrity_log("signer", f"create_done:{created}_created:{failed}_failed")
+    print(f"\n  [+] Phase 1 complete: {created} unsigned TXs created, {failed} failed.")
+    if failed:
+        print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
+        sys.exit(1)
+    print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
+
+
+def phase_sign(args, plan: List[dict]):
+    """PHASE 2: Sign unsigned TXs on offline machine with wallet-cli.
+
+    Uses monero-wallet-cli's sign_transfer command which reads unsigned
+    TX sets and produces signed TX sets using the spend key.
+    """
+    outdir = Path(args.outdir)
+    if not outdir.is_dir():
+        sys.exit(f"[!] Output dir not found: {outdir}")
+
+    # Load unsigned manifest
+    manifest_path = outdir / "unsigned_manifest.json"
+    if not manifest_path.exists():
+        sys.exit("[!] unsigned_manifest.json not found in output dir")
+
+    with open(manifest_path) as f:
+        manifest_data = json.load(f)
+
+    saved_fp = manifest_data.get("plan_fingerprint", "")
+    current_fp = _compute_plan_fingerprint(plan)
+    if saved_fp and saved_fp != current_fp:
+        sys.exit("[!] Plan fingerprint mismatch: manifest is from a different plan!")
+
+    entries = manifest_data.get("entries", [])
+    if not entries:
+        sys.exit("[!] No unsigned TX entries in manifest")
+
+    wallet_file = args.wallet_file
+    if not wallet_file or not Path(wallet_file).exists():
+        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
+
+    # Create signed output directory
+    signed_dir = outdir / "signed"
+    signed_dir.mkdir(parents=True, exist_ok=True)
+
+    signed_manifest = []
+    signed_count = 0
+
+    for entry in entries:
+        if shutdown_requested():
+            print("  [!] Shutdown requested")
+            break
+
+        idx = entry["idx"]
+        unsigned_file = Path(entry["file"])
+        if not unsigned_file.exists():
+            print(f"  [!] Missing unsigned TX: {unsigned_file}")
             continue
-        amt = Decimal(tx["amt"])
-        if args.bump:
-            amt *= (Decimal(1) + Decimal(args.bump) / Decimal(100))
-        blob_path = Path(args.outdir) / f"tx_{idx}.blob"
 
-        # build batch file for wallet-cli
-        with tempfile.NamedTemporaryFile("w", delete=False) as batch:
-            batch.write(f"transfer {tx['dst']} {amt} 0 '{tx['extra']}' filename {blob_path}\n")
-        # sign
-        subprocess.run([
-            args.wallet_cli, "--wallet-file", args.wallet_file, "--offline",
-            "--command", f"batch < {batch.name}"
-        ], check=True, shell=True)
+        # Verify hash
+        actual_hash = hashlib.sha256(unsigned_file.read_text().encode()).hexdigest()
+        if actual_hash != entry["hash"]:
+            print(f"  [!] TX {idx}: hash mismatch - file may be corrupted!")
+            continue
 
-        if not blob_path.exists():
-            sys.exit(f"[!] Blob not created for TX {idx}")
+        signed_file = signed_dir / f"tx_{idx}.signed"
 
-        # verification loop (check_tx_key) — stub (needs wallet RPC context)
-        # For offline demonstration we hash‑sum verify.
-        sha = hashlib.sha256(open(blob_path, "rb").read()).hexdigest()
-        progress["manifest"].append({
-            "idx": idx, "file": str(blob_path), "hash": sha,
-            "dst": tx['dst'], "amt": str(amt)
-        })
-        progress["last"] = idx
-        _atomic_write(json.dumps(progress, indent=2), progress_file)
-        _ = _hash_line(f"signed | idx={idx} | sha={sha[:12]} | ts={int(time.time())}")
-        print(f"Signed ✓ TX {idx} → {blob_path.name}")
+        print(f"  [*] Signing TX {idx}...")
 
-    # final manifest dump
-    final_manifest = Path(args.outdir)/"signed_manifest_v1.json"
-    _atomic_write(json.dumps(progress["manifest"], indent=2), final_manifest)
-    _ = _hash_line("sign_done")
-    print("All TXs signed & verified.")
-except subprocess.CalledProcessError as e:
-    print("wallet-cli error:", e)
-    sys.exit(1)
+        # Write unsigned data to a temp location wallet-cli can find
+        # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
+        import tempfile
+        work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        try:
+            unsigned_in = Path(work_dir) / "unsigned_monero_tx"
+            unsigned_in.write_text(unsigned_file.read_text())
+
+            cmd = [
+                args.wallet_cli,
+                "--wallet-file", wallet_file,
+                "--password", args.wallet_password or "",
+                "--command", "sign_transfer",
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=120, cwd=work_dir,
+            )
+
+            # sign_transfer creates signed_monero_tx in the working directory
+            signed_out = Path(work_dir) / "signed_monero_tx"
+            if signed_out.exists():
+                signed_data = signed_out.read_bytes()
+                signed_file.write_bytes(signed_data)
+                secure_file_perms(signed_file)
+
+                sha = hashlib.sha256(signed_data).hexdigest()
+                signed_manifest.append({
+                    "idx": idx,
+                    "file": str(signed_file),
+                    "hash": sha,
+                    "dst": entry.get("dst", ""),
+                    "amt": entry.get("amt", ""),
+                    "delay": entry.get("delay", 0),
+                })
+                signed_count += 1
+                print(f"  [+] TX {idx} signed -> {signed_file.name}")
+            else:
+                stderr = result.stderr[:200] if result.stderr else ""
+                stdout = result.stdout[:200] if result.stdout else ""
+                print(f"  [!] TX {idx} signing produced no output")
+                if stderr:
+                    print(f"      stderr: {stderr}")
+                if stdout:
+                    print(f"      stdout: {stdout}")
+        except subprocess.TimeoutExpired:
+            print(f"  [!] TX {idx} signing timed out")
+        except Exception as e:
+            print(f"  [!] TX {idx} signing error: {e}")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    # Write signed manifest
+    final_manifest = signed_dir / "signed_manifest_v1.json"
+    atomic_write_json(signed_manifest, final_manifest)
+
+    integrity_log("signer", f"sign_done:{signed_count}_signed")
+    print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
+    print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
+
+
+def main():
+    install_signal_handlers()
+
+    cli = argparse.ArgumentParser(
+        "airgap_tx_signer v10.5",
+        description="Two-phase Monero TX signer (create unsigned / sign offline)",
+    )
+    cli.add_argument("unsigned_json",
+                     help="unsigned_v1 JSON plan from GhostSpiral")
+    cli.add_argument("--phase", required=True, choices=["create", "sign"],
+                     help="'create' = online: create unsigned TXs via RPC; "
+                          "'sign' = offline: sign with wallet-cli")
+    cli.add_argument("--rpc", default="http://127.0.0.1:18083",
+                     help="monero-wallet-rpc endpoint (phase=create only)")
+    cli.add_argument("--tor-proxy",
+                     help="SOCKS5 proxy (phase=create only)")
+    cli.add_argument("--wallet-cli", default="monero-wallet-cli",
+                     help="Path to monero-wallet-cli (phase=sign only)")
+    cli.add_argument("--wallet-file",
+                     help="Path to full wallet file (phase=sign only)")
+    cli.add_argument("--wallet-password", default="",
+                     help="Wallet password (phase=sign only)")
+    cli.add_argument("--outdir", default="tx_staging",
+                     help="Directory for TX files")
+    cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
+                     help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    args = cli.parse_args()
+
+    plan_path = Path(args.unsigned_json)
+    if not plan_path.exists():
+        sys.exit(f"[!] File not found: {plan_path}")
+
+    plan = _load_unsigned(plan_path)
+    _validate_plan(plan)
+
+    if args.phase == "create":
+        phase_create(args, plan)
+    elif args.phase == "sign":
+        phase_sign(args, plan)
+
+
+if __name__ == "__main__":
+    main()

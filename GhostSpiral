@@ -1,244 +1,644 @@
-GHOST SPIRVAL V10.5
-
-
 #!/usr/bin/env python3
 """
-GhostSpiral v10.5 — Fully‑wired BTC→XMR Mixer Core (working ThorChain + Live RPC)
-==============================================================================
-!!  RESEARCH / RED‑TEAM TOOL  !!
-Never use on main‑net coins you do not own.
+GhostSpiral v10.5 - Fully-wired BTC->XMR Mixer Core
+=====================================================
+!! RESEARCH / RED-TEAM TOOL !!
+Never use on main-net coins you do not own.
 
-Changelog vs v10.0 (this canvas version)
-────────────────────────────────────────
-✓   Wired ThorChain swap wrapper (`stage2_thor_swap()`)
-✓   Added minimal *functional* JoinMarket wrapper (`stage1_joinmarket()`)
-✓   Integrated fee oracle into DAG amount calc → no more "AUTO" placeholder
-✓   Added balance fetch and dust‑sweeper stub (sweeper_v3)
-✓   Connected broadcast + exit helpers via subprocess calls to companion scripts
-    (`airgap_tx_signer.py`, `broadcast_signed_xmr.py`, `exit_strategy_simulator.py`)
-✓   All TODO tags moved to explicit function hooks for future refactor
+End-to-end pipeline:
+  Stage 0: Validate inputs, Tor, RPC sync
+  Stage 1: JoinMarket receive (optional BTC tumble)
+  Stage 2: ThorChain BTC->XMR swap
+  Stage 3: Build wallets & DAG mixing graph
+  Stage 4: Build unsigned TX plan with fee-aware amounts
+  Stage 5: Auto-sign + broadcast (or dump for cold/airgap)
 
-NOTE: This is **not** the final hardened release.  The goal is to demonstrate
-      a *working* pipeline end‑to‑end so the companion scripts can actually run
-      after this core finishes.
+OPSEC hardening (v10.5):
+  - All traffic forced through Tor with leak checks at every stage
+  - NEWNYM circuit rotation between stages
+  - CSPRNG for all security-critical randomness (delays, hex extras)
+  - Timing jitter between operations
+  - Secure file permissions (0600) on all outputs
+  - Signal handlers for graceful shutdown
+  - Integrity hash-chain logging for every action
+  - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, os, random, re, sys, time, hashlib, subprocess
+import argparse, json, os, re, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List
 
-import requests, psutil
-from tenacity import retry, wait_exponential_jitter, stop_after_attempt
-from stem import Signal; from stem.control import Controller
-from monero.wallet import Wallet as XMRWallet
-from monero.backends.jsonrpc import JSONRPCWallet
+from gs_common import (
+    VERSION, integrity_log, verify_tor, tor_recheck, newnym,
+    safe_get, safe_post, connect_rpc, require_resources,
+    secure_hex, secure_delay, atomic_write_json, secure_file_perms,
+    validate_proxy, install_signal_handlers, shutdown_requested,
+    scrub_address,
+)
 
-# ───────────── Static constants ─────────────
-VERSION = "10.5"
 DUST_XMR = Decimal("0.0001")
-BASE_FEE_XMR = Decimal("0.00021")
-HEX = "0123456789abcdef"
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
-BLOCK_API = [
-    "https://blockstream.info/api",
-    "https://mempool.space/api"
+SWAPKIT_API = "https://api.swapkit.dev"
+# Fee oracle endpoints (tried in order; LocalMonero is defunct since 2023)
+FEE_ORACLE_URLS = [
+    "https://moneroblocks.info/api/get_stats",
+    "https://xmrchain.net/api/emission",
 ]
-THOR_API = "https://api.thorswap.net/aggregator"
-CHECK_TOR = "https://check.torproject.org/api/ip"
 
-# ───────────── Helper lambdas / utils ─────────────
-hexstr = lambda n: "0x" + "".join(random.choice(HEX) for _ in range(n*2))
+# Minimum wallets/rounds to provide meaningful mixing
+MIN_WALLETS = 3
+MIN_DEEP = 1
+NUM_DECOYS = 4
 
-def sha256(data:str)->str:
-    return hashlib.sha256(data.encode()).hexdigest()
 
-# ───────────── Integrity logger ─────────────
-INTF = Path("integrity.log")
+def fetch_fee(proxy: Dict[str, str]) -> Decimal:
+    """Fetch current median XMR fee from oracle. Tries multiple sources."""
+    for url in FEE_ORACLE_URLS:
+        try:
+            j = safe_get(url, proxy)
+            # Different APIs return fee in different fields
+            raw_fee = j.get("fee_per_kb_median") or j.get("fee_per_byte")
+            if raw_fee:
+                fee = Decimal(str(raw_fee)) / Decimal(1024)
+                if fee > 0:
+                    return fee
+        except Exception:
+            continue
 
-def _log(stage: str, msg: str):
-    prev = INTF.read_text().splitlines()[-1].split(" | ")[0] if INTF.exists() else "0"*64
-    line = f"{int(time.time())}|{VERSION}|{stage}|{msg}"
-    h = sha256(prev + line)
-    INTF.open("a").write(f"{h} | {line}\n")
+    # All oracles failed - use conservative fallback based on typical XMR fees
+    # (~0.00005 XMR per TX as of 2024-2025)
+    fallback = Decimal("0.00005")
+    integrity_log("fee", "all_oracles_failed:using_fallback")
+    return fallback
 
-# ───────────── Retry wrappers ─────────────
-retry_net = retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4,max=30))
 
-@retry_net
-def safe_get(u:str,p=None):
-    return requests.get(u,timeout=20,proxies=p).json()
+def main():
+    install_signal_handlers()
 
-@retry_net
-def safe_post(u:str,pl:dict,p=None):
-    return requests.post(u,json=pl,timeout=25,proxies=p).json()
+    cli = argparse.ArgumentParser(
+        "GhostSpiral v10.5",
+        description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
+    )
 
-# ───────────── Tor helpers ─────────────
+    mode_group = cli.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--btc-entry",
+                            help="BTC entry address (bech32) — SENDER mode: you own the BTC")
+    mode_group.add_argument("--receive-wallet",
+                            help="gs_receive_wallet_v1 JSON from create_receive_wallet — "
+                                 "RECEIVER mode: XMR already arrived on this address")
 
-def ensure_tor(proxy:Dict[str,str]):
-    info = safe_get(CHECK_TOR, proxy)
-    if not info.get("IsTor"):
-        sys.exit("[!] Tor leak detected — abort.")
+    cli.add_argument("--tor-proxy", required=True,
+                     help="SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050)")
+    cli.add_argument("--joinmarket", action="store_true",
+                     help="Enable JoinMarket tumble before ThorChain swap")
+    cli.add_argument("--split", type=int, default=1,
+                     help="Number of BTC chunks to split across ThorChain")
+    cli.add_argument("--wallets", type=int, default=10,
+                     help=f"Number of mix wallets (min {MIN_WALLETS})")
+    cli.add_argument("--deep", type=int, default=2,
+                     help=f"Depth multiplier for DAG edges (min {MIN_DEEP})")
+    cli.add_argument("--airgap", action="store_true",
+                     help="Dump unsigned plan and stop (manual sign required)")
+    cli.add_argument("--cold", action="store_true",
+                     help="Dump unsigned plan for cold-wallet signing")
+    cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
+                     help="Primary monero-wallet-rpc endpoint")
+    cli.add_argument("--rpc-alt",
+                     help="Fallback monero-wallet-rpc endpoint")
+    cli.add_argument("--output", default="./unsigned",
+                     help="Output directory for unsigned TX plans")
+    cli.add_argument("--joinmarket-wallet",
+                     help="JoinMarket wallet file for tumbles")
+    cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
+                     help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    args = cli.parse_args()
 
-_DEF_CTRL="/var/run/tor/control"
+    # ---- Determine mode ----
+    receive_mode = bool(args.receive_wallet)
+    receive_entry_addr = None
+    receive_account_index = 0
 
-def newnym(ctrl:str=_DEF_CTRL):
-    try:
-        with Controller.from_socket_file(ctrl) as c:
-            c.authenticate(); c.signal(Signal.NEWNYM)
-    except Exception:
-        _log("tor","NEWNYM_fail")
-
-# ───────────── Fee oracle v3 ─────────────
-@retry_net
-def fetch_fee(proxy):
-    j=safe_get("https://localmonero.co/blocks/api/get_stats",proxy)
-    return Decimal(str(j["fee_per_kb_median"]))/Decimal(1024)
-
-# ───────────── Resource sentinel v3 ─────────────
-
-def resource_ok():
-    mem=psutil.virtual_memory(); cpu=psutil.cpu_percent(interval=1); disk=psutil.disk_usage(".")
-    return mem.percent<90 and cpu<90 and disk.free>2*1024**3
-
-# ───────────── CLI ─────────────
-cli=argparse.ArgumentParser("GhostSpiral v10.5")
-cli.add_argument("--btc-entry", required=True)
-cli.add_argument("--tor-proxy", required=True)
-cli.add_argument("--joinmarket", action="store_true")
-cli.add_argument("--split", type=int, default=1)
-cli.add_argument("--wallets", type=int, default=10)
-cli.add_argument("--deep", type=int, default=2)
-cli.add_argument("--airgap", action="store_true")
-cli.add_argument("--cold", action="store_true")
-cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083")
-cli.add_argument("--rpc-alt")
-cli.add_argument("--output", default="./unsigned")
-cli.add_argument("--joinmarket-wallet", help="JM wallet file for tumbles")
-args=cli.parse_args()
-
-proxy={"http":args.tor_proxy,"https":args.tor_proxy}
-ensure_tor(proxy)
-
-if not BTC_RE.match(args.btc_entry):
-    sys.exit("Invalid BTC entry address")
-_log("stage0","btc_entry_validated")
-
-FEE_XMR = fetch_fee(proxy)
-
-# ───────────── RPC connect w/ fallback ─────────────
-
-def connect_rpc(url:str):
-    port=int(url.rsplit(":",1)[-1])
-    return XMRWallet(JSONRPCWallet(port=port))
-
-rpc_primary = connect_rpc(args.rpc_primary)
-rpc_alt     = connect_rpc(args.rpc_alt) if args.rpc_alt else None
-
-# sync guard
-for _ in range(30):
-    h1=rpc_primary.raw_request("get_height",{})["height"]
-    if rpc_alt:
-        h2=rpc_alt.raw_request("get_height",{})["height"]
-        if abs(h1-h2)<=2: break
+    if receive_mode:
+        rw_path = Path(args.receive_wallet)
+        if not rw_path.exists():
+            sys.exit(f"[!] Receive wallet file not found: {rw_path}")
+        with open(rw_path) as f:
+            rw_data = json.load(f)
+        if rw_data.get("schema") != "gs_receive_wallet_v1":
+            sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
+        receive_entry_addr = rw_data.get("address")
+        receive_account_index = rw_data.get("account_index", 0)
+        if not receive_entry_addr:
+            sys.exit("[!] Receive wallet JSON missing 'address' field")
+        integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
+        print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
+        if args.joinmarket:
+            sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
     else:
-        if h1: break
-    time.sleep(10)
-else:
-    sys.exit("RPC nodes out of sync; abort.")
-_log("stage0","rpc_sync_ok")
+        if not BTC_RE.match(args.btc_entry):
+            sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
+        integrity_log("stage0", "btc_entry_validated")
 
-###############################################################################
-# Stage 1 – JoinMarket receive wrapper
-###############################################################################
+    # ---- Validate inputs early ----
+    args.wallets = max(args.wallets, MIN_WALLETS)
+    args.deep = max(args.deep, MIN_DEEP)
 
-def stage1_joinmarket(btc_addr:str):
-    """Return list of clean UTXO amounts after tumble (mock if disabled)."""
-    if not args.joinmarket:
-        return [Decimal("0.0")]  # placeholder to keep pipeline simple
-    # Minimal stub; assumes external tumble.py present
+    proxy = validate_proxy(args.tor_proxy)
+
+    # ---- Stage 0: Environment checks ----
+    require_resources(min_disk_gb=2.0)
+    verify_tor(proxy)
+    integrity_log("stage0", "tor_ok")
+
+    fee_xmr = fetch_fee(proxy)
+    integrity_log("stage0", "fee_fetched")
+
+    rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
+
+    # Sync guard: wait for nodes to agree on height
+    for attempt in range(30):
+        if shutdown_requested():
+            sys.exit("[!] Shutdown requested during sync wait.")
+        try:
+            h1 = rpc_primary.raw_request("get_height", {})["height"]
+            if rpc_alt:
+                h2 = rpc_alt.raw_request("get_height", {})["height"]
+                if abs(h1 - h2) <= 2:
+                    break
+            else:
+                if h1 > 0:
+                    break
+        except Exception as e:
+            integrity_log("stage0", f"rpc_height_err:{str(e)[:40]}")
+        time.sleep(10)
+    else:
+        sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
+    integrity_log("stage0", f"rpc_sync_ok:height={h1}")
+
+    ###########################################################################
+    # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
+    ###########################################################################
+    newnym()
+
+    def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
+        if not args.joinmarket:
+            integrity_log("stage1", "JM_skipped")
+            return []
+        if not args.joinmarket_wallet:
+            sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
+        try:
+            # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
+            # --socks5-host/port to be explicit (JM >= 0.9 supports this).
+            # Without this, JM may resolve maker addresses over clearnet.
+            from urllib.parse import urlparse as _urlparse
+            _parsed_proxy = _urlparse(args.tor_proxy)
+            result = subprocess.run(
+                ["python3", "tumble.py",
+                 "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
+                 "--socks5-port", str(_parsed_proxy.port or 9050),
+                 args.joinmarket_wallet, btc_addr, "all"],
+                check=True, capture_output=True, text=True, timeout=3600,
+            )
+            integrity_log("stage1", "JM_tumble_OK")
+            # TODO: parse actual UTXO amounts from result.stdout
+            # For now return empty - operator must check JM output manually
+            return []
+        except subprocess.TimeoutExpired:
+            integrity_log("stage1", "JM_timeout")
+            sys.exit("[!] JoinMarket tumble timed out after 1 hour")
+        except FileNotFoundError:
+            integrity_log("stage1", "JM_not_found")
+            sys.exit("[!] tumble.py not found - JoinMarket not installed?")
+        except subprocess.CalledProcessError as e:
+            integrity_log("stage1", f"JM_fail:{e.returncode}")
+            sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
+
+    if receive_mode:
+        jm_utxos = []
+        integrity_log("stage1", "skipped:receive_mode")
+    else:
+        jm_utxos = stage1_joinmarket(args.btc_entry)
+    integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
+
+    ###########################################################################
+    # Stage 2 - ThorChain swap definition
+    ###########################################################################
+
+    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
+        """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
+
+        Uses the REAL SwapKit v3 API (https://docs.swapkit.dev):
+          POST /v3/quote
+          Body: {sellAsset, buyAsset, sellAmount, destinationAddress}
+          Response: {quoteId, routes: [{..., expectedOutput, depositAddress, memo}]}
+
+        Returns list of deposit instructions for the operator.
+        The operator must MANUALLY send BTC to each deposit address.
+        """
+        deposits = []
+        for i, amt in enumerate(chunks):
+            if shutdown_requested():
+                integrity_log("stage2", f"shutdown_at_chunk_{i}")
+                sys.exit("[!] Shutdown requested during quote fetch.")
+
+            if amt <= Decimal(0):
+                continue
+
+            if i > 0:
+                newnym()
+                secure_delay(3.0, 10.0)
+
+            # SwapKit v3 API uses sellAsset/buyAsset not from/to
+            payload = {
+                "sellAsset": "BTC.BTC",
+                "buyAsset": "XMR.XMR",
+                "sellAmount": str(amt),
+                "destinationAddress": xmr_dest,
+            }
+
+            try:
+                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+            except Exception as e:
+                newnym()
+                integrity_log("stage2", f"quote_api_error:{i}")
+                sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
+
+            # Parse the routes from the response
+            routes = quote_resp.get("routes", [])
+            if not routes:
+                error = quote_resp.get("error", "unknown")
+                provider_errors = quote_resp.get("providerErrors", [])
+                integrity_log("stage2", f"no_routes_chunk_{i}")
+                sys.exit(
+                    f"[!] No swap routes available for chunk {i}.\n"
+                    f"    Error: {str(error)[:80]}\n"
+                    f"    Provider errors: {str(provider_errors)[:120]}"
+                )
+
+            # Use the first (best) route
+            route = routes[0]
+            expected_output = route.get("expectedOutput", "0")
+            # The actual deposit details come from executing the route
+            # For THORChain routes, the deposit info is in the route's transaction object
+            tx_info = route.get("transaction", route.get("calldata", {}))
+            deposit_addr = tx_info.get("depositAddress", tx_info.get("to", ""))
+            memo = tx_info.get("memo", tx_info.get("data", ""))
+
+            if not deposit_addr:
+                integrity_log("stage2", f"no_deposit_in_route_{i}")
+                sys.exit(f"[!] Route has no deposit address for chunk {i}")
+
+            expected_dec = Decimal(str(expected_output))
+
+            deposit_info = {
+                "chunk": i,
+                "btc_amount": str(amt),
+                "deposit_address": deposit_addr,
+                "memo": str(memo),
+                "expected_xmr": str(expected_dec),
+                "quote_id": quote_resp.get("quoteId", ""),
+            }
+            deposits.append(deposit_info)
+
+            print(f"  [*] Chunk {i}/{len(chunks)-1}:")
+            print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
+            if memo:
+                print(f"      With memo: {str(memo)[:40]}...")
+            print(f"      Expected: ~{expected_dec} XMR")
+            integrity_log("stage2", f"quote_ready:{i}")
+
+            secure_delay(5.0, 15.0)
+
+        return deposits
+
+    ###########################################################################
+    # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
+    # the ENTRY receive address exists for ThorChain destination)
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage3_pre")
+
+    sub_account = receive_account_index if receive_mode else 0
+
+    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> List[str]:
+        subs = []
+        for i in range(n):
+            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Mix_{i}")
+            subs.append(addr)
+        for d in range(decoys):
+            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Decoy_{d}")
+            subs.append(addr)
+        return subs
+
+    subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
+    if len(subs) < MIN_WALLETS + 1:
+        sys.exit("[!] Failed to create enough subaddresses")
+
+    if receive_mode:
+        ENTRY = receive_entry_addr
+        if ENTRY in subs:
+            subs.remove(ENTRY)
+        subs.insert(0, ENTRY)
+        integrity_log("stage3", "entry_reused_from_receive_wallet")
+        print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
+    else:
+        ENTRY = subs[0]
+        integrity_log("stage3", "entry_created")
+
+    import secrets as _secrets
+    _secrets.SystemRandom().shuffle(subs)
+
+    ###########################################################################
+    # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage2_exec")
+
+    if receive_mode:
+        integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
+        print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
+        print(f"  [+] Entry address: {scrub_address(ENTRY)}")
+    else:
+        # Determine what BTC chunks to swap:
+        # - If JoinMarket produced UTXOs, use those
+        # - If --split > 1, operator plans to manually split their BTC
+        # - Otherwise this is a direct single-chunk flow
+        # NOTE: ThorChain swap produces deposit addresses for the operator
+        # to manually send BTC to. The operator must do the actual BTC send.
+        if jm_utxos:
+            btc_chunks = jm_utxos
+        elif args.split >= 1:
+            print(f"\n  [!] No JoinMarket UTXOs. Generating {args.split} ThorChain deposit(s).")
+            print(f"  [!] You must manually send BTC to the deposit addresses below.")
+            print(f"  [!] XMR will arrive at ENTRY address after ThorChain processes.")
+            btc_chunks = []
+        else:
+            btc_chunks = []
+
+        if btc_chunks:
+            swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
+            integrity_log("stage2", "swap_quotes_generated")
+            total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+            print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+            print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+            print(f"  [!] YOU MUST manually send BTC to each deposit address above!")
+            print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
+        else:
+            integrity_log("stage2", "manual_mode")
+            print(f"\n  [!] MANUAL MODE: Send BTC through ThorChain to your ENTRY address.")
+            print(f"  [!] Use thor_swap_preparer to generate deposit addresses.")
+            print(f"  [!] Then wait for XMR to arrive and confirm before proceeding.")
+
+    dag = {}
+    for a in subs:
+        others = [b for b in subs if b != a]
+        max_k = len(others)
+        k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
+        k = max(k, 1)
+        chosen = []
+        pool = list(others)
+        for _ in range(k):
+            idx = _secrets.randbelow(len(pool))
+            chosen.append(pool.pop(idx))
+        dag[a] = chosen
+    integrity_log("stage3", "dag_built")
+
+    ###########################################################################
+    # Stage 4 - Balance, amounts, plan
+    ###########################################################################
+
+    bal_account = receive_account_index if receive_mode else 0
+
+    def xmr_balance() -> tuple[Decimal, Decimal]:
+        """Returns (total_balance, unlocked_balance) in XMR."""
+        res = rpc_primary.raw_request(
+            "get_balance", {"account_index": bal_account, "address_indices": []}
+        )
+        total = Decimal(str(res.get("balance", 0))) / Decimal(10 ** 12)
+        unlocked = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        return total, unlocked
+
+    total_bal, unlocked_bal = xmr_balance()
+    integrity_log("stage4", "balance_fetched")
+
+    if total_bal > unlocked_bal + DUST_XMR:
+        print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
+
+    bal = unlocked_bal
+    if bal <= DUST_XMR:
+        if args.cold or args.airgap:
+            print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
+            print("[!] DO NOT sign/broadcast this plan without real funds!")
+            bal = Decimal("10.0")
+            integrity_log("stage4", "mock_balance:dry_run_only")
+        else:
+            sys.exit(
+                f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
+                f"    Cannot create a real TX plan without funds.\n"
+                f"    Total balance: {total_bal} XMR (may be locked/unconfirmed).\n"
+                f"    Use --cold or --airgap for dry-run planning."
+            )
+
+    rounds = args.wallets * 2 * args.deep
+    per_round_fee = fee_xmr * Decimal("1.5")  # 1 TX/round + 50% safety margin for fee spikes
+    total_fees = per_round_fee * rounds
+    usable = bal - total_fees
+
+    if usable <= DUST_XMR:
+        sys.exit(
+            f"[!] Balance {bal} XMR insufficient.\n"
+            f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
+            f"    Usable after fees: {usable} XMR"
+        )
+
+    split_amt = usable / Decimal(rounds)
+    integrity_log("stage4", "plan_calculated")
+
+    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
+    quantized_split = split_amt.quantize(Decimal("0.0001"))
+    total_planned = quantized_split * rounds
+    if total_planned > usable:
+        quantized_split -= Decimal("0.0001")
+        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
+
+    plan = []
+
+    # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
+    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
+    # deposits to ENTRY. Either way, we must spread funds outward before
+    # the random DAG mixing can function (otherwise src addresses have no
+    # balance and every TX fails).
+    mix_targets = [s for s in subs if s != ENTRY]
+    fanout_count = min(len(mix_targets), args.wallets)
+    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+    if fanout_amt <= DUST_XMR:
+        sys.exit(
+            f"[!] Usable balance {usable} XMR too small to fan out across "
+            f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
+        )
+    for fi in range(fanout_count):
+        if shutdown_requested():
+            integrity_log("stage4", f"shutdown_at_fanout_{fi}")
+            break
+        plan.append({
+            "src": ENTRY,
+            "dst": mix_targets[fi],
+            "amt": str(fanout_amt),
+            "delay": _secrets.randbelow(540) + 180,
+            "extra": secure_hex(16),
+        })
+    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:amt_each={fanout_amt}")
+
+    # Phase B: DAG mixing — random hops between mix subaddresses.
+    # Recalculate per-round amount from the remaining balance after fan-out.
+    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    dag_rounds = max(rounds - fanout_count, args.wallets)
+    if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
+        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+        if dag_split <= DUST_XMR:
+            dag_split = DUST_XMR
+        for r in range(dag_rounds):
+            if shutdown_requested():
+                integrity_log("stage4", f"shutdown_at_round_{r}")
+                break
+            src_idx = _secrets.randbelow(len(mix_targets))
+            s = mix_targets[src_idx]
+            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+            if not dst_candidates:
+                continue
+            dst_idx = _secrets.randbelow(len(dst_candidates))
+            d = dst_candidates[dst_idx]
+            plan.append({
+                "src": s,
+                "dst": d,
+                "amt": str(dag_split),
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+            })
+    else:
+        integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
+
+    meta = {
+        "schema": "unsigned_v1",
+        "version": VERSION,
+        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "rounds": len(plan),
+        "fee_per_round": str(per_round_fee),
+        "total_fees": str(total_fees),
+    }
+    unsigned = {"meta": meta, "txs": plan}
+
+    outdir = Path(args.output)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ufile = outdir / f"unsigned_{secure_hex(8)}.json"
+    atomic_write_json(unsigned, ufile)
+    integrity_log("stage4", "unsigned_dump_saved")
+    print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
+
+    if args.cold or args.airgap:
+        mode = "cold" if args.cold else "airgap"
+        for stale in ["signer_progress.json", "broadcast_progress.json"]:
+            stale_path = Path(stale)
+            if stale_path.exists():
+                stale_path.unlink()
+                integrity_log("stage4", f"cleaned_stale:{stale}")
+        print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
+        integrity_log("stage4", f"{mode}_exit")
+        sys.exit(0)
+
+    ###########################################################################
+    # Stage 5 - Auto sign + broadcast
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage5_pre")
+
+    # Clean stale progress files from prior runs to prevent poisoning
+    for stale in ["signer_progress.json", "broadcast_progress.json"]:
+        stale_path = Path(stale)
+        if stale_path.exists():
+            stale_path.unlink()
+            integrity_log("stage5", f"cleaned_stale:{stale}")
+
+    # Clean old signed blobs directory
+    signed_dir = Path("signed_blobs")
+    if signed_dir.is_dir():
+        import shutil
+        shutil.rmtree(signed_dir)
+        integrity_log("stage5", "cleaned_old_signed_blobs")
+
+    # Lock file to prevent concurrent runs
+    lock_path = Path(".ghostspiral.lock")
+    if lock_path.exists():
+        sys.exit(
+            "[!] Lock file exists: .ghostspiral.lock\n"
+            "    Another GhostSpiral instance may be running.\n"
+            "    If not, delete the lock file manually."
+        )
+    lock_path.write_text(str(os.getpid()))
+    secure_file_perms(lock_path)
+
     try:
-        subprocess.run(["python","tumble.py",args.joinmarket_wallet,btc_addr,"all"],check=True)
-        _log("stage1","JM_tumble_OK")
+        print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
+        sign_cmd = [
+            "python3", "airgap_tx_signer", str(ufile),
+            "--phase", "create",
+            "--rpc", args.rpc_primary,
+            "--tor-proxy", args.tor_proxy,
+            "--outdir", "tx_staging",
+            f"--fee-priority={args.fee_priority}" if hasattr(args, 'fee_priority') else "--fee-priority=1",
+        ]
+        subprocess.run(sign_cmd, check=True, timeout=1800)
+        integrity_log("stage5", "signer_ok")
+    except subprocess.TimeoutExpired:
+        integrity_log("stage5", "signer_timeout")
+        sys.exit("[!] Signer timed out after 30 min")
+    except subprocess.CalledProcessError as e:
+        integrity_log("stage5", f"signer_fail:{e.returncode}")
+        sys.exit(f"[!] Signer failed (exit {e.returncode})")
+
+    newnym()
+    secure_delay(5.0, 15.0)
+
+    try:
+        print("  [*] Stage 5b: Broadcasting signed TXs...")
+        subprocess.run(
+            ["python3", "broadcast_signed_xmr", "tx_staging/signed",
+             "--tor-proxy", args.tor_proxy],
+            check=True, timeout=7200,
+        )
+        integrity_log("stage5", "broadcast_ok")
+    except subprocess.TimeoutExpired:
+        integrity_log("stage5", "broadcast_timeout")
+        sys.exit("[!] Broadcast timed out after 2 hours")
+    except subprocess.CalledProcessError as e:
+        integrity_log("stage5", f"broadcast_fail:{e.returncode}")
+        sys.exit(f"[!] Broadcast failed (exit {e.returncode})")
+
+    newnym()
+    secure_delay(5.0, 15.0)
+
+    try:
+        print("  [*] Stage 5c: Exit strategy simulation...")
+        subprocess.run(
+            ["python3", "exit_strategy_simulator", str(bal),
+             "--method", "bisq", "--tor-proxy", args.tor_proxy],
+            check=True, timeout=300,
+        )
+        integrity_log("stage5", "exit_sim_ok")
     except Exception as e:
-        _log("stage1","JM_fail")
-        sys.exit(f"JoinMarket failed: {e}")
-    # TODO: parse output UTXOs
-    return [Decimal("0.0")]
+        integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
+        print(f"  [!] Exit simulation failed (non-fatal): {e}")
 
-###############################################################################
-# Stage 2 – ThorChain swap wrapper
-###############################################################################
+    integrity_log("stage5", "full_pipeline_complete")
 
-def stage2_thor_swap(btc_chunks:List[Decimal], xmr_dest:str):
-    """For every BTC chunk call ThorChain and wait until XMR arrives."""
-    received_total = Decimal(0)
-    for i, amt in enumerate(btc_chunks):
-        payload={"from":"BTC.BTC","to":"XMR.XMR","amount":str(amt),"destination":xmr_dest}
-        quote=safe_post(f"{THOR_API}/swap",payload,proxy)
-        deposit=quote.get("deposit")
-        memo   =quote.get("memo","")
-        print(f"[🌀] Send {amt} BTC → {deposit} (memo {memo[:12]}…)")
-        _log("stage2",f"thor_deposit_{i}:{deposit[:12]}")
-        # In production we would watch mempool + ThorChain WS until XMR hits dest.
-        # Here we just sleep‑mock:
-        time.sleep(random.randint(5,10))
-        received_total += Decimal(str(quote.get("expected_amount_out","0")))
-    return received_total
+    # Clean up lock file
+    if lock_path.exists():
+        lock_path.unlink()
 
-###############################################################################
-# Stage 3 – Build wallets & DAG
-###############################################################################
+    print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
-def create_subs(wallet:XMRWallet,n:int,decoys:int)->List[str]:
-    subs=[wallet.accounts[0].new_subaddress(label=f"Mix_{i}").address for i in range(n)]
-    subs+=[wallet.accounts[0].new_subaddress(label=f"Decoy_{d}").address for d in range(decoys)]
-    return subs
 
-subs=create_subs(rpc_primary,args.wallets,4)
-ENTRY=subs[0]
-_log("stage3","entry_created")
-random.shuffle(subs)
-dag={a:random.sample([b for b in subs if b!=a],k=random.randint(1,3)*args.deep) for a in subs}
-_log("stage3","dag_built")
-
-###############################################################################
-# Stage 4 – Pull balance, calc amounts, build plan
-###############################################################################
-
-def xmr_balance(addr:str)->Decimal:
-    res=rpc_primary.raw_request("get_balance",{"account_index":0,"address_indices":[]})
-    return Decimal(str(res.get("balance",0)))/Decimal(1e12)
-
-bal=xmr_balance(ENTRY)
-if bal<=0:
-    bal=Decimal("10.0")  # mock balance for dry demonstration
-
-rounds=args.wallets*2*args.deep
-split=bal/Decimal(rounds)
-plan=[]
-for _ in range(rounds):
-    s=random.choice(subs); d=random.choice(dag[s])
-    plan.append({"src":s,"dst":d,"amt":str(split.quantize(Decimal("0.0001"))),"delay":random.randint(180,720),"extra":hexstr(16)})
-
-meta={"schema":"unsigned_v1","version":VERSION,"created":int(time.time()),"rounds":rounds}
-unsigned={"meta":meta,"txs":plan}
-
-outdir=Path(args.output); outdir.mkdir(parents=True,exist_ok=True)
-ufile=outdir/f"unsigned_{int(time.time())}.json"
-with open(ufile,"w") as f: json.dump(unsigned,f,indent=2)
-_log("stage4",f"unsigned_dump:{ufile.name}")
-
-###############################################################################
-# Stage 5 – Optionally call air‑gap signer & broadcaster automatically
-###############################################################################
-if not args.cold and not args.airgap:
-    # 1. sign
-    subprocess.run(["python3","airgap_tx_signer.py",str(ufile),"--wallet-file","offline.wallet","--outdir","signed_blobs"],check=True)
-    # 2. broadcast
-    subprocess.run(["python3","broadcast_signed_xmr.py","signed_blobs","--tor-proxy",args.tor_proxy],check=True)
-    # 3. exit sim (example  exit via bisq )
-    subprocess.run(["python3","exit_strategy_simulator.py",str(bal),"--method","bisq","--tor-proxy",args.tor_proxy],check=True)
-    _log("stage5","auto_fullflow_done")
-
-print("[✓] GhostSpiral v10.5 plan complete — next: sign & broadcast")
+if __name__ == "__main__":
+    main()

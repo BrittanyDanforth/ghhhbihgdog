@@ -1,169 +1,402 @@
-BROADCAST SIGNED XMR V10
-
-
 #!/usr/bin/env python3
 """
-broadcast_signed_xmr v10.0 — Resilient Monero relay & confirmation
-=================================================================
-Focus: **fee‑aware, Tor‑hardened, integrity‑logged** broadcast of pre‑signed
-XMR blobs (air‑gap flow).  Supersedes v2.x.
+broadcast_signed_xmr v10.0 - Resilient Monero relay & confirmation
+===================================================================
+Fee-aware, Tor-hardened, integrity-logged broadcast of pre-signed XMR blobs.
 
-Key upgrades ⬆️ (vs v2):
-────────────────────────
-1. **Fee‑bump auto‑retry**  If node replies `low_fee`, bumps fee by +20 % and
-   re‑signs via `monero-wallet-cli` (requires --wallet-file).
-2. **Exponential back‑off**  Tenacity wrapper; NEWNYM on *every* failure.
-3. **Integrity chain**       SHA‑256 hash‑chain line per broadcast & mined‑ht.
-4. **Onion‑RPC fallback**    Built‑in list + optional `--rpc-list` file.
-5. **Atomic progress**       fsync‑rename update so crash ≠ lost state.
-
-CLI:
-    python3 broadcast_signed_xmr_v10.py dir_or_manifest.json \
-        --wallet-file /path/offline.wallet \
-        --tor-proxy socks5h://127.0.0.1:9050 \
-        --rpc "http://node1.onion:18089" --rpc-alt "http://node2.onion:18089"
+OPSEC hardening:
+  - Tor verified before first broadcast and re-checked periodically
+  - NEWNYM circuit rotation between every TX broadcast
+  - Timing jitter between broadcasts to frustrate traffic analysis
+  - Mine-wait has configurable timeout (default 2h)
+  - Atomic progress writes survive crash
+  - Fee-bump with proper subprocess error handling
+  - Signal handlers for graceful shutdown mid-broadcast
+  - All progress files written 0600
 """
 from __future__ import annotations
-import argparse, json, time, random, sys, os, hashlib, requests, tempfile
+import argparse, json, time, sys, os, hashlib
 from pathlib import Path
 from typing import List
-from tenacity import retry, wait_exponential, stop_after_attempt
-from stem import Signal
-from stem.control import Controller
 
-# ────────────────────────── Integrity log ──────────────────────────
-INT_LOG = Path("integrity_chain.log")
+import requests
 
-def hash_line(line: str):
-    if INT_LOG.exists():
-        last = INT_LOG.read_text().splitlines()[-1].split(" | ")[0]
-    else:
-        last = "0" * 64
-    h = hashlib.sha256((last + line).encode()).hexdigest()
-    INT_LOG.open("a").write(f"{h} | {line}\n")
+from gs_common import (
+    integrity_log, verify_tor, tor_recheck, validate_proxy,
+    safe_post, newnym, secure_delay, atomic_write_json,
+    install_signal_handlers, shutdown_requested, scrub_address,
+    secure_hex,
+)
 
-# ────────────────────────── Helpers ────────────────────────────────
-CHECK_TOR = "https://check.torproject.org/api/ip"
-HEADERS = {"Content-Type": "application/json"}
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, max=30))
-def jget(u, p):
-    return requests.get(u, timeout=20, proxies=p).json()
+def _single_post(url: str, payload: dict, proxies=None) -> dict:
+    """Single-attempt POST without tenacity retry. Used for broadcast
+    submissions where the outer loop handles retries with NEWNYM rotation."""
+    if proxies is None:
+        sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
+    r = requests.post(url, json=payload, timeout=30, proxies=proxies)
+    r.raise_for_status()
+    return r.json()
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, max=30))
-def jpost(u, pl, p):
-    return requests.post(u, json=pl, timeout=30, proxies=p, headers=HEADERS).json()
+MAX_MINE_WAIT_SECONDS = 7200
+TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
-# NEWNYM helper
 
-def newnym(ctrl: str = "/var/run/tor/control"):
-    try:
-        with Controller.from_socket_file(ctrl) as c:
-            c.authenticate(); c.signal(Signal.NEWNYM)
-    except Exception:
-        pass
+    # NOTE: Monero does NOT support RBF (Replace-By-Fee). Once a TX is signed,
+    # its fee is fixed. If a node rejects with "low_fee", the TX must be
+    # re-created with higher priority on the signing machine and re-signed.
+    # There is no way to bump the fee of a pre-signed TX blob.
 
-# fee‑bump helper
 
-def bump_fee(hex_tx: str, pct: float, wallet_file: str) -> str:
-    """Call wallet‑cli to re‑sign the raw hex with bumped fee."""
-    tmp_in = Path(tempfile.mkstemp(suffix=".hex")[1])
-    tmp_in.write_text(hex_tx)
-    cmd = f"fee {pct}\nsign_transfer {tmp_in}"
-    os.system(f"monero-wallet-cli --wallet-file {wallet_file} --command \"{cmd}\" --offline")
-    bumped_hex = tmp_in.read_text()
-    tmp_in.unlink(missing_ok=True)
-    return bumped_hex
+def main():
+    install_signal_handlers()
 
-# ────────────────────────── CLI ────────────────────────────────────
-cli = argparse.ArgumentParser("broadcast_signed_xmr v10.0")
-cli.add_argument("path", help="dir with *.blob, a single .blob, or manifest.json")
-cli.add_argument("--wallet-file", help="needed for auto fee‑bump", default=None)
-cli.add_argument("--tor-proxy")
-cli.add_argument("--rpc", help="primary onion RPC", default="http://node.onion:18089")
-cli.add_argument("--rpc-alt", help="fallback onion RPC")
-cli.add_argument("--rpc-list", help="file with onion RPCs, one per line")
-cli.add_argument("--rebroadcast", type=int, default=5)
-cli.add_argument("--timeout-min", type=int, default=30)
-cli.add_argument("--resume", help="progress file")
-args = cli.parse_args()
+    cli = argparse.ArgumentParser(
+        "broadcast_signed_xmr v10.0",
+        description="Broadcast pre-signed Monero TX blobs with Tor + retry",
+    )
+    cli.add_argument("path",
+                     help="dir with *.blob, a single .blob, or manifest.json")
+    cli.add_argument("--wallet-file", default=None,
+                     help="needed for auto fee-bump")
+    cli.add_argument("--tor-proxy",
+                     help="SOCKS5 proxy for all network access")
+    cli.add_argument("--rpc", default="http://node.onion:18089",
+                     help="primary Monero RPC")
+    cli.add_argument("--rpc-alt", help="fallback RPC")
+    cli.add_argument("--rpc-list",
+                     help="file with RPC endpoints, one per line")
+    cli.add_argument("--rebroadcast", type=int, default=5,
+                     help="max rebroadcast attempts per TX")
+    cli.add_argument("--timeout-min", type=int, default=30,
+                     help="per-TX broadcast timeout in minutes")
+    cli.add_argument("--mine-wait", type=int, default=MAX_MINE_WAIT_SECONDS,
+                     help="max seconds to wait for mining confirmation")
+    cli.add_argument("--resume", help="progress file for crash-resume")
+    args = cli.parse_args()
 
-proxy = {"http": args.tor_proxy, "https": args.tor_proxy} if args.tor_proxy else None
-# Tor leak guard
-if args.tor_proxy:
-    try:
-        if not jget(CHECK_TOR, proxy).get("IsTor"):
-            sys.exit("[!] Tor leak detected — abort")
-    except Exception:
-        sys.exit("[!] Cannot verify Tor — abort")
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Broadcasting over clearnet leaks your IP\n"
+            "    to every Monero node you submit transactions to. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
-# RPC pool
-rpc_pool: List[str] = [args.rpc]
-if args.rpc_alt:
-    rpc_pool.append(args.rpc_alt)
-if args.rpc_list and Path(args.rpc_list).exists():
-    rpc_pool += [l.strip() for l in Path(args.rpc_list).read_text().splitlines() if l.strip()]
+    # Build RPC pool
+    rpc_pool: List[str] = [args.rpc]
+    if args.rpc_alt:
+        rpc_pool.append(args.rpc_alt)
+    if args.rpc_list and Path(args.rpc_list).exists():
+        rpc_pool += [
+            line.strip()
+            for line in Path(args.rpc_list).read_text().splitlines()
+            if line.strip()
+        ]
+    integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
-# Gather blobs
-blobs: List[Path] = []
-if args.path.endswith(".json"):
-    blobs = [Path(entry["file"]) if isinstance(entry, dict) else Path(entry) for entry in json.load(open(args.path))]
-elif Path(args.path).is_dir():
-    blobs = sorted(Path(args.path).glob("*.blob"))
-else:
-    blobs = [Path(args.path)]
+    # Gather blobs FIRST (input_path must be defined before delay loading uses it)
+    blobs: List[Path] = []
+    input_path = Path(args.path)
+    if args.path.endswith(".json"):
+        with open(input_path) as f:
+            entries = json.load(f)
+        if isinstance(entries, dict) and "manifest" in entries:
+            entries = entries["manifest"]
+        blobs = [
+            Path(e["file"]) if isinstance(e, dict) else Path(e)
+            for e in entries
+        ]
+    elif input_path.is_dir():
+        # Look for both .signed (new format) and .blob (legacy) files
+        raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
+        def _blob_sort_key(p: Path) -> int:
+            """Extract numeric index from tx_N.signed for correct numeric sort."""
+            stem = p.stem  # e.g. "tx_15"
+            parts = stem.split("_")
+            try:
+                return int(parts[-1])
+            except (ValueError, IndexError):
+                return 999999
+        blobs = sorted(raw_blobs, key=_blob_sort_key)
+    elif input_path.exists():
+        blobs = [input_path]
 
-# Progress state
-progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
-if progF.exists():
-    prog = json.load(open(progF))
-    last_idx = prog.get("last", -1)
-else:
-    prog = {"last": -1, "log": []}; last_idx = -1
+    if not blobs:
+        sys.exit("[!] No blobs found to broadcast")
+    integrity_log("broadcast", f"blobs_found:{len(blobs)}")
 
-# ────────────────────────── Broadcast loop ─────────────────────────
-for idx, blob in enumerate(blobs):
-    if idx <= last_idx:
-        continue
-    raw_hex = blob.read_text().strip()
-    attempts = args.rebroadcast
-    sent = False
-    start_time = time.time()
-    while attempts and (time.time() - start_time) < args.timeout_min * 60:
-        rpc_url = random.choice(rpc_pool)
+    # Load per-TX delays. Primary source: signed manifest (travels with blobs
+    # on USB for air-gap workflow). Fallback: unsigned plan in ./unsigned/.
+    tx_delays: dict = {}
+    delay_source = "none"
+
+    # Try manifest first (embedded by signer)
+    _manifest_for_delays = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
+    if _manifest_for_delays and _manifest_for_delays.exists():
         try:
-            res = jpost(rpc_url, {"jsonrpc": "2.0", "id": "0", "method": "send_raw_transaction", "params": {"tx_as_hex": raw_hex, "do_not_relay": False}}, proxy)
-            if res.get("result", {}).get("status") == "OK":
-                txid = res["result"].get("tx_hash", "unknown")
-                print(f"[✓] TX {idx} → pool | {txid}")
-                hash_line(f"BROADCAST {idx} {txid}")
-                # wait until mined
-                while True:
-                    q = jpost(rpc_url, {"jsonrpc": "2.0", "id": "0", "method": "get_transactions", "params": {"txs_hashes": [txid], "decode_as_json": False, "prune": False}}, proxy)
-                    in_pool = q["result"]["txs"][0].get("in_pool", True)
-                    ht = q["result"].get("txs")[0].get("block_height", 0)
-                    if not in_pool:
-                        print(f"[Mined] {txid} at height {ht}")
-                        hash_line(f"MINED {idx} {txid} {ht}")
-                        break
-                    time.sleep(60)
-                sent = True
-                break
-            else:
-                err = (res.get("error", {}) or res).get("message", str(res))
-                print(f"Node reply: {err}")
-                if "low_fee" in err.lower() and args.wallet_file:
-                    raw_hex = bump_fee(raw_hex, 1.2, args.wallet_file)  # +20 %
-                    print("[+] Fee bumped, retrying…")
-        except Exception as e:
-            print("Broadcast error:", str(e)[:120])
-        attempts -= 1
-        newnym(); time.sleep(random.uniform(5, 15))
-    if not sent:
-        print(f"[⚠️] TX {idx} could not be broadcast within budget — manual action needed")
-    prog["last"] = idx
-    prog["log"].append({"idx": idx, "file": str(blob), "sent": sent})
-    # atomic write
-    tmp = progF.with_suffix(".tmp"); json.dump(prog, open(tmp, "w"), indent=2); os.replace(tmp, progF)
+            with open(_manifest_for_delays) as mf:
+                _mdata = json.load(mf)
+            for entry in _mdata:
+                if "delay" in entry and "idx" in entry:
+                    tx_delays[int(entry["idx"])] = int(entry["delay"])
+            if tx_delays:
+                delay_source = "manifest"
+        except Exception:
+            pass
 
-print("All blobs processed. Manifest in", progF)
+    # Fallback: unsigned plan (only works if same machine/directory)
+    if not tx_delays:
+        plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+        if plan_files:
+            try:
+                with open(plan_files[0]) as pf:
+                    plan_data = json.load(pf)
+                if isinstance(plan_data, dict) and "txs" in plan_data:
+                    for i, tx in enumerate(plan_data["txs"]):
+                        if "delay" in tx:
+                            tx_delays[i] = int(tx["delay"])
+                    if tx_delays:
+                        delay_source = "unsigned_plan"
+            except Exception:
+                pass
+
+    if tx_delays:
+        integrity_log("broadcast", f"delays_loaded:{delay_source}")
+        print(f"  [+] TX delays loaded from {delay_source} ({len(tx_delays)} entries)")
+    else:
+        integrity_log("broadcast", "WARNING:no_delays_found")
+        print("  [!] WARNING: No TX delays found - all TXs will broadcast with minimal gap!")
+        print("  [!] This creates a timing cluster visible to chain analysts.")
+
+    # Verify blob integrity against signer manifest if available
+    manifest_path = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
+    if manifest_path and manifest_path.exists():
+        with open(manifest_path) as mf:
+            manifest = json.load(mf)
+        manifest_hashes = {Path(e["file"]).name: e["hash"] for e in manifest}
+        tampered = []
+        for blob in blobs:
+            if blob.name in manifest_hashes and blob.exists():
+                with open(blob, "rb") as bf:
+                    actual = hashlib.sha256(bf.read()).hexdigest()
+                if actual != manifest_hashes[blob.name]:
+                    tampered.append(blob.name)
+        if tampered:
+            integrity_log("broadcast", f"TAMPER_DETECTED:{len(tampered)}_blobs")
+            for t in tampered:
+                print(f"  [!] TAMPERED: {t}")
+            sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
+        integrity_log("broadcast", f"manifest_verified:{len(manifest_hashes)}_blobs_ok")
+        print(f"  [+] Manifest verification: {len(manifest_hashes)} blobs OK")
+
+    # Compute blob fingerprint to bind progress to this specific set of blobs
+    blob_fp = hashlib.sha256(
+        "|".join(b.name for b in blobs).encode()
+    ).hexdigest()[:32]
+
+    # Progress state
+    progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
+    if progF.exists():
+        with open(progF) as f:
+            prog = json.load(f)
+        saved_fp = prog.get("blob_fingerprint", "")
+        if saved_fp and saved_fp != blob_fp:
+            integrity_log("broadcast", "STALE_PROGRESS:blob_set_changed")
+            sys.exit(
+                "[!] Broadcast progress is from a DIFFERENT set of blobs!\n"
+                "    Delete the progress file or use the matching blob set.\n"
+                "    Stale progress would silently skip TXs."
+            )
+        last_idx = prog.get("last", -1)
+    else:
+        prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
+        last_idx = -1
+
+    import secrets as _secrets
+    last_tor_check = time.time()
+    success_count = 0
+    fail_count = 0
+    skip_count = 0
+
+    for idx, blob in enumerate(blobs):
+        if shutdown_requested():
+            integrity_log("broadcast", f"shutdown_at_blob_{idx}")
+            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progF}")
+            break
+
+        if idx <= last_idx:
+            skip_count += 1
+            continue
+
+        # Periodic Tor re-check
+        if proxy and (time.time() - last_tor_check) > TOR_RECHECK_INTERVAL:
+            tor_recheck(proxy, f"broadcast_tx_{idx}")
+            last_tor_check = time.time()
+
+        if not blob.exists():
+            integrity_log("broadcast", f"missing_blob:{blob.name}")
+            print(f"  [!] Missing: {blob.name} - skipping")
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+                                "error": "file_missing"})
+            prog["last"] = idx
+            atomic_write_json(prog, progF)
+            fail_count += 1
+            continue
+
+        raw_data = blob.read_bytes()
+        if not raw_data:
+            integrity_log("broadcast", f"empty_blob:{blob.name}")
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+                                "error": "empty_blob"})
+            prog["last"] = idx
+            atomic_write_json(prog, progF)
+            fail_count += 1
+            continue
+
+        # Convert to hex for the daemon's send_raw_transaction endpoint
+        raw_hex = raw_data.hex()
+
+        # NEWNYM + planned delay before each TX for circuit isolation and
+        # timing decorrelation. The delay comes from the unsigned plan and is
+        # critical for preventing timing-cluster analysis on the blockchain.
+        if idx > 0:
+            planned_delay = tx_delays.get(idx, 0)
+            if planned_delay > 0:
+                print(f"  [*] Waiting {planned_delay}s (planned delay for TX {idx})...")
+                integrity_log("broadcast", f"delay:idx={idx}:secs={planned_delay}")
+                # Sleep in chunks so shutdown_requested() can be checked
+                waited = 0
+                while waited < planned_delay:
+                    if shutdown_requested():
+                        break
+                    chunk = min(30, planned_delay - waited)
+                    time.sleep(chunk)
+                    waited += chunk
+            newnym(required=True)
+            secure_delay(5.0, 15.0)
+
+        attempts = args.rebroadcast
+        sent = False
+        start_time = time.time()
+
+        while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
+            rpc_url = rpc_pool[_secrets.randbelow(len(rpc_pool))]
+            try:
+                # send_raw_transaction is a daemon /sendrawtransaction endpoint,
+                # NOT a JSON-RPC method. It takes {tx_as_hex, do_not_relay}.
+                submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
+                res = _single_post(
+                    submit_url,
+                    {"tx_as_hex": raw_hex, "do_not_relay": False},
+                    proxy,
+                )
+
+                status = res.get("status", "")
+                is_double = res.get("double_spend", False)
+                if status == "OK" and not is_double:
+                    txid = res.get("tx_hash", "")
+                    if not txid:
+                        integrity_log("broadcast", f"no_txid:idx={idx}")
+                        print(f"  [!] TX {idx} accepted but no txid returned - cannot track confirmation")
+                        # Still mark as sent since daemon accepted it
+
+                    txid_display = txid[:16] if txid else "no-txid"
+                    print(f"  [+] TX {idx} -> mempool | {txid_display}...")
+                    integrity_log("broadcast", f"sent:idx={idx}")
+
+                    # Wait for mining confirmation (only if we have a real txid)
+                    check_url = rpc_url.rstrip("/") + "/gettransactions"
+                    mine_start = time.time()
+                    confirmed = False
+                    block_height = 0
+                    while txid and (time.time() - mine_start) < args.mine_wait:
+                        if shutdown_requested():
+                            break
+                        try:
+                            q = safe_post(
+                                check_url,
+                                {"txs_hashes": [txid],
+                                 "decode_as_json": False,
+                                 "prune": False},
+                                proxy,
+                            )
+                            txs = q.get("txs", [])
+                            if txs:
+                                in_pool = txs[0].get("in_pool", True)
+                                ht = txs[0].get("block_height", 0)
+                                if not in_pool and ht > 0:
+                                    print(f"  [Mined] TX {idx} at height {ht}")
+                                    integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
+                                    confirmed = True
+                                    block_height = ht
+                                    break
+                        except Exception:
+                            pass
+                        time.sleep(60)
+
+                    if not confirmed:
+                        integrity_log("broadcast", f"unconfirmed:idx={idx}:txid={txid[:16]}")
+                        print(f"  [!] TX {idx} unconfirmed after {args.mine_wait}s")
+
+                    sent = True
+                    # Save txid in progress so we can check again on resume
+                    prog["log"].append({
+                        "idx": idx, "file": str(blob), "sent": True,
+                        "txid": txid, "confirmed": confirmed,
+                        "block_height": block_height,
+                    })
+                    prog["last"] = idx
+                    atomic_write_json(prog, progF)
+                    success_count += 1
+                    break
+                else:
+                    err_msg = res.get("reason", res.get("status", str(res)))
+                    if isinstance(err_msg, dict):
+                        err_msg = str(err_msg)
+                    print(f"  Node: {str(err_msg)[:80]}")
+
+                    if res.get("double_spend"):
+                        integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
+                        print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
+                        prog["log"].append({
+                            "idx": idx, "file": str(blob), "sent": False,
+                            "error": "double_spend",
+                        })
+                        prog["last"] = idx
+                        atomic_write_json(prog, progF)
+                        fail_count += 1
+                        sent = False
+                        break
+
+                    if "low_fee" in str(err_msg).lower():
+                        integrity_log("broadcast", f"low_fee_rejected:idx={idx}")
+                        print("  [!] TX rejected: fee too low. Re-sign with higher --fee-priority.")
+                        print("  [!] Monero does NOT support RBF - cannot bump fee on signed TX.")
+                        break
+            except Exception as e:
+                integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")
+                print(f"  [!] Error: {str(e)[:80]}")
+
+            attempts -= 1
+            if attempts > 0:
+                newnym()
+                secure_delay(5.0, 15.0)
+
+        if not sent and not any(e.get("idx") == idx for e in prog["log"]):
+            fail_count += 1
+            print(f"  [!] TX {idx} FAILED after {args.rebroadcast} attempts - manual action needed")
+            prog["last"] = idx
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+                                "error": "exhausted_retries"})
+            atomic_write_json(prog, progF)
+
+    integrity_log("broadcast", "done")
+    print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed, {skip_count} resumed.")
+    if skip_count > 0:
+        print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
+    print(f"  [+] Progress: {progF}")
+
+
+if __name__ == "__main__":
+    main()

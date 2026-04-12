@@ -1,183 +1,226 @@
-thor swap preparer
-
 #!/usr/bin/env python3
 """
-thor_swap_preparer.py  v10.0 — ThorChain BTC → XMR quote fetcher (production‑hardened)
-====================================================================
-Generates **integrity‑logged** deposit / memo pairs that GhostSpiral v10
-can consume later with `--auto‑swap` or deliver to an air‑gap operator.
+thor_swap_preparer v10.0 - ThorChain BTC -> XMR quote fetcher
+==============================================================
+Generates integrity-logged deposit/memo pairs that GhostSpiral v10
+can consume later.
 
-Security & Resilience (v10 spec)
-────────────────────────────────
-1. **Tor‑leak guard**             – Aborts if `check.torproject.org` ≠ IsTor.
-2. **Exponential‑retry + NEWNYM** – 4 attempts per quote; rotates Tor on fail.
-3. **XMR dest checksum**          – Validates each provided destination.
-4. **Fee‑oracle v3**              – Pulls BTC/XMR spot; warns if quote dev > 5 %.
-5. **Atomic fsync‑rename**        – Writes `thor_pairs_v1.json.tmp` → fsync → rename.
-6. **Integrity hash‑chain**       – Appends a SHA‑256‑linked log line per pair.
-
-Usage
------
-```bash
-torsocks python3 thor_swap_preparer.py \
-    --amounts 0.04 0.0258 \
-    --dests  48XMRsub1 48XMRsub2 \
-    --tor-proxy socks5h://127.0.0.1:9050 \
-    --outfile thor_pairs_batch.json
-``` 
+OPSEC hardening:
+  - Tor verified with retry before any API contact
+  - NEWNYM circuit rotation between each quote request
+  - Timing jitter between quotes to frustrate correlation
+  - XMR destination addresses validated (regex + checksum)
+  - BTC deposit addresses validated (bech32 format check)
+  - Slippage oracle cross-check with 5% deviation warning
+  - Atomic fsync-rename on all output files (0600 perms)
+  - GPG encryption support with import guard
+  - Integrity hash-chain per pair
 """
 from __future__ import annotations
-import argparse, json, os, sys, time, hashlib, tempfile, random, re
+import argparse, json, os, sys, time, re
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List
-import requests
-from tenacity import retry, wait_exponential, stop_after_attempt
-from stem.control import Controller, Signal
-from monero.address import address as _xmr_addr, Address
 
-THOR_API = "https://api.thorswap.net/aggregator"
-CHECK_TOR = "https://check.torproject.org/api/ip"
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, newnym,
+    safe_get, safe_post, secure_delay, atomic_write_json,
+    install_signal_handlers, shutdown_requested, scrub_address,
+)
+
+try:
+    from monero.address import Address as XMRAddress
+except ImportError:
+    sys.exit("[!] python-monero missing - pip install monero")
+
+SWAPKIT_API = "https://api.swapkit.dev"
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
-
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
 
-################################################################################
-#  Integrity‑log helpers
-################################################################################
-INT_LOG = Path("integrity_chain.log")
 
-def _hash_line(line: str) -> None:
-    """Append a hash‑chained line to integrity log."""
-    prev = "0" * 64
-    if INT_LOG.exists():
-        prev = INT_LOG.read_text().splitlines()[-1].split(" | ")[0]
-    h = hashlib.sha256((prev + line).encode()).hexdigest()
-    INT_LOG.open("a").write(f"{h} | {line}\n")
+def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
+    """Fetch current BTC/XMR rate from CoinGecko."""
+    try:
+        p = safe_get(CG_PRICE, proxy)
+        rate = Decimal(str(p["monero"]["btc"]))
+        if rate <= 0:
+            raise ValueError("Non-positive rate")
+        return rate
+    except Exception as e:
+        integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
+        print("[!] Price oracle failed; using conservative fallback 0.003 BTC/XMR")
+        return Decimal("0.003")
 
-################################################################################
-#  Tor helpers
-################################################################################
 
-def _ensure_tor(proxy: Dict[str, str]):
-    try:
-        resp = requests.get(CHECK_TOR, timeout=15, proxies=proxy).json()
-        if not resp.get("IsTor"):
-            sys.exit("[!] Tor leak detected — aborting.")
-    except Exception:
-        sys.exit("[!] Could not verify Tor connection — aborting.")
+def _validate_xmr_addr(addr: str) -> None:
+    """Validate XMR address format and checksum."""
+    if not _XMR_RE.match(addr):
+        sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
+    try:
+        XMRAddress(addr)
+    except Exception:
+        sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
 
-def _newnym(ctrl: str = "/var/run/tor/control"):
-    try:
-        with Controller.from_socket_file(ctrl) as c:
-            c.authenticate(); c.signal(Signal.NEWNYM)
-    except Exception:
-        print("[!] NEWNYM failed; continuing with same circuit.")
 
-################################################################################
-#  Retry‑wrapped HTTP helpers
-################################################################################
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _jget(url: str, proxy: Dict[str, str] | None):
-    return requests.get(url, timeout=20, proxies=proxy).json()
+def main():
+    install_signal_handlers()
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _jpost(url: str, payload: dict, proxy: Dict[str, str] | None):
-    return requests.post(url, json=payload, timeout=25, proxies=proxy).json()
+    ap = argparse.ArgumentParser(
+        "thor_swap_preparer v10.0",
+        description="Fetch ThorChain BTC->XMR quotes with OPSEC hardening",
+    )
+    ap.add_argument("--amounts", nargs="+", required=True, type=Decimal,
+                    help="BTC amounts to swap")
+    ap.add_argument("--dests", nargs="+", required=True,
+                    help="XMR destination addresses (one per amount)")
+    ap.add_argument("--tor-proxy",
+                    help="SOCKS5 proxy (required for production use)")
+    ap.add_argument("--gpg-recipient",
+                    help="GPG recipient for encrypted output")
+    ap.add_argument("--outfile", default="thor_pairs_batch.json")
+    args = ap.parse_args()
 
-################################################################################
-#  Atomic JSON dump
-################################################################################
+    if len(args.amounts) != len(args.dests):
+        sys.exit(f"[!] Mismatch: {len(args.amounts)} amounts vs {len(args.dests)} dests")
 
-def _atomic_dump(obj, path: Path):
-    tmp = Path(str(path) + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
-        f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
-    # quick verification read
-    json.load(open(path))
+    for amt in args.amounts:
+        if amt <= 0:
+            sys.exit(f"[!] Amount must be positive: {amt}")
 
-################################################################################
-#  Price oracle & slippage check
-################################################################################
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Clearnet queries to ThorChain API leak\n"
+            "    your IP and reveal you are performing BTC->XMR swaps. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
-def _btc_per_xmr(proxy):
-    try:
-        p = _jget(CG_PRICE, proxy)
-        return Decimal(str(p["monero"]["btc"]))
-    except Exception:
-        print("[!] Price oracle failed; using fallback 0.000015 BTC/XMR")
-        return Decimal("0.000015")  # ~ 1 XMR ≈ 0.000015 BTC (placeholder)
+    for d in args.dests:
+        _validate_xmr_addr(d)
 
-################################################################################
-#  Main
-################################################################################
+    btc_per_xmr = _btc_per_xmr(proxy)
+    integrity_log("thor", "oracle_fetched")
+
+    pairs: List[dict] = []
+
+    for i, (amt, dest) in enumerate(zip(args.amounts, args.dests)):
+        if shutdown_requested():
+            integrity_log("thor", f"shutdown_at_pair_{i}")
+            break
+
+        # Rotate circuit between quotes
+        if i > 0 and proxy:
+            newnym()
+            secure_delay(3.0, 8.0)
+
+        # SwapKit v3 API (replaces defunct thorswap aggregator)
+        payload = {
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": dest,
+        }
+
+        try:
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+        except Exception as e:
+            if proxy:
+                newnym()
+            integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
+            raise
+
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            error = quote_resp.get("error", "unknown")
+            integrity_log("thor", f"no_routes_{i}")
+            sys.exit(f"[!] No swap routes for pair {i}: {str(error)[:80]}")
+
+        route = routes[0]
+        tx_info = route.get("transaction", route.get("calldata", {}))
+        deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
+        memo = tx_info.get("memo", tx_info.get("data", ""))
+        expected_xmr = Decimal(str(route.get("expectedOutput", "0")))
+
+        if not deposit:
+            integrity_log("thor", f"no_deposit_{i}")
+            sys.exit(f"[!] ThorChain returned no deposit address for pair {i}")
+
+        if not BTC_RE.match(deposit):
+            integrity_log("thor", f"bad_deposit_format_{i}")
+            sys.exit(f"[!] Deposit address not valid bech32: {scrub_address(deposit)}")
+
+        # Slippage check
+        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
+        if oracle_xmr > 0:
+            deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
+            if deviation > Decimal("0.05"):
+                print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
+                integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
+
+        pair = {
+            "schema": PAIR_SCHEMA,
+            "btc_in": str(amt),
+            "deposit": deposit,
+            "memo": memo,
+            "dest_xmr": dest,
+            "expected_xmr": str(expected_xmr),
+            "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        }
+        pairs.append(pair)
+        integrity_log("thor", f"pair_{i}:ready")
+        print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
+              f"(expected {expected_xmr} XMR)")
+
+    if not pairs:
+        sys.exit("[!] No pairs generated")
+
+    _out = Path(args.outfile)
+    atomic_write_json(pairs, _out)
+    integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
+    print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
+
+    print()
+    print("  ============================================================")
+    print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
+    print("  ============================================================")
+    for i, pair in enumerate(pairs):
+        print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
+        print(f"  Send exactly: {pair['btc_in']} BTC")
+        print(f"  To address:   {pair['deposit']}")
+        if pair.get("memo"):
+            print(f"  With memo:    {pair['memo']}")
+        else:
+            print(f"  Memo:         (none required)")
+        print(f"  Expected XMR: ~{pair['expected_xmr']}")
+    print()
+    print("  ============================================================")
+    print("  IMPORTANT: The sender must include the memo in the BTC")
+    print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
+    print("  route the swap. Quotes expire — send promptly.")
+    print("  ============================================================")
+
+    if args.gpg_recipient:
+        try:
+            import gnupg
+            g = gnupg.GPG()
+            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+            if enc.ok:
+                gpg_path = Path(str(_out) + ".gpg")
+                gpg_path.write_text(str(enc))
+                os.chmod(gpg_path, 0o600)
+                integrity_log("thor", f"gpg_ok:{gpg_path.name}")
+                print(f"  [+] GPG bundle -> {gpg_path}")
+            else:
+                integrity_log("thor", f"gpg_fail:{enc.status}")
+                print(f"  [!] GPG encryption failed: {enc.status}")
+        except ImportError:
+            print("[!] python-gnupg not installed - skipping GPG encryption")
+
+    if proxy:
+        newnym()
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser("thor_swap_preparer v10.0")
-    ap.add_argument("--amounts", nargs='+', required=True, type=Decimal)
-    ap.add_argument("--dests", nargs='+', required=True)
-    ap.add_argument("--tor-proxy")
-    ap.add_argument("--gpg-recipient")
-    ap.add_argument("--outfile", default="thor_pairs_batch.json")
-    args = ap.parse_args()
-
-    if len(args.amounts) != len(args.dests):
-        sys.exit("[!] amounts and dests length mismatch")
-
-    proxy = {"http": args.tor_proxy, "https": args.tor_proxy} if args.tor_proxy else None
-    if args.tor_proxy:
-        _ensure_tor(proxy)
-
-    # validate XMR addresses
-    for d in args.dests:
-        if not _XMR_RE.match(d):
-            sys.exit(f"[!] Bad XMR address format: {d}")
-        try:
-            Address(d)  # checksum validation from monero‑py
-        except Exception:
-            sys.exit(f"[!] XMR checksum invalid: {d}")
-
-    btc_per_xmr = _btc_per_xmr(proxy)
-    pairs: List[dict] = []
-
-    for amt, dest in zip(args.amounts, args.dests):
-        payload = {"from": "BTC.BTC", "to": "XMR.XMR", "amount": str(amt), "destination": dest}
-        try:
-            quote = _jpost(f"{THOR_API}/swap", payload, proxy)
-        except Exception as e:
-            _newnym(); raise
-
-        deposit = quote.get("deposit")
-        if not deposit or not deposit.startswith("bc1"):
-            sys.exit("[!] ThorChain response missing/invalid deposit address")
-
-        expected_xmr = Decimal(quote.get("expected_amount_out", "0"))
-        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
-        if oracle_xmr and abs(expected_xmr - oracle_xmr) > oracle_xmr * Decimal("0.05"):
-            print("⚠️  Quote deviates >5 % from oracle price — check liquidity.")
-
-        pair = {
-            "schema": PAIR_SCHEMA,
-            "btc_in": str(amt),
-            "deposit": deposit,
-            "memo": quote.get("memo", ""),
-            "dest_xmr": dest,
-            "expected_xmr": str(expected_xmr),
-            "ts": int(time.time())
-        }
-        pairs.append(pair)
-        _hash_line(f"thor_pair {deposit[:10]}… → {dest[:10]} {expected_xmr} XMR")
-        time.sleep(random.uniform(2, 5))
-
-    _out = Path(args.outfile)
-    _atomic_dump(pairs, _out)
-    print(f"[✓] Saved {len(pairs)} pair(s) → {_out}")
-
-    if args.gpg_recipient:
-        import gnupg
-        g = gnupg.GPG()
-        enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
-        Path(str(_out) + ".gpg").write_text(str(enc))
-        print("[✓] GPG bundle →", str(_out) + ".gpg")
+    main()
