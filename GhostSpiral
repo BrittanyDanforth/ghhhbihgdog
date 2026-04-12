@@ -124,8 +124,8 @@ def main():
     fee_xmr = fetch_fee(proxy)
     integrity_log("stage0", "fee_fetched")
 
-    rpc_primary = connect_rpc(args.rpc_primary)
-    rpc_alt = connect_rpc(args.rpc_alt) if args.rpc_alt else None
+    rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
 
     # Sync guard: wait for nodes to agree on height
     for attempt in range(30):
@@ -159,8 +159,16 @@ def main():
         if not args.joinmarket_wallet:
             sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
         try:
+            # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
+            # --socks5-host/port to be explicit (JM >= 0.9 supports this).
+            # Without this, JM may resolve maker addresses over clearnet.
+            from urllib.parse import urlparse as _urlparse
+            _parsed_proxy = _urlparse(args.tor_proxy)
             result = subprocess.run(
-                ["python3", "tumble.py", args.joinmarket_wallet, btc_addr, "all"],
+                ["python3", "tumble.py",
+                 "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
+                 "--socks5-port", str(_parsed_proxy.port or 9050),
+                 args.joinmarket_wallet, btc_addr, "all"],
                 check=True, capture_output=True, text=True, timeout=3600,
             )
             integrity_log("stage1", "JM_tumble_OK")
@@ -348,7 +356,7 @@ def main():
             )
 
     rounds = args.wallets * 2 * args.deep
-    per_round_fee = fee_xmr * Decimal("2")
+    per_round_fee = fee_xmr * Decimal("1.5")  # 1 TX/round + 50% safety margin for fee spikes
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
 
@@ -389,7 +397,7 @@ def main():
     meta = {
         "schema": "unsigned_v1",
         "version": VERSION,
-        "created": int(time.time()),
+        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         "rounds": len(plan),
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
@@ -398,13 +406,18 @@ def main():
 
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
-    ufile = outdir / f"unsigned_{int(time.time())}.json"
+    ufile = outdir / f"unsigned_{secure_hex(8)}.json"
     atomic_write_json(unsigned, ufile)
     integrity_log("stage4", "unsigned_dump_saved")
     print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
 
     if args.cold or args.airgap:
         mode = "cold" if args.cold else "airgap"
+        for stale in ["signer_progress.json", "broadcast_progress.json"]:
+            stale_path = Path(stale)
+            if stale_path.exists():
+                stale_path.unlink()
+                integrity_log("stage4", f"cleaned_stale:{stale}")
         print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
         integrity_log("stage4", f"{mode}_exit")
         sys.exit(0)

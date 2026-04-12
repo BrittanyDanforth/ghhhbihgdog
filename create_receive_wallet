@@ -23,7 +23,7 @@ import time
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json, secure_file_perms,
-    install_signal_handlers, newnym, scrub_address,
+    install_signal_handlers, newnym, scrub_address, secure_hex,
 )
 
 
@@ -46,13 +46,16 @@ def main():
 
     require_resources(min_disk_gb=2.0)
 
-    proxy = None
-    if args.tor_proxy:
-        proxy = validate_proxy(args.tor_proxy)
-        verify_tor(proxy)
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. The Tor verification check itself needs\n"
+            "    a proxy to confirm safe operation. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
     try:
-        wallet_rpc = connect_rpc(args.rpc)
+        wallet_rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
     except Exception as e:
         integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
@@ -65,15 +68,15 @@ def main():
 
     out = {
         "schema": "gs_receive_wallet_v1",
-        "created": datetime.now(timezone.utc).isoformat(),
+        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         "address": addr_str,
-        "account_index": acct.index,
+        "account_index": 0,
         "label": args.label,
     }
 
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    fname = outdir / f"wallet_{int(time.time())}.json"
+    fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 
     print(f"  [+] Wallet saved -> {fname}")

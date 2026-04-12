@@ -89,13 +89,13 @@ def main():
         if amt <= 0:
             sys.exit(f"[!] Amount must be positive: {amt}")
 
-    proxy = None
-    if args.tor_proxy:
-        proxy = validate_proxy(args.tor_proxy)
-        verify_tor(proxy)
-    else:
-        print("[!] WARNING: No Tor proxy specified. Queries will be clearnet!")
-        integrity_log("thor", "WARNING:clearnet_mode")
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Clearnet queries to ThorChain API leak\n"
+            "    your IP and reveal you are performing BTC->XMR swaps. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
     for d in args.dests:
         _validate_xmr_addr(d)
@@ -157,7 +157,7 @@ def main():
             "memo": memo,
             "dest_xmr": dest,
             "expected_xmr": str(expected_xmr),
-            "ts": int(time.time()),
+            "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         }
         pairs.append(pair)
         integrity_log("thor", f"pair_{i}:ready")

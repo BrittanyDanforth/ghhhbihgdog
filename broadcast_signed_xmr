@@ -32,6 +32,8 @@ from gs_common import (
 def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """Single-attempt POST without tenacity retry. Used for broadcast
     submissions where the outer loop handles retries with NEWNYM rotation."""
+    if proxies is None:
+        sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies)
     r.raise_for_status()
     return r.json()
@@ -93,10 +95,13 @@ def main():
     cli.add_argument("--resume", help="progress file for crash-resume")
     args = cli.parse_args()
 
-    proxy = None
-    if args.tor_proxy:
-        proxy = validate_proxy(args.tor_proxy)
-        verify_tor(proxy)
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Broadcasting over clearnet leaks your IP\n"
+            "    to every Monero node you submit transactions to. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
     # Build RPC pool
     rpc_pool: List[str] = [args.rpc]

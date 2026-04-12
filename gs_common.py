@@ -33,7 +33,10 @@ from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 VERSION = "10.5"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
 INTEGRITY_LOG = Path("integrity_chain.log")
-SOCKS_RE = re.compile(r"^socks5h?://[^\s:]+:\d{1,5}$")
+SOCKS_RE = re.compile(r"^socks5h://[^\s:]+:\d{1,5}$")
+# CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
+# because the requests library resolves hostnames BEFORE sending through
+# the SOCKS proxy. With socks5h://, DNS resolution happens at the proxy.
 
 # ---------------------------------------------------------------------------
 #  Secure randomness
@@ -54,14 +57,20 @@ def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
 # ---------------------------------------------------------------------------
 
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
-    """Append a SHA-256-chained line to the integrity log. Returns the hash."""
+    """Append a SHA-256-chained line to the integrity log. Returns the hash.
+
+    Timestamp is coarsened to 600-second (10-min) buckets to reduce the
+    correlation window between the log and blockchain/network timestamps.
+    An attacker with the log can only narrow the operation to a 10-min window
+    instead of the exact second.
+    """
     prev = "0" * 64
     if log_path.exists():
         text = log_path.read_text()
         lines = text.splitlines()
         if lines:
             prev = lines[-1].split(" | ")[0].strip()
-    ts = int(time.time())
+    ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
     line = f"{ts}|{VERSION}|{stage}|{msg}"
     h = hashlib.sha256((prev + line).encode()).hexdigest()
     with log_path.open("a") as f:
@@ -109,11 +118,21 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
 # ---------------------------------------------------------------------------
 
 def validate_proxy(proxy_url: str) -> Dict[str, str]:
-    """Validate and return a proxy dict, or abort if format is wrong."""
+    """Validate and return a proxy dict, or abort if format is wrong.
+
+    ONLY socks5h:// is accepted. Plain socks5:// resolves DNS locally,
+    leaking every destination hostname to the ISP's DNS resolver.
+    """
+    if proxy_url.startswith("socks5://") and not proxy_url.startswith("socks5h://"):
+        sys.exit(
+            f"[!] CRITICAL: socks5:// leaks DNS locally!\n"
+            f"    Use socks5h:// so DNS resolves through the proxy.\n"
+            f"    Change: {proxy_url} -> {proxy_url.replace('socks5://', 'socks5h://')}"
+        )
     if not SOCKS_RE.match(proxy_url):
         sys.exit(
             f"[!] Invalid proxy format: {proxy_url}\n"
-            f"    Expected: socks5h://host:port"
+            f"    Expected: socks5h://host:port  (NOT socks5://)"
         )
     return {"http": proxy_url, "https": proxy_url}
 
@@ -186,14 +205,18 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
-def safe_get(url: str, proxies: Optional[Dict] = None) -> dict:
+def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
+    if proxies is None:
+        sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
     r = requests.get(url, timeout=20, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
-def safe_post(url: str, payload: dict, proxies: Optional[Dict] = None) -> dict:
+def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
+    if proxies is None:
+        sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=25, proxies=proxies)
     r.raise_for_status()
     return r.json()
@@ -202,17 +225,44 @@ def safe_post(url: str, payload: dict, proxies: Optional[Dict] = None) -> dict:
 #  RPC connection (monero-wallet-rpc)
 # ---------------------------------------------------------------------------
 
+_LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
 class MoneroRPC:
     """Wrapper around monero-python that exposes both high-level Wallet
-    methods and raw JSON-RPC calls via the backend."""
+    methods and raw JSON-RPC calls via the backend.
 
-    def __init__(self, url: str):
+    OPSEC: monero-python's JSONRPCWallet uses requests internally but does
+    NOT support SOCKS proxy configuration. Connections to non-localhost
+    hosts go clearnet, leaking the operator's IP to the Monero node.
+    We enforce localhost-only, or patch the session with proxy support.
+    """
+
+    def __init__(self, url: str, proxy_url: Optional[str] = None):
         from monero.wallet import Wallet as XMRWallet
         from monero.backends.jsonrpc import JSONRPCWallet
         parsed = urlparse(url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 18083
+
+        if host.lower() not in _LOCALHOST_NAMES:
+            if not proxy_url:
+                sys.exit(
+                    f"[!] RPC endpoint {host}:{port} is NOT localhost.\n"
+                    f"    monero-python's JSONRPCWallet has no proxy support.\n"
+                    f"    Connection would be clearnet, leaking your IP to the node.\n"
+                    f"    Either: (a) use 127.0.0.1 with a local RPC, or\n"
+                    f"            (b) tunnel the RPC through Tor externally (socat/ssh)."
+                )
+            integrity_log("rpc", f"WARN:non_local_rpc:{host}:{port}:proxy_patched")
+
         self._backend = JSONRPCWallet(host=host, port=port)
+
+        if proxy_url and host.lower() not in _LOCALHOST_NAMES:
+            proxies = {"http": proxy_url, "https": proxy_url}
+            if hasattr(self._backend, '_session'):
+                self._backend._session.proxies.update(proxies)
+
         self._wallet = XMRWallet(self._backend)
 
     @property
@@ -234,9 +284,13 @@ class MoneroRPC:
         return str(addr)
 
 
-def connect_rpc(url: str) -> MoneroRPC:
-    """Connect to monero-wallet-rpc extracting host and port from URL."""
-    return MoneroRPC(url)
+def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
+    """Connect to monero-wallet-rpc extracting host and port from URL.
+
+    If the RPC host is non-localhost, proxy_url is required or the
+    connection is rejected to prevent clearnet IP leaks.
+    """
+    return MoneroRPC(url, proxy_url=proxy_url)
 
 # ---------------------------------------------------------------------------
 #  Resource sentinel

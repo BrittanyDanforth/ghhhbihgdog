@@ -392,7 +392,48 @@ These bugs were found by mentally tracing real crypto through the entire pipelin
 **Impact:** Operator thinks they're getting 5-chunk mixing, actually getting none. False sense of security.
 **Status:** Logged but still needs full implementation (requires BTC splitting logic).
 
-## 8. Remaining Items
+## 8. Money-Flow Deep Trace (Round 4)
+
+Precise mathematical audit of fund flow through the pipeline.
+
+### Finding 1: BALANCE MATH — Rounding guard is correct
+**Trace with** `unlocked_balance=47.5, fee_xmr=0.00005, wallets=10, deep=2`:
+- `rounds = 10 * 2 * 2 = 40`
+- `per_round_fee = 0.00005 * 1.5 = 0.000075` (was `*2=0.00010`, fixed)
+- `total_fees = 0.000075 * 40 = 0.003`
+- `usable = 47.5 - 0.003 = 47.497`
+- `split_amt = 47.497 / 40 = 1.187425`
+- `quantized_split = 1.1874`
+- `total_planned = 1.1874 * 40 = 47.496 <= 47.497` → guard does NOT fire
+- **Guard proof:** `quantize(0.0001)` rounds up by at most 0.00005. Max overshoot = `rounds * 0.00005`. Correction subtracts `0.0001 * rounds > 0.00005 * rounds`. Guard always sufficient.
+
+### Finding 2: SELF-SEND is impossible
+- `dag[a]` built from `others = [b for b in subs if b != a]` — a is excluded (GhostSpiral:304)
+- Plan picks `dst = dag[src][random]` — dst can never equal src
+- **No fix needed.**
+
+### Finding 3: ENTRY survives shuffle correctly
+- `ENTRY = subs[0]` binds to the string object (GhostSpiral:260)
+- `shuffle(subs)` rearranges list but ENTRY keeps original reference
+- No subsequent code assumes `subs[0] == ENTRY`
+- **No fix needed.**
+
+### BUG 13 (FIXED): Stale progress files not cleaned in airgap/cold mode
+**Scenario:** Run 1 produces 40-TX plan + signer_progress.json (last=39). Run 2 produces 15-TX plan in --airgap mode. `sys.exit(0)` skipped the cleanup that auto-mode does.
+**Impact:** Signer detects plan mismatch and aborts, but operator must manually delete the stale file.
+**Fix:** Added progress file cleanup before `sys.exit(0)` on the airgap/cold path (GhostSpiral:416-420).
+
+### BUG 14 (FIXED): Unsigned file timestamp collision
+**Scenario:** Two runs within the same second produce `unsigned_{ts}.json` with identical name. `os.replace()` silently overwrites the first.
+**Impact:** First plan destroyed without warning. Also affected `create_receive_wallet` filenames.
+**Fix:** Added `secure_hex(4)` random suffix: `unsigned_{ts}_{hex}.json` (GhostSpiral:409, create_receive_wallet:76).
+
+### BUG 15 (FIXED): Fee estimation 2x over-budget
+**Scenario:** `per_round_fee = fee_xmr * 2` but only 1 TX is generated per round. Budgets double the actual fees.
+**Impact:** For 47.5 XMR the waste is 0.002 XMR (negligible). For small balances (e.g. 0.01 XMR), can lose 3%+ or cause false "insufficient balance" aborts.
+**Fix:** Changed to `fee_xmr * Decimal("1.5")` — 1 TX/round + 50% safety margin (GhostSpiral:359).
+
+## 9. Remaining Items
 
 | Item | Status | Notes |
 |------|--------|-------|

@@ -74,10 +74,13 @@ def main():
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")
 
-    proxy = None
-    if args.tor_proxy:
-        proxy = validate_proxy(args.tor_proxy)
-        verify_tor(proxy)
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Clearnet queries to CoinGecko/Bisq/Haveno\n"
+            "    leak your IP and reveal interest in XMR off-ramp methods. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
 
     prices = fetch_prices(proxy)
 
