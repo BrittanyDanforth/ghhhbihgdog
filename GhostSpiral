@@ -599,12 +599,15 @@ def main():
             integrity_log("stage5", f"cleaned_old_dir:{old_dir}")
 
     # Clean old unsigned plans (OPSEC: contain full destination addresses)
+    # but NOT the current plan that Stage 4 just created
     outdir_path = Path(args.output)
     if outdir_path.is_dir():
+        current_plan_name = ufile.name if hasattr(ufile, 'name') else Path(str(ufile)).name
         old_plans = list(outdir_path.glob("unsigned_*.json"))
         for old_plan in old_plans:
-            old_plan.unlink()
-            integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
+            if old_plan.name != current_plan_name:
+                old_plan.unlink()
+                integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
     # Lock file to prevent concurrent runs
     lock_path = Path(".ghostspiral.lock")
