@@ -328,7 +328,71 @@ All scripts import from `gs_common.py` which provides:
 
 ---
 
-## 7. Remaining Items
+## 7. Money-Flow & Silent OPSEC Bugs Found (Round 3 - Deep Trace)
+
+These bugs were found by mentally tracing real crypto through the entire pipeline.
+
+### BUG 1: MONEY LOST - Stage 2 (ThorChain swap) was NEVER actually called
+**Scenario:** Operator runs full pipeline. BTC enters via JoinMarket, ThorChain is supposed to swap BTC->XMR, but stage2_thor_swap() is defined but the actual call was gated behind a condition that was always false in the non-JM case, and even in the JM case it said "Would need a real XMR dest address here" and did nothing.
+**Impact:** BTC sits at ThorChain deposit address forever. XMR never arrives. Money gone.
+**Fix:** Reordered stages: Stage 3 (wallet creation) now runs BEFORE Stage 2 (swap), so ENTRY address exists when stage2 needs it. stage2_thor_swap() is now actually called with the ENTRY address.
+
+### BUG 2: MONEY LOST - Spending locked/unconfirmed balance
+**Scenario:** XMR arrives from ThorChain but hasn't confirmed yet (10 blocks). GhostSpiral reads `balance` (includes unconfirmed) instead of `unlocked_balance`. Builds a plan for 10 XMR. Signs TXs. Broadcasts. Node rejects every TX because the funds are locked.
+**Impact:** All TXs fail. Operator thinks something is broken. Retries, gets same failure. Meanwhile timing window leaks that "someone is trying to spend newly received XMR."
+**Fix:** Now reads `unlocked_balance` specifically. Warns if there's a gap between total and unlocked.
+
+### BUG 3: MONEY LOST - Rounding dust accumulates across rounds
+**Scenario:** 9.9997 XMR usable, 40 rounds. split = 0.24999... quantized to 0.2499. 40 * 0.2499 = 9.996. But if quantize rounds UP to 0.2500, then 40 * 0.2500 = 10.0 > 9.9997. Signing fails because there isn't enough balance.
+**Impact:** Entire batch of TXs fails at signing or broadcast.
+**Fix:** After quantizing, verify total_planned <= usable. If it overflows, subtract 0.0001 from the per-round amount.
+
+### BUG 4: MONEY SENT WRONG - DAG edge count operator precedence bug
+**Scenario:** `_secrets.randbelow(3) + 1 * args.deep` evaluates as `randbelow(3) + (1 * deep)` instead of `(randbelow(3) + 1) * deep`. With deep=2, k is always 2-4 instead of 2-8. DAG is less mixed than intended.
+**Impact:** Mixing graph is sparser than intended, reducing privacy.
+**Fix:** Added parentheses: `(_secrets.randbelow(3) + 1) * args.deep`
+
+### BUG 5: BROADCAST SENDS TO WRONG ENDPOINT
+**Scenario:** `send_raw_transaction` is NOT a Monero JSON-RPC method (it's not under `/json_rpc`). It's a separate daemon endpoint at `/sendrawtransaction`. Similarly `get_transactions` is at `/gettransactions`. The code was sending to `/json_rpc` which would return "Method not found."
+**Impact:** Every single broadcast attempt fails. Money signed but never sent. Operator sees "Node: Method not found" errors.
+**Fix:** Changed to use correct daemon HTTP endpoints: `/sendrawtransaction` and `/gettransactions`.
+
+### BUG 6: DOUBLE-SPEND DETECTION MISSING
+**Scenario:** TX is broadcast but the node says "double_spend: true". The old code didn't check this flag and might retry, potentially getting a different TX accepted or confusing the state.
+**Impact:** Potential double-spend attempt logged against operator, or funds sent twice.
+**Fix:** Now checks `double_spend` flag in response. If true, logs it and stops retrying that TX.
+
+### BUG 7: PROGRESS LOG DUPLICATE ENTRIES
+**Scenario:** Successful TX appends to `prog["log"]` inside the success branch, then AGAIN after the while loop in the unconditional append.
+**Impact:** On resume, progress file has duplicate entries per TX. If code iterates progress to count sent TXs, it overcounts. Manifest integrity check could also be confused.
+**Fix:** Success branch saves its own progress (with txid). Failure branch saves separately. No unconditional append.
+
+### BUG 8: OPSEC LEAK - Tor exit IP logged to integrity_chain.log
+**Scenario:** `verify_tor()` logged `verified_exit_ip=185.220.100.xxx` into integrity_chain.log. This file persists on disk.
+**Impact:** Forensic investigator reads integrity_chain.log, sees exact Tor exit IP used at each stage. Can correlate with ThorChain/node logs by timestamp+IP to deanonymize the operator.
+**Fix:** Now logs only "verified_ok" with no IP.
+
+### BUG 9: OPSEC LEAK - BTC entry address logged (even scrubbed)
+**Scenario:** integrity_chain.log contains `btc_entry_ok:bc1qxyz...12345678`. Even scrubbed, 8+8 chars of a bech32 address is often enough to narrow to a single address on-chain.
+**Impact:** Links the GhostSpiral run to a specific BTC address.
+**Fix:** Now logs only "btc_entry_validated" with no address fragment.
+
+### BUG 10: OPSEC LEAK - Full XMR balance logged
+**Scenario:** integrity_chain.log contains `balance_total=47.239100000000:unlocked=47.239100000000`. Exact balance at exact timestamp.
+**Impact:** Trivially correlates with on-chain data to identify the wallet.
+**Fix:** Now logs only "balance_fetched" with no amounts.
+
+### BUG 11: OPSEC LEAK - integrity_chain.log survives paranoia_mode
+**Scenario:** Operator runs paranoia_mode to wipe everything. But integrity_chain.log was never in the wipe list. It contains timestamps, stage transitions, fee rates, and (previously) addresses.
+**Impact:** Complete forensic timeline of the operation survives on disk.
+**Fix:** paranoia_mode now has Phase 10: wipe GhostSpiral artifacts, including integrity_chain.log, all unsigned/signed plans, wallet JSONs, progress files, thor pairs, exit plans. Files are overwritten with null bytes before unlinking.
+
+### BUG 12: --split flag accepted but never used
+**Scenario:** Operator passes `--split 5` expecting BTC to be split into 5 chunks across ThorChain for better mixing. The flag is parsed but nothing in the pipeline reads it.
+**Impact:** Operator thinks they're getting 5-chunk mixing, actually getting none. False sense of security.
+**Status:** Logged but still needs full implementation (requires BTC splitting logic).
+
+## 8. Remaining Items
 
 | Item | Status | Notes |
 |------|--------|-------|

@@ -184,36 +184,43 @@ def main():
         while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
             rpc_url = rpc_pool[_secrets.randbelow(len(rpc_pool))]
             try:
+                # send_raw_transaction is a daemon /sendrawtransaction endpoint,
+                # NOT a JSON-RPC method. It takes {tx_as_hex, do_not_relay}.
+                submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
                 res = safe_post(
-                    f"{rpc_url}/json_rpc" if not rpc_url.endswith("/json_rpc") else rpc_url,
-                    {"jsonrpc": "2.0", "id": "0",
-                     "method": "send_raw_transaction",
-                     "params": {"tx_as_hex": raw_hex, "do_not_relay": False}},
+                    submit_url,
+                    {"tx_as_hex": raw_hex, "do_not_relay": False},
                     proxy,
                 )
-                result = res.get("result", {})
-                if result.get("status") == "OK":
-                    txid = result.get("tx_hash", "unknown")
+
+                status = res.get("status", "")
+                if status == "OK" or res.get("double_spend", False) is False and status:
+                    txid = res.get("tx_hash", "unknown")
+                    if txid == "unknown":
+                        # Some daemons return tx hash differently
+                        txid = hashlib.sha256(raw_hex.encode()).hexdigest()[:64]
+                        integrity_log("broadcast", f"computed_txid:idx={idx}")
+
                     print(f"  [+] TX {idx} -> mempool | {txid[:16]}...")
                     integrity_log("broadcast", f"sent:idx={idx}:txid={txid[:16]}")
 
                     # Wait for mining confirmation
+                    check_url = rpc_url.rstrip("/") + "/gettransactions"
                     mine_start = time.time()
                     confirmed = False
+                    block_height = 0
                     while (time.time() - mine_start) < args.mine_wait:
                         if shutdown_requested():
                             break
                         try:
                             q = safe_post(
-                                f"{rpc_url}/json_rpc" if not rpc_url.endswith("/json_rpc") else rpc_url,
-                                {"jsonrpc": "2.0", "id": "0",
-                                 "method": "get_transactions",
-                                 "params": {"txs_hashes": [txid],
-                                            "decode_as_json": False,
-                                            "prune": False}},
+                                check_url,
+                                {"txs_hashes": [txid],
+                                 "decode_as_json": False,
+                                 "prune": False},
                                 proxy,
                             )
-                            txs = q.get("result", {}).get("txs", [])
+                            txs = q.get("txs", [])
                             if txs:
                                 in_pool = txs[0].get("in_pool", True)
                                 ht = txs[0].get("block_height", 0)
@@ -221,6 +228,7 @@ def main():
                                     print(f"  [Mined] TX {idx} at height {ht}")
                                     integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
                                     confirmed = True
+                                    block_height = ht
                                     break
                         except Exception:
                             pass
@@ -231,13 +239,29 @@ def main():
                         print(f"  [!] TX {idx} unconfirmed after {args.mine_wait}s")
 
                     sent = True
+                    # Save txid in progress so we can check again on resume
+                    prog["log"].append({
+                        "idx": idx, "file": str(blob), "sent": True,
+                        "txid": txid, "confirmed": confirmed,
+                        "block_height": block_height,
+                    })
+                    prog["last"] = idx
+                    atomic_write_json(prog, progF)
+                    success_count += 1
                     break
                 else:
-                    err_obj = res.get("error", {})
-                    err_msg = (err_obj.get("message", str(res))
-                               if isinstance(err_obj, dict) else str(res))
-                    print(f"  Node: {err_msg[:80]}")
-                    if "low_fee" in err_msg.lower() and args.wallet_file:
+                    err_msg = res.get("reason", res.get("status", str(res)))
+                    if isinstance(err_msg, dict):
+                        err_msg = str(err_msg)
+                    print(f"  Node: {str(err_msg)[:80]}")
+
+                    if res.get("double_spend"):
+                        integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
+                        print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
+                        sent = False
+                        break
+
+                    if "low_fee" in str(err_msg).lower() and args.wallet_file:
                         raw_hex = _bump_fee(raw_hex, args.wallet_file)
                         print("  [+] Fee bumped, retrying...")
             except Exception as e:
@@ -250,14 +274,14 @@ def main():
                 secure_delay(5.0, 15.0)
 
         if sent:
-            success_count += 1
+            # Progress already saved inside the success branch with txid
+            pass
         else:
             fail_count += 1
             print(f"  [!] TX {idx} FAILED - manual action needed")
-
-        prog["last"] = idx
-        prog["log"].append({"idx": idx, "file": str(blob), "sent": sent})
-        atomic_write_json(prog, progF)
+            prog["last"] = idx
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False})
+            atomic_write_json(prog, progF)
 
     integrity_log("broadcast", f"done:success={success_count}:fail={fail_count}")
     print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed.")

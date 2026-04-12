@@ -104,7 +104,7 @@ def main():
 
     if not BTC_RE.match(args.btc_entry):
         sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
-    integrity_log("stage0", f"btc_entry_ok:{scrub_address(args.btc_entry)}")
+    integrity_log("stage0", "btc_entry_validated")
 
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
@@ -214,16 +214,9 @@ def main():
 
         return received_total
 
-    # Note: in a real flow, stage2 would be called after stage1 provides chunks
-    # For the JM-disabled case, we skip the actual swap
-    if args.joinmarket and any(c > 0 for c in btc_chunks):
-        integrity_log("stage2", "executing_swap")
-        # Would need a real XMR dest address here from stage3
-    else:
-        integrity_log("stage2", "swap_skipped:no_btc_chunks")
-
     ###########################################################################
-    # Stage 3 - Build wallets & DAG
+    # Stage 3 - Build wallets & DAG (must run BEFORE stage2 so we have
+    # a receive address for the ThorChain swap destination)
     ###########################################################################
     newnym()
     tor_recheck(proxy, "stage3_pre")
@@ -248,11 +241,25 @@ def main():
     import secrets as _secrets
     _secrets.SystemRandom().shuffle(subs)
 
+    ###########################################################################
+    # Stage 2 - ThorChain swap (runs AFTER stage3 so ENTRY address exists)
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage2_pre")
+
+    if args.joinmarket and any(c > 0 for c in btc_chunks):
+        xmr_received = stage2_thor_swap(btc_chunks, ENTRY)
+        integrity_log("stage2", f"swap_done:received={xmr_received}")
+    elif args.split > 1:
+        integrity_log("stage2", f"split_mode:chunks={args.split}")
+    else:
+        integrity_log("stage2", "swap_skipped:no_btc_chunks")
+
     dag = {}
     for a in subs:
         others = [b for b in subs if b != a]
         max_k = len(others)
-        k = min(_secrets.randbelow(3) + 1 * args.deep, max_k)
+        k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
         k = max(k, 1)
         chosen = []
         pool = list(others)
@@ -266,16 +273,22 @@ def main():
     # Stage 4 - Balance, amounts, plan
     ###########################################################################
 
-    def xmr_balance() -> Decimal:
+    def xmr_balance() -> tuple[Decimal, Decimal]:
+        """Returns (total_balance, unlocked_balance) in XMR."""
         res = rpc_primary.raw_request(
             "get_balance", {"account_index": 0, "address_indices": []}
         )
-        raw = res.get("balance", 0)
-        return Decimal(str(raw)) / Decimal(10 ** 12)
+        total = Decimal(str(res.get("balance", 0))) / Decimal(10 ** 12)
+        unlocked = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        return total, unlocked
 
-    bal = xmr_balance()
-    integrity_log("stage4", f"balance_raw={bal}")
+    total_bal, unlocked_bal = xmr_balance()
+    integrity_log("stage4", "balance_fetched")
 
+    if total_bal > unlocked_bal + DUST_XMR:
+        print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
+
+    bal = unlocked_bal
     if bal <= DUST_XMR:
         print("[!] Balance too low or zero - using mock balance for dry demo")
         bal = Decimal("10.0")
@@ -296,6 +309,13 @@ def main():
     split_amt = usable / Decimal(rounds)
     integrity_log("stage4", f"rounds={rounds}:split={split_amt}:fees={total_fees}")
 
+    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
+    quantized_split = split_amt.quantize(Decimal("0.0001"))
+    total_planned = quantized_split * rounds
+    if total_planned > usable:
+        quantized_split -= Decimal("0.0001")
+        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
+
     plan = []
     for r in range(rounds):
         if shutdown_requested():
@@ -308,7 +328,7 @@ def main():
         plan.append({
             "src": s,
             "dst": d,
-            "amt": str(split_amt.quantize(Decimal("0.0001"))),
+            "amt": str(quantized_split),
             "delay": _secrets.randbelow(540) + 180,  # 180-720s
             "extra": secure_hex(16),
         })

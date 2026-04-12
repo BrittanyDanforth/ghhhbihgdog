@@ -207,6 +207,48 @@ def wipe_swap_ram(dry: bool):
         print(f"  [!] RAM wipe failed: {e}")
 
 
+def wipe_gs_artifacts(dry: bool):
+    """Wipe GhostSpiral output files: unsigned plans, signed blobs, manifests,
+    wallet JSONs, integrity log, progress files, exit plans, thor pairs."""
+    patterns = [
+        "unsigned_*.json", "signed_blobs/", "signer_progress.json",
+        "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
+        "thor_pairs_*.json.gpg", "exitplan_*.json", "integrity_chain.log",
+        "*.blob",
+    ]
+    count = 0
+    cwd = Path(".")
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            d = cwd / pattern.rstrip("/")
+            if d.is_dir():
+                if dry:
+                    print(f"  [dry] would remove dir {d}")
+                else:
+                    shutil.rmtree(d, ignore_errors=True)
+                count += 1
+        else:
+            for f in cwd.glob(pattern):
+                if dry:
+                    print(f"  [dry] would remove {f}")
+                else:
+                    try:
+                        f.write_bytes(b"\x00" * min(f.stat().st_size, 65536))
+                        f.unlink()
+                    except (PermissionError, OSError):
+                        pass
+                count += 1
+    # Also check ./unsigned/ directory
+    unsigned_dir = cwd / "unsigned"
+    if unsigned_dir.is_dir():
+        if dry:
+            print(f"  [dry] would remove {unsigned_dir}")
+        else:
+            shutil.rmtree(unsigned_dir, ignore_errors=True)
+        count += 1
+    integrity_log("paranoia", f"gs_artifacts_wiped:{count}" if not dry else f"gs_artifacts_dry:{count}")
+
+
 def wipe_tmp_files(dry: bool):
     """Remove user-owned files from temp directories."""
     uid = os.getuid()
@@ -274,6 +316,9 @@ def main():
 
     print("  [*] Phase 9: Swap/RAM")
     wipe_swap_ram(args.dry_run)
+
+    print("  [*] Phase 10: GhostSpiral artifacts")
+    wipe_gs_artifacts(args.dry_run)
 
     integrity_log("paranoia", f"complete:dry={args.dry_run}")
     print("\n  [+] paranoia_mode complete.")

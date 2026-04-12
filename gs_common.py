@@ -130,7 +130,7 @@ def verify_tor(proxy: Dict[str, str]) -> None:
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
         sys.exit("[!] Tor leak detected - traffic NOT exiting via Tor. Aborting.")
-    integrity_log("tor", f"verified_exit_ip={data.get('IP', 'unknown')[:16]}")
+    integrity_log("tor", "verified_ok")
 
 
 def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
