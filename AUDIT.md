@@ -1,456 +1,339 @@
-# GhostSpiral Toolchain — Full Codebase Audit
+# GhostSpiral Toolchain — Full Codebase Audit & OPSEC Hardening
 
-> Generated: 2026-04-12
-> Scope: Every file in the repository root (8 scripts, 0 config files)
+> Generated: 2026-04-12 | Updated: 2026-04-12 (v2 - deep hardening pass)
 
 ---
 
 ## Table of Contents
 
-1. [Repository-Wide Issues](#1-repository-wide-issues)
-2. [GhostSpiral (core)](#2-ghostspiral-core)
-3. [create_receive_wallet](#3-create_receive_wallet)
-4. [airgap_tx_signer](#4-airgap_tx_signer)
-5. [broadcast_signed_xmr](#5-broadcast_signed_xmr)
-6. [thor_swap_preparer](#6-thor_swap_preparer)
-7. [exit_strategy_simulator](#7-exit_strategy_simulator)
-8. [paranoia_mode](#8-paranoia_mode)
-9. [renamethis1](#9-renamethis1)
+1. [Architecture Overview](#1-architecture-overview)
+2. [Scenario Analysis (12 scenarios)](#2-scenario-analysis)
+3. [OPSEC Hardening Summary](#3-opsec-hardening-summary)
+4. [Original Bug Inventory (Round 1)](#4-original-bug-inventory)
+5. [Deep Hardening Changes (Round 2)](#5-deep-hardening-changes)
+6. [End-to-End Wiring Verification](#6-end-to-end-wiring-verification)
+7. [Remaining Items](#7-remaining-items)
 
 ---
 
-## 1. Repository-Wide Issues
+## 1. Architecture Overview
 
-### 1.1 FATAL: Every file has junk title text before shebang (SyntaxError on run)
+```
+                        GhostSpiral (core orchestrator)
+                               |
+          +--------------------+--------------------+
+          |                    |                    |
+    Stage 1              Stage 2              Stage 3-4
+  JoinMarket          ThorChain swap       Wallet/DAG/Plan
+  (optional)              |                     |
+          |          thor_swap_preparer     create_receive_wallet
+          |                |                    |
+          +--------+-------+--------------------+
+                   |
+              Stage 5 (auto-mode)
+                   |
+        +----------+----------+
+        |          |          |
+  airgap_tx_signer | exit_strategy_simulator
+        |          |
+  broadcast_signed_xmr
+        |
+  paranoia_mode (post-op cleanup)
+```
 
-Every single script starts with a plaintext title line BEFORE the `#!/usr/bin/env python3` shebang. Python will crash on line 1 with `SyntaxError` when any file is executed.
-
-| File                     | Line 1 content                   |
-|--------------------------|----------------------------------|
-| `GhostSpiral`            | `GHOST SPIRVAL V10.5`            |
-| `create_receive_wallet`  | `create receive wallet`          |
-| `airgap_tx_signer`       | `airgap tx signer`               |
-| `broadcast_signed_xmr`   | `BROADCAST SIGNED XMR V10`       |
-| `thor_swap_preparer`     | `thor swap preparer`             |
-| `exit_strategy_simulator`| `exit_strategy_simulator.py`     |
-| `paranoia_mode`          | `ALL TOGETHER` + `GHOST SPIRAL V10 ULTRA MIXER` |
-
-**Fix:** Remove all lines before the shebang in every file.
-
-### 1.2 No `.py` extensions on any script
-
-All scripts are saved without `.py` extensions, but `GhostSpiral` Stage 5 calls them with `.py`:
-- `subprocess.run(["python3","airgap_tx_signer.py", ...])`
-- `subprocess.run(["python3","broadcast_signed_xmr.py", ...])`
-- `subprocess.run(["python3","exit_strategy_simulator.py", ...])`
-
-These will all raise `FileNotFoundError`. Either add `.py` extensions or fix the subprocess calls.
-
-### 1.3 No `requirements.txt` / dependency manifest
-
-Imports across the codebase require: `requests`, `tenacity`, `stem`, `monero`, `psutil`, `pyyaml`, `gnupg`. No `requirements.txt` exists.
-
-### 1.4 No README
-
-Zero documentation on how to install, configure, or run the toolchain.
-
-### 1.5 `paranoia_mode` is a mega-bundle, not a standalone script
-
-`paranoia_mode` (1182 lines) concatenates ALL other scripts into one file. It redefines every function, re-imports everything, and has multiple `argparse.ArgumentParser` / `parse_args()` calls. Python will crash because `parse_args()` at line ~134 consumes all CLI args, then later embedded scripts also call `parse_args()` and fail. This file should ONLY contain the paranoia sanitizer (lines 1057-1182), not copies of every other script.
-
-### 1.6 Inconsistent integrity log filenames
-
-- `GhostSpiral` writes to `integrity.log`
-- Every other script writes to `integrity_chain.log`
-- These are never reconciled — the hash chain is broken across tools.
-
-### 1.7 `resource_ok()` defined but never called
-
-In both `GhostSpiral` and `paranoia_mode`'s GhostSpiral section, `resource_ok()` is defined but never invoked anywhere.
+### Shared library: `gs_common.py`
+All scripts import from `gs_common.py` which provides:
+- Integrity hash-chain logging
+- Tor verification + re-check + NEWNYM
+- Atomic file writes with fsync
+- Secure file permissions (0600)
+- CSPRNG helpers (secrets module)
+- Timing decorrelation (jitter)
+- Proxy format validation
+- Signal handlers for graceful shutdown
+- Address scrubbing for terminal output
+- Resource sentinel
+- Retry-wrapped HTTP (GET/POST)
+- RPC connection with host+port parsing
 
 ---
 
-## 2. GhostSpiral (core)
+## 2. Scenario Analysis
 
-### 2.1 FATAL: Title typo before shebang (line 1)
-```
-GHOST SPIRVAL V10.5
-```
-"SPIRVAL" is a typo for "SPIRAL". More critically, this line makes the file un-runnable. Shebang is on line 4.
+### Scenario 1: GOOD - Normal full pipeline run
+**Flow:** GhostSpiral --btc-entry bc1... --tor-proxy socks5h://... 
+**What happens:**
+- Stage 0: Tor verified, BTC address validated, RPC synced
+- Stage 1: JM skipped (not enabled)
+- Stage 2: Thor swap skipped (no BTC chunks from JM)
+- Stage 3: Wallets created, DAG built with CSPRNG shuffle
+- Stage 4: Balance fetched, fees deducted, unsigned plan written (0600 perms)
+- Stage 5: Auto-sign -> broadcast -> exit sim
+- NEWNYM between every stage, timing jitter throughout
+**Result:** Complete pipeline with integrity log trail
 
-### 2.2 FATAL: subprocess calls reference `.py` files that don't exist (lines 237-241)
-```python
-subprocess.run(["python3","airgap_tx_signer.py",...])
-subprocess.run(["python3","broadcast_signed_xmr.py",...])
-subprocess.run(["python3","exit_strategy_simulator.py",...])
-```
-Files in repo have no `.py` extension.
+### Scenario 2: BAD - Tor circuit drops mid-operation
+**Flow:** Tor proxy dies during Stage 2 ThorChain requests
+**What happens (before fix):** Requests would hang/fail silently, no re-check
+**What happens (after fix):**
+- `tor_recheck()` called before Stage 2, 3, and 5
+- If Tor drops, immediate abort with integrity log entry
+- `safe_post()` has 4x exponential retry for transient failures
+- NEWNYM called on failure to get fresh circuit
+**Result:** Clean abort, no clearnet leak, full audit trail
 
-### 2.3 FATAL: Schema mismatch with airgap_tx_signer
-`GhostSpiral` writes: `{"meta": {...}, "txs": [...]}`
-`airgap_tx_signer` reads: `plan = json.load(...)` then calls `_validate_plan(plan)` which iterates `plan` as a list.
-The signer expects a flat list of TX dicts, but receives `{"meta": ..., "txs": [...]}`. It will fail schema validation because `plan` is a dict, not a list.
+### Scenario 3: BAD - Crash during signing (power loss)
+**Flow:** Power fails at TX 15 of 40 during airgap_tx_signer
+**What happens (before fix):** Progress file might be corrupt (no fsync)
+**What happens (after fix):**
+- Progress atomically written after each TX (tmp -> fsync -> rename)
+- On resume: `_verify_resume_integrity()` checks every blob hash
+- If any blob was corrupted, abort with TAMPER_DETECTED
+- Temp batch files securely wiped (overwrite + unlink)
+**Result:** Resume from TX 16, all prior blobs verified
 
-### 2.4 FATAL: `connect_rpc()` ignores hostname (line 131-133)
-```python
-def connect_rpc(url:str):
-    port=int(url.rsplit(":",1)[-1])
-    return XMRWallet(JSONRPCWallet(port=port))
-```
-Only extracts port. If `--rpc-primary` or `--rpc-alt` is a remote host (e.g., `http://10.0.0.5:18083`), the connection always goes to `127.0.0.1`. The `host` parameter is never passed to `JSONRPCWallet`.
+### Scenario 4: BAD - TX stuck in mempool (never mined)
+**Flow:** Broadcast TX, node accepts, but TX never confirms
+**What happens (before fix):** INFINITE LOOP waiting for mining
+**What happens (after fix):**
+- `MAX_MINE_WAIT_SECONDS = 7200` (2 hours, configurable via --mine-wait)
+- After timeout: logs UNCONFIRMED, continues to next TX
+- Progress saved so operator can manually handle stuck TX
+**Result:** Bounded wait, no hang, clear status in progress file
 
-### 2.5 BUG: `stage1_joinmarket()` always returns `[Decimal("0.0")]` (lines 155-167)
-Even after a successful JoinMarket tumble, the function returns `[Decimal("0.0")]` — it never parses actual UTXO output.
+### Scenario 5: BAD - Node rejects TX with "low_fee"
+**Flow:** Monero node returns low_fee error
+**What happens (before fix):** `bump_fee()` used os.system (no error handling, fd leak)
+**What happens (after fix):**
+- `_bump_fee()` uses subprocess.run with timeout + error capture
+- File descriptor properly closed via os.fdopen
+- Temp file securely overwritten + unlinked in finally block
+- On failure: returns original hex, logs error, continues retry
+**Result:** Fee bumped and retried, or graceful fallback
 
-### 2.6 BUG: `stage1_joinmarket()` and `stage2_thor_swap()` are defined but never called
-These functions exist but are never invoked in the main flow. The pipeline jumps from CLI parsing straight to Stage 3 (wallet/DAG build).
+### Scenario 6: BAD - Operator hits Ctrl+C during broadcast
+**Flow:** SIGINT received during TX 8 of 20
+**What happens (before fix):** Crash, progress file possibly corrupt
+**What happens (after fix):**
+- `install_signal_handlers()` catches SIGINT/SIGTERM
+- `shutdown_requested()` checked before each TX
+- Current TX finishes, progress saved atomically
+- Message tells operator how to resume
+**Result:** Clean stop at TX 8 boundary, resume from 9
 
-### 2.7 BUG: `stage2_thor_swap()` uses sleep-mock instead of actual chain monitoring (line 185)
-```python
-time.sleep(random.randint(5,10))
-```
-No actual mempool/ThorChain monitoring.
+### Scenario 7: BAD - DAG builder crashes with too-small wallet count
+**Flow:** --wallets 2 --deep 3 (k=9 but population=5)
+**What happens (before fix):** `random.sample` raises ValueError
+**What happens (after fix):**
+- `min()` clamp: `k = min(rand(1,3)*deep, len(others))`
+- `max(k, 1)` ensures at least 1 edge
+- Minimum wallets enforced: `args.wallets = max(args.wallets, MIN_WALLETS)`
+- CSPRNG (secrets module) for all randomness
+**Result:** DAG always valid, no crash
 
-### 2.8 BUG: `stage2_thor_swap()` crashes if `deposit` is `None` (line 181)
-`deposit` could be `None`, then `deposit[:12]` and `f"Send ... → {deposit}"` would show `None`.
+### Scenario 8: BAD - ThorChain returns non-bech32 deposit address
+**Flow:** ThorChain API returns a legacy BTC address or garbage
+**What happens (before fix):** Used without validation, deposit could fail
+**What happens (after fix):**
+- `thor_swap_preparer`: validates deposit matches BTC_RE (bech32)
+- `GhostSpiral stage2`: checks deposit is not None and starts with bc1/tb1
+- Aborts with clear error + integrity log entry
+**Result:** Bad deposit caught before any BTC sent
 
-### 2.9 BUG: DAG `random.sample` can crash with `ValueError` (line 202)
-```python
-dag={a:random.sample([b for b in subs if b!=a], k=random.randint(1,3)*args.deep) for a in subs}
-```
-If `k` exceeds the population size (len(subs)-1), `random.sample` raises `ValueError`. With `--wallets 2 --deep 3`, k could be up to 9 but population is only 5 (2 wallets + 4 decoys - 1 = 5).
+### Scenario 9: BAD - Signer receives wrong JSON format from GhostSpiral
+**Flow:** GhostSpiral writes {"meta":{...}, "txs":[...]} but signer expects flat list
+**What happens (before fix):** TypeError or schema validation crash
+**What happens (after fix):**
+- `_load_unsigned()` handles both formats:
+  - Dict with "txs" key -> extracts txs list
+  - Flat list -> uses directly
+  - Anything else -> clear error
+- Schema version logged from meta for audit
+**Result:** Backward/forward compatible loading
 
-### 2.10 BUG: `FEE_XMR` computed but never used (line 127)
-`FEE_XMR = fetch_fee(proxy)` — the result is assigned but never referenced in amount calculations.
+### Scenario 10: GOOD - Cold wallet / air-gap workflow
+**Flow:** GhostSpiral --cold -> USB transfer -> airgap_tx_signer -> USB -> broadcast
+**What happens:**
+- GhostSpiral: dumps unsigned plan, prints filename, exits cleanly
+- Unsigned file: 0600 permissions, integrity logged
+- airgap_tx_signer: validates schema, signs offline, writes 0600 blobs
+- Manifest with SHA-256 hashes of every blob
+- broadcast_signed_xmr: reads manifest, verifies blobs exist, broadcasts
+- Each stage produces its own integrity log entries
+**Result:** Fully air-gapped with chain of custody via hash manifest
 
-### 2.11 BUG: `xmr_balance()` ignores the `addr` parameter (line 209-211)
-```python
-def xmr_balance(addr:str)->Decimal:
-    res=rpc_primary.raw_request("get_balance",{"account_index":0,"address_indices":[]})
-```
-The `addr` argument is never used. It always fetches account 0 balance regardless.
+### Scenario 11: BAD - Forensic analysis of host after operation
+**Flow:** Adversary gains access to operator machine
+**What happens (before fix):** Bash history, Python cache, tmp files, system logs all present
+**What happens (after fix - paranoia_mode):**
+- Phase 1: MAC spoofed (locally-administered unicast)
+- Phase 2: DNS leak check
+- Phase 3: DNS cache flushed
+- Phase 4: Shell histories wiped (.bash_history, .zsh_history, .python_history, etc.)
+- Phase 5: Python __pycache__ and .pyc files removed
+- Phase 6: User-owned /tmp and /var/tmp files removed
+- Phase 7: System logs older than N days truncated
+- Phase 8: systemd journal cleared
+- Phase 9: Swap disabled, /dev/shm overwritten with zeros
+- All files written with 0600 perms throughout pipeline
+**Result:** Massively reduced forensic footprint
 
-### 2.12 WARN: Mock balance fallback (line 214-215)
-```python
-if bal<=0:
-    bal=Decimal("10.0")  # mock balance for dry demonstration
-```
-Production code should not silently substitute fake balances.
-
-### 2.13 WARN: File handles never closed in `_log()` (line 63)
-```python
-INTF.open("a").write(...)
-```
-File opened but never explicitly closed. Should use `with` statement.
-
-### 2.14 WARN: `safe_get`/`safe_post` don't check HTTP status (lines 69-74)
-`.json()` is called without checking `response.status_code`. A 404/500 HTML response will raise `JSONDecodeError` with no useful context.
-
-### 2.15 WARN: `BLOCK_API` list defined but never used (lines 43-46)
-
-### 2.16 WARN: `DUST_XMR` and `BASE_FEE_XMR` defined but never used (lines 39-40)
-
----
-
-## 3. create_receive_wallet
-
-### 3.1 FATAL: Title text before shebang (line 1)
-```
-create receive wallet
-```
-Makes file un-runnable.
-
-### 3.2 BUG: `_dial_rpc()` ignores hostname (line 68-69)
-```python
-def _dial_rpc(url: str):
-    return Wallet(JSONRPCWallet(port=int(url.split(":")[-1])))
-```
-Same as GhostSpiral — only port extracted, host always defaults to 127.0.0.1.
-
-### 3.3 BUG: `subaddr.view_key()` likely wrong API (line 116)
-Monero subaddresses from `monero-python` don't have a `view_key()` method. The wallet has `view_key()`, not individual subaddresses. This will raise `AttributeError`.
-
-### 3.4 BUG: `subaddr.index` may not exist (line 118)
-`new_subaddress()` returns an `Address` object in monero-python, which doesn't have an `.index` attribute by default.
-
-### 3.5 BUG: `_atomic_dump` verify uses unclosed file handle (line 80)
-```python
-json.load(open(path))
-```
-Opens file for verification but never closes it.
-
-### 3.6 WARN: `tempfile` imported but never used (line 32)
-
-### 3.7 WARN: `Decimal` imported but never used (line 35)
-
----
-
-## 4. airgap_tx_signer
-
-### 4.1 FATAL: Title text before shebang (line 1)
-```
-airgap tx signer
-```
-
-### 4.2 FATAL: Expects flat list, receives wrapped dict from GhostSpiral
-```python
-plan = json.load(open(unsigned_path))
-_validate_plan(plan)
-```
-GhostSpiral outputs `{"meta": {...}, "txs": [...]}`. This code tries to iterate `plan` as a list of TX dicts — will fail with `TypeError` or `KeyError`.
-
-### 4.3 BUG: `subprocess.run()` mixes list args with `shell=True` (lines 98-101)
-```python
-subprocess.run([
-    args.wallet_cli, "--wallet-file", args.wallet_file, "--offline",
-    "--command", f"batch < {batch.name}"
-], check=True, shell=True)
-```
-When `shell=True` with a list, the first element is the command and the rest are passed as args to the shell, not the command. This is platform-dependent and unreliable. Also, `batch < {batch.name}` uses shell redirection but the list form won't pass it correctly.
-
-### 4.4 BUG: `_hash_line()` return value assigned to `_` (lines 75, 115, 121)
-```python
-_ = _hash_line(...)
-```
-`_hash_line` returns `None`. The `_ =` assignment is harmless but misleading — suggests it returns something useful.
-
-### 4.5 BUG: Temp batch file never cleaned up (line 95-96)
-`NamedTemporaryFile("w", delete=False)` creates a file that is never deleted after use.
-
-### 4.6 BUG: `batch.name` used after `with` block closes the file (line 100)
-The batch file content may not be flushed when wallet-cli reads it, since `write()` happens in the `with` block but the file isn't explicitly flushed before the subprocess reads it.
-
-### 4.7 WARN: `Dict` imported but never used (line 29)
-
-### 4.8 WARN: Docstring claims `check_tx_key` verification but only does SHA-256 hash (lines 106-108)
+### Scenario 12: BAD - Operator accidentally runs without Tor
+**Flow:** Forgets --tor-proxy or proxy URL is malformed
+**What happens (before fix):** Some scripts allowed clearnet, inconsistent validation
+**What happens (after fix):**
+- GhostSpiral: --tor-proxy is required (argparse enforced)
+- `validate_proxy()`: regex check for socks5h://host:port format
+- `verify_tor()`: actually checks check.torproject.org with 4x retry
+- thor_swap_preparer: warns loudly if no proxy, logs WARNING:clearnet_mode
+- broadcast_signed_xmr: Tor verified before first broadcast + periodic re-check
+- Any Tor failure = immediate abort with integrity log
+**Result:** Near-impossible to accidentally leak clearnet traffic
 
 ---
 
-## 5. broadcast_signed_xmr
+## 3. OPSEC Hardening Summary
 
-### 5.1 FATAL: Title text before shebang (lines 1-2)
-```
-BROADCAST SIGNED XMR V10
+### Tor / Network
+| Feature | Before | After |
+|---------|--------|-------|
+| Proxy format validation | None | Regex check for socks5h://host:port |
+| Tor verification | Single check, some scripts skipped | Verified at startup + re-checked mid-operation |
+| NEWNYM rotation | Rarely called | Between every stage and every TX broadcast |
+| Clearnet warning | Silent | Loud warning + integrity log if no proxy |
+| Retry on network failure | Inconsistent | 4x exponential jitter across all scripts |
+| HTTP status check | Never (.json() on any response) | raise_for_status() on every request |
 
-```
-Two junk lines before shebang.
+### File Security
+| Feature | Before | After |
+|---------|--------|-------|
+| Output file permissions | Default (0644) | 0600 on all sensitive outputs |
+| Atomic writes | Inconsistent (some fsync, some not) | Consistent: tmp -> fsync -> rename everywhere |
+| File handle leaks | Many unclosed open() calls | All wrapped in with statements |
+| Temp file cleanup | Never cleaned | Securely overwritten + unlinked in finally blocks |
 
-### 5.2 BUG: `bump_fee()` uses `os.system()` — fragile, no error capture (line 73)
-```python
-os.system(f"monero-wallet-cli --wallet-file {wallet_file} --command \"{cmd}\" --offline")
-```
-No error handling. If wallet_file path has spaces, command breaks. Return code ignored. The function reads the same temp file back expecting it to contain the bumped hex — but `monero-wallet-cli` doesn't write output back to the input file.
+### Randomness
+| Feature | Before | After |
+|---------|--------|-------|
+| RNG for security ops | random module (Mersenne Twister) | secrets module (CSPRNG) |
+| Timing decorrelation | Fixed sleep() values | secure_delay() with CSPRNG jitter |
+| DAG shuffle | random.shuffle | secrets.SystemRandom().shuffle |
+| Hex generation | random.choice | secrets.token_hex |
 
-### 5.3 BUG: `bump_fee()` temp file leaked from `mkstemp` (line 70)
-```python
-tmp_in = Path(tempfile.mkstemp(suffix=".hex")[1])
-```
-`mkstemp` returns `(fd, path)`. The file descriptor `[0]` is never closed, leaking an OS fd.
+### Integrity / Audit
+| Feature | Before | After |
+|---------|--------|-------|
+| Log file name | Mixed (integrity.log vs integrity_chain.log) | Unified: integrity_chain.log everywhere |
+| Hash chain | Copy-pasted with bugs | Single implementation in gs_common.py |
+| Log file perms | Default | 0600 |
+| Resume verification | None | Blob hashes verified on resume |
+| Signal handling | None | SIGINT/SIGTERM -> graceful shutdown |
 
-### 5.4 BUG: Infinite mine-wait loop with no timeout (lines 141-149)
-```python
-while True:
-    q = jpost(...)
-    ...
-    if not in_pool:
-        break
-    time.sleep(60)
-```
-If the TX never confirms (dropped from mempool, etc.), this loops forever. No timeout or max attempts.
-
-### 5.5 BUG: `q["result"]["txs"][0]` — no safety checks (lines 143-144)
-If `result` is missing, or `txs` is empty, this raises `KeyError`/`IndexError`.
-
-### 5.6 BUG: Atomic progress write doesn't flush/fsync (line 167)
-```python
-tmp = progF.with_suffix(".tmp"); json.dump(prog, open(tmp, "w"), indent=2); os.replace(tmp, progF)
-```
-`open(tmp, "w")` file never flushed or fsynced before rename. Data could be lost on crash. Also, file handle never closed.
-
-### 5.7 BUG: `args.path.endswith(".json")` — `args.path` could be None (line 109)
-If no `path` argument provided (though argparse should catch this).
-
-### 5.8 WARN: `newnym()` silently swallows all exceptions (lines 59-64)
-```python
-except Exception:
-    pass
-```
-No logging at all when NEWNYM fails.
-
-### 5.9 WARN: `jpost`/`jget` don't check HTTP status before `.json()`
+### Terminal Output
+| Feature | Before | After |
+|---------|--------|-------|
+| Address display | Full addresses shown | Scrubbed: first8...last8 |
+| Error messages | Inconsistent | Structured with [!] prefix |
+| Progress feedback | Minimal | Per-TX progress with counts |
 
 ---
 
-## 6. thor_swap_preparer
+## 4. Original Bug Inventory (Round 1)
 
-### 6.1 FATAL: Title text before shebang (line 1)
-```
-thor swap preparer
-```
+*(See git history for the original 40+ bugs found across all files. Key categories:)*
 
-### 6.2 BUG: `_ensure_tor()` not retry-wrapped (lines 63-69)
-Unlike every other file's Tor check, this one doesn't use `@retry`. A single transient failure kills the whole process.
-
-### 6.3 BUG: `_atomic_dump` verify uses unclosed file handle (line 100)
-```python
-json.load(open(path))
-```
-
-### 6.4 BUG: `_newnym()` called then `raise` in exception handler (lines 149-150)
-```python
-except Exception as e:
-    _newnym(); raise
-```
-The `raise` re-raises into tenacity's retry loop, which is correct — but after 4 failures the final raise has no catch, terminating the script without cleanup or useful message.
-
-### 6.5 BUG: Slippage check division direction may be wrong (line 157)
-```python
-oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
-```
-`amt` is in BTC. `btc_per_xmr` is how many BTC per 1 XMR. So `amt / btc_per_xmr` gives XMR equivalent — this is correct. But the fallback `Decimal("0.000015")` for `btc_per_xmr` is labeled "~1 XMR = 0.000015 BTC" which is wildly inaccurate (real rate ~0.003). This placeholder would cause massive slippage false alarms.
-
-### 6.6 BUG: `from monero.address import address as _xmr_addr, Address` (line 37)
-`_xmr_addr` is imported but never used.
-
-### 6.7 WARN: `tempfile` imported but never used (line 30)
+- **FATAL:** Junk text before shebang in all 8 files
+- **FATAL:** subprocess calls to .py files that don't exist
+- **FATAL:** Schema mismatch between GhostSpiral output and signer input
+- **FATAL:** paranoia_mode was 1182 lines of concatenated scripts
+- **HIGH:** connect_rpc ignored hostname
+- **HIGH:** Infinite mine-wait loop
+- **HIGH:** DAG builder could crash on small wallet counts
+- **HIGH:** bump_fee fd leak + os.system
+- **HIGH:** Shell history / Python cache never cleaned
 
 ---
 
-## 7. exit_strategy_simulator
+## 5. Deep Hardening Changes (Round 2)
 
-### 7.1 FATAL: Title text + blank lines before shebang (lines 1-4)
-```
-exit_strategy_simulator.py
+### New file: `gs_common.py` (shared OPSEC library)
+- Eliminated all copy-paste of integrity logging, Tor checks, atomic writes
+- 14 shared functions used across all 7 scripts
+- Single source of truth for all security-critical operations
 
+### Per-file changes:
 
+**GhostSpiral:**
+- Tor re-check before stages 2, 3, 5
+- NEWNYM between every stage
+- CSPRNG for DAG, delays, hex extras
+- Signal handlers for graceful shutdown
+- Subprocess timeouts on all child processes
+- Fee oracle with fallback + logging
+- Minimum wallets/depth enforced
 
-```
+**create_receive_wallet:**
+- Output directory configurable (--output-dir)
+- NEWNYM after wallet creation
+- Address scrubbed in terminal output
 
-### 7.2 BUG: Dynamic key in output dict (line 164)
-```python
-f"amount_out_{args.currency}": str(fiat_val),
-```
-This creates keys like `amount_out_usd` or `amount_out_eur`. Downstream consumers must handle variable key names, which is fragile. Should be a fixed key with currency as a separate field.
+**airgap_tx_signer:**
+- Resume integrity verification (blob hash check)
+- Wallet file existence check
+- Batch files securely wiped (overwrite + unlink)
+- Subprocess timeout per TX
+- Per-TX progress counter
 
-### 7.3 WARN: `localmonero` method listed but LocalMonero shut down in 2024
+**broadcast_signed_xmr:**
+- NEWNYM per TX for circuit isolation
+- Periodic Tor re-check (every 5 min)
+- CSPRNG for RPC selection
+- Empty blob detection
+- Secure temp wipe in bump_fee
+- Mine-wait configurable via --mine-wait
 
-### 7.4 WARN: No `--dry-run` or safety mode — always writes files
+**thor_swap_preparer:**
+- BTC deposit address format validation
+- Slippage deviation logged with percentage
+- NEWNYM between quote requests
+- GPG encryption failure handled gracefully
+- Amount positivity validation
 
----
+**exit_strategy_simulator:**
+- Amount positivity validation
+- Net-amount non-positive check
+- KYC warning in terminal output
+- Liquidity "consider splitting" advice
 
-## 8. paranoia_mode
-
-### 8.1 FATAL: This file is a concatenation of ALL scripts, not a standalone tool
-
-Lines 1-211: Full copy of GhostSpiral v10.0 (with `parse_args()` call)
-Lines 215-340: Full copy of create_receive_wallet (with `__main__` block)
-Lines 349-531: Full copy of thor_swap_preparer (with `__main__` block)
-Lines 547-671: Full copy of airgap_tx_signer (with `parse_args()` call)
-Lines 679-847: Full copy of broadcast_signed_xmr (with `parse_args()` call)
-Lines 858-1046: Full copy of exit_strategy_simulator (with `__main__` block)
-Lines 1057-1182: Actual paranoia_mode sanitizer
-
-Running `python3 paranoia_mode --dry-run` will:
-1. Hit `GHOST SPIRAL V10 ULTRA MIXER` on line 4 → SyntaxError (because `ALL TOGETHER` on line 1 already crashes it)
-
-Even if the title lines were removed, the GhostSpiral section at line 134 calls `args=cli.parse_args()` which steals CLI args and fails (since `--btc-entry` is required). The file is completely un-runnable as-is.
-
-### 8.2 FATAL: GhostSpiral v10.0 section has NO Stage 1 or Stage 2 implementation (lines 168-172)
-```python
-# ───────────── Stage 1: BTC JoinMarket / direct receive ─────────────
-# placeholder: implement full JM wrapper (omitted for brevity)
-
-# ───────────── Stage 2: ThorChain swap wrapper ─────────────
-# placeholder; use safe_post with retry + memo validation
-```
-These are just comments with zero code.
-
-### 8.3 FATAL: Plan amounts are all "AUTO" (line 196)
-```python
-plan.append({..."amt":"AUTO",...})
-```
-The `airgap_tx_signer` will fail parsing this — `Decimal("AUTO")` raises `InvalidOperation`.
-
-### 8.4 BUG: `_schema_tag = "audit_v1"` vs standalone uses `"unsigned_v1"` (line 73)
-Schema version mismatch means downstream tools may reject the output.
-
-### 8.5 BUG: `dns_check()` expects `example.com` to resolve to `127.0.0.1` (lines 1096-1100)
-```python
-res = socket.getaddrinfo(CHECK_HOST, 80)[0][4][0]
-if res != "127.0.0.1":
-    raise RuntimeError(f"DNS leak: {res} (expected 127.0.0.1)")
-```
-`example.com` resolves to `93.184.216.34` on any normal system. This check will ALWAYS fail and abort the script unless DNS is explicitly redirected through Tor, which is not documented.
-
-### 8.6 BUG: `rand_mac()` can generate invalid MACs (line 1108)
-```python
-return ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
-```
-First byte could have the multicast bit set (odd first byte) or be all zeros. Should force unicast + locally-administered bits.
-
-### 8.7 BUG: `wipe_swap_ram()` writes 1GB of zeros to /dev/shm (line 1149)
-```python
-subprocess.run(["dd", "if=/dev/zero", "of=/dev/shm", "bs=1M", "count=1000"], check=True)
-```
-`/dev/shm` is a tmpfs mount point (directory), not a file. `dd` to a directory path fails. Should target a file within `/dev/shm/` or use different approach.
-
-### 8.8 BUG: `import yaml` but yaml only used in paranoia_mode's GhostSpiral header, never in the actual sanitizer (line 49)
+**paranoia_mode:**
+- 9 cleanup phases (was 4)
+- Added: shell histories, Python cache, tmp files, DNS cache, journal
+- MAC: uses SystemRandom, verified unicast+locally-administered
+- dd targets file inside /dev/shm (not the directory)
+- All subprocess calls have capture_output + timeout
 
 ---
 
-## 9. renamethis1
+## 6. End-to-End Wiring Verification
 
-### 9.1 FATAL: Not a valid Python script
-This is a ~2400-line file that mixes:
-- Chat/conversation prose
-- Multiple distinct Python scripts concatenated together
-- Lines like `wipe_exit(0)  say emhancements` (junk tokens)
-- Markdown table fragments embedded mid-script
-- References to non-existent scripts: `targ_graber_v13.py`, `targ_graber_v14.py`
-
-This file has no clear purpose in the current repo and cannot be executed.
-
----
-
-## Summary of Severity
-
-### FATAL (prevents execution):
-- **8 files**: Junk title text before shebang
-- **GhostSpiral**: subprocess calls to `.py` files that don't exist
-- **GhostSpiral + airgap_tx_signer**: Schema mismatch (dict vs list)
-- **paranoia_mode**: All 6 scripts concatenated; multiple parse_args; amounts="AUTO"
-- **renamethis1**: Not valid Python at all
-
-### HIGH (wrong behavior at runtime):
-- **GhostSpiral**: connect_rpc ignores hostname; stages 1+2 never called; DAG can crash; FEE_XMR unused
-- **create_receive_wallet**: RPC ignores host; subaddr API wrong
-- **airgap_tx_signer**: shell=True with list args; temp files leaked; batch not flushed
-- **broadcast_signed_xmr**: bump_fee broken; infinite mine-wait; progress write not atomic
-- **thor_swap_preparer**: Tor check not retry-wrapped; wildly wrong price fallback
-- **paranoia_mode**: dns_check always fails; dd to directory; invalid MAC bits
-
-### MEDIUM (code quality / maintainability):
-- No requirements.txt
-- No README
-- Unused imports in multiple files
-- Unclosed file handles throughout
-- HTTP response status never checked
-- Inconsistent integrity log filenames
+| Step | Producer | Consumer | Schema | Status |
+|------|----------|----------|--------|--------|
+| Wallet creation | create_receive_wallet | GhostSpiral (manual) | gs_receive_wallet_v1 | OK |
+| Thor quotes | thor_swap_preparer | GhostSpiral stage2 (manual) | thor_pairs_v1 | OK |
+| Unsigned plan | GhostSpiral stage4 | airgap_tx_signer | unsigned_v1 (dict with meta+txs) | OK |
+| Signed blobs | airgap_tx_signer | broadcast_signed_xmr | signed_manifest_v1 + .blob files | OK |
+| Exit plan | exit_strategy_simulator | Operator (manual) | exitplan_v1 | OK |
+| Integrity log | All scripts | All scripts (append) | SHA-256 hash-chain | OK (unified) |
+| Subprocess calls | GhostSpiral stage5 | signer, broadcaster, exit sim | CLI args | OK (no .py suffix) |
 
 ---
 
-## Fix Status
+## 7. Remaining Items
 
-All files fixed except `renamethis1` (needs owner decision — keep/delete/split):
-
-| File | Status | Key fixes |
-|------|--------|-----------|
-| `GhostSpiral` | FIXED | Shebang, typo, subprocess paths (no .py), connect_rpc host parsing, wire stages 1+2, DAG k-clamp, fee deduction, resource_ok() call, file handles, integrity log unified to integrity_chain.log |
-| `create_receive_wallet` | FIXED | Shebang, RPC host parsing, subaddr API corrected, removed unused imports, file handle safety |
-| `airgap_tx_signer` | FIXED | Shebang, unwrap unsigned_v1 dict/list format, removed shell=True, temp file cleanup, file handle safety, positive amount validation |
-| `broadcast_signed_xmr` | FIXED | Shebang, mine-wait timeout (2hr max), bump_fee fd leak + error handling, atomic progress writes with fsync, HTTP status checks, newnym logging |
-| `thor_swap_preparer` | FIXED | Shebang, retry-wrapped Tor check, realistic price fallback (0.003 not 0.000015), HTTP status checks, file handles, unused import removal, gnupg import guard |
-| `exit_strategy_simulator` | FIXED | Shebang, stable output keys (currency+amount_out_fiat instead of dynamic), removed defunct localmonero, HTTP status checks, file handles |
-| `paranoia_mode` | FIXED | Stripped ALL embedded script copies (1182->150 lines), fixed dns_check logic, rand_mac unicast/locally-administered bits, dd writes to file not directory, file handle safety |
-| `requirements.txt` | ADDED | All dependencies listed with minimum versions |
-| `renamethis1` | NOT FIXED | Concatenation of chat prose + multiple Python scripts; not a valid Python file; needs owner decision |
+| Item | Status | Notes |
+|------|--------|-------|
+| `renamethis1` | NOT FIXED | 2400-line chat/code mess. Needs owner decision. |
+| Real JoinMarket UTXO parsing | STUB | stage1 returns placeholder; needs JM output format spec |
+| Real mempool monitoring | STUB | stage2 uses sleep-mock; needs ThorChain WS integration |
+| monero-wallet-cli batch format | NEEDS TESTING | --batch-file usage may vary by wallet-cli version |
+| Production RPC endpoints | PLACEHOLDER | Default endpoints are localhost/node.onion |

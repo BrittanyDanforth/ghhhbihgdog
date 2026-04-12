@@ -1,129 +1,92 @@
 #!/usr/bin/env python3
 """
-create_receive_wallet.py - GhostSpiral companion (v10-ready)
-================================================================
-Generates a **fresh Monero receive wallet / sub-address bundle** that
-conforms to the new GhostSpiral v10 JSON-schema and feeds an integrity
-hash-chain so every wallet generation event is provably logged.
+create_receive_wallet - GhostSpiral companion (v10-ready)
+==========================================================
+Generates a fresh Monero receive wallet / sub-address bundle that
+conforms to the GhostSpiral v10 JSON schema.
 
-Key Hardening (v10)
--------------------
-1. Tor-leak guard    - verifies traffic really egresses via Tor when
-   a socks proxy is supplied, aborts otherwise.
-2. Exponential-retry RPC dial - up to 4 attempts with doubling
-   back-off when contacting monero-wallet-rpc.
-3. Integrity hash-chain - every wallet creation appends a SHA-256
-   line chained to the previous hash (same file used by GhostSpiral).
-4. Atomic JSON dump  - writes wallet_<ts>.json.tmp then fsync +
-   rename. Matches the gs_receive_wallet_v1 schema.
-5. Disk/RAM sentinel - abort if free disk <2 GB or RAM >90%.
-
-Usage (example):
-    torsocks python3 create_receive_wallet \
-        --rpc http://127.0.0.1:18083 \
-        --tor-proxy socks5h://127.0.0.1:9050
-
-Outputs wallet_<timestamp>.json and appends a line to integrity_chain.log.
+OPSEC hardening:
+  - Tor leak check before RPC contact
+  - NEWNYM after wallet creation to break timing correlation
+  - Output files written 0600 (owner-only)
+  - Addresses scrubbed in terminal output
+  - Integrity hash-chain for every wallet event
+  - Atomic JSON writes with fsync
+  - Resource sentinel
 """
 from __future__ import annotations
-import argparse, os, json, time, hashlib, psutil, sys
+import argparse, sys
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+import time
 
-import requests
-from tenacity import retry, wait_exponential, stop_after_attempt
-
-INT_LOG = Path("integrity_chain.log")
-
-
-def _hash_line(line: str) -> None:
-    """Append a line to the integrity log, chained with SHA-256."""
-    prev = "0" * 64
-    if INT_LOG.exists():
-        lines = INT_LOG.read_text().splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0]
-    new_hash = hashlib.sha256((prev + line).encode()).hexdigest()
-    with INT_LOG.open("a") as f:
-        f.write(f"{new_hash} | {line}\n")
-
-
-_CHECK_TOR = "https://check.torproject.org/api/ip"
-
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(min=3, max=20))
-def _tor_ok(proxy: dict[str, str]) -> bool:
-    r = requests.get(_CHECK_TOR, timeout=15, proxies=proxy)
-    r.raise_for_status()
-    return bool(r.json().get("IsTor"))
-
-
-try:
-    from monero.wallet import Wallet
-    from monero.backends.jsonrpc import JSONRPCWallet
-except ImportError:
-    sys.exit("[!] python-monero library missing - pip install monero")
-
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(min=2, max=16))
-def _dial_rpc(url: str):
-    """Connect to monero-wallet-rpc, extracting both host and port from URL."""
-    parsed = urlparse(url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 18083
-    return Wallet(JSONRPCWallet(host=host, port=port))
-
-
-def _atomic_dump(obj: dict, path: Path):
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    with open(path) as fh:
-        json.load(fh)
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, connect_rpc,
+    require_resources, atomic_write_json, secure_file_perms,
+    install_signal_handlers, newnym, scrub_address,
+)
 
 
 def main():
-    ap = argparse.ArgumentParser("create_receive_wallet v10")
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "create_receive_wallet v10",
+        description="Generate a fresh Monero receive subaddress for GhostSpiral",
+    )
     ap.add_argument("--rpc", default="http://127.0.0.1:18083",
-                    help="monero-wallet-rpc primary endpoint")
+                    help="monero-wallet-rpc endpoint")
     ap.add_argument("--tor-proxy",
                     help="socks5h://host:port if routing via Tor")
     ap.add_argument("--label", default="GhostSpiral_entry",
                     help="label for the new subaddress")
+    ap.add_argument("--output-dir", default=".",
+                    help="directory for wallet JSON output")
     args = ap.parse_args()
 
-    if psutil.virtual_memory().percent > 90 or psutil.disk_usage(".").free < 2 * 1024 ** 3:
-        sys.exit("[!] Resource ceiling hit - aborting wallet creation")
+    require_resources(min_disk_gb=2.0)
 
-    proxy = {"http": args.tor_proxy, "https": args.tor_proxy} if args.tor_proxy else None
-    if args.tor_proxy and not _tor_ok(proxy):
-        sys.exit("[!] Tor proxy leak detected - abort.")
+    proxy = None
+    if args.tor_proxy:
+        proxy = validate_proxy(args.tor_proxy)
+        verify_tor(proxy)
 
     try:
-        wallet_rpc = _dial_rpc(args.rpc)
+        wallet_rpc = connect_rpc(args.rpc)
     except Exception as e:
+        integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
-    acct = wallet_rpc.accounts[0] if wallet_rpc.accounts else wallet_rpc.new_account(label="GhostSpiral")
+    acct = (wallet_rpc.accounts[0]
+            if wallet_rpc.accounts
+            else wallet_rpc.new_account(label="GhostSpiral"))
     subaddr = acct.new_subaddress(label=args.label)
+    addr_str = str(subaddr)
+
+    integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
         "schema": "gs_receive_wallet_v1",
         "created": datetime.now(timezone.utc).isoformat(),
-        "address": str(subaddr),
+        "address": addr_str,
         "account_index": acct.index,
         "label": args.label,
     }
-    fname = f"wallet_{int(time.time())}.json"
-    _atomic_dump(out, Path(fname))
-    print(f"[+] Fresh receive wallet saved -> {fname}")
 
-    _hash_line(f"wallet-create {fname} {str(subaddr)[:12]}...")
-    print(f"[+] Integrity chain updated -> {INT_LOG}")
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    fname = outdir / f"wallet_{int(time.time())}.json"
+    atomic_write_json(out, fname)
+
+    print(f"  [+] Wallet saved -> {fname}")
+    print(f"  [+] Address: {scrub_address(addr_str)}")
+
+    integrity_log("wallet", f"saved:{fname.name}")
+
+    if proxy:
+        newnym()
+
+    print(f"  [+] Integrity chain updated.")
 
 
 if __name__ == "__main__":

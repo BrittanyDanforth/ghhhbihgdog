@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
 airgap_tx_signer v10.0 - Offline signer for GhostSpiral unsigned_v1 bundles
-==========================================================================
-Focus: deterministic, verifiable, crash-resumable signing with fee-bump support.
-Supersedes v2.x. Completely offline; never touches the network.
+============================================================================
+Completely offline; never touches the network.
 
-What's new vs v2.0
--------------------
-1. unsigned_v1 schema parse + validation - aborts if any field missing/wrong type.
-2. Integrity-chain journal - rolling SHA-256 hash for every action.
-3. Resume-safe - --resume progress.json stores last signed index.
-4. Signature verification loop - after signing each TX, verifies blob hash.
-5. Fee-bump support - --bump +pct rewrites fees in-memory and re-signs.
-6. Atomic writes everywhere - *.tmp -> fsync -> rename; survives power loss.
-
-Quick Example
--------------
-    python3 airgap_tx_signer unsigned_1718.json \
-        --wallet-file /mnt/usb/offline.wallet --resume signer_progress.json
+OPSEC hardening:
+  - Validates unsigned_v1 schema (handles both dict-wrapped and flat list)
+  - Validates all amounts are positive decimals
+  - Resume-safe with integrity verification on resume
+  - Temp batch files securely wiped after use
+  - Blob hashes recorded in manifest for downstream verification
+  - All output files written 0600
+  - Signal handlers for graceful interruption
+  - Progress atomically written with fsync
 """
 from __future__ import annotations
 import argparse, json, subprocess, hashlib, os, sys, tempfile, time
@@ -25,76 +20,85 @@ from pathlib import Path
 from decimal import Decimal
 from typing import List
 
-INT_LOG = Path("integrity_chain.log")
-
-
-def _hash_line(line: str):
-    prev = "0" * 64
-    if INT_LOG.exists():
-        lines = INT_LOG.read_text().splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0]
-    h = hashlib.sha256((prev + line).encode()).hexdigest()
-    with INT_LOG.open("a") as f:
-        f.write(f"{h} | {line}\n")
-
-
-def _atomic_write(data: str | bytes, path: Path):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    mode = "wb" if isinstance(data, bytes) else "w"
-    with open(tmp, mode) as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
+from gs_common import (
+    integrity_log, atomic_write_json, atomic_write_text,
+    secure_file_perms, install_signal_handlers, shutdown_requested,
+    scrub_address,
+)
 
 REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str, "extra": str}
 
 
-def _validate_plan(plan: List[dict]):
+def _validate_plan(plan: List[dict]) -> None:
+    """Validate every TX in the plan has required fields with correct types."""
+    if not plan:
+        sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
         for k, typ in REQUIRED_TX_FIELDS.items():
             if k not in tx or not isinstance(tx[k], typ):
                 sys.exit(
-                    f"[!] unsigned_v1 schema error at index {i}: "
-                    f"field '{k}' missing/type mismatch"
+                    f"[!] Schema error at TX {i}: field '{k}' missing or wrong type"
                 )
         try:
             val = Decimal(tx["amt"])
             if val <= 0:
-                sys.exit(f"[!] Amount must be positive at index {i}: {tx['amt']}")
+                sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
         except Exception:
-            sys.exit(f"[!] Unsigned plan amount not decimal-parsable at index {i}")
+            sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
 
 
 def _load_unsigned(path: Path) -> List[dict]:
-    """Load unsigned_v1 bundle, handling both wrapped and flat formats.
+    """Load unsigned_v1 bundle from GhostSpiral.
 
-    GhostSpiral v10.5 writes: {"meta": {...}, "txs": [...]}
-    This function extracts the txs list from either format.
+    Handles: {"meta": {...}, "txs": [...]}  (v10.5 format)
+             [tx, tx, ...]                  (flat list)
     """
-    raw = json.load(open(path))
+    with open(path) as f:
+        raw = json.load(f)
+
     if isinstance(raw, dict):
-        if "txs" in raw:
+        if "txs" in raw and isinstance(raw["txs"], list):
+            meta = raw.get("meta", {})
+            schema = meta.get("schema", "unknown")
+            integrity_log("signer", f"loaded_schema={schema}:version={meta.get('version', '?')}")
             return raw["txs"]
-        if "meta" in raw:
-            sys.exit("[!] unsigned_v1 bundle has 'meta' but no 'txs' key")
-        sys.exit("[!] unsigned_v1 bundle is a dict but missing 'txs' key")
+        sys.exit("[!] unsigned_v1 dict format missing 'txs' list")
+
     if isinstance(raw, list):
+        integrity_log("signer", "loaded_flat_list")
         return raw
-    sys.exit("[!] unsigned_v1 bundle has unexpected top-level type")
+
+    sys.exit("[!] unsigned_v1 has unexpected format (not dict or list)")
+
+
+def _verify_resume_integrity(progress: dict, plan: List[dict]) -> None:
+    """On resume, verify that manifest hashes match expectations."""
+    manifest = progress.get("manifest", [])
+    for entry in manifest:
+        blob_path = Path(entry["file"])
+        if blob_path.exists():
+            with open(blob_path, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+            if actual_hash != entry.get("hash"):
+                integrity_log("signer", f"TAMPER_DETECTED:idx={entry['idx']}")
+                sys.exit(f"[!] Blob tampered: {blob_path} hash mismatch on resume!")
+    integrity_log("signer", f"resume_integrity_ok:last={progress.get('last', -1)}")
 
 
 def main():
-    cli = argparse.ArgumentParser("airgap_tx_signer v10.0")
+    install_signal_handlers()
+
+    cli = argparse.ArgumentParser(
+        "airgap_tx_signer v10.0",
+        description="Offline signer for GhostSpiral unsigned_v1 plans",
+    )
     cli.add_argument("unsigned_json",
-                     help="unsigned_v1 plan produced by GhostSpiral >= v10")
+                     help="unsigned_v1 JSON from GhostSpiral")
     cli.add_argument("--wallet-cli", default="monero-wallet-cli")
     cli.add_argument("--wallet-file", required=True)
     cli.add_argument("--outdir", default="signed_blobs")
     cli.add_argument("--resume",
-                     help="progress file to resume from if interrupted")
+                     help="progress file for crash-resume")
     cli.add_argument("--bump", type=float,
                      help="fee bump percentage (e.g. --bump 15 for +15%%)")
     args = cli.parse_args()
@@ -103,51 +107,73 @@ def main():
     if not unsigned_path.exists():
         sys.exit(f"[!] File not found: {unsigned_path}")
 
+    wallet_path = Path(args.wallet_file)
+    if not wallet_path.exists():
+        sys.exit(f"[!] Wallet file not found: {wallet_path}")
+
     plan = _load_unsigned(unsigned_path)
     _validate_plan(plan)
-    _hash_line(f"loaded_unsigned | entries={len(plan)} | ts={int(time.time())}")
+    integrity_log("signer", f"plan_loaded:entries={len(plan)}")
 
-    Path(args.outdir).mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     progress_file = Path(args.resume) if args.resume else Path("signer_progress.json")
     if progress_file.exists():
         with open(progress_file) as pf:
             progress = json.load(pf)
+        _verify_resume_integrity(progress, plan)
     else:
         progress = {"last": -1, "manifest": []}
 
+    signed_count = 0
+    skipped_count = 0
+
     try:
         for idx, tx in enumerate(plan):
+            if shutdown_requested():
+                integrity_log("signer", f"shutdown_at_idx={idx}")
+                print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progress_file}")
+                break
+
             if idx <= progress["last"]:
+                skipped_count += 1
                 continue
+
             amt = Decimal(tx["amt"])
             if args.bump:
                 amt *= Decimal(1) + Decimal(args.bump) / Decimal(100)
-            blob_path = Path(args.outdir) / f"tx_{idx}.blob"
+
+            blob_path = outdir / f"tx_{idx}.blob"
 
             batch_path = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    "w", delete=False, suffix=".batch"
-                ) as batch:
+                fd, batch_path = tempfile.mkstemp(suffix=".batch", prefix="gs_sign_")
+                with os.fdopen(fd, "w") as batch:
                     batch.write(
                         f"transfer {tx['dst']} {amt} 0 "
                         f"'{tx['extra']}' filename {blob_path}\n"
                     )
-                    batch.flush()
-                    batch_path = batch.name
 
                 subprocess.run(
                     [args.wallet_cli, "--wallet-file", args.wallet_file,
                      "--offline", "--batch-file", batch_path],
-                    check=True,
+                    check=True, timeout=120,
                 )
+            except subprocess.TimeoutExpired:
+                integrity_log("signer", f"timeout_idx={idx}")
+                sys.exit(f"[!] wallet-cli timed out on TX {idx}")
             finally:
                 if batch_path and os.path.exists(batch_path):
+                    with open(batch_path, "w") as f:
+                        f.write("\x00" * 256)
                     os.unlink(batch_path)
 
             if not blob_path.exists():
+                integrity_log("signer", f"no_blob_idx={idx}")
                 sys.exit(f"[!] Blob not created for TX {idx}")
+
+            secure_file_perms(blob_path)
 
             with open(blob_path, "rb") as bf:
                 sha = hashlib.sha256(bf.read()).hexdigest()
@@ -156,21 +182,24 @@ def main():
                 "idx": idx,
                 "file": str(blob_path),
                 "hash": sha,
-                "dst": tx["dst"],
+                "dst": scrub_address(tx["dst"]),
                 "amt": str(amt),
             })
             progress["last"] = idx
-            _atomic_write(json.dumps(progress, indent=2), progress_file)
-            _hash_line(f"signed | idx={idx} | sha={sha[:12]} | ts={int(time.time())}")
-            print(f"[+] Signed TX {idx} -> {blob_path.name}")
+            atomic_write_json(progress, progress_file)
+            integrity_log("signer", f"signed:idx={idx}:sha={sha[:16]}")
+            signed_count += 1
+            print(f"  [+] TX {idx}/{len(plan) - 1} -> {blob_path.name}")
 
-        final_manifest = Path(args.outdir) / "signed_manifest_v1.json"
-        _atomic_write(json.dumps(progress["manifest"], indent=2), final_manifest)
-        _hash_line("sign_done")
-        print("[+] All TXs signed & verified.")
+        # Final manifest
+        final_manifest = outdir / "signed_manifest_v1.json"
+        atomic_write_json(progress["manifest"], final_manifest)
+        integrity_log("signer", f"done:signed={signed_count}:skipped={skipped_count}")
+        print(f"\n  [+] Signing complete: {signed_count} signed, {skipped_count} resumed.")
 
     except subprocess.CalledProcessError as e:
-        print(f"[!] wallet-cli error: {e}")
+        integrity_log("signer", f"wallet_cli_error:{e.returncode}")
+        print(f"  [!] wallet-cli error: {e}")
         sys.exit(1)
 
 

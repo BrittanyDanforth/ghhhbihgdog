@@ -4,3 +4,4 @@ stem>=1.8
 monero>=0.8
 psutil>=5.9
 python-gnupg>=0.5
+PyYAML>=6.0

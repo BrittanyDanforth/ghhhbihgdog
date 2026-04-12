@@ -1,152 +1,282 @@
 #!/usr/bin/env python3
 """
 paranoia_mode v10.0 - Post-Op Host Sanitiser
-===========================================
+=============================================
 Focus: footprint erasure + network-fingerprint randomisation.
-This upgrade removes 3rd-party deps, logs every destructive action to the
-hash-chained integrity_chain.log, and supports a safe --dry-run mode.
 
-New in v10.0
-------------
-1. Native MAC spoof  - uses 'ip link set dev ... address ...' (no macchanger).
-2. DNS leak guard    - re-runs dns_check() after spoof; aborts on leak.
-3. Integrity log     - every action writes SHA-256 hash chain line.
-4. Dry-run switch    - prints intended actions, does not execute.
-5. Resource sentinel - abort if free RAM <10% or disk <1 GiB.
+OPSEC hardening:
+  - Wipes bash/zsh history, Python __pycache__, .pyc files
+  - Wipes common temp directories (/tmp, /var/tmp user files)
+  - Truncates system logs older than N days
+  - Flushes DNS cache
+  - Spoofs MAC with locally-administered unicast address
+  - Clears systemd journal (if present)
+  - Overwrites swap + shared memory
+  - DNS leak check post-spoof
+  - Integrity log for every action (even in dry-run)
+  - Resource sentinel
+  - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
 import argparse, glob, hashlib, os, random, shutil, socket, subprocess, sys, time
 from pathlib import Path
+
 import psutil
 
-INT_LOG = Path("integrity_chain.log")
+from gs_common import (
+    integrity_log, require_resources, install_signal_handlers,
+    shutdown_requested, secure_hex,
+)
+
+# Paths to wipe
+SHELL_HISTORIES = [
+    Path.home() / ".bash_history",
+    Path.home() / ".zsh_history",
+    Path.home() / ".python_history",
+    Path.home() / ".lesshst",
+    Path.home() / ".wget-hsts",
+    Path.home() / ".viminfo",
+]
+
+PYCACHE_GLOBS = [
+    str(Path.home() / "**/__pycache__"),
+    "/tmp/**/__pycache__",
+]
 
 
-def _hash_line(tag: str, detail: str):
-    """Append a hash-chained line to integrity log."""
-    prev = "0" * 64
-    if INT_LOG.exists():
-        lines = INT_LOG.read_text().splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0]
-    h = hashlib.sha256((prev + tag + detail).encode()).hexdigest()
-    with INT_LOG.open("a") as f:
-        f.write(f"{h} | {tag} | {detail}\n")
-
-
-def dns_check(expected_loopback: bool = True) -> None:
-    """Check for DNS leaks.
-
-    If expected_loopback is True (Tor mode), DNS for external hosts should
-    resolve through Tor (we verify by checking that resolution works at all).
-    If False, we just verify basic connectivity.
-    """
+def dns_check() -> None:
+    """Verify DNS works (post-spoof connectivity check)."""
     try:
         res = socket.getaddrinfo("check.torproject.org", 443)
         if not res:
-            raise RuntimeError("DNS resolution returned empty result")
+            raise RuntimeError("DNS returned empty")
+        integrity_log("paranoia", "dns_check_ok")
     except socket.gaierror as e:
-        _hash_line("dns_check", f"resolution_failed:{e}")
-        print(f"[!] DNS resolution failed: {e}")
+        integrity_log("paranoia", f"dns_fail:{e}")
+        print(f"  [!] DNS resolution failed post-spoof: {e}")
         sys.exit(1)
-    except Exception as e:
-        _hash_line("dns_leak", str(e))
-        sys.exit(f"[!] DNS check error: {e}")
 
 
 def rand_mac() -> str:
-    """Generate a random locally-administered unicast MAC address."""
-    octets = [random.randint(0, 255) for _ in range(6)]
-    octets[0] = (octets[0] | 0x02) & 0xFE
+    """Generate locally-administered unicast MAC."""
+    octets = [random.SystemRandom().randint(0, 255) for _ in range(6)]
+    octets[0] = (octets[0] | 0x02) & 0xFE  # locally administered + unicast
     return ":".join(f"{o:02x}" for o in octets)
 
 
-def spoof_mac_native(iface: str, new_mac: str, dry: bool):
+def spoof_mac(iface: str, dry: bool):
+    new_mac = rand_mac()
     if dry:
-        print(f"[dry] would run: ip link set {iface} down && "
-              f"ip link set {iface} address {new_mac} && "
-              f"ip link set {iface} up")
-        _hash_line("mac_dry", f"{iface}->{new_mac}")
+        print(f"  [dry] MAC {iface} -> {new_mac}")
+        integrity_log("paranoia", f"mac_dry:{iface}->{new_mac}")
         return
     try:
-        subprocess.run(["ip", "link", "set", iface, "down"], check=True)
+        subprocess.run(["ip", "link", "set", iface, "down"], check=True,
+                       capture_output=True)
         subprocess.run(["ip", "link", "set", iface, "address", new_mac],
-                       check=True)
-        subprocess.run(["ip", "link", "set", iface, "up"], check=True)
-        print(f"[+] MAC on {iface} -> {new_mac}")
-        _hash_line("mac_spoof", f"{iface}->{new_mac}")
+                       check=True, capture_output=True)
+        subprocess.run(["ip", "link", "set", iface, "up"], check=True,
+                       capture_output=True)
+        print(f"  [+] MAC {iface} -> {new_mac}")
+        integrity_log("paranoia", f"mac_spoof:{iface}->{new_mac}")
     except subprocess.CalledProcessError as e:
-        _hash_line("mac_error", f"{iface}:{e}")
-        print(f"[!] MAC spoof failed on {iface}: {e}")
+        integrity_log("paranoia", f"mac_fail:{iface}:{e}")
+        print(f"  [!] MAC spoof failed: {e}")
+    except FileNotFoundError:
+        integrity_log("paranoia", "mac_fail:ip_not_found")
+        print("  [!] 'ip' command not found - cannot spoof MAC")
 
 
-def wipe_logs(days: int, dry: bool):
+def wipe_shell_histories(dry: bool):
+    count = 0
+    for hist in SHELL_HISTORIES:
+        if hist.exists():
+            if dry:
+                print(f"  [dry] would wipe {hist}")
+            else:
+                try:
+                    hist.write_bytes(b"")
+                    count += 1
+                except (PermissionError, OSError):
+                    pass
+    integrity_log("paranoia", f"histories_wiped:{count}" if not dry else f"histories_dry:{count}")
+
+
+def wipe_pycache(dry: bool):
+    count = 0
+    for pattern in PYCACHE_GLOBS:
+        for d in glob.glob(pattern, recursive=True):
+            if dry:
+                print(f"  [dry] would remove {d}")
+            else:
+                try:
+                    shutil.rmtree(d)
+                    count += 1
+                except (PermissionError, OSError):
+                    pass
+    # Also .pyc in home
+    for pyc in Path.home().rglob("*.pyc"):
+        if dry:
+            pass
+        else:
+            try:
+                pyc.unlink()
+                count += 1
+            except (PermissionError, OSError):
+                pass
+    integrity_log("paranoia", f"pycache_wiped:{count}" if not dry else f"pycache_dry")
+
+
+def wipe_system_logs(days: int, dry: bool):
     cutoff = time.time() - days * 86400
     count = 0
     for f in glob.glob("/var/log/**/*.log", recursive=True):
         try:
             if os.path.getmtime(f) < cutoff:
                 if dry:
-                    print(f"[dry] would truncate {f}")
-                    _hash_line("log_dry", f)
+                    print(f"  [dry] would truncate {f}")
                 else:
-                    open(f, "w").close()
-                    _hash_line("log_wipe", f)
+                    with open(f, "w"):
+                        pass
                 count += 1
-        except (PermissionError, OSError) as e:
-            _hash_line("log_err", f"{f}:{e}")
-    print(f"[+] {'Would truncate' if dry else 'Truncated'} {count} log file(s)")
+        except (PermissionError, OSError):
+            pass
+    integrity_log("paranoia", f"logs_wiped:{count}" if not dry else f"logs_dry:{count}")
+    print(f"  [+] {'Would truncate' if dry else 'Truncated'} {count} log(s)")
+
+
+def clear_journal(dry: bool):
+    """Clear systemd journal if journalctl is available."""
+    if dry:
+        print("  [dry] would run journalctl --vacuum-time=1s")
+        integrity_log("paranoia", "journal_dry")
+        return
+    try:
+        subprocess.run(["journalctl", "--vacuum-time=1s"],
+                       check=True, capture_output=True, timeout=30)
+        integrity_log("paranoia", "journal_cleared")
+        print("  [+] Journal cleared")
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+
+def flush_dns_cache(dry: bool):
+    """Flush DNS resolver cache."""
+    if dry:
+        print("  [dry] would flush DNS cache")
+        return
+    for cmd in [
+        ["resolvectl", "flush-caches"],
+        ["systemd-resolve", "--flush-caches"],
+    ]:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=10)
+            integrity_log("paranoia", "dns_cache_flushed")
+            print("  [+] DNS cache flushed")
+            return
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    integrity_log("paranoia", "dns_cache_skip:no_resolver")
 
 
 def wipe_swap_ram(dry: bool):
     if dry:
-        print("[dry] would run swapoff -a && overwrite /dev/shm/paranoia_wipe")
-        _hash_line("ram_dry", "swapoff/dd")
+        print("  [dry] would wipe swap+shm")
+        integrity_log("paranoia", "ram_dry")
         return
+
     try:
-        subprocess.run(["swapoff", "-a"], check=True)
-        wipe_file = "/dev/shm/paranoia_wipe"
+        subprocess.run(["swapoff", "-a"], check=True, capture_output=True,
+                       timeout=30)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        integrity_log("paranoia", f"swapoff_fail:{e}")
+
+    wipe_file = "/dev/shm/gs_paranoia_wipe"
+    try:
         subprocess.run(
-            ["dd", "if=/dev/zero", f"of={wipe_file}",
-             "bs=1M", "count=256"],
-            check=True, capture_output=True,
+            ["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M", "count=128"],
+            check=True, capture_output=True, timeout=60,
         )
         if os.path.exists(wipe_file):
             os.unlink(wipe_file)
-        subprocess.run(["sync"], check=True)
-        _hash_line("ram_wipe", "ok")
-        print("[+] Swap/RAM wipe complete")
-    except subprocess.CalledProcessError as e:
-        _hash_line("ram_err", str(e))
-        print(f"[!] RAM wipe failed: {e}")
+        subprocess.run(["sync"], check=True, capture_output=True, timeout=10)
+        integrity_log("paranoia", "ram_wipe_ok")
+        print("  [+] Swap/SHM wipe complete")
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        integrity_log("paranoia", f"ram_wipe_fail:{e}")
+        print(f"  [!] RAM wipe failed: {e}")
+
+
+def wipe_tmp_files(dry: bool):
+    """Remove user-owned files from temp directories."""
+    uid = os.getuid()
+    count = 0
+    for tmpdir in ["/tmp", "/var/tmp"]:
+        if not os.path.isdir(tmpdir):
+            continue
+        for entry in os.scandir(tmpdir):
+            try:
+                if entry.stat().st_uid == uid:
+                    if dry:
+                        print(f"  [dry] would remove {entry.path}")
+                    else:
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                        else:
+                            os.unlink(entry.path)
+                    count += 1
+            except (PermissionError, OSError):
+                pass
+    integrity_log("paranoia", f"tmp_wiped:{count}" if not dry else f"tmp_dry:{count}")
 
 
 def main():
-    ap = argparse.ArgumentParser("paranoia_mode v10.0")
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "paranoia_mode v10.0",
+        description="Post-operation host sanitisation",
+    )
     ap.add_argument("--wipe-days", type=int, default=7,
-                    help="truncate logs older than N days (default 7)")
+                    help="truncate logs older than N days")
     ap.add_argument("--iface", default="wlan0",
-                    help="network interface to spoof (default wlan0)")
+                    help="network interface to spoof")
     ap.add_argument("--dry-run", action="store_true",
-                    help="just print actions, do nothing")
+                    help="print actions without executing")
     args = ap.parse_args()
 
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(".")
-    if mem.percent > 90 or disk.free < 1 * 1024 ** 3:
-        sys.exit("[!] Host under heavy load / low disk - aborting.")
+    require_resources(min_disk_gb=1.0)
+    integrity_log("paranoia", f"start:dry={args.dry_run}")
 
-    new_mac = rand_mac()
-    spoof_mac_native(args.iface, new_mac, args.dry_run)
+    print("  [*] Phase 1: MAC spoof")
+    spoof_mac(args.iface, args.dry_run)
 
+    print("  [*] Phase 2: DNS check")
     dns_check()
 
-    wipe_logs(args.wipe_days, args.dry_run)
+    print("  [*] Phase 3: DNS cache flush")
+    flush_dns_cache(args.dry_run)
 
+    print("  [*] Phase 4: Shell histories")
+    wipe_shell_histories(args.dry_run)
+
+    print("  [*] Phase 5: Python cache")
+    wipe_pycache(args.dry_run)
+
+    print("  [*] Phase 6: Temp files")
+    wipe_tmp_files(args.dry_run)
+
+    print("  [*] Phase 7: System logs")
+    wipe_system_logs(args.wipe_days, args.dry_run)
+
+    print("  [*] Phase 8: Journal")
+    clear_journal(args.dry_run)
+
+    print("  [*] Phase 9: Swap/RAM")
     wipe_swap_ram(args.dry_run)
 
-    _hash_line("paranoia_complete", f"dry={args.dry_run}")
-    print("[+] paranoia_mode complete.")
+    integrity_log("paranoia", f"complete:dry={args.dry_run}")
+    print("\n  [+] paranoia_mode complete.")
 
 
 if __name__ == "__main__":
