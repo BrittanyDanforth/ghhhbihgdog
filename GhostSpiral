@@ -110,6 +110,8 @@ def main():
                      help="Output directory for unsigned TX plans")
     cli.add_argument("--joinmarket-wallet",
                      help="JoinMarket wallet file for tumbles")
+    cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
+                     help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     args = cli.parse_args()
 
     # ---- Determine mode ----
@@ -566,12 +568,26 @@ def main():
         shutil.rmtree(signed_dir)
         integrity_log("stage5", "cleaned_old_signed_blobs")
 
+    # Lock file to prevent concurrent runs
+    lock_path = Path(".ghostspiral.lock")
+    if lock_path.exists():
+        sys.exit(
+            "[!] Lock file exists: .ghostspiral.lock\n"
+            "    Another GhostSpiral instance may be running.\n"
+            "    If not, delete the lock file manually."
+        )
+    lock_path.write_text(str(os.getpid()))
+    secure_file_perms(lock_path)
+
     try:
-        print("  [*] Stage 5a: Signing...")
+        print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
         sign_cmd = [
             "python3", "airgap_tx_signer", str(ufile),
-            "--wallet-file", "offline.wallet",
-            "--outdir", "signed_blobs",
+            "--phase", "create",
+            "--rpc", args.rpc_primary,
+            "--tor-proxy", args.tor_proxy,
+            "--outdir", "tx_staging",
+            f"--fee-priority={args.fee_priority}" if hasattr(args, 'fee_priority') else "--fee-priority=1",
         ]
         subprocess.run(sign_cmd, check=True, timeout=1800)
         integrity_log("stage5", "signer_ok")
@@ -586,9 +602,9 @@ def main():
     secure_delay(5.0, 15.0)
 
     try:
-        print("  [*] Stage 5b: Broadcasting...")
+        print("  [*] Stage 5b: Broadcasting signed TXs...")
         subprocess.run(
-            ["python3", "broadcast_signed_xmr", "signed_blobs",
+            ["python3", "broadcast_signed_xmr", "tx_staging/signed",
              "--tor-proxy", args.tor_proxy],
             check=True, timeout=7200,
         )
@@ -616,6 +632,11 @@ def main():
         print(f"  [!] Exit simulation failed (non-fatal): {e}")
 
     integrity_log("stage5", "full_pipeline_complete")
+
+    # Clean up lock file
+    if lock_path.exists():
+        lock_path.unlink()
+
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
