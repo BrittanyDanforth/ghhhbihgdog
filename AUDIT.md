@@ -439,14 +439,18 @@ This file has no clear purpose in the current repo and cannot be executed.
 
 ---
 
-## Fix Plan (one file at a time)
+## Fix Status
 
-1. **GhostSpiral** — Fix shebang, typo, subprocess paths, schema output, connect_rpc, wire stages, DAG safety, use FEE_XMR, close file handles
-2. **create_receive_wallet** — Fix shebang, RPC host, subaddr API, remove unused imports
-3. **airgap_tx_signer** — Fix shebang, unwrap schema dict, fix subprocess shell usage, clean up temp files
-4. **broadcast_signed_xmr** — Fix shebang, fix bump_fee, add mine-wait timeout, fix atomic writes, fix fd leak
-5. **thor_swap_preparer** — Fix shebang, add retry to tor check, fix price fallback, remove unused imports
-6. **exit_strategy_simulator** — Fix shebang, fix dynamic key
-7. **paranoia_mode** — Strip embedded scripts, keep ONLY the sanitizer section, fix dns_check, MAC gen, dd target
-8. **renamethis1** — Needs owner decision (keep/delete/split)
-9. **Add** `requirements.txt`
+All files fixed except `renamethis1` (needs owner decision — keep/delete/split):
+
+| File | Status | Key fixes |
+|------|--------|-----------|
+| `GhostSpiral` | FIXED | Shebang, typo, subprocess paths (no .py), connect_rpc host parsing, wire stages 1+2, DAG k-clamp, fee deduction, resource_ok() call, file handles, integrity log unified to integrity_chain.log |
+| `create_receive_wallet` | FIXED | Shebang, RPC host parsing, subaddr API corrected, removed unused imports, file handle safety |
+| `airgap_tx_signer` | FIXED | Shebang, unwrap unsigned_v1 dict/list format, removed shell=True, temp file cleanup, file handle safety, positive amount validation |
+| `broadcast_signed_xmr` | FIXED | Shebang, mine-wait timeout (2hr max), bump_fee fd leak + error handling, atomic progress writes with fsync, HTTP status checks, newnym logging |
+| `thor_swap_preparer` | FIXED | Shebang, retry-wrapped Tor check, realistic price fallback (0.003 not 0.000015), HTTP status checks, file handles, unused import removal, gnupg import guard |
+| `exit_strategy_simulator` | FIXED | Shebang, stable output keys (currency+amount_out_fiat instead of dynamic), removed defunct localmonero, HTTP status checks, file handles |
+| `paranoia_mode` | FIXED | Stripped ALL embedded script copies (1182->150 lines), fixed dns_check logic, rand_mac unicast/locally-administered bits, dd writes to file not directory, file handle safety |
+| `requirements.txt` | ADDED | All dependencies listed with minimum versions |
+| `renamethis1` | NOT FIXED | Concatenation of chat prose + multiple Python scripts; not a valid Python file; needs owner decision |
