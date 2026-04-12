@@ -27,11 +27,11 @@ from __future__ import annotations
 import argparse, json, os, re, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_get, safe_post, connect_rpc, require_resources,
+    safe_post, connect_rpc, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,

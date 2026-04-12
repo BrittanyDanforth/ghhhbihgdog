@@ -14,7 +14,7 @@ OPSEC hardening:
   - Liquidity depth validation (warns if thin)
 """
 from __future__ import annotations
-import argparse, json, os, sys, time, hashlib
+import argparse, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict

@@ -24,8 +24,7 @@ import requests
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     safe_post, newnym, secure_delay, atomic_write_json,
-    install_signal_handlers, shutdown_requested, scrub_address,
-    secure_hex,
+    install_signal_handlers, shutdown_requested,
 )
 
 

@@ -18,10 +18,8 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, hashlib, os, random, shutil, socket, subprocess, sys, time
+import argparse, glob, os, random, shutil, socket, subprocess, sys, time
 from pathlib import Path
-
-import psutil
 
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
