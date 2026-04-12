@@ -27,11 +27,11 @@ from __future__ import annotations
 import argparse, json, os, re, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_get, safe_post, connect_rpc, require_resources,
+    safe_post, connect_rpc, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
@@ -40,37 +40,33 @@ from gs_common import (
 DUST_XMR = Decimal("0.0001")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
-# Fee oracle endpoints (tried in order; LocalMonero is defunct since 2023)
-FEE_ORACLE_URLS = [
-    "https://moneroblocks.info/api/get_stats",
-    "https://xmrchain.net/api/emission",
-]
 
-# Minimum wallets/rounds to provide meaningful mixing
 MIN_WALLETS = 3
 MIN_DEEP = 1
 NUM_DECOYS = 4
 
+# Fallback fee: conservative estimate for typical 2-input/2-output Monero TX.
+# Updated periodically; safe to overshoot slightly (operator keeps the change).
+FALLBACK_FEE_XMR = Decimal("0.00005")
 
-def fetch_fee(proxy: Dict[str, str]) -> Decimal:
-    """Fetch current median XMR fee from oracle. Tries multiple sources."""
-    for url in FEE_ORACLE_URLS:
-        try:
-            j = safe_get(url, proxy)
-            # Different APIs return fee in different fields
-            raw_fee = j.get("fee_per_kb_median") or j.get("fee_per_byte")
-            if raw_fee:
-                fee = Decimal(str(raw_fee)) / Decimal(1024)
-                if fee > 0:
-                    return fee
-        except Exception:
-            continue
 
-    # All oracles failed - use conservative fallback based on typical XMR fees
-    # (~0.00005 XMR per TX as of 2024-2025)
-    fallback = Decimal("0.00005")
-    integrity_log("fee", "all_oracles_failed:using_fallback")
-    return fallback
+def fetch_fee_from_rpc(rpc) -> Decimal:
+    """Ask monero-wallet-rpc for current fee estimate (the only reliable source).
+    Returns fee per TX in XMR, assuming ~2kB typical TX weight at default priority."""
+    try:
+        resp = rpc.raw_request("get_fee_estimate", {})
+        fee_per_byte = resp.get("fee", 0)
+        if fee_per_byte > 0:
+            # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
+            fee_atomic = fee_per_byte * 2000
+            fee_xmr = Decimal(str(fee_atomic)) / Decimal(10 ** 12)
+            if fee_xmr > 0:
+                integrity_log("fee", "rpc_fee_estimate_ok")
+                return fee_xmr
+    except Exception as e:
+        integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
+    integrity_log("fee", "using_fallback_fee")
+    return FALLBACK_FEE_XMR
 
 
 def main():
@@ -94,6 +90,9 @@ def main():
                      help="Enable JoinMarket tumble before ThorChain swap")
     cli.add_argument("--split", type=int, default=1,
                      help="Number of BTC chunks to split across ThorChain")
+    cli.add_argument("--btc-amount", type=Decimal,
+                     help="Total BTC amount for ThorChain swap "
+                          "(required when --split > 0 in sender mode)")
     cli.add_argument("--wallets", type=int, default=10,
                      help=f"Number of mix wallets (min {MIN_WALLETS})")
     cli.add_argument("--deep", type=int, default=2,
@@ -112,6 +111,10 @@ def main():
                      help="JoinMarket wallet file for tumbles")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--wallet-file", default="offline.wallet",
+                     help="Path to Monero wallet file for auto-mode signing")
+    cli.add_argument("--wallet-password", default="",
+                     help="Password for the wallet file (empty for no password)")
     args = cli.parse_args()
 
     # ---- Determine mode ----
@@ -151,8 +154,8 @@ def main():
     verify_tor(proxy)
     integrity_log("stage0", "tor_ok")
 
-    fee_xmr = fetch_fee(proxy)
-    integrity_log("stage0", "fee_fetched")
+    # Fee estimation done after RPC is connected (needs the RPC)
+    integrity_log("stage0", "env_checks_ok")
 
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
@@ -176,6 +179,9 @@ def main():
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
     integrity_log("stage0", f"rpc_sync_ok:height={h1}")
+
+    fee_xmr = fetch_fee_from_rpc(rpc_primary)
+    integrity_log("stage0", "fee_fetched")
 
     ###########################################################################
     # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
@@ -361,21 +367,19 @@ def main():
         print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
         print(f"  [+] Entry address: {scrub_address(ENTRY)}")
     else:
-        # Determine what BTC chunks to swap:
-        # - If JoinMarket produced UTXOs, use those
-        # - If --split > 1, operator plans to manually split their BTC
-        # - Otherwise this is a direct single-chunk flow
-        # NOTE: ThorChain swap produces deposit addresses for the operator
-        # to manually send BTC to. The operator must do the actual BTC send.
+        btc_chunks = []
+
         if jm_utxos:
             btc_chunks = jm_utxos
-        elif args.split >= 1:
-            print(f"\n  [!] No JoinMarket UTXOs. Generating {args.split} ThorChain deposit(s).")
-            print(f"  [!] You must manually send BTC to the deposit addresses below.")
-            print(f"  [!] XMR will arrive at ENTRY address after ThorChain processes.")
-            btc_chunks = []
-        else:
-            btc_chunks = []
+        elif args.btc_amount and args.btc_amount > 0:
+            num_splits = max(args.split, 1)
+            per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
+            btc_chunks = [per_chunk] * num_splits
+            remainder = args.btc_amount - (per_chunk * num_splits)
+            if remainder > 0:
+                btc_chunks[0] += remainder
+            integrity_log("stage2", f"btc_split:{num_splits}_chunks:{per_chunk}_each")
+            print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
 
         if btc_chunks:
             swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
@@ -383,13 +387,32 @@ def main():
             total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
             print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
             print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
-            print(f"  [!] YOU MUST manually send BTC to each deposit address above!")
-            print(f"  [!] Wait for XMR to arrive and confirm before proceeding!")
+            print()
+            print("  ============================================================")
+            print("  SENDER INSTRUCTIONS — send BTC to these deposit addresses:")
+            print("  ============================================================")
+            for dep in swap_deposits:
+                print(f"\n  --- Chunk {dep['chunk']} ---")
+                print(f"  Send exactly: {dep['btc_amount']} BTC")
+                print(f"  To address:   {dep['deposit_address']}")
+                if dep.get("memo"):
+                    print(f"  With memo:    {dep['memo']}")
+                print(f"  Expected XMR: ~{dep['expected_xmr']}")
+            print()
+            print("  ============================================================")
+            print("  [!] YOU MUST manually send BTC to each deposit address above!")
+            print("  [!] Include the memo in the BTC transaction OP_RETURN field!")
+            print("  [!] Wait for XMR to arrive and confirm before proceeding!")
+            print("  ============================================================")
         else:
             integrity_log("stage2", "manual_mode")
-            print(f"\n  [!] MANUAL MODE: Send BTC through ThorChain to your ENTRY address.")
-            print(f"  [!] Use thor_swap_preparer to generate deposit addresses.")
-            print(f"  [!] Then wait for XMR to arrive and confirm before proceeding.")
+            print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
+            print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
+            print(f"        python3 thor_swap_preparer \\")
+            print(f"          --amounts <BTC_AMOUNT> \\")
+            print(f"          --dests {scrub_address(ENTRY)} \\")
+            print(f"          --tor-proxy {args.tor_proxy}")
+            print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
 
     dag = {}
     for a in subs:
@@ -427,11 +450,13 @@ def main():
         print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
 
     bal = unlocked_bal
+    is_mock_plan = False
     if bal <= DUST_XMR:
         if args.cold or args.airgap:
             print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
             print("[!] DO NOT sign/broadcast this plan without real funds!")
             bal = Decimal("10.0")
+            is_mock_plan = True
             integrity_log("stage4", "mock_balance:dry_run_only")
         else:
             sys.exit(
@@ -523,11 +548,14 @@ def main():
     meta = {
         "schema": "unsigned_v1",
         "version": VERSION,
-        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "created": int(time.time()) // 600 * 600,
         "rounds": len(plan),
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
+        "account_index": bal_account,
     }
+    if is_mock_plan:
+        meta["mock"] = True
     unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)
@@ -554,7 +582,9 @@ def main():
     newnym()
     tor_recheck(proxy, "stage5_pre")
 
-    # Clean stale progress files from prior runs to prevent poisoning
+    import shutil as _shutil
+
+    # Clean ALL stale artifacts from prior runs to prevent poisoning
     for stale in ["signer_progress.json", "broadcast_progress.json"]:
         stale_path = Path(stale)
         if stale_path.exists():
@@ -562,11 +592,22 @@ def main():
             integrity_log("stage5", f"cleaned_stale:{stale}")
 
     # Clean old signed blobs directory
-    signed_dir = Path("signed_blobs")
-    if signed_dir.is_dir():
-        import shutil
-        shutil.rmtree(signed_dir)
-        integrity_log("stage5", "cleaned_old_signed_blobs")
+    for old_dir in ["signed_blobs", "tx_staging"]:
+        old_path = Path(old_dir)
+        if old_path.is_dir():
+            _shutil.rmtree(old_path)
+            integrity_log("stage5", f"cleaned_old_dir:{old_dir}")
+
+    # Clean old unsigned plans (OPSEC: contain full destination addresses)
+    # but NOT the current plan that Stage 4 just created
+    outdir_path = Path(args.output)
+    if outdir_path.is_dir():
+        current_plan_name = ufile.name if hasattr(ufile, 'name') else Path(str(ufile)).name
+        old_plans = list(outdir_path.glob("unsigned_*.json"))
+        for old_plan in old_plans:
+            if old_plan.name != current_plan_name:
+                old_plan.unlink()
+                integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
     # Lock file to prevent concurrent runs
     lock_path = Path(".ghostspiral.lock")
@@ -579,32 +620,83 @@ def main():
     lock_path.write_text(str(os.getpid()))
     secure_file_perms(lock_path)
 
+    staging_dir = "tx_staging"
+
+    try:  # ensures lock file is cleaned even on error
+        _stage5_run(args, ufile, staging_dir, proxy, bal)
+    finally:
+        if lock_path.exists():
+            lock_path.unlink()
+
+    print("\n  [+] GhostSpiral v10.5 pipeline complete.")
+
+
+def _stage5_run(args, ufile, staging_dir, proxy, bal):
+    """Execute the create -> sign -> broadcast -> exit sim pipeline."""
     try:
         print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
-        sign_cmd = [
+        create_cmd = [
             "python3", "airgap_tx_signer", str(ufile),
             "--phase", "create",
             "--rpc", args.rpc_primary,
             "--tor-proxy", args.tor_proxy,
-            "--outdir", "tx_staging",
-            f"--fee-priority={args.fee_priority}" if hasattr(args, 'fee_priority') else "--fee-priority=1",
+            "--outdir", staging_dir,
+            f"--fee-priority={args.fee_priority}",
+        ]
+        subprocess.run(create_cmd, check=True, timeout=1800)
+        integrity_log("stage5", "create_unsigned_ok")
+
+        # Verify unsigned TXs were actually created before proceeding
+        unsigned_count = len(list(Path(staging_dir).glob("*.unsigned")))
+        if unsigned_count == 0:
+            integrity_log("stage5", "no_unsigned_txs_created")
+            sys.exit("[!] Phase 'create' produced no unsigned TX files. Check RPC and balance.")
+        print(f"  [+] {unsigned_count} unsigned TXs created.")
+
+    except subprocess.TimeoutExpired:
+        integrity_log("stage5", "create_timeout")
+        sys.exit("[!] Unsigned TX creation timed out after 30 min")
+    except subprocess.CalledProcessError as e:
+        integrity_log("stage5", f"create_fail:{e.returncode}")
+        sys.exit(f"[!] Unsigned TX creation failed (exit {e.returncode})")
+
+    newnym()
+    secure_delay(3.0, 8.0)
+
+    try:
+        print("  [*] Stage 5b: Signing unsigned TXs (offline wallet)...")
+        sign_cmd = [
+            "python3", "airgap_tx_signer", str(ufile),
+            "--phase", "sign",
+            "--wallet-file", args.wallet_file,
+            "--wallet-password", args.wallet_password,
+            "--outdir", staging_dir,
         ]
         subprocess.run(sign_cmd, check=True, timeout=1800)
-        integrity_log("stage5", "signer_ok")
+        integrity_log("stage5", "sign_ok")
+
+        # Verify signed TXs exist
+        signed_dir = Path(staging_dir) / "signed"
+        signed_count = len(list(signed_dir.glob("*.signed"))) if signed_dir.is_dir() else 0
+        if signed_count == 0:
+            integrity_log("stage5", "no_signed_txs")
+            sys.exit("[!] Phase 'sign' produced no signed TX files. Check wallet file and password.")
+        print(f"  [+] {signed_count} TXs signed.")
+
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", "signer_timeout")
-        sys.exit("[!] Signer timed out after 30 min")
+        integrity_log("stage5", "sign_timeout")
+        sys.exit("[!] Signing timed out after 30 min")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"signer_fail:{e.returncode}")
-        sys.exit(f"[!] Signer failed (exit {e.returncode})")
+        integrity_log("stage5", f"sign_fail:{e.returncode}")
+        sys.exit(f"[!] Signing failed (exit {e.returncode})")
 
     newnym()
     secure_delay(5.0, 15.0)
 
     try:
-        print("  [*] Stage 5b: Broadcasting signed TXs...")
+        print("  [*] Stage 5c: Broadcasting signed TXs...")
         subprocess.run(
-            ["python3", "broadcast_signed_xmr", "tx_staging/signed",
+            ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
              "--tor-proxy", args.tor_proxy],
             check=True, timeout=7200,
         )
@@ -620,7 +712,7 @@ def main():
     secure_delay(5.0, 15.0)
 
     try:
-        print("  [*] Stage 5c: Exit strategy simulation...")
+        print("  [*] Stage 5d: Exit strategy simulation...")
         subprocess.run(
             ["python3", "exit_strategy_simulator", str(bal),
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
@@ -632,12 +724,6 @@ def main():
         print(f"  [!] Exit simulation failed (non-fatal): {e}")
 
     integrity_log("stage5", "full_pipeline_complete")
-
-    # Clean up lock file
-    if lock_path.exists():
-        lock_path.unlink()
-
-    print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
 if __name__ == "__main__":
