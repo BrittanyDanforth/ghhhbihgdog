@@ -686,6 +686,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
     print(f"  [*] Stage 5: Processing {total_txs} TXs iteratively (create→sign→broadcast each)")
     print(f"  [*] This is the ONLY safe approach — Monero does not support batch unsigned TXs.")
 
+    # Compute plan fingerprint so resume rejects stale progress from a different plan
+    import hashlib as _hl
+    _h = _hl.sha256()
+    for _tx in plan_txs:
+        _h.update(f"{_tx.get('dst','')}:{_tx.get('amt','')}".encode())
+    plan_fingerprint = _h.hexdigest()[:32]
+
     # Progress tracking for resume
     progress_file = Path("stage5_progress.json")
     completed_indices = set()
@@ -693,9 +700,16 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         try:
             with open(progress_file) as pf:
                 progress = json.load(pf)
-            completed_indices = set(progress.get("completed", []))
-            if completed_indices:
-                print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
+            saved_fp = progress.get("plan_fingerprint", "")
+            if saved_fp and saved_fp != plan_fingerprint:
+                print(f"  [!] Progress file is from a DIFFERENT plan (fingerprint mismatch).")
+                print(f"  [!] Discarding stale progress and starting fresh.")
+                integrity_log("stage5", "progress_fingerprint_mismatch:discarded")
+                progress_file.unlink()
+            else:
+                completed_indices = set(progress.get("completed", []))
+                if completed_indices:
+                    print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
         except Exception:
             pass
 
@@ -748,19 +762,20 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         except subprocess.CalledProcessError as e:
             integrity_log("stage5", f"create_fail:tx={tx_idx}:rc={e.returncode}")
             print(f"  [!] TX {tx_idx} create failed (exit {e.returncode})")
+            print(f"  [!] ABORTING — subsequent TXs depend on change from this TX.")
             fail_count += 1
-            continue
+            break
         except subprocess.TimeoutExpired:
             integrity_log("stage5", f"create_timeout:tx={tx_idx}")
-            print(f"  [!] TX {tx_idx} create timed out")
+            print(f"  [!] TX {tx_idx} create timed out — ABORTING pipeline.")
             fail_count += 1
-            continue
+            break
 
         unsigned_file = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
         if not unsigned_file.exists():
-            print(f"  [!] TX {tx_idx}: unsigned file not created")
+            print(f"  [!] TX {tx_idx}: unsigned file not created — ABORTING.")
             fail_count += 1
-            continue
+            break
 
         # Step 2: Sign the unsigned TX
         print(f"  [*] Step 2: Signing TX {tx_idx}...")
@@ -770,23 +785,25 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                 "--phase", "sign",
                 "--wallet-file", args.wallet_file,
                 "--outdir", staging_dir,
+                "--tx-index", str(tx_idx),
             ]
             subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env)
         except subprocess.CalledProcessError as e:
             integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
-            print(f"  [!] TX {tx_idx} signing failed")
+            print(f"  [!] TX {tx_idx} signing failed — ABORTING pipeline.")
             fail_count += 1
-            continue
+            break
         except subprocess.TimeoutExpired:
             integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
+            print(f"  [!] TX {tx_idx} sign timed out — ABORTING pipeline.")
             fail_count += 1
-            continue
+            break
 
         signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
         if not signed_file.exists():
-            print(f"  [!] TX {tx_idx}: signed file not created")
+            print(f"  [!] TX {tx_idx}: signed file not created — ABORTING.")
             fail_count += 1
-            continue
+            break
 
         # Step 3: Broadcast via wallet-rpc's submit_transfer
         # (NOT via monerod — submit_transfer is a wallet-rpc method)
@@ -799,37 +816,45 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                 "tx_data_hex": signed_data.hex(),
             })
             tx_hashes = result.get("tx_hash_list", [])
-            if tx_hashes:
-                txid = tx_hashes[0]
-                print(f"  [+] TX {tx_idx} broadcast OK | txid: {txid[:16]}...")
-                integrity_log("stage5", f"broadcast_ok:tx={tx_idx}")
-            else:
-                print(f"  [!] TX {tx_idx} submitted but no txid returned")
+            if not tx_hashes:
                 integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
+                print(f"  [!] TX {tx_idx} submitted but no txid returned — ABORTING pipeline.")
+                print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+                fail_count += 1
+                break
+            txid = tx_hashes[0]
+            print(f"  [+] TX {tx_idx} broadcast OK | txid: {txid[:16]}...")
+            integrity_log("stage5", f"broadcast_ok:tx={tx_idx}")
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
+            print(f"  [!] ABORTING pipeline — wallet state may be inconsistent.")
+            print(f"  [!] Check if the TX was actually broadcast before rerunning.")
             fail_count += 1
-            continue
+            break
 
-        # Step 4: Brief wait for mempool acceptance
+        # Step 4: Wait for mempool acceptance, then refresh wallet state.
+        # submit_transfer broadcasts via wallet-rpc, which updates the hot
+        # wallet's internal state (spent outputs). But we must still call
+        # refresh so the wallet re-scans and sees the TX in the mempool/chain.
+        # Without this, the next transfer_split may reuse spent outputs.
         time.sleep(5)
-
-        # Step 5: Key image sync — critical for view-only wallets.
-        # After broadcasting, the view-only wallet doesn't know which
-        # outputs are spent. We must sync key images so the next
-        # transfer_split call doesn't reuse spent outputs.
-        # For a hot wallet (auto-mode), this happens automatically.
-        # For a view-only wallet, we'd need export_outputs→import_key_images.
-        # In auto-mode, since we're using the same wallet-rpc for both
-        # create and broadcast, the wallet state should be updated.
+        try:
+            rpc_primary.raw_request("refresh", {})
+        except Exception as e:
+            integrity_log("stage5", f"refresh_warn:tx={tx_idx}:{str(e)[:40]}")
+            print(f"  [!] Wallet refresh after TX {tx_idx} failed: {str(e)[:60]}")
+            print(f"  [!] Next TX may fail due to stale wallet state.")
 
         success_count += 1
         completed_indices.add(tx_idx)
 
-        # Save progress atomically
+        # Save progress atomically with plan fingerprint to detect stale resumes
         from gs_common import atomic_write_json as _awj
-        _awj({"completed": sorted(completed_indices)}, progress_file)
+        _awj({
+            "plan_fingerprint": plan_fingerprint,
+            "completed": sorted(completed_indices),
+        }, progress_file)
 
         print(f"  [+] TX {tx_idx} complete ({success_count}/{total_txs})")
 

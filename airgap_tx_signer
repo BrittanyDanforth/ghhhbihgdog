@@ -258,12 +258,19 @@ def phase_sign(args, plan: List[dict]):
     if wallet_password is None:
         wallet_password = os.environ.get("GS_WALLET_PASSWORD", "")
 
-    # Create signed output directory — clean stale signed files first
+    # Filter entries if --tx-index is specified (iterative mode).
+    # In iterative mode, sign ONLY the requested TX to avoid re-signing
+    # already-broadcast TXs whose outputs are now spent on-chain.
+    tx_index = getattr(args, 'tx_index', None)
+    if tx_index is not None:
+        entries = [e for e in entries if e["idx"] == tx_index]
+        if not entries:
+            sys.exit(f"[!] No manifest entry for tx-index {tx_index}")
+
     signed_dir = outdir / "signed"
-    if signed_dir.is_dir():
-        # BUG 43 FIX: Stale signed files from a prior run could persist
-        # if the new plan has fewer TXs. The broadcaster filters by manifest
-        # but this is defense in depth.
+    # Only wipe the signed dir in batch mode (no --tx-index).
+    # In iterative mode, prior signed files belong to already-broadcast TXs.
+    if tx_index is None and signed_dir.is_dir():
         shutil.rmtree(signed_dir)
     signed_dir.mkdir(parents=True, exist_ok=True)
 
@@ -305,10 +312,16 @@ def phase_sign(args, plan: List[dict]):
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
             unsigned_in.write_text(unsigned_file.read_text())
 
+            # Write password to a temp file so it's not visible in /proc/PID/cmdline.
+            # monero-wallet-cli --password-file reads from file instead of CLI arg.
+            pw_file = Path(work_dir) / ".wallet_pw"
+            pw_file.write_text(wallet_password)
+            secure_file_perms(pw_file)
+
             cmd = [
                 args.wallet_cli,
                 "--wallet-file", wallet_file,
-                "--password", wallet_password,
+                "--password-file", str(pw_file),
                 "--command", "sign_transfer",
             ]
             result = subprocess.run(
