@@ -139,8 +139,15 @@ def main():
         try:
             with open(_manifest_for_delays) as mf:
                 _mdata = json.load(mf)
-            for entry in _mdata:
-                if "delay" in entry and "idx" in entry:
+            # BUG 50 FIX: Handle both list and dict-with-entries format
+            if isinstance(_mdata, dict) and "entries" in _mdata:
+                _entries = _mdata["entries"]
+            elif isinstance(_mdata, list):
+                _entries = _mdata
+            else:
+                _entries = []
+            for entry in _entries:
+                if isinstance(entry, dict) and "delay" in entry and "idx" in entry:
                     tx_delays[int(entry["idx"])] = int(entry["delay"])
             if tx_delays:
                 delay_source = "manifest"
@@ -175,7 +182,14 @@ def main():
     manifest_path = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
     if manifest_path and manifest_path.exists():
         with open(manifest_path) as mf:
-            manifest = json.load(mf)
+            manifest_raw = json.load(mf)
+        # BUG 49 FIX: Handle both list format and dict-with-entries format
+        if isinstance(manifest_raw, dict) and "entries" in manifest_raw:
+            manifest = manifest_raw["entries"]
+        elif isinstance(manifest_raw, list):
+            manifest = manifest_raw
+        else:
+            manifest = []
         manifest_hashes = {Path(e["file"]).name: e["hash"] for e in manifest}
         tampered = []
         for blob in blobs:
@@ -251,7 +265,7 @@ def main():
         if not blob.exists():
             integrity_log("broadcast", f"missing_blob:{blob.name}")
             print(f"  [!] Missing: {blob.name} - skipping")
-            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+            prog["log"].append({"idx": idx, "file": blob.name, "sent": False,
                                 "error": "file_missing"})
             prog["last"] = idx
             atomic_write_json(prog, progF)
@@ -261,15 +275,33 @@ def main():
         raw_data = blob.read_bytes()
         if not raw_data:
             integrity_log("broadcast", f"empty_blob:{blob.name}")
-            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+            prog["log"].append({"idx": idx, "file": blob.name, "sent": False,
                                 "error": "empty_blob"})
             prog["last"] = idx
             atomic_write_json(prog, progF)
             fail_count += 1
             continue
 
-        # Convert to hex for the daemon's send_raw_transaction endpoint
-        raw_hex = raw_data.hex()
+        # BUG 47 FIX: signed_monero_tx files from monero-wallet-cli's
+        # sign_transfer are in Monero's internal signed_txset format,
+        # NOT raw transaction hex. The correct broadcast method is to use
+        # monero-wallet-rpc's submit_transfer which reads the signed_txset.
+        # Alternatively, we can use the daemon's /sendrawtransaction
+        # endpoint, but ONLY if the blob contains raw TX hex.
+        #
+        # We detect the format: if the data starts with valid hex chars and
+        # decodes cleanly, treat as raw hex. Otherwise, treat as a
+        # signed_txset (base64/binary) and use submit_transfer via RPC.
+        try:
+            raw_hex = raw_data.decode('ascii').strip()
+            # Verify it's actually hex
+            bytes.fromhex(raw_hex)
+            use_raw_hex = True
+        except (UnicodeDecodeError, ValueError):
+            # Binary signed_txset — need to base64-encode for submit_transfer
+            import base64
+            signed_txset_b64 = base64.b64encode(raw_data).decode('ascii')
+            use_raw_hex = False
 
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
@@ -279,7 +311,6 @@ def main():
             if planned_delay > 0:
                 print(f"  [*] Waiting {planned_delay}s (planned delay for TX {idx})...")
                 integrity_log("broadcast", f"delay:idx={idx}:secs={planned_delay}")
-                # Sleep in chunks so shutdown_requested() can be checked
                 waited = 0
                 while waited < planned_delay:
                     if shutdown_requested():
@@ -297,29 +328,44 @@ def main():
         while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
             rpc_url = rpc_pool[_secrets.randbelow(len(rpc_pool))]
             try:
-                # send_raw_transaction is a daemon /sendrawtransaction endpoint,
-                # NOT a JSON-RPC method. It takes {tx_as_hex, do_not_relay}.
-                submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
-                res = _single_post(
-                    submit_url,
-                    {"tx_as_hex": raw_hex, "do_not_relay": False},
-                    proxy,
-                )
-
-                status = res.get("status", "")
-                is_double = res.get("double_spend", False)
-                if status == "OK" and not is_double:
+                if use_raw_hex:
+                    submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
+                    res = _single_post(
+                        submit_url,
+                        {"tx_as_hex": raw_hex, "do_not_relay": False},
+                        proxy,
+                    )
+                    status = res.get("status", "")
+                    is_double = res.get("double_spend", False)
                     txid = res.get("tx_hash", "")
+                else:
+                    # Use wallet-rpc submit_transfer for signed_txset format
+                    submit_url = rpc_url.rstrip("/") + "/json_rpc"
+                    rpc_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "0",
+                        "method": "submit_transfer",
+                        "params": {"tx_data_hex": raw_data.hex()},
+                    }
+                    res = _single_post(submit_url, rpc_payload, proxy)
+                    rpc_result = res.get("result", {})
+                    status = "OK" if "tx_hash_list" in rpc_result else "FAILED"
+                    is_double = False
+                    tx_hashes = rpc_result.get("tx_hash_list", [])
+                    txid = tx_hashes[0] if tx_hashes else ""
+
+                if status == "OK" and not is_double:
                     if not txid:
                         integrity_log("broadcast", f"no_txid:idx={idx}")
-                        print(f"  [!] TX {idx} accepted but no txid returned - cannot track confirmation")
-                        # Still mark as sent since daemon accepted it
+                        print(f"  [!] TX {idx} accepted but no txid returned")
 
                     txid_display = txid[:16] if txid else "no-txid"
                     print(f"  [+] TX {idx} -> mempool | {txid_display}...")
                     integrity_log("broadcast", f"sent:idx={idx}")
 
-                    # Wait for mining confirmation (only if we have a real txid)
+                    # BUG 48 FIX: /gettransactions is a daemon REST endpoint,
+                    # NOT a JSON-RPC method. Use _single_post (no retry)
+                    # since we're polling in a loop anyway.
                     check_url = rpc_url.rstrip("/") + "/gettransactions"
                     mine_start = time.time()
                     confirmed = False
@@ -328,7 +374,7 @@ def main():
                         if shutdown_requested():
                             break
                         try:
-                            q = safe_post(
+                            q = _single_post(
                                 check_url,
                                 {"txs_hashes": [txid],
                                  "decode_as_json": False,
@@ -350,13 +396,12 @@ def main():
                         time.sleep(60)
 
                     if not confirmed:
-                        integrity_log("broadcast", f"unconfirmed:idx={idx}:txid={txid[:16]}")
+                        integrity_log("broadcast", f"unconfirmed:idx={idx}")
                         print(f"  [!] TX {idx} unconfirmed after {args.mine_wait}s")
 
                     sent = True
-                    # Save txid in progress so we can check again on resume
                     prog["log"].append({
-                        "idx": idx, "file": str(blob), "sent": True,
+                        "idx": idx, "file": blob.name, "sent": True,
                         "txid": txid, "confirmed": confirmed,
                         "block_height": block_height,
                     })
@@ -365,7 +410,8 @@ def main():
                     success_count += 1
                     break
                 else:
-                    err_msg = res.get("reason", res.get("status", str(res)))
+                    err_msg = res.get("reason", res.get("status",
+                               res.get("error", {}).get("message", str(res))))
                     if isinstance(err_msg, dict):
                         err_msg = str(err_msg)
                     print(f"  Node: {str(err_msg)[:80]}")
@@ -374,7 +420,7 @@ def main():
                         integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
                         print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
                         prog["log"].append({
-                            "idx": idx, "file": str(blob), "sent": False,
+                            "idx": idx, "file": blob.name, "sent": False,
                             "error": "double_spend",
                         })
                         prog["last"] = idx
@@ -401,7 +447,7 @@ def main():
             fail_count += 1
             print(f"  [!] TX {idx} FAILED after {args.rebroadcast} attempts - manual action needed")
             prog["last"] = idx
-            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
+            prog["log"].append({"idx": idx, "file": blob.name, "sent": False,
                                 "error": "exhausted_retries"})
             atomic_write_json(prog, progF)
 

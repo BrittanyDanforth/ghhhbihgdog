@@ -163,7 +163,7 @@ def main():
             "schema": PAIR_SCHEMA,
             "btc_in": str(amt),
             "deposit": deposit,
-            "memo": memo,
+            "memo": str(memo),
             "dest_xmr": dest,
             "expected_xmr": str(expected_xmr),
             "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket

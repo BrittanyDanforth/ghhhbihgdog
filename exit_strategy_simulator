@@ -146,11 +146,16 @@ def main():
 
     liq_guidance = liquidity_estimate(args.method, gross)
 
+    # BUG 54 FIX: --suppress-kyc now also affects the JSON output's
+    # kyc_required field. Previously it only hid the terminal warning,
+    # meaning the JSON would still say kyc_required=true, misleading
+    # any downstream tooling or operator reviewing the JSON.
+    effective_kyc = cfg["kyc"] and not args.suppress_kyc
     plan = {
         "schema": "exitplan_v1",
         "timestamp": int(time.time()) // 600 * 600,
         "method": args.method,
-        "kyc_required": cfg["kyc"],
+        "kyc_required": effective_kyc,
         "amount_in_xmr": str(gross),
         "fee_pct": str(cfg["fee_pct"]),
         "slippage_pct": str(cfg["slippage"]),
@@ -168,7 +173,7 @@ def main():
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
-    kyc_label = "KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"
+    kyc_label = "KYC" if effective_kyc else "No-KYC"
     print(f"  Method      : {args.method} ({kyc_label})")
     print(f"  Gross       : {gross} XMR")
     print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
@@ -178,7 +183,7 @@ def main():
     print(f"  Value       : {fiat_val} {args.currency.upper()}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
     print(f"  Liquidity   : {liq_guidance}")
-    if cfg["kyc"] and not args.suppress_kyc:
+    if effective_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
     print(f"  [+] Plan saved -> {args.outfile}")
 

@@ -148,9 +148,12 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             secure_file_perms(tx_file)
 
             sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
+            # BUG 45 FIX: Store only the filename (not full path) in
+            # manifest to avoid leaking absolute paths from the signing
+            # machine into cross-machine workflows.
             manifest.append({
                 "idx": idx,
-                "file": str(tx_file),
+                "file": tx_file.name,
                 "hash": sha,
                 "dst": scrub_address(dst),
                 "amt": tx["amt"],
@@ -211,8 +214,19 @@ def phase_sign(args, plan: List[dict]):
     if not wallet_file or not Path(wallet_file).exists():
         sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
 
-    # Create signed output directory
+    # BUG 42 FIX: Prefer GS_WALLET_PASSWORD env var over --wallet-password
+    # CLI arg. CLI args are visible in /proc/PID/cmdline to all local users.
+    wallet_password = args.wallet_password
+    if wallet_password is None:
+        wallet_password = os.environ.get("GS_WALLET_PASSWORD", "")
+
+    # Create signed output directory — clean stale signed files first
     signed_dir = outdir / "signed"
+    if signed_dir.is_dir():
+        # BUG 43 FIX: Stale signed files from a prior run could persist
+        # if the new plan has fewer TXs. The broadcaster filters by manifest
+        # but this is defense in depth.
+        shutil.rmtree(signed_dir)
     signed_dir.mkdir(parents=True, exist_ok=True)
 
     signed_manifest = []
@@ -225,9 +239,15 @@ def phase_sign(args, plan: List[dict]):
 
         idx = entry["idx"]
         unsigned_file = Path(entry["file"])
+        # BUG 46 FIX: If the manifest path doesn't exist (cross-machine
+        # air-gap workflow), try resolving by filename in the outdir.
         if not unsigned_file.exists():
-            print(f"  [!] Missing unsigned TX: {unsigned_file}")
-            continue
+            local_file = outdir / unsigned_file.name
+            if local_file.exists():
+                unsigned_file = local_file
+            else:
+                print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
+                continue
 
         # Verify hash
         actual_hash = hashlib.sha256(unsigned_file.read_text().encode()).hexdigest()
@@ -250,13 +270,29 @@ def phase_sign(args, plan: List[dict]):
             cmd = [
                 args.wallet_cli,
                 "--wallet-file", wallet_file,
-                "--password", args.wallet_password or "",
+                "--password", wallet_password,
                 "--command", "sign_transfer",
             ]
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, cwd=work_dir,
             )
+
+            # BUG 44 FIX: Check wallet-cli return code. A non-zero exit
+            # with no signed_monero_tx means the wallet couldn't sign
+            # (wrong password, corrupt wallet, etc). Report clearly.
+            if result.returncode != 0:
+                stderr = result.stderr[:300] if result.stderr else ""
+                stdout = result.stdout[:300] if result.stdout else ""
+                print(f"  [!] TX {idx} wallet-cli exited with code {result.returncode}")
+                if "password" in (stderr + stdout).lower():
+                    print(f"      Likely cause: wrong wallet password")
+                elif "not enough" in (stderr + stdout).lower():
+                    print(f"      Likely cause: insufficient balance")
+                if stderr:
+                    print(f"      stderr: {stderr[:200]}")
+                integrity_log("signer", f"sign_fail:idx={idx}:rc={result.returncode}")
+                continue
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"
@@ -266,9 +302,10 @@ def phase_sign(args, plan: List[dict]):
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
+                # BUG 45 FIX: Store only filename, not absolute path
                 signed_manifest.append({
                     "idx": idx,
-                    "file": str(signed_file),
+                    "file": signed_file.name,
                     "hash": sha,
                     "dst": entry.get("dst", ""),
                     "amt": entry.get("amt", ""),
@@ -320,8 +357,9 @@ def main():
                      help="Path to monero-wallet-cli (phase=sign only)")
     cli.add_argument("--wallet-file",
                      help="Path to full wallet file (phase=sign only)")
-    cli.add_argument("--wallet-password", default="",
-                     help="Wallet password (phase=sign only)")
+    cli.add_argument("--wallet-password", default=None,
+                     help="Wallet password (phase=sign only). "
+                          "Prefer GS_WALLET_PASSWORD env var to avoid /proc leak")
     cli.add_argument("--outdir", default="tx_staging",
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,

@@ -63,13 +63,24 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     correlation window between the log and blockchain/network timestamps.
     An attacker with the log can only narrow the operation to a 10-min window
     instead of the exact second.
+
+    BUG 32 FIX: The previous hash extraction was brittle — if the log file
+    ended with a blank line or a corrupted line, the split would fail or
+    extract the wrong value, breaking the hash chain silently. Now falls
+    back to the genesis hash on any parse error.
     """
     prev = "0" * 64
     if log_path.exists():
-        text = log_path.read_text()
-        lines = text.splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0].strip()
+        try:
+            text = log_path.read_text()
+            lines = [l for l in text.splitlines() if l.strip()]
+            if lines:
+                parts = lines[-1].split(" | ", 1)
+                candidate = parts[0].strip()
+                if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                    prev = candidate
+        except (OSError, UnicodeDecodeError):
+            pass
     ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
     line = f"{ts}|{VERSION}|{stage}|{msg}"
     h = hashlib.sha256((prev + line).encode()).hexdigest()
@@ -91,7 +102,13 @@ def secure_file_perms(path: Path, mode: int = 0o600) -> None:
 
 
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
-    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    BUG 35 FIX: The old verify-by-reload silently swallowed parse errors
+    (truncated JSON from disk-full, etc). If the reload fails, that means
+    the file on disk is corrupt — we must crash loudly, not continue.
+    Also fsync the parent directory to ensure the rename is durable.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
@@ -99,8 +116,20 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
     os.replace(tmp, path)
-    with open(path) as f:
-        json.load(f)
+    try:
+        with open(path) as f:
+            json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(f"[!] CRITICAL: Atomic write to {path} produced corrupt JSON: {e}")
+    # fsync parent dir to make the rename durable across power loss
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
@@ -177,14 +206,28 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 
     If NEWNYM fails _NEWNYM_MAX_FAILURES times in a row and required=True,
     the process aborts to prevent all operations going over one circuit.
+
+    BUG 34 FIX: The old code only tried the Unix socket file at
+    /var/run/tor/control. Most Tor installations (especially on non-Debian
+    or when installed via Tor Browser) use TCP control port 9051 instead.
+    Now tries socket file first, then falls back to TCP port 9051.
     """
     global _NEWNYM_CONSECUTIVE_FAILURES
     try:
         from stem import Signal as StemSignal
         from stem.control import Controller
-        with Controller.from_socket_file(ctrl) as c:
+
+        c = None
+        try:
+            if os.path.exists(ctrl):
+                c = Controller.from_socket_file(ctrl)
+            else:
+                c = Controller.from_port(port=9051)
             c.authenticate()
             c.signal(StemSignal.NEWNYM)
+        finally:
+            if c is not None:
+                c.close()
         time.sleep(5)
         _NEWNYM_CONSECUTIVE_FAILURES = 0
         return True
@@ -204,19 +247,35 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 #  Retry-wrapped HTTP
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
+    """GET with retry. Aborts if proxies is None (clearnet leak prevention).
+
+    BUG 33 FIX: The proxy-None check must happen BEFORE the @retry decorator,
+    because tenacity retries SystemExit (it inherits from BaseException), so
+    the abort would be retried 4 times before propagating. Check first, then
+    call the retry-wrapped inner function.
+    """
     if proxies is None:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
+    return _safe_get_inner(url, proxies)
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
+def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r = requests.get(url, timeout=20, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
+    """POST with retry. Aborts if proxies is None (clearnet leak prevention)."""
     if proxies is None:
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
+    return _safe_post_inner(url, payload, proxies)
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
+def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str]) -> dict:
     r = requests.post(url, json=payload, timeout=25, proxies=proxies)
     r.raise_for_status()
     return r.json()
@@ -356,7 +415,17 @@ def shutdown_requested() -> bool:
 # ---------------------------------------------------------------------------
 
 def scrub_address(addr: str, visible: int = 8) -> str:
-    """Truncate an address for safe terminal display."""
-    if len(addr) <= visible * 2:
-        return addr
+    """Truncate an address for safe terminal display.
+
+    BUG 36 FIX: For Monero addresses (95 chars), 8+8=16 visible chars is
+    already enough to uniquely identify a subaddress on-chain. Reduce to
+    6 visible chars for addresses over 40 chars (Monero), and ensure we
+    never return the full address even for short inputs.
+    """
+    if not addr:
+        return "<empty>"
+    if len(addr) > 40:
+        visible = min(visible, 6)
+    if len(addr) <= visible * 2 + 3:
+        return f"{addr[:4]}...{addr[-4:]}" if len(addr) > 11 else "****"
     return f"{addr[:visible]}...{addr[-visible:]}"

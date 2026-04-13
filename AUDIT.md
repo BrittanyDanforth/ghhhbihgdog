@@ -1424,10 +1424,324 @@ the signer on this plan and attempting to broadcast, causing confusing failures.
 **Impact:** MEDIUM — wasted time and confusing errors.
 **Fix:** Mock plans now have `meta.mock = true`. Signer refuses to process them.
 
+## Section 16: Deep Adversarial Audit (Round 11)
+
+Complete hostile trace of every dangerous path — manual signer, manual broadcaster,
+air-gap workflow, resume/rerun, cross-machine, stale files, silent failures.
+
+### BUG 32 (FIXED): Integrity log hash-chain breaks on corrupt/trailing-newline log
+
+**File:** gs_common.py `integrity_log()`
+**Scenario:** The log file ends with a blank line (common after manual editing or
+after a text editor appends a newline). The `lines[-1].split(" | ")[0].strip()` call
+extracts an empty string as the "previous hash". The next entry chains from an empty
+string instead of the actual last hash, silently breaking the tamper-detection chain.
+From that point on, ALL chain verification will fail even though no tampering occurred.
+**Impact:** HIGH (integrity) — The hash chain that's supposed to detect tampering is
+broken by a single trailing newline. An attacker who appends a blank line can then
+modify earlier entries without detection.
+**Fix:** Filter blank lines before extracting the previous hash. Validate the
+candidate hash is exactly 64 hex chars before using it. Fall back to genesis hash
+on any parse failure.
+
+### BUG 33 (FIXED): safe_get/safe_post retry sys.exit() via tenacity
+
+**File:** gs_common.py
+**Scenario:** `safe_get(url, proxies=None)` calls `sys.exit()`. But `sys.exit()` raises
+`SystemExit` which inherits from `BaseException`. The `@retry` decorator from tenacity
+catches ALL exceptions including `SystemExit`, so the abort is retried 4 times with
+exponential backoff before finally propagating. During those retries, any error output
+is duplicated 4 times, confusing the operator.
+**Impact:** MEDIUM — the abort eventually works, but the 4 retries add 20+ seconds of
+delay and 4 duplicate error messages before the process actually exits.
+**Fix:** Move the proxy-None check outside the retry-decorated function. The outer
+function does the safety check, then calls a separate retry-decorated inner function.
+
+### BUG 34 (FIXED): NEWNYM only tries Unix socket, not TCP port
+
+**File:** gs_common.py `newnym()`
+**Scenario:** Most Tor installations (Tor Browser, manual builds on non-Debian systems)
+use TCP control port 9051, not the Unix socket at `/var/run/tor/control`. The old code
+only tried `Controller.from_socket_file()`. If the socket didn't exist, NEWNYM failed
+on every call, and after 3 failures the process either aborts (if required=True) or
+prints a warning and continues with the SAME Tor circuit for all operations.
+**Impact:** CRITICAL (OPSEC) — all operations go over one Tor circuit. Every ThorChain
+quote, every broadcast, every RPC call uses the same exit node. The operator thinks
+circuits are rotating but they aren't.
+**Fix:** Try socket file first, fall back to TCP port 9051.
+
+### BUG 35 (FIXED): atomic_write_json verify-reload silently masks disk-full corruption
+
+**File:** gs_common.py
+**Scenario:** Write to a nearly-full disk. `json.dump()` partially writes, `os.fsync()`
+flushes the partial data, `os.replace()` puts the truncated file in place. The reload
+`json.load(f)` raises `JSONDecodeError` — but this exception is NOT caught, so it
+propagates as an unhandled exception with a confusing traceback. More subtly, if the
+partial file happens to be valid JSON (e.g., an array truncated after a closing bracket),
+the reload succeeds and the data loss is silent.
+**Impact:** HIGH — data corruption goes undetected, or confusing crash replaces the
+clear "disk full" diagnosis.
+**Fix:** Catch `JSONDecodeError` from the reload and call `sys.exit()` with a clear
+"corrupt JSON" message. Also fsync the parent directory for rename durability.
+
+### BUG 36 (FIXED): scrub_address shows too many chars for Monero addresses
+
+**File:** gs_common.py
+**Scenario:** Monero addresses are 95 chars. With `visible=8`, the scrubbed form shows
+16 chars (8 prefix + 8 suffix). A Monero subaddress with 16 known chars can often be
+uniquely identified on-chain, especially in low-volume wallets.
+**Impact:** MEDIUM (OPSEC) — scrubbed addresses in terminal output and integrity log
+can be correlated with on-chain addresses.
+**Fix:** Reduce visible chars to 6 for addresses over 40 chars. Ensure very short
+addresses are always masked.
+
+### BUG 37 (FIXED): Wallet subaddress labels leak role and count
+
+**File:** GhostSpiral `create_subs()`
+**Scenario:** Subaddresses are created with labels like `Mix_0`, `Mix_1`, ..., `Decoy_0`,
+`Decoy_1`. If the wallet file is ever recovered forensically (or backed up to cloud
+storage, or transferred via USB), the labels reveal:
+- Exactly how many mixing addresses vs decoys were used
+- The role of each address (mix vs decoy)
+- The order of creation (sequential numbering)
+**Impact:** MEDIUM (OPSEC) — forensic analysis of the wallet reveals the mixing strategy.
+**Fix:** Labels now use random hex: `gs_a1b2c3d4` (indistinguishable from each other).
+
+### BUG 38 (FIXED): Wallet password passed via CLI arg (visible in /proc/PID/cmdline)
+
+**File:** GhostSpiral Stage 5b
+**Scenario:** `--wallet-password` is passed on the command line to `airgap_tx_signer`.
+While the signing subprocess is running, any local user can read the wallet password
+from `/proc/PID/cmdline`. On shared systems or VMs with monitoring agents, the password
+is leaked to anyone who can enumerate processes.
+**Impact:** HIGH (OPSEC) — wallet password exposed to local adversary. Combined with
+wallet file access, the adversary can steal all funds.
+**Fix:** Pass wallet password via `GS_WALLET_PASSWORD` environment variable instead.
+Environment variables are only readable by the same UID (via `/proc/PID/environ`),
+which is marginally better, and are cleared by paranoia_mode Phase 12.
+
+### BUG 39 (FIXED): `h1` variable potentially unbound after sync loop
+
+**File:** GhostSpiral RPC sync guard
+**Scenario:** If every iteration of the 30-attempt sync loop raises an exception
+(e.g., RPC is unreachable), `h1` is never assigned. The `else` clause calls `sys.exit()`
+so this particular path is safe, but the `integrity_log` after the loop references `h1`
+which could be from the wrong iteration (the last failed attempt, not the successful one).
+**Impact:** LOW — incorrect height logged; sync guard itself works correctly.
+**Fix:** Initialize `h1 = 0` before the loop. Don't log the height value (it leaks info).
+
+### BUG 40 (FIXED): Fan-out total can exceed usable balance after quantization
+
+**File:** GhostSpiral Stage 4
+**Scenario:** `fanout_amt = (usable * 0.9 / fanout_count).quantize("0.0001")`.
+For small balances (e.g., 0.05 XMR), quantization can round UP, making
+`fanout_amt * fanout_count > usable`. The signing phase then fails because there
+aren't enough funds.
+**Impact:** MEDIUM (money) — batch fails, operator must manually debug.
+**Fix:** Verify `fanout_total <= usable` after quantization; subtract DUST if over.
+
+### BUG 41 (FIXED): Exit strategy uses `bal` which may be mock value
+
+**File:** GhostSpiral Stage 5d
+**Scenario:** In cold/airgap mock mode, `bal` is set to 10.0 XMR. If the operator
+later runs auto-mode after funds arrive, `bal` is the real unlocked balance. But
+the exit strategy simulator receives `str(bal)` which is the raw balance, not the
+amount actually distributed in the plan (which accounts for fees and fan-out).
+**Impact:** LOW — exit plan shows wrong amount; operator may over-estimate off-ramp.
+**Fix:** Calculate exit amount from the plan's actual TX sum.
+
+### BUG 42 (FIXED): airgap_tx_signer wallet password from CLI visible in /proc
+
+**File:** airgap_tx_signer `phase_sign()`
+**Scenario:** Same as BUG 38, but from the signer's perspective. When called manually
+(not via GhostSpiral), the operator passes `--wallet-password` directly.
+**Fix:** Prefer `GS_WALLET_PASSWORD` env var; fall back to `--wallet-password` arg.
+
+### BUG 43 (FIXED): Signer doesn't clean stale signed files in signed/ directory
+
+**File:** airgap_tx_signer `phase_sign()`
+**Scenario:** Run 1 signs 40 TXs -> `signed/tx_0.signed` through `signed/tx_39.signed`.
+Run 2 signs 20 TXs -> `signed/tx_0.signed` through `signed/tx_19.signed` (overwrites).
+But `signed/tx_20.signed` through `signed/tx_39.signed` from Run 1 still exist.
+The manifest only covers 0-19, and the broadcaster filters by manifest (BUG 20 fix),
+so they won't be broadcast. But they persist on disk as forensic evidence containing
+signed transactions to old addresses.
+**Impact:** MEDIUM (OPSEC) — stale signed TX files on disk.
+**Fix:** `shutil.rmtree(signed_dir)` before creating new signed directory.
+
+### BUG 44 (FIXED): Signer ignores wallet-cli non-zero exit code
+
+**File:** airgap_tx_signer `phase_sign()`
+**Scenario:** `monero-wallet-cli` returns non-zero (wrong password, corrupt wallet,
+insufficient balance). The code checks for `signed_monero_tx` file existence but
+doesn't check `result.returncode`. If wallet-cli fails but doesn't produce the
+signed file, the generic "no output" message gives no diagnosis.
+More critically: if the error is "wrong password", the operator might re-run with
+different passwords, each creating a process visible in /proc with the password arg.
+**Impact:** HIGH (UX + OPSEC) — operator gets unhelpful error message and may
+expose multiple password attempts.
+**Fix:** Check `result.returncode` first. Parse stderr for common errors (wrong
+password, insufficient balance) and provide targeted guidance.
+
+### BUG 45 (FIXED): Manifest stores absolute paths leaking machine directory structure
+
+**File:** airgap_tx_signer `phase_create()` and `phase_sign()`
+**Scenario:** Manifest entries contain `"file": "/home/user/ghostspiral/tx_staging/tx_0.unsigned"`.
+This leaks the operator's username, home directory path, and working directory to
+anyone who sees the manifest (e.g., transferred on USB to air-gap machine, or
+recovered forensically). Combined with timestamps, this can deanonymize the operator.
+**Impact:** MEDIUM (OPSEC) — machine directory structure leaked in manifest.
+**Fix:** Store only filename (`tx_0.unsigned`) instead of full path.
+
+### BUG 46 (FIXED): Signer phase_sign can't find unsigned files cross-machine
+
+**File:** airgap_tx_signer `phase_sign()`
+**Scenario:** Manifest from phase_create has `"file": "tx_0.unsigned"` (after BUG 45 fix).
+On the air-gap machine, the operator places files in a different directory. The signer
+tries `Path("tx_0.unsigned")` which resolves relative to CWD, not to the outdir.
+**Impact:** HIGH — all signing fails with "Missing unsigned TX" on air-gap machine.
+**Fix:** If the manifest path doesn't exist, try resolving in the outdir.
+
+### BUG 47 (FIXED): Broadcaster sends signed_txset as raw hex via /sendrawtransaction
+
+**File:** broadcast_signed_xmr
+**Scenario:** `signed_monero_tx` files from wallet-cli's `sign_transfer` are in
+Monero's internal signed_txset format (binary serialization), NOT raw transaction hex.
+The daemon's `/sendrawtransaction` endpoint expects raw transaction hex.
+Sending a signed_txset as hex to `/sendrawtransaction` results in "Failed to parse
+tx from blob" or similar deserialization errors.
+The correct way to broadcast a signed_txset is via monero-wallet-rpc's
+`submit_transfer` JSON-RPC method, which knows how to deserialize the signed_txset.
+**Impact:** CRITICAL (money) — no transactions can be broadcast via the old code path.
+All TXs fail with parse errors. The operator's money is signed but never sent.
+**Fix:** Auto-detect file format. If the blob is ASCII hex, use `/sendrawtransaction`.
+If it's binary (signed_txset), use wallet-rpc's `submit_transfer` method.
+
+### BUG 48 (FIXED): Broadcaster uses safe_post (4x retry) for mine-wait polling
+
+**File:** broadcast_signed_xmr mine confirmation loop
+**Scenario:** The mine-wait loop calls `safe_post()` to check `/gettransactions`.
+`safe_post` has 4x retry with exponential backoff. Inside a loop that already
+polls every 60 seconds, this means a single poll failure triggers 4 retries
+(~30 seconds of backoff) before returning to the 60-second sleep. This makes
+the mine-wait loop take much longer than expected and generates excessive
+traffic to the daemon.
+**Impact:** LOW — mine-wait takes longer; more requests to daemon.
+**Fix:** Use `_single_post` (no retry) since the outer loop already polls.
+
+### BUG 49 (FIXED): Broadcaster manifest parser doesn't handle dict-with-entries format
+
+**File:** broadcast_signed_xmr manifest hash verification
+**Scenario:** The unsigned manifest from phase_create is a dict:
+`{"plan_fingerprint": "...", "phase": "unsigned", "entries": [...]}`.
+The signed manifest from phase_sign is a flat list. The broadcaster does
+`manifest_hashes = {Path(e["file"]).name: e["hash"] for e in manifest}` which
+fails with `TypeError: string indices must be integers` if manifest is a dict.
+**Impact:** HIGH — manifest verification crashes; all TXs fail to broadcast.
+**Fix:** Handle both formats: extract `entries` from dict, or use list directly.
+
+### BUG 50 (FIXED): Broadcaster delay-loading doesn't handle dict manifest format
+
+**File:** broadcast_signed_xmr delay loading from manifest
+**Scenario:** Same as BUG 49 but in the delay-loading path. If the manifest is a
+dict, `for entry in _mdata:` iterates over dict keys (strings), and
+`entry["delay"]` raises `TypeError: string indices must be integers`.
+**Impact:** HIGH — delay loading crashes or silently loads no delays.
+**Fix:** Handle both list and dict-with-entries format.
+
+### BUG 51 (FIXED): paranoia_mode doesn't search USB mount points for artifacts
+
+**File:** paranoia_mode `wipe_gs_artifacts()`
+**Scenario:** Air-gap workflow involves copying signed files to/from USB drives
+mounted at `/media/`, `/mnt/`, or `/run/media/`. After operation, the operator
+runs paranoia_mode but it only searches CWD and home directory. Signed TX files,
+unsigned plans, and manifests remain on the USB drive.
+**Impact:** MEDIUM (OPSEC) — critical artifacts survive on removable media.
+**Fix:** Add `/media`, `/mnt`, `/run/media`, `~/Desktop`, `~/Downloads` to
+search roots. Operator can also use `--search-dir` for custom paths.
+
+### BUG 52 (FIXED): paranoia_mode DNS check creates MAC-to-activity correlation
+
+**File:** paranoia_mode `dns_check()` → renamed to `connectivity_check()`
+**Scenario:** Immediately after MAC spoof, the old code resolved `www.google.com`
+via clearnet DNS. Even though `www.google.com` is benign, the DNS query creates a
+timing correlation: ISP DNS logs show "new MAC address X immediately resolved
+www.google.com at time T." This narrows the anonymity set — if the ISP sees only
+one MAC change followed by immediate DNS activity in that time window, the
+operator is identified.
+**Impact:** MEDIUM (OPSEC) — timing correlation defeats MAC spoof purpose.
+**Fix:** Replace DNS check with local interface check (`ip addr show`). Proves
+connectivity without generating any network traffic.
+
+### BUG 53 (FIXED): paranoia_mode only overwrites first 64KB of files
+
+**File:** paranoia_mode `_secure_delete_file()`
+**Scenario:** The old code did `f.write(b"\x00" * min(size, 65536))`. For files
+larger than 64KB (wallet files can be several MB, unsigned plans with many TXs
+can be hundreds of KB, signed blob files are typically 2-10KB each but could be
+larger), the data beyond 64KB remains on disk, recoverable with forensic tools.
+**Impact:** HIGH (OPSEC) — partial data recovery reveals transaction details,
+addresses, and wallet information.
+**Fix:** Overwrite the full file size in 64KB chunks.
+
+### BUG 54 (FIXED): --suppress-kyc only affects terminal display, not JSON output
+
+**File:** exit_strategy_simulator
+**Scenario:** Operator uses `--suppress-kyc` expecting the exit plan to be
+configured for no-KYC. The JSON output still says `kyc_required: true`. If any
+downstream tooling reads the JSON, it will flag KYC as required despite the
+operator's intent to suppress it.
+**Impact:** MEDIUM (UX deception) — operator thinks they've configured no-KYC
+but the plan JSON disagrees.
+**Fix:** `--suppress-kyc` now also sets `kyc_required: false` in the JSON output.
+
+### BUG 55 (FIXED): create_receive_wallet prints full XMR address in terminal
+
+**File:** create_receive_wallet
+**Scenario:** The full 95-character Monero address is printed to the terminal in
+the "Address (full)" line and again in the "Next Steps" example commands. Terminal
+scrollback buffers persist in memory and in terminal emulator log files. Screen
+recording software captures them. Shoulder-surfing captures them.
+**Impact:** MEDIUM (OPSEC) — full receive address exposed in terminal output.
+**Fix:** Only print scrubbed address. Reference the JSON file for full address.
+Use `jq -r .address` in example commands so the address is read from the
+permission-protected file, not from terminal history.
+
+### Complete Bug Status Table (Updated Round 11)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 1-31 | (See previous sections) | Various | YES |
+| BUG 32 | Integrity log hash-chain breaks on trailing newline | HIGH | YES |
+| BUG 33 | safe_get/safe_post retry sys.exit via tenacity | MEDIUM | YES |
+| BUG 34 | NEWNYM only tries Unix socket, not TCP port | CRITICAL | YES |
+| BUG 35 | atomic_write_json verify-reload masks disk-full | HIGH | YES |
+| BUG 36 | scrub_address shows too many chars for XMR addrs | MEDIUM | YES |
+| BUG 37 | Wallet subaddress labels leak role and count | MEDIUM | YES |
+| BUG 38 | Wallet password passed via CLI arg | HIGH | YES |
+| BUG 39 | h1 variable potentially unbound after sync loop | LOW | YES |
+| BUG 40 | Fan-out total can exceed usable after quantization | MEDIUM | YES |
+| BUG 41 | Exit strategy uses mock balance value | LOW | YES |
+| BUG 42 | Signer wallet password from CLI in /proc | HIGH | YES |
+| BUG 43 | Signer doesn't clean stale signed files | MEDIUM | YES |
+| BUG 44 | Signer ignores wallet-cli non-zero exit code | HIGH | YES |
+| BUG 45 | Manifest stores absolute paths leaking dirs | MEDIUM | YES |
+| BUG 46 | Signer can't find unsigned files cross-machine | HIGH | YES |
+| BUG 47 | Broadcaster sends signed_txset as raw hex | CRITICAL | YES |
+| BUG 48 | Broadcaster uses 4x-retry for mine-wait polling | LOW | YES |
+| BUG 49 | Broadcaster manifest parser can't handle dict | HIGH | YES |
+| BUG 50 | Broadcaster delay-loading can't handle dict | HIGH | YES |
+| BUG 51 | paranoia_mode misses USB mount points | MEDIUM | YES |
+| BUG 52 | paranoia DNS check creates MAC-activity correlation | MEDIUM | YES |
+| BUG 53 | paranoia only overwrites first 64KB of files | HIGH | YES |
+| BUG 54 | --suppress-kyc only affects display, not JSON | MEDIUM | YES |
+| BUG 55 | create_receive_wallet prints full address | MEDIUM | YES |
+
 ### Remaining Known Issues (not bugs, design limitations):
 | Item | Status | Notes |
 |------|--------|-------|
 | JoinMarket UTXO parsing | STUB | Returns empty; needs JM output format spec |
-| /proc/PID/cmdline exposure | KNOWN | Can't fix from userspace; consider env vars |
+| /proc/PID/cmdline exposure | MITIGATED | Wallet password now uses env var; other args still visible |
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
 | CoinGecko rate limiting via Tor | KNOWN | Bisq fallback added; may still fail |
+| signed_txset vs raw hex detection | HEURISTIC | Auto-detection works for known formats but untested edge cases may exist |

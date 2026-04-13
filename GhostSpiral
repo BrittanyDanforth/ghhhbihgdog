@@ -24,7 +24,7 @@ OPSEC hardening (v10.5):
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, os, re, sys, time, subprocess
+import argparse, json, os, re, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import List
@@ -114,7 +114,8 @@ def main():
     cli.add_argument("--wallet-file", default="offline.wallet",
                      help="Path to Monero wallet file for auto-mode signing")
     cli.add_argument("--wallet-password", default="",
-                     help="Password for the wallet file (empty for no password)")
+                     help="Password for the wallet file (empty for no password). "
+                          "WARNING: visible in /proc/PID/cmdline — prefer GS_WALLET_PASSWORD env var")
     args = cli.parse_args()
 
     # ---- Determine mode ----
@@ -134,7 +135,7 @@ def main():
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
-        integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
+        integrity_log("stage0", "receive_mode:entry_loaded")
         print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
         if args.joinmarket:
             sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
@@ -161,6 +162,11 @@ def main():
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
 
     # Sync guard: wait for nodes to agree on height
+    # BUG 39 FIX: h1 was referenced after the for/else but only assigned
+    # inside a try block — if every attempt threw an exception, h1 would
+    # be unbound at the integrity_log call (NameError on the success path
+    # that never succeeds, but also confusing if partial success).
+    h1 = 0
     for attempt in range(30):
         if shutdown_requested():
             sys.exit("[!] Shutdown requested during sync wait.")
@@ -178,7 +184,7 @@ def main():
         time.sleep(10)
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
-    integrity_log("stage0", f"rpc_sync_ok:height={h1}")
+    integrity_log("stage0", "rpc_sync_ok")
 
     fee_xmr = fetch_fee_from_rpc(rpc_primary)
     integrity_log("stage0", "fee_fetched")
@@ -329,12 +335,17 @@ def main():
     sub_account = receive_account_index if receive_mode else 0
 
     def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> List[str]:
+        """Create mixing subaddresses. Labels use random hex instead of
+        sequential indices to avoid leaking the role or count of each
+        address if the wallet file is inspected forensically (BUG 37 FIX)."""
         subs = []
         for i in range(n):
-            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Mix_{i}")
+            label = f"gs_{secure_hex(4)}"
+            addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         for d in range(decoys):
-            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Decoy_{d}")
+            label = f"gs_{secure_hex(4)}"
+            addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         return subs
 
@@ -353,8 +364,7 @@ def main():
         ENTRY = subs[0]
         integrity_log("stage3", "entry_created")
 
-    import secrets as _secrets
-    _secrets.SystemRandom().shuffle(subs)
+    secrets.SystemRandom().shuffle(subs)
 
     ###########################################################################
     # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
@@ -396,7 +406,7 @@ def main():
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
                 print(f"  To address:   {dep['deposit_address']}")
                 if dep.get("memo"):
-                    print(f"  With memo:    {dep['memo']}")
+                    print(f"  With memo:    {dep['memo'][:60]}...")
                 print(f"  Expected XMR: ~{dep['expected_xmr']}")
             print()
             print("  ============================================================")
@@ -418,12 +428,12 @@ def main():
     for a in subs:
         others = [b for b in subs if b != a]
         max_k = len(others)
-        k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
+        k = min((secrets.randbelow(3) + 1) * args.deep, max_k)
         k = max(k, 1)
         chosen = []
         pool = list(others)
         for _ in range(k):
-            idx = _secrets.randbelow(len(pool))
+            idx = secrets.randbelow(len(pool))
             chosen.append(pool.pop(idx))
         dag[a] = chosen
     integrity_log("stage3", "dag_built")
@@ -498,6 +508,11 @@ def main():
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
     fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+    # BUG 40 FIX: Verify fan-out total doesn't exceed usable balance.
+    # Quantization rounding can push total above usable for small balances.
+    fanout_total = fanout_amt * fanout_count
+    if fanout_total > usable:
+        fanout_amt -= DUST_XMR
     if fanout_amt <= DUST_XMR:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
@@ -511,7 +526,7 @@ def main():
             "src": ENTRY,
             "dst": mix_targets[fi],
             "amt": str(fanout_amt),
-            "delay": _secrets.randbelow(540) + 180,
+            "delay": secrets.randbelow(540) + 180,
             "extra": secure_hex(16),
         })
     integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:amt_each={fanout_amt}")
@@ -528,18 +543,18 @@ def main():
             if shutdown_requested():
                 integrity_log("stage4", f"shutdown_at_round_{r}")
                 break
-            src_idx = _secrets.randbelow(len(mix_targets))
+            src_idx = secrets.randbelow(len(mix_targets))
             s = mix_targets[src_idx]
             dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
             if not dst_candidates:
                 continue
-            dst_idx = _secrets.randbelow(len(dst_candidates))
+            dst_idx = secrets.randbelow(len(dst_candidates))
             d = dst_candidates[dst_idx]
             plan.append({
                 "src": s,
                 "dst": d,
                 "amt": str(dag_split),
-                "delay": _secrets.randbelow(540) + 180,
+                "delay": secrets.randbelow(540) + 180,
                 "extra": secure_hex(16),
             })
     else:
@@ -669,10 +684,14 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             "python3", "airgap_tx_signer", str(ufile),
             "--phase", "sign",
             "--wallet-file", args.wallet_file,
-            "--wallet-password", args.wallet_password,
             "--outdir", staging_dir,
         ]
-        subprocess.run(sign_cmd, check=True, timeout=1800)
+        # BUG 38 FIX: Pass wallet password via environment variable
+        # instead of --wallet-password CLI arg, which would be visible in
+        # /proc/PID/cmdline to any process on the system.
+        sign_env = os.environ.copy()
+        sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
+        subprocess.run(sign_cmd, check=True, timeout=1800, env=sign_env)
         integrity_log("stage5", "sign_ok")
 
         # Verify signed TXs exist
@@ -713,8 +732,20 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
 
     try:
         print("  [*] Stage 5d: Exit strategy simulation...")
+        # BUG 41 FIX: Use actual usable balance from plan, not the `bal`
+        # variable which may be mock 10.0 in dry-run modes. Re-read the
+        # plan we just signed to get the real total.
+        exit_amt = str(bal)
+        try:
+            with open(str(ufile)) as _ef:
+                _plan_data = json.load(_ef)
+                _txs = _plan_data.get("txs", [])
+                if _txs:
+                    exit_amt = str(sum(Decimal(t["amt"]) for t in _txs))
+        except Exception:
+            pass
         subprocess.run(
-            ["python3", "exit_strategy_simulator", str(bal),
+            ["python3", "exit_strategy_simulator", exit_amt,
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
         )

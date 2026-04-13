@@ -82,9 +82,9 @@ def main():
     atomic_write_json(out, fname)
 
     print(f"  [+] Wallet saved -> {fname}")
-    print(f"  [+] Address (full): {addr_str}")
-    print(f"  [+] Subaddress index: {sub_idx} (account 0)")
     print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
+    print(f"  [+] Subaddress index: {sub_idx} (account 0)")
+    print(f"  [+] Full address is in the JSON file (0600 permissions).")
 
     integrity_log("wallet", f"saved:{fname.name}")
 
@@ -93,11 +93,14 @@ def main():
 
     print(f"  [+] Integrity chain updated.")
     print()
+    # BUG 55 FIX: Don't print full XMR address in terminal output.
+    # Terminal scrollback, screen recordings, and shoulder-surfing can
+    # capture it. Instead, reference the JSON file which has 0600 perms.
     print(f"  === RECEIVER FLOW: NEXT STEPS ===")
     print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
     print(f"       python3 thor_swap_preparer \\")
     print(f"         --amounts <BTC_AMOUNT> \\")
-    print(f"         --dests {addr_str} \\")
+    print(f"         --dests $(jq -r .address {fname}) \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
     print(f"  2. Give the BTC deposit address + memo to the sender")
     print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")

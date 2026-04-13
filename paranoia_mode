@@ -18,7 +18,7 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, shutil, socket, subprocess, sys, time
+import argparse, glob, os, random, shutil, subprocess, sys, time
 from pathlib import Path
 
 from gs_common import (
@@ -42,23 +42,32 @@ PYCACHE_GLOBS = [
 ]
 
 
-def dns_check() -> None:
+def connectivity_check(iface: str) -> None:
     """Verify basic network connectivity after MAC spoof.
 
-    OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
-    over clearnet DNS — that links the new MAC address to Tor usage in
-    ISP DNS logs. Instead, resolve a benign, high-traffic domain that
-    reveals nothing about the operator's intent.
+    BUG 52 FIX: ANY clearnet DNS resolution immediately after MAC spoof
+    creates a timing correlation between the new MAC and network activity.
+    Instead of DNS resolution, just check that the network interface is up
+    and has an IP address. This proves connectivity without generating any
+    traffic that could be logged by the ISP or network observer.
     """
     try:
-        res = socket.getaddrinfo("www.google.com", 443)
-        if not res:
-            raise RuntimeError("DNS returned empty")
-        integrity_log("paranoia", "dns_check_ok")
-    except socket.gaierror as e:
-        integrity_log("paranoia", f"dns_fail:{e}")
-        print(f"  [!] DNS resolution failed post-spoof: {e}")
-        sys.exit(1)
+        result = subprocess.run(
+            ["ip", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            integrity_log("paranoia", "connectivity_check_fail:iface_down")
+            print(f"  [!] Interface {iface} appears to be down after MAC spoof")
+            return
+        if "inet " in result.stdout:
+            integrity_log("paranoia", "connectivity_check_ok")
+        else:
+            integrity_log("paranoia", "connectivity_check_warn:no_ip")
+            print(f"  [!] Interface {iface} has no IP address (DHCP may need renewal)")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        integrity_log("paranoia", f"connectivity_check_fail:{e}")
+        print(f"  [!] Connectivity check failed: {e}")
 
 
 def rand_mac() -> str:
@@ -212,11 +221,23 @@ def wipe_swap_ram(dry: bool):
 
 
 def _secure_delete_file(path: Path):
-    """Overwrite file content with nulls before unlinking."""
+    """Overwrite file content with nulls before unlinking.
+
+    BUG 53 FIX: The old code only overwrote the first 64KB. For large
+    files (wallet files, plans with many TXs, signed blobs), the rest
+    of the file data remained on disk, recoverable with forensic tools.
+    Now overwrites the full file size, writing in 64KB chunks to avoid
+    memory issues with very large files.
+    """
     try:
         size = path.stat().st_size
         with open(path, "wb") as f:
-            f.write(b"\x00" * min(size, 65536))
+            remaining = size
+            chunk_size = 65536
+            while remaining > 0:
+                write_size = min(remaining, chunk_size)
+                f.write(b"\x00" * write_size)
+                remaining -= write_size
             f.flush()
             os.fsync(f.fileno())
         path.unlink()
@@ -252,11 +273,18 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "signed_blobs", "unsigned", "tx_staging",
     ]
 
+    # BUG 51 FIX: Also search common USB mount points where air-gap
+    # signed files may have been left (operator may forget to clean USB).
     search_roots = list(set([
         Path("."),
         Path.home(),
         Path.home() / "ghostspiral",
         Path.home() / "GhostSpiral",
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+        Path("/media"),
+        Path("/mnt"),
+        Path("/run/media"),
     ] + [Path(d) for d in (extra_dirs or [])]))
 
     count = 0
@@ -428,11 +456,11 @@ def main():
     print("  [*] Phase 1: MAC spoof")
     spoof_mac(args.iface, args.dry_run)
 
-    print("  [*] Phase 2: DNS check")
+    print("  [*] Phase 2: Connectivity check (no DNS — avoids MAC-to-activity correlation)")
     if args.dry_run:
-        print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
+        print("  [dry] would check interface connectivity")
     else:
-        dns_check()
+        connectivity_check(args.iface)
 
     print("  [*] Phase 3: DNS cache flush")
     flush_dns_cache(args.dry_run)
@@ -455,19 +483,19 @@ def main():
     print("  [*] Phase 9: Swap/RAM")
     wipe_swap_ram(args.dry_run)
 
-    print("  [*] Phase 11: Clipboard")
+    print("  [*] Phase 10: Clipboard")
     wipe_clipboard(args.dry_run)
 
-    print("  [*] Phase 12: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
+    print("  [*] Phase 11: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
     wipe_xdg_traces(args.dry_run)
 
-    print("  [*] Phase 13: Environment variables")
+    print("  [*] Phase 12: Environment variables")
     scrub_env_vars(args.dry_run)
 
-    # Phase 14 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 14: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
     wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
 
     # DO NOT call integrity_log() here — it would recreate the wiped log file
