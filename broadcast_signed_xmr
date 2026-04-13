@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse, json, time, sys, os, hashlib
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 import requests
 
@@ -27,10 +28,18 @@ from gs_common import (
     install_signal_handlers, shutdown_requested,
 )
 
+_LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
 
 def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """Single-attempt POST without tenacity retry. Used for broadcast
-    submissions where the outer loop handles retries with NEWNYM rotation."""
+    submissions where the outer loop handles retries with NEWNYM rotation.
+
+    proxies may be:
+      - A real SOCKS proxy dict (normal case)
+      - {"http": None, "https": None} for localhost-only wallet-rpc
+      - None -> abort (clearnet leak)
+    """
     if proxies is None:
         sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies)
@@ -222,10 +231,19 @@ def main():
         if not blobs:
             sys.exit("[!] No blobs remaining after manifest filter")
 
-    # Compute blob fingerprint to bind progress to this specific set of blobs
-    blob_fp = hashlib.sha256(
-        "|".join(b.name for b in blobs).encode()
-    ).hexdigest()[:32]
+    # Compute blob fingerprint to bind progress to this specific set of blobs.
+    # MUST include file content hashes, not just names. Otherwise, re-signed
+    # blobs with the same filenames (tx_0.signed..tx_9.signed) but different
+    # destinations/amounts pass the fingerprint check, and stale progress
+    # silently skips TXs that are now completely different transactions.
+    _fp_hasher = hashlib.sha256()
+    for b in blobs:
+        _fp_hasher.update(b.name.encode())
+        _fp_hasher.update(b"|")
+        with open(b, "rb") as _bf:
+            _fp_hasher.update(hashlib.sha256(_bf.read()).hexdigest().encode())
+        _fp_hasher.update(b"|")
+    blob_fp = _fp_hasher.hexdigest()[:32]
 
     # Progress state
     progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
@@ -348,14 +366,24 @@ def main():
                     # The old code sent this to the daemon RPC pool, which
                     # always returned "Method not found." Must use the
                     # --wallet-rpc endpoint instead.
+                    #
+                    # Proxy routing: wallet-rpc is typically on localhost.
+                    # Routing localhost through a SOCKS proxy fails (the
+                    # proxy connects to ITS localhost, not ours). Only use
+                    # the proxy for non-localhost wallet-rpc endpoints.
                     wallet_rpc_url = args.wallet_rpc.rstrip("/") + "/json_rpc"
+                    _wrpc_host = urlparse(args.wallet_rpc).hostname or "127.0.0.1"
+                    if _wrpc_host.lower() in _LOCALHOST_NAMES:
+                        wallet_proxy = {"http": None, "https": None}
+                    else:
+                        wallet_proxy = proxy
                     rpc_payload = {
                         "jsonrpc": "2.0",
                         "id": "0",
                         "method": "submit_transfer",
                         "params": {"tx_data_hex": raw_data.hex()},
                     }
-                    res = _single_post(wallet_rpc_url, rpc_payload, proxy)
+                    res = _single_post(wallet_rpc_url, rpc_payload, wallet_proxy)
                     rpc_result = res.get("result", {})
                     rpc_error = res.get("error", {})
                     if rpc_error:
@@ -378,6 +406,23 @@ def main():
                     txid_display = txid[:16] if txid else "no-txid"
                     print(f"  [+] TX {idx} -> mempool | {txid_display}...")
                     integrity_log("broadcast", f"sent:idx={idx}")
+
+                    # Save progress IMMEDIATELY after mempool acceptance,
+                    # BEFORE the mine-wait loop. If the operator Ctrl+C's
+                    # during mine-wait (up to 2h), we must not lose the
+                    # fact that this TX was accepted. On resume, the TX
+                    # will be skipped (correctly — re-broadcasting a TX
+                    # already in the mempool is harmless but wasteful).
+                    sent = True
+                    prog_entry = {
+                        "idx": idx, "file": blob.name, "sent": True,
+                        "txid": txid, "confirmed": False,
+                        "block_height": 0,
+                    }
+                    prog["log"].append(prog_entry)
+                    prog["last"] = idx
+                    atomic_write_json(prog, progF)
+                    success_count += 1
 
                     # BUG 48 FIX: /gettransactions is a daemon REST endpoint,
                     # NOT a JSON-RPC method. Use _single_post (no retry)
@@ -411,19 +456,14 @@ def main():
                             pass
                         time.sleep(60)
 
-                    if not confirmed:
+                    if confirmed:
+                        prog_entry["confirmed"] = True
+                        prog_entry["block_height"] = block_height
+                        atomic_write_json(prog, progF)
+                    else:
                         integrity_log("broadcast", f"unconfirmed:idx={idx}")
                         print(f"  [!] TX {idx} unconfirmed after {args.mine_wait}s")
 
-                    sent = True
-                    prog["log"].append({
-                        "idx": idx, "file": blob.name, "sent": True,
-                        "txid": txid, "confirmed": confirmed,
-                        "block_height": block_height,
-                    })
-                    prog["last"] = idx
-                    atomic_write_json(prog, progF)
-                    success_count += 1
                     break
                 else:
                     err_msg = res.get("reason", res.get("status",

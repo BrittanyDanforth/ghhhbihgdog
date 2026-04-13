@@ -90,8 +90,33 @@ def spoof_mac(iface: str, dry: bool):
                        check=True, capture_output=True)
         subprocess.run(["ip", "link", "set", iface, "up"], check=True,
                        capture_output=True)
-        print(f"  [+] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_spoof:{iface}->{new_mac}")
+
+        # Verify the MAC was actually applied. Some wireless drivers
+        # (Intel AX200/AX201, some Realtek) accept the command but
+        # silently revert to the hardware MAC.
+        verify = subprocess.run(
+            ["ip", "link", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if verify.returncode == 0:
+            import re as _re
+            mac_match = _re.search(
+                r"link/ether\s+([0-9a-f:]{17})", verify.stdout
+            )
+            if mac_match:
+                actual_mac = mac_match.group(1).lower()
+                if actual_mac != new_mac.lower():
+                    integrity_log("paranoia",
+                                  f"mac_verify_FAIL:{iface}:wanted={new_mac}:got={actual_mac}")
+                    print(f"  [!] MAC spoof FAILED verification!")
+                    print(f"      Requested: {new_mac}")
+                    print(f"      Actual:    {actual_mac}")
+                    print(f"      Your wireless driver may reject programmatic MAC changes.")
+                    print(f"      Try: macchanger -r {iface}")
+                    return
+
+        print(f"  [+] MAC {iface} -> {new_mac} (verified)")
+        integrity_log("paranoia", f"mac_spoof_verified:{iface}->{new_mac}")
     except subprocess.CalledProcessError as e:
         integrity_log("paranoia", f"mac_fail:{iface}:{e}")
         print(f"  [!] MAC spoof failed: {e}")
@@ -223,15 +248,24 @@ def wipe_swap_ram(dry: bool):
 def _secure_delete_file(path: Path):
     """Overwrite file content with nulls before unlinking.
 
-    BUG 53 FIX: The old code only overwrote the first 64KB. For large
-    files (wallet files, plans with many TXs, signed blobs), the rest
-    of the file data remained on disk, recoverable with forensic tools.
-    Now overwrites the full file size, writing in 64KB chunks to avoid
-    memory issues with very large files.
+    BUG 53 FIX: The old code only overwrote the first 64KB. Now overwrites
+    the full file size in 64KB chunks.
+
+    Limitations acknowledged and warned about:
+    - Hardlinks: if nlink > 1, data persists via other links. We warn.
+    - CoW filesystems (btrfs/ZFS): overwrite allocates new blocks; old
+      data remains until GC. We warn and suggest shred.
+    - Journaling (ext4): journal may contain original data for recent
+      writes. fsync + overwrite helps but doesn't guarantee journal purge.
     """
     try:
-        size = path.stat().st_size
-        with open(path, "wb") as f:
+        stat = path.stat()
+        size = stat.st_size
+        if stat.st_nlink > 1:
+            print(f"  [!] WARNING: {path} has {stat.st_nlink} hardlinks — "
+                  f"data persists via other links after deletion")
+            integrity_log("paranoia", f"hardlink_warn:{path.name}:nlinks={stat.st_nlink}")
+        with open(path, "r+b") as f:
             remaining = size
             chunk_size = 65536
             while remaining > 0:
@@ -241,8 +275,9 @@ def _secure_delete_file(path: Path):
             f.flush()
             os.fsync(f.fileno())
         path.unlink()
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as e:
+        integrity_log("paranoia", f"secure_delete_fail:{path.name}:{e}")
+        print(f"  [!] Secure delete failed for {path}: {e}")
 
 
 def _secure_delete_dir(path: Path):
@@ -292,36 +327,35 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         if not root.is_dir():
             continue
 
+        # Use recursive glob (**/) to find artifacts at any depth.
+        # The old code only searched one level deep, missing artifacts
+        # in nested directories (e.g. ~/projects/ghostspiral/run3/unsigned/).
+        # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
+        depth_patterns = [
+            "",          # root itself
+            "*/",        # 1 level
+            "*/*/",      # 2 levels
+            "*/*/*/",    # 3 levels
+        ]
+
         for pattern in file_patterns:
-            for f in root.glob(pattern):
-                if dry:
-                    print(f"  [dry] would securely delete {f}")
-                else:
-                    _secure_delete_file(f)
-                count += 1
-            # Also search one level of subdirectories
-            for f in root.glob(f"*/{pattern}"):
-                if dry:
-                    print(f"  [dry] would securely delete {f}")
-                else:
-                    _secure_delete_file(f)
-                count += 1
+            for depth in depth_patterns:
+                for f in root.glob(f"{depth}{pattern}"):
+                    if dry:
+                        print(f"  [dry] would securely delete {f}")
+                    else:
+                        _secure_delete_file(f)
+                    count += 1
 
         for dirname in dir_patterns:
-            for d in root.glob(dirname):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
-                    count += 1
-            for d in root.glob(f"*/{dirname}"):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
-                    count += 1
+            for depth in depth_patterns:
+                for d in root.glob(f"{depth}{dirname}"):
+                    if d.is_dir():
+                        if dry:
+                            print(f"  [dry] would securely delete dir {d}")
+                        else:
+                            _secure_delete_dir(d)
+                        count += 1
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
     integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
@@ -491,11 +525,19 @@ def main():
 
     print("  [*] Phase 12: Environment variables")
     scrub_env_vars(args.dry_run)
+    print("  [!] NOTE: env var scrubbing only affects THIS process. Your parent")
+    print("  [!] shell still has the original variables. Close the terminal or run:")
+    print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
+    print("  [!]   history -c && history -w  # clear shell history of unset commands")
 
     # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
     print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
+    print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
+    print("  [!] encryption instead. On ext4 with journaling, recently-written file")
+    print("  [!] data may persist in the journal even after secure deletion.")
     wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
 
     # DO NOT call integrity_log() here — it would recreate the wiped log file
