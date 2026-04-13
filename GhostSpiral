@@ -686,11 +686,17 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
     print(f"  [*] Stage 5: Processing {total_txs} TXs iteratively (create→sign→broadcast each)")
     print(f"  [*] This is the ONLY safe approach — Monero does not support batch unsigned TXs.")
 
-    # Compute plan fingerprint so resume rejects stale progress from a different plan
+    # Compute plan fingerprint so resume rejects stale progress from a different plan.
+    # BUG 74 FIX: Include ALL plan fields (src, dst, amt, delay, extra) in the
+    # fingerprint. The old hash only covered (dst, amt), so changing delays, src
+    # addresses, or extra nonces produced the same fingerprint. Stale progress
+    # from a prior run would be loaded, skipping TXs that should be re-executed
+    # with different timing decorrelation or routing.
     import hashlib as _hl
     _h = _hl.sha256()
     for _tx in plan_txs:
-        _h.update(f"{_tx.get('dst','')}:{_tx.get('amt','')}".encode())
+        _h.update(f"{_tx.get('src','')}:{_tx.get('dst','')}:{_tx.get('amt','')}:"
+                  f"{_tx.get('delay','')}:{_tx.get('extra','')}".encode())
     plan_fingerprint = _h.hexdigest()[:32]
 
     # Progress tracking for resume
@@ -708,6 +714,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                 progress_file.unlink()
             else:
                 completed_indices = set(progress.get("completed", []))
+                # BUG 73 FIX: Detect broadcast_pending — a TX that was
+                # broadcast but progress wasn't finalized (crash/kill
+                # between broadcast and completed save). Treat as
+                # completed to prevent double-payment on resume.
+                pending_idx = progress.get("broadcast_pending")
+                if pending_idx is not None and pending_idx not in completed_indices:
+                    print(f"  [!] TX {pending_idx} was broadcast but not confirmed "
+                          f"as complete (crash during broadcast?).")
+                    print(f"  [!] Treating TX {pending_idx} as completed to prevent "
+                          f"double-payment. Verify wallet state manually.")
+                    integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
+                    completed_indices.add(pending_idx)
                 if completed_indices:
                     print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
         except Exception:
@@ -805,6 +823,23 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             fail_count += 1
             break
 
+        # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
+        # If the process is killed between broadcast and progress save,
+        # the TX is on-chain but progress doesn't reflect it. On resume,
+        # the code would re-create a NEW TX (different nonces) spending
+        # the same inputs. If the original confirmed between crash and
+        # resume, the wallet picks different inputs → double-payment.
+        # By persisting broadcast_pending first, the resume path can
+        # detect this and verify wallet state before re-creating.
+        from gs_common import atomic_write_json as _awj
+        broadcast_pending = set(completed_indices)
+        broadcast_pending.add(tx_idx)
+        _awj({
+            "plan_fingerprint": plan_fingerprint,
+            "completed": sorted(completed_indices),
+            "broadcast_pending": tx_idx,
+        }, progress_file)
+
         # Step 3: Broadcast via wallet-rpc's submit_transfer
         # (NOT via monerod — submit_transfer is a wallet-rpc method)
         print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
@@ -849,8 +884,6 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         success_count += 1
         completed_indices.add(tx_idx)
 
-        # Save progress atomically with plan fingerprint to detect stale resumes
-        from gs_common import atomic_write_json as _awj
         _awj({
             "plan_fingerprint": plan_fingerprint,
             "completed": sorted(completed_indices),

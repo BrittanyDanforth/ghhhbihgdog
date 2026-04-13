@@ -74,9 +74,14 @@ def _load_unsigned(path: Path) -> tuple:
 
 
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    # BUG 74 FIX: Hash ALL plan fields, not just (dst, amt). Without src,
+    # delay, and extra, plans with different timing or routing produce
+    # identical fingerprints, allowing stale progress/manifest to be
+    # accepted for a materially different plan.
     h = hashlib.sha256()
     for tx in plan:
-        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
+        h.update(f"{tx.get('src','')}:{tx.get('dst','')}:{tx.get('amt','')}:"
+                 f"{tx.get('delay','')}:{tx.get('extra','')}".encode())
     return h.hexdigest()[:32]
 
 
@@ -158,22 +163,58 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
             result = rpc.raw_request("transfer_split", create_params)
 
-            # For view-only wallets, transfer_split returns unsigned_txset
-            # (hex-encoded, NOT base64 as previously documented)
+            # BUG 72 FIX: transfer_split returns DIFFERENT fields depending
+            # on wallet type:
+            #   - View-only wallet → unsigned_txset (hex-encoded binary blob)
+            #   - Hot wallet (has spend key) → tx_metadata_list (list of hex
+            #     strings) — the wallet already signed internally.
+            # The original code only checked unsigned_txset, so hot wallets
+            # always got "no unsigned_txset" and failed on every TX.
+            # We handle both: unsigned_txset for air-gap flow (needs sign
+            # phase), tx_metadata_list for auto-mode (already signed,
+            # sign phase can be skipped — write as .signed instead).
             unsigned_txset = result.get("unsigned_txset", "")
-            if not unsigned_txset:
-                integrity_log("signer", f"no_unsigned_txset:idx={idx}")
-                print(f"  [!] TX {idx}: RPC returned no unsigned_txset")
-                print(f"  [!] This usually means: the wallet is not view-only,")
-                print(f"  [!] or there are insufficient unlocked funds.")
+            tx_metadata_list = result.get("tx_metadata_list", [])
+            is_presigned = False
+
+            if unsigned_txset:
+                blob_hex = unsigned_txset
+            elif tx_metadata_list:
+                is_presigned = True
+                blob_hex = tx_metadata_list[0] if len(tx_metadata_list) == 1 \
+                    else "".join(tx_metadata_list)
+                integrity_log("signer", f"hot_wallet_presigned:idx={idx}")
+            else:
+                integrity_log("signer", f"no_txset:idx={idx}")
+                print(f"  [!] TX {idx}: RPC returned neither unsigned_txset "
+                      f"nor tx_metadata_list")
+                print(f"  [!] Likely cause: insufficient unlocked funds.")
                 failed += 1
                 continue
 
-            tx_file = outdir / f"tx_{idx}.unsigned"
-            tx_file.write_text(unsigned_txset)
-            secure_file_perms(tx_file)
+            # BUG 71 FIX: wallet-rpc returns blobs as hex-encoded binary.
+            # monero-wallet-cli sign_transfer expects native binary.
+            try:
+                blob_bytes = bytes.fromhex(blob_hex)
+            except ValueError:
+                integrity_log("signer", f"bad_hex:idx={idx}")
+                print(f"  [!] TX {idx}: txset blob is not valid hex")
+                failed += 1
+                continue
 
-            sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
+            if is_presigned:
+                signed_dir = outdir / "signed"
+                signed_dir.mkdir(parents=True, exist_ok=True)
+                tx_file = signed_dir / f"tx_{idx}.signed"
+                tx_file.write_bytes(blob_bytes)
+                secure_file_perms(tx_file)
+                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed)")
+            else:
+                tx_file = outdir / f"tx_{idx}.unsigned"
+                tx_file.write_bytes(blob_bytes)
+                secure_file_perms(tx_file)
+
+            sha = hashlib.sha256(blob_bytes).hexdigest()
             manifest.append({
                 "idx": idx,
                 "file": tx_file.name,
@@ -181,6 +222,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "dst": scrub_address(dst),
                 "amt": tx["amt"],
                 "delay": tx.get("delay", 0),
+                "presigned": is_presigned,
             })
             created += 1
             print(f"  [+] TX {idx} -> {tx_file.name}")
@@ -283,6 +325,13 @@ def phase_sign(args, plan: List[dict]):
             break
 
         idx = entry["idx"]
+
+        # BUG 72 FIX: Hot wallet TXs are already signed in phase_create.
+        # Skip signing for entries marked presigned.
+        if entry.get("presigned"):
+            print(f"  [skip] TX {idx}: already signed (hot wallet)")
+            signed_count += 1
+            continue
         unsigned_file = Path(entry["file"])
         # BUG 46 FIX: If the manifest path doesn't exist (cross-machine
         # air-gap workflow), try resolving by filename in the outdir.
@@ -294,8 +343,8 @@ def phase_sign(args, plan: List[dict]):
                 print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
                 continue
 
-        # Verify hash
-        actual_hash = hashlib.sha256(unsigned_file.read_text().encode()).hexdigest()
+        # Verify hash (BUG 71 FIX: file is now binary, not hex text)
+        actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
         if actual_hash != entry["hash"]:
             print(f"  [!] TX {idx}: hash mismatch - file may be corrupted!")
             continue
@@ -310,7 +359,7 @@ def phase_sign(args, plan: List[dict]):
         work_dir = tempfile.mkdtemp(prefix="gs_sign_")
         try:
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
-            unsigned_in.write_text(unsigned_file.read_text())
+            unsigned_in.write_bytes(unsigned_file.read_bytes())
 
             # Write password to a temp file so it's not visible in /proc/PID/cmdline.
             # monero-wallet-cli --password-file reads from file instead of CLI arg.

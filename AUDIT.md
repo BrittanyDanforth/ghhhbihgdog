@@ -1966,6 +1966,119 @@ this file is referenced in instructions that may be shared.
 | BUG 69 | Secure delete on CoW filesystems | MEDIUM | YES |
 | BUG 70 | rpc_endpoint leaked in wallet JSON | MEDIUM | YES |
 
+## Section 19: Deep Adversarial Audit Round 14 — Cold-Signing & Race Conditions
+
+### BUG 71 (FIXED): unsigned_txset written as hex text but wallet-cli expects binary
+
+**File:** airgap_tx_signer `phase_create()` (line 173) and `phase_sign()` (lines 298, 313)
+**What was wrong:** `transfer_split` with `do_not_relay=True` returns `unsigned_txset`
+as a hex-encoded string (standard JSON-RPC encoding for binary blobs). The code wrote
+this hex text directly to the `.unsigned` file via `write_text()`. In `phase_sign`, this
+hex text was copied verbatim to `unsigned_monero_tx`. But `monero-wallet-cli sign_transfer`
+reads `unsigned_monero_tx` as **raw binary** (Monero's native serialization format). The
+wallet-cli fails to parse the hex text — every signing attempt fails with a deserialization
+error.
+
+Additionally, the hash verification in `phase_sign` used `.read_text().encode()` which
+hashes the hex text, not the binary content — but since `phase_create` also hashed the
+hex text, the hashes matched despite both being wrong. After the fix, both sides
+consistently hash the decoded binary bytes.
+
+**Impact:** CRITICAL — air-gap signing is completely non-functional. Every TX fails
+at the sign step. Auto-mode Stage 5 aborts at step 2 of every TX.
+**Fix:** Decode hex to bytes before writing: `bytes.fromhex(unsigned_txset)`. Read/write
+as bytes throughout. Hash the binary content consistently.
+
+### BUG 72 (FIXED): Hot wallet returns tx_metadata_list, not unsigned_txset
+
+**File:** airgap_tx_signer `phase_create()` (line 163)
+**What was wrong:** `transfer_split` with `do_not_relay=True` returns **different fields**
+depending on wallet type:
+- **View-only wallet** → `unsigned_txset` (hex blob needing offline signing)
+- **Hot wallet** (has spend key) → `tx_metadata_list` (list of hex strings, already signed)
+
+The code ONLY checked for `unsigned_txset`. When using a hot wallet (the default
+`--wallet-file offline.wallet` in auto-mode), `unsigned_txset` is empty because the
+wallet already signed internally. The code printed "no unsigned_txset" and failed on
+every TX. In GhostSpiral auto-mode Stage 5, this means the entire pipeline fails at
+step 1 (create) of every TX.
+
+**Impact:** CRITICAL — auto-mode Stage 5 is completely broken when wallet-rpc has a
+hot wallet loaded (the common case). Only the air-gap view-only wallet flow worked.
+**Fix:** Check for both `unsigned_txset` and `tx_metadata_list`. For hot wallets,
+write the pre-signed blob directly to `signed/tx_N.signed` and mark the manifest
+entry as `presigned: true`. The sign phase skips presigned entries.
+
+### BUG 73 (FIXED): Progress saved AFTER broadcast — crash race causes double-payment
+
+**File:** GhostSpiral `_stage5_run()` (lines 841-857)
+**What was wrong:** The execution order was:
+1. Broadcast TX via `submit_transfer` (line 815)
+2. `time.sleep(5)` (line 841)
+3. `rpc.refresh()` (line 843)
+4. Save progress with TX marked completed (line 854)
+
+If the process is killed (SIGKILL, OOM, power loss) between steps 1 and 4 (an 8+ second
+window), the TX is broadcast on-chain but progress shows it as not completed. On resume:
+- `completed_indices` does not contain the TX index
+- The code re-creates the TX via `transfer_split` — but the wallet's inputs are now spent
+- If the original TX confirmed, the wallet selects DIFFERENT inputs for the re-created TX
+- This creates a legitimate ADDITIONAL payment — **real money is sent twice**
+- If the original TX is still in mempool, the new TX (different nonces) may be rejected
+  as a double-spend, or may replace it depending on fee priority
+
+**Impact:** CRITICAL (MONEY LOST) — race condition on crash/kill causes double-payment.
+The 8+ second window (sleep + refresh + progress write) is large enough to be hit
+regularly by OOM killer, system shutdown, or aggressive Ctrl+C.
+**Fix:** Save `broadcast_pending: tx_idx` to progress file BEFORE broadcasting. On
+resume, if `broadcast_pending` is set but the TX is not in `completed`, treat it as
+completed to prevent re-creation. Log a warning so the operator can verify wallet state.
+
+### BUG 74 (FIXED): plan_fingerprint excludes delay, src, and extra — stale progress accepted
+
+**File:** GhostSpiral `_stage5_run()` (line 693), airgap_tx_signer `_compute_plan_fingerprint()` (line 79)
+**What was wrong:** The plan fingerprint was `SHA-256(dst:amt)` for each TX. It excluded:
+- `delay` — timing decorrelation values
+- `src` — source subaddress (mixing graph topology)
+- `extra` — random nonce for TX uniqueness
+
+If an operator regenerates the plan changing ONLY the delays (e.g., to improve timing
+decorrelation), the fingerprint is identical. Stale progress from the prior run is loaded
+and TXs are skipped. But the skipped TXs should have been re-executed with different
+timing. The net effect is that the operator's timing changes are silently ignored.
+
+Similarly, changing the `src` field (different mixing graph) or `extra` nonce produces
+the same fingerprint. The manifest fingerprint check in `airgap_tx_signer` has the same
+flaw — a manifest from a prior plan with different topology is accepted.
+
+**Impact:** HIGH — timing decorrelation changes are silently ignored on resume. Mixing
+graph topology changes are silently ignored. Both undermine the privacy guarantees.
+**Fix:** Include all five TX fields (src, dst, amt, delay, extra) in the fingerprint
+hash in both GhostSpiral and airgap_tx_signer.
+
+### Scenario Analysis Results (Adversarial Scenarios 1-8)
+
+| Scenario | Question | Finding |
+|----------|----------|---------|
+| 1. Stale fingerprint on delay change | Is delay excluded from fingerprint? | **YES — BUG 74.** Fixed. |
+| 2. Same wallet file for create+sign | Can one file be both view-only and hot? | **No — but moot.** Auto-mode uses ONE wallet-rpc with ONE loaded wallet. The create phase talks to wallet-rpc (which has the loaded wallet). The sign phase runs wallet-cli against the wallet file. If wallet-rpc has a hot wallet loaded, the create phase returns tx_metadata_list (already signed) — **BUG 72** made this fail silently. Fixed. |
+| 3. Fresh RPC connection after broadcast | Does reconnect lose wallet state? | **No bug.** `connect_rpc` creates a new JSON-RPC HTTP session, but wallet-rpc is a long-running daemon process. Its wallet state (loaded wallet, spent outputs) is server-side, not session-bound. The `refresh` call on the new connection works correctly — it tells the server to re-scan. |
+| 4. Hot wallet returns tx_metadata_list | Does code handle non-view-only wallet? | **YES — BUG 72.** Fixed. |
+| 5. Ctrl+C between broadcast and progress | Can TX be double-spent on resume? | **YES — BUG 73.** Fixed with broadcast_pending pre-save. |
+| 6. Fan-out TX input handling | Does wallet handle chained unconfirmed TXs? | **No new bug.** The iterative pipeline (BUG 58 fix) broadcasts each TX and calls `refresh` before creating the next. The wallet sees the broadcast TX's outputs (including change) after refresh. Unconfirmed-but-broadcast outputs are usable as inputs for subsequent TXs in Monero. |
+| 7. Subaddress accumulation | Do subaddresses grow unboundedly? | **Design issue, not a bug.** `create_subs` creates 14 new subaddresses per run. Old subaddresses from prior runs persist in the wallet file. This leaks the number of prior runs (forensic metadata) but does not cause functional failure. The wallet file should be single-use per the OPSEC design. Documented in Remaining Known Issues. |
+| 8. `secrets` import inconsistency | Is there a real inconsistency? | **No bug.** GhostSpiral imports `secrets` for `secrets.randbelow()` and `secrets.SystemRandom().shuffle()` — direct stdlib usage. It also imports `secure_hex` from `gs_common`, which wraps `secrets.token_hex()`. Both use the same CSPRNG backend (`os.urandom`). No inconsistency. |
+
+### Complete Bug Status Table (Round 14 Final)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 1-70 | (See previous sections) | Various | YES |
+| BUG 71 | unsigned_txset hex text written as-is; wallet-cli expects binary | CRITICAL | YES |
+| BUG 72 | Hot wallet returns tx_metadata_list not unsigned_txset | CRITICAL | YES |
+| BUG 73 | Progress saved after broadcast — crash race causes double-payment | CRITICAL | YES |
+| BUG 74 | plan_fingerprint excludes delay/src/extra fields | HIGH | YES |
+
 ### Remaining Known Issues:
 | Item | Status | Notes |
 |------|--------|-------|
@@ -1976,3 +2089,4 @@ this file is referenced in instructions that may be shared.
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
 | SwapKit API key management | PARTIAL | --api-key and env var supported; no hardcoded key |
 | CoW/journaling filesystem forensics | WARNED | paranoia_mode warns but cannot guarantee erase on btrfs/ZFS |
+| Subaddress accumulation across runs | DESIGN | create_subs appends 14 new subaddresses per run; old ones persist. Leaks run count as forensic metadata. Mitigated by single-use wallet per OPSEC design. |
