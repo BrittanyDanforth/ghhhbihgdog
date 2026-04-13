@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--outfile", default="thor_pairs_batch.json")
     ap.add_argument("--api-key",
                     help="SwapKit API key (or set SWAPKIT_API_KEY env var)")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite existing output file (DANGER: old deposit "
+                         "addresses are invalidated when new ones are generated)")
     args = ap.parse_args()
 
     # Resolve API key
@@ -152,7 +155,8 @@ def main():
             quote_headers["x-api-key"] = api_key
 
         try:
-            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", quote_payload, proxy)
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
+                                   headers=quote_headers)
         except Exception as e:
             if proxy:
                 newnym()
@@ -185,7 +189,8 @@ def main():
                 "destinationAddress": dest,
             }
             try:
-                swap_resp = safe_post(f"{SWAPKIT_API}/v3/swap", swap_payload, proxy)
+                swap_resp = safe_post(f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
+                                     headers=quote_headers)
                 tx_info = swap_resp.get("tx", swap_resp.get("transaction", {}))
                 deposit = (tx_info.get("depositAddress", "") or
                           tx_info.get("targetAddress", "") or
@@ -236,7 +241,18 @@ def main():
     if not pairs:
         sys.exit("[!] No pairs generated")
 
+    # BUG 76 FIX: /v3/swap creates a binding commitment on ThorChain.
+    # Re-running generates different deposit addresses. If the sender
+    # already sent BTC to the old addresses, overwriting the file loses
+    # those addresses and the BTC may be unrecoverable.
     _out = Path(args.outfile)
+    if _out.exists() and not args.force:
+        sys.exit(
+            f"[!] Output file {_out} already exists!\n"
+            f"    Re-running creates NEW deposit addresses — old ones may expire.\n"
+            f"    If a sender already sent BTC to the old addresses, DO NOT overwrite.\n"
+            f"    Use --force to overwrite, or --outfile <different_name>."
+        )
     atomic_write_json(pairs, _out)
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
     print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")

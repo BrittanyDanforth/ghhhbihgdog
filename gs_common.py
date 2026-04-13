@@ -111,6 +111,20 @@ def secure_file_perms(path: Path, mode: int = 0o600) -> None:
         pass
 
 
+def _json_safe_default(o):
+    """JSON serializer that handles Decimal but rejects dangerous types.
+
+    BUG 75 FIX: The old `default=str` silently converted Path objects to
+    strings like 'PosixPath(/home/user/...)' leaking filesystem paths.
+    This only allows Decimal (common in Monero amounts) and rejects
+    everything else loudly.
+    """
+    if isinstance(o, Decimal):
+        return str(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable "
+                    f"(and would leak data if converted via str())")
+
+
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
 
@@ -121,7 +135,7 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+        json.dump(obj, f, indent=2, default=_json_safe_default)
         f.flush()
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
@@ -243,7 +257,14 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                 c = Controller.from_socket_file(ctrl)
             else:
                 c = Controller.from_port(port=9051)
-            c.authenticate()
+            # BUG 73 FIX: Support password auth for Tor control port.
+            # stem.authenticate() tries NONE, SAFECOOKIE, COOKIE by default.
+            # If torrc uses HashedControlPassword, we need the password.
+            tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
+            if tor_pw:
+                c.authenticate(password=tor_pw)
+            else:
+                c.authenticate()
             c.signal(StemSignal.NEWNYM)
         finally:
             if c is not None:
@@ -280,23 +301,34 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     return _safe_get_inner(url, proxies)
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
+def _newnym_between_retries(retry_state):
+    """Called by tenacity before each retry sleep to rotate Tor circuit.
+    BUG 74 FIX: Without this, all retries hit the same blocked exit node."""
+    newnym()
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
+       before_sleep=_newnym_between_retries)
 def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r = requests.get(url, timeout=20, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
 
-def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
+def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
+              headers: Dict[str, str] = None) -> dict:
     """POST with retry. Aborts if proxies is None (clearnet leak prevention)."""
     if proxies is None:
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
-    return _safe_post_inner(url, payload, proxies)
+    return _safe_post_inner(url, payload, proxies, headers or {})
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
-def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str]) -> dict:
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies)
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
+       before_sleep=_newnym_between_retries)
+def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
+                     headers: Dict[str, str] = None) -> dict:
+    r = requests.post(url, json=payload, timeout=25, proxies=proxies,
+                      headers=headers or {})
     r.raise_for_status()
     return r.json()
 
@@ -363,8 +395,11 @@ class MoneroRPC:
         try:
             self._backend = JSONRPCWallet(**backend_kwargs)
         except TypeError:
-            # Older monero-python may not support proxy_url kwarg
-            self._backend = JSONRPCWallet(host=host, port=port)
+            # BUG 79 FIX: Only strip proxy_url from kwargs on TypeError,
+            # not auth credentials or protocol.
+            fallback_kwargs = {k: v for k, v in backend_kwargs.items()
+                               if k != "proxy_url"}
+            self._backend = JSONRPCWallet(**fallback_kwargs)
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
             proxy_dict = {"http": proxy_url, "https": proxy_url}

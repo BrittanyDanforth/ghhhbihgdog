@@ -2079,14 +2079,90 @@ hash in both GhostSpiral and airgap_tx_signer.
 | BUG 73 | Progress saved after broadcast — crash race causes double-payment | CRITICAL | YES |
 | BUG 74 | plan_fingerprint excludes delay/src/extra fields | HIGH | YES |
 
+## Section 19: Deep Adversarial Audit Round 14
+
+### BUG 71 (ALREADY FIXED): unsigned_txset hex text vs binary mismatch
+
+The signer already handles hex→binary conversion and both wallet types.
+
+### BUG 72 (FIXED): --suppress-kyc falsified factual KYC field
+
+**File:** exit_strategy_simulator
+**What was wrong:** BUG 54's "fix" made --suppress-kyc set kyc_required=false in
+the JSON output. But azteco GENUINELY requires KYC — suppressing the warning
+doesn't remove the real-world requirement. The JSON falsely claimed "no KYC needed."
+**Fix:** --suppress-kyc now only suppresses the terminal warning. The JSON field
+always reflects the factual cfg["kyc"] value.
+
+### BUG 73 (FIXED): NEWNYM auth fails on password-protected Tor control port
+
+**File:** gs_common.py newnym()
+**What was wrong:** stem's authenticate() without a password only tries NONE,
+SAFECOOKIE, and COOKIE auth. On systems with HashedControlPassword in torrc
+(common on hardened setups), NEWNYM fails every time. After 3 failures with
+required=True, the process aborts.
+**Fix:** Read TOR_CONTROL_PASSWORD env var and pass to authenticate(password=...).
+
+### BUG 74 (FIXED): No NEWNYM between retries — all 4 attempts hit same blocked circuit
+
+**File:** gs_common.py safe_get/safe_post
+**What was wrong:** When a Tor exit node is blocked by the destination (CoinGecko,
+SwapKit), tenacity retried 4 times on the same circuit. All 4 fail identically.
+**Fix:** Added tenacity before_sleep callback that calls newnym() between retries.
+
+### BUG 75 (FIXED): atomic_write_json default=str silently leaks filesystem paths
+
+**File:** gs_common.py
+**What was wrong:** json.dump(default=str) silently converted Path objects to
+"PosixPath('/home/kali/...')" strings, leaking filesystem paths into JSON files.
+**Fix:** Custom serializer that only handles Decimal, raises TypeError for all else.
+
+### BUG 76 (FIXED): Re-running thor_swap_preparer overwrites deposit addresses
+
+**File:** thor_swap_preparer
+**What was wrong:** /v3/swap creates a binding commitment. Re-running generates
+different deposit addresses. If the sender already sent BTC to the old addresses
+and the operator re-runs and overwrites the file, the old addresses are lost.
+**Fix:** Refuse to overwrite existing output without --force flag.
+
+### BUG 77 (FIXED): SwapKit API key collected but never sent in HTTP headers
+
+**File:** thor_swap_preparer + gs_common.py
+**What was wrong:** quote_headers dict was created with the API key but never
+passed to safe_post(). safe_post didn't even accept a headers parameter.
+All SwapKit API calls sent without x-api-key, returning 401.
+**Fix:** Added headers parameter to safe_post/safe_post_inner. Pass quote_headers.
+
+### BUG 79 (FIXED): TypeError fallback in MoneroRPC drops auth credentials
+
+**File:** gs_common.py MoneroRPC.__init__()
+**What was wrong:** The TypeError catch (for older monero-python without proxy_url)
+fell back to JSONRPCWallet(host=host, port=port), dropping protocol, user, and
+password. If RPC requires HTTPS + digest auth, the fallback silently creates an
+unauthenticated HTTP connection.
+**Fix:** Only strip proxy_url from kwargs in the fallback, not auth credentials.
+
+### Complete Bug Status Table (Final — Round 14)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 1-70 | (See previous sections) | Various | YES |
+| BUG 71 | unsigned_txset hex vs binary | CRITICAL | YES (already) |
+| BUG 72 | suppress-kyc falsifies factual KYC status | MEDIUM | YES |
+| BUG 73 | NEWNYM auth fails with HashedControlPassword | HIGH | YES |
+| BUG 74 | No NEWNYM between retries (same blocked circuit) | HIGH | YES |
+| BUG 75 | default=str leaks filesystem paths into JSON | HIGH | YES |
+| BUG 76 | Re-running thor_swap overwrites deposit addresses | HIGH | YES |
+| BUG 77 | SwapKit API key never sent in headers | HIGH | YES |
+| BUG 79 | TypeError fallback drops auth credentials | MEDIUM | YES |
+
 ### Remaining Known Issues:
 | Item | Status | Notes |
 |------|--------|-------|
 | JoinMarket UTXO parsing | STUB | Returns empty; needs JM output format spec |
-| Subaddress mixing privacy | DESIGN | Self-sends in same account waste fees with no privacy gain |
-| subaddr_indices for src enforcement | TODO | Requires subaddress string → index resolution |
-| Key image sync for view-only wallets | PARTIAL | Auto-mode uses hot wallet with refresh; air-gap needs manual |
+| Subaddress mixing privacy | DESIGN | Self-sends in same account provide no extra privacy |
+| subaddr_indices for src enforcement | TODO | Requires subaddress → index resolution via get_address |
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
-| SwapKit API key management | PARTIAL | --api-key and env var supported; no hardcoded key |
-| CoW/journaling filesystem forensics | WARNED | paranoia_mode warns but cannot guarantee erase on btrfs/ZFS |
+| CoW/journaling forensics | WARNED | paranoia_mode warns but can't guarantee erase |
+| Broadcaster resume of unconfirmed TXs | DOCUMENTED | Sent-but-unconfirmed TXs skipped on resume |
 | Subaddress accumulation across runs | DESIGN | create_subs appends 14 new subaddresses per run; old ones persist. Leaks run count as forensic metadata. Mitigated by single-use wallet per OPSEC design. |
