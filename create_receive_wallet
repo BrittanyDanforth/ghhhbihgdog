@@ -66,14 +66,16 @@ def main():
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
+    # BUG 70 FIX: Don't include rpc_endpoint in the output JSON.
+    # This file may be shared with the sender in the receiver workflow.
+    # The RPC endpoint leaks infrastructure info (hostname, port, custom setup).
     out = {
         "schema": "gs_receive_wallet_v1",
-        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "created": int(time.time()) // 600 * 600,
         "address": addr_str,
         "account_index": 0,
         "subaddress_index": sub_idx,
         "label": args.label,
-        "rpc_endpoint": args.rpc,
     }
 
     outdir = Path(args.output_dir)

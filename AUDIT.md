@@ -1852,12 +1852,127 @@ a false sense of security.
 | BUG 58 | Batch create produces double-spend TXs (no output reservation) | FATAL | YES |
 | BUG 59 | submit_transfer sent to monerod instead of wallet-rpc | CRITICAL | YES |
 
+## Section 18: Deep Adversarial Audit Round 13 — Real-World API Verification
+
+### BUG 60 (FIXED): MoneroRPC proxy STILL broken — session.proxies overridden by raw_request
+
+**File:** gs_common.py `MoneroRPC.__init__()`
+**What was wrong:** The BUG 56 fix patched `session.proxies`, but monero-python's
+`raw_request()` calls `session.post(..., proxies=self.proxies)`. The `proxies=`
+kwarg to `session.post()` OVERRIDES `session.proxies`. Since `self.proxies` was
+never patched (only `session.proxies` was), every RPC call used `self.proxies`
+which was `{"http": None}` — clearnet.
+**Impact:** CRITICAL (OPSEC) — every non-localhost RPC call still leaked IP.
+**Fix:** Pass `proxy_url` to `JSONRPCWallet()` constructor natively AND patch
+`self._backend.proxies` dict directly. Also extract auth creds from URL.
+
+### BUG 61 (FIXED): Integrity log newline injection allows hash chain forgery
+
+**File:** gs_common.py `integrity_log()`
+**What was wrong:** If `stage` or `msg` contained `\n`, the log entry spanned
+multiple lines. Subsequent `splitlines()` treated injected lines as separate
+entries. An attacker controlling error messages (e.g., crafted TX labels) could
+inject fake log lines with valid-looking hashes.
+**Fix:** Sanitize `\n` and `\r` from inputs. Truncate to max lengths.
+
+### BUG 62 (FIXED): No file locking on integrity log — concurrent corruption
+
+**File:** gs_common.py `integrity_log()`
+**What was wrong:** Two concurrent processes (e.g., GhostSpiral + broadcaster)
+both read the same prev-hash, compute different hashes, and append. The chain
+forks — verification fails on the second entry.
+**Fix:** `fcntl.flock(LOCK_EX)` around the read-prev + write-new critical section.
+
+### BUG 63 (FIXED): Uppercase SOCKS5:// bypasses DNS-leak warning
+
+**File:** gs_common.py `validate_proxy()`
+**What was wrong:** `proxy_url.startswith("socks5://")` is case-sensitive. An
+operator passing `SOCKS5://127.0.0.1:9050` bypassed both the DNS leak warning
+AND the regex validation. Port validation also accepted 0 and 65536+.
+**Fix:** Case-insensitive comparison. Port range validated (1-65535).
+
+### BUG 64 (FIXED): Bisq price oracle inversion produces ~3.6 billion× wrong fiat values
+
+**File:** exit_strategy_simulator `fetch_prices()`
+**What was wrong:** Bisq pricenode returns fiat prices as "BTC price in fiat"
+(e.g., `60000` = $60k per BTC). The code inverted this: `1.0 / 60000 = 0.0000166`.
+Then `xmr_usd = 0.00413 * 0.0000166 = 6.88e-8` — meaning 1 XMR = $0.00000007.
+The real value is $247.80 (off by factor of ~3.6 billion).
+**Impact:** CRITICAL — exit plan with catastrophically wrong fiat values.
+Any operator making decisions based on this data could lose money.
+**Fix:** Don't invert — use the Bisq price directly as btc_usd.
+
+### BUG 65 (FIXED): XMR address regex rejects valid integrated addresses
+
+**File:** thor_swap_preparer
+**What was wrong:** `{93}$` forced exactly 95 chars. Monero integrated addresses
+are 106 chars and were rejected before the checksum validation could accept them.
+**Fix:** Changed to `{93,104}$` to accept 95-106 char addresses.
+
+### BUG 66 (FIXED): BTC address regex rejects P2SH/P2PKH ThorChain vault addresses
+
+**File:** thor_swap_preparer
+**What was wrong:** Only bech32 (`bc1...`) accepted. ThorChain vaults can use
+legacy (`1...`) or P2SH (`3...`) addresses. Valid deposit addresses were rejected.
+**Fix:** Accept all BTC address formats.
+
+### BUG 67 (FIXED): SwapKit API two-step flow completely wrong
+
+**File:** thor_swap_preparer
+**What was wrong:** The code tried to extract `depositAddress` from `/v3/quote`
+response. SwapKit uses a two-step flow: `/v3/quote` returns routes with
+`routeId` + pricing, then `/v3/swap` takes the `routeId` and returns the actual
+`depositAddress` + `memo`. The quote response has NO `transaction` or
+`depositAddress` field. Every invocation hit the "no deposit address" abort.
+**Impact:** CRITICAL — thor_swap_preparer was completely non-functional.
+**Fix:** Implement two-step flow: quote → extract routeId → swap → extract deposit.
+Added `--api-key` and `SWAPKIT_API_KEY` env var support.
+
+### BUG 68 (ALREADY FIXED): submit_transfer routed through Tor to localhost
+
+**File:** broadcast_signed_xmr
+**What was wrong:** When wallet-rpc is on localhost (127.0.0.1:18083),
+`_single_post(url, payload, proxy)` sent the request through the Tor SOCKS proxy.
+SOCKS5h resolves "127.0.0.1" at the Tor exit node, not locally.
+**Fix:** Already applied — detect localhost wallet-rpc and bypass proxy.
+
+### BUG 69 (ALREADY FIXED): Secure delete uses truncating open on CoW filesystems
+
+**File:** paranoia_mode `_secure_delete_file()`
+**Fix:** Already applied — uses `r+b` in-place overwrite + hardlink warnings.
+
+### BUG 70 (FIXED): create_receive_wallet leaks rpc_endpoint in output JSON
+
+**File:** create_receive_wallet
+**What was wrong:** The output JSON included `rpc_endpoint` which leaks the
+Monero RPC hostname/port to anyone who sees the file. In receiver workflow,
+this file is referenced in instructions that may be shared.
+**Fix:** Removed `rpc_endpoint` from JSON output.
+
+### Complete Bug Status Table (Round 13 Final)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 1-59 | (See previous sections) | Various | YES |
+| BUG 60 | MoneroRPC proxy patched wrong attribute (session vs self.proxies) | CRITICAL | YES |
+| BUG 61 | Integrity log newline injection | HIGH | YES |
+| BUG 62 | No file locking on concurrent integrity log writes | HIGH | YES |
+| BUG 63 | Uppercase SOCKS5:// bypasses DNS-leak warning | MEDIUM | YES |
+| BUG 64 | Bisq price inversion (~3.6 billion× wrong) | CRITICAL | YES |
+| BUG 65 | XMR regex rejects integrated addresses | MEDIUM | YES |
+| BUG 66 | BTC regex rejects P2SH/legacy ThorChain vault addresses | HIGH | YES |
+| BUG 67 | SwapKit two-step API flow completely wrong | CRITICAL | YES |
+| BUG 68 | submit_transfer routed through Tor to localhost | HIGH | YES |
+| BUG 69 | Secure delete on CoW filesystems | MEDIUM | YES |
+| BUG 70 | rpc_endpoint leaked in wallet JSON | MEDIUM | YES |
+
 ### Remaining Known Issues:
 | Item | Status | Notes |
 |------|--------|-------|
 | JoinMarket UTXO parsing | STUB | Returns empty; needs JM output format spec |
 | Subaddress mixing privacy | DESIGN | Self-sends in same account waste fees with no privacy gain |
 | subaddr_indices for src enforcement | TODO | Requires subaddress string → index resolution |
-| Key image sync for view-only wallets | PARTIAL | Auto-mode uses hot wallet; air-gap needs manual sync |
+| Key image sync for view-only wallets | PARTIAL | Auto-mode uses hot wallet with refresh; air-gap needs manual |
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
-| CoinGecko rate limiting via Tor | KNOWN | Bisq fallback added; may still fail |
+| SwapKit API key management | PARTIAL | --api-key and env var supported; no hardcoded key |
+| CoW/journaling filesystem forensics | WARNED | paranoia_mode warns but cannot guarantee erase on btrfs/ZFS |

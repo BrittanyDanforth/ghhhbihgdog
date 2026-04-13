@@ -52,6 +52,9 @@ def fetch_prices(proxy):
         integrity_log("exit", f"coingecko_fail:{str(e)[:40]}")
 
     # Fallback: Bisq price oracle (returns all market prices)
+    # The Bisq pricenode returns "price" as:
+    #   - For fiat (USD, EUR): BTC price in that fiat (e.g., 60000 = $60k per BTC)
+    #   - For altcoins (XMR): altcoin price in BTC (e.g., 0.00413 BTC per XMR)
     try:
         j = safe_get(BISQ_PRICE_URL, proxy)
         prices = {}
@@ -61,9 +64,12 @@ def fetch_prices(proxy):
             if code == "XMR" and price > 0:
                 prices["xmr_btc"] = Decimal(str(price))
             elif code == "USD" and price > 0:
-                prices["btc_usd"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                # BUG 64 FIX: The old code inverted the price (1/60000 = 0.00001666),
+                # producing XMR/USD values off by a factor of ~3.6 billion.
+                # Bisq pricenode returns BTC price IN USD directly (e.g., 60000).
+                prices["btc_usd"] = Decimal(str(price))
             elif code == "EUR" and price > 0:
-                prices["btc_eur"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                prices["btc_eur"] = Decimal(str(price))
 
         if "xmr_btc" in prices and "btc_usd" in prices:
             xmr_usd = prices["xmr_btc"] * prices["btc_usd"]

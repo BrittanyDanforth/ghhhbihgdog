@@ -49,6 +49,9 @@ def secure_hex(n_bytes: int) -> str:
 
 def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
     """Sleep a CSPRNG-uniform duration to decorrelate timing."""
+    if hi <= lo:
+        time.sleep(max(lo, 0))
+        return
     delay = lo + (secrets.randbelow(int((hi - lo) * 1000)) / 1000.0)
     time.sleep(delay)
 
@@ -61,31 +64,38 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
 
     Timestamp is coarsened to 600-second (10-min) buckets to reduce the
     correlation window between the log and blockchain/network timestamps.
-    An attacker with the log can only narrow the operation to a 10-min window
-    instead of the exact second.
-
-    BUG 32 FIX: The previous hash extraction was brittle — if the log file
-    ended with a blank line or a corrupted line, the split would fail or
-    extract the wrong value, breaking the hash chain silently. Now falls
-    back to the genesis hash on any parse error.
     """
-    prev = "0" * 64
-    if log_path.exists():
-        try:
-            text = log_path.read_text()
-            lines = [l for l in text.splitlines() if l.strip()]
-            if lines:
-                parts = lines[-1].split(" | ", 1)
-                candidate = parts[0].strip()
-                if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
-                    prev = candidate
-        except (OSError, UnicodeDecodeError):
-            pass
-    ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
-    line = f"{ts}|{VERSION}|{stage}|{msg}"
-    h = hashlib.sha256((prev + line).encode()).hexdigest()
+    import fcntl
+    # BUG 61 FIX: Sanitize inputs — newlines in stage/msg would break the
+    # hash chain and allow log injection attacks.
+    stage = stage.replace("\n", " ").replace("\r", " ")[:64]
+    msg = msg.replace("\n", " ").replace("\r", " ")[:200]
+
+    # BUG 62 FIX: File locking — concurrent processes writing to the same
+    # log would read the same prev-hash and create a forked chain.
     with log_path.open("a") as f:
-        f.write(f"{h} | {line}\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            prev = "0" * 64
+            if log_path.exists():
+                try:
+                    text = log_path.read_text()
+                    lines = [l for l in text.splitlines() if l.strip()]
+                    if lines:
+                        parts = lines[-1].split(" | ", 1)
+                        candidate = parts[0].strip()
+                        if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                            prev = candidate
+                except (OSError, UnicodeDecodeError):
+                    pass
+            ts = int(time.time()) // 600 * 600
+            line = f"{ts}|{VERSION}|{stage}|{msg}"
+            h = hashlib.sha256((prev + line).encode()).hexdigest()
+            f.write(f"{h} | {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     secure_file_perms(log_path)
     return h
 
@@ -111,7 +121,7 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
+        json.dump(obj, f, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
@@ -152,17 +162,27 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
     ONLY socks5h:// is accepted. Plain socks5:// resolves DNS locally,
     leaking every destination hostname to the ISP's DNS resolver.
     """
-    if proxy_url.startswith("socks5://") and not proxy_url.startswith("socks5h://"):
+    # BUG 63 FIX: Case-insensitive check to prevent SOCKS5:// bypass
+    proxy_lower = proxy_url.lower()
+    if proxy_lower.startswith("socks5://") and not proxy_lower.startswith("socks5h://"):
         sys.exit(
             f"[!] CRITICAL: socks5:// leaks DNS locally!\n"
             f"    Use socks5h:// so DNS resolves through the proxy.\n"
             f"    Change: {proxy_url} -> {proxy_url.replace('socks5://', 'socks5h://')}"
         )
-    if not SOCKS_RE.match(proxy_url):
+    if not SOCKS_RE.match(proxy_lower):
         sys.exit(
             f"[!] Invalid proxy format: {proxy_url}\n"
             f"    Expected: socks5h://host:port  (NOT socks5://)"
         )
+    # Extract and validate port range
+    port_str = proxy_lower.rsplit(":", 1)[-1]
+    try:
+        port = int(port_str)
+        if port < 1 or port > 65535:
+            sys.exit(f"[!] Invalid proxy port: {port}. Must be 1-65535.")
+    except ValueError:
+        sys.exit(f"[!] Invalid proxy port: {port_str}")
     return {"http": proxy_url, "https": proxy_url}
 
 # ---------------------------------------------------------------------------
@@ -301,8 +321,13 @@ class MoneroRPC:
         from monero.wallet import Wallet as XMRWallet
         from monero.backends.jsonrpc import JSONRPCWallet
         parsed = urlparse(url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 18083
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            sys.exit(
+                f"[!] Invalid RPC URL: {url}\n"
+                f"    Expected format: http://host:port (e.g., http://127.0.0.1:18083)"
+            )
 
         if host.lower() not in _LOCALHOST_NAMES:
             if not proxy_url:
@@ -315,19 +340,42 @@ class MoneroRPC:
                 )
             integrity_log("rpc", f"WARN:non_local_rpc:{host}:{port}:proxy_patched")
 
-        self._backend = JSONRPCWallet(host=host, port=port)
+        # BUG 60 FIX: Pass proxy_url directly to JSONRPCWallet constructor
+        # (monero-python natively supports it). ALSO patch self.proxies
+        # because raw_request() passes proxies=self.proxies to session.post(),
+        # which overrides session.proxies. The old BUG 56 fix only patched
+        # session.proxies but raw_request bypasses it.
+        # Also extract auth credentials from URL if present.
+        protocol = parsed.scheme or "http"
+        user = parsed.username or ""
+        password = parsed.password or ""
 
-        # BUG 56 FIX: The old code checked for `self._backend._session`
-        # (with underscore) but monero-python's JSONRPCWallet uses
-        # `self._backend.session` (no underscore prefix). The hasattr()
-        # returned False, so proxy was never patched, and non-localhost
-        # RPC connections silently went clearnet — leaking operator IP.
+        backend_kwargs = {
+            "host": host, "port": port, "protocol": protocol,
+        }
+        if user:
+            backend_kwargs["user"] = user
+        if password:
+            backend_kwargs["password"] = password
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
-            proxies = {"http": proxy_url, "https": proxy_url}
-            if hasattr(self._backend, 'session'):
-                self._backend.session.proxies.update(proxies)
-            elif hasattr(self._backend, '_session'):
-                self._backend._session.proxies.update(proxies)
+            backend_kwargs["proxy_url"] = proxy_url
+
+        try:
+            self._backend = JSONRPCWallet(**backend_kwargs)
+        except TypeError:
+            # Older monero-python may not support proxy_url kwarg
+            self._backend = JSONRPCWallet(host=host, port=port)
+
+        if proxy_url and host.lower() not in _LOCALHOST_NAMES:
+            proxy_dict = {"http": proxy_url, "https": proxy_url}
+            # Patch self.proxies (used by raw_request's session.post call)
+            if hasattr(self._backend, 'proxies'):
+                self._backend.proxies = proxy_dict
+            # Also patch session.proxies as belt-and-suspenders
+            for attr in ('session', '_session'):
+                if hasattr(self._backend, attr):
+                    getattr(self._backend, attr).proxies.update(proxy_dict)
+                    break
 
         self._wallet = XMRWallet(self._backend)
 
@@ -383,7 +431,10 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
 
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
     """Return True if resources are OK. False if system is stressed."""
-    import psutil
+    try:
+        import psutil
+    except ImportError:
+        return True  # Can't check — assume OK rather than crashing mid-operation
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage(".")
     return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
