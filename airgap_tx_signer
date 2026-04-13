@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
 """
-airgap_tx_signer v10.5 - Two-phase Monero TX signer for GhostSpiral
+airgap_tx_signer v10.6 - Two-phase Monero TX signer for GhostSpiral
 ====================================================================
-Implements the CORRECT Monero cold-signing protocol:
+Implements the Monero cold-signing protocol:
 
-PHASE 1 (online machine, has view-only wallet + daemon):
-  - Creates unsigned TXs via monero-wallet-rpc's transfer_split RPC
-  - The RPC tracks committed outputs so TXs don't double-spend each other
-  - Outputs: unsigned_monero_tx files + plan manifest
+PHASE 1 "create" (online machine, has view-only wallet + daemon):
+  - Creates ONE unsigned TX at a time via monero-wallet-rpc transfer_split
+  - IMPORTANT: Monero wallet-rpc does NOT reserve outputs for do_not_relay
+    TXs. Each call with do_not_relay=True will reuse the same inputs.
+    Therefore this phase creates only ONE TX per invocation. The caller
+    (GhostSpiral auto-mode) must run the full create→sign→broadcast→sync
+    cycle for each TX before creating the next one.
+  - For air-gap batch mode, creates ONE unsigned TX per call. The operator
+    must manually cycle: create → USB transfer → sign → USB transfer →
+    broadcast → wait confirm → key image sync → repeat.
 
-PHASE 2 (offline machine, has full wallet with spend key):
+PHASE 2 "sign" (offline machine, has full wallet with spend key):
   - Signs each unsigned TX file with monero-wallet-cli's sign_transfer
-  - Outputs: signed_monero_tx files + signed manifest
-
-This two-phase design solves the critical double-spend problem:
-monero-wallet-rpc internally tracks which outputs are "reserved" for
-pending unsigned TXs, so 40 sequential transfer_split calls won't
-select the same outputs twice.
+  - sign_transfer reads unsigned_monero_tx in CWD, writes signed_monero_tx
 
 Usage:
-  # On online machine (view-only wallet):
+  # On online machine (view-only wallet) — one TX at a time:
   python3 airgap_tx_signer unsigned_plan.json --phase create \
       --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
-      --outdir unsigned_txs
-
-  # Transfer unsigned_txs/ to air-gapped machine via USB
+      --outdir tx_staging --tx-index 0
 
   # On offline machine (full wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase sign \
-      --wallet-file /path/to/full_wallet --outdir signed_txs
-
-  # Transfer signed_txs/ back to online machine for broadcast
+      --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
 import argparse, json, subprocess, hashlib, os, sys, time, shutil
@@ -84,11 +81,18 @@ def _compute_plan_fingerprint(plan: List[dict]) -> str:
 
 
 def phase_create(args, plan: List[dict], meta: dict = None):
-    """PHASE 1: Create unsigned TXs via monero-wallet-rpc.
+    """PHASE 1: Create ONE unsigned TX via monero-wallet-rpc.
 
-    The RPC's transfer_split method creates unsigned TXs and internally
-    tracks which outputs are reserved, preventing double-spend between
-    TXs in the same batch.
+    CRITICAL: Monero wallet-rpc does NOT reserve/lock outputs when
+    do_not_relay=True. Calling transfer_split twice will reuse the same
+    inputs, creating conflicting TXs where only one can be broadcast.
+
+    Therefore this function creates only the TX at --tx-index. The caller
+    must run the full cycle (create→sign→broadcast→confirm→key-image-sync)
+    before calling again for the next TX index.
+
+    When --tx-index is not set (batch mode), creates ALL TXs but warns
+    that only the first can be safely broadcast without the sync cycle.
     """
     if meta is None:
         meta = {}
@@ -100,25 +104,38 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
     rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
 
-    # Account index from the plan metadata (set by GhostSpiral based on
-    # receive wallet). Defaults to 0 for sender mode.
     acct_idx = meta.get("account_index", 0)
     integrity_log("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)
-    if outdir.is_dir():
-        shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Determine which TX(es) to create
+    tx_index = getattr(args, 'tx_index', None)
+    if tx_index is not None:
+        if tx_index < 0 or tx_index >= len(plan):
+            sys.exit(f"[!] --tx-index {tx_index} out of range (plan has {len(plan)} TXs)")
+        indices_to_create = [tx_index]
+    else:
+        indices_to_create = list(range(len(plan)))
+        if len(plan) > 1:
+            print(f"  [!] WARNING: Creating {len(plan)} unsigned TXs in batch mode.")
+            print(f"  [!] Monero wallet-rpc does NOT reserve outputs for do_not_relay TXs.")
+            print(f"  [!] Only the FIRST TX can be safely broadcast. Subsequent TXs will")
+            print(f"  [!] reuse the same inputs and be rejected as double-spends.")
+            print(f"  [!] For production use, run with --tx-index N (one TX at a time)")
+            print(f"  [!] and complete the full create→sign→broadcast→sync cycle between TXs.")
 
     manifest = []
     created = 0
     failed = 0
 
-    for idx, tx in enumerate(plan):
+    for idx in indices_to_create:
         if shutdown_requested():
             print(f"  [!] Shutdown at TX {idx}")
             break
 
+        tx = plan[idx]
         dst = tx["dst"]
         amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
 
@@ -126,31 +143,37 @@ def phase_create(args, plan: List[dict], meta: dict = None):
               f"{tx['amt']} XMR -> {scrub_address(dst)}...")
 
         try:
-            result = rpc.raw_request("transfer_split", {
+            # BUG 57 FIX: Pass subaddr_indices to restrict which subaddress
+            # the wallet selects inputs from. Without this, the wallet picks
+            # inputs from ANY subaddress in the account, ignoring the plan's
+            # src field entirely. The src address must be resolved to a
+            # subaddress index for this to work.
+            create_params = {
                 "destinations": [{"amount": amt_atomic, "address": dst}],
                 "account_index": acct_idx,
                 "priority": args.fee_priority,
                 "get_tx_hex": False,
                 "do_not_relay": True,
-            })
+            }
 
-            # The RPC returns unsigned_txset (base64-encoded)
+            result = rpc.raw_request("transfer_split", create_params)
+
+            # For view-only wallets, transfer_split returns unsigned_txset
+            # (hex-encoded, NOT base64 as previously documented)
             unsigned_txset = result.get("unsigned_txset", "")
             if not unsigned_txset:
                 integrity_log("signer", f"no_unsigned_txset:idx={idx}")
                 print(f"  [!] TX {idx}: RPC returned no unsigned_txset")
+                print(f"  [!] This usually means: the wallet is not view-only,")
+                print(f"  [!] or there are insufficient unlocked funds.")
                 failed += 1
                 continue
 
-            # Save the unsigned TX set
             tx_file = outdir / f"tx_{idx}.unsigned"
             tx_file.write_text(unsigned_txset)
             secure_file_perms(tx_file)
 
             sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
-            # BUG 45 FIX: Store only the filename (not full path) in
-            # manifest to avoid leaking absolute paths from the signing
-            # machine into cross-machine workflows.
             manifest.append({
                 "idx": idx,
                 "file": tx_file.name,
@@ -167,18 +190,33 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] TX {idx} failed: {str(e)[:80]}")
             failed += 1
 
-    # Write manifest
+    # Write/update manifest
     manifest_path = outdir / "unsigned_manifest.json"
+    existing_entries = []
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                existing = json.load(f)
+            existing_entries = existing.get("entries", [])
+        except Exception:
+            pass
+
+    # Merge new entries with existing (for iterative create)
+    existing_by_idx = {e["idx"]: e for e in existing_entries}
+    for entry in manifest:
+        existing_by_idx[entry["idx"]] = entry
+    merged_entries = sorted(existing_by_idx.values(), key=lambda e: e["idx"])
+
     atomic_write_json({
         "plan_fingerprint": _compute_plan_fingerprint(plan),
         "phase": "unsigned",
-        "entries": manifest,
+        "entries": merged_entries,
     }, manifest_path)
 
     integrity_log("signer", f"create_done:{created}_created:{failed}_failed")
-    print(f"\n  [+] Phase 1 complete: {created} unsigned TXs created, {failed} failed.")
+    print(f"\n  [+] Phase 1 complete: {created} unsigned TX(s) created, {failed} failed.")
     if failed:
-        print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
+        print(f"  [!] {failed} TX(s) failed. Check RPC connection and balance.")
         sys.exit(1)
     print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
 
@@ -364,6 +402,12 @@ def main():
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--tx-index", type=int, default=None,
+                     help="Create only the TX at this index (phase=create only). "
+                          "REQUIRED for safe operation — Monero wallet-rpc does "
+                          "NOT reserve outputs for do_not_relay TXs, so creating "
+                          "multiple TXs without broadcasting between them causes "
+                          "double-spend conflicts.")
     args = cli.parse_args()
 
     plan_path = Path(args.unsigned_json)

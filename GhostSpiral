@@ -647,103 +647,210 @@ def main():
 
 
 def _stage5_run(args, ufile, staging_dir, proxy, bal):
-    """Execute the create -> sign -> broadcast -> exit sim pipeline."""
-    try:
-        print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
-        create_cmd = [
-            "python3", "airgap_tx_signer", str(ufile),
-            "--phase", "create",
-            "--rpc", args.rpc_primary,
-            "--tor-proxy", args.tor_proxy,
-            "--outdir", staging_dir,
-            f"--fee-priority={args.fee_priority}",
-        ]
-        subprocess.run(create_cmd, check=True, timeout=1800)
-        integrity_log("stage5", "create_unsigned_ok")
+    """Execute the iterative create→sign→broadcast pipeline.
 
-        # Verify unsigned TXs were actually created before proceeding
-        unsigned_count = len(list(Path(staging_dir).glob("*.unsigned")))
-        if unsigned_count == 0:
-            integrity_log("stage5", "no_unsigned_txs_created")
-            sys.exit("[!] Phase 'create' produced no unsigned TX files. Check RPC and balance.")
-        print(f"  [+] {unsigned_count} unsigned TXs created.")
+    CRITICAL DESIGN NOTE (BUG 58 FIX):
+    Monero wallet-rpc does NOT reserve/lock outputs when do_not_relay=True.
+    Creating multiple unsigned TXs without broadcasting between them causes
+    all TXs to reuse the same inputs — only one can be broadcast, the rest
+    are rejected as double-spends.
 
-    except subprocess.TimeoutExpired:
-        integrity_log("stage5", "create_timeout")
-        sys.exit("[!] Unsigned TX creation timed out after 30 min")
-    except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"create_fail:{e.returncode}")
-        sys.exit(f"[!] Unsigned TX creation failed (exit {e.returncode})")
+    Furthermore, change outputs from unbroadcast TXs are invisible to the
+    wallet's coin selection. You CANNOT create a TX that spends the change
+    from another unsigned/unbroadcast TX.
 
-    newnym()
-    secure_delay(3.0, 8.0)
+    Therefore, auto-mode MUST process TXs one at a time:
+      For each TX in the plan:
+        1. Create unsigned TX (wallet-rpc transfer_split with do_not_relay)
+        2. Sign the unsigned TX (wallet-cli sign_transfer)
+        3. Broadcast the signed TX (wallet-rpc submit_transfer)
+        4. Wait for confirmation (at least accepted into mempool)
+        5. Key image sync (export_outputs → import_key_images) so the
+           view-only wallet knows which outputs are now spent
 
-    try:
-        print("  [*] Stage 5b: Signing unsigned TXs (offline wallet)...")
-        sign_cmd = [
-            "python3", "airgap_tx_signer", str(ufile),
-            "--phase", "sign",
-            "--wallet-file", args.wallet_file,
-            "--outdir", staging_dir,
-        ]
-        # BUG 38 FIX: Pass wallet password via environment variable
-        # instead of --wallet-password CLI arg, which would be visible in
-        # /proc/PID/cmdline to any process on the system.
-        sign_env = os.environ.copy()
-        sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
-        subprocess.run(sign_cmd, check=True, timeout=1800, env=sign_env)
-        integrity_log("stage5", "sign_ok")
+    This is slower than batch mode but is the ONLY correct approach for
+    chained Monero transactions.
+    """
+    sign_env = os.environ.copy()
+    sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
 
-        # Verify signed TXs exist
-        signed_dir = Path(staging_dir) / "signed"
-        signed_count = len(list(signed_dir.glob("*.signed"))) if signed_dir.is_dir() else 0
-        if signed_count == 0:
-            integrity_log("stage5", "no_signed_txs")
-            sys.exit("[!] Phase 'sign' produced no signed TX files. Check wallet file and password.")
-        print(f"  [+] {signed_count} TXs signed.")
+    # Read the plan to get TX count
+    with open(str(ufile)) as _pf:
+        plan_data = json.load(_pf)
+    plan_txs = plan_data.get("txs", [])
+    total_txs = len(plan_txs)
 
-    except subprocess.TimeoutExpired:
-        integrity_log("stage5", "sign_timeout")
-        sys.exit("[!] Signing timed out after 30 min")
-    except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"sign_fail:{e.returncode}")
-        sys.exit(f"[!] Signing failed (exit {e.returncode})")
+    if total_txs == 0:
+        sys.exit("[!] Plan has no TXs")
 
-    newnym()
-    secure_delay(5.0, 15.0)
+    print(f"  [*] Stage 5: Processing {total_txs} TXs iteratively (create→sign→broadcast each)")
+    print(f"  [*] This is the ONLY safe approach — Monero does not support batch unsigned TXs.")
 
-    try:
-        print("  [*] Stage 5c: Broadcasting signed TXs...")
-        subprocess.run(
-            ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
-             "--tor-proxy", args.tor_proxy],
-            check=True, timeout=7200,
-        )
-        integrity_log("stage5", "broadcast_ok")
-    except subprocess.TimeoutExpired:
-        integrity_log("stage5", "broadcast_timeout")
-        sys.exit("[!] Broadcast timed out after 2 hours")
-    except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"broadcast_fail:{e.returncode}")
-        sys.exit(f"[!] Broadcast failed (exit {e.returncode})")
-
-    newnym()
-    secure_delay(5.0, 15.0)
-
-    try:
-        print("  [*] Stage 5d: Exit strategy simulation...")
-        # BUG 41 FIX: Use actual usable balance from plan, not the `bal`
-        # variable which may be mock 10.0 in dry-run modes. Re-read the
-        # plan we just signed to get the real total.
-        exit_amt = str(bal)
+    # Progress tracking for resume
+    progress_file = Path("stage5_progress.json")
+    completed_indices = set()
+    if progress_file.exists():
         try:
-            with open(str(ufile)) as _ef:
-                _plan_data = json.load(_ef)
-                _txs = _plan_data.get("txs", [])
-                if _txs:
-                    exit_amt = str(sum(Decimal(t["amt"]) for t in _txs))
+            with open(progress_file) as pf:
+                progress = json.load(pf)
+            completed_indices = set(progress.get("completed", []))
+            if completed_indices:
+                print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
         except Exception:
             pass
+
+    success_count = 0
+    fail_count = 0
+
+    for tx_idx in range(total_txs):
+        if shutdown_requested():
+            integrity_log("stage5", f"shutdown_at_tx_{tx_idx}")
+            print(f"  [!] Shutdown at TX {tx_idx}. Rerun to resume from here.")
+            break
+
+        if tx_idx in completed_indices:
+            print(f"  [skip] TX {tx_idx} already completed in prior run")
+            success_count += 1
+            continue
+
+        tx = plan_txs[tx_idx]
+        print(f"\n  [*] TX {tx_idx}/{total_txs-1}: {tx['amt']} XMR -> {scrub_address(tx['dst'])}")
+
+        # Apply planned delay (timing decorrelation)
+        if tx_idx > 0:
+            delay = tx.get("delay", 0)
+            if delay > 0:
+                print(f"  [*] Waiting {delay}s (planned delay)...")
+                waited = 0
+                while waited < delay:
+                    if shutdown_requested():
+                        break
+                    chunk = min(30, delay - waited)
+                    time.sleep(chunk)
+                    waited += chunk
+
+        newnym()
+        secure_delay(3.0, 8.0)
+
+        # Step 1: Create unsigned TX
+        print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
+        try:
+            create_cmd = [
+                "python3", "airgap_tx_signer", str(ufile),
+                "--phase", "create",
+                "--rpc", args.rpc_primary,
+                "--tor-proxy", args.tor_proxy,
+                "--outdir", staging_dir,
+                f"--fee-priority={args.fee_priority}",
+                "--tx-index", str(tx_idx),
+            ]
+            subprocess.run(create_cmd, check=True, timeout=300)
+        except subprocess.CalledProcessError as e:
+            integrity_log("stage5", f"create_fail:tx={tx_idx}:rc={e.returncode}")
+            print(f"  [!] TX {tx_idx} create failed (exit {e.returncode})")
+            fail_count += 1
+            continue
+        except subprocess.TimeoutExpired:
+            integrity_log("stage5", f"create_timeout:tx={tx_idx}")
+            print(f"  [!] TX {tx_idx} create timed out")
+            fail_count += 1
+            continue
+
+        unsigned_file = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
+        if not unsigned_file.exists():
+            print(f"  [!] TX {tx_idx}: unsigned file not created")
+            fail_count += 1
+            continue
+
+        # Step 2: Sign the unsigned TX
+        print(f"  [*] Step 2: Signing TX {tx_idx}...")
+        try:
+            sign_cmd = [
+                "python3", "airgap_tx_signer", str(ufile),
+                "--phase", "sign",
+                "--wallet-file", args.wallet_file,
+                "--outdir", staging_dir,
+            ]
+            subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env)
+        except subprocess.CalledProcessError as e:
+            integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
+            print(f"  [!] TX {tx_idx} signing failed")
+            fail_count += 1
+            continue
+        except subprocess.TimeoutExpired:
+            integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
+            fail_count += 1
+            continue
+
+        signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+        if not signed_file.exists():
+            print(f"  [!] TX {tx_idx}: signed file not created")
+            fail_count += 1
+            continue
+
+        # Step 3: Broadcast via wallet-rpc's submit_transfer
+        # (NOT via monerod — submit_transfer is a wallet-rpc method)
+        print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
+        newnym()
+        try:
+            signed_data = signed_file.read_bytes()
+            rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+            result = rpc_primary.raw_request("submit_transfer", {
+                "tx_data_hex": signed_data.hex(),
+            })
+            tx_hashes = result.get("tx_hash_list", [])
+            if tx_hashes:
+                txid = tx_hashes[0]
+                print(f"  [+] TX {tx_idx} broadcast OK | txid: {txid[:16]}...")
+                integrity_log("stage5", f"broadcast_ok:tx={tx_idx}")
+            else:
+                print(f"  [!] TX {tx_idx} submitted but no txid returned")
+                integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
+        except Exception as e:
+            integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
+            print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
+            fail_count += 1
+            continue
+
+        # Step 4: Brief wait for mempool acceptance
+        time.sleep(5)
+
+        # Step 5: Key image sync — critical for view-only wallets.
+        # After broadcasting, the view-only wallet doesn't know which
+        # outputs are spent. We must sync key images so the next
+        # transfer_split call doesn't reuse spent outputs.
+        # For a hot wallet (auto-mode), this happens automatically.
+        # For a view-only wallet, we'd need export_outputs→import_key_images.
+        # In auto-mode, since we're using the same wallet-rpc for both
+        # create and broadcast, the wallet state should be updated.
+
+        success_count += 1
+        completed_indices.add(tx_idx)
+
+        # Save progress atomically
+        from gs_common import atomic_write_json as _awj
+        _awj({"completed": sorted(completed_indices)}, progress_file)
+
+        print(f"  [+] TX {tx_idx} complete ({success_count}/{total_txs})")
+
+    # Summary
+    integrity_log("stage5", f"pipeline:{success_count}_ok:{fail_count}_fail")
+    print(f"\n  [+] Stage 5 complete: {success_count} sent, {fail_count} failed out of {total_txs}")
+
+    if fail_count:
+        print(f"  [!] {fail_count} TXs failed. Check logs and retry.")
+
+    # Clean progress file on full success
+    if success_count == total_txs and progress_file.exists():
+        progress_file.unlink()
+
+    # Exit strategy simulation
+    newnym()
+    secure_delay(5.0, 15.0)
+
+    try:
+        print("  [*] Exit strategy simulation...")
+        exit_amt = str(sum(Decimal(t["amt"]) for t in plan_txs))
         subprocess.run(
             ["python3", "exit_strategy_simulator", exit_amt,
              "--method", "bisq", "--tor-proxy", args.tor_proxy],

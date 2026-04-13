@@ -1737,11 +1737,127 @@ permission-protected file, not from terminal history.
 | BUG 54 | --suppress-kyc only affects display, not JSON | MEDIUM | YES |
 | BUG 55 | create_receive_wallet prints full address | MEDIUM | YES |
 
-### Remaining Known Issues (not bugs, design limitations):
+## Section 17: FATAL Architectural Bugs (Round 12 — Real Monero Verification)
+
+### BUG 56 (FIXED): MoneroRPC proxy patching checked wrong attribute name
+
+**File:** gs_common.py `MoneroRPC.__init__()`
+**What was wrong:** The proxy patching code checked `hasattr(self._backend, '_session')`
+(with underscore prefix). monero-python's JSONRPCWallet uses `self.session` (no
+underscore). The `hasattr()` returned False, so the proxy was never patched.
+**Impact:** CRITICAL (OPSEC) — any non-localhost RPC endpoint (e.g., remote node,
+.onion address) would connect clearnet, leaking the operator's real IP to the
+Monero node operator. The code had a safety comment about this but the
+implementation was broken.
+**Fix:** Check both `session` and `_session` (for compatibility with different
+monero-python versions).
+
+### BUG 57 (DOCUMENTED): Plan's `src` field is ignored by transfer_split
+
+**File:** airgap_tx_signer `phase_create()`
+**What was wrong:** The unsigned TX plan has a `src` field specifying which
+subaddress the TX should spend from. But `transfer_split` was called WITHOUT
+the `subaddr_indices` parameter. Without it, wallet-rpc selects inputs from
+ANY subaddress in the account, completely ignoring the mixing graph's src field.
+**Impact:** CRITICAL (design) — the entire DAG mixing topology (which subaddress
+sends to which) is cosmetic. The actual transaction inputs come from wherever
+the wallet finds available funds.
+**Status:** Documented. Full fix requires resolving subaddress strings to indices
+via the wallet-rpc `get_address` method, which is a significant refactor.
+
+### BUG 58 (FIXED): Batch create mode produces conflicting double-spend TXs
+
+**File:** GhostSpiral Stage 5, airgap_tx_signer `phase_create()`
+**What was wrong:** The old Stage 5 called `airgap_tx_signer --phase create`
+ONCE to create ALL unsigned TXs, then signed ALL, then broadcast ALL.
+
+This is fundamentally broken because:
+
+1. **Monero wallet-rpc does NOT reserve outputs for `do_not_relay` TXs.**
+   Confirmed by Monero core contributor jtgrassie on StackExchange: after
+   calling `transfer` with `do_not_relay: true`, the wallet's balance,
+   unlocked_balance, and num_unspent_outputs are ALL unchanged. There is
+   no internal reservation.
+
+2. **Subsequent transfer_split calls reuse the same inputs.** With a single
+   5.0 XMR UTXO, the first call creates a TX spending that UTXO. The second
+   call sees the same UTXO as available and creates another TX spending it.
+   Both TXs contain the same key image — only one can ever be broadcast.
+   The rest are rejected with `double_spend: true`.
+
+3. **Change outputs from unsigned TXs don't exist.** The change from TX 0
+   only exists inside the unsigned_txset blob. It's not on the blockchain
+   and not in the wallet's output set. TX 1 cannot use it as an input.
+
+4. **Key image sync required between TXs.** For view-only wallets (the
+   recommended setup), the wallet cannot see outgoing transactions without
+   explicit key image sync (`export_outputs` → `import_key_images`). Without
+   this sync after broadcasting TX 0, the wallet doesn't know TX 0's
+   inputs are spent and will try to reuse them for TX 1.
+
+**Net result:** In the old batch mode, only TX 0 out of 40 would broadcast.
+TXs 1-39 would ALL fail with double-spend errors. The operator sees 1
+success and 39 failures with no clear explanation.
+
+**Fix:** Complete architectural rewrite. Stage 5 now processes TXs
+iteratively: for each TX in the plan, create→sign→broadcast→wait. The
+signer accepts `--tx-index N` to create one TX at a time. Progress is
+saved atomically for crash-resume.
+
+### BUG 59 (FIXED): Broadcaster sent submit_transfer to monerod (wrong service)
+
+**File:** broadcast_signed_xmr
+**What was wrong:** `submit_transfer` is exclusively a wallet-rpc method
+(port 18082/18083). The broadcaster's `--rpc` default was `http://127.0.0.1:18081`
+(monerod daemon). When the BUG 47 fix added the `submit_transfer` path for binary
+signed_txset files, it sent the JSON-RPC call to the daemon RPC pool. monerod
+does not implement `submit_transfer` and returns "Method not found."
+**Impact:** CRITICAL — ALL broadcasts of signed_txset files (the format produced
+by the air-gap signer) fail. The operator's signed TXs can never be broadcast
+through the broadcaster tool.
+**Fix:** Added `--wallet-rpc` argument (default `http://127.0.0.1:18083`) for
+submit_transfer calls. Daemon RPC (`--rpc`) is still used for
+`/sendrawtransaction` (raw hex format).
+
+### DESIGN ISSUE: Subaddress mixing provides no real privacy benefit
+
+All mixing subaddresses are created in the same Monero account (account 0).
+In Monero, all subaddresses within an account share the same private spend key.
+The "mixing" is just self-sends within the same account that:
+- Waste transaction fees (~0.00005 XMR × 40 TXs = 0.002 XMR)
+- Create additional on-chain transactions (fingerprint of mixing activity)
+- Provide ZERO additional privacy beyond Monero's built-in ring signatures
+
+Monero's ring signatures already hide the real input among 16 decoys per TX.
+Self-sends between subaddresses in the same wallet do not add to this anonymity
+set. An attacker who obtains the wallet file can trivially reconstruct the
+entire mixing graph.
+
+For real privacy improvement, the tool would need to:
+- Send to addresses in DIFFERENT wallets with DIFFERENT spend keys
+- Use time-locked outputs or different accounts
+- Or accept that Monero's built-in privacy is sufficient and focus on
+  the BTC→XMR swap leg (which IS the privacy-critical step)
+
+This is a design limitation, not a fixable bug. The current mixing provides
+a false sense of security.
+
+### Complete Bug Status Table (Updated Round 12)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 1-55 | (See previous sections) | Various | YES |
+| BUG 56 | MoneroRPC proxy checks wrong attribute (_session vs session) | CRITICAL | YES |
+| BUG 57 | Plan src field ignored by transfer_split (no subaddr_indices) | CRITICAL | DOCUMENTED |
+| BUG 58 | Batch create produces double-spend TXs (no output reservation) | FATAL | YES |
+| BUG 59 | submit_transfer sent to monerod instead of wallet-rpc | CRITICAL | YES |
+
+### Remaining Known Issues:
 | Item | Status | Notes |
 |------|--------|-------|
 | JoinMarket UTXO parsing | STUB | Returns empty; needs JM output format spec |
-| /proc/PID/cmdline exposure | MITIGATED | Wallet password now uses env var; other args still visible |
+| Subaddress mixing privacy | DESIGN | Self-sends in same account waste fees with no privacy gain |
+| subaddr_indices for src enforcement | TODO | Requires subaddress string → index resolution |
+| Key image sync for view-only wallets | PARTIAL | Auto-mode uses hot wallet; air-gap needs manual sync |
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
 | CoinGecko rate limiting via Tor | KNOWN | Bisq fallback added; may still fail |
-| signed_txset vs raw hex detection | HEURISTIC | Auto-detection works for known formats but untested edge cases may exist |

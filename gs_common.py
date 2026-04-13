@@ -317,9 +317,16 @@ class MoneroRPC:
 
         self._backend = JSONRPCWallet(host=host, port=port)
 
+        # BUG 56 FIX: The old code checked for `self._backend._session`
+        # (with underscore) but monero-python's JSONRPCWallet uses
+        # `self._backend.session` (no underscore prefix). The hasattr()
+        # returned False, so proxy was never patched, and non-localhost
+        # RPC connections silently went clearnet — leaking operator IP.
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
             proxies = {"http": proxy_url, "https": proxy_url}
-            if hasattr(self._backend, '_session'):
+            if hasattr(self._backend, 'session'):
+                self._backend.session.proxies.update(proxies)
+            elif hasattr(self._backend, '_session'):
                 self._backend._session.proxies.update(proxies)
 
         self._wallet = XMRWallet(self._backend)
