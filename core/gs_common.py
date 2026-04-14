@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-gs_common.py - Shared OPSEC library for the GhostSpiral v10 toolchain
-=====================================================================
+gs_common.py - Shared OPSEC library for the core toolchain
+===========================================================
 Centralises integrity logging, Tor verification, atomic I/O, secure
 file permissions, CSPRNG helpers, and timing decorrelation so that
 every companion script uses battle-tested, consistent implementations.

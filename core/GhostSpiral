@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GhostSpiral v10.5 - Fully-wired BTC->XMR Mixer Core
-=====================================================
+Fully-wired BTC->XMR Mixer Core
+=================================
 !! RESEARCH / RED-TEAM TOOL !!
 Never use on main-net coins you do not own.
 
@@ -13,7 +13,7 @@ End-to-end pipeline:
   Stage 4: Build unsigned TX plan with fee-aware amounts
   Stage 5: Auto-sign + broadcast (or dump for cold/airgap)
 
-OPSEC hardening (v10.5):
+OPSEC hardening:
   - All traffic forced through Tor with leak checks at every stage
   - NEWNYM circuit rotation between stages
   - CSPRNG for all security-critical randomness (delays, hex extras)
@@ -224,7 +224,7 @@ def main():
             if lock_path.exists():
                 lock_path.unlink()
 
-        print("\n  [*] GhostSpiral resume finished. Check Stage 5 summary above for failures.")
+        print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
         sys.exit(0)
 
     # ---- Determine mode ----
@@ -243,7 +243,7 @@ def main():
             )
         with open(rw_path) as f:
             rw_data = json.load(f)
-        if rw_data.get("schema") not in ("receive_wallet_v1", "gs_receive_wallet_v1"):
+        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1", "gs_receive_wallet_v1"):
             sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
@@ -1006,7 +1006,7 @@ def main():
         if lock_path.exists():
             lock_path.unlink()
 
-    print("\n  [*] GhostSpiral v10.5 pipeline finished. Check Stage 5 summary above for failures.")
+    print("\n  [*] Pipeline finished. Check Stage 5 summary above for failures.")
 
 
 def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):

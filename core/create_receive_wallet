@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-create_receive_wallet - GhostSpiral companion (v10-ready)
-==========================================================
+create_receive_wallet - Receive wallet generator
+==================================================
 Generates a fresh Monero receive wallet / sub-address bundle that
-conforms to the GhostSpiral v10 JSON schema.
+conforms to the pipeline's JSON schema.
 
 OPSEC hardening:
   - Tor leak check before RPC contact
@@ -62,8 +62,7 @@ def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "create_receive_wallet v10",
-        description="Generate a fresh Monero receive subaddress for GhostSpiral",
+        description="Generate a fresh Monero receive subaddress for the mixer pipeline",
     )
     ap.add_argument("--rpc", default="http://127.0.0.1:18083",
                     help="monero-wallet-rpc endpoint")
@@ -111,13 +110,13 @@ def main():
     network = _detect_network(addr_str)
     if network != "mainnet":
         print(f"  [!] WARNING: Address belongs to {network.upper()}, not mainnet.")
-        print(f"  [!] Do NOT feed this wallet JSON into a mainnet GhostSpiral pipeline.")
+        print(f"  [!] Do NOT feed this wallet JSON into a mainnet pipeline.")
         integrity_log("wallet", f"network_warning:{network}")
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
-        "schema": "receive_wallet_v1",
+        "schema": "recv_wallet",
         "created": int(time.time()) // 600 * 600,
         "address": addr_str,
         "account_index": acct_idx,
@@ -155,8 +154,8 @@ def main():
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
     print(f"  2. Give the BTC deposit address + memo to the sender")
     print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")
-    print(f"  4. Run GhostSpiral in receive mode:")
-    print(f"       python3 GhostSpiral \\")
+    print(f"  4. Run the mixer pipeline in receive mode:")
+    print(f"       python3 mixer \\")
     print(f"         --receive-wallet {fname} \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
 

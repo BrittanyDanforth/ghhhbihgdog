@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-airgap_tx_signer v10.6 - Two-phase Monero TX signer for GhostSpiral
-====================================================================
+airgap_tx_signer - Two-phase Monero TX signer
+===============================================
 Implements the Monero cold-signing protocol:
 
 PHASE 1 "create" (online machine, has view-only wallet + daemon):
@@ -9,7 +9,7 @@ PHASE 1 "create" (online machine, has view-only wallet + daemon):
   - IMPORTANT: Monero wallet-rpc does NOT reserve outputs for do_not_relay
     TXs. Each call with do_not_relay=True will reuse the same inputs.
     Therefore this phase creates only ONE TX per invocation. The caller
-    (GhostSpiral auto-mode) must run the full create→sign→broadcast→sync
+    (auto-mode) must run the full create→sign→broadcast→sync
     cycle for each TX before creating the next one.
   - For air-gap batch mode, creates ONE unsigned TX per call. The operator
     must manually cycle: create → USB transfer → sign → USB transfer →
@@ -554,7 +554,6 @@ def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        "airgap_tx_signer v10.5",
         description="Two-phase Monero TX signer (create unsigned / sign offline)",
     )
     cli.add_argument("unsigned_json",

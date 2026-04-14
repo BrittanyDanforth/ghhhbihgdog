@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-broadcast_signed_xmr v10.0 - Resilient Monero relay & confirmation
-===================================================================
+broadcast_signed_xmr - Resilient Monero relay & confirmation
+=============================================================
 Fee-aware, Tor-hardened, integrity-logged broadcast of pre-signed XMR blobs.
 
 OPSEC hardening:
@@ -63,7 +63,6 @@ def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        "broadcast_signed_xmr v10.0",
         description="Broadcast pre-signed Monero TX blobs with Tor + retry",
     )
     cli.add_argument("path",

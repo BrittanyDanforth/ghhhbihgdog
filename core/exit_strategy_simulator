@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 - Off-Ramp Planner w/ Liquidity Probe
-====================================================================
-Part of the GhostSpiral v10 tool-chain. Generates a schema-tagged
-exitplan_v1.json bundle.
+exit_strategy_simulator - Off-Ramp Planner w/ Liquidity Probe
+==============================================================
+Generates a schema-tagged exit plan JSON bundle.
 
 OPSEC hardening:
   - Tor verified before any API access
@@ -123,7 +122,6 @@ def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "exit_strategy_simulator v10.0",
         description="Plan XMR off-ramp with liquidity analysis",
     )
     ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
@@ -167,7 +165,7 @@ def main():
     # kyc_required=false would mislead the operator into thinking they can
     # use a KYC method without KYC.
     plan = {
-        "schema": "exitplan_v1",
+        "schema": "exit_plan",
         "timestamp": int(time.time()) // 600 * 600,
         "method": args.method,
         "kyc_required": cfg["kyc"],
