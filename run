@@ -200,7 +200,7 @@ def flow_full_pipeline():
     heading("Full Pipeline: BTC → Mixed XMR")
     tor = get_tor_proxy()
     rpc = get_rpc()
-    btc = prompt("Your BTC address (bech32, bc1...)")
+    btc = prompt("Your BTC address (bc1..., 1..., or 3...)")
     amt = prompt("BTC amount to swap")
     splits = prompt("Split into how many chunks?", "2")
     wallets = prompt("Number of mix wallets", "10")
@@ -322,7 +322,14 @@ def flow_resume():
         plan = prompt("Path to unsigned plan JSON")
 
     wallet_files = sorted(Path(".").glob("wallet_*.json"))
-    wf = prompt("Wallet JSON file", str(wallet_files[0]) if wallet_files else "")
+    if wallet_files:
+        wf = prompt("Wallet JSON file", str(wallet_files[0]))
+    else:
+        wf = prompt("Path to wallet JSON file")
+
+    if not wf:
+        err("Wallet JSON file is required for resume")
+        return
 
     args = [
         "--receive-wallet", wf,
@@ -353,8 +360,13 @@ def flow_swap_preparer():
     dest = prompt("XMR destination address (or wallet JSON path)")
     if dest.endswith(".json") and Path(dest).exists():
         import json
-        dest = json.load(open(dest))["address"]
-        info(f"Loaded address from JSON: {dest[:8]}...{dest[-8:]}")
+        try:
+            with open(dest) as _f:
+                dest = json.load(_f)["address"]
+            info(f"Loaded address from JSON: {dest[:8]}...{dest[-8:]}")
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            err(f"Failed to read address from {dest}: {e}")
+            return
 
     api_key = os.environ.get("SWAPKIT_API_KEY", "")
     if not api_key:

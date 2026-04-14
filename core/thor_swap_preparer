@@ -30,6 +30,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
+    secure_hex,
 )
 
 try:
@@ -38,9 +39,11 @@ except ImportError:
     sys.exit("[!] python-monero missing - pip install monero")
 
 SWAPKIT_API = "https://api.swapkit.dev"
-# SwapKit API requires an x-api-key header.
-# Operators must set SWAPKIT_API_KEY env var or pass --api-key.
 SWAPKIT_API_KEY_ENV = "SWAPKIT_API_KEY"
+THORNODE_APIS = [
+    "https://thornode.ninerealms.com",
+    "https://thornode.thorswap.net",
+]
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
 # BUG 66 FIX: Accept all valid BTC address formats including legacy (1...),
@@ -77,6 +80,32 @@ def _validate_xmr_addr(addr: str) -> None:
         XMRAddress(addr)
     except Exception:
         sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
+
+
+def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> dict | None:
+    """Try THORNode native API for a swap quote. Returns deposit info or None."""
+    amt_sats = int(amt_btc * Decimal("100000000"))
+    for node in THORNODE_APIS:
+        try:
+            url = (f"{node}/thorchain/quote/swap"
+                   f"?from_asset=BTC.BTC&to_asset=XMR.XMR"
+                   f"&amount={amt_sats}&destination={xmr_dest}")
+            resp = safe_get(url, proxy)
+            inbound = resp.get("inbound_address", "")
+            memo = resp.get("memo", "")
+            expected_out = resp.get("expected_amount_out", "0")
+            if inbound and memo:
+                expected_xmr = Decimal(str(expected_out)) / Decimal("1000000000000")
+                return {
+                    "deposit": inbound,
+                    "memo": memo,
+                    "expected_xmr": expected_xmr,
+                    "source": "thornode",
+                }
+        except Exception as e:
+            integrity_log("thor", f"thornode_fail:{node}:{str(e)[:40]}")
+            continue
+    return None
 
 
 def main():
@@ -142,75 +171,81 @@ def main():
             newnym()
             secure_delay(3.0, 8.0)
 
-        # BUG 67 FIX: SwapKit API uses a two-step flow:
-        #   Step 1: POST /v3/quote — returns routes with routeId + expectedBuyAmount
-        #   Step 2: POST /v3/swap  — takes routeId, returns actual depositAddress + memo
-        # The old code tried to extract depositAddress from /v3/quote which doesn't have it.
+        # Try THORNode native API first (no API key needed, more reliable)
+        tn_result = _thornode_quote(amt, dest, proxy)
+        if tn_result:
+            deposit = tn_result["deposit"]
+            memo = tn_result["memo"]
+            expected_xmr = tn_result["expected_xmr"]
+            integrity_log("thor", f"thornode_ok_{i}")
+            print(f"  [+] Using THORNode native API for pair {i}")
+        else:
+            # Fall back to SwapKit two-step flow
+            integrity_log("thor", f"thornode_unavail_{i}:trying_swapkit")
+            print(f"  [!] THORNode unavailable for pair {i}, falling back to SwapKit...")
 
-        quote_payload = {
-            "sellAsset": "BTC.BTC",
-            "buyAsset": "XMR.XMR",
-            "sellAmount": str(amt),
-            "destinationAddress": dest,
-        }
-
-        quote_headers = {}
-        if api_key:
-            quote_headers["x-api-key"] = api_key
-
-        try:
-            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
-                                   headers=quote_headers)
-        except Exception as e:
-            if proxy:
-                newnym()
-            integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
-            raise
-
-        routes = quote_resp.get("routes", [])
-        if not routes:
-            error = quote_resp.get("error", quote_resp.get("message", "unknown"))
-            provider_errors = quote_resp.get("providerErrors", [])
-            integrity_log("thor", f"no_routes_{i}")
-            sys.exit(
-                f"[!] No swap routes for pair {i}: {str(error)[:80]}\n"
-                f"    Provider errors: {str(provider_errors)[:120]}"
-            )
-
-        route = routes[0]
-        route_id = route.get("routeId", route.get("id", ""))
-        expected_xmr = Decimal(str(
-            route.get("expectedBuyAmount",
-            route.get("expectedOutput",
-            route.get("expectedOutputMaxSlippage", "0")))
-        ))
-
-        # Step 2: Get actual swap details with deposit address
-        if route_id:
-            swap_payload = {
-                "routeId": route_id,
-                "sourceAddress": "",
+            quote_payload = {
+                "sellAsset": "BTC.BTC",
+                "buyAsset": "XMR.XMR",
+                "sellAmount": str(amt),
                 "destinationAddress": dest,
             }
+
+            quote_headers = {}
+            if api_key:
+                quote_headers["x-api-key"] = api_key
+
             try:
-                swap_resp = safe_post(f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
-                                     headers=quote_headers)
-                tx_info = swap_resp.get("tx", swap_resp.get("transaction", {}))
-                deposit = (tx_info.get("depositAddress", "") or
-                          tx_info.get("targetAddress", "") or
-                          tx_info.get("to", "") or
-                          swap_resp.get("inboundAddress", ""))
-                memo = (tx_info.get("memo", "") or
-                       tx_info.get("data", "") or
-                       swap_resp.get("memo", ""))
+                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
+                                       headers=quote_headers)
             except Exception as e:
-                integrity_log("thor", f"swap_api_fail_{i}:{str(e)[:40]}")
-                sys.exit(f"[!] SwapKit /v3/swap failed for pair {i}: {str(e)[:60]}")
-        else:
-            # Fallback: try extracting from quote response (some API versions)
-            tx_info = route.get("transaction", route.get("calldata", {}))
-            deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
-            memo = str(tx_info.get("memo", tx_info.get("data", "")))
+                if proxy:
+                    newnym()
+                integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
+                raise
+
+            routes = quote_resp.get("routes", [])
+            if not routes:
+                error = quote_resp.get("error", quote_resp.get("message", "unknown"))
+                provider_errors = quote_resp.get("providerErrors", [])
+                integrity_log("thor", f"no_routes_{i}")
+                sys.exit(
+                    f"[!] No swap routes for pair {i}: {str(error)[:80]}\n"
+                    f"    Provider errors: {str(provider_errors)[:120]}"
+                )
+
+            route = routes[0]
+            route_id = route.get("routeId", route.get("id", ""))
+            expected_xmr = Decimal(str(
+                route.get("expectedBuyAmount",
+                route.get("expectedOutput",
+                route.get("expectedOutputMaxSlippage", "0")))
+            ))
+
+            if route_id:
+                swap_payload = {
+                    "routeId": route_id,
+                    "sourceAddress": "",
+                    "destinationAddress": dest,
+                }
+                try:
+                    swap_resp = safe_post(f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
+                                         headers=quote_headers)
+                    tx_info = swap_resp.get("tx", swap_resp.get("transaction", {}))
+                    deposit = (tx_info.get("depositAddress", "") or
+                              tx_info.get("targetAddress", "") or
+                              tx_info.get("to", "") or
+                              swap_resp.get("inboundAddress", ""))
+                    memo = (tx_info.get("memo", "") or
+                           tx_info.get("data", "") or
+                           swap_resp.get("memo", ""))
+                except Exception as e:
+                    integrity_log("thor", f"swap_api_fail_{i}:{str(e)[:40]}")
+                    sys.exit(f"[!] SwapKit /v3/swap failed for pair {i}: {str(e)[:60]}")
+            else:
+                tx_info = route.get("transaction", route.get("calldata", {}))
+                deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
+                memo = str(tx_info.get("memo", tx_info.get("data", "")))
 
         if not deposit:
             integrity_log("thor", f"no_deposit_{i}")
@@ -218,7 +253,7 @@ def main():
 
         if not BTC_RE.match(deposit):
             integrity_log("thor", f"bad_deposit_format_{i}")
-            sys.exit(f"[!] Deposit address not valid bech32: {scrub_address(deposit)}")
+            sys.exit(f"[!] Deposit address not a valid BTC address: {scrub_address(deposit)}")
 
         # Slippage check
         oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
