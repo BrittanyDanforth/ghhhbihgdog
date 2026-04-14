@@ -267,9 +267,10 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
     the process aborts to prevent all operations going over one circuit.
 
     BUG 34 FIX: The old code only tried the Unix socket file at
-    /var/run/tor/control. Most Tor installations (especially on non-Debian
-    or when installed via Tor Browser) use TCP control port 9051 instead.
-    Now tries socket file first, then falls back to TCP port 9051.
+    /var/run/tor/control. Typical setups: Debian/system ``tor`` exposes a
+    socket and/or TCP control **9051**; **Tor Browser**'s bundled tor uses
+    SOCKS **9150** and control **9151** (not 9051). Order: socket if present,
+    else TCP **9051**, else TCP **9151**.
     """
     global _NEWNYM_CONSECUTIVE_FAILURES
     try:
@@ -281,7 +282,16 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
             if os.path.exists(ctrl):
                 c = Controller.from_socket_file(ctrl)
             else:
-                c = Controller.from_port(port=9051)
+                last_err: Optional[BaseException] = None
+                for port in (9051, 9151):
+                    try:
+                        c = Controller.from_port(port=port)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        c = None
+                if c is None and last_err is not None:
+                    raise last_err
             # BUG 73 FIX: Support password auth for Tor control port.
             # stem.authenticate() tries NONE, SAFECOOKIE, COOKIE by default.
             # If torrc uses HashedControlPassword, we need the password.

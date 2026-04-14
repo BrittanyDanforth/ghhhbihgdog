@@ -88,11 +88,17 @@ else
     warn "No /etc/tor/torrc found — configure Tor manually"
 fi
 
-# Verify Tor
-if curl -s --max-time 15 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
-    ok "Tor is running and working"
-else
-    warn "Tor check failed — run: sudo systemctl start tor"
+# Verify Tor (system tor: 9050; Tor Browser embedded tor: 9150)
+TOR_CHECK_OK=false
+for TOR_SOCKS_PORT in 9050 9150; do
+    if curl -s --max-time 15 --socks5-hostname "127.0.0.1:${TOR_SOCKS_PORT}" https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        ok "Tor SOCKS responding on 127.0.0.1:${TOR_SOCKS_PORT}"
+        TOR_CHECK_OK=true
+        break
+    fi
+done
+if [ "$TOR_CHECK_OK" = false ]; then
+    warn "Tor SOCKS check failed on 127.0.0.1:9050 and :9150 — run: sudo systemctl start tor"
 fi
 
 # ---------- Step 4: Check Monero tools ----------
