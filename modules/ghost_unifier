@@ -267,7 +267,9 @@ def main():
 
         print("\n[✓] Phase‑1 prep complete!")
         print("    Mutated core   :", MUTATED)
-        print("    Manifest       :", MANIFEST)
+        if MANIFEST.exists():
+            print("    Manifest       :", MANIFEST)
+            print("    [!] WARNING: Manifest is a de-obfuscation key. Delete after use.")
         print("    DAG            :", DAG)
         print("    Labels (raw)   :", LABELS)
         print("    Labels (poison):", LABELS_PO)

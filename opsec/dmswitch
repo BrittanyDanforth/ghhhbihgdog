@@ -502,38 +502,22 @@ class DeadManSwitch:
             return False
     
     def _start_ttl_countdown(self, ttl: int):
-        """Start TTL countdown with periodic warnings"""
-        def countdown():
-            intervals = [ttl//2, ttl//4, 60, 30, 10, 5, 3, 2, 1]  # Warning intervals
-            start_time = time.time()
-            
-            while time.time() - start_time < ttl:
-                elapsed = time.time() - start_time
-                remaining = ttl - elapsed
-                
-                # Check for warning intervals
-                for interval in intervals:
-                    if abs(remaining - interval) < 1:  # Within 1 second
-                        if interval >= 60:
-                            print(f"[!] WARNING: {int(remaining//60)}m {int(remaining%60)}s remaining until auto-destruct")
-                        else:
-                            print(f"[!] WARNING: {int(remaining)}s remaining until auto-destruct")
-                        break
-                
-                time.sleep(1)
-                
-                # Check if files were unlocked externally
-                if not LOCKED_BUNDLE.exists():
-                    return
-            
-            # TTL expired - self destruct
+        """Start TTL countdown as a separate process (survives parent exit)."""
+        import signal as _sig
+        _sig.signal(_sig.SIGCHLD, _sig.SIG_IGN)  # Auto-reap
+        pid = os.fork()
+        if pid == 0:
+            # Child process
+            _sig.signal(_sig.SIGTERM, lambda *_: sys.exit(0))
+            time.sleep(ttl)
             if LOCKED_BUNDLE.exists():
                 print("\n[!] TTL EXPIRED - INITIATING SELF-DESTRUCT")
-                self._secure_cleanup()
-        
-        # Run countdown in background thread
-        countdown_thread = threading.Thread(target=countdown, daemon=True)
-        countdown_thread.start()
+                AntiForensics.secure_delete_file(LOCKED_BUNDLE)
+                AntiForensics.secure_delete_file(LOCK_METADATA)
+                AntiForensics.cleanup_decoys()
+            sys.exit(0)
+        else:
+            print(f"  [·] TTL wiper started (PID {pid})")
     
     def unlock_entropy_seed(self, token: str) -> bool:
         """Unlock the entropy seed with verification"""
