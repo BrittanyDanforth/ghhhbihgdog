@@ -337,7 +337,9 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "wallet_*.json", "thor_pairs_*.json",
         "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
         "exitplan_*.json", "exitplan_v1.json",
+        "plan_output.json",
         "integrity_chain.log", "integrity.log",
+        "integrity_chain.log.lock",
         "*.blob", "*.signed", "*.unsigned",
         "signed_manifest_v1.json", "unsigned_manifest.json",
         ".ghostspiral.lock", ".mixer.lock",
@@ -347,22 +349,32 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "unsigned_*.json.tmp", "signer_progress.json.tmp",
         "stage5_progress.json.tmp", "broadcast_progress.json.tmp",
         "wallet_*.json.tmp", "exitplan_*.json.tmp",
+        "plan_output.json.tmp",
         "integrity_chain.log.tmp",
         "unsigned_manifest.json.tmp", "signed_manifest_v1.json.tmp",
         "swap_progress_secure.json.tmp",
         # Entropy + chaos pipeline
         "entropy_seed.json", "entropy_seed.json.tmp",
-        "dag_structure.json", "dag_augmented.json",
-        "label_map.json", "label_map_poisoned.json",
-        "decoy_noise.json",
+        "dag_structure.json", "dag_structure.json.tmp",
+        "dag_augmented.json", "dag_augmented.json.tmp",
+        "label_map.json", "label_map.json.tmp",
+        "label_map_poisoned.json", "label_map_poisoned.json.tmp",
+        "decoy_noise.json", "decoy_noise.json.tmp",
         "swap_integrity_v2.log", "swap_progress_secure.json",
-        "tor_operations.log", "operational_endpoints.json",
+        "tor_operations.log", "tor_operations.log.tmp",
+        "operational_endpoints.json", "operational_endpoints.json.tmp",
         # Mutator output + manifests (smoking gun if left on disk)
-        "*.manifest.json",
+        "*.manifest.json", "*.manifest.json.tmp",
         "wallet_mutation_manifest_v1.json",
+        "fake_leaf_manifest_v1.json",
+        "mutated_wallet.json", "mutated_wallet.json.tmp",
         # Fake/decoy logs
-        "mirror_exec.log", "fake_errors.log",
+        "mirror_exec.log", "mirror_exec.log.tmp",
+        "fake_errors.log",
         "fake_integrity_chain.log",
+        "integrity_fake.log", "integrity_fake.log.tmp",
+        # Catch-all for any remaining .tmp from atomic writes
+        "thor_pairs_batch.json.tmp",
     ]
     dir_patterns = [
         "signed_blobs", "unsigned", "tx_staging", "runtime",
@@ -387,10 +399,17 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     if shm.is_dir():
         shm_patterns = [
             ".gs_seed_active", ".gs_seed_active.tmp",
+            ".gs_seed_lock",
             "gs_*", "vm_timing.json", "vm_timing.tmp",
             "swap_progress_secure.json", "swap_progress_secure.tmp",
             "circuit_burn.log", "gs_unlock_token", "gs_paranoia_wipe",
             ".gs_locked_bundle", ".gs_lock_meta",
+            ".tk_*",
+            "fake_errors.log",
+        ]
+        shm_dir_patterns = [
+            "qr_codes",
+            "decoys",
         ]
         for pat in shm_patterns:
             for f in shm.glob(pat):
@@ -398,6 +417,14 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
                     print(f"  [dry] would securely delete {f}")
                 else:
                     _secure_delete_file(f)
+                count += 1
+        for dirname in shm_dir_patterns:
+            d = shm / dirname
+            if d.is_dir():
+                if dry:
+                    print(f"  [dry] would securely delete dir {d}")
+                else:
+                    _secure_delete_dir(d)
                 count += 1
     for root in search_roots:
         if not root.is_dir():

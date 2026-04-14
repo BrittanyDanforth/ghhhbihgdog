@@ -364,12 +364,48 @@ def main():
             try:
                 url = f"{base_url}/thorchain/quote/swap?{params}"
                 resp = safe_get(url, proxy)
-                if resp.get("error"):
+                # BUG 77 FIX: `resp.get("error")` returns "" for {"error": ""},
+                # which is falsy — so empty-string errors were silently accepted.
+                # Check for the KEY's presence, not its truthiness.
+                if "error" in resp:
+                    integrity_log("stage2", f"thornode_error:{str(resp['error'])[:60]}")
                     continue
                 inbound = resp.get("inbound_address", "")
                 memo = resp.get("memo", "")
                 expected_out = resp.get("expected_amount_out", "0")
                 if inbound and memo and len(memo) > 5:
+                    # BUG 78 FIX: Check memo length against BTC OP_RETURN limit.
+                    # BTC OP_RETURN outputs are limited to 80 bytes. ThorChain
+                    # memos can exceed this. If the memo is too long, the BTC TX
+                    # will be rejected by miners and the operator loses nothing
+                    # (TX never confirms), but they waste time and may miss the
+                    # quote expiry window trying to debug.
+                    memo_bytes = len(memo.encode("utf-8"))
+                    if memo_bytes > 80:
+                        integrity_log("stage2", f"memo_too_long:{memo_bytes}B")
+                        print(f"  [!] WARNING: ThorChain memo is {memo_bytes} bytes "
+                              f"(BTC OP_RETURN limit is 80 bytes).")
+                        print(f"  [!] This memo CANNOT fit in a standard OP_RETURN output.")
+                        print(f"  [!] The BTC transaction will be rejected by miners.")
+                        continue
+
+                    # BUG 79 FIX: Check recommended_min_amount_in from THORNode.
+                    # ThorChain has minimum swap amounts that vary by pool depth.
+                    # Sending below the minimum = funds stuck or refunded minus fees.
+                    rec_min = resp.get("recommended_min_amount_in")
+                    if rec_min:
+                        try:
+                            min_sats = int(rec_min)
+                            if amount_sats < min_sats:
+                                min_btc = Decimal(str(min_sats)) / Decimal("1e8")
+                                integrity_log("stage2", f"below_min:{amt}<{min_btc}")
+                                print(f"  [!] WARNING: {amt} BTC is below ThorChain minimum "
+                                      f"of {min_btc} BTC for this pool.")
+                                print(f"  [!] Swap will likely fail or be refunded minus fees.")
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+
                     # THORNode returns expected_amount_out in target asset's
                     # native precision. For XMR that's piconero (1e12).
                     expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
@@ -380,10 +416,23 @@ def main():
                     if expected_xmr > 100000:
                         integrity_log("stage2", f"suspicious_quote:{expected_xmr}")
                         continue
+
+                    # BUG 80 FIX: Extract and return quote expiry timestamp.
+                    # ThorChain quotes are time-limited. The inbound_address
+                    # (vault) may rotate and the memo becomes invalid after expiry.
+                    # Sending BTC with an expired memo = funds stuck in vault.
+                    expiry = resp.get("expiry", 0)
+                    try:
+                        expiry = int(expiry)
+                    except (ValueError, TypeError):
+                        expiry = 0
+
                     return {
                         "deposit_address": inbound,
                         "memo": memo,
                         "expected_xmr": str(expected_xmr),
+                        "expiry": expiry,
+                        "memo_bytes": memo_bytes,
                     }
             except Exception:
                 continue
@@ -422,6 +471,9 @@ def main():
             memo = result.get("memo", "")
             expected_dec = Decimal(result.get("expected_xmr", "0"))
 
+            expiry_ts = result.get("expiry", 0)
+            memo_bytes = result.get("memo_bytes", 0)
+
             deposit_info = {
                 "chunk": i,
                 "btc_amount": str(amt),
@@ -429,6 +481,8 @@ def main():
                 "memo": str(memo),
                 "expected_xmr": str(expected_dec),
                 "source": "thornode",
+                "expiry": expiry_ts,
+                "memo_bytes": memo_bytes,
             }
             deposits.append(deposit_info)
 
@@ -437,6 +491,13 @@ def main():
             if memo:
                 print(f"      With memo: {str(memo)[:40]}...")
             print(f"      Expected: ~{expected_dec} XMR")
+            if expiry_ts:
+                remaining = expiry_ts - int(time.time())
+                if remaining <= 0:
+                    print(f"      [!] QUOTE ALREADY EXPIRED — do NOT send BTC!")
+                    integrity_log("stage2", f"quote_expired_at_print:{i}")
+                else:
+                    print(f"      [!] Quote expires in {remaining // 60}m {remaining % 60}s — send BTC promptly!")
             integrity_log("stage2", f"quote_ready:{i}:thornode")
 
             secure_delay(5.0, 15.0)
@@ -473,6 +534,34 @@ def main():
 
     if receive_mode:
         ENTRY = receive_entry_addr
+        # Verify the receive address actually exists in the connected wallet.
+        # If the operator points --rpc at a different wallet, ENTRY won't be
+        # resolvable to a subaddress index and every fan-out TX will fail at
+        # Stage 5 (airgap_tx_signer aborts when src address is not found).
+        try:
+            _all_addrs = rpc_primary.raw_request(
+                "get_address", {"account_index": sub_account}
+            )
+            _found = any(
+                e.get("address") == ENTRY
+                for e in _all_addrs.get("addresses", [])
+            )
+            if not _found:
+                sys.exit(
+                    f"[!] Receive-wallet address {scrub_address(ENTRY)} NOT FOUND\n"
+                    f"    in the wallet connected at {args.rpc_primary} "
+                    f"(account {sub_account}).\n"
+                    f"    The RPC wallet must be the SAME wallet that generated\n"
+                    f"    the receive address. All fan-out TXs would fail.\n"
+                    f"    Connect the correct wallet and retry."
+                )
+            integrity_log("stage3", "receive_entry_verified_in_wallet")
+        except SystemExit:
+            raise
+        except Exception as e:
+            integrity_log("stage3", f"entry_verify_warn:{str(e)[:40]}")
+            print(f"  [!] WARNING: Could not verify receive address in wallet: {e}")
+            print(f"  [!] Proceeding, but fan-out TXs may fail if address is wrong.")
         if ENTRY in subs:
             subs.remove(ENTRY)
         subs.insert(0, ENTRY)
@@ -529,10 +618,21 @@ def main():
                     # Truncate memo in terminal to reduce log exposure
                     print(f"  With memo:    {dep['memo'][:40]}…")
                 print(f"  Expected XMR: ~{dep['expected_xmr']}")
+                dep_expiry = dep.get("expiry", 0)
+                if dep_expiry:
+                    dep_remaining = dep_expiry - int(time.time())
+                    if dep_remaining <= 0:
+                        print(f"  *** EXPIRED — DO NOT SEND — request new quote! ***")
+                    elif dep_remaining < 600:
+                        print(f"  *** URGENT: expires in {dep_remaining // 60}m {dep_remaining % 60}s ***")
+                    else:
+                        print(f"  Expires in:   {dep_remaining // 60}m {dep_remaining % 60}s")
             print()
             print("  ============================================================")
             print("  [!] YOU MUST manually send BTC to each deposit address above!")
             print("  [!] Include the memo in the BTC transaction OP_RETURN field!")
+            print("  [!] Quotes EXPIRE — send BTC BEFORE the expiry time above!")
+            print("  [!] Sending after expiry = funds stuck in ThorChain vault!")
             print("  [!] Wait for XMR to arrive and confirm before proceeding!")
             print("  ============================================================")
         else:
@@ -827,6 +927,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         print("  [!] Mitigation: ensure full-disk encryption (LUKS) is enabled so")
         print("  [!] swap contents cannot be read from a seized disk.")
 
+    # Refresh wallet state before reading the plan. On resume after a crash,
+    # TXs from the prior run are confirmed on-chain but the wallet's internal
+    # state is stale (spent outputs not marked, change outputs invisible).
+    # Without this, the next transfer_split reuses already-spent inputs.
+    try:
+        rpc.raw_request("refresh", {})
+        integrity_log("stage5", "wallet_refreshed_at_start")
+    except Exception as _refresh_err:
+        integrity_log("stage5", f"refresh_at_start_warn:{str(_refresh_err)[:40]}")
+        print(f"  [!] WARNING: Wallet refresh at start failed: {str(_refresh_err)[:60]}")
+        print(f"  [!] If resuming after a crash, TXs may fail due to stale wallet state.")
+
     # Read the plan to get TX count
     with open(str(ufile)) as _pf:
         plan_data = json.load(_pf)
@@ -973,6 +1085,28 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             fail_count += 1
             break
 
+        # Validate file is non-empty and above minimum viable size.
+        # A crash during the create phase can leave a truncated/empty file.
+        # Monero unsigned_txset blobs are always > 100 bytes; anything
+        # smaller is certainly corrupt.
+        _MIN_BLOB_SIZE = 100
+        _check_file = presigned_file if is_presigned else unsigned_file
+        try:
+            _fsize = _check_file.stat().st_size
+        except OSError:
+            _fsize = 0
+        if _fsize < _MIN_BLOB_SIZE:
+            print(f"  [!] TX {tx_idx}: {'signed' if is_presigned else 'unsigned'} file is "
+                  f"truncated/empty ({_fsize} bytes) — likely from a prior crash.")
+            print(f"  [!] Removing corrupt file and ABORTING. Re-run to recreate.")
+            integrity_log("stage5", f"corrupt_blob:tx={tx_idx}:size={_fsize}")
+            try:
+                _check_file.unlink()
+            except OSError:
+                pass
+            fail_count += 1
+            break
+
         if is_presigned:
             print(f"  [skip] Step 2: TX {tx_idx} already signed (hot wallet)")
             signed_file = presigned_file
@@ -1068,13 +1202,29 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         # wallet's internal state (spent outputs). But we must still call
         # refresh so the wallet re-scans and sees the TX in the mempool/chain.
         # Without this, the next transfer_split may reuse spent outputs.
+        # BUG 81 FIX: Refresh failure must be retried, not silently continued.
+        # Without refresh, the wallet doesn't know which outputs are spent.
+        # The next transfer_split reuses spent inputs → double-spend rejection
+        # → the operator thinks it's a transient error and retries, creating
+        # more conflicting TXs and potentially losing track of wallet state.
         secure_delay(3.0, 8.0)
-        try:
-            rpc_primary.raw_request("refresh", {})
-        except Exception as e:
-            integrity_log("stage5", f"refresh_warn:tx={tx_idx}:{str(e)[:40]}")
-            print(f"  [!] Wallet refresh after TX {tx_idx} failed: {str(e)[:60]}")
-            print(f"  [!] Next TX may fail due to stale wallet state.")
+        refresh_ok = False
+        for _refresh_attempt in range(5):
+            try:
+                rpc_primary.raw_request("refresh", {})
+                refresh_ok = True
+                break
+            except Exception as e:
+                integrity_log("stage5", f"refresh_retry:{_refresh_attempt}:tx={tx_idx}:{str(e)[:40]}")
+                print(f"  [!] Wallet refresh attempt {_refresh_attempt + 1}/5 failed: {str(e)[:60]}")
+                secure_delay(3.0, 10.0)
+        if not refresh_ok:
+            integrity_log("stage5", f"refresh_FATAL:tx={tx_idx}")
+            print(f"  [!] Wallet refresh FAILED after 5 attempts for TX {tx_idx}.")
+            print(f"  [!] ABORTING — next TX would reuse spent outputs (double-spend).")
+            print(f"  [!] The successfully broadcast TXs are safe. Resume after fixing RPC.")
+            fail_count += 1
+            break
 
         success_count += 1
         completed_indices.add(tx_idx)
@@ -1093,9 +1243,33 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     if fail_count:
         print(f"  [!] {fail_count} TXs failed. Check logs and retry.")
 
-    # Clean progress file on full success
-    if success_count == total_txs and progress_file.exists():
-        progress_file.unlink()
+    # Clean progress file and plan file on full success.
+    # The plan file contains the FULL mixing DAG (every src/dst XMR address).
+    # If seized, it reveals the entire transaction graph. Securely overwrite
+    # before unlinking so data is unrecoverable from disk journal/sectors.
+    if success_count == total_txs:
+        if progress_file.exists():
+            progress_file.unlink()
+        try:
+            plan_path = Path(str(ufile))
+            if plan_path.exists():
+                _psize = plan_path.stat().st_size
+                with open(plan_path, "r+b") as _wf:
+                    _wf.write(b"\x00" * _psize)
+                    _wf.flush()
+                    os.fsync(_wf.fileno())
+                plan_path.unlink()
+                integrity_log("stage5", "plan_wiped_after_success")
+        except OSError:
+            integrity_log("stage5", "plan_wipe_failed")
+        try:
+            staging_path = Path(staging_dir)
+            if staging_path.is_dir():
+                import shutil as _shutil_clean
+                _shutil_clean.rmtree(staging_path)
+                integrity_log("stage5", "tx_staging_wiped_after_success")
+        except OSError:
+            integrity_log("stage5", "tx_staging_wipe_failed")
 
     # Exit strategy simulation
     newnym()
