@@ -1,5 +1,7 @@
 *.pyc
 __pycache__/
+.venv/
+gs
 *.log
 *.tmp
 integrity_chain.log

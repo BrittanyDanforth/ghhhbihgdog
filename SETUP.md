@@ -16,10 +16,23 @@ sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
 
 ## 2. Python libraries
 
+The installer creates a **virtual environment** (`.venv/`) so nothing
+conflicts with your system packages. No red errors, no warnings.
+
+Easiest way — just run the installer (it does everything):
+
 ```
-python3 -m pip install requests PySocks tenacity stem monero psutil
-python3 -m pip install python-gnupg pycryptodomex cryptography qrcode pyyaml
-python3 -m pip install beautifulsoup4 aiohttp aiohttp-socks
+bash install.sh
+```
+
+Or manually:
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install requests PySocks tenacity stem monero psutil
+pip install python-gnupg pycryptodomex cryptography qrcode pyyaml
+pip install beautifulsoup4 aiohttp aiohttp-socks
 ```
 
 Quick check — should print `ALL OK`:
@@ -28,7 +41,7 @@ Quick check — should print `ALL OK`:
 python3 -c "import requests, socks, stem, monero, psutil, tenacity, cryptography; print('ALL OK')"
 ```
 
-If it says `ModuleNotFoundError`, just install whichever one it names.
+If it says `ModuleNotFoundError`, install whichever one it names.
 
 ---
 
@@ -173,6 +186,16 @@ Same password from step 5c. Setting it as an env var keeps it out of
 
 ```
 cd /path/to/ghostspiral
+./gs
+```
+
+That `./gs` shortcut was created by the installer — it uses the venv
+automatically so you don't have to activate it every time.
+
+Or if you prefer to activate manually:
+
+```
+source .venv/bin/activate
 python3 run
 ```
 
@@ -205,8 +228,8 @@ Go in reverse order: clean artifacts first, then stop services.
 **8a. Wipe GhostSpiral artifacts** (do this while Tor is still running):
 
 ```
-python3 run paranoia --dry-run   # preview what gets deleted
-python3 run paranoia             # actually delete (sudo recommended)
+./gs paranoia --dry-run   # preview what gets deleted
+./gs paranoia             # actually delete (sudo recommended)
 ```
 
 **8b. Stop wallet RPC:**
@@ -272,7 +295,9 @@ ss -tlnp | grep -E '18081|18083|9050' || echo "No GhostSpiral ports open"
 
 | Problem | Fix |
 |---------|-----|
-| `ModuleNotFoundError` | Re-run step 2 |
+| Red errors / version conflicts during pip install | Use `bash install.sh` — it creates a venv so nothing clashes with system packages |
+| "Running pip as root" warning | Use `bash install.sh` — it installs into `.venv/` not system Python |
+| `ModuleNotFoundError` | Make sure you're using `./gs` (uses the venv) or activate it first: `source .venv/bin/activate` |
 | `curl: (7) ... port 9050` | Tor isn't running. `sudo systemctl start tor`. Using Tor Browser? Try port 9150 |
 | `Tor leak detected` | `sudo systemctl start tor` |
 | `NEWNYM failed` | Re-run the ControlPort lines from step 3 |
@@ -308,27 +333,14 @@ ONLY use:
 
 ## Quick install (all-in-one)
 
-If you prefer one block instead of step-by-step:
+The installer handles everything — system packages, venv, Python deps, Tor config, Monero:
 
 ```
-sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
-python3 -m pip install -r requirements.txt
-echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
-sudo systemctl restart tor
-curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip || curl --socks5-hostname 127.0.0.1:9150 https://check.torproject.org/api/ip
+sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip python3-venv curl wget bzip2
+bash install.sh
 ```
 
-For Monero tools:
-
-```
-cd /tmp
-wget https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
-tar xf monero-cli.tar.bz2
-sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
-rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2
-cd -
-monerod --version && monero-wallet-rpc --version
-```
+That's it. Then run `./gs` to start.
 
 ---
 
@@ -336,8 +348,10 @@ monerod --version && monero-wallet-rpc --version
 
 ```
 ghostspiral/
+  gs                     <- shortcut (uses venv automatically)
   run                    <- interactive launcher
-  install.sh             <- auto-installer
+  install.sh             <- auto-installer (creates .venv/)
+  .venv/                 <- virtual environment (created by install.sh)
   requirements.txt       <- Python dependencies
   core/                  <- main pipeline
   modules/               <- mixing & chaos
@@ -345,4 +359,4 @@ ghostspiral/
   intel/                 <- OSINT collection
 ```
 
-`python3 run list` shows all available tools.
+`./gs list` shows all available tools.
