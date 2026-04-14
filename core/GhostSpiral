@@ -177,7 +177,7 @@ def main():
             sys.exit("[!] Lock file exists. Another instance may be running.")
 
         try:
-            _stage5_run(args, resume_path, staging_dir, proxy, bal)
+            _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
         finally:
             if lock_path.exists():
                 lock_path.unlink()
@@ -662,6 +662,8 @@ def main():
     }
     if is_mock_plan:
         meta["mock"] = True
+    if not receive_mode and args.btc_entry:
+        meta["btc_entry"] = args.btc_entry
     if shutdown_requested():
         meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
@@ -749,7 +751,7 @@ def main():
     staging_dir = "tx_staging"
 
     try:  # ensures lock file is cleaned even on error
-        _stage5_run(args, ufile, staging_dir, proxy, bal)
+        _stage5_run(args, ufile, staging_dir, proxy, bal, rpc_primary)
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -757,7 +759,7 @@ def main():
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
-def _stage5_run(args, ufile, staging_dir, proxy, bal):
+def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     """Execute the iterative create→sign→broadcast pipeline.
 
     CRITICAL DESIGN NOTE (BUG 58 FIX):
@@ -888,6 +890,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         # Step 1: Create unsigned TX
         print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
         try:
+            create_env = os.environ.copy()
+            for sensitive_key in ("GS_WALLET_PASSWORD",):
+                create_env.pop(sensitive_key, None)
             create_cmd = [
                 sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                 "--phase", "create",
@@ -897,7 +902,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                 f"--fee-priority={args.fee_priority}",
                 "--tx-index", str(tx_idx),
             ]
-            subprocess.run(create_cmd, check=True, timeout=300)
+            subprocess.run(create_cmd, check=True, timeout=300, env=create_env)
         except subprocess.CalledProcessError as e:
             integrity_log("stage5", f"create_fail:tx={tx_idx}:rc={e.returncode}")
             print(f"  [!] TX {tx_idx} create failed (exit {e.returncode})")
@@ -976,7 +981,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         newnym()
         try:
             signed_data = signed_file.read_bytes()
-            rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+            rpc_primary = rpc
             result = rpc_primary.raw_request("submit_transfer", {
                 "tx_data_hex": signed_data.hex(),
             })
