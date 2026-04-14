@@ -798,7 +798,7 @@ Examples:
     
     # Network configuration
     parser.add_argument("--proxy-chain", required=True, 
-                       help="Comma-separated SOCKS/HTTP proxy chain (e.g. socks5h://127.0.0.1:9050). "
+                       help="Comma-separated socks5h:// proxy chain (e.g. socks5h://127.0.0.1:9050). "
                             "Tor control is 9051 (system) or 9151 (Tor Browser) — never use those as SOCKS hops.")
     parser.add_argument("--aggregator-pool", 
                        help="YAML file with additional aggregator endpoints")
@@ -847,8 +847,10 @@ Examples:
         if proxy_url.lower().startswith('socks5://') and not proxy_url.lower().startswith('socks5h://'):
             print(f"[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead: {proxy_url}")
             sys.exit(1)
-        if not proxy_url.startswith(('socks5h://', 'http://', 'https://')):
-            print(f"[!] Invalid proxy URL format: {proxy_url}", file=sys.stderr)
+        if not proxy_url.lower().startswith('socks5h://'):
+            print(f"[!] Only socks5h:// proxies are accepted (Tor DNS privacy).", file=sys.stderr)
+            print(f"    Got: {proxy_url}", file=sys.stderr)
+            print(f"    http/https proxies leak DNS and don't route through Tor.", file=sys.stderr)
             sys.exit(1)
             
         # Parse URL to validate
