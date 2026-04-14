@@ -36,14 +36,12 @@ Usage:
 """
 from __future__ import annotations
 import argparse
-import asyncio
 import base64
 import ctypes
 import gc
 import hashlib
 import hmac
 import json
-import mmap
 import os
 import random
 import secrets
@@ -53,13 +51,11 @@ import struct
 import sys
 import time
 import threading
-import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, Union
 from urllib.parse import urlparse
-import weakref
 
 # Advanced imports with fallback handling
 try:
@@ -67,7 +63,7 @@ try:
     import yaml
     from tenacity import (
         retry, wait_exponential_jitter, stop_after_attempt,
-        retry_if_exception_type, before_sleep_log
+        retry_if_exception_type
     )
     from stem import Signal
     from stem.control import Controller
@@ -586,6 +582,7 @@ class AdvancedSwapOrchestrator:
                 "timestamp": time.time()
             })
             self._save_progress(self.progress)
+            return True
             
         # Dry run mode
         if hasattr(self.args, 'dry_run') and self.args.dry_run:
@@ -832,13 +829,14 @@ Examples:
         print("[!] Warning: Low phantom failure rate may reduce traffic analysis resistance.")
     
     # Memory locking (requires root on most systems)
-    if args.memory_lock and os.geteuid() == 0:
+    if args.memory_lock:
         try:
-            import mlock
-            mlock.mlockall()
-            print("[•] Memory locking enabled")
-        except ImportError:
-            print("[!] Memory locking requested but mlock module not available")
+            import ctypes as _ctypes
+            _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+            if _libc.mlockall(1 | 2) == 0:
+                print("[•] Memory locking enabled")
+            else:
+                print("[!] Memory locking failed (need root or CAP_IPC_LOCK)")
         except Exception as e:
             print(f"[!] Memory locking failed: {e}")
     
