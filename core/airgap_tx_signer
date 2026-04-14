@@ -185,8 +185,11 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 blob_hex = unsigned_txset
             elif tx_metadata_list:
                 is_presigned = True
-                blob_hex = tx_metadata_list[0] if len(tx_metadata_list) == 1 \
-                    else "".join(tx_metadata_list)
+                if len(tx_metadata_list) > 1:
+                    integrity_log("signer", f"multi_metadata:idx={idx}:count={len(tx_metadata_list)}")
+                    print(f"  [!] TX {idx}: transfer_split returned {len(tx_metadata_list)} "
+                          f"metadata items (split TX). Using first item only.")
+                blob_hex = tx_metadata_list[0]
                 integrity_log("signer", f"hot_wallet_presigned:idx={idx}")
             else:
                 integrity_log("signer", f"no_txset:idx={idx}")

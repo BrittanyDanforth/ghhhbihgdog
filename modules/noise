@@ -504,6 +504,7 @@ def main():
                     os.fsync(f.fileno())
                 
                 tmp_path.replace(args.out)
+                os.chmod(args.out, 0o600)
                 print(f"[+] Log saved to {args.out}")
                 
             except Exception as e:

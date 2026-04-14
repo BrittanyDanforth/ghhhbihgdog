@@ -227,8 +227,8 @@ class PolymorphicGenerator:
         strategies.extend([deep_narrow, wide_shallow, irregular, 
                           fibonacci_branch, chaotic])
         
-        # Shuffle strategies
-        random.shuffle(strategies)
+        # Shuffle strategies using CSPRNG (not global random)
+        secrets.SystemRandom().shuffle(strategies)
         
         return strategies
     

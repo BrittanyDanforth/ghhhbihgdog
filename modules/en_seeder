@@ -159,6 +159,7 @@ def write_bundle(bundle: dict, out_path: Path):
         
         # Atomic move
         tmp_path.replace(out_path)
+        os.chmod(out_path, 0o600)
         
     except Exception as e:
         print(f"[-] Error writing bundle: {e}")

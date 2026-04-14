@@ -47,6 +47,7 @@ def safe_write_json(path: Path, data: Any) -> None:
         with tmp_path.open('w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         tmp_path.replace(path)
+        os.chmod(path, 0o600)
     except (PermissionError, OSError) as e:
         print(f"[!] Error writing {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -182,7 +183,7 @@ def insert_fake_leaves(
             
             fake_node = {
                 "id": fake_id,
-                "type": "fake_leaf",
+                "type": "decoy",
                 "amount": fake_amount
             }
             

@@ -48,7 +48,10 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
         sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies)
     r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        raise RuntimeError(f"Non-JSON response (HTTP {r.status_code}): {r.text[:200]}")
 
 MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
@@ -328,25 +331,16 @@ def main():
             fail_count += 1
             continue
 
-        # BUG 47 FIX: signed_monero_tx files from monero-wallet-cli's
-        # sign_transfer are in Monero's internal signed_txset format,
-        # NOT raw transaction hex. The correct broadcast method is to use
-        # monero-wallet-rpc's submit_transfer which reads the signed_txset.
-        # Alternatively, we can use the daemon's /sendrawtransaction
-        # endpoint, but ONLY if the blob contains raw TX hex.
+        # All .signed files from our pipeline are signed_txset blobs (binary).
+        # They MUST be broadcast via wallet-rpc's submit_transfer, which
+        # expects tx_data_hex = hex encoding of the binary signed_txset.
+        # The daemon's /sendrawtransaction expects raw TX hex (a completely
+        # different format) and would reject signed_txset data.
         #
-        # We detect the format: if the data starts with valid hex chars and
-        # decodes cleanly, treat as raw hex. Otherwise, treat as a
-        # signed_txset (base64/binary) and use submit_transfer via RPC.
-        try:
-            raw_hex = raw_data.decode('ascii').strip()
-            # Verify it's actually hex
-            bytes.fromhex(raw_hex)
-            use_raw_hex = True
-        except (UnicodeDecodeError, ValueError):
-            # Binary signed_txset — will hex-encode for submit_transfer's
-            # tx_data_hex parameter (see line where rpc_payload is built).
-            use_raw_hex = False
+        # Hot wallet blobs (from tx_metadata_list) are also binary on disk
+        # (decoded from hex during phase_create). They go through the same
+        # submit_transfer path.
+        use_wallet_rpc = True  # always for our pipeline's .signed files
 
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
@@ -371,55 +365,35 @@ def main():
         start_time = time.time()
 
         while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
-            rpc_url = rpc_pool[_secrets.randbelow(len(rpc_pool))]
             try:
-                if use_raw_hex:
-                    submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
-                    res = _single_post(
-                        submit_url,
-                        {"tx_as_hex": raw_hex, "do_not_relay": False},
-                        proxy,
-                    )
-                    status = res.get("status", "")
-                    is_double = res.get("double_spend", False)
-                    txid = res.get("tx_hash", "")
+                # submit_transfer via wallet-rpc (the ONLY correct method
+                # for signed_txset files from our pipeline)
+                wallet_rpc_url = args.wallet_rpc.rstrip("/") + "/json_rpc"
+                _wrpc_host = urlparse(args.wallet_rpc).hostname or "127.0.0.1"
+                if _wrpc_host.lower() in _LOCALHOST_NAMES:
+                    wallet_proxy = {"http": None, "https": None}
                 else:
-                    # BUG 59 FIX: submit_transfer is a WALLET-RPC method
-                    # (port 18082/18083), NOT a monerod method (port 18081).
-                    # The old code sent this to the daemon RPC pool, which
-                    # always returned "Method not found." Must use the
-                    # --wallet-rpc endpoint instead.
-                    #
-                    # Proxy routing: wallet-rpc is typically on localhost.
-                    # Routing localhost through a SOCKS proxy fails (the
-                    # proxy connects to ITS localhost, not ours). Only use
-                    # the proxy for non-localhost wallet-rpc endpoints.
-                    wallet_rpc_url = args.wallet_rpc.rstrip("/") + "/json_rpc"
-                    _wrpc_host = urlparse(args.wallet_rpc).hostname or "127.0.0.1"
-                    if _wrpc_host.lower() in _LOCALHOST_NAMES:
-                        wallet_proxy = {"http": None, "https": None}
-                    else:
-                        wallet_proxy = proxy
-                    rpc_payload = {
-                        "jsonrpc": "2.0",
-                        "id": "0",
-                        "method": "submit_transfer",
-                        "params": {"tx_data_hex": raw_data.hex()},
-                    }
-                    res = _single_post(wallet_rpc_url, rpc_payload, wallet_proxy)
-                    rpc_result = res.get("result", {})
-                    rpc_error = res.get("error", {})
-                    if rpc_error:
-                        status = "FAILED"
-                        is_double = "double" in str(rpc_error).lower()
-                        txid = ""
-                        err_msg = rpc_error.get("message", str(rpc_error))
-                        print(f"  [!] submit_transfer error: {str(err_msg)[:80]}")
-                    else:
-                        status = "OK" if "tx_hash_list" in rpc_result else "FAILED"
-                        is_double = False
-                        tx_hashes = rpc_result.get("tx_hash_list", [])
-                        txid = tx_hashes[0] if tx_hashes else ""
+                    wallet_proxy = proxy
+                rpc_payload = {
+                    "jsonrpc": "2.0",
+                    "id": "0",
+                    "method": "submit_transfer",
+                    "params": {"tx_data_hex": raw_data.hex()},
+                }
+                res = _single_post(wallet_rpc_url, rpc_payload, wallet_proxy)
+                rpc_result = res.get("result", {})
+                rpc_error = res.get("error", {})
+                if rpc_error:
+                    status = "FAILED"
+                    is_double = "double" in str(rpc_error).lower()
+                    txid = ""
+                    err_msg = rpc_error.get("message", str(rpc_error))
+                    print(f"  [!] submit_transfer error: {str(err_msg)[:80]}")
+                else:
+                    tx_hashes = rpc_result.get("tx_hash_list", [])
+                    status = "OK" if tx_hashes else "FAILED"
+                    is_double = False
+                    txid = tx_hashes[0] if tx_hashes else ""
 
                 if status == "OK" and not is_double:
                     if not txid:

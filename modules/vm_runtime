@@ -430,6 +430,7 @@ Examples:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
         tmp.replace(args.out)
+        os.chmod(args.out, 0o600)
         
         print(f"[+] VM timing profile → {args.out}")
         print(f"[+] Events: {len(delays)}, Base delay: {base_delay}s")
