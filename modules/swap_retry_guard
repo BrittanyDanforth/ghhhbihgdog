@@ -810,8 +810,7 @@ Examples:
     # Security options
     parser.add_argument("--stealth-mode", action="store_true",
                        help="Enable maximum stealth with traffic obfuscation")
-    parser.add_argument("--quantum-entropy", action="store_true",
-                       help="(Always enabled) PBKDF2-based entropy fusion from multiple sources")
+    
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
     
@@ -820,16 +819,10 @@ Examples:
                        help="Simulate swaps without actual execution")
     parser.add_argument("--force-circuit-burn", action="store_true",
                        help="Force circuit burn before each swap")
-    parser.add_argument("--max-concurrent", type=int, default=1,
-                       help="Maximum concurrent swap operations")
-    
     # Advanced options
-    parser.add_argument("--integrity-verify", action="store_true",
-                       help="Enable deep integrity verification")
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")
-    parser.add_argument("--no-timing-jitter", action="store_true",
-                       help="Disable timing jitter between swaps (not recommended)")
+    
     
     args = parser.parse_args()
     
@@ -847,9 +840,6 @@ Examples:
         print(f"[!] phantom-prob must be between 0.0 and 1.0, got {args.phantom_prob}", file=sys.stderr)
         sys.exit(1)
         
-    if args.max_concurrent < 1 or args.max_concurrent > 10:
-        print(f"[!] max-concurrent must be between 1 and 10, got {args.max_concurrent}", file=sys.stderr)
-        sys.exit(1)
         
     # Validate proxy chain
     for proxy_url in args.proxy_chain.split(','):
@@ -893,7 +883,7 @@ Examples:
     print(f"    Plan file: {args.plan}")
     print(f"    Proxy chain: {len(args.proxy_chain.split(','))} hops")
     print(f"    Stealth mode: {'enabled' if args.stealth_mode else 'disabled'}")
-    print(f"    Quantum entropy: {'enabled' if args.quantum_entropy else 'disabled'}")
+    
     print(f"    Phantom failure rate: {args.phantom_prob:.2%}")
     print(f"    Dry run: {'yes' if args.dry_run else 'no'}")
     print()

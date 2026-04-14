@@ -470,11 +470,7 @@ class DeadManSwitch:
             # Secure delete original
             AntiForensics.secure_delete_file(SEED_FILE)
             
-            print(f"[+] Entropy seed locked successfully")
-            print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
-            print(f"[+] Expires: {metadata['expires_at']}")
-            
-            # Handle QR code generation
+            # Handle QR code generation / token delivery BEFORE announcing success
             if qr_image and QR_AVAILABLE:
                 qr_filename = f"unlock_qr_{secrets.token_hex(4)}.png"
                 qr_path = QR_OUTPUT_DIR / qr_filename
@@ -493,7 +489,11 @@ class DeadManSwitch:
             
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)
-            
+
+            print(f"[+] Entropy seed locked successfully")
+            print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
+            print(f"[+] Expires: {metadata['expires_at']}")
+
             return True
             
         except Exception as e:
@@ -633,7 +633,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
                        help="Save QR code as encrypted image file")
     parser.add_argument("--steganography", action="store_true",
                        help="Hide QR code using steganographic techniques")
-    parser.add_argument("--auto-clear", action="store_true", default=True,
+    parser.add_argument("--no-auto-clear", action="store_true", default=False,
                        help="Auto-clear terminal QR after 30 seconds")
     
     return parser
@@ -658,7 +658,7 @@ def main():
                 show_qr=args.show_qr,
                 qr_image=args.qr_image,
                 steganography=args.steganography,
-                auto_clear=args.auto_clear
+                auto_clear=not args.no_auto_clear
             )
             sys.exit(0 if success else 1)
             

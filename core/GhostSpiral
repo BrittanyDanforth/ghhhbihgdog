@@ -35,7 +35,7 @@ if _CORE_DIR not in sys.path:
     sys.path.insert(0, _CORE_DIR)
 
 from gs_common import (
-    VERSION, integrity_log, verify_tor, tor_recheck, newnym,
+    integrity_log, verify_tor, tor_recheck, newnym,
     safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
@@ -89,7 +89,6 @@ def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        "GhostSpiral v10.5",
         description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
     )
 
@@ -240,9 +239,6 @@ def main():
     verify_tor(proxy)
     integrity_log("stage0", "tor_ok")
 
-    # Fee estimation done after RPC is connected (needs the RPC)
-    integrity_log("stage0", "env_checks_ok")
-
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
 
@@ -270,6 +266,7 @@ def main():
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
     integrity_log("stage0", "rpc_sync_ok")
+    integrity_log("stage0", "env_checks_ok")
 
     fee_xmr = fetch_fee_from_rpc(rpc_primary)
     integrity_log("stage0", "fee_fetched")
