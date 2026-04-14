@@ -315,7 +315,6 @@ def main():
             print(f"  [!] Missing: {blob.name} - skipping")
             prog["log"].append({"idx": idx, "file": blob.name, "sent": False,
                                 "error": "file_missing"})
-            prog["last"] = idx
             atomic_write_json(prog, progF)
             fail_count += 1
             continue
@@ -325,7 +324,6 @@ def main():
             integrity_log("broadcast", f"empty_blob:{blob.name}")
             prog["log"].append({"idx": idx, "file": blob.name, "sent": False,
                                 "error": "empty_blob"})
-            prog["last"] = idx
             atomic_write_json(prog, progF)
             fail_count += 1
             continue
