@@ -65,8 +65,8 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
     """Gather entropy from multiple OS / hardware sources."""
     entropy: dict[str, object] = {}
 
-    # 1. OS randomness pool
-    entropy["urandom"] = secrets.token_hex(num_bytes)
+    # 1. OS randomness pool (store hash only — raw CSPRNG output must not leak into JSON)
+    entropy["urandom_hash"] = hashlib.sha256(secrets.token_bytes(num_bytes)).hexdigest()
 
     # 2. High‑precision time snapshot
     entropy["time_ns"] = time.time_ns()
@@ -77,18 +77,20 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
     # 4. CPU, memory, network stats (if psutil available)
     if psutil:
         try:
-            cpu_times = psutil.cpu_times()._asdict()
-            mem_info = psutil.virtual_memory()._asdict()
-            entropy["cpu"] = cpu_times
-            entropy["mem"] = mem_info
-            
-            # Network stats might not be available on all systems
+            # Hash system metrics instead of storing raw values (OPSEC:
+            # raw cpu_times, mem_info, net_io are strong host fingerprints)
+            cpu_raw = json.dumps(psutil.cpu_times()._asdict(), sort_keys=True)
+            mem_raw = json.dumps(psutil.virtual_memory()._asdict(), sort_keys=True)
+            entropy["cpu_hash"] = hashlib.sha256(cpu_raw.encode()).hexdigest()
+            entropy["mem_hash"] = hashlib.sha256(mem_raw.encode()).hexdigest()
+
             try:
                 net_io = psutil.net_io_counters()
                 if net_io:
-                    entropy["net"] = net_io._asdict()
+                    net_raw = json.dumps(net_io._asdict(), sort_keys=True)
+                    entropy["net_hash"] = hashlib.sha256(net_raw.encode()).hexdigest()
             except (AttributeError, OSError):
-                entropy["net"] = {"status": "unavailable"}
+                pass
         except Exception as e:
             entropy["psutil_error"] = str(e)
 
@@ -125,19 +127,26 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
 
 
 def build_seed_bundle(entropy: dict, num_bytes: int) -> dict:
-    """Wrap collected entropy into final bundle with metadata."""
+    """Wrap collected entropy into final bundle with metadata.
+    Includes top-level ``seed_hex`` so that SML and other modules can
+    load the primary seed directly without digging into ``sources``.
+    """
+    # Derive a primary seed from all collected entropy
+    combined = json.dumps(entropy, sort_keys=True).encode()
+    primary_seed = hashlib.sha256(combined).hexdigest()
+
     bundle = {
         "version": VERSION,
         "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
         "bytes_len": num_bytes,
+        "seed_hex": primary_seed,
         "sources": entropy,
     }
-    
-    # Create a copy without the sha256 field for hashing
-    bundle_for_hash = bundle.copy()
+
+    bundle_for_hash = {k: v for k, v in bundle.items() if k != "sha256"}
     bundle_bytes = json.dumps(bundle_for_hash, sort_keys=True).encode()
     bundle["sha256"] = hashlib.sha256(bundle_bytes).hexdigest()
-    
+
     return bundle
 
 
@@ -149,6 +158,7 @@ def write_bundle(bundle: dict, out_path: Path):
         
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         with tmp_path.open("w", encoding="utf-8") as fh:
+            os.chmod(tmp_path, 0o600)
             json.dump(bundle, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())

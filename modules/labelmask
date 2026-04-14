@@ -60,6 +60,10 @@ def sha256_hex(data: bytes) -> str:
 def load_json(path: Path) -> Tuple[dict, str]:
     if not path.exists():
         print(f"[!] File not found → {path}", file=sys.stderr)
+        if "entropy_seed" in str(path):
+            print(f"[!] Generate it first: python3 en_seeder --out {path}", file=sys.stderr)
+        elif "dag" in str(path):
+            print(f"[!] Generate it first: python3 PAG --seed entropy_seed.json --out {path}", file=sys.stderr)
         sys.exit(1)
     try:
         raw = path.read_bytes()
@@ -296,9 +300,12 @@ def main():
     dag, dag_sha = load_json(args.dag)
     seed_bundle, seed_sha = load_json(args.seed)
 
-    if args.verify and not validate_dag_structure(dag):
-        print("[!] Invalid DAG structure", file=sys.stderr)
-        sys.exit(1)
+    if not validate_dag_structure(dag):
+        if args.verify:
+            print("[!] Invalid DAG structure — aborting (--verify)", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("[!] WARNING: DAG structure validation failed. Processing anyway...", file=sys.stderr)
 
     # Enhanced deterministic RNG seeding
     # Mix seed hash + dag hash + version for better entropy distribution

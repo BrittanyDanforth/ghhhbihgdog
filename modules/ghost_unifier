@@ -74,11 +74,13 @@ MODULES = {
 # Helper/runner
 # ---------------------------------------------------------------------------
 
-def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True):
+def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True,
+             timeout: int = 600):
     """Execute a subprocess command with error handling."""
     print("[•]", " ".join(cmd))
     try:
-        result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True)
+        result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True,
+                                timeout=timeout)
         if result.stdout:
             print(f"    Output: {result.stdout.strip()}")
         return result
@@ -86,6 +88,9 @@ def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = Tr
         print(f"    Error: Command failed with exit code {e.returncode}")
         if e.stderr:
             print(f"    Stderr: {e.stderr.strip()}")
+        raise
+    except subprocess.TimeoutExpired:
+        print(f"    Error: Command timed out after {timeout}s")
         raise
     except FileNotFoundError as e:
         print(f"    Error: Command not found - {e}")
@@ -193,8 +198,19 @@ def main():
 
         steps = []
 
-        # 1. Entropy seed
-        if args.force or not SEED.exists():
+        # 1. Entropy seed — also regenerate if file exists but is corrupt
+        regen_seed = args.force or not SEED.exists()
+        if not regen_seed and SEED.exists():
+            try:
+                import json as _j
+                _s = _j.loads(SEED.read_text())
+                if not _s.get("seed_hex") or not _s.get("sha256"):
+                    print(f"[!] Seed file exists but is incomplete — regenerating")
+                    regen_seed = True
+            except (ValueError, OSError):
+                print(f"[!] Seed file exists but is corrupt — regenerating")
+                regen_seed = True
+        if regen_seed:
             cmd = MODULES["seed"] + ["--bytes", str(args.seed_bytes), "--out", str(SEED)]
             steps.append(("Entropy seed", cmd))
 
@@ -215,7 +231,8 @@ def main():
 
         # 5. VM runtime delays
         if args.force or not VM_TIMING.exists():
-            cmd = MODULES["vm"] + ["--seed", str(SEED), "--events", "100", "--out", str(VM_TIMING)]
+            cmd = MODULES["vm"] + ["--seed", str(SEED), "--events", "100", "--out", str(VM_TIMING),
+                                   "--tor-proxy", args.tor]
             steps.append(("VM timing", cmd))
 
         # 6. Noise (optional)

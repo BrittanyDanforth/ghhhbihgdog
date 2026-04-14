@@ -88,8 +88,7 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 # Network configuration
 THOR_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
-    "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 
 # Security parameters
@@ -189,7 +188,7 @@ class QuantumEntropyFusion:
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=b'GhostSpiral_v16.9_Quantum',
+                salt=b'entropy_fusion_kdf_v1',
                 iterations=100000,
             )
             return kdf.derive(combined)
@@ -233,12 +232,30 @@ class CircuitBurnProtocol:
         return False
         
     def burn_circuit(self) -> bool:
-        """Execute circuit burn with full identity rotation."""
+        """Execute circuit burn with full identity rotation.
+        Tries Unix socket first, then TCP 9051 (system tor), then 9151 (Tor Browser).
+        """
         try:
-            with Controller.from_socket_file(self.control_socket) as controller:
-                controller.authenticate()
-                
-                # Signal new identity
+            controller = None
+            if os.path.exists(self.control_socket):
+                controller = Controller.from_socket_file(self.control_socket)
+            else:
+                for port in (9051, 9151):
+                    try:
+                        controller = Controller.from_port(port=port)
+                        break
+                    except Exception:
+                        continue
+            if controller is None:
+                return False
+
+            with controller:
+                tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
+                if tor_pw:
+                    controller.authenticate(password=tor_pw)
+                else:
+                    controller.authenticate()
+
                 controller.signal(Signal.NEWNYM)
                 
                 # Wait for circuit establishment
@@ -402,16 +419,18 @@ class AdvancedSwapOrchestrator:
         signal.signal(signal.SIGTERM, self._cleanup_handler)
         
     def _build_proxy_chain(self, proxy_string: str) -> List[Dict[str, str]]:
-        """Build multi-hop proxy chain."""
+        """Build multi-hop proxy chain. Never returns empty proxy dicts
+        (that would allow direct clearnet connections)."""
         proxies = []
         if proxy_string:
             for proxy_url in proxy_string.split(','):
-                proxy = {
-                    'http': proxy_url.strip(),
-                    'https': proxy_url.strip()
-                }
-                proxies.append(proxy)
-        return proxies or [{}]
+                url = proxy_url.strip()
+                if url:
+                    proxies.append({'http': url, 'https': url})
+        if not proxies:
+            print("[!] CRITICAL: No valid proxies in chain — would leak to clearnet.", file=sys.stderr)
+            sys.exit(1)
+        return proxies
         
     def _build_aggregator_pool(self) -> List[str]:
         """Build aggregator endpoint pool."""
@@ -454,7 +473,11 @@ class AdvancedSwapOrchestrator:
                 self.integrity_chain.add_entry("PROGRESS_CORRUPT", "integrity_check_failed")
                 return default_progress
                 
-        except Exception:
+        except json.JSONDecodeError:
+            print(f"[!] WARNING: Corrupt progress file {RAM_PROGRESS} — starting fresh", file=sys.stderr)
+            return default_progress
+        except Exception as e:
+            print(f"[!] WARNING: Cannot read progress file: {e} — starting fresh", file=sys.stderr)
             return default_progress
             
     def _verify_progress_integrity(self, progress: Dict[str, Any]) -> bool:
@@ -489,10 +512,13 @@ class AdvancedSwapOrchestrator:
             hashlib.sha256
         ).hexdigest()
         
-        # Atomic write
+        # Atomic write with fsync
         temp_file = RAM_PROGRESS.with_suffix('.tmp')
         try:
-            temp_file.write_text(json.dumps(progress, indent=2))
+            with temp_file.open('w') as f:
+                json.dump(progress, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(RAM_PROGRESS)
         except Exception:
             if temp_file.exists():
@@ -618,6 +644,11 @@ class AdvancedSwapOrchestrator:
         if "affiliate" in swap_entry:
             payload["affiliate"] = swap_entry["affiliate"]
             
+        # Force circuit burn before every swap if requested
+        if getattr(self.args, 'force_circuit_burn', False):
+            if self.circuit_burn.burn_circuit():
+                self.integrity_chain.add_entry("FORCED_CIRCUIT_BURN", f"idx={idx}")
+
         # Execute swap with retry logic
         success = False
         last_error = None
@@ -629,8 +660,8 @@ class AdvancedSwapOrchestrator:
             proxy = self.rng.choice(self.proxy_chain)
             
             try:
-                # Anti-correlation timing delay
-                if attempt > 1:
+                # Anti-correlation timing delay (always in stealth mode, only after first attempt otherwise)
+                if attempt > 1 or getattr(self.args, 'stealth_mode', False):
                     delay = self.traffic_obfuscator.calculate_timing_delay()
                     time.sleep(delay)
                     
@@ -674,8 +705,10 @@ class AdvancedSwapOrchestrator:
                 {"last_error": str(last_error)[:100] if last_error else "unknown"}
             )
             
-        # Update progress
-        self.progress["last"] = idx
+        # Only advance progress["last"] on success — failed swaps must be
+        # retried on the next run, not silently skipped.
+        if success:
+            self.progress["last"] = idx
         self.progress["log"].append({
             "idx": idx,
             "success": success,
@@ -684,7 +717,7 @@ class AdvancedSwapOrchestrator:
             "error_count": error_count
         })
         self._save_progress(self.progress)
-        
+
         return success
         
     def execute_swap_plan(self, plan_file: Path) -> bool:
@@ -709,9 +742,15 @@ class AdvancedSwapOrchestrator:
                 print(f"\n[•] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
                 
                 try:
-                    if self._execute_single_swap(swap_entry):
-                        successful_swaps += 1
-                        print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                    result = self._execute_single_swap(swap_entry)
+                    if result:
+                        # Don't count phantom decoys or dry-run as real successes
+                        last_log = self.progress["log"][-1] if self.progress["log"] else {}
+                        if not last_log.get("phantom") and not last_log.get("dry_run"):
+                            successful_swaps += 1
+                            print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                        else:
+                            print(f"[·] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
                     else:
                         print(f"[!] Swap {swap_entry.get('idx', i)} failed")
                         
@@ -743,7 +782,7 @@ class AdvancedSwapOrchestrator:
 def main():
     """Main entry point with enhanced argument parsing."""
     parser = argparse.ArgumentParser(
-        description="GhostSpiral v16.9 Advanced Swap Orchestrator",
+        description="Advanced Swap Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -771,8 +810,7 @@ Examples:
     # Security options
     parser.add_argument("--stealth-mode", action="store_true",
                        help="Enable maximum stealth with traffic obfuscation")
-    parser.add_argument("--quantum-entropy", action="store_true",
-                       help="Use quantum-resistant entropy fusion")
+    
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
     
@@ -781,16 +819,10 @@ Examples:
                        help="Simulate swaps without actual execution")
     parser.add_argument("--force-circuit-burn", action="store_true",
                        help="Force circuit burn before each swap")
-    parser.add_argument("--max-concurrent", type=int, default=1,
-                       help="Maximum concurrent swap operations")
-    
     # Advanced options
-    parser.add_argument("--integrity-verify", action="store_true",
-                       help="Enable deep integrity verification")
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")
-    parser.add_argument("--timing-analysis-resist", action="store_true", default=True,
-                       help="Enable timing analysis resistance")
+    
     
     args = parser.parse_args()
     
@@ -808,9 +840,6 @@ Examples:
         print(f"[!] phantom-prob must be between 0.0 and 1.0, got {args.phantom_prob}", file=sys.stderr)
         sys.exit(1)
         
-    if args.max_concurrent < 1 or args.max_concurrent > 10:
-        print(f"[!] max-concurrent must be between 1 and 10, got {args.max_concurrent}", file=sys.stderr)
-        sys.exit(1)
         
     # Validate proxy chain
     for proxy_url in args.proxy_chain.split(','):
@@ -850,11 +879,11 @@ Examples:
         except Exception as e:
             print(f"[!] Memory locking failed: {e}")
     
-    print("[•] GhostSpiral v16.9 Swap Orchestrator Starting")
+    print("[•] Swap Orchestrator Starting")
     print(f"    Plan file: {args.plan}")
     print(f"    Proxy chain: {len(args.proxy_chain.split(','))} hops")
     print(f"    Stealth mode: {'enabled' if args.stealth_mode else 'disabled'}")
-    print(f"    Quantum entropy: {'enabled' if args.quantum_entropy else 'disabled'}")
+    
     print(f"    Phantom failure rate: {args.phantom_prob:.2%}")
     print(f"    Dry run: {'yes' if args.dry_run else 'no'}")
     print()

@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import sys
 import tempfile
 from pathlib import Path
@@ -185,17 +186,20 @@ def create_gap_account(rng: random.Random) -> dict:
 
 
 def create_gap_subaddress(rng: random.Random) -> dict:
-    """Create a gap subaddress with realistic structure.
-    Uses a plausible-looking random hex string as address placeholder
-    instead of empty string, which would crash tools expecting valid addresses."""
-    fake_addr = "4" + "".join(rng.choices("0123456789ABCDEFabcdef", k=94))
+    """Create a gap subaddress that looks like a real unused Monero subaddress.
+    Uses the standard Monero subaddress prefix '8' + random hex to match the
+    95-character format, but with zero balance and 'used: False' to indicate
+    it was never funded. No metadata field that reveals this is synthetic.
+    """
+    charset = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    fake_addr = "8" + "".join(secrets.choice(charset) for _ in range(94))
     return {
         "label": generate_secure_label(rng),
         "address": fake_addr,
         "balance": 0,
         "unlocked_balance": 0,
         "used": False,
-        "index": 0
+        "index": 0,
     }
 
 

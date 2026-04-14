@@ -63,7 +63,7 @@ OPERATIONAL_LOG = Path("tor_operations.log")
 
 # Real Tor configuration
 TOR_SOCKS_HOST = "127.0.0.1"
-TOR_SOCKS_PORT = 9050
+TOR_SOCKS_PORT = 9050  # default; updated at startup if Tor Browser (9150) is found instead
 TOR_CONTROL_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051
 TOR_CONTROL_SOCKET = "/var/run/tor/control"
@@ -405,7 +405,7 @@ class ProductionEndpointJuggler:
                 return False
             if not parsed.hostname.endswith('.onion'):
                 return False
-            if len(parsed.hostname.replace('.onion', '')) not in [16, 56]:  # v2 or v3 onion
+            if len(parsed.hostname.replace('.onion', '')) != 56:  # v3 only (v2 is dead)
                 return False
             return True
         except:
@@ -504,6 +504,7 @@ class ProductionEndpointJuggler:
         # Atomic write operation
         temp_path = output_path.with_suffix('.tmp')
         with open(temp_path, 'w') as f:
+            os.chmod(temp_path, 0o600)
             json.dump(operational_data, f, indent=2)
         temp_path.replace(output_path)
         os.chmod(output_path, 0o600)
@@ -592,42 +593,53 @@ async def main():
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    # Verify Tor is running
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        result = sock.connect_ex((TOR_SOCKS_HOST, TOR_SOCKS_PORT))
-        sock.close()
-        if result != 0:
-            logger.error(f"Tor SOCKS proxy not accessible at {TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}")
-            logger.error("Ensure Tor is running with SOCKS proxy enabled")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"Cannot verify Tor connection: {e}")
+    # Verify Tor is running (try system tor 9050, then Tor Browser 9150)
+    global TOR_SOCKS_PORT
+    tor_found = False
+    for _try_port in (TOR_SOCKS_PORT, 9150):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((TOR_SOCKS_HOST, _try_port))
+            sock.close()
+            if result == 0:
+                if _try_port != TOR_SOCKS_PORT:
+                    logger.info(f"Tor SOCKS found on port {_try_port} (Tor Browser)")
+                TOR_SOCKS_PORT = _try_port
+                tor_found = True
+                break
+        except Exception:
+            continue
+    if not tor_found:
+        logger.error(f"Tor SOCKS proxy not accessible on {TOR_SOCKS_HOST}:9050 or :9150")
+        logger.error("Ensure Tor is running with SOCKS proxy enabled")
         sys.exit(1)
     
     try:
         juggler = ProductionEndpointJuggler()
         
+        # Apply isolation level: high forces newnym before every operation,
+        # medium uses the --newnym flag, low skips circuit rotation.
+        force_newnym = args.newnym or args.isolation_level == 'high'
+        aggressive = args.aggressive or args.isolation_level == 'high'
+
         if args.loop:
-            # Continuous operations
             await juggler.run_continuous_operations(
                 yaml_files=args.endpoints,
                 output_path=args.output,
                 interval=args.loop,
                 validate_endpoints=args.probe,
-                aggressive_rotation=args.aggressive
+                aggressive_rotation=aggressive
             )
         else:
-            # Single operation
             endpoints = juggler.load_endpoint_sources(args.endpoints)
-            
+
             if args.probe:
                 validated = juggler.validate_endpoint_pool(endpoints, args.max_workers)
             else:
                 validated = list(endpoints)
-            
-            rotated = juggler.rotate_endpoints(validated, args.newnym)
+
+            rotated = juggler.rotate_endpoints(validated, force_newnym)
             juggler.export_operational_data(rotated, args.output)
             
             logger.info(f"Operation complete: {len(rotated)} endpoints ready")

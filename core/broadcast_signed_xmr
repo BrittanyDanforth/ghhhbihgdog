@@ -15,7 +15,7 @@ OPSEC hardening:
   - All progress files written 0600
 """
 from __future__ import annotations
-import argparse, json, time, sys, os, hashlib
+import argparse, json, time, sys, os, hashlib, secrets
 from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
@@ -397,9 +397,12 @@ def main():
                 if status == "OK" and not is_double:
                     if not txid:
                         integrity_log("broadcast", f"no_txid:idx={idx}")
-                        print(f"  [!] TX {idx} accepted but no txid returned")
+                        print(f"  [!] TX {idx} accepted but no txid returned — treating as failure.")
+                        print(f"  [!] Wallet state is ambiguous. Check before rerunning.")
+                        fail_count += 1
+                        break
 
-                    txid_display = txid[:16] if txid else "no-txid"
+                    txid_display = txid[:16]
                     print(f"  [+] TX {idx} -> mempool | {txid_display}...")
                     integrity_log("broadcast", f"sent:idx={idx}")
 
@@ -448,9 +451,9 @@ def main():
                                     confirmed = True
                                     block_height = ht
                                     break
-                        except Exception:
-                            pass
-                        time.sleep(60)
+                        except Exception as poll_err:
+                            integrity_log("broadcast", f"poll_err:idx={idx}:{str(poll_err)[:30]}")
+                        time.sleep(45 + secrets.randbelow(30))
 
                     if confirmed:
                         prog_entry["confirmed"] = True

@@ -40,11 +40,10 @@ except ImportError:
 
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
-    "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
-PAIR_SCHEMA = "thor_pairs_v1"
+PAIR_SCHEMA = "swap_pairs_v1"
 # BUG 66 FIX: Accept all valid BTC address formats including legacy (1...),
 # P2SH (3...), and bech32 (bc1...). ThorChain vaults can use any format.
 BTC_RE = re.compile(
@@ -58,10 +57,16 @@ _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
 
 
 def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
-    """Fetch current BTC/XMR rate from CoinGecko."""
+    """Fetch current BTC/XMR rate from CoinGecko.
+    Set COINGECKO_API_KEY env var for reliable access (free demo key).
+    """
     try:
-        p = safe_get(CG_PRICE, proxy)
-        rate = Decimal(str(p["monero"]["btc"]))
+        url = CG_PRICE
+        cg_key = os.environ.get("COINGECKO_API_KEY", "")
+        if cg_key:
+            url += f"&x_cg_demo_api_key={cg_key}"
+        p = safe_get(url, proxy)
+        rate = Decimal(str(p.get("monero", {}).get("btc", 0)))
         if rate <= 0:
             raise ValueError("Non-positive rate")
         return rate
@@ -249,10 +254,10 @@ def main():
         try:
             import gnupg
             g = gnupg.GPG()
-            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient, armor=True)
             if enc.ok:
                 gpg_path = Path(str(_out) + ".gpg")
-                gpg_path.write_text(str(enc))
+                gpg_path.write_bytes(enc.data if isinstance(enc.data, bytes) else str(enc).encode())
                 os.chmod(gpg_path, 0o600)
                 integrity_log("thor", f"gpg_ok:{gpg_path.name}")
                 print(f"  [+] GPG bundle -> {gpg_path}")

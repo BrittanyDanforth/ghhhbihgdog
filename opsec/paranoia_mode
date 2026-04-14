@@ -313,6 +313,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
     common subdirectories, and any --search-dir paths provided."""
     file_patterns = [
+        # Core pipeline
         "unsigned_*.json", "signer_progress.json",
         "broadcast_progress.json", "stage5_progress.json",
         "wallet_*.json", "thor_pairs_*.json",
@@ -321,15 +322,25 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "integrity_chain.log", "integrity.log",
         "*.blob", "*.signed", "*.unsigned",
         "signed_manifest_v1.json", "unsigned_manifest.json",
-        ".ghostspiral.lock",
-        "renamethis1",
+        ".ghostspiral.lock", ".mixer.lock",
+        # Entropy + chaos pipeline
+        "entropy_seed.json", "entropy_seed.json.tmp",
+        "dag_structure.json", "dag_augmented.json",
+        "label_map.json", "label_map_poisoned.json",
+        "decoy_noise.json",
+        "swap_integrity_v2.log", "swap_progress_secure.json",
+        "tor_operations.log", "operational_endpoints.json",
+        # Mutator output + manifests (smoking gun if left on disk)
+        "*.manifest.json",
+        "wallet_mutation_manifest_v1.json",
+        # Fake/decoy logs
+        "mirror_exec.log", "fake_errors.log",
+        "fake_integrity_chain.log",
     ]
     dir_patterns = [
         "signed_blobs", "unsigned", "tx_staging", "runtime",
     ]
 
-    # BUG 51 FIX: Also search common USB mount points where air-gap
-    # signed files may have been left (operator may forget to clean USB).
     search_roots = list(set([
         Path("."),
         Path.home(),
@@ -343,6 +354,24 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     ] + [Path(d) for d in (extra_dirs or [])]))
 
     count = 0
+
+    # Wipe GhostSpiral files in /dev/shm (RAM-only storage)
+    shm = Path("/dev/shm")
+    if shm.is_dir():
+        shm_patterns = [
+            ".gs_seed_active", ".gs_seed_active.tmp",
+            "gs_*", "vm_timing.json", "vm_timing.tmp",
+            "swap_progress_secure.json", "swap_progress_secure.tmp",
+            "circuit_burn.log", "gs_unlock_token", "gs_paranoia_wipe",
+            ".gs_locked_bundle", ".gs_lock_meta",
+        ]
+        for pat in shm_patterns:
+            for f in shm.glob(pat):
+                if dry:
+                    print(f"  [dry] would securely delete {f}")
+                else:
+                    _secure_delete_file(f)
+                count += 1
     for root in search_roots:
         if not root.is_dir():
             continue
@@ -539,6 +568,12 @@ def main():
 
     require_resources(min_disk_gb=1.0)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
+
+    if os.geteuid() != 0:
+        print("  [!] WARNING: Not running as root. Some operations will silently fail:")
+        print("  [!]   MAC spoof, system log wipe, journal clear, swap wipe")
+        print("  [!]   Run with: sudo python3 paranoia_mode ...")
+        print()
 
     print("  [*] Phase 1: MAC spoof")
     spoof_mac(args.iface, args.dry_run)

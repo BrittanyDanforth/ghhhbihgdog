@@ -35,7 +35,7 @@ if _CORE_DIR not in sys.path:
     sys.path.insert(0, _CORE_DIR)
 
 from gs_common import (
-    VERSION, integrity_log, verify_tor, tor_recheck, newnym,
+    integrity_log, verify_tor, tor_recheck, newnym,
     safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
@@ -50,8 +50,7 @@ BTC_RE = re.compile(
 )
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
-    "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 
 def _core_script(name: str) -> str:
@@ -90,7 +89,6 @@ def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        "GhostSpiral v10.5",
         description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
     )
 
@@ -98,7 +96,7 @@ def main():
     mode_group.add_argument("--btc-entry",
                             help="BTC entry address (bech32) — SENDER mode: you own the BTC")
     mode_group.add_argument("--receive-wallet",
-                            help="gs_receive_wallet_v1 JSON from create_receive_wallet — "
+                            help="Wallet JSON from create_receive_wallet — "
                                  "RECEIVER mode: XMR already arrived on this address")
 
     cli.add_argument("--tor-proxy", required=True,
@@ -147,8 +145,9 @@ def main():
             sys.exit(f"[!] Resume plan not found: {resume_path}")
         with open(resume_path) as f:
             _rp = json.load(f)
-        if _rp.get("meta", {}).get("schema") != "unsigned_v1":
-            sys.exit("[!] Resume plan is not unsigned_v1 schema")
+        _schema = _rp.get("meta", {}).get("schema", "")
+        if _schema not in ("plan_v1", "unsigned_v1"):
+            sys.exit(f"[!] Unrecognized plan schema: {_schema}")
         if _rp.get("meta", {}).get("mock"):
             sys.exit("[!] Cannot resume a mock plan (no real funds)")
 
@@ -169,11 +168,13 @@ def main():
             pass
 
         staging_dir = "tx_staging"
-        lock_path = Path(".ghostspiral.lock")
-        if lock_path.exists():
+        lock_path = Path(".mixer.lock")
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
             sys.exit("[!] Lock file exists. Another instance may be running.")
-        lock_path.write_text(str(os.getpid()))
-        secure_file_perms(lock_path)
 
         try:
             _stage5_run(args, resume_path, staging_dir, proxy, bal)
@@ -195,8 +196,8 @@ def main():
             sys.exit(f"[!] Receive wallet file not found: {rw_path}")
         with open(rw_path) as f:
             rw_data = json.load(f)
-        if rw_data.get("schema") != "gs_receive_wallet_v1":
-            sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
+        if rw_data.get("schema") not in ("receive_wallet_v1", "gs_receive_wallet_v1"):
+            sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:
@@ -238,9 +239,6 @@ def main():
     verify_tor(proxy)
     integrity_log("stage0", "tor_ok")
 
-    # Fee estimation done after RPC is connected (needs the RPC)
-    integrity_log("stage0", "env_checks_ok")
-
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
 
@@ -268,6 +266,7 @@ def main():
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
     integrity_log("stage0", "rpc_sync_ok")
+    integrity_log("stage0", "env_checks_ok")
 
     fee_xmr = fetch_fee_from_rpc(rpc_primary)
     integrity_log("stage0", "fee_fetched")
@@ -289,8 +288,11 @@ def main():
             # Without this, JM may resolve maker addresses over clearnet.
             from urllib.parse import urlparse as _urlparse
             _parsed_proxy = _urlparse(args.tor_proxy)
+            jm_path = Path(args.joinmarket_wallet).parent / "tumble.py"
+            if not jm_path.exists():
+                jm_path = Path("tumble.py")
             result = subprocess.run(
-                ["python3", "tumble.py",
+                [sys.executable, str(jm_path),
                  "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
                  "--socks5-port", str(_parsed_proxy.port or 9050),
                  args.joinmarket_wallet, btc_addr, "all"],
@@ -323,10 +325,11 @@ def main():
 
     def _thornode_quote(amt: Decimal, xmr_dest: str) -> dict | None:
         """Try THORNode native API for a swap quote (no API key needed)."""
+        from urllib.parse import quote as _url_quote
         amount_sats = int(amt * Decimal("1e8"))
         params = (
             f"from_asset=BTC.BTC&to_asset=XMR.XMR"
-            f"&amount={amount_sats}&destination={xmr_dest}"
+            f"&amount={amount_sats}&destination={_url_quote(xmr_dest, safe='')}"
         )
         for base_url in THORNODE_APIS:
             try:
@@ -337,8 +340,17 @@ def main():
                 inbound = resp.get("inbound_address", "")
                 memo = resp.get("memo", "")
                 expected_out = resp.get("expected_amount_out", "0")
-                if inbound and memo:
+                if inbound and memo and len(memo) > 5:
+                    # THORNode returns expected_amount_out in target asset's
+                    # native precision. For XMR that's piconero (1e12).
                     expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
+                    if expected_xmr <= 0:
+                        continue
+                    # Sanity: if the result looks wildly wrong (e.g. millions of XMR
+                    # for a normal BTC amount), the API may have changed units
+                    if expected_xmr > 100000:
+                        integrity_log("stage2", f"suspicious_quote:{expected_xmr}")
+                        continue
                     return {
                         "deposit_address": inbound,
                         "memo": memo,
@@ -417,11 +429,11 @@ def main():
         address if the wallet file is inspected forensically (BUG 37 FIX)."""
         subs = []
         for i in range(n):
-            label = f"gs_{secure_hex(4)}"
+            label = secure_hex(6)
             addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         for d in range(decoys):
-            label = f"gs_{secure_hex(4)}"
+            label = secure_hex(6)
             addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         return subs
@@ -481,9 +493,12 @@ def main():
             for dep in swap_deposits:
                 print(f"\n  --- Chunk {dep['chunk']} ---")
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
+                # Show full deposit address — the operator needs it to send BTC.
+                # These are THORChain vault addresses, not the operator's own.
                 print(f"  To address:   {dep['deposit_address']}")
                 if dep.get("memo"):
-                    print(f"  With memo:    {dep['memo'][:60]}...")
+                    # Truncate memo in terminal to reduce log exposure
+                    print(f"  With memo:    {dep['memo'][:40]}…")
                 print(f"  Expected XMR: ~{dep['expected_xmr']}")
             print()
             print("  ============================================================")
@@ -638,8 +653,7 @@ def main():
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
     meta = {
-        "schema": "unsigned_v1",
-        "version": VERSION,
+        "schema": "plan_v1",
         "created": int(time.time()) // 600 * 600,
         "rounds": len(plan),
         "fee_per_round": str(per_round_fee),
@@ -648,6 +662,8 @@ def main():
     }
     if is_mock_plan:
         meta["mock"] = True
+    if shutdown_requested():
+        meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)
@@ -702,16 +718,33 @@ def main():
                 old_plan.unlink()
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
-    # Lock file to prevent concurrent runs
-    lock_path = Path(".ghostspiral.lock")
-    if lock_path.exists():
-        sys.exit(
-            "[!] Lock file exists: .ghostspiral.lock\n"
-            "    Another GhostSpiral instance may be running.\n"
-            "    If not, delete the lock file manually."
-        )
-    lock_path.write_text(str(os.getpid()))
-    secure_file_perms(lock_path)
+    # Atomic lock file to prevent concurrent runs (O_EXCL = fail if exists)
+    lock_path = Path(".mixer.lock")
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        try:
+            stale_pid = lock_path.read_text().strip()
+            if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                lock_path.unlink()
+                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+            else:
+                sys.exit(
+                    f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                    "    Another instance may be running.\n"
+                    "    If not, delete the lock file manually."
+                )
+        except (OSError, ValueError):
+            sys.exit(
+                "[!] Lock file exists: .mixer.lock\n"
+                "    Another instance may be running.\n"
+                "    If not, delete the lock file manually."
+            )
 
     staging_dir = "tx_staging"
 
@@ -810,8 +843,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                     completed_indices.add(pending_idx)
                 if completed_indices:
                     print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            integrity_log("stage5", f"progress_corrupt:{str(e)[:40]}")
+            print(f"  [!] Corrupt progress file — starting fresh ({e})")
 
     success_count = 0
     fail_count = 0
@@ -828,6 +862,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             continue
 
         tx = plan_txs[tx_idx]
+        if "amt" not in tx or "dst" not in tx:
+            integrity_log("stage5", f"malformed_tx:idx={tx_idx}")
+            print(f"  [!] TX {tx_idx} is malformed (missing amt or dst) — ABORTING.")
+            fail_count += 1
+            break
         print(f"\n  [*] TX {tx_idx}/{total_txs-1}: {tx['amt']} XMR -> {scrub_address(tx['dst'])}")
 
         # Apply planned delay (timing decorrelation)
@@ -850,7 +889,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
         try:
             create_cmd = [
-                "python3", _core_script("airgap_tx_signer"), str(ufile),
+                sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                 "--phase", "create",
                 "--rpc", args.rpc_primary,
                 "--tor-proxy", args.tor_proxy,
@@ -890,7 +929,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             print(f"  [*] Step 2: Signing TX {tx_idx}...")
             try:
                 sign_cmd = [
-                    "python3", _core_script("airgap_tx_signer"), str(ufile),
+                    sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                     "--phase", "sign",
                     "--wallet-file", args.wallet_file,
                     "--outdir", staging_dir,
@@ -956,6 +995,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
             print(f"  [!] ABORTING pipeline — wallet state may be inconsistent.")
             print(f"  [!] Check if the TX was actually broadcast before rerunning.")
+            _awj({
+                "plan_fingerprint": plan_fingerprint,
+                "completed": sorted(completed_indices),
+            }, progress_file)
             fail_count += 1
             break
 
@@ -964,7 +1007,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         # wallet's internal state (spent outputs). But we must still call
         # refresh so the wallet re-scans and sees the TX in the mempool/chain.
         # Without this, the next transfer_split may reuse spent outputs.
-        time.sleep(5)
+        secure_delay(3.0, 8.0)
         try:
             rpc_primary.raw_request("refresh", {})
         except Exception as e:
@@ -999,9 +1042,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
 
     try:
         print("  [*] Exit strategy simulation...")
-        exit_amt = str(sum(Decimal(t["amt"]) for t in plan_txs))
+        exit_amt = str(sum(Decimal(t.get("amt", "0")) for t in plan_txs))
         subprocess.run(
-            ["python3", _core_script("exit_strategy_simulator"), exit_amt,
+            [sys.executable, _core_script("exit_strategy_simulator"), exit_amt,
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
         )

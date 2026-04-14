@@ -69,8 +69,8 @@ def main():
                     help="monero-wallet-rpc endpoint")
     ap.add_argument("--tor-proxy",
                     help="socks5h://host:port if routing via Tor")
-    ap.add_argument("--label", default="GhostSpiral_entry",
-                    help="label for the new subaddress")
+    ap.add_argument("--label", default="",
+                    help="label for the new subaddress (default: random hex)")
     ap.add_argument("--account-index", type=int, default=0,
                     help="wallet account index to create subaddress on (default: 0)")
     ap.add_argument("--output-dir", default=".",
@@ -93,6 +93,9 @@ def main():
         integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
+    if not args.label:
+        args.label = secure_hex(6)
+
     acct_idx = args.account_index
     accounts = wallet_rpc.accounts
     if acct_idx >= len(accounts):
@@ -114,7 +117,7 @@ def main():
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
-        "schema": "gs_receive_wallet_v1",
+        "schema": "receive_wallet_v1",
         "created": int(time.time()) // 600 * 600,
         "address": addr_str,
         "account_index": acct_idx,

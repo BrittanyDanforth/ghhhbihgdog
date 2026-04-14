@@ -470,11 +470,7 @@ class DeadManSwitch:
             # Secure delete original
             AntiForensics.secure_delete_file(SEED_FILE)
             
-            print(f"[+] Entropy seed locked successfully")
-            print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
-            print(f"[+] Expires: {metadata['expires_at']}")
-            
-            # Handle QR code generation
+            # Handle QR code generation / token delivery BEFORE announcing success
             if qr_image and QR_AVAILABLE:
                 qr_filename = f"unlock_qr_{secrets.token_hex(4)}.png"
                 qr_path = QR_OUTPUT_DIR / qr_filename
@@ -493,7 +489,11 @@ class DeadManSwitch:
             
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)
-            
+
+            print(f"[+] Entropy seed locked successfully")
+            print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
+            print(f"[+] Expires: {metadata['expires_at']}")
+
             return True
             
         except Exception as e:
@@ -545,16 +545,22 @@ class DeadManSwitch:
         try:
             # Load and verify metadata
             metadata = json.loads(LOCK_METADATA.read_text())
+            for required_key in ("expires_at", "encrypted_size", "data_hash"):
+                if required_key not in metadata:
+                    print(f"[!] Lock metadata missing required field: {required_key}")
+                    print("[!] Bundle preserved — metadata may be corrupt. Check manually.")
+                    return False
+
             expires_at = datetime.fromisoformat(metadata["expires_at"].replace('Z', '+00:00'))
-            
+
             if datetime.now(timezone.utc) > expires_at:
                 print("[!] Unlock token expired - initiating self-destruct")
                 self._secure_cleanup()
                 return False
-            
+
             # Attempt decryption
             encrypted_data = LOCKED_BUNDLE.read_bytes()
-            
+
             if len(encrypted_data) != metadata["encrypted_size"]:
                 print("[!] Data integrity check failed - possible tampering")
                 self._secure_cleanup()
@@ -567,24 +573,24 @@ class DeadManSwitch:
             data_hash = hashlib.sha3_256(decrypted_data).hexdigest()
             if data_hash != metadata["data_hash"]:
                 print("[!] Decrypted data integrity check failed")
-                self._secure_cleanup()
+                print("[!] Locked bundle is PRESERVED — you can retry with the correct token.")
                 return False
-            
+
             # Restore entropy seed
             SEED_FILE.write_bytes(decrypted_data)
-            
-            # Secure cleanup
+
+            # Only now that restore succeeded, clean up the encrypted copies
             self._secure_cleanup()
-            
+
             print("[+] Entropy seed successfully unlocked and restored")
             print(f"[+] File restored: {SEED_FILE}")
-            
+
             return True
-            
+
         except Exception as e:
             print(f"[!] Unlock failed: {e}")
-            print("[!] Invalid token or corrupted data - initiating self-destruct")
-            self._secure_cleanup()
+            print("[!] Locked bundle is PRESERVED — retry with the correct token.")
+            print("[!] Use --emergency-destruct if you want to destroy everything.")
             return False
     
     def emergency_destruct(self) -> bool:
@@ -627,7 +633,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
                        help="Save QR code as encrypted image file")
     parser.add_argument("--steganography", action="store_true",
                        help="Hide QR code using steganographic techniques")
-    parser.add_argument("--auto-clear", action="store_true", default=True,
+    parser.add_argument("--no-auto-clear", action="store_true", default=False,
                        help="Auto-clear terminal QR after 30 seconds")
     
     return parser
@@ -652,7 +658,7 @@ def main():
                 show_qr=args.show_qr,
                 qr_image=args.qr_image,
                 steganography=args.steganography,
-                auto_clear=args.auto_clear
+                auto_clear=not args.no_auto_clear
             )
             sys.exit(0 if success else 1)
             

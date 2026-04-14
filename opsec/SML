@@ -81,18 +81,27 @@ def cmd_load(args):
         print("  [!] Seed file has no seed_hex field")
         sys.exit(1)
 
-    # Verify integrity
+    # Verify integrity: en_seeder's sha256 is over the bundle JSON (minus sha256 key),
+    # NOT over the raw seed_hex bytes. Verify the bundle hash if present.
     try:
         seed_bytes = bytes.fromhex(seed_hex)
     except ValueError:
         print("  [!] seed_hex is not valid hexadecimal — file may be corrupt")
         sys.exit(1)
-    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
-    if claimed_hash and actual_hash != claimed_hash:
-        print("  [!] Seed hash MISMATCH — file may be tampered!")
-        print(f"      Expected: {claimed_hash}")
-        print(f"      Actual:   {actual_hash}")
-        sys.exit(1)
+
+    if claimed_hash:
+        bundle_for_hash = {k: v for k, v in data.items() if k != "sha256"}
+        bundle_json = json.dumps(bundle_for_hash, sort_keys=True).encode()
+        actual_bundle_hash = hashlib.sha256(bundle_json).hexdigest()
+        if actual_bundle_hash != claimed_hash:
+            # Fallback: maybe sha256 was computed over seed_hex bytes directly
+            seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+            if seed_hash != claimed_hash:
+                print("  [!] Seed hash MISMATCH — file may be tampered!")
+                print(f"      Expected: {claimed_hash}")
+                print(f"      Bundle:   {actual_bundle_hash}")
+                print(f"      SeedHex:  {seed_hash}")
+                sys.exit(1)
 
     # Check /dev/shm availability
     if not SHM_DIR.is_dir():
@@ -113,10 +122,13 @@ def cmd_load(args):
         _secure_wipe_bytes(SEED_SHM)
         print("  [·] Previous seed wiped")
 
+    # Compute the hash of the raw seed bytes for the SHM bundle
+    loaded_seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+
     # Write to /dev/shm with 0600 permissions
     bundle = {
         "seed_hex": seed_hex,
-        "sha256": actual_hash,
+        "sha256": loaded_seed_hash,
         "loaded_at": int(time.time()),
         "ttl": args.ttl if args.ttl else None,
         "source": str(seed_path.name),
@@ -130,8 +142,8 @@ def cmd_load(args):
     os.replace(tmp, SEED_SHM)
     os.chmod(SEED_SHM, 0o600)
 
-    seed_bytes = len(seed_hex) // 2
-    print(f"  [+] Seed loaded into RAM: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    seed_len = len(seed_hex) // 2
+    print(f"  [+] Seed loaded into RAM: {seed_len} bytes ({seed_len * 8} bits)")
     print(f"  [+] Location: {SEED_SHM} (RAM-only, 0600 permissions)")
 
     if args.ttl:

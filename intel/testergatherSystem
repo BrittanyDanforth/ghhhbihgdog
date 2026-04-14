@@ -947,8 +947,14 @@ class UltraStealthBrowser:
             chain = proxy_manager.build_chain()
             
             if chain:
-                options.add_argument(f'--proxy-server={chain[0]}')
-                
+                chrome_proxy = chain[0]
+                # Chrome uses socks5:// but always does remote DNS for SOCKS5;
+                # rewrite socks5h:// to socks5:// for Chrome syntax compatibility.
+                chrome_proxy = chrome_proxy.replace('socks5h://', 'socks5://')
+                options.add_argument(f'--proxy-server={chrome_proxy}')
+                # Force remote DNS resolution through the proxy
+                options.add_argument('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1')
+
             # Additional privacy
             options.add_argument('--no-first-run')
             options.add_argument('--no-default-browser-check')
