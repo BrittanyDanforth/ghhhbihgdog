@@ -488,7 +488,6 @@ def generate_dag(args):
         "version": "3.0-poly",
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "seed_ref": {
-            "file": str(args.seed),
             "sha256": seed_hash
         },
         "graph": graph

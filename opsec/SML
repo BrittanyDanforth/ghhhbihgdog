@@ -122,10 +122,13 @@ def cmd_load(args):
         _secure_wipe_bytes(SEED_SHM)
         print("  [·] Previous seed wiped")
 
+    # Compute the hash of the raw seed bytes for the SHM bundle
+    loaded_seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+
     # Write to /dev/shm with 0600 permissions
     bundle = {
         "seed_hex": seed_hex,
-        "sha256": actual_hash,
+        "sha256": loaded_seed_hash,
         "loaded_at": int(time.time()),
         "ttl": args.ttl if args.ttl else None,
         "source": str(seed_path.name),

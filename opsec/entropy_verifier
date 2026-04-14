@@ -143,7 +143,10 @@ def main():
                 print(f"      Actual:  {actual_hash}")
                 errors.append("Hash mismatch — seed file may be tampered")
         seed_bytes = len(seed_hex) // 2
-        entropy_bits = check_entropy_bits(seed_hex)
+        if seed_raw:
+            entropy_bits = check_entropy_bits(seed_hex)
+        else:
+            entropy_bits = 0.0
     else:
         errors.append("No seed_hex and no sources — unrecognized format")
         seed_bytes = 0

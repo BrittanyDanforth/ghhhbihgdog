@@ -567,24 +567,24 @@ class DeadManSwitch:
             data_hash = hashlib.sha3_256(decrypted_data).hexdigest()
             if data_hash != metadata["data_hash"]:
                 print("[!] Decrypted data integrity check failed")
-                self._secure_cleanup()
+                print("[!] Locked bundle is PRESERVED — you can retry with the correct token.")
                 return False
-            
+
             # Restore entropy seed
             SEED_FILE.write_bytes(decrypted_data)
-            
-            # Secure cleanup
+
+            # Only now that restore succeeded, clean up the encrypted copies
             self._secure_cleanup()
-            
+
             print("[+] Entropy seed successfully unlocked and restored")
             print(f"[+] File restored: {SEED_FILE}")
-            
+
             return True
-            
+
         except Exception as e:
             print(f"[!] Unlock failed: {e}")
-            print("[!] Invalid token or corrupted data - initiating self-destruct")
-            self._secure_cleanup()
+            print("[!] Locked bundle is PRESERVED — retry with the correct token.")
+            print("[!] Use --emergency-destruct if you want to destroy everything.")
             return False
     
     def emergency_destruct(self) -> bool:

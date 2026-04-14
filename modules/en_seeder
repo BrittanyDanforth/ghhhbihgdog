@@ -77,18 +77,20 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
     # 4. CPU, memory, network stats (if psutil available)
     if psutil:
         try:
-            cpu_times = psutil.cpu_times()._asdict()
-            mem_info = psutil.virtual_memory()._asdict()
-            entropy["cpu"] = cpu_times
-            entropy["mem"] = mem_info
-            
-            # Network stats might not be available on all systems
+            # Hash system metrics instead of storing raw values (OPSEC:
+            # raw cpu_times, mem_info, net_io are strong host fingerprints)
+            cpu_raw = json.dumps(psutil.cpu_times()._asdict(), sort_keys=True)
+            mem_raw = json.dumps(psutil.virtual_memory()._asdict(), sort_keys=True)
+            entropy["cpu_hash"] = hashlib.sha256(cpu_raw.encode()).hexdigest()
+            entropy["mem_hash"] = hashlib.sha256(mem_raw.encode()).hexdigest()
+
             try:
                 net_io = psutil.net_io_counters()
                 if net_io:
-                    entropy["net"] = net_io._asdict()
+                    net_raw = json.dumps(net_io._asdict(), sort_keys=True)
+                    entropy["net_hash"] = hashlib.sha256(net_raw.encode()).hexdigest()
             except (AttributeError, OSError):
-                entropy["net"] = {"status": "unavailable"}
+                pass
         except Exception as e:
             entropy["psutil_error"] = str(e)
 

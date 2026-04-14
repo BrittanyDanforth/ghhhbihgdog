@@ -700,12 +700,13 @@ def main():
         print(f"[!] Error: {e}")
         sys.exit(1)
     finally:
-        # Secure cleanup
         try:
-            # Clear any temporary files
-            for temp_file in TEMP_DIR.glob("*.tmp"):
+            # Only clean up our own temp files (mirror_exec prefix)
+            for temp_file in TEMP_DIR.glob("mirror_exec*.tmp"):
                 temp_file.unlink(missing_ok=True)
-        except:
+            for temp_file in TEMP_DIR.glob("decoy_*.log"):
+                temp_file.unlink(missing_ok=True)
+        except Exception:
             pass
 
 if __name__ == "__main__":

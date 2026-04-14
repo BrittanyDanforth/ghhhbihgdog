@@ -509,10 +509,13 @@ class AdvancedSwapOrchestrator:
             hashlib.sha256
         ).hexdigest()
         
-        # Atomic write
+        # Atomic write with fsync
         temp_file = RAM_PROGRESS.with_suffix('.tmp')
         try:
-            temp_file.write_text(json.dumps(progress, indent=2))
+            with temp_file.open('w') as f:
+                json.dump(progress, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(RAM_PROGRESS)
         except Exception:
             if temp_file.exists():
@@ -734,9 +737,15 @@ class AdvancedSwapOrchestrator:
                 print(f"\n[•] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
                 
                 try:
-                    if self._execute_single_swap(swap_entry):
-                        successful_swaps += 1
-                        print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                    result = self._execute_single_swap(swap_entry)
+                    if result:
+                        # Don't count phantom decoys or dry-run as real successes
+                        last_log = self.progress["log"][-1] if self.progress["log"] else {}
+                        if not last_log.get("phantom") and not last_log.get("dry_run"):
+                            successful_swaps += 1
+                            print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                        else:
+                            print(f"[·] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
                     else:
                         print(f"[!] Swap {swap_entry.get('idx', i)} failed")
                         

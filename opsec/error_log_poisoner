@@ -107,7 +107,7 @@ def generate_entries(count: int, base_ts: int, rng: random.Random) -> List[str]:
                         msg = msg_tpl.format(rng.randint(1, 99))
                     else:
                         # Generic string replacement
-                        random_str = sha256_hex(rng.randbytes(4))[:8]
+                        random_str = sha256_hex(rng.getrandbits(32).to_bytes(4, 'big'))[:8]
                         msg = msg_tpl.format(random_str)
                 else:
                     # Multiple placeholders - use generic approach
@@ -116,7 +116,7 @@ def generate_entries(count: int, base_ts: int, rng: random.Random) -> List[str]:
                         if rng.choice([True, False]):
                             values.append(rng.randint(1, 1000))
                         else:
-                            values.append(sha256_hex(rng.randbytes(2))[:6])
+                            values.append(sha256_hex(rng.getrandbits(16).to_bytes(2, 'big'))[:6])
                     msg = msg_tpl.format(*values)
             else:
                 msg = msg_tpl
@@ -124,7 +124,7 @@ def generate_entries(count: int, base_ts: int, rng: random.Random) -> List[str]:
             # Fallback to original template if formatting fails
             msg = msg_tpl
         
-        entropy_id = sha256_hex(rng.randbytes(4))[:6]
+        entropy_id = sha256_hex(rng.getrandbits(32).to_bytes(4, 'big'))[:6]
         lines.append(f"{ts} | {tag} | {msg} | id={entropy_id}")
     
     return lines

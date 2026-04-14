@@ -132,7 +132,15 @@ for tool in monerod monero-wallet-cli monero-wallet-rpc; do
 done
 if [ "$MONERO_OK" = false ]; then
     echo ""
+    warn "Monero download uses clearnet (your IP is visible to getmonero.org)."
+    dim "For maximum privacy, download via Tor Browser instead."
+    echo ""
     if confirm "  Download Monero CLI tools now?"; then
+        ARCH=$(uname -m)
+        if [ "$ARCH" != "x86_64" ]; then
+            warn "Detected architecture: $ARCH (not x86_64)"
+            warn "The linux64 download may not work. Check getmonero.org for your arch."
+        fi
         echo "  Downloading from getmonero.org..."
         cd /tmp
         wget -q https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2 && \
@@ -142,6 +150,7 @@ if [ "$MONERO_OK" = false ]; then
         ok "Monero CLI installed" || \
         fail "Download failed — get it from https://www.getmonero.org/downloads/"
         cd - >/dev/null
+        dim "Tip: verify Monero binaries with GPG — see https://www.getmonero.org/downloads/#verify"
     fi
 fi
 

@@ -430,8 +430,13 @@ class MoneroRPC:
         try:
             self._backend = JSONRPCWallet(**backend_kwargs)
         except TypeError:
-            # BUG 79 FIX: Only strip proxy_url from kwargs on TypeError,
-            # not auth credentials or protocol.
+            if "proxy_url" in backend_kwargs and host.lower() not in _LOCALHOST_NAMES:
+                sys.exit(
+                    f"[!] monero-python does not support proxy_url for {host}:{port}.\n"
+                    f"    Cannot safely connect to a non-localhost RPC without proxy.\n"
+                    f"    Either: (a) use 127.0.0.1 with a local wallet-rpc, or\n"
+                    f"            (b) upgrade monero-python to a version that supports proxy_url."
+                )
             fallback_kwargs = {k: v for k, v in backend_kwargs.items()
                                if k != "proxy_url"}
             self._backend = JSONRPCWallet(**fallback_kwargs)
