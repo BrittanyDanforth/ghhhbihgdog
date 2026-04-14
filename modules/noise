@@ -502,7 +502,11 @@ def main():
         print(f"[!] Failed to load configuration: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Initialize deterministic RNG
+    # Initialize deterministic RNG.
+    # WARNING: This PRNG is deterministic from the seed file. Anyone who
+    # obtains entropy_seed.json + dag + labels can reproduce the exact
+    # timing pattern of every noise event, defeating traffic obfuscation.
+    # Delete the seed file after operations or use SML to keep it RAM-only.
     combined_hash = hashlib.sha256(
         (seed_sha + dag_sha + lbl_sha + VERSION + args.intensity).encode()
     ).hexdigest()

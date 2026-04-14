@@ -141,13 +141,37 @@ class AntiForensics:
     
     @staticmethod
     def secure_delete_file(filepath: Path) -> bool:
-        """DOD 5220.22-M standard file wiping"""
+        """DOD 5220.22-M standard file wiping.
+
+        WARNING: Multi-pass overwrite is ineffective on:
+        - SSD/NVMe: firmware wear-levelling remaps blocks; original data may
+          persist on unmapped pages. Use full-disk encryption (LUKS) or
+          blkdiscard --secure instead.
+        - CoW filesystems (btrfs/ZFS): overwrite allocates new blocks; old
+          data remains in snapshots/CoW until garbage collected.
+        - Journaling (ext4 default): journal may retain original data.
+        Only full-disk encryption guarantees erasure on modern hardware.
+        """
         if not filepath.exists():
             return True
         
         try:
             file_size = filepath.stat().st_size
             
+            try:
+                dev = os.stat(filepath).st_dev
+                dev_path = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+                rotational = (dev_path / "queue" / "rotational").resolve()
+                if not rotational.exists():
+                    parent = dev_path.resolve()
+                    rotational = parent.parent / "queue" / "rotational"
+                if rotational.exists() and rotational.read_text().strip() == "0":
+                    print(f"[!] WARNING: {filepath} is on SSD/NVMe — overwrite may not erase "
+                          f"original blocks. Use full-disk encryption (LUKS) or "
+                          f"blkdiscard --secure for reliable erasure.")
+            except (OSError, ValueError):
+                pass
+
             # Multiple pass overwriting
             patterns = [
                 b'\x00' * 1024,  # Zeros

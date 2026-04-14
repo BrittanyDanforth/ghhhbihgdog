@@ -37,6 +37,7 @@ import secrets
 import socket
 
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -264,29 +265,31 @@ class RealEndpointProber:
     def __init__(self, circuit_manager: TorCircuitManager):
         self.circuit_manager = circuit_manager
         self.session_cache = {}
+        self._cache_lock = threading.Lock()
         
     def _create_tor_session(self, session_id: str) -> requests.Session:
-        """Create real Tor-routed HTTP session"""
-        if session_id in self.session_cache:
-            return self.session_cache[session_id]
+        """Create real Tor-routed HTTP session (thread-safe)"""
+        with self._cache_lock:
+            if session_id in self.session_cache:
+                return self.session_cache[session_id]
         
-        session = requests.Session()
-        proxy_config = self.circuit_manager.create_isolation_session(session_id)
-        session.proxies.update(proxy_config)
-        
-        # Production headers
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        })
-        
-        self.session_cache[session_id] = session
-        return session
+            session = requests.Session()
+            proxy_config = self.circuit_manager.create_isolation_session(session_id)
+            session.proxies.update(proxy_config)
+            
+            # Production headers
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            })
+            
+            self.session_cache[session_id] = session
+            return session
     
     def validate_onion_endpoint(self, url: str, timeout: int = 20) -> Tuple[bool, float, Dict]:
         """Real .onion endpoint validation"""
@@ -596,14 +599,14 @@ async def main():
     # Verify Tor is running (try system tor 9050, then Tor Browser 9150)
     global TOR_SOCKS_PORT
     tor_found = False
-    for _try_port in (TOR_SOCKS_PORT, 9150):
+    for _try_port in (9050, 9150):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
             result = sock.connect_ex((TOR_SOCKS_HOST, _try_port))
             sock.close()
             if result == 0:
-                if _try_port != TOR_SOCKS_PORT:
+                if _try_port != 9050:
                     logger.info(f"Tor SOCKS found on port {_try_port} (Tor Browser)")
                 TOR_SOCKS_PORT = _try_port
                 tor_found = True

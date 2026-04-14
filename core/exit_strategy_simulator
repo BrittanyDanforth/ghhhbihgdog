@@ -31,6 +31,11 @@ from gs_common import (
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
 # Bisq and Haveno are P2P DEXs without centralized market APIs.
 # The Bisq price oracle is the closest to an official data source.
+# NOTE: The wiz-operated pricenode (price.bisq.wiz.biz) was removed from
+# the Bisq network in Oct 2023 (PR #6938). Bisq pricenodes now run as
+# Tor hidden services only. This URL will likely time out or 404.
+# Kept as best-effort fallback; the code already aborts gracefully if
+# both CoinGecko and Bisq fail (no silent wrong prices).
 BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
 
 METHODS: Dict[str, Dict] = {

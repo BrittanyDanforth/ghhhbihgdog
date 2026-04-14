@@ -4,6 +4,7 @@ GhostSpiral Toolkit — Interactive Launcher
 """
 from __future__ import annotations
 import json, os, sys, subprocess, shutil
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -242,14 +243,14 @@ def flow_full_pipeline():
 
     amt = prompt("BTC amount to swap")
     try:
-        amt_f = float(amt)
-        if amt_f <= 0:
+        amt_d = Decimal(amt)
+        if amt_d <= 0:
             raise ValueError
-        if amt_f < 0.0001:
+        if amt_d < Decimal("0.0001"):
             warn(f"Very small amount ({amt} BTC) — fees may consume most of it")
-        if amt_f > 10:
+        if amt_d > Decimal("10"):
             warn(f"Large amount ({amt} BTC) — consider splitting into smaller swaps")
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, InvalidOperation):
         err(f"Invalid BTC amount: {amt}")
         return
 
@@ -545,7 +546,7 @@ def flow_testnet():
             txs = p.get("txs", [])
             info(f"TXs in plan: {len(txs)}")
             if txs:
-                total = sum(float(t["amt"]) for t in txs)
+                total = sum(Decimal(t["amt"]) for t in txs)
                 info(f"Total amount: {total:.4f} XMR (mock)")
             if p.get("meta", {}).get("mock"):
                 warn("This is a MOCK plan — cannot be signed/broadcast with real wallet")

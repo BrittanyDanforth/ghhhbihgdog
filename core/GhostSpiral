@@ -51,6 +51,7 @@ BTC_RE = re.compile(
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
+    "https://thornode.thorswap.net",
 ]
 
 def _core_script(name: str) -> str:
@@ -223,6 +224,13 @@ def main():
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
+        _XMR_RECV_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
+        if not _XMR_RECV_RE.match(receive_entry_addr):
+            sys.exit(
+                f"[!] Receive wallet address fails format check: "
+                f"{scrub_address(receive_entry_addr)}\n"
+                f"    Expected a 95-char Monero address starting with 4 or 8."
+            )
         wallet_network = rw_data.get("network")
         if wallet_network and wallet_network != "mainnet":
             sys.exit(
@@ -906,7 +914,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
         # Apply planned delay (timing decorrelation)
         if tx_idx > 0:
-            delay = tx.get("delay", 0)
+            try:
+                delay = int(tx.get("delay", 0))
+            except (TypeError, ValueError):
+                delay = 0
+            if delay < 0:
+                delay = 0
             if delay > 0:
                 print(f"  [*] Waiting {delay}s (planned delay)...")
                 waited = 0

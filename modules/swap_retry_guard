@@ -89,6 +89,7 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 THOR_APIS = [
     "https://thornode.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
+    "https://thornode.thorswap.net",
 ]
 
 # Security parameters
@@ -235,7 +236,7 @@ class CircuitBurnProtocol:
             return True
             
         # Random burns for unpredictability
-        if random.random() < 0.05:  # 5% chance
+        if secrets.randbelow(100) < 5:  # 5% chance
             return True
             
         return False
@@ -268,7 +269,7 @@ class CircuitBurnProtocol:
                 controller.signal(Signal.NEWNYM)
                 
                 # Wait for circuit establishment
-                time.sleep(random.uniform(2, 5))
+                time.sleep(2 + secrets.randbelow(3000) / 1000.0)
                 
                 # Log burn event
                 self.burn_count += 1
@@ -885,6 +886,11 @@ Examples:
     # Security warnings
     if not args.stealth_mode:
         print("[!] Warning: Stealth mode disabled. Traffic patterns may be detectable.")
+
+    if len(args.proxy_chain.split(',')) == 1 and not args.force_circuit_burn:
+        print("[!] WARNING: Single-proxy chain without --force-circuit-burn means all")
+        print("    swap requests in a batch share the same Tor circuit (until periodic")
+        print("    burn triggers). Use --force-circuit-burn for per-swap circuit isolation.")
         
     if args.phantom_prob > 0:
         print(f"[•] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")

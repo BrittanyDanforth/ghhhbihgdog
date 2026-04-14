@@ -135,14 +135,16 @@ def main():
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
-        def _blob_sort_key(p: Path) -> int:
-            """Extract numeric index from tx_N.signed for correct numeric sort."""
+        def _blob_sort_key(p: Path) -> tuple:
+            """Extract numeric index from tx_N.signed for correct numeric sort.
+            Secondary key is the filename itself to guarantee stable ordering
+            when multiple blobs share the same numeric index (or lack one)."""
             stem = p.stem  # e.g. "tx_15"
             parts = stem.split("_")
             try:
-                return int(parts[-1])
+                return (int(parts[-1]), p.name)
             except (ValueError, IndexError):
-                return 999999
+                return (999999, p.name)
         blobs = sorted(raw_blobs, key=_blob_sort_key)
         # Warn loudly if no manifest — stale blobs from prior runs could be
         # broadcast to wrong addresses/amounts without manifest filtering.

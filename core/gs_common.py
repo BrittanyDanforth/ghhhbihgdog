@@ -66,15 +66,12 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     correlation window between the log and blockchain/network timestamps.
     """
     import fcntl
-    # BUG 61 FIX: Sanitize inputs — newlines in stage/msg would break the
-    # hash chain and allow log injection attacks.
-    stage = stage.replace("\n", " ").replace("\r", " ")[:64]
-    msg = msg.replace("\n", " ").replace("\r", " ")[:200]
+    stage = stage.replace("\n", " ").replace("\r", " ").replace("|", "_")[:64]
+    msg = msg.replace("\n", " ").replace("\r", " ").replace("|", "_")[:200]
 
-    # BUG 62 FIX: File locking — concurrent processes writing to the same
-    # log would read the same prev-hash and create a forked chain.
-    with log_path.open("a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             prev = "0" * 64
             if log_path.exists():
@@ -91,11 +88,12 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             ts = int(time.time()) // 600 * 600
             line = f"{ts}|{stage}|{msg}"
             h = hashlib.sha256((prev + line).encode()).hexdigest()
-            f.write(f"{h} | {line}\n")
-            f.flush()
-            os.fsync(f.fileno())
+            with log_path.open("a") as f:
+                f.write(f"{h} | {line}\n")
+                f.flush()
+                os.fsync(f.fileno())
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            fcntl.flock(lf, fcntl.LOCK_UN)
     secure_file_perms(log_path)
     return h
 
@@ -110,6 +108,11 @@ def lock_memory() -> bool:
     spend keys) can be written to the swap partition and recovered forensically
     from a seized machine. Requires CAP_IPC_LOCK or root on Linux.
     Returns True if successful, False otherwise (non-fatal).
+
+    NOTE: Even with mlockall, Python's immutable strings and garbage collector
+    cannot guarantee when secret data is freed from memory. The only reliable
+    mitigation for at-rest exposure is full-disk encryption (LUKS/dm-crypt)
+    so that swap contents are encrypted on disk.
     """
     try:
         import ctypes
@@ -260,6 +263,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
 
 _NEWNYM_CONSECUTIVE_FAILURES = 0
 _NEWNYM_MAX_FAILURES = 3
+_NEWNYM_LOCK = _threading.Lock()
 
 
 def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
@@ -294,9 +298,6 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                         c = None
                 if c is None and last_err is not None:
                     raise last_err
-            # BUG 73 FIX: Support password auth for Tor control port.
-            # stem.authenticate() tries NONE, SAFECOOKIE, COOKIE by default.
-            # If torrc uses HashedControlPassword, we need the password.
             tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
             if tor_pw:
                 c.authenticate(password=tor_pw)
@@ -308,12 +309,15 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                 c.close()
         # Jittered wait for circuit establishment (fixed 5s was a timing fingerprint)
         time.sleep(3 + secrets.randbelow(5000) / 1000.0)
-        _NEWNYM_CONSECUTIVE_FAILURES = 0
+        with _NEWNYM_LOCK:
+            _NEWNYM_CONSECUTIVE_FAILURES = 0
         return True
     except Exception as e:
-        _NEWNYM_CONSECUTIVE_FAILURES += 1
-        integrity_log("tor", f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(e)[:40]}")
-        if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
+        with _NEWNYM_LOCK:
+            _NEWNYM_CONSECUTIVE_FAILURES += 1
+            fail_count = _NEWNYM_CONSECUTIVE_FAILURES
+        integrity_log("tor", f"NEWNYM_fail:{fail_count}:{str(e)[:40]}")
+        if fail_count >= _NEWNYM_MAX_FAILURES:
             msg = (f"[!] NEWNYM failed {_NEWNYM_MAX_FAILURES} consecutive times. "
                    f"Tor circuit rotation is NOT working.")
             if required:
@@ -532,12 +536,13 @@ def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> No
 #  Signal handling for graceful shutdown
 # ---------------------------------------------------------------------------
 
-_SHUTDOWN_REQUESTED = False
+import threading as _threading
+
+_SHUTDOWN_EVENT = _threading.Event()
 
 
 def _shutdown_handler(signum, frame):
-    global _SHUTDOWN_REQUESTED
-    _SHUTDOWN_REQUESTED = True
+    _SHUTDOWN_EVENT.set()
     integrity_log("signal", f"shutdown_requested_sig={signum}")
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
@@ -549,7 +554,7 @@ def install_signal_handlers():
 
 
 def shutdown_requested() -> bool:
-    return _SHUTDOWN_REQUESTED
+    return _SHUTDOWN_EVENT.is_set()
 
 # ---------------------------------------------------------------------------
 #  Sensitive data scrubbing
