@@ -428,7 +428,8 @@ def _run_pipeline():
                 f"https://api.pullpush.io/reddit/search/comment/"
                 f"?q={quote_plus(target)}&size=50"
             )
-            response = session.get(push_url, timeout=30)
+            response = session.get(push_url, timeout=30,
+                                   headers={'User-Agent': random.choice(USER_AGENTS)})
 
             if response.status_code == 200:
                 data = response.json().get("data", [])
