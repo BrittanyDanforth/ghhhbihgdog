@@ -2,21 +2,22 @@
 # Install: python3 -m pip install -r requirements.txt
 # Or just run: bash install.sh
 
-# Core (required)
-requests
-PySocks
-tenacity
-stem
-monero
-psutil
+# Core (required for main pipeline)
+requests            # HTTP with SOCKS proxy support
+PySocks             # SOCKS proxy backend for requests
+tenacity            # Retry logic with exponential backoff
+stem                # Tor circuit control (NEWNYM rotation)
+monero              # Monero address validation + wallet RPC
+psutil              # System resource monitoring
 
-# OPSEC / Modules
-python-gnupg
-pycryptodomex
-qrcode
-pyyaml
+# Crypto / OPSEC (required for security modules)
+cryptography        # PBKDF2HMAC, secure KDF (used by swap_retry_guard, testergatherSystem)
+python-gnupg        # GPG encryption for swap pairs
+pycryptodomex       # AES encryption for dmswitch deadman switch
+pyyaml              # YAML config parsing for aggregator pools
 
-# Intel (optional)
-beautifulsoup4
-aiohttp
-aiohttp-socks
+# Optional (enhanced features)
+qrcode              # QR code generation for dmswitch
+beautifulsoup4      # HTML parsing for collectgrab OSINT
+aiohttp             # Async HTTP for testergatherSystem
+aiohttp-socks       # SOCKS proxy support for aiohttp (prevents clearnet leaks)

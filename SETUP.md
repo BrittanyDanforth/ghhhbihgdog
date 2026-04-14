@@ -19,14 +19,14 @@ sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
 
 ```bash
 python3 -m pip install requests PySocks tenacity stem monero psutil
-python3 -m pip install python-gnupg pycryptodomex qrcode pyyaml
+python3 -m pip install python-gnupg pycryptodomex cryptography qrcode pyyaml
 python3 -m pip install beautifulsoup4 aiohttp aiohttp-socks
 ```
 
 Check they all installed:
 
 ```bash
-python3 -c "import requests, socks, stem, monero, psutil, tenacity; print('ALL OK')"
+python3 -c "import requests, socks, stem, monero, psutil, tenacity, cryptography; print('ALL OK')"
 ```
 
 If it prints `ALL OK` you're good. If it says `ModuleNotFoundError`, install whichever one it says is missing.
@@ -171,14 +171,11 @@ Should return something with `"height":` and a number.
 
 ```bash
 export GS_WALLET_PASSWORD="YOUR_WALLET_PASSWORD"
-export SWAPKIT_API_KEY="your_swapkit_key"
 ```
 
 - `GS_WALLET_PASSWORD`: same password you used in step 5c. Setting it here
   prevents it from showing up in `ps aux` output where anyone on the machine
   could see it.
-- `SWAPKIT_API_KEY`: get one from https://swapkit.dev (needed for BTC→XMR swaps).
-  Free tier works.
 
 ---
 
@@ -216,6 +213,41 @@ without touching real money.
 
 ---
 
+## Step 8: Stopping Services (When Done)
+
+### Stop wallet RPC:
+
+```bash
+# If running in foreground: Ctrl+C
+# If running with --detach:
+kill $(pgrep monero-wallet-rpc)
+```
+
+### Stop monerod:
+
+```bash
+monerod exit
+# Or if detached:
+kill $(pgrep monerod)
+```
+
+### Stop Tor (optional — you probably want to keep it running):
+
+```bash
+sudo systemctl stop tor
+```
+
+### Clean up GhostSpiral artifacts:
+
+```bash
+# Option 9 (Paranoia Cleanup) in the menu does this automatically.
+# Or manually:
+python3 run paranoia --dry-run   # see what would be deleted
+python3 run paranoia             # actually delete
+```
+
+---
+
 ## Common Workflows
 
 ### Receive XMR (someone sends you BTC):
@@ -247,10 +279,62 @@ without touching real money.
 | `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
 | `No wallet file` | Start wallet RPC (Step 5c) |
 | `Method not found` | You're connecting to port 18081 instead of 18083 |
-| `No swap routes` | Set `SWAPKIT_API_KEY` (Step 6) |
-| `Invalid BTC address` | Must start with `bc1` (bech32 format) |
+| `No swap routes` | All THORNode endpoints failed. Check Tor connectivity, try again later |
+| `Invalid BTC address` | Must start with `bc1`, `1`, or `3` |
 | System Check shows `[!]` for Monero | Run Step 4 |
 | System Check shows `[!]` for wallet-rpc | Run Step 5c |
+
+---
+
+## IMPORTANT: Proxy Safety
+
+```
+NEVER use free/cheap/public SOCKS proxies with GhostSpiral.
+
+A malicious proxy can:
+  - See ALL your traffic (destinations, amounts, addresses)
+  - Modify RPC responses (change destination addresses = steal funds)
+  - Log your real IP and correlate with blockchain activity
+
+ONLY use:
+  ✓ Your own local Tor instance (socks5h://127.0.0.1:9050)
+  ✓ A Tor instance you control on a trusted VPS
+  ✗ NEVER public proxy lists
+  ✗ NEVER "free VPN" SOCKS proxies
+  ✗ NEVER shared proxies from unknown providers
+
+The ONLY safe proxy is one YOU control end-to-end.
+```
+
+---
+
+## Manual Install (if you prefer)
+
+```bash
+# 1. System packages
+sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
+
+# 2. Python deps (use python3 -m pip, NOT bare pip which may be python2)
+python3 -m pip install -r requirements.txt
+
+# 3. Enable Tor control port
+echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
+sudo systemctl restart tor
+
+# 4. Download + install Monero CLI tools
+cd /tmp
+wget https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+tar xf monero-cli.tar.bz2
+sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
+rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2
+cd -
+
+# 5. Verify everything
+python3 -c "import requests, stem, monero, psutil; print('OK')"
+curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+monerod --version
+monero-wallet-rpc --version
+```
 
 ---
 

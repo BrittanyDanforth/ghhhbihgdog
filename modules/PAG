@@ -12,7 +12,6 @@ import gc
 import hashlib
 import json
 import math
-import mmap
 import os
 import random
 import secrets
@@ -22,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import ctypes
@@ -528,16 +527,7 @@ def main():
     parser.add_argument("--amount", "-a", type=float, 
                        default=1.0)
     
-    # Hidden options
-    parser.add_argument("--chaos", action="store_true",
-                       help=argparse.SUPPRESS)  # Max obfuscation
-    
     args = parser.parse_args()
-    
-    # Enable maximum paranoia
-    if args.chaos:
-        global PARANOID_MODE
-        PARANOID_MODE = True
     
     try:
         # Generate DAG
@@ -546,25 +536,10 @@ def main():
         if not STEALTH_MODE:
             print(f"[+] Generated: {nodes} nodes, {edges} edges → {args.out}")
         
-        # Clear tracks
         if PARANOID_MODE:
-            # Clear bash history
-            os.system("history -c 2>/dev/null")
-            os.system("echo > ~/.bash_history 2>/dev/null")
-            
-            # Clear logs
-            log_files = ['/var/log/syslog', '/var/log/auth.log']
-            for log in log_files:
-                try:
-                    if os.path.exists(log):
-                        # Remove our traces
-                        with open(log, 'r') as f:
-                            lines = f.readlines()
-                        filtered = [l for l in lines if 'dag' not in l.lower()]
-                        with open(log, 'w') as f:
-                            f.writelines(filtered)
-                except:
-                    pass
+            if not STEALTH_MODE:
+                print("[!] PARANOID_MODE: log/history cleanup is the operator's responsibility.")
+                print("[!] Consider: history -c && history -w, and review /var/log manually.")
         
     except KeyboardInterrupt:
         mem_guard.scramble()

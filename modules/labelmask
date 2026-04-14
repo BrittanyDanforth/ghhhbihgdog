@@ -316,7 +316,15 @@ def main():
         for node in dag["graph"]["nodes"]:
             lbl, note = gen_label_for_node(node, rng)
             label_map[node["id"]] = {"label": lbl, "note": note}
+    except (KeyError, TypeError) as e:
+        print(f"[!] Malformed DAG structure: {e}", file=sys.stderr)
+        print("[!] Expected dag[\"graph\"][\"nodes\"] to be a list of "
+              "{{\"id\": ..., \"type\": ...}} objects.", file=sys.stderr)
+        print("[!] Run with --verify to validate DAG before processing, "
+              "or check your DAG generator output.", file=sys.stderr)
+        sys.exit(1)
 
+    try:
         # Create payload without hash first
         payload = {
             "version": VERSION,

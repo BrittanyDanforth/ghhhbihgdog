@@ -39,7 +39,7 @@ Security Notes
   debugging; delete it if maximum stealth is required.
 """
 from __future__ import annotations
-import argparse, ast, hashlib, json, os, random, re, sys, textwrap
+import argparse, ast, hashlib, json, os, random, sys, textwrap
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -186,7 +186,7 @@ def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str
     out: List[str] = []
     for idx, line in enumerate(lines, 1):
         out.append(line)
-        if idx % every_n == rng.randint(20, 60):  # Vary the interval
+        if rng.random() < 0.08:
             prefix = rng.choice(junk_prefixes)
             suffix = rng.choice(junk_suffixes)
             garbage = f"{prefix}: {rand_name(rng, 8)} - {suffix}"

@@ -49,8 +49,6 @@ import secrets
 import socket
 import time
 import random
-import base64
-import pickle
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -111,19 +109,17 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
         except Exception as e:
             entropy["extra"] = f"read_error: {str(e)}"
 
-    # 7. Inject random module state snapshot (fixed serialization)
+    # 7. Inject random module state snapshot as a stable hash (portable across Python versions)
     try:
-        # Get random state and serialize it properly
         state = random.getstate()
-        # Serialize using pickle then encode to base64
-        state_bytes = pickle.dumps(state)
-        entropy["random_state"] = base64.b64encode(state_bytes).decode()
+        entropy["random_state"] = hashlib.sha256(str(state).encode()).hexdigest()
     except Exception as e:
         entropy["random_state"] = f"error: {str(e)}"
 
-    # 8. Additional entropy sources for better randomness
-    entropy["env_hash"] = hashlib.sha256(str(dict(os.environ)).encode()).hexdigest()
-    entropy["cwd_hash"] = hashlib.sha256(str(os.getcwd()).encode()).hexdigest()
+    # 8. Additional non-identifying entropy (PID, time, urandom only — no env
+    #    vars or CWD which leak workspace/user fingerprints)
+    extra_entropy = f"{os.getpid()}:{time.time_ns()}:{secrets.token_hex(32)}"
+    entropy["extra_entropy"] = hashlib.sha256(extra_entropy.encode()).hexdigest()
     
     return entropy
 

@@ -292,3 +292,246 @@ Found **30+ confirmed bugs** across the entire codebase. The most dangerous:
 | BUG 112 | collectgrab output perms | MEDIUM | YES |
 | BUG 113 | Module output perms (3 files) | MEDIUM | YES |
 | BUG 114 | collectgrab boolean precedence | MEDIUM | YES |
+
+---
+
+## Round 6 — Deep Adversarial Audit (BUG 115-145)
+
+### CRITICAL Bugs
+
+### BUG 115 (FIXED): broadcast_signed_xmr — `rpc_url` undefined (NameError)
+**File:** `broadcast_signed_xmr` line 427
+**Scenario:** After successful TX broadcast, the mine-confirmation polling loop uses `rpc_url` which is never defined anywhere in the file. Every broadcast that reaches the confirmation-wait stage crashes with `NameError`.
+**Impact:** CRITICAL — TX broadcasts succeed but confirmation tracking is impossible. Operator has no idea if TX was mined.
+**Fix:** Changed `rpc_url` to `args.rpc`.
+
+### BUG 116 (FIXED): GhostSpiral Stage 2 — only calls /v3/quote, not /v3/swap
+**File:** `GhostSpiral` stage2_get_swap_quotes
+**Scenario:** The function only called SwapKit's `/v3/quote` and tried to extract `depositAddress` from the quote response. SwapKit's documented flow requires a second `POST /v3/swap` call to get the actual deposit address. Quotes often don't include deposit details.
+**Impact:** CRITICAL — Stage 2 fails with "no deposit address" for most SwapKit routes.
+**Fix:** Complete rewrite with THORNode native API as primary (no API key needed, GET endpoint), SwapKit two-step flow as fallback. Also added to `thor_swap_preparer`.
+
+### BUG 117 (FIXED): fake_leaf_inserter — missing `os` import
+**File:** `fake_leaf_inserter` line 50
+**Scenario:** `os.chmod(path, 0o600)` called but `os` never imported. Every successful file write crashes.
+**Impact:** CRITICAL — tool completely broken.
+**Fix:** Added `import os`.
+
+### BUG 118 (FIXED): label_poisoner — missing `os` import
+**File:** `label_poisoner` line 326
+**Scenario:** Same as BUG 117. `os.chmod()` with no `os` import.
+**Impact:** CRITICAL — tool completely broken.
+**Fix:** Added `import os`.
+
+### BUG 119 (FIXED): swap_retry_guard — `before_sleep_log` ImportError
+**File:** `swap_retry_guard` line 70
+**Scenario:** `before_sleep_log` is not part of tenacity's standard API. The import fails and the entire script cannot start.
+**Impact:** CRITICAL — swap orchestrator completely broken on import.
+**Fix:** Removed `before_sleep_log` from import (was unused).
+
+### BUG 120 (FIXED): testergatherSystem — wrong PBKDF2 import
+**File:** `testergatherSystem` line 40
+**Scenario:** `from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2` — the `cryptography` library exports `PBKDF2HMAC`, not `PBKDF2`. ImportError on any code path that uses it.
+**Impact:** CRITICAL — SecureDataProcessor completely broken.
+**Fix:** Changed to `PBKDF2HMAC`.
+
+### HIGH Bugs
+
+### BUG 121 (FIXED): swap_retry_guard — phantom failure advances progress
+**File:** `swap_retry_guard` lines 672-673
+**Scenario:** After the phantom failure block, `self.progress["last"] = idx` was ALWAYS called. Phantom failures (decoys) advanced progress, causing real swaps to be permanently skipped on resume. 15% chance per swap of being silently lost.
+**Impact:** HIGH — money loss on resume after phantom failure.
+**Fix:** Added `return True` after phantom block to skip progress advancement.
+
+### BUG 122 (FIXED): testergatherSystem — undefined `orchestrator` in KeyboardInterrupt
+**File:** `testergatherSystem` near end of file
+**Scenario:** If Ctrl+C during initialization, `except KeyboardInterrupt` references `orchestrator` which doesn't exist yet → NameError on top of the interrupt.
+**Impact:** HIGH — unclean shutdown, potential resource leak.
+**Fix:** Wrapped in `try/except NameError`.
+
+### BUG 123 (FIXED): testergatherSystem — clearnet aiohttp leaks
+**File:** `testergatherSystem` check_hibp, check_dehashed
+**Scenario:** `aiohttp.ClientSession()` without proxy → operator's real IP sent to HaveIBeenPwned and DeHashed APIs.
+**Impact:** HIGH (OPSEC) — real IP correlated with breach database queries.
+**Fix:** Added ProxyConnector with `socks5h://127.0.0.1:9050`.
+
+### BUG 124 (FIXED): testergatherSystem — socks5:// DNS leak in decoy traffic
+**File:** `testergatherSystem` _generate_decoy_traffic
+**Scenario:** `socks5://` instead of `socks5h://` → DNS resolution happens locally.
+**Impact:** HIGH (OPSEC) — decoy traffic destinations leaked via DNS.
+**Fix:** Changed to `socks5h://`.
+
+### BUG 125 (FIXED): PAG — destructive log tampering
+**File:** `PAG` anti-forensic functions
+**Scenario:** Rewrites `~/.bash_history`, filters `/var/log/syslog` and `/var/log/auth.log`. Destructive on shared systems, needs root, corrupts logs.
+**Impact:** HIGH — destroys evidence on shared systems, may break audit requirements.
+**Fix:** Replaced with warning message telling operator to handle manually.
+
+### BUG 126 (FIXED): dmswitch — name shadowing (method vs attribute)
+**File:** `dmswitch` self.emergency_destruct
+**Scenario:** Boolean attribute `self.emergency_destruct` shadows the `emergency_destruct()` method. Calling `switch.emergency_destruct(...)` could resolve to the wrong one.
+**Impact:** HIGH — emergency destruct may not trigger when needed.
+**Fix:** Renamed attribute to `self._emergency_destruct_enabled`.
+
+### BUG 127 (FIXED): dmswitch — randomized paths at import
+**File:** `dmswitch` lines 86-87
+**Scenario:** `LOCKED_BUNDLE` and `LOCK_METADATA` paths use `secrets.token_hex(8)` at module load. A second process can never find the same paths.
+**Impact:** HIGH — unlock impossible from a different process or after restart.
+**Fix:** Changed to fixed paths `.gs_locked_bundle` and `.gs_lock_meta`.
+
+### BUG 128 (FIXED): SML — zombie child processes
+**File:** `SML` cmd_load, os.fork()
+**Scenario:** Parent never calls `os.waitpid()` → zombie process accumulates.
+**Impact:** MEDIUM — process table pollution.
+**Fix:** Added `signal.signal(signal.SIGCHLD, signal.SIG_IGN)` before fork.
+
+### BUG 129 (FIXED): GhostSpiral BTC_RE too restrictive
+**File:** `GhostSpiral` line 46
+**Scenario:** Only accepted bech32 (bc1.../tb1...) but THORChain vaults use legacy (1...) and P2SH (3...) addresses.
+**Impact:** MEDIUM — operators with P2SH/legacy addresses rejected at startup.
+**Fix:** Updated regex to match `thor_swap_preparer`'s broader pattern.
+
+### MEDIUM Bugs
+
+### BUG 130 (FIXED): tor_endpoint_juggler — log/export files not 0600
+**Files:** `tor_endpoint_juggler` log file and JSON export
+**Fix:** Added `os.chmod(path, 0o600)` after writes.
+
+### BUG 131 (FIXED): wdna — output files not 0600
+**File:** `wdna` write_file_atomically
+**Fix:** Added `os.chmod(path, 0o600)` after atomic rename.
+
+### BUG 132 (FIXED): integrity_faker — output not 0600
+**File:** `integrity_faker` output writes
+**Fix:** Added `os.chmod()` after write.
+
+### BUG 133 (FIXED): mirrormask — entropy_seed.json created without 0600
+**File:** `mirrormask` auto-create path
+**Fix:** Added `os.chmod()` after write_text.
+
+### BUG 134 (FIXED): collectgrab — no `if __name__` guard
+**File:** `collectgrab` module level
+**Scenario:** Importing the module for testing triggers the entire pipeline.
+**Fix:** Wrapped in `_run_pipeline()` with `if __name__ == "__main__"` guard.
+
+### BUG 135 (FIXED): error_log_poisoner — deprecated `utcfromtimestamp`
+**File:** `error_log_poisoner`
+**Fix:** Changed to `datetime.fromtimestamp(ts, tz=timezone.utc)`.
+
+### LOW Bugs / Cleanup
+
+### BUG 136-145 (FIXED): Unused imports across 8 files
+- `label_poisoner`: removed `unicodedata`
+- `swap_retry_guard`: removed `asyncio`, `mmap`, `uuid`, `weakref`
+- `swap_retry_guard`: fixed fake `import mlock` → real `ctypes.CDLL` mlockall
+- `tor_endpoint_juggler`: removed `aiohttp`, dead constants
+- `noise`: removed `socket`, `ssl`, `urllib.parse`
+- `ghostmutator`: removed `re`
+- `vm_runtime`: removed `threading`; wired `tor_proxy` param in `snapshot_metrics`
+- `PAG`: removed `mmap`, `timedelta`; removed dead `--chaos` flag
+- `paranoia_mode`: removed unused `secure_hex` import
+- `mirrormask`: removed `shutil`; removed dead CLI flags
+- `broadcast_signed_xmr`: removed unused `import secrets as _secrets`
+
+### Complete Bug Status Table (Round 6)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 115 | broadcast_signed_xmr `rpc_url` undefined | CRITICAL | YES |
+| BUG 116 | GhostSpiral Stage 2 quote-only (no /v3/swap) | CRITICAL | YES |
+| BUG 117 | fake_leaf_inserter missing `os` import | CRITICAL | YES |
+| BUG 118 | label_poisoner missing `os` import | CRITICAL | YES |
+| BUG 119 | swap_retry_guard `before_sleep_log` ImportError | CRITICAL | YES |
+| BUG 120 | testergatherSystem wrong PBKDF2 import | CRITICAL | YES |
+| BUG 121 | swap_retry_guard phantom advances progress | HIGH | YES |
+| BUG 122 | testergatherSystem undefined orchestrator on interrupt | HIGH | YES |
+| BUG 123 | testergatherSystem clearnet aiohttp (HIBP/DeHashed) | HIGH | YES |
+| BUG 124 | testergatherSystem socks5:// DNS leak in decoy | HIGH | YES |
+| BUG 125 | PAG destructive log tampering | HIGH | YES |
+| BUG 126 | dmswitch name shadowing (method vs attribute) | HIGH | YES |
+| BUG 127 | dmswitch randomized paths at import | HIGH | YES |
+| BUG 128 | SML zombie child processes | MEDIUM | YES |
+| BUG 129 | GhostSpiral BTC_RE too restrictive | MEDIUM | YES |
+| BUG 130 | tor_endpoint_juggler file perms | MEDIUM | YES |
+| BUG 131 | wdna file perms | MEDIUM | YES |
+| BUG 132 | integrity_faker file perms | MEDIUM | YES |
+| BUG 133 | mirrormask entropy_seed.json perms | MEDIUM | YES |
+| BUG 134 | collectgrab no `__name__` guard | MEDIUM | YES |
+| BUG 135 | error_log_poisoner deprecated utcfromtimestamp | MEDIUM | YES |
+| BUG 136-145 | Unused imports / dead code across 8+ files | LOW | YES |
+
+### Architecture Improvement: THORNode Native API
+
+Added THORNode native API (`GET /thorchain/quote/swap`) as the primary swap quote source for both `GhostSpiral` and `thor_swap_preparer`. This eliminates the dependency on SwapKit API keys and provides a more reliable, direct connection to the THORChain protocol.
+
+**Flow:**
+1. Try THORNode endpoints (`thornode.ninerealms.com`, `thornode.thorswap.net`)
+2. If THORNode fails, fall back to SwapKit two-step flow (quote + swap)
+3. SwapKit now correctly implements the documented two-step flow
+
+**Benefits:**
+- No API key required for THORNode
+- Direct protocol access (no intermediary)
+- Multiple endpoint fallbacks
+- SwapKit still available as backup
+
+---
+
+## Round 7 — Final Hardening Audit (BUG 146-150)
+
+**Date:** 2026-04-14
+**Scope:** Remaining integration issues in swap_retry_guard, vm_runtime, en_seeder
+**Method:** Endpoint verification, protocol correctness, cross-version portability
+
+### SwapKit Removal Confirmed
+
+SwapKit aggregator endpoints have been **permanently removed** from the codebase. Multiple sources (including Malwarebytes) flagged SwapKit-associated domains as hosting phishing/malicious content. THORNode native API is now the **only** swap quote source across all modules.
+
+### BUG 146 (FIXED): swap_retry_guard — THOR_APIS contained dead/wrong aggregator URLs
+**File:** `swap_retry_guard` THOR_APIS constant
+**Scenario:** `THOR_APIS` listed aggregator-style URLs (`api.thorswap.net/aggregator`, `thorchain.net/api/aggregator`, `midgard.ninerealms.com/v2/thorchain`) that are either defunct, return 404, or serve a different API format than expected.
+**Impact:** HIGH — swap quotes fail on most endpoints; only 1 of 5 URLs was partially functional.
+**Fix:** Replaced with verified THORNode native API base URLs: `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com`.
+
+### BUG 147 (FIXED): swap_retry_guard — _execute_swap_request POSTs to /swap (wrong method & path)
+**File:** `swap_retry_guard` `_execute_swap_request` method
+**Scenario:** Method did `session.post(f"{endpoint}/swap", json=payload)`. THORNode's quote endpoint is `GET /thorchain/quote/swap` with query parameters, not a POST endpoint. Every request returned 404 or 405.
+**Impact:** HIGH — swap execution completely broken against THORNode.
+**Fix:** Changed to `session.get()` with `GET /thorchain/quote/swap?from_asset=...&to_asset=...&amount=...&destination=...` using proper query parameter encoding.
+
+### BUG 148 (FIXED): swap_retry_guard — PHANTOM_TRAFFIC_PROB default 0.15 too aggressive
+**File:** `swap_retry_guard` constant + argparse default
+**Scenario:** 15% of swaps randomly get phantom-failed as decoys. While progress advancement was already fixed (Round 6, BUG 121), the high default still confuses operators who see frequent "failures" in logs with no explanation.
+**Impact:** MEDIUM (UX) — operators assume real failures and abort or restart unnecessarily.
+**Fix:** Changed default to `0.0` (disabled). Operators can opt in with `--phantom-prob 0.15`.
+
+### BUG 149 (FIXED): vm_runtime — Tor connectivity test uses httpbin.org (third-party, unreliable)
+**File:** `vm_runtime` `test_tor_connectivity` function
+**Scenario:** Used `http://httpbin.org/ip` to verify Tor connectivity. httpbin.org is a third-party service that may be down, rate-limited, or blocked. It also cannot confirm whether traffic is actually routed through Tor — only that a connection succeeded.
+**Impact:** MEDIUM (reliability + correctness) — false positives (connected but not via Tor) and false negatives (httpbin down).
+**Fix:** Changed to `https://check.torproject.org/api/ip` (official Tor Project endpoint). Now validates `"IsTor": true` in the JSON response to confirm actual Tor routing.
+
+### BUG 150 (FIXED): en_seeder — pickle serialization of random state is brittle
+**File:** `en_seeder` `collect_system_entropy` function
+**Scenario:** `pickle.dumps(random.getstate())` serializes Python's internal RNG state using pickle, then base64-encodes it into the seed file. Pickle format is not stable across Python versions — a seed generated on Python 3.11 may fail to deserialize on 3.12+, breaking seed portability.
+**Impact:** MEDIUM (portability) — seed files not portable across Python versions; `pickle.loads` is also a deserialization attack vector if seed files are shared.
+**Fix:** Replaced with `hashlib.sha256(str(random.getstate()).encode()).hexdigest()`. Stores a stable hash of the RNG state instead of raw pickle bytes. Removed unused `pickle` and `base64` imports.
+
+### Complete Bug Status Table (Round 7)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 146 | swap_retry_guard dead/wrong THOR_APIS URLs | HIGH | YES |
+| BUG 147 | swap_retry_guard POST to /swap (wrong method) | HIGH | YES |
+| BUG 148 | swap_retry_guard PHANTOM_TRAFFIC_PROB too high | MEDIUM | YES |
+| BUG 149 | vm_runtime httpbin.org Tor test unreliable | MEDIUM | YES |
+| BUG 150 | en_seeder pickle serialization brittle | MEDIUM | YES |
+
+### Final Architecture State
+
+- **Swap source:** THORNode native API only (`GET /thorchain/quote/swap`). SwapKit removed entirely (confirmed malicious/phishing by Malwarebytes).
+- **Endpoints:** `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com` — all verified THORNode instances.
+- **Tor verification:** Uses official `check.torproject.org/api/ip` with `IsTor` validation.
+- **Entropy:** Portable SHA-256 hash of RNG state; no pickle dependency.
+- **Phantom traffic:** Disabled by default; opt-in via `--phantom-prob`.
+- **All files compile cleanly** under Python 3.10+.

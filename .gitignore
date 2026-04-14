@@ -1,2 +1,15 @@
 *.pyc
 __pycache__/
+*.log
+*.tmp
+integrity_chain.log
+tor_operations.log
+swap_integrity_v2.log
+entropy_seed.json
+stage5_progress.json
+broadcast_progress.json
+signer_progress.json
+.ghostspiral.lock
+tx_staging/
+signed_blobs/
+unsigned/

@@ -35,7 +35,7 @@ import logging
 import os
 import secrets
 import socket
-import ssl
+
 import sys
 import time
 from collections import defaultdict, deque
@@ -54,15 +54,11 @@ try:
     import socks
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    import aiohttp
 except ImportError as e:
     print(f"Missing dependency: {e}")
     sys.exit(1)
 
 # Operational configuration
-ENTROPY_FILE = Path("operational_entropy.json")
-CIRCUIT_STATE = Path("circuit_state.json") 
-ENDPOINT_CACHE = Path("endpoint_cache.json")
 OPERATIONAL_LOG = Path("tor_operations.log")
 
 # Real Tor configuration
@@ -81,6 +77,8 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+if OPERATIONAL_LOG.exists():
+    os.chmod(OPERATIONAL_LOG, 0o600)
 logger = logging.getLogger("TorEndpointJuggler")
 
 @dataclass
@@ -508,6 +506,7 @@ class ProductionEndpointJuggler:
         with open(temp_path, 'w') as f:
             json.dump(operational_data, f, indent=2)
         temp_path.replace(output_path)
+        os.chmod(output_path, 0o600)
         
         logger.info(f"Exported operational data to {output_path}")
     

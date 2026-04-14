@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -63,17 +64,12 @@ class CryptoSecureRNG:
     def _ensure_entropy(self):
         """Generate or load high-entropy seed for deterministic chaos"""
         if not self.seed_file.exists():
-            # Generate cryptographically secure entropy
+            seed_hex = secrets.token_hex(32)
             entropy_data = {
-                "primary_seed": os.urandom(64).hex(),
-                "creation_timestamp": time.time_ns(),
-                "system_entropy": {
-                    "urandom_32": os.urandom(32).hex(),
-                    "process_id": os.getpid(),
-                    "thread_id": os.get_native_id() if hasattr(os, 'get_native_id') else 0,
-                    "time_ns": time.time_ns()
-                },
-                "version": "2.0"
+                "seed_hex": seed_hex,
+                "sha256": hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest(),
+                "timestamp": int(time.time()),
+                "sources": {"auto_generated": True}
             }
             
             # Write atomically with secure permissions
@@ -94,9 +90,9 @@ class CryptoSecureRNG:
         with open(self.seed_file, 'r') as f:
             entropy_data = json.load(f)
         
-        primary_seed = (entropy_data.get("primary_seed")
+        primary_seed = (entropy_data.get("seed_hex")
                         or entropy_data.get("sha256")
-                        or entropy_data.get("seed_hex")
+                        or entropy_data.get("primary_seed")
                         or hashlib.sha256(json.dumps(entropy_data, sort_keys=True).encode()).hexdigest())
         
         # Combine with source file hash if available
@@ -417,6 +413,7 @@ def main():
             f.write('\n'.join(fake_chain) + '\n')
         
         temp_path.replace(output_path)
+        os.chmod(output_path, 0o600)
         
         print(f"[+] Fake integrity chain written → {output_path}")
         print(f"[+] Entries: {len(fake_chain)}")

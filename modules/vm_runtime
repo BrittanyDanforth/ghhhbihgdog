@@ -56,7 +56,7 @@ Security / OPSEC Notes
 """
 from __future__ import annotations
 import argparse, json, math, os, random, sys, time, hashlib, statistics
-import socket, subprocess, tempfile, threading
+import socket, subprocess, tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Union
@@ -162,16 +162,19 @@ def probe_disk_io() -> float:
 
 
 def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
-    """Test Tor connectivity if proxy is specified."""
+    """Test Tor connectivity via the official Tor Project check endpoint."""
     if not proxy_url or not requests:
         return "unknown"
     
     try:
         proxies = {'http': proxy_url, 'https': proxy_url}
-        response = requests.get('http://httpbin.org/ip', 
-                              proxies=proxies, timeout=10)
+        url = "https://check.torproject.org/api/ip"
+        response = requests.get(url, proxies=proxies, timeout=10)
         if response.status_code == 200:
-            return "connected"
+            data = response.json()
+            if data.get("IsTor") is True:
+                return "connected"
+            return "not_tor"
         else:
             return "failed"
     except Exception:
@@ -250,6 +253,12 @@ def snapshot_metrics(network_probe: Optional[str] = None,
             metrics["boot_time_hash"] = 0
     else:
         metrics["boot_time_hash"] = 0
+
+    # Tor connectivity status
+    if tor_proxy:
+        metrics["tor_status"] = test_tor_connectivity(tor_proxy)
+    else:
+        metrics["tor_status"] = "not_tested"
 
     return metrics
 

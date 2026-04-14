@@ -36,11 +36,8 @@ import json
 import os
 import random
 import secrets
-import socket
-import ssl
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any
@@ -64,7 +61,16 @@ except ImportError:
 
 VERSION = "3.0"
 
-# Enhanced endpoint lists with realistic services
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ WARNING: CLEARNET EXIT — These endpoints are accessed via Tor      │
+# │ exit nodes. While your real IP is hidden by Tor, the exit node     │
+# │ connects to clearnet servers (httpbin.org, CoinGecko, Google,      │
+# │ etc.) in the clear. This means:                                    │
+# │   1. Exit node operators can see the request content.              │
+# │   2. Destination servers see a Tor exit IP, not yours.             │
+# │   3. Traffic correlation attacks are still possible at exit.       │
+# │ Use --onion-only to restrict traffic to .onion endpoints only.     │
+# └─────────────────────────────────────────────────────────────────────┘
 CLEARNET_ENDPOINTS = [
     "https://httpbin.org/get",
     "https://jsonplaceholder.typicode.com/posts/1",
@@ -85,7 +91,8 @@ ONION_ENDPOINTS = [
     "http://www.facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion/",
 ]
 
-# Cryptocurrency and privacy service endpoints
+# WARNING: CLEARNET EXIT — Same caveat as CLEARNET_ENDPOINTS above.
+# These crypto API endpoints exit to clearnet via Tor.
 CRYPTO_ENDPOINTS = [
     "https://api.coingecko.com/api/v3/ping",
     "https://api.coinbase.com/v2/time",
@@ -442,8 +449,17 @@ def main():
                        help="Output log file (optional)")
     parser.add_argument("--verify-proxy", action="store_true",
                        help="Verify proxy connectivity before starting")
+    parser.add_argument("--onion-only", action="store_true",
+                       help="Restrict noise traffic to .onion endpoints only (no clearnet exit)")
     
     args = parser.parse_args()
+    
+    if not args.onion_only:
+        print("  [!] WARNING: Noise traffic exits to clearnet via Tor. "
+              "Use --onion-only for onion-only traffic.", file=sys.stderr)
+    else:
+        CLEARNET_ENDPOINTS.clear()
+        CRYPTO_ENDPOINTS.clear()
     
     # Validate proxy
     if not args.tor_proxy.startswith("socks5h://"):
