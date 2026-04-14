@@ -411,7 +411,7 @@ class ProductionEndpointJuggler:
             if len(parsed.hostname.replace('.onion', '')) != 56:  # v3 only (v2 is dead)
                 return False
             return True
-        except:
+        except (ValueError, AttributeError):
             return False
     
     def validate_endpoint_pool(self, endpoints: Set[str], max_workers: int = 10) -> List[str]:

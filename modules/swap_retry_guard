@@ -170,7 +170,7 @@ class QuantumEntropyFusion:
                 proc = psutil.Process()
                 sources.append(struct.pack('f', proc.cpu_percent()))
                 sources.append(struct.pack('Q', proc.memory_info().rss))
-            except:
+            except (OSError, psutil.Error):
                 pass
                 
             # Network entropy — use local interface info only (no clearnet traffic)
@@ -824,12 +824,13 @@ Examples:
                        help="Tor control socket path")
     
     # Security options
-    parser.add_argument("--stealth-mode", action=argparse.BooleanOptionalAction,
-                       default=True,
-                       help="Add timing jitter before first request per swap (default: on). "
-                            "Disable with --no-stealth-mode. "
-                            "NOTE: this only affects request timing, not traffic "
-                            "content, headers, endpoints, or Tor circuit behaviour.")
+    stealth_group = parser.add_mutually_exclusive_group()
+    stealth_group.add_argument("--stealth-mode", action="store_true", dest="stealth_mode", default=True,
+                               help="Add timing jitter before first request per swap (default: on). "
+                                    "NOTE: this only affects request timing, not traffic "
+                                    "content, headers, endpoints, or Tor circuit behaviour.")
+    stealth_group.add_argument("--no-stealth-mode", action="store_false", dest="stealth_mode",
+                               help="Disable stealth mode timing jitter")
     
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
@@ -837,10 +838,11 @@ Examples:
     # Operational modes
     parser.add_argument("--dry-run", action="store_true",
                        help="Simulate swaps without actual execution")
-    parser.add_argument("--force-circuit-burn", action=argparse.BooleanOptionalAction,
-                       default=True,
-                       help="Force Tor circuit rotation before each swap for per-swap isolation (default: on). "
-                            "Disable with --no-force-circuit-burn.")
+    burn_group = parser.add_mutually_exclusive_group()
+    burn_group.add_argument("--force-circuit-burn", action="store_true", dest="force_circuit_burn", default=True,
+                            help="Force Tor circuit rotation before each swap for per-swap isolation (default: on)")
+    burn_group.add_argument("--no-force-circuit-burn", action="store_false", dest="force_circuit_burn",
+                            help="Disable forced circuit rotation before each swap")
     # Advanced options
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")

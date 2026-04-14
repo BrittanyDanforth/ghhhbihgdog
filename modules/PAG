@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Callable, Dict, List, Tuple, Optional, Any
 import ctypes
 
 # Stealth configuration
@@ -48,7 +48,7 @@ class MemoryScrambler:
             MCL_CURRENT = 1
             MCL_FUTURE = 2
             libc.mlockall(MCL_CURRENT | MCL_FUTURE)
-        except:
+        except (OSError, AttributeError):
             pass
     
     def register(self, data: Any):
@@ -68,7 +68,7 @@ class MemoryScrambler:
                         del item[k]
                 elif isinstance(item, list):
                     item.clear()
-            except:
+            except (TypeError, AttributeError):
                 pass
         
         self._sensitive.clear()
@@ -93,7 +93,7 @@ class EntropyMixer:
         try:
             with open('/dev/hwrng', 'rb') as f:
                 sources.append(f.read(1024))
-        except:
+        except (OSError, PermissionError):
             pass
         
         # Timing jitter
@@ -112,7 +112,7 @@ class EntropyMixer:
                 if pid.isdigit():
                     proc_data.append(pid.encode())
             sources.append(b''.join(proc_data[:100]))
-        except:
+        except (OSError, PermissionError):
             pass
         
         # System entropy
@@ -175,7 +175,7 @@ class PolymorphicGenerator:
         self.strategies = self._build_strategies()
         self.obfuscation_level = secrets.randbelow(5) + 1
     
-    def _build_strategies(self) -> List[callable]:
+    def _build_strategies(self) -> List[Callable]:
         """Build randomized generation strategies."""
         # Each strategy produces different graph characteristics
         strategies = []
@@ -412,7 +412,7 @@ class StealthWriter:
                     subprocess.run(['sync'], capture_output=True)
                     with open('/proc/sys/vm/drop_caches', 'w') as f:
                         f.write('3')
-                except:
+                except (OSError, PermissionError, FileNotFoundError):
                     pass
             
         except Exception as e:
@@ -424,9 +424,9 @@ class StealthWriter:
                         f.seek(0)
                         f.write(secrets.token_bytes(size))
                     temp_path.unlink()
-                except:
+                except OSError:
                     pass
-            raise e
+            raise
 
 def load_seed_secure(seed_path: Path) -> Tuple[dict, str]:
     """Load seed file with verification."""

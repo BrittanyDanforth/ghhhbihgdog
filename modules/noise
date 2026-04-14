@@ -471,10 +471,11 @@ def main():
                        default="medium", help="Traffic intensity level")
     parser.add_argument("--out", "-o", type=Path,
                        help="Output log file (optional)")
-    parser.add_argument("--verify-proxy", action=argparse.BooleanOptionalAction,
-                       default=True,
-                       help="Verify proxy is routing through Tor before starting (default: on). "
-                            "Disable with --no-verify-proxy.")
+    verify_group = parser.add_mutually_exclusive_group()
+    verify_group.add_argument("--verify-proxy", action="store_true", dest="verify_proxy", default=True,
+                              help="Verify proxy is routing through Tor before starting (default: on)")
+    verify_group.add_argument("--no-verify-proxy", action="store_false", dest="verify_proxy",
+                              help="Skip proxy verification")
     parser.add_argument("--onion-only", action="store_true",
                        help="Restrict noise traffic to .onion endpoints only (no clearnet exit)")
     
