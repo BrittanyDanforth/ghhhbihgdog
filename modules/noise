@@ -171,7 +171,8 @@ def validate_proxy(proxy_url: str) -> bool:
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
         response = requests.get("https://check.torproject.org/api/ip",
-                                proxies=proxies, timeout=10)
+                                proxies=proxies, timeout=10,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"})
         if response.status_code == 200:
             data = response.json()
             if data.get("IsTor"):

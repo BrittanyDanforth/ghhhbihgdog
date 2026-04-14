@@ -35,6 +35,9 @@ from gs_common import (
 _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+
+
 def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """Single-attempt POST without tenacity retry. Used for broadcast
     submissions where the outer loop handles retries with NEWNYM rotation.
@@ -46,7 +49,8 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """
     if proxies is None:
         sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
-    r = requests.post(url, json=payload, timeout=30, proxies=proxies)
+    r = requests.post(url, json=payload, timeout=30, proxies=proxies,
+                      headers={"User-Agent": _BROWSER_UA})
     r.raise_for_status()
     try:
         return r.json()

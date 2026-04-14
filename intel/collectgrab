@@ -59,7 +59,8 @@ if TOR_AVAILABLE:
                 'https': f'socks5h://127.0.0.1:{_candidate_port}',
             }
             _r = requests.get("https://check.torproject.org/api/ip",
-                              proxies=_test_px, timeout=10)
+                              proxies=_test_px, timeout=10,
+                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"})
             if _r.json().get("IsTor"):
                 _tor_socks_port = _candidate_port
                 break
@@ -121,8 +122,12 @@ for d in source_dirs.values():
 
 # Delay utilities
 def random_sleep(min_seconds, max_seconds):
-    """Sleep a random amount of time between min_seconds and max_seconds."""
-    wait = random.uniform(min_seconds, max_seconds)
+    """Sleep a random amount of time between min_seconds and max_seconds.
+    Uses secrets module for CSPRNG to avoid predictable timing patterns.
+    """
+    import secrets as _secrets
+    range_ms = int((max_seconds - min_seconds) * 1000)
+    wait = min_seconds + (_secrets.randbelow(max(range_ms, 1)) / 1000.0)
     logger.debug("Sleeping for %.2f seconds", wait)
     time.sleep(wait)
 
@@ -164,7 +169,8 @@ def tor_newnym_session(session):
     except Exception as e:
         logger.warning("Failed to rotate Tor circuit: %s", e)
     
-    time.sleep(5)
+    import secrets as _secrets
+    time.sleep(3 + _secrets.randbelow(5000) / 1000.0)
     session.cookies.clear()
 
 def safe_filename(name):
