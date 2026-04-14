@@ -706,6 +706,9 @@ def main():
                 temp_file.unlink(missing_ok=True)
             for temp_file in TEMP_DIR.glob("decoy_*.log"):
                 temp_file.unlink(missing_ok=True)
+            for proc_name in DECOY_PROCESSES:
+                for temp_file in TEMP_DIR.glob(f".{proc_name}_*"):
+                    temp_file.unlink(missing_ok=True)
         except Exception:
             pass
 

@@ -112,7 +112,7 @@ def main():
         print(f"  [·] Detected en_seeder format (bundle hash)")
         bundle_for_hash = json.dumps(
             {k: v for k, v in data.items() if k != "sha256"},
-            sort_keys=True, separators=(",", ":"),
+            sort_keys=True,
         ).encode()
         actual_hash = hashlib.sha256(bundle_for_hash).hexdigest()
         if actual_hash == claimed_hash:

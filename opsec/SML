@@ -131,7 +131,7 @@ def cmd_load(args):
         "sha256": loaded_seed_hash,
         "loaded_at": int(time.time()),
         "ttl": args.ttl if args.ttl else None,
-        "source": str(seed_path.name),
+        "source": hashlib.sha256(str(seed_path.name).encode()).hexdigest()[:16],
     }
     tmp = SEED_SHM.with_suffix(".tmp")
     with open(tmp, "w") as f:

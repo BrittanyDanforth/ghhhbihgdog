@@ -179,7 +179,7 @@ class IntegrityChainFaker:
                 interval += self.rng.randint(3600, 86400)  # 1-24 hours
             
             current_time += interval
-            timestamps.append(current_time)
+            timestamps.append(current_time // 600 * 600)
         
         return timestamps
     
