@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+thor_swap_preparer v10.0 - ThorChain BTC -> XMR quote fetcher
+==============================================================
+Generates integrity-logged deposit/memo pairs that GhostSpiral v10
+can consume later.
+
+OPSEC hardening:
+  - Tor verified with retry before any API contact
+  - NEWNYM circuit rotation between each quote request
+  - Timing jitter between quotes to frustrate correlation
+  - XMR destination addresses validated (regex + checksum)
+  - BTC deposit addresses validated (bech32 format check)
+  - Slippage oracle cross-check with 5% deviation warning
+  - Atomic fsync-rename on all output files (0600 perms)
+  - GPG encryption support with import guard
+  - Integrity hash-chain per pair
+"""
+from __future__ import annotations
+import argparse, json, os, sys, time, re
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List
+
+_CORE_DIR = str(Path(__file__).resolve().parent)
+if _CORE_DIR not in sys.path:
+    sys.path.insert(0, _CORE_DIR)
+
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, newnym,
+    safe_get, safe_post, secure_delay, atomic_write_json,
+    install_signal_handlers, shutdown_requested, scrub_address,
+)
+
+try:
+    from monero.address import Address as XMRAddress
+except ImportError:
+    sys.exit("[!] python-monero missing - pip install monero")
+
+SWAPKIT_API = "https://api.swapkit.dev"
+# SwapKit API requires an x-api-key header.
+# Operators must set SWAPKIT_API_KEY env var or pass --api-key.
+SWAPKIT_API_KEY_ENV = "SWAPKIT_API_KEY"
+CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
+PAIR_SCHEMA = "thor_pairs_v1"
+# BUG 66 FIX: Accept all valid BTC address formats including legacy (1...),
+# P2SH (3...), and bech32 (bc1...). ThorChain vaults can use any format.
+BTC_RE = re.compile(
+    r"^(bc1[ac-hj-np-z02-9]{25,59}|tb1[ac-hj-np-z02-9]{25,59}"
+    r"|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
+    re.I
+)
+# BUG 65 FIX: Accept standard (95 char), subaddress (95 char), and
+# integrated (106 char) Monero address formats.
+_XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
+
+
+def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
+    """Fetch current BTC/XMR rate from CoinGecko."""
+    try:
+        p = safe_get(CG_PRICE, proxy)
+        rate = Decimal(str(p["monero"]["btc"]))
+        if rate <= 0:
+            raise ValueError("Non-positive rate")
+        return rate
+    except Exception as e:
+        integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
+        print("[!] Price oracle failed; using conservative fallback 0.003 BTC/XMR")
+        return Decimal("0.003")
+
+
+def _validate_xmr_addr(addr: str) -> None:
+    """Validate XMR address format and checksum."""
+    if not _XMR_RE.match(addr):
+        sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
+    try:
+        XMRAddress(addr)
+    except Exception:
+        sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "thor_swap_preparer v10.0",
+        description="Fetch ThorChain BTC->XMR quotes with OPSEC hardening",
+    )
+    ap.add_argument("--amounts", nargs="+", required=True, type=Decimal,
+                    help="BTC amounts to swap")
+    ap.add_argument("--dests", nargs="+", required=True,
+                    help="XMR destination addresses (one per amount)")
+    ap.add_argument("--tor-proxy",
+                    help="SOCKS5 proxy (required for production use)")
+    ap.add_argument("--gpg-recipient",
+                    help="GPG recipient for encrypted output")
+    ap.add_argument("--outfile", default="thor_pairs_batch.json")
+    ap.add_argument("--api-key",
+                    help="SwapKit API key (or set SWAPKIT_API_KEY env var)")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite existing output file (DANGER: old deposit "
+                         "addresses are invalidated when new ones are generated)")
+    args = ap.parse_args()
+
+    # Resolve API key
+    api_key = args.api_key or os.environ.get(SWAPKIT_API_KEY_ENV, "")
+    if not api_key:
+        print("  [!] WARNING: No SwapKit API key provided.")
+        print(f"  [!] Set {SWAPKIT_API_KEY_ENV} env var or use --api-key.")
+        print("  [!] API calls may fail with 401 Unauthorized.")
+
+    if len(args.amounts) != len(args.dests):
+        sys.exit(f"[!] Mismatch: {len(args.amounts)} amounts vs {len(args.dests)} dests")
+
+    for amt in args.amounts:
+        if amt <= 0:
+            sys.exit(f"[!] Amount must be positive: {amt}")
+
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Clearnet queries to ThorChain API leak\n"
+            "    your IP and reveal you are performing BTC->XMR swaps. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+
+    for d in args.dests:
+        _validate_xmr_addr(d)
+
+    btc_per_xmr = _btc_per_xmr(proxy)
+    integrity_log("thor", "oracle_fetched")
+
+    pairs: List[dict] = []
+
+    for i, (amt, dest) in enumerate(zip(args.amounts, args.dests)):
+        if shutdown_requested():
+            integrity_log("thor", f"shutdown_at_pair_{i}")
+            break
+
+        # Rotate circuit between quotes
+        if i > 0 and proxy:
+            newnym()
+            secure_delay(3.0, 8.0)
+
+        # BUG 67 FIX: SwapKit API uses a two-step flow:
+        #   Step 1: POST /v3/quote — returns routes with routeId + expectedBuyAmount
+        #   Step 2: POST /v3/swap  — takes routeId, returns actual depositAddress + memo
+        # The old code tried to extract depositAddress from /v3/quote which doesn't have it.
+
+        quote_payload = {
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": dest,
+        }
+
+        quote_headers = {}
+        if api_key:
+            quote_headers["x-api-key"] = api_key
+
+        try:
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
+                                   headers=quote_headers)
+        except Exception as e:
+            if proxy:
+                newnym()
+            integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
+            raise
+
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            error = quote_resp.get("error", quote_resp.get("message", "unknown"))
+            provider_errors = quote_resp.get("providerErrors", [])
+            integrity_log("thor", f"no_routes_{i}")
+            sys.exit(
+                f"[!] No swap routes for pair {i}: {str(error)[:80]}\n"
+                f"    Provider errors: {str(provider_errors)[:120]}"
+            )
+
+        route = routes[0]
+        route_id = route.get("routeId", route.get("id", ""))
+        expected_xmr = Decimal(str(
+            route.get("expectedBuyAmount",
+            route.get("expectedOutput",
+            route.get("expectedOutputMaxSlippage", "0")))
+        ))
+
+        # Step 2: Get actual swap details with deposit address
+        if route_id:
+            swap_payload = {
+                "routeId": route_id,
+                "sourceAddress": "",
+                "destinationAddress": dest,
+            }
+            try:
+                swap_resp = safe_post(f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
+                                     headers=quote_headers)
+                tx_info = swap_resp.get("tx", swap_resp.get("transaction", {}))
+                deposit = (tx_info.get("depositAddress", "") or
+                          tx_info.get("targetAddress", "") or
+                          tx_info.get("to", "") or
+                          swap_resp.get("inboundAddress", ""))
+                memo = (tx_info.get("memo", "") or
+                       tx_info.get("data", "") or
+                       swap_resp.get("memo", ""))
+            except Exception as e:
+                integrity_log("thor", f"swap_api_fail_{i}:{str(e)[:40]}")
+                sys.exit(f"[!] SwapKit /v3/swap failed for pair {i}: {str(e)[:60]}")
+        else:
+            # Fallback: try extracting from quote response (some API versions)
+            tx_info = route.get("transaction", route.get("calldata", {}))
+            deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
+            memo = str(tx_info.get("memo", tx_info.get("data", "")))
+
+        if not deposit:
+            integrity_log("thor", f"no_deposit_{i}")
+            sys.exit(f"[!] ThorChain returned no deposit address for pair {i}")
+
+        if not BTC_RE.match(deposit):
+            integrity_log("thor", f"bad_deposit_format_{i}")
+            sys.exit(f"[!] Deposit address not valid bech32: {scrub_address(deposit)}")
+
+        # Slippage check
+        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
+        if oracle_xmr > 0:
+            deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
+            if deviation > Decimal("0.05"):
+                print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
+                integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
+
+        pair = {
+            "schema": PAIR_SCHEMA,
+            "btc_in": str(amt),
+            "deposit": deposit,
+            "memo": str(memo),
+            "dest_xmr": dest,
+            "expected_xmr": str(expected_xmr),
+            "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        }
+        pairs.append(pair)
+        integrity_log("thor", f"pair_{i}:ready")
+        print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
+              f"(expected {expected_xmr} XMR)")
+
+    if not pairs:
+        sys.exit("[!] No pairs generated")
+
+    # BUG 76 FIX: /v3/swap creates a binding commitment on ThorChain.
+    # Re-running generates different deposit addresses. If the sender
+    # already sent BTC to the old addresses, overwriting the file loses
+    # those addresses and the BTC may be unrecoverable.
+    _out = Path(args.outfile)
+    if _out.exists() and not args.force:
+        sys.exit(
+            f"[!] Output file {_out} already exists!\n"
+            f"    Re-running creates NEW deposit addresses — old ones may expire.\n"
+            f"    If a sender already sent BTC to the old addresses, DO NOT overwrite.\n"
+            f"    Use --force to overwrite, or --outfile <different_name>."
+        )
+    atomic_write_json(pairs, _out)
+    integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
+    print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
+
+    print()
+    print("  ============================================================")
+    print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
+    print("  ============================================================")
+    for i, pair in enumerate(pairs):
+        print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
+        print(f"  Send exactly: {pair['btc_in']} BTC")
+        print(f"  To address:   {pair['deposit']}")
+        if pair.get("memo"):
+            print(f"  With memo:    {pair['memo']}")
+        else:
+            print(f"  Memo:         (none required)")
+        print(f"  Expected XMR: ~{pair['expected_xmr']}")
+    print()
+    print("  ============================================================")
+    print("  IMPORTANT: The sender must include the memo in the BTC")
+    print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
+    print("  route the swap. Quotes expire — send promptly.")
+    print("  ============================================================")
+
+    if args.gpg_recipient:
+        try:
+            import gnupg
+            g = gnupg.GPG()
+            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+            if enc.ok:
+                gpg_path = Path(str(_out) + ".gpg")
+                gpg_path.write_text(str(enc))
+                os.chmod(gpg_path, 0o600)
+                integrity_log("thor", f"gpg_ok:{gpg_path.name}")
+                print(f"  [+] GPG bundle -> {gpg_path}")
+            else:
+                integrity_log("thor", f"gpg_fail:{enc.status}")
+                print(f"  [!] GPG encryption failed: {enc.status}")
+        except ImportError:
+            print("[!] python-gnupg not installed - skipping GPG encryption")
+
+    if proxy:
+        newnym()
+
+
+if __name__ == "__main__":
+    main()

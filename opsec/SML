@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+SML — Secure Memory-Locked Seed Manager
+========================================
+Manages entropy seeds in RAM-only storage with memory locking.
+
+Features:
+  - Loads seed into mlock'd memory (won't be swapped to disk)
+  - Stores seed in /dev/shm (RAM-backed tmpfs, never touches disk)
+  - Auto-wipes after TTL expiry
+  - Verifies seed integrity on load
+  - Secure overwrite on cleanup (zeros + random + zeros)
+
+Usage:
+    python3 SML load entropy_seed.json              # load seed into RAM
+    python3 SML load entropy_seed.json --ttl 3600   # auto-wipe after 1 hour
+    python3 SML verify                              # check if seed is loaded
+    python3 SML wipe                                # securely erase from RAM
+"""
+import argparse, ctypes, hashlib, json, os, secrets, signal, sys, time, threading
+from pathlib import Path
+
+SHM_DIR = Path("/dev/shm")
+SEED_SHM = SHM_DIR / ".gs_seed_active"
+LOCK_SHM = SHM_DIR / ".gs_seed_lock"
+
+
+def _mlock_available() -> bool:
+    """Check if mlockall is available and working."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        MCL_CURRENT = 1
+        MCL_FUTURE = 2
+        rc = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+        return rc == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def _secure_wipe_bytes(path: Path):
+    """Overwrite file content with zeros, random, then zeros again before unlinking."""
+    try:
+        size = path.stat().st_size
+        with open(path, "r+b") as f:
+            f.write(b"\x00" * size)
+            f.flush()
+            f.seek(0)
+            f.write(os.urandom(size))
+            f.flush()
+            f.seek(0)
+            f.write(b"\x00" * size)
+            f.flush()
+            os.fsync(f.fileno())
+        path.unlink()
+    except (OSError, PermissionError):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def cmd_load(args):
+    """Load seed into RAM-locked storage."""
+    seed_path = Path(args.seed_file)
+    if not seed_path.exists():
+        print(f"  [!] Seed file not found: {seed_path}")
+        sys.exit(1)
+
+    # Parse seed
+    try:
+        with open(seed_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  [!] Cannot read seed: {e}")
+        sys.exit(1)
+
+    seed_hex = data.get("seed_hex", "")
+    claimed_hash = data.get("sha256", "")
+
+    if not seed_hex:
+        print("  [!] Seed file has no seed_hex field")
+        sys.exit(1)
+
+    # Verify integrity
+    try:
+        seed_bytes = bytes.fromhex(seed_hex)
+    except ValueError:
+        print("  [!] seed_hex is not valid hexadecimal — file may be corrupt")
+        sys.exit(1)
+    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
+    if claimed_hash and actual_hash != claimed_hash:
+        print("  [!] Seed hash MISMATCH — file may be tampered!")
+        print(f"      Expected: {claimed_hash}")
+        print(f"      Actual:   {actual_hash}")
+        sys.exit(1)
+
+    # Check /dev/shm availability
+    if not SHM_DIR.is_dir():
+        print("  [!] /dev/shm not available — cannot use RAM-only storage")
+        print("  [!] On this system, seed would touch disk. Aborting.")
+        sys.exit(1)
+
+    # Lock memory
+    if _mlock_available():
+        print("  [+] Memory locked (mlockall) — seed won't be swapped to disk")
+    else:
+        print("  [!] WARNING: mlockall failed — seed may leak to swap partition")
+        print("  [!] Run as root or with CAP_IPC_LOCK for full protection")
+
+    # Clean old seed if present
+    if SEED_SHM.exists():
+        _secure_wipe_bytes(SEED_SHM)
+        print("  [·] Previous seed wiped")
+
+    # Write to /dev/shm with 0600 permissions
+    bundle = {
+        "seed_hex": seed_hex,
+        "sha256": actual_hash,
+        "loaded_at": int(time.time()),
+        "ttl": args.ttl if args.ttl else None,
+        "source": str(seed_path.name),
+    }
+    tmp = SEED_SHM.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(bundle, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SEED_SHM)
+    os.chmod(SEED_SHM, 0o600)
+
+    seed_bytes = len(seed_hex) // 2
+    print(f"  [+] Seed loaded into RAM: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    print(f"  [+] Location: {SEED_SHM} (RAM-only, 0600 permissions)")
+
+    if args.ttl:
+        print(f"  [+] Auto-wipe in {args.ttl} seconds")
+        # Write TTL lock file so background process knows when to wipe
+        lock_data = {"wipe_at": int(time.time()) + args.ttl}
+        with open(LOCK_SHM, "w") as f:
+            json.dump(lock_data, f)
+        os.chmod(LOCK_SHM, 0o600)
+
+        # Fork a background wiper
+        pid = os.fork()
+        if pid == 0:
+            # Child process: wait then wipe
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            time.sleep(args.ttl)
+            if SEED_SHM.exists():
+                _secure_wipe_bytes(SEED_SHM)
+            if LOCK_SHM.exists():
+                LOCK_SHM.unlink()
+            sys.exit(0)
+        else:
+            print(f"  [·] Wiper process started (PID {pid})")
+
+
+def cmd_verify(args):
+    """Check if a seed is currently loaded in RAM."""
+    if not SEED_SHM.exists():
+        print("  [!] No seed loaded in RAM")
+        sys.exit(1)
+
+    try:
+        with open(SEED_SHM) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        print("  [!] Seed file in RAM is corrupt")
+        sys.exit(1)
+
+    seed_hex = data.get("seed_hex", "")
+    claimed_hash = data.get("sha256", "")
+    loaded_at = data.get("loaded_at", 0)
+    ttl = data.get("ttl")
+
+    # Verify hash
+    try:
+        seed_bytes = bytes.fromhex(seed_hex)
+    except ValueError:
+        print("  [!] seed_hex in RAM is not valid hex — data is corrupt!")
+        sys.exit(1)
+    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
+    if actual_hash != claimed_hash:
+        print("  [!] INTEGRITY FAILURE — seed in RAM has been modified!")
+        sys.exit(1)
+
+    age = int(time.time()) - loaded_at
+    seed_bytes = len(seed_hex) // 2
+    print(f"  [+] Seed is loaded and verified")
+    print(f"      Size: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    print(f"      Hash: {actual_hash[:16]}...")
+    print(f"      Age:  {age // 60} minutes")
+    if ttl:
+        remaining = ttl - age
+        if remaining > 0:
+            print(f"      TTL:  {remaining}s remaining before auto-wipe")
+        else:
+            print(f"      TTL:  EXPIRED (wiper should have cleaned this)")
+
+    # Check if it was leaked to disk
+    for check_dir in [Path("."), Path.home()]:
+        for pattern in ["entropy_seed*.json", "*seed*.json"]:
+            for f in check_dir.glob(pattern):
+                if f != SEED_SHM:
+                    print(f"  [!] WARNING: Seed file also on DISK: {f}")
+                    print(f"      Consider deleting: shred -u {f}")
+
+
+def cmd_wipe(args):
+    """Securely erase seed from RAM."""
+    wiped = False
+    if SEED_SHM.exists():
+        _secure_wipe_bytes(SEED_SHM)
+        print(f"  [+] Seed securely wiped from RAM")
+        wiped = True
+    if LOCK_SHM.exists():
+        LOCK_SHM.unlink()
+        wiped = True
+    if not wiped:
+        print("  [·] No seed was loaded")
+    else:
+        print("  [+] RAM storage clean")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        "SML — Secure Memory-Locked Seed Manager",
+        description="Manage entropy seeds in RAM-only storage with memory locking",
+    )
+    sub = ap.add_subparsers(dest="command")
+
+    load_p = sub.add_parser("load", help="Load seed into RAM-locked storage")
+    load_p.add_argument("seed_file", help="Path to entropy_seed.json")
+    load_p.add_argument("--ttl", type=int, default=None,
+                        help="Auto-wipe after N seconds")
+
+    sub.add_parser("verify", help="Check if seed is loaded and intact")
+    sub.add_parser("wipe", help="Securely erase seed from RAM")
+
+    args = ap.parse_args()
+    if not args.command:
+        ap.print_help()
+        sys.exit(0)
+
+    if args.command == "load":
+        cmd_load(args)
+    elif args.command == "verify":
+        cmd_verify(args)
+    elif args.command == "wipe":
+        cmd_wipe(args)
+
+
+if __name__ == "__main__":
+    main()

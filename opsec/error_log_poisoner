@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+error_log_poisoner.py — GhostSpiral v16.9 Chaos Toolkit
+=====================================================
+Generates **misleading, yet believable error/warning entries** in a target log
+file so that forensic analysts reconstructing an incident timeline get false
+signals. All entries are deterministically randomised from
+`entropy_seed.json` and can be safely reproduced by downstream modules.
+
+Key Traits
+──────────
+• **Deterministic chaos** — seeded from seed SHA‑256 + target log hash.
+• **RAM‑only default** — writes to `/dev/shm/fake_errors.log` unless `--out`.
+• **Timestamp skew** — back‑dates or forward‑dates errors ±10–3600 s around
+  real event markers to muddy ordering.
+• **Noise blend** — blends real‑looking tags (`WARN`, `ERROR`, `RPC_FAIL`,
+  `TIMEOUT`, `SIGSEGV`) with entropy‑salted IDs.
+• **Insert‑only** — never overwrites genuine lines; appends safely.
+
+Usage
+─────
+    # Inject 50 decoy lines into broadcast log (RAM‑only)
+    python3 error_log_poisoner.py --source bc_integrity_v3.log.aes --count 50
+
+    # Disk output with custom path
+    python3 error_log_poisoner.py --source exec.log --out decoy_exec.log
+"""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from pathlib import Path
+from typing import List
+
+VERSION = "1.0"
+SEED_FILE = Path("entropy_seed.json")
+RAM_DEFAULT = Path("/dev/shm/fake_errors.log") if Path("/dev/shm").exists() else Path("fake_errors.log")
+
+TAGS = ["WARN", "ERROR", "RPC_FAIL", "TIMEOUT", "SIGSEGV", "OOM", "ASSERT"]
+MSG_BANK = [
+    "buffer overflow @ 0x{:08x}",
+    "index out of range ({})",
+    "bad file descriptor: {}",
+    "mempool reject – fee too low",
+    "orphan block detected height={}",
+    "SSL handshake failed code=0x{:x}",
+    "CRC mismatch shard {:02d}",
+    "connection timeout after {} seconds",
+    "segmentation fault at address 0x{:08x}",
+    "out of memory: requested {} bytes",
+    "assertion failed: {}",
+    "network unreachable: {}",
+    "permission denied: {}",
+    "resource temporarily unavailable",
+    "invalid argument: {}",
+    "broken pipe",
+    "interrupted system call",
+    "no space left on device",
+]
+
+
+def sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def load_seed_sha() -> str:
+    if not SEED_FILE.exists():
+        print(f"[!] {SEED_FILE} missing", file=sys.stderr)
+        sys.exit(1)
+    return sha256_hex(SEED_FILE.read_bytes())[:64]
+
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+def generate_entries(count: int, base_ts: int, rng: random.Random) -> List[str]:
+    lines: List[str] = []
+    for _ in range(count):
+        ts_skew = rng.randint(-3600, 3600)
+        ts = dt.datetime.utcfromtimestamp(base_ts + ts_skew).isoformat()
+        tag = rng.choice(TAGS)
+        msg_tpl = rng.choice(MSG_BANK)
+        
+        # Fill format patterns safely
+        try:
+            if "{}" in msg_tpl:
+                # Count number of format placeholders
+                placeholder_count = msg_tpl.count("{}")
+                if placeholder_count == 1:
+                    # Single placeholder - choose appropriate value based on template
+                    if "0x" in msg_tpl or "address" in msg_tpl:
+                        msg = msg_tpl.format(rng.getrandbits(32))
+                    elif "bytes" in msg_tpl:
+                        msg = msg_tpl.format(rng.randint(1024, 1024*1024))
+                    elif "height" in msg_tpl:
+                        msg = msg_tpl.format(rng.randint(1, 999999))
+                    elif "seconds" in msg_tpl:
+                        msg = msg_tpl.format(rng.randint(1, 300))
+                    elif "shard" in msg_tpl:
+                        msg = msg_tpl.format(rng.randint(1, 99))
+                    else:
+                        # Generic string replacement
+                        random_str = sha256_hex(rng.randbytes(4))[:8]
+                        msg = msg_tpl.format(random_str)
+                else:
+                    # Multiple placeholders - use generic approach
+                    values = []
+                    for _ in range(placeholder_count):
+                        if rng.choice([True, False]):
+                            values.append(rng.randint(1, 1000))
+                        else:
+                            values.append(sha256_hex(rng.randbytes(2))[:6])
+                    msg = msg_tpl.format(*values)
+            else:
+                msg = msg_tpl
+        except (ValueError, TypeError) as e:
+            # Fallback to original template if formatting fails
+            msg = msg_tpl
+        
+        entropy_id = sha256_hex(rng.randbytes(4))[:6]
+        lines.append(f"{ts} | {tag} | {msg} | id={entropy_id}")
+    
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="error_log_poisoner v1.0")
+    ap.add_argument("--source", required=True, help="Real log to fingerprint (hash only)")
+    ap.add_argument("--out", type=Path, default=RAM_DEFAULT, help="Where to write decoy log (default: RAM path)")
+    ap.add_argument("--count", type=int, default=30, help="How many fake lines to append (default 30)")
+    args = ap.parse_args()
+
+    src_path = Path(args.source)
+    if not src_path.exists():
+        print(f"[!] source log {src_path} missing", file=sys.stderr)
+        sys.exit(1)
+
+    seed_sha = load_seed_sha()
+    try:
+        src_sha = sha256_hex(src_path.read_bytes())
+    except Exception as e:
+        print(f"[!] Failed to read source log: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    rng_seed = int((seed_sha + src_sha)[:32], 16)
+    rng = random.Random(rng_seed)
+
+    # Determine base_ts as most recent real line timestamp (best‑effort)
+    try:
+        content = src_path.read_text(encoding='utf-8', errors='ignore')
+        lines = content.splitlines()
+        if lines:
+            last_line = lines[-1]
+            # Try to extract timestamp from various formats
+            timestamp_part = last_line.split(" | ")[0] if " | " in last_line else last_line.split()[0]
+            try:
+                # Try ISO format first
+                base_ts = int(time.mktime(dt.datetime.fromisoformat(timestamp_part).timetuple()))
+            except ValueError:
+                # Try other common formats
+                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"]:
+                    try:
+                        base_ts = int(time.mktime(dt.datetime.strptime(timestamp_part, fmt).timetuple()))
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    # Fallback to current time
+                    base_ts = int(time.time())
+        else:
+            base_ts = int(time.time())
+    except Exception as e:
+        print(f"[!] Warning: Could not parse timestamps from source log: {e}", file=sys.stderr)
+        base_ts = int(time.time())
+
+    decoys = generate_entries(args.count, base_ts, rng)
+
+    try:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if args.out.exists() else "w"
+        with args.out.open(mode, encoding="utf-8") as fh:
+            for ln in decoys:
+                fh.write(ln + "\n")
+        os.chmod(args.out, 0o600)
+        print(f"[+] Injected {len(decoys)} decoy errors → {args.out}")
+    except Exception as e:
+        print(f"[!] Failed to write output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

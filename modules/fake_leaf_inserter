@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+dag_fake_leaf_inserter.py — Fixed version
+==========================================
+Injects fake leaf nodes into an existing DAG structure for testing purposes.
+
+Fixed Issues:
+- Proper error handling and input validation
+- Secure file operations with context managers
+- Fixed ID parsing logic
+- Removed potentially problematic comments
+- Added proper type checking
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import random
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
+
+SEED_FILE = Path("entropy_seed.json")
+MANIFEST_NAME = "fake_leaf_manifest_v1.json"
+
+
+def sha256_hex(data: bytes) -> str:
+    """Calculate SHA256 hash of data."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe_read_json(path: Path) -> Dict[str, Any]:
+    """Safely read and parse JSON file."""
+    try:
+        with path.open('r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
+        print(f"[!] Error reading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def safe_write_json(path: Path, data: Any) -> None:
+    """Safely write JSON data to file."""
+    try:
+        # Write to temporary file first, then atomic rename
+        tmp_path = path.with_suffix(path.suffix + '.tmp')
+        with tmp_path.open('w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(path)
+        os.chmod(path, 0o600)
+    except (PermissionError, OSError) as e:
+        print(f"[!] Error writing {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def deterministic_rng(dag_path: Path) -> random.Random:
+    """Create deterministic RNG from seed file and DAG content."""
+    if not SEED_FILE.exists():
+        print(f"[!] Seed file {SEED_FILE} not found", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        with SEED_FILE.open('rb') as f:
+            seed_data = f.read()
+        with dag_path.open('rb') as f:
+            dag_data = f.read()
+    except (PermissionError, OSError) as e:
+        print(f"[!] Error reading files: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    seed_sha = sha256_hex(seed_data)
+    dag_sha = sha256_hex(dag_data)
+    combined_hash = seed_sha + dag_sha
+    
+    # Use first 32 hex chars as seed
+    seed_value = int(combined_hash[:32], 16)
+    return random.Random(seed_value)
+
+
+def extract_numeric_id(node_id: str) -> Optional[int]:
+    """Extract numeric part from node ID, handling both 'n' and 'f' prefixes."""
+    if not node_id:
+        return None
+    
+    # Handle IDs that start with 'n' or 'f'
+    if node_id.startswith(('n', 'f')):
+        try:
+            return int(node_id[1:])
+        except ValueError:
+            return None
+    
+    # Try to parse as pure number
+    try:
+        return int(node_id)
+    except ValueError:
+        return None
+
+
+def get_next_id_counter(nodes: List[Dict[str, Any]]) -> int:
+    """Find the highest numeric ID to start counter from."""
+    max_id = 0
+    for node in nodes:
+        node_id = node.get("id", "")
+        numeric_id = extract_numeric_id(node_id)
+        if numeric_id is not None:
+            max_id = max(max_id, numeric_id)
+    return max_id
+
+
+def build_depth_map(nodes: List[Dict[str, Any]], edges: List[List[str]]) -> Dict[str, int]:
+    """Build mapping of node ID to depth in DAG."""
+    # Find root node (assuming it's "n0" or first node with no parents)
+    all_node_ids = {node["id"] for node in nodes}
+    children_ids = {edge[1] for edge in edges}
+    root_candidates = all_node_ids - children_ids
+    
+    if not root_candidates:
+        print("[!] No root node found in DAG", file=sys.stderr)
+        sys.exit(1)
+    
+    # Build adjacency list
+    children: Dict[str, List[str]] = {}
+    for parent, child in edges:
+        children.setdefault(parent, []).append(child)
+    
+    # BFS from ALL roots to handle multi-root DAGs correctly
+    depth_map: Dict[str, int] = {}
+    queue = []
+    for root_id in sorted(root_candidates):
+        depth_map[root_id] = 0
+        queue.append(root_id)
+    
+    while queue:
+        current = queue.pop(0)
+        current_depth = depth_map[current]
+        
+        for child in children.get(current, []):
+            if child not in depth_map or depth_map[child] > current_depth + 1:
+                depth_map[child] = current_depth + 1
+                queue.append(child)
+    
+    return depth_map
+
+
+def insert_fake_leaves(
+    graph: Dict[str, Any], 
+    rng: random.Random, 
+    min_leaves: int, 
+    max_leaves: int, 
+    max_depth: int
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Insert fake leaf nodes into the graph."""
+    if "nodes" not in graph or "edges" not in graph:
+        print("[!] Invalid graph structure - missing 'nodes' or 'edges'", file=sys.stderr)
+        sys.exit(1)
+    
+    nodes = graph["nodes"].copy()
+    edges = graph["edges"].copy()
+    
+    if not nodes:
+        print("[!] No nodes in graph", file=sys.stderr)
+        sys.exit(1)
+    
+    id_counter = get_next_id_counter(nodes)
+    depth_map = build_depth_map(nodes, edges)
+    manifest: List[Dict[str, Any]] = []
+    
+    # Only add fake leaves to nodes within depth limit
+    original_nodes = nodes.copy()
+    for node in original_nodes:
+        node_id = node["id"]
+        node_depth = depth_map.get(node_id, 0)
+        
+        if node_depth >= max_depth:
+            continue
+        
+        fake_count = rng.randint(min_leaves, max_leaves)
+        
+        for _ in range(fake_count):
+            id_counter += 1
+            fake_id = f"f{id_counter}"
+            fake_amount = round(rng.uniform(0.00000001, 0.0009), 8)
+            
+            fake_node = {
+                "id": fake_id,
+                "type": "decoy",
+                "amount": fake_amount
+            }
+            
+            nodes.append(fake_node)
+            edges.append([node_id, fake_id])
+            
+            manifest.append({
+                "parent": node_id,
+                "fake_id": fake_id,
+                "amount": fake_amount
+            })
+    
+    return {"nodes": nodes, "edges": edges}, manifest
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate command line arguments."""
+    if args.min < 0:
+        print("[!] --min must be non-negative", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.max < args.min:
+        print("[!] --max must be >= --min", file=sys.stderr)
+        sys.exit(1)
+    
+    if args.max_depth < 0:
+        print("[!] --max-depth must be non-negative", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Insert fake leaf nodes into DAG structure",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--input", "-i", 
+        type=Path, 
+        default=Path("dag_structure.json"),
+        help="Input DAG JSON file"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=Path,
+        default=Path("dag_augmented.json"),
+        help="Output augmented DAG JSON file"
+    )
+    parser.add_argument(
+        "--min",
+        type=int,
+        default=1,
+        help="Minimum fake leaves per node"
+    )
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=3,
+        help="Maximum fake leaves per node"
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=2,
+        help="Maximum depth to add fake leaves"
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite input file"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show preview without making changes"
+    )
+    
+    args = parser.parse_args()
+    validate_args(args)
+    
+    input_path = args.input
+    if not input_path.exists():
+        print(f"[!] Input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Load and validate DAG structure
+    dag_data = safe_read_json(input_path)
+    
+    if "graph" not in dag_data:
+        print("[!] Invalid DAG file - missing 'graph' key", file=sys.stderr)
+        sys.exit(1)
+    
+    # Create deterministic RNG
+    rng = deterministic_rng(input_path)
+    
+    # Insert fake leaves
+    augmented_graph, manifest = insert_fake_leaves(
+        dag_data["graph"], 
+        rng, 
+        args.min, 
+        args.max, 
+        args.max_depth
+    )
+    
+    if args.dry_run:
+        preview = {
+            "fake_leaves_added": len(manifest),
+            "sample_entries": manifest[:5] if manifest else []
+        }
+        print(json.dumps(preview, indent=2))
+        return
+    
+    # Update DAG data
+    dag_data["graph"] = augmented_graph
+    dag_data["augmented"] = True
+    dag_data["augment_metadata"] = {
+        "tool": "dag_fake_leaf_inserter",
+        "min_leaves": args.min,
+        "max_leaves": args.max,
+        "max_depth": args.max_depth,
+        "fake_count": len(manifest),
+    }
+    
+    # Calculate final hash
+    dag_json = json.dumps(dag_data, sort_keys=True, ensure_ascii=False)
+    dag_data["content_hash"] = sha256_hex(dag_json.encode('utf-8'))
+    
+    # Write output
+    output_path = input_path if args.in_place else args.output
+    safe_write_json(output_path, dag_data)
+    
+    # Write manifest
+    manifest_path = output_path.parent / MANIFEST_NAME
+    safe_write_json(manifest_path, manifest)
+    
+    print(f"[+] Added {len(manifest)} fake leaves")
+    print(f"    Output: {output_path}")
+    print(f"    Manifest: {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+# COLLECT AND GRAB
+import os, sys, time, random, json, hashlib, logging, subprocess, shutil, re
+from urllib.parse import quote_plus
+
+# External libraries
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as e:
+    logging.error("Missing required library: %s. Please install 'requests' and 'beautifulsoup4'.", e)
+    sys.exit(1)
+
+# Selenium for optional headless browser fallback (CAPTCHA solving not implemented)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    webdriver = None
+    SELENIUM_AVAILABLE = False
+
+# Tor control - make optional
+try:
+    from stem.control import Controller
+    from stem import Signal
+    TOR_AVAILABLE = True
+except ImportError:
+    TOR_AVAILABLE = False
+    logging.warning("Stem library not available. Tor functionality disabled.")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Check required executables only if Selenium is available
+if SELENIUM_AVAILABLE:
+    if not shutil.which("firefox"):
+        logger.warning("Firefox is not installed or not in PATH. Selenium functionality disabled.")
+        SELENIUM_AVAILABLE = False
+    if not shutil.which("geckodriver"):
+        logger.warning("geckodriver is not installed or not in PATH. Selenium functionality disabled.")
+        SELENIUM_AVAILABLE = False
+
+# Check targ_graber dependency - make optional
+targ_script = "targ_graber_v14.py"
+if not (os.path.isfile(targ_script) and os.access(targ_script, os.X_OK)):
+    logger.warning("Script '%s' is missing or not executable. Using default targets.", targ_script)
+
+# Setup proxy configuration — ABORT if Tor is not available
+# Running clearnet exposes the operator's real IP to every target
+proxies = {}
+if TOR_AVAILABLE:
+    proxies = {
+        'http': 'socks5h://127.0.0.1:9050',
+        'https': 'socks5h://127.0.0.1:9050'
+    }
+else:
+    logger.critical("Tor (stem) not available — refusing to run over clearnet.")
+    logger.critical("Install stem: pip install stem  and ensure Tor is running.")
+    sys.exit(1)
+
+def _secure_perms(path):
+    """Set file to owner-only (0600) to protect collected data."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+# Create a requests session for persistent settings
+session = requests.Session()
+session.proxies.update(proxies)
+
+# Randomized user agents list
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+    " Chrome/111.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:111.0) Gecko/20100101 Firefox/111.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+]
+
+# List of Nitter instances to rotate through
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.42l.fr",
+    "https://nitter.pussthecat.org",
+    "https://nitter.kavin.rocks",
+    "https://nitter.poast.org",
+    "https://nitter.unixfox.eu",
+    "https://nitter.mint.lgbt",
+    "https://nitter.tiekoetter.com"
+]
+
+# Define base directories for outputs - fallback to current directory if /dev/shm unavailable
+RAM_DIR = "/dev/shm" if os.path.exists("/dev/shm") and os.access("/dev/shm", os.W_OK) else "."
+source_dirs = {
+    'twitter': os.path.join(RAM_DIR, "source_split", "twitter"),
+    'reddit': os.path.join(RAM_DIR, "source_split", "reddit"),
+    'linkedin': os.path.join(RAM_DIR, "source_split", "linkedin")
+}
+for d in source_dirs.values():
+    os.makedirs(d, exist_ok=True)
+
+# Delay utilities
+def random_sleep(min_seconds, max_seconds):
+    """Sleep a random amount of time between min_seconds and max_seconds."""
+    wait = random.uniform(min_seconds, max_seconds)
+    logger.debug("Sleeping for %.2f seconds", wait)
+    time.sleep(wait)
+
+# Tor rotate + clear cookies
+def tor_newnym_session(session):
+    """Rotate Tor circuit and clear session cookies if Tor is available."""
+    if not TOR_AVAILABLE:
+        logger.debug("Tor not available, skipping circuit rotation")
+        return
+    
+    try:
+        # Try different socket paths
+        socket_paths = ['/var/run/tor/control', '/run/tor/control']
+        controller = None
+        
+        for socket_path in socket_paths:
+            if os.path.exists(socket_path):
+                try:
+                    controller = Controller.from_socket_file(socket_path)
+                    break
+                except Exception:
+                    continue
+        
+        if controller is None:
+            # Try default port
+            controller = Controller.from_port(port=9051)
+        
+        with controller:
+            controller.authenticate()
+            controller.signal(Signal.NEWNYM)
+            logger.debug("Tor circuit rotated successfully")
+    except Exception as e:
+        logger.warning("Failed to rotate Tor circuit: %s", e)
+    
+    time.sleep(5)
+    session.cookies.clear()
+
+def safe_filename(name):
+    """Create a safe filename from a name string."""
+    return re.sub(r'[^\w\-_\.]', '_', name.replace(' ', '_'))
+
+def extract_emails(text):
+    """Extract email addresses from text."""
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    return list(set(re.findall(email_pattern, text)))
+
+# Load targets from targ_graber_v14 fingerprinting script or other sources
+def load_targets():
+    """Load targets from fingerprinting script or other sources."""
+    targets = []
+    
+    # Try to load from targ_graber_v14.py fingerprinting script
+    if os.path.isfile(targ_script) and os.access(targ_script, os.X_OK):
+        try:
+            result = subprocess.run([sys.executable, targ_script], 
+                                  capture_output=True, text=True, timeout=60)
+            if result.returncode == 0 and result.stdout.strip():
+                # Expect JSON output with fingerprinted targets
+                try:
+                    fingerprint_data = json.loads(result.stdout.strip())
+                    # Handle different possible output formats from fingerprinting
+                    if isinstance(fingerprint_data, list):
+                        targets = fingerprint_data
+                    elif isinstance(fingerprint_data, dict):
+                        # Extract targets from structured fingerprint data
+                        if 'targets' in fingerprint_data:
+                            targets = fingerprint_data['targets']
+                        elif 'emails' in fingerprint_data or 'names' in fingerprint_data or 'phones' in fingerprint_data:
+                            # Convert fingerprint results to target list
+                            target_set = set()
+                            for field in ['emails', 'names', 'phones']:
+                                if field in fingerprint_data:
+                                    if isinstance(fingerprint_data[field], list):
+                                        target_set.update(fingerprint_data[field])
+                                    elif isinstance(fingerprint_data[field], str):
+                                        target_set.add(fingerprint_data[field])
+                            targets = list(target_set)
+                except json.JSONDecodeError:
+                    # Try parsing as newline-separated values
+                    lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+                    # Filter out obvious non-target lines (logs, headers, etc.)
+                    targets = [line for line in lines if not line.startswith('[') and ('@' in line or ' ' in line)]
+                
+                logger.info("Loaded %d targets from fingerprinting script %s", len(targets), targ_script)
+        except Exception as e:
+            logger.warning("Failed to load targets from %s: %s", targ_script, e)
+    
+    # Try loading from targets.json (output from previous fingerprinting)
+    if not targets and os.path.exists("targets.json"):
+        try:
+            with open("targets.json", 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    targets = data
+                elif isinstance(data, dict):
+                    # Extract from structured fingerprint data
+                    target_set = set()
+                    for field in ['emails', 'names', 'phones', 'targets']:
+                        if field in data and isinstance(data[field], list):
+                            target_set.update(data[field])
+                    targets = list(target_set)
+            logger.info("Loaded %d targets from targets.json", len(targets))
+        except Exception as e:
+            logger.warning("Failed to load targets.json: %s", e)
+    
+    # Fallback to command line arguments
+    if not targets and len(sys.argv) > 1:
+        targets = sys.argv[1:]
+        logger.info("Using %d targets from command line", len(targets))
+    
+    # Fallback to environment variable
+    if not targets:
+        env_targets = os.getenv("SEARCH_TARGETS")
+        if env_targets:
+            targets = [t.strip() for t in env_targets.split(',') if t.strip()]
+            logger.info("Using %d targets from environment variable", len(targets))
+    
+    if not targets:
+        logger.error("No targets found. Provide targets via:")
+        logger.error("  1. %s fingerprinting script (outputs emails/names/phones)", targ_script)
+        logger.error("  2. targets.json file with fingerprinted data")
+        logger.error("  3. Command line arguments: python script.py 'target1' 'target2'")
+        logger.error("  4. SEARCH_TARGETS environment variable (comma-separated)")
+        sys.exit(1)
+    
+    # Clean and validate targets
+    cleaned_targets = []
+    for target in targets:
+        target = target.strip()
+        if target and len(target) > 2:  # Basic validation
+            cleaned_targets.append(target)
+    
+    logger.info("Using %d cleaned targets for collection", len(cleaned_targets))
+    return cleaned_targets
+
+targets = load_targets()
+
+meta_entries = []
+audit_info = {
+    "timestamp": time.ctime(),
+    "targets_processed": 0,
+    "errors": [],
+    "tor_available": TOR_AVAILABLE,
+    "selenium_available": SELENIUM_AVAILABLE
+}
+
+for target in targets:
+    logger.info("Processing target: %s", target)
+    # Rate-limit / Tor rotation every 2 HTTP calls
+    if len(meta_entries) and len(meta_entries) % 2 == 0:
+        tor_newnym_session(session)
+
+    # --- LinkedIn via Google Search ---
+    entry = {"target": target}
+    
+    # Determine search strategy based on target type
+    if '@' in target:
+        # Email address - search for the email or domain
+        if target.count('@') == 1:
+            email_parts = target.split('@')
+            query = f"site:linkedin.com \"{email_parts[0]}\" OR \"{email_parts[1]}\""
+        else:
+            query = f"site:linkedin.com \"{target}\""
+    elif target.replace(' ', '').replace('-', '').replace('.', '').isdigit():
+        # Phone number - search as quoted string
+        query = f"site:linkedin.com \"{target}\""
+    else:
+        # Name or other identifier
+        query = f"site:linkedin.com \"{target}\""
+    
+    url = f"https://www.google.com/search?q={quote_plus(query)}"
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
+    
+    try:
+        random_sleep(5, 10)
+        res = session.get(url, headers=headers, timeout=30)
+        content = res.text
+        
+        # CAPTCHA detection
+        if res.status_code != 200 or "Our systems have detected unusual traffic" in content:
+            logger.warning("Google CAPTCHA or error status (%s). Backing off.", res.status_code)
+            time.sleep(60)  # Reduced from 300 seconds
+            # Try again after backoff
+            try:
+                res = session.get(url, headers=headers, timeout=30)
+                content = res.text
+            except Exception as retry_e:
+                logger.error("Retry failed for %s: %s", target, retry_e)
+                content = ""
+        
+        # Extract email addresses from content
+        emails = extract_emails(content)
+        entry["emails"] = emails
+        
+    except requests.exceptions.Timeout:
+        logger.error("Timeout during Google search for %s", target)
+        entry["emails"] = []
+        audit_info["errors"].append(f"Google search timeout for {target}")
+    except Exception as e:
+        logger.error("Exception during Google search for %s: %s", target, e)
+        entry["emails"] = []
+        audit_info["errors"].append(f"Google search error for {target}: {str(e)}")
+
+    safe_name = safe_filename(target)
+    linkedin_file = os.path.join(source_dirs['linkedin'], f"{safe_name}.json")
+    try:
+        with open(linkedin_file, 'w', encoding='utf-8') as jf:
+            json.dump(entry, jf, indent=2, ensure_ascii=False)
+        _secure_perms(linkedin_file)
+    except Exception as e:
+        logger.error("Failed to write LinkedIn file for %s: %s", target, e)
+        audit_info["errors"].append(f"LinkedIn file write error for {target}: {str(e)}")
+    
+    meta_entries.append(entry)
+
+    # --- Twitter via Nitter ---
+    tweets_data = []
+    
+    # Format target for Twitter search
+    if '@' in target:
+        # Email - search for username part or domain
+        email_parts = target.split('@')
+        search_terms = [email_parts[0], email_parts[1].split('.')[0]]
+        twitter_query = ' OR '.join([f'"{term}"' for term in search_terms])
+    elif target.replace(' ', '').replace('-', '').replace('.', '').isdigit():
+        # Phone number - search as quoted string
+        twitter_query = f'"{target}"'
+    else:
+        # Name - search as quoted phrase
+        twitter_query = f'"{target}"'
+    
+    encoded_query = quote_plus(twitter_query)
+    
+    for base in NITTER_INSTANCES:
+        twitter_url = f"{base}/search?f=tweets&q={encoded_query}"
+        try:
+            random_sleep(1, 3)
+            r = session.get(twitter_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, 'html.parser')
+                # Try multiple selectors for different Nitter versions
+                tweets = []
+                for selector in [".tweet-content", ".tweet-body", ".tweet-text"]:
+                    tweets = [t.get_text().strip() for t in soup.select(selector)]
+                    if tweets:
+                        break
+                
+                if tweets:  # Only use if we found tweets
+                    tweets_data = tweets
+                    logger.info("Found %d tweets from %s for target: %s", len(tweets), base, target)
+                    break
+            else:
+                logger.warning("Nitter instance %s returned status %s", base, r.status_code)
+        except requests.exceptions.Timeout:
+            logger.warning("Nitter instance %s timed out", base)
+            continue
+        except Exception as e:
+            logger.warning("Nitter instance %s failed: %s", base, e)
+            continue
+    
+    twitter_entry = {"target": target, "tweets": tweets_data}
+    twitter_file = os.path.join(source_dirs['twitter'], f"{safe_name}.json")
+    try:
+        with open(twitter_file, 'w', encoding='utf-8') as tf:
+            json.dump(twitter_entry, tf, indent=2, ensure_ascii=False)
+        _secure_perms(twitter_file)
+    except Exception as e:
+        logger.error("Failed to write Twitter file for %s: %s", target, e)
+        audit_info["errors"].append(f"Twitter file write error for {target}: {str(e)}")
+    
+    meta_entries.append(twitter_entry)
+
+    # --- Reddit via Pushshift JSON API ---
+    random_sleep(1, 2)
+    reddit_entry = {"target": target, "comments": []}
+    
+    try:
+        # Updated API endpoint (Pushshift has changed)
+        push_url = (
+            f"https://api.pullpush.io/reddit/search/comment/"
+            f"?q={quote_plus(target)}&size=50"
+        )
+        response = session.get(push_url, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json().get("data", [])
+            reddit_entry["comments"] = [
+                {"author": c.get("author", "unknown"), "body": c.get("body", "")} 
+                for c in data if isinstance(c, dict)
+            ]
+            logger.info("Found %d Reddit comments for %s", len(reddit_entry["comments"]), target)
+        else:
+            logger.warning("Reddit API returned status %s", response.status_code)
+            
+    except requests.exceptions.Timeout:
+        logger.warning("Reddit API timeout for %s", target)
+        audit_info["errors"].append(f"Reddit API timeout for {target}")
+    except Exception as e:
+        logger.warning("Reddit API error for %s: %s", target, e)
+        audit_info["errors"].append(f"Reddit API error for {target}: {str(e)}")
+    
+    reddit_file = os.path.join(source_dirs['reddit'], f"{safe_name}.json")
+    try:
+        with open(reddit_file, 'w', encoding='utf-8') as rf:
+            json.dump(reddit_entry, rf, indent=2, ensure_ascii=False)
+        _secure_perms(reddit_file)
+    except Exception as e:
+        logger.error("Failed to write Reddit file for %s: %s", target, e)
+        audit_info["errors"].append(f"Reddit file write error for {target}: {str(e)}")
+    
+    meta_entries.append(reddit_entry)
+    audit_info["targets_processed"] += 1
+
+# Write meta.jsonl
+meta_path = os.path.join(RAM_DIR, "meta.jsonl")
+try:
+    with open(meta_path, 'w', encoding='utf-8') as mf:
+        for rec in meta_entries:
+            mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    _secure_perms(meta_path)
+    logger.info("Meta file written to %s", meta_path)
+except Exception as e:
+    logger.error("Failed to write meta file: %s", e)
+    audit_info["errors"].append(f"Meta file write error: {str(e)}")
+
+# Write audit.json
+audit_path = os.path.join(RAM_DIR, "audit.json")
+try:
+    with open(audit_path, 'w', encoding='utf-8') as af:
+        json.dump(audit_info, af, indent=2, ensure_ascii=False)
+    _secure_perms(audit_path)
+    logger.info("Audit file written to %s", audit_path)
+except Exception as e:
+    logger.error("Failed to write audit file: %s", e)
+
+# Compute SHA-256 digests and optional GPG signing
+use_gpg = os.getenv("USE_GPG") is not None
+files_to_sign = [meta_path, audit_path]
+
+# Collect all JSON files
+for subdir in source_dirs.values():
+    if os.path.exists(subdir):
+        for fname in os.listdir(subdir):
+            if fname.endswith(".json"):
+                files_to_sign.append(os.path.join(subdir, fname))
+
+for filepath in files_to_sign:
+    if not os.path.exists(filepath):
+        logger.warning("File %s does not exist, skipping hash/sign", filepath)
+        continue
+        
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+            sha_digest = hashlib.sha256(data).hexdigest()
+        
+        sha_file = filepath + ".sha256"
+        with open(sha_file, 'w') as sf:
+            sf.write(f"{sha_digest}  {os.path.basename(filepath)}\n")
+        
+        logger.info("SHA256 for %s: %s", os.path.basename(filepath), sha_digest)
+        
+        if use_gpg:
+            sigfile = filepath + ".asc"
+            try:
+                result = subprocess.run(
+                    ["gpg", "--batch", "--yes", "--detach-sign", "--armor", "-o", sigfile, filepath], 
+                    check=True, 
+                    capture_output=True, 
+                    text=True
+                )
+                logger.info("GPG signature created for %s", os.path.basename(filepath))
+            except subprocess.CalledProcessError as e:
+                logger.error("GPG signing failed for %s: %s", filepath, e.stderr)
+            except FileNotFoundError:
+                logger.error("GPG not found in PATH. Cannot create signatures.")
+                use_gpg = False  # Disable for remaining files
+                
+    except Exception as e:
+        logger.error("Failed to hash or sign %s: %s", filepath, e)
+
+logger.info("Processing complete. Processed %d targets with %d errors.", 
+           audit_info["targets_processed"], len(audit_info["errors"]))

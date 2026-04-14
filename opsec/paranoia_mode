@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""
+paranoia_mode v10.0 - Post-Op Host Sanitiser
+=============================================
+Focus: footprint erasure + network-fingerprint randomisation.
+
+OPSEC hardening:
+  - Wipes bash/zsh history, Python __pycache__, .pyc files
+  - Wipes common temp directories (/tmp, /var/tmp user files)
+  - Truncates system logs older than N days
+  - Flushes DNS cache
+  - Spoofs MAC with locally-administered unicast address
+  - Clears systemd journal (if present)
+  - Overwrites swap + shared memory
+  - DNS leak check post-spoof
+  - Integrity log for every action (even in dry-run)
+  - Resource sentinel
+  - All actions idempotent and safe to re-run
+"""
+from __future__ import annotations
+import argparse, glob, os, random, shutil, subprocess, sys, time
+from pathlib import Path
+
+# Add core/ to path so gs_common can be found regardless of working directory
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+
+from gs_common import (
+    integrity_log, require_resources, install_signal_handlers,
+    shutdown_requested, secure_hex,
+)
+
+# Paths to wipe
+SHELL_HISTORIES = [
+    Path.home() / ".bash_history",
+    Path.home() / ".zsh_history",
+    Path.home() / ".python_history",
+    Path.home() / ".lesshst",
+    Path.home() / ".wget-hsts",
+    Path.home() / ".viminfo",
+]
+
+PYCACHE_GLOBS = [
+    str(Path.home() / "**/__pycache__"),
+    "/tmp/**/__pycache__",
+]
+
+
+def connectivity_check(iface: str) -> None:
+    """Verify basic network connectivity after MAC spoof.
+
+    BUG 52 FIX: ANY clearnet DNS resolution immediately after MAC spoof
+    creates a timing correlation between the new MAC and network activity.
+    Instead of DNS resolution, just check that the network interface is up
+    and has an IP address. This proves connectivity without generating any
+    traffic that could be logged by the ISP or network observer.
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            integrity_log("paranoia", "connectivity_check_fail:iface_down")
+            print(f"  [!] Interface {iface} appears to be down after MAC spoof")
+            return
+        if "inet " in result.stdout:
+            integrity_log("paranoia", "connectivity_check_ok")
+        else:
+            integrity_log("paranoia", "connectivity_check_warn:no_ip")
+            print(f"  [!] Interface {iface} has no IP address (DHCP may need renewal)")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        integrity_log("paranoia", f"connectivity_check_fail:{e}")
+        print(f"  [!] Connectivity check failed: {e}")
+
+
+def rand_mac() -> str:
+    """Generate locally-administered unicast MAC."""
+    octets = [random.SystemRandom().randint(0, 255) for _ in range(6)]
+    octets[0] = (octets[0] | 0x02) & 0xFE  # locally administered + unicast
+    return ":".join(f"{o:02x}" for o in octets)
+
+
+def spoof_mac(iface: str, dry: bool):
+    new_mac = rand_mac()
+    if dry:
+        print(f"  [dry] MAC {iface} -> {new_mac}")
+        integrity_log("paranoia", f"mac_dry:{iface}->{new_mac}")
+        return
+    try:
+        subprocess.run(["ip", "link", "set", iface, "down"], check=True,
+                       capture_output=True)
+        subprocess.run(["ip", "link", "set", iface, "address", new_mac],
+                       check=True, capture_output=True)
+        subprocess.run(["ip", "link", "set", iface, "up"], check=True,
+                       capture_output=True)
+
+        # Verify the MAC was actually applied. Some wireless drivers
+        # (Intel AX200/AX201, some Realtek) accept the command but
+        # silently revert to the hardware MAC.
+        verify = subprocess.run(
+            ["ip", "link", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if verify.returncode == 0:
+            import re as _re
+            mac_match = _re.search(
+                r"link/ether\s+([0-9a-f:]{17})", verify.stdout
+            )
+            if mac_match:
+                actual_mac = mac_match.group(1).lower()
+                if actual_mac != new_mac.lower():
+                    integrity_log("paranoia",
+                                  f"mac_verify_FAIL:{iface}:wanted={new_mac}:got={actual_mac}")
+                    print(f"  [!] MAC spoof FAILED verification!")
+                    print(f"      Requested: {new_mac}")
+                    print(f"      Actual:    {actual_mac}")
+                    print(f"      Your wireless driver may reject programmatic MAC changes.")
+                    print(f"      Try: macchanger -r {iface}")
+                    return
+
+        print(f"  [+] MAC {iface} -> {new_mac} (verified)")
+        integrity_log("paranoia", f"mac_spoof_verified:{iface}->{new_mac}")
+    except subprocess.CalledProcessError as e:
+        integrity_log("paranoia", f"mac_fail:{iface}:{e}")
+        print(f"  [!] MAC spoof failed: {e}")
+    except FileNotFoundError:
+        integrity_log("paranoia", "mac_fail:ip_not_found")
+        print("  [!] 'ip' command not found - cannot spoof MAC")
+
+
+def wipe_shell_histories(dry: bool):
+    count = 0
+    for hist in SHELL_HISTORIES:
+        if hist.exists():
+            if dry:
+                print(f"  [dry] would wipe {hist}")
+            else:
+                try:
+                    hist.write_bytes(b"")
+                    count += 1
+                except (PermissionError, OSError):
+                    pass
+    integrity_log("paranoia", f"histories_wiped:{count}" if not dry else f"histories_dry:{count}")
+
+
+def wipe_pycache(dry: bool):
+    count = 0
+    for pattern in PYCACHE_GLOBS:
+        for d in glob.glob(pattern, recursive=True):
+            if dry:
+                print(f"  [dry] would remove {d}")
+            else:
+                try:
+                    shutil.rmtree(d)
+                    count += 1
+                except (PermissionError, OSError):
+                    pass
+    # Also .pyc in home
+    for pyc in Path.home().rglob("*.pyc"):
+        if dry:
+            pass
+        else:
+            try:
+                pyc.unlink()
+                count += 1
+            except (PermissionError, OSError):
+                pass
+    integrity_log("paranoia", f"pycache_wiped:{count}" if not dry else f"pycache_dry")
+
+
+def wipe_system_logs(days: int, dry: bool):
+    cutoff = time.time() - days * 86400
+    count = 0
+    for f in glob.glob("/var/log/**/*.log", recursive=True):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                if dry:
+                    print(f"  [dry] would truncate {f}")
+                else:
+                    with open(f, "w"):
+                        pass
+                count += 1
+        except (PermissionError, OSError):
+            pass
+    integrity_log("paranoia", f"logs_wiped:{count}" if not dry else f"logs_dry:{count}")
+    print(f"  [+] {'Would truncate' if dry else 'Truncated'} {count} log(s)")
+
+
+def clear_journal(dry: bool):
+    """Clear systemd journal if journalctl is available."""
+    if dry:
+        print("  [dry] would run journalctl --vacuum-time=1s")
+        integrity_log("paranoia", "journal_dry")
+        return
+    try:
+        subprocess.run(["journalctl", "--vacuum-time=1s"],
+                       check=True, capture_output=True, timeout=30)
+        integrity_log("paranoia", "journal_cleared")
+        print("  [+] Journal cleared")
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+
+def flush_dns_cache(dry: bool):
+    """Flush DNS resolver cache."""
+    if dry:
+        print("  [dry] would flush DNS cache")
+        return
+    for cmd in [
+        ["resolvectl", "flush-caches"],
+        ["systemd-resolve", "--flush-caches"],
+    ]:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=10)
+            integrity_log("paranoia", "dns_cache_flushed")
+            print("  [+] DNS cache flushed")
+            return
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    integrity_log("paranoia", "dns_cache_skip:no_resolver")
+
+
+def wipe_swap_ram(dry: bool):
+    if dry:
+        print("  [dry] would wipe swap+shm")
+        integrity_log("paranoia", "ram_dry")
+        return
+
+    try:
+        subprocess.run(["swapoff", "-a"], check=True, capture_output=True,
+                       timeout=30)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        integrity_log("paranoia", f"swapoff_fail:{e}")
+
+    wipe_file = "/dev/shm/gs_paranoia_wipe"
+    try:
+        subprocess.run(
+            ["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M", "count=128"],
+            check=True, capture_output=True, timeout=60,
+        )
+        if os.path.exists(wipe_file):
+            os.unlink(wipe_file)
+        subprocess.run(["sync"], check=True, capture_output=True, timeout=10)
+        integrity_log("paranoia", "ram_wipe_ok")
+        print("  [+] Swap/SHM wipe complete")
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        integrity_log("paranoia", f"ram_wipe_fail:{e}")
+        print(f"  [!] RAM wipe failed: {e}")
+
+
+def _secure_delete_file(path: Path):
+    """Overwrite file content with nulls before unlinking.
+
+    BUG 53 FIX: The old code only overwrote the first 64KB. Now overwrites
+    the full file size in 64KB chunks.
+
+    Limitations acknowledged and warned about:
+    - Hardlinks: if nlink > 1, data persists via other links. We warn.
+    - CoW filesystems (btrfs/ZFS): overwrite allocates new blocks; old
+      data remains until GC. We warn and suggest shred.
+    - Journaling (ext4): journal may contain original data for recent
+      writes. fsync + overwrite helps but doesn't guarantee journal purge.
+    """
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        if stat.st_nlink > 1:
+            print(f"  [!] WARNING: {path} has {stat.st_nlink} hardlinks — "
+                  f"data persists via other links after deletion")
+            integrity_log("paranoia", f"hardlink_warn:{path.name}:nlinks={stat.st_nlink}")
+        with open(path, "r+b") as f:
+            remaining = size
+            chunk_size = 65536
+            while remaining > 0:
+                write_size = min(remaining, chunk_size)
+                f.write(b"\x00" * write_size)
+                remaining -= write_size
+            f.flush()
+            os.fsync(f.fileno())
+        path.unlink()
+    except (PermissionError, OSError) as e:
+        integrity_log("paranoia", f"secure_delete_fail:{path.name}:{e}")
+        print(f"  [!] Secure delete failed for {path}: {e}")
+
+
+def _secure_delete_dir(path: Path):
+    """Overwrite all files in a directory tree then remove it."""
+    if not path.is_dir():
+        return
+    for f in path.rglob("*"):
+        if f.is_file():
+            _secure_delete_file(f)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
+    """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
+    common subdirectories, and any --search-dir paths provided."""
+    file_patterns = [
+        "unsigned_*.json", "signer_progress.json",
+        "broadcast_progress.json", "stage5_progress.json",
+        "wallet_*.json", "thor_pairs_*.json",
+        "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+        "exitplan_*.json", "exitplan_v1.json",
+        "integrity_chain.log", "integrity.log",
+        "*.blob", "*.signed", "*.unsigned",
+        "signed_manifest_v1.json", "unsigned_manifest.json",
+        ".ghostspiral.lock",
+        "renamethis1",
+    ]
+    dir_patterns = [
+        "signed_blobs", "unsigned", "tx_staging", "runtime",
+    ]
+
+    # BUG 51 FIX: Also search common USB mount points where air-gap
+    # signed files may have been left (operator may forget to clean USB).
+    search_roots = list(set([
+        Path("."),
+        Path.home(),
+        Path.home() / "ghostspiral",
+        Path.home() / "GhostSpiral",
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+        Path("/media"),
+        Path("/mnt"),
+        Path("/run/media"),
+    ] + [Path(d) for d in (extra_dirs or [])]))
+
+    count = 0
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+
+        # Use recursive glob (**/) to find artifacts at any depth.
+        # The old code only searched one level deep, missing artifacts
+        # in nested directories (e.g. ~/projects/ghostspiral/run3/unsigned/).
+        # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
+        depth_patterns = [
+            "",          # root itself
+            "*/",        # 1 level
+            "*/*/",      # 2 levels
+            "*/*/*/",    # 3 levels
+        ]
+
+        for pattern in file_patterns:
+            for depth in depth_patterns:
+                for f in root.glob(f"{depth}{pattern}"):
+                    if dry:
+                        print(f"  [dry] would securely delete {f}")
+                    else:
+                        _secure_delete_file(f)
+                    count += 1
+
+        for dirname in dir_patterns:
+            for depth in depth_patterns:
+                for d in root.glob(f"{depth}{dirname}"):
+                    if d.is_dir():
+                        if dry:
+                            print(f"  [dry] would securely delete dir {d}")
+                        else:
+                            _secure_delete_dir(d)
+                        count += 1
+
+    print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
+    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
+
+
+def wipe_tmp_files(dry: bool):
+    """Remove user-owned files from temp directories."""
+    uid = os.getuid()
+    count = 0
+    for tmpdir in ["/tmp", "/var/tmp"]:
+        if not os.path.isdir(tmpdir):
+            continue
+        for entry in os.scandir(tmpdir):
+            try:
+                if entry.stat().st_uid == uid:
+                    if dry:
+                        print(f"  [dry] would remove {entry.path}")
+                    else:
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                        else:
+                            os.unlink(entry.path)
+                    count += 1
+            except (PermissionError, OSError):
+                pass
+    integrity_log("paranoia", f"tmp_wiped:{count}" if not dry else f"tmp_dry:{count}")
+
+
+def wipe_clipboard(dry: bool):
+    """Clear clipboard contents from all common clipboard managers."""
+    count = 0
+    for cmd in [
+        ["xclip", "-selection", "clipboard", "-i", "/dev/null"],
+        ["xclip", "-selection", "primary", "-i", "/dev/null"],
+        ["xsel", "--clipboard", "--clear"],
+        ["xsel", "--primary", "--clear"],
+        ["wl-copy", "--clear"],
+    ]:
+        if dry:
+            print(f"  [dry] would run {' '.join(cmd)}")
+            count += 1
+            continue
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=5)
+            count += 1
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
+    integrity_log("paranoia", f"clipboard:{'dry' if dry else 'wiped'}:{count}")
+
+
+def wipe_xdg_traces(dry: bool):
+    """Wipe XDG recently-used files, thumbnail caches, Trash, and bookmarks.
+
+    These are high-value forensic targets: recently-used.xbel records every
+    file opened by GUI apps (with timestamps), thumbnails cache previews of
+    files (including JSON plans), Trash retains 'deleted' files, and
+    bookmarks may reference working directories.
+    """
+    targets = [
+        Path.home() / ".local/share/recently-used.xbel",
+        Path.home() / ".local/share/recently-used.xbel.bak",
+        Path.home() / ".config/gtk-3.0/bookmarks",
+        Path.home() / ".local/share/tracker/data/tracker-store.journal",
+    ]
+    dir_targets = [
+        Path.home() / ".cache/thumbnails",
+        Path.home() / ".thumbnails",
+        Path.home() / ".local/share/Trash",
+        Path.home() / ".local/share/tracker",
+    ]
+    count = 0
+    for f in targets:
+        if f.exists():
+            if dry:
+                print(f"  [dry] would wipe {f}")
+            else:
+                _secure_delete_file(f)
+            count += 1
+    for d in dir_targets:
+        if d.is_dir():
+            if dry:
+                print(f"  [dry] would wipe dir {d}")
+            else:
+                _secure_delete_dir(d)
+            count += 1
+    integrity_log("paranoia", f"xdg_traces:{'dry' if dry else 'wiped'}:{count}")
+
+
+def scrub_env_vars(dry: bool):
+    """Remove GhostSpiral-related environment variables from the current process.
+
+    /proc/self/environ is immutable on Linux, so we can only clear the
+    variables in the current process. The parent shell's env persists until
+    the terminal is closed.
+    """
+    sensitive_prefixes = [
+        "GPT_KEYS", "MASTER_ENTROPY", "WG_CONF", "TOR_PROXY",
+        "MONERO_RPC", "XMR_", "BTC_", "GHOSTSPIRAL", "GS_",
+    ]
+    count = 0
+    for key in list(os.environ.keys()):
+        if any(key.upper().startswith(p) for p in sensitive_prefixes):
+            if dry:
+                print(f"  [dry] would unset env {key}")
+            else:
+                del os.environ[key]
+            count += 1
+    integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
+
+
+def _detect_active_interface() -> str:
+    """Detect the active network interface (the one with a default route).
+    Falls back to first non-loopback interface, then 'eth0'."""
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and "dev " in result.stdout:
+            import re as _re
+            m = _re.search(r"dev\s+(\S+)", result.stdout)
+            if m:
+                return m.group(1)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "link", "show", "up"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2:
+                iface = parts[1].strip()
+                if iface != "lo":
+                    return iface
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "eth0"
+
+
+def main():
+    install_signal_handlers()
+
+    default_iface = _detect_active_interface()
+
+    ap = argparse.ArgumentParser(
+        "paranoia_mode v10.0",
+        description="Post-operation host sanitisation",
+    )
+    ap.add_argument("--wipe-days", type=int, default=7,
+                    help="truncate logs older than N days")
+    ap.add_argument("--iface", default=default_iface,
+                    help=f"network interface to spoof (detected: {default_iface})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print actions without executing")
+    ap.add_argument("--search-dir", action="append", default=[],
+                    help="additional directories to search for GhostSpiral artifacts "
+                         "(can be specified multiple times)")
+    args = ap.parse_args()
+
+    require_resources(min_disk_gb=1.0)
+    integrity_log("paranoia", f"start:dry={args.dry_run}")
+
+    print("  [*] Phase 1: MAC spoof")
+    spoof_mac(args.iface, args.dry_run)
+
+    print("  [*] Phase 2: Connectivity check (no DNS — avoids MAC-to-activity correlation)")
+    if args.dry_run:
+        print("  [dry] would check interface connectivity")
+    else:
+        connectivity_check(args.iface)
+
+    print("  [*] Phase 3: DNS cache flush")
+    flush_dns_cache(args.dry_run)
+
+    print("  [*] Phase 4: Shell histories")
+    wipe_shell_histories(args.dry_run)
+
+    print("  [*] Phase 5: Python cache")
+    wipe_pycache(args.dry_run)
+
+    print("  [*] Phase 6: Temp files")
+    wipe_tmp_files(args.dry_run)
+
+    print("  [*] Phase 7: System logs")
+    wipe_system_logs(args.wipe_days, args.dry_run)
+
+    print("  [*] Phase 8: Journal")
+    clear_journal(args.dry_run)
+
+    print("  [*] Phase 9: Swap/RAM")
+    wipe_swap_ram(args.dry_run)
+
+    print("  [*] Phase 10: Clipboard")
+    wipe_clipboard(args.dry_run)
+
+    print("  [*] Phase 11: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
+    wipe_xdg_traces(args.dry_run)
+
+    print("  [*] Phase 12: Environment variables")
+    scrub_env_vars(args.dry_run)
+    print("  [!] NOTE: env var scrubbing only affects THIS process. Your parent")
+    print("  [!] shell still has the original variables. Close the terminal or run:")
+    print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
+    print("  [!]   history -c && history -w  # clear shell history of unset commands")
+
+    # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # integrity_chain.log. Any integrity_log() calls after this point
+    # would recreate the file, leaving forensic evidence.
+    print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
+    print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
+    print("  [!] encryption instead. On ext4 with journaling, recently-written file")
+    print("  [!] data may persist in the journal even after secure deletion.")
+    wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
+
+    # DO NOT call integrity_log() here — it would recreate the wiped log file
+    print("\n  [+] paranoia_mode complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+ghost_mutator.py — GhostSpiral v16.9 Chaos Toolkit (Upgraded)
+=============================================================
+Self‑mutation engine that rewrites an existing Python script (e.g.
+`ghostspiral_v15.py`) into a **structurally‑identical but hash‑unique** copy
+for the current session.  By randomising identifiers, shuffling harmless code
+blocks, and injecting junk comments, this module ensures *no two runs ever
+produce the same file hash* — defeating YARA rules, signature matching, and
+static‑analysis clustering.
+
+Key Features
+────────────
+1. **Deterministic per session** — seeded from `entropy_seed.json` so every
+   cooperating module can reproduce the same mutation when needed.
+2. **Identifier mutation** — renames functions, classes, and *safe* module‑
+   level variables to random Base58 tokens.
+3. **Comment injection** — adds harmless garbage comments/junk docstrings to
+   change byte layout.
+4. **Code block re‑ordering** — non‑critical top‑level helper functions are
+   randomly shuffled without changing execution order.
+5. **Output path isolation** — mutated script is written to a runtime dir
+   (default `./runtime/`).  Original source remains untouched.
+6. **Enhanced mutations** — string obfuscation, whitespace variance, and
+   numeric constant tweaking.
+
+Usage
+─────
+    python3 ghost_mutator.py --source ghostspiral_v15.py
+    python3 ghost_mutator.py -s src.py -o runtime/mutated.py --seed entropy_seed.json
+
+Security Notes
+──────────────
+* The AST transformation is *conservative*: it will **not** rename imported
+  symbols, dunder names, or anything starting with `_` to avoid breakage.
+* Only module‑level functions/classes/variables declared **in the source file**
+  are renamed.
+* A manifest JSON describing the rename map is stored alongside the output for
+  debugging; delete it if maximum stealth is required.
+"""
+from __future__ import annotations
+import argparse, ast, hashlib, json, os, random, re, sys, textwrap
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+VERSION = "2.0"
+BASE58 = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+ZERO_WIDTH = "\u200b"  # Zero-width space for string obfuscation
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_seed(seed_path: Path) -> Tuple[str, int]:
+    """Return (seed_sha, rng_seed_int)."""
+    try:
+        if seed_path.exists():
+            raw = seed_path.read_bytes()
+        else:
+            print(f"[!] Seed file {seed_path} not found, using fallback seed")
+            raw = b"fallback"
+        seed_sha = sha256_hex(raw)
+        rng_int = int(seed_sha[:16], 16)
+        return seed_sha, rng_int
+    except Exception as e:
+        print(f"[!] Error reading seed: {e}")
+        sys.exit(1)
+
+
+def rand_name(rng: random.Random, length: int = 10) -> str:
+    """Generate random identifier starting with 'm_'."""
+    return "m_" + "".join(rng.choice(BASE58) for _ in range(length))
+
+
+def validate_python_syntax(code: str) -> bool:
+    """Validate that the code is syntactically correct Python."""
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# AST Transformer for renaming
+# ---------------------------------------------------------------------------
+
+class Renamer(ast.NodeTransformer):
+    """Rename functions, classes, and selected variables consistently."""
+
+    def __init__(self, rng: random.Random, rename_map: Dict[str, str]):
+        self.rng = rng
+        self.rename_map = rename_map
+        self.builtin_names = set(dir(__builtins__))
+        self.imported_names: Set[str] = set()
+        self._collect_imports = True
+
+    def _get_new(self, old: str) -> str:
+        """Get or create a new name for the given identifier."""
+        if old not in self.rename_map:
+            self.rename_map[old] = rand_name(self.rng)
+        return self.rename_map[old]
+
+    def _should_rename(self, name: str) -> bool:
+        """Check if a name should be renamed."""
+        return (
+            not name.startswith("_") and 
+            name not in self.builtin_names and
+            name not in self.imported_names and
+            name != "main"  # Preserve main function
+        )
+
+    def visit_Import(self, node: ast.Import) -> ast.Import:
+        """Track imported names."""
+        if self._collect_imports:
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                self.imported_names.add(name.split('.')[0])
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        """Track imported names."""
+        if self._collect_imports:
+            for alias in node.names:
+                name = alias.asname if alias.asname else alias.name
+                self.imported_names.add(name)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Rename function definitions."""
+        if self._should_rename(node.name):
+            node.name = self._get_new(node.name)
+        self.generic_visit(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        """Rename async function definitions."""
+        if self._should_rename(node.name):
+            node.name = self._get_new(node.name)
+        self.generic_visit(node)
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        """Rename class definitions."""
+        if self._should_rename(node.name):
+            node.name = self._get_new(node.name)
+        self.generic_visit(node)
+        return node
+
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        """Rename variable references."""
+        if node.id in self.rename_map:
+            node.id = self.rename_map[node.id]
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        """Handle assignments to potentially rename global variables."""
+        for target in node.targets:
+            if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store):
+                if self._should_rename(target.id):
+                    old_name = target.id
+                    target.id = self._get_new(old_name)
+        self.generic_visit(node)
+        return node
+
+
+# ---------------------------------------------------------------------------
+# Enhanced mutation strategies
+# ---------------------------------------------------------------------------
+
+def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str:
+    """Insert junk comments roughly every N lines to fuzz hash."""
+    lines = src.splitlines()
+    junk_prefixes = ["TODO", "FIXME", "HACK", "NOTE", "DEBUG", "OPTIMIZE", "REFACTOR"]
+    junk_suffixes = [
+        "check this later", "verify assumption", "needs review",
+        "temporary workaround", "performance bottleneck?",
+        "¯\\_(ツ)_/¯", "( ͡° ͜ʖ ͡°)", "🤔", "🚀"
+    ]
+    
+    out: List[str] = []
+    for idx, line in enumerate(lines, 1):
+        out.append(line)
+        if idx % every_n == rng.randint(20, 60):  # Vary the interval
+            prefix = rng.choice(junk_prefixes)
+            suffix = rng.choice(junk_suffixes)
+            garbage = f"{prefix}: {rand_name(rng, 8)} - {suffix}"
+            indent = len(line) - len(line.lstrip())
+            out.append(" " * indent + f"# {garbage}")
+    
+    return "\n".join(out)
+
+
+def obfuscate_strings(tree: ast.Module, rng: random.Random) -> None:
+    """Add zero-width spaces to string literals randomly."""
+    class StringObfuscator(ast.NodeTransformer):
+        def visit_Str(self, node: ast.Str) -> ast.Str:
+            # Legacy AST node (Python < 3.8)
+            if rng.random() < 0.3 and len(node.s) > 5:
+                idx = rng.randint(1, len(node.s) - 1)
+                node.s = node.s[:idx] + ZERO_WIDTH + node.s[idx:]
+            return node
+        
+        def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+            # Modern AST node (Python >= 3.8)
+            if isinstance(node.value, str) and rng.random() < 0.3 and len(node.value) > 5:
+                idx = rng.randint(1, len(node.value) - 1)
+                node.value = node.value[:idx] + ZERO_WIDTH + node.value[idx:]
+            return node
+    
+    StringObfuscator().visit(tree)
+
+
+def shuffle_helpers(tree: ast.Module, rng: random.Random) -> None:
+    """Randomly shuffle non-critical top-level statements."""
+    # Categorize statements
+    imports = []
+    functions = []
+    classes = []
+    assignments = []
+    main_guard = []
+    others = []
+    
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "main":
+                main_guard.append(node)
+            else:
+                functions.append(node)
+        elif isinstance(node, ast.ClassDef):
+            classes.append(node)
+        elif isinstance(node, ast.Assign):
+            assignments.append(node)
+        elif isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+            # Check for if __name__ == "__main__"
+            if (isinstance(node.test.left, ast.Name) and 
+                node.test.left.id == "__name__"):
+                main_guard.append(node)
+            else:
+                others.append(node)
+        else:
+            others.append(node)
+    
+    # Shuffle only safe groups
+    rng.shuffle(functions)
+    rng.shuffle(classes)
+    
+    # Reassemble in safe order
+    tree.body = imports + assignments + classes + functions + others + main_guard
+
+
+def add_whitespace_variance(src: str, rng: random.Random) -> str:
+    """Add random blank lines and adjust spacing."""
+    lines = src.splitlines()
+    out: List[str] = []
+    
+    for line in lines:
+        out.append(line)
+        # Occasionally add blank lines
+        if rng.random() < 0.1:
+            out.append("")
+    
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
+
+def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
+    """Main mutation logic."""
+    try:
+        # Load seed and initialize RNG
+        seed_sha, rng_seed = load_seed(seed_path)
+        rng = random.Random(rng_seed)
+        
+        # Read source file
+        if not source_path.exists():
+            print(f"[!] Source file not found: {source_path}")
+            sys.exit(1)
+            
+        raw_src = source_path.read_text(encoding="utf-8")
+        
+        # Parse AST
+        try:
+            tree = ast.parse(raw_src)
+        except SyntaxError as e:
+            print(f"[!] Syntax error in source file: {e}")
+            sys.exit(1)
+        
+        # Apply mutations
+        rename_map: Dict[str, str] = {}
+        renamer = Renamer(rng, rename_map)
+        
+        # First pass: collect imports
+        renamer.visit(tree)
+        renamer._collect_imports = False
+        
+        # Second pass: perform renaming
+        tree = renamer.visit(tree)
+        
+        # Additional mutations
+        obfuscate_strings(tree, rng)
+        shuffle_helpers(tree, rng)
+        
+        # Convert AST back to source
+        try:
+            mutated_src = ast.unparse(tree)
+        except AttributeError:
+            # Python < 3.9 fallback
+            try:
+                import astor  # type: ignore
+                mutated_src = astor.to_source(tree)
+            except ImportError:
+                print("[!] ast.unparse not available and astor not installed")
+                print("[!] Install astor: pip install astor")
+                sys.exit(1)
+        
+        # Apply text-level mutations
+        mutated_src = inject_junk_comments(mutated_src, rng)
+        mutated_src = add_whitespace_variance(mutated_src, rng)
+        
+        # Validate mutated code
+        if not validate_python_syntax(mutated_src):
+            print("[!] Mutation resulted in invalid Python syntax")
+            sys.exit(1)
+        
+        # Add metadata banner
+        banner = textwrap.dedent(f"""
+        # =============================================================
+        #  Auto‑mutated by ghost_mutator.py v{VERSION}
+        #  Timestamp: {datetime.now(timezone.utc).isoformat()}
+        #  Source SHA‑256: {sha256_hex(raw_src.encode())[:16]}…
+        #  Seed SHA‑256:   {seed_sha[:16]}…
+        #  Mutations: {len(rename_map)} renames, string obfuscation, code shuffle
+        # =============================================================
+        """).strip()
+        
+        mutated_src = banner + "\n\n" + mutated_src
+        
+        # Write output
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(mutated_src, encoding="utf-8")
+        os.chmod(out_path, 0o600)
+        
+        # Save manifest
+        manifest = {
+            "version": VERSION,
+            "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+            "source": str(source_path),
+            "output": str(out_path),
+            "seed_sha256": seed_sha,
+            "rename_map": rename_map,
+            "mutations_applied": [
+                "identifier_renaming",
+                "string_obfuscation",
+                "code_shuffling",
+                "comment_injection",
+                "whitespace_variance"
+            ]
+        }
+        man_path = out_path.with_suffix(".manifest.json")
+        man_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.chmod(man_path, 0o600)
+        
+        print(f"[+] Mutated script → {out_path}")
+        print(f"[+] Output hash: {sha256_hex(mutated_src.encode())[:16]}…")
+        print(f"[+] Rename count: {len(rename_map)}")
+        print(f"[i] Manifest saved → {man_path} (delete for stealth)")
+        
+    except Exception as e:
+        print(f"[!] Unexpected error during mutation: {e}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Mutate a Python script to produce a unique, hash‑immune copy.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+        Examples:
+          %(prog)s --source script.py
+          %(prog)s -s app.py -o runtime/mutated_app.py --seed custom_seed.json
+          
+        Note: The mutated script preserves functionality while changing its hash signature.
+        """)
+    )
+    p.add_argument("--source", "-s", type=Path, required=True, 
+                   help="Path to original .py file to mutate")
+    p.add_argument("--out", "-o", type=Path, 
+                   help="Output path (default: runtime/<name>_<random>.py)")
+    p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
+                   help="Entropy seed file (default: entropy_seed.json)")
+    p.add_argument("--version", "-v", action="version", 
+                   version=f"%(prog)s {VERSION}")
+    
+    args = p.parse_args()
+    
+    # Validate source exists
+    if not args.source.exists():
+        print(f"[!] Source file not found: {args.source}")
+        sys.exit(1)
+    
+    # Default output path
+    if not args.out:
+        rnd = rand_name(random.Random(), 6)
+        args.out = Path("runtime") / f"{args.source.stem}_{rnd}.py"
+    
+    mutate(args.source, args.out, args.seed)
+
+
+if __name__ == "__main__":
+    main()

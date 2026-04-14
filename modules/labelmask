@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+label_masker_v3.py — GhostSpiral v16.9 Chaos Toolkit
+===================================================
+Creates **forensic‑poisoning labels, memos, and tx_notes** for every *real*
+node in a DAG.  Output is a `label_map.json` consumed by broadcast and signer
+modules so that **on‑chain metadata matches no known wallet pattern**.
+
+Design Goals
+────────────
+1. **Deterministic per session** — seeded from `entropy_seed.json` so every
+   module stays in sync without sharing raw entropy.
+2. **Cross‑wallet mimicry** — mixes label formats from Wasabi, Samurai,
+   MyMonero, Electrum, and random junk strings.
+3. **Length + charset variance** — defeats simple regex clustering.
+4. **Decoy support** — decoy nodes get shorter memos to look like spam.
+
+Schema
+──────
+{
+  "version"  : "3.0",
+  "sha256"   : "…",            # of this file
+  "dag_ref"  : {"file":"dag_structure.json","sha256":"…"},
+  "seed_ref" : {"file":"entropy_seed.json","sha256":"…"},
+  "labels"   : {
+      "n0" : {"label":"<=32‑char str","note":"<=64‑char str"},
+      "n1" : {"label":"…","note":"…"}
+  }
+}
+
+Usage
+─────
+    python3 label_masker_v3.py                      # default paths
+    python3 label_masker_v3.py --dag my_dag.json    # custom DAG
+    python3 label_masker_v3.py -o /tmp/map.json     # custom output
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import secrets
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+
+VERSION = "3.0"
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_json(path: Path) -> Tuple[dict, str]:
+    if not path.exists():
+        print(f"[!] File not found → {path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+        return data, sha256_hex(raw)
+    except json.JSONDecodeError as e:
+        print(f"[!] Invalid JSON in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"[!] Error reading {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def secure_wipe(path: Path) -> None:
+    """Securely overwrite temp files before deletion"""
+    if path.exists():
+        try:
+            size = path.stat().st_size
+            with path.open("r+b") as f:
+                f.write(secrets.token_bytes(size))
+                f.flush()
+                os.fsync(f.fileno())
+            path.unlink()
+        except Exception:
+            # Fallback to simple deletion
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Enhanced label word banks with better OPSEC
+# ---------------------------------------------------------------------------
+
+# More diverse and realistic wallet patterns
+WASABI_BANK = [
+    "Deposit", "CoinJoin", "Premix", "Postmix", "Change", "Consolidation",
+    "Split", "Merge", "Privacy", "Mixing", "Input", "Output", "Round"
+]
+
+SAMURAI_BANK = [
+    "STONEWALL", "STOWAWAY", "RICOCHET", "PAYNYM", "CAHOOTS", "WHIRLPOOL",
+    "PREMIX", "POSTMIX", "SOROBAN", "STONEWALLX2", "MIX", "BATCH"
+]
+
+ELECTRUM_BANK = [
+    "Invoice", "Payment", "Received", "Sent", "Imported", "WatchOnly",
+    "MultiSig", "Lightning", "Channel", "HTLC", "Backup", "Restore"
+]
+
+MONERO_BANK = [
+    "Ring", "Stealth", "Subaddress", "Account", "Transfer", "Sweep",
+    "Mining", "Pool", "Daemon", "Wallet", "Key", "View"
+]
+
+GENERIC_BANK = [
+    "Transaction", "Payment", "Receipt", "Transfer", "Exchange",
+    "Trade", "Swap", "Bridge", "Fee", "Gas", "Dust", "UTXO"
+]
+
+JUNK_BANK = [
+    "sync_backup", "tx_log", "client_dump", "fwd_log", "archive_chunk",
+    "tmp_data", "snapshot", "backup", "draft", "cache", "notes",
+    "metadata", "index", "buffer", "queue", "batch", "chunk"
+]
+
+# Base58-like charset (removing confusing chars)
+CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+HEX_CHARSET = "0123456789abcdef"
+
+# Common separators used in wallet software
+SEPARATORS = ["-", "_", ":", ".", "#"]
+
+
+# ---------------------------------------------------------------------------
+# Enhanced label generation with better patterns
+# ---------------------------------------------------------------------------
+
+def rand_word(rng: random.Random, bank: List[str]) -> str:
+    return rng.choice(bank)
+
+
+def rand_charset(rng: random.Random, charset: str, length: int) -> str:
+    return "".join(rng.choice(charset) for _ in range(length))
+
+
+def rand_base58(rng: random.Random, length: int) -> str:
+    return rand_charset(rng, CHARSET, length)
+
+
+def rand_hex(rng: random.Random, length: int) -> str:
+    return rand_charset(rng, HEX_CHARSET, length)
+
+
+def gen_realistic_timestamp(rng: random.Random) -> str:
+    """Generate realistic timestamp formats"""
+    patterns = [
+        lambda: str(rng.randint(1600000000, 1700000000)),  # Unix timestamp
+        lambda: f"{rng.randint(2020, 2024)}{rng.randint(1,12):02d}{rng.randint(1,28):02d}",  # YYYYMMDD
+        lambda: f"{rng.randint(1,12):02d}{rng.randint(1,28):02d}{rng.randint(20,24):02d}",  # MMDDYY
+    ]
+    return rng.choice(patterns)()
+
+
+def gen_wallet_specific_note(rng: random.Random, style: str) -> str:
+    """Generate wallet-specific note patterns"""
+    if style == "wasabi":
+        # Wasabi often uses round numbers and coordination IDs
+        patterns = [
+            f"Round{rng.randint(100, 9999)}",
+            f"Mix{rand_base58(rng, 8)}",
+            f"Coord{rand_hex(rng, 6)}",
+            f"{rand_base58(rng, 6)}-{rng.randint(100, 999)}"
+        ]
+    elif style == "samurai":
+        # Samurai uses specific tx types and batch IDs
+        patterns = [
+            f"Batch{rand_hex(rng, 8)}",
+            f"Pool{rng.randint(1, 99):02d}",
+            rand_base58(rng, 12),
+            f"TX{rand_hex(rng, 8)}"
+        ]
+    elif style == "electrum":
+        # Electrum uses addresses and invoice IDs
+        patterns = [
+            f"{rand_base58(rng, 4)}:{rand_base58(rng, 6)}",
+            f"Addr{rand_base58(rng, 8)}",
+            f"Invoice{rng.randint(1000, 9999)}",
+            rand_hex(rng, 16)
+        ]
+    elif style == "monero":
+        # Monero-style patterns
+        patterns = [
+            f"Sub{rng.randint(0, 99)}",
+            f"Acc{rng.randint(0, 9)}",
+            rand_hex(rng, 16),
+            f"Ring{rng.randint(10, 15)}"
+        ]
+    else:  # generic/junk
+        patterns = [
+            rand_base58(rng, rng.randint(8, 16)),
+            f"{rand_hex(rng, 8)}{rng.choice(SEPARATORS)}{gen_realistic_timestamp(rng)}",
+            f"ID{rand_hex(rng, 12)}",
+            rand_charset(rng, CHARSET + "".join(SEPARATORS), rng.randint(10, 20))
+        ]
+    
+    return rng.choice(patterns)
+
+
+def gen_label_for_node(node: dict, rng: random.Random) -> Tuple[str, str]:
+    """Return (label, note) for given DAG node with enhanced patterns."""
+    
+    if node["type"] == "decoy":
+        # Decoy nodes get minimal, spam-like labels
+        label = rand_word(rng, JUNK_BANK)
+        note = rand_base58(rng, rng.randint(4, 8))
+        return label, note
+
+    # Real nodes: weighted selection favoring more common wallet types
+    styles = ["wasabi", "samurai", "electrum", "monero", "generic", "junk"]
+    weights = [20, 20, 25, 15, 15, 5]  # Electrum most common, junk least
+    style = rng.choices(styles, weights=weights)[0]
+    
+    if style == "wasabi":
+        label = rand_word(rng, WASABI_BANK)
+        note = gen_wallet_specific_note(rng, "wasabi")
+    elif style == "samurai":
+        label = rand_word(rng, SAMURAI_BANK)
+        note = gen_wallet_specific_note(rng, "samurai")
+    elif style == "electrum":
+        label = rand_word(rng, ELECTRUM_BANK)
+        note = gen_wallet_specific_note(rng, "electrum")
+    elif style == "monero":
+        label = rand_word(rng, MONERO_BANK)
+        note = gen_wallet_specific_note(rng, "monero")
+    elif style == "generic":
+        label = rand_word(rng, GENERIC_BANK)
+        note = gen_wallet_specific_note(rng, "generic")
+    else:  # junk
+        label = rand_word(rng, JUNK_BANK)
+        note = gen_wallet_specific_note(rng, "junk")
+    
+    # Ensure length limits (wallet compatibility)
+    label = label[:32]
+    note = note[:64]
+    
+    return label, note
+
+
+def validate_dag_structure(dag: dict) -> bool:
+    """Validate DAG structure before processing"""
+    try:
+        if "graph" not in dag:
+            return False
+        if "nodes" not in dag["graph"]:
+            return False
+        
+        nodes = dag["graph"]["nodes"]
+        if not isinstance(nodes, list) or len(nodes) == 0:
+            return False
+        
+        # Check each node has required fields
+        for node in nodes:
+            if not isinstance(node, dict):
+                return False
+            if "id" not in node or "type" not in node:
+                return False
+            if node["type"] not in ["root", "real", "decoy"]:
+                return False
+        
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate randomized label_map.json for a GhostSpiral DAG.")
+    parser.add_argument("--dag", "-d", type=Path, default=Path("dag_structure.json"), 
+                       help="Path to DAG JSON from dag_generator_v2.py")
+    parser.add_argument("--seed", "-s", type=Path, default=Path("entropy_seed.json"), 
+                       help="Path to entropy_seed.json")
+    parser.add_argument("--out", "-o", type=Path, default=Path("label_map.json"), 
+                       help="Where to write map (default: ./label_map.json)")
+    parser.add_argument("--verify", action="store_true", 
+                       help="Verify DAG structure before processing")
+    args = parser.parse_args()
+
+    # Load and validate inputs
+    dag, dag_sha = load_json(args.dag)
+    seed_bundle, seed_sha = load_json(args.seed)
+
+    if args.verify and not validate_dag_structure(dag):
+        print("[!] Invalid DAG structure", file=sys.stderr)
+        sys.exit(1)
+
+    # Enhanced deterministic RNG seeding
+    # Mix seed hash + dag hash + version for better entropy distribution
+    combined_hash = hashlib.sha256(
+        (seed_sha + dag_sha + VERSION).encode()
+    ).hexdigest()
+    
+    # Use larger portion of hash for RNG seed
+    mix_int = int(combined_hash[:32], 16)
+    rng = random.Random(mix_int)
+
+    label_map: Dict[str, Dict[str, str]] = {}
+
+    try:
+        for node in dag["graph"]["nodes"]:
+            lbl, note = gen_label_for_node(node, rng)
+            label_map[node["id"]] = {"label": lbl, "note": note}
+
+        # Create payload without hash first
+        payload = {
+            "version": VERSION,
+            "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+            "dag_ref": {"file": str(args.dag), "sha256": dag_sha},
+            "seed_ref": {"file": str(args.seed), "sha256": seed_sha},
+            "labels": label_map,
+        }
+
+        # Calculate hash of payload (without sha256 field)
+        temp_payload = payload.copy()
+        payload_bytes = json.dumps(temp_payload, sort_keys=True).encode()
+        payload["sha256"] = sha256_hex(payload_bytes)
+
+        # Atomic write with secure temp file handling
+        tmp = args.out.with_suffix(".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            
+            # Atomic move
+            os.chmod(tmp, 0o600)
+            tmp.replace(args.out)
+            os.chmod(args.out, 0o600)
+            print(f"[+] Label map saved → {args.out} (labels: {len(label_map)})")
+            
+        except Exception as e:
+            print(f"[!] Error writing label map: {e}", file=sys.stderr)
+            secure_wipe(tmp)
+            sys.exit(1)
+            
+    except Exception as e:
+        print(f"[!] Error generating labels: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

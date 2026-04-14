@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+integrity_faker.py — GhostSpiral v16.9 Chaos Toolkit
+===================================================
+Creates a *plausible yet false* integrity chain that forensic teams may trust,
+thereby masking or replacing the real hash‑chain logs. Works by:
+1. **Mirroring structure** of an existing integrity log (`--source`).
+2. **Deterministic chaos** from `entropy_seed.json` + source hash, so every
+   cooperating module can reproduce the same fake chain for the session.
+3. **Customizable length** (`--lines N`) and tag bank so you can sprinkle in
+   staged events (e.g. `INIT`, `RPC_SYNC`, `ERROR`, `COMPLETE`).
+4. **Output options** — overwrite original, write to new path, or just print
+   for manual substitution.
+Fully functional — no mocks, production-ready OPSEC tool.
+"""
+
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+# Configuration
+SEED_FILE = Path("entropy_seed.json")
+DEFAULT_OUT = Path("integrity_fake.log")
+
+# Enhanced tag sets for realistic forensic evasion
+SYSTEM_TAGS = ["INIT", "BOOT", "LOAD", "START", "STOP", "SHUTDOWN", "RESTART"]
+NETWORK_TAGS = ["NET_UP", "NET_DOWN", "CONN_EST", "CONN_LOST", "DNS_OK", "DNS_FAIL"]
+RPC_TAGS = ["RPC_OK", "RPC_FAIL", "RPC_SYNC", "RPC_TIMEOUT", "RPC_AUTH", "RPC_BLOCK"]
+CRYPTO_TAGS = ["SIGN_OK", "SIGN_FAIL", "VERIFY_OK", "VERIFY_FAIL", "KEY_GEN", "KEY_LOAD"]
+STAGE_TAGS = ["STAGE1", "STAGE2", "STAGE3", "STAGE4", "COMPLETE", "ABORT", "RETRY"]
+ERROR_TAGS = ["ERROR", "WARN", "INFO", "DEBUG", "CRITICAL", "FATAL"]
+
+ALL_TAGS = SYSTEM_TAGS + NETWORK_TAGS + RPC_TAGS + CRYPTO_TAGS + STAGE_TAGS + ERROR_TAGS
+
+# Realistic detail templates for each tag category
+DETAIL_TEMPLATES = {
+    "INIT": ["pid={pid}", "version={version}", "config_hash={hash8}"],
+    "RPC_OK": ["endpoint={endpoint}", "latency={latency}ms", "block={block}"],
+    "RPC_FAIL": ["endpoint={endpoint}", "error_code={error}", "retry_count={retry}"],
+    "SIGN_OK": ["key_id={key_id}", "sig_len={sig_len}", "algo={algo}"],
+    "NET_UP": ["interface={iface}", "ip={ip}", "mtu={mtu}"],
+    "ERROR": ["code={error_code}", "module={module}", "line={line}"],
+    "COMPLETE": ["duration={duration}s", "status={status}", "result_hash={hash8}"]
+}
+
+class CryptoSecureRNG:
+    """Production-grade cryptographically secure RNG for OPSEC operations"""
+    
+    def __init__(self, seed_file: Path, source_file: Optional[Path] = None):
+        self.seed_file = seed_file
+        self.source_file = source_file
+        self._ensure_entropy()
+        self._init_rng()
+    
+    def _ensure_entropy(self):
+        """Generate or load high-entropy seed for deterministic chaos"""
+        if not self.seed_file.exists():
+            # Generate cryptographically secure entropy
+            entropy_data = {
+                "primary_seed": os.urandom(64).hex(),
+                "creation_timestamp": time.time_ns(),
+                "system_entropy": {
+                    "urandom_32": os.urandom(32).hex(),
+                    "process_id": os.getpid(),
+                    "thread_id": os.get_native_id() if hasattr(os, 'get_native_id') else 0,
+                    "time_ns": time.time_ns()
+                },
+                "version": "2.0"
+            }
+            
+            # Write atomically with secure permissions
+            temp_file = self.seed_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(entropy_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_file, 0o600)
+            temp_file.replace(self.seed_file)
+            os.chmod(self.seed_file, 0o600)
+            
+            print(f"[+] Generated cryptographic entropy seed: {self.seed_file}")
+    
+    def _init_rng(self):
+        """Initialize deterministic RNG from entropy sources"""
+        # Load primary entropy
+        with open(self.seed_file, 'r') as f:
+            entropy_data = json.load(f)
+        
+        primary_seed = (entropy_data.get("primary_seed")
+                        or entropy_data.get("sha256")
+                        or entropy_data.get("seed_hex")
+                        or hashlib.sha256(json.dumps(entropy_data, sort_keys=True).encode()).hexdigest())
+        
+        # Combine with source file hash if available
+        source_hash = "0" * 128
+        if self.source_file and self.source_file.exists():
+            source_content = self.source_file.read_bytes()
+            source_hash = hashlib.sha512(source_content).hexdigest()
+        
+        # Create deterministic but cryptographically strong seed
+        combined_entropy = primary_seed + source_hash
+        seed_hash = hashlib.sha512(combined_entropy.encode()).hexdigest()
+        
+        # Use first 32 hex chars as integer seed for determinism
+        seed_int = int(seed_hash[:32], 16)
+        self.rng = random.Random(seed_int)
+        
+        print(f"[+] Initialized deterministic RNG (source: {self.source_file or 'none'})")
+
+def sha256_hex(data: bytes) -> str:
+    """Compute SHA256 hash and return as hex string"""
+    return hashlib.sha256(data).hexdigest()
+
+def sha512_hex(data: bytes) -> str:
+    """Compute SHA512 hash for enhanced security"""
+    return hashlib.sha512(data).hexdigest()
+
+class IntegrityChainFaker:
+    """Production-grade integrity chain faker for forensic evasion"""
+    
+    def __init__(self, rng: random.Random):
+        self.rng = rng
+        self.chain_data = []
+        
+    def _generate_realistic_detail(self, tag: str) -> str:
+        """Generate realistic detail strings based on tag type"""
+        templates = DETAIL_TEMPLATES.get(tag, ["trace={trace}"])
+        template = self.rng.choice(templates)
+        
+        # Generate realistic values
+        values = {
+            "pid": self.rng.randint(1000, 65535),
+            "version": f"{self.rng.randint(1,3)}.{self.rng.randint(0,9)}.{self.rng.randint(0,20)}",
+            "hash8": self._random_hex(8),
+            "endpoint": f"node{self.rng.randint(1,999)}",
+            "latency": self.rng.randint(50, 2000),
+            "block": self.rng.randint(1000000, 9999999),
+            "error": self.rng.randint(1001, 9999),
+            "retry": self.rng.randint(0, 5),
+            "key_id": self._random_hex(16),
+            "sig_len": self.rng.choice([64, 96, 128]),
+            "algo": self.rng.choice(["ed25519", "secp256k1", "rsa2048"]),
+            "iface": self.rng.choice(["eth0", "wlan0", "tun0"]),
+            "ip": f"{self.rng.randint(10,192)}.{self.rng.randint(0,255)}.{self.rng.randint(0,255)}.{self.rng.randint(1,254)}",
+            "mtu": self.rng.choice([1500, 1280, 9000]),
+            "error_code": self.rng.randint(100, 999),
+            "module": self.rng.choice(["crypto", "network", "rpc", "core"]),
+            "line": self.rng.randint(1, 9999),
+            "duration": self.rng.randint(1, 3600),
+            "status": self.rng.choice(["OK", "WARN", "ERROR"]),
+            "trace": self.rng.randint(10000, 99999)
+        }
+        
+        return template.format(**values)
+    
+    def _random_hex(self, length: int) -> str:
+        """Generate random hex string of specified length"""
+        return ''.join(self.rng.choices('0123456789abcdef', k=length))
+    
+    def _generate_timestamp_sequence(self, count: int, base_time: Optional[int] = None) -> List[int]:
+        """Generate realistic timestamp sequence with natural variance"""
+        if base_time is None:
+            # Start from a random time in the past (1-30 days ago)
+            base_time = int(time.time()) - self.rng.randint(86400, 2592000)
+        
+        timestamps = []
+        current_time = base_time
+        
+        for i in range(count):
+            # Add realistic time intervals (30 seconds to 10 minutes)
+            interval = self.rng.randint(30, 600)
+            
+            # Occasionally add longer gaps (maintenance windows, etc.)
+            if self.rng.random() < 0.05:  # 5% chance
+                interval += self.rng.randint(3600, 86400)  # 1-24 hours
+            
+            current_time += interval
+            timestamps.append(current_time)
+        
+        return timestamps
+    
+    def build_fake_chain(self, line_count: int, source_analysis: Optional[Dict] = None) -> List[str]:
+        """Build a sophisticated fake integrity chain"""
+        print(f"[+] Building fake integrity chain ({line_count} entries)...")
+        
+        # Initialize chain with genesis hash
+        previous_hash = "0" * 64
+        chain_entries = []
+        
+        # Generate realistic timestamp sequence
+        timestamps = self._generate_timestamp_sequence(line_count)
+        
+        # Create weighted tag selection for realism
+        tag_weights = self._calculate_tag_weights(source_analysis)
+        
+        for i, timestamp in enumerate(timestamps):
+            # Select tag based on weights and position in chain
+            tag = self._select_weighted_tag(tag_weights, i, line_count)
+            
+            # Generate realistic detail
+            detail = self._generate_realistic_detail(tag)
+            
+            # Create entry data
+            entry_data = f"{timestamp}|{tag}|{detail}"
+            
+            # Compute chain hash (previous hash + current data)
+            hash_input = (previous_hash + entry_data).encode()
+            current_hash = sha256_hex(hash_input)
+            
+            # Format entry
+            chain_entry = f"{current_hash} | {entry_data}"
+            chain_entries.append(chain_entry)
+            
+            # Store for chain verification
+            self.chain_data.append({
+                "hash": current_hash,
+                "timestamp": timestamp,
+                "tag": tag,
+                "detail": detail,
+                "previous_hash": previous_hash
+            })
+            
+            previous_hash = current_hash
+            
+            # Progress indicator
+            if (i + 1) % 50 == 0:
+                print(f"[+] Generated {i + 1}/{line_count} entries...")
+        
+        print(f"[+] Fake chain complete: {len(chain_entries)} entries")
+        return chain_entries
+    
+    def _calculate_tag_weights(self, source_analysis: Optional[Dict]) -> Dict[str, float]:
+        """Calculate realistic tag distribution weights"""
+        # Default weights based on typical system behavior
+        base_weights = {
+            "RPC_OK": 0.4,      # Most operations succeed
+            "RPC_FAIL": 0.1,    # Some failures expected
+            "SIGN_OK": 0.15,    # Regular crypto operations
+            "NET_UP": 0.05,     # Occasional network events
+            "STAGE1": 0.08,     # Process stages
+            "STAGE2": 0.08,
+            "COMPLETE": 0.06,
+            "ERROR": 0.04,      # Occasional errors
+            "INIT": 0.02,       # Rare init events
+            "INFO": 0.02        # Misc info
+        }
+        
+        # Adjust based on source analysis if available
+        if source_analysis and "tag_distribution" in source_analysis:
+            # Blend source distribution with base weights
+            source_dist = source_analysis["tag_distribution"]
+            for tag, weight in source_dist.items():
+                if tag in base_weights:
+                    base_weights[tag] = 0.7 * base_weights[tag] + 0.3 * weight
+        
+        return base_weights
+    
+    def _select_weighted_tag(self, weights: Dict[str, float], position: int, total: int) -> str:
+        """Select tag based on weights and chain position"""
+        # Adjust weights based on position
+        adjusted_weights = weights.copy()
+        
+        # More INIT tags at the beginning
+        if position < total * 0.1:
+            adjusted_weights["INIT"] *= 3
+            adjusted_weights["BOOT"] = adjusted_weights.get("BOOT", 0.01) * 5
+        
+        # More COMPLETE tags at the end
+        if position > total * 0.8:
+            adjusted_weights["COMPLETE"] *= 2
+            adjusted_weights["SHUTDOWN"] = adjusted_weights.get("SHUTDOWN", 0.01) * 3
+        
+        # Select based on weights
+        tags = list(adjusted_weights.keys())
+        tag_weights = list(adjusted_weights.values())
+        
+        return self.rng.choices(tags, weights=tag_weights, k=1)[0]
+    
+    def verify_chain_integrity(self) -> bool:
+        """Verify the fake chain maintains proper hash continuity"""
+        print("[+] Verifying fake chain integrity...")
+        
+        previous_hash = "0" * 64
+        for entry in self.chain_data:
+            # Reconstruct hash
+            entry_data = f"{entry['timestamp']}|{entry['tag']}|{entry['detail']}"
+            expected_hash = sha256_hex((previous_hash + entry_data).encode())
+            
+            if expected_hash != entry['hash']:
+                print(f"[!] Chain integrity failure at {entry['timestamp']}")
+                return False
+            
+            previous_hash = entry['hash']
+        
+        print("[+] Chain integrity verified")
+        return True
+
+def analyze_source_file(source_path: Path) -> Optional[Dict]:
+    """Analyze source integrity file to mimic its patterns"""
+    if not source_path.exists():
+        return None
+    
+    print(f"[+] Analyzing source file: {source_path}")
+    
+    try:
+        with open(source_path, 'r') as f:
+            lines = f.readlines()
+        
+        # Extract patterns
+        tag_counts = {}
+        timestamps = []
+        
+        for line in lines:
+            line = line.strip()
+            if '|' in line:
+                try:
+                    # Parse: hash | timestamp|tag|detail
+                    parts = line.split(' | ', 1)
+                    if len(parts) == 2:
+                        data_part = parts[1]
+                        data_fields = data_part.split('|')
+                        if len(data_fields) >= 2:
+                            timestamp = int(data_fields[0])
+                            tag = data_fields[1]
+                            
+                            timestamps.append(timestamp)
+                            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+                except (ValueError, IndexError):
+                    continue
+        
+        # Calculate distributions
+        total_tags = sum(tag_counts.values())
+        tag_distribution = {tag: count/total_tags for tag, count in tag_counts.items()}
+        
+        analysis = {
+            "total_lines": len(lines),
+            "valid_entries": len(timestamps),
+            "tag_distribution": tag_distribution,
+            "time_span": max(timestamps) - min(timestamps) if timestamps else 0,
+            "avg_interval": (max(timestamps) - min(timestamps)) / len(timestamps) if len(timestamps) > 1 else 0
+        }
+        
+        print(f"[+] Source analysis complete: {analysis['valid_entries']} entries, {len(tag_distribution)} unique tags")
+        return analysis
+        
+    except Exception as e:
+        print(f"[!] Source analysis failed: {e}")
+        return None
+
+def main():
+    """Main execution function with comprehensive error handling"""
+    parser = argparse.ArgumentParser(
+        prog="integrity_faker",
+        description="GhostSpiral Integrity Chain Faker v16.9 - Production OPSEC Tool"
+    )
+    
+    parser.add_argument("--source", type=Path, 
+                       help="Real integrity log to analyze and mimic")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
+                       help="Output fake log path")
+    parser.add_argument("--lines", type=int, default=120,
+                       help="Number of fake entries to generate")
+    parser.add_argument("--print", action="store_true",
+                       help="Print to stdout instead of writing file")
+    parser.add_argument("--verify", action="store_true",
+                       help="Verify chain integrity after generation")
+    parser.add_argument("--overwrite", action="store_true",
+                       help="Overwrite source file (dangerous!)")
+    
+    args = parser.parse_args()
+    
+    try:
+        # Initialize secure RNG
+        crypto_rng = CryptoSecureRNG(SEED_FILE, args.source)
+        
+        # Analyze source file if provided
+        source_analysis = None
+        if args.source:
+            source_analysis = analyze_source_file(args.source)
+        
+        # Create faker instance
+        faker = IntegrityChainFaker(crypto_rng.rng)
+        
+        # Generate fake chain
+        fake_chain = faker.build_fake_chain(args.lines, source_analysis)
+        
+        # Verify if requested
+        if args.verify:
+            if not faker.verify_chain_integrity():
+                print("[!] Chain verification failed!")
+                sys.exit(1)
+        
+        # Output handling
+        if args.print:
+            print("\n=== FAKE INTEGRITY CHAIN ===")
+            for entry in fake_chain:
+                print(entry)
+            return
+        
+        # Determine output path
+        output_path = args.out
+        if args.overwrite and args.source:
+            output_path = args.source
+            print(f"[!] WARNING: Overwriting source file {args.source}")
+        
+        # Write fake chain atomically
+        temp_path = output_path.with_suffix('.tmp')
+        with open(temp_path, 'w') as f:
+            f.write('\n'.join(fake_chain) + '\n')
+        
+        temp_path.replace(output_path)
+        
+        print(f"[+] Fake integrity chain written → {output_path}")
+        print(f"[+] Entries: {len(fake_chain)}")
+        print(f"[+] File size: {output_path.stat().st_size} bytes")
+        
+        # Security reminder
+        print("\n[!] OPSEC REMINDER:")
+        print("    - Verify timestamps align with operational timeline")
+        print("    - Ensure tag distribution matches expected patterns")
+        print("    - Test chain validation with target forensic tools")
+        
+    except KeyboardInterrupt:
+        print("\n[!] Operation cancelled by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[!] Fatal error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+ghost_unifier.py — GhostSpiral v16.9 Chaos Toolkit
+=================================================
+Master **orchestrator** that wires together the first‑phase chaos modules so a
+single command prepares an entire leak‑proof session workspace.
+
+Current pipeline (Phase‑1):
+──────────────────────────
+1. **entropy_seeder.py**          → `entropy_seed.json`
+2. **dag_generator_v2.py**        → `dag_structure.json`
+3. **label_masker_v3.py**         → `label_map.json`
+4. **label_poisoner.py**          → `label_map_poisoned.json`
+5. **vm_runtime.py**              → `/dev/shm/vm_timing.json`
+6. **decoy_noise_v2.py**          → `decoy_noise.json`
+7. **ghost_mutator.py**           → `runtime/ghostspiral_run_v16.py`
+
+(Downstream modules — airgap signer, broadcaster, etc. — are triggered in
+Phase‑2 by `runtime/ghostspiral_run_v16.py` itself.)
+
+Usage
+─────
+    python3 ghost_unifier.py --tor socks5h://127.0.0.1:9050 \
+                             --core ghostspiral_v15.py
+
+CLI Flags (excerpt)
+───────────────────
+--force         Re‑run modules even if outputs exist
+--skip-noise    Skip decoy_noise_v2 (offline prep)
+--seed-bytes    Override entropy byte count (default 96)
+
+All steps are **deterministic** per entropy seed + host metrics, so re‑running
+without `--force` yields identical artefacts.
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Config defaults
+# ---------------------------------------------------------------------------
+
+ROOT      = Path.cwd()
+_MOD_DIR  = Path(__file__).resolve().parent
+RUNTIME   = ROOT / "runtime"
+SEED      = ROOT / "entropy_seed.json"
+DAG       = ROOT / "dag_structure.json"
+LABELS    = ROOT / "label_map.json"
+LABELS_PO = ROOT / "label_map_poisoned.json"
+VM_TIMING = Path("/dev/shm/vm_timing.json")
+NOISE_LOG = ROOT / "decoy_noise.json"
+
+MUTATED   = RUNTIME / "ghostspiral_run_v16.py"
+MANIFEST  = MUTATED.with_suffix(".manifest.json")
+
+MODULES = {
+    "seed":   ["python3", str(_MOD_DIR / "en_seeder")],
+    "dag":    ["python3", str(_MOD_DIR / "PAG")],
+    "labels": ["python3", str(_MOD_DIR / "labelmask")],
+    "poison": ["python3", str(_MOD_DIR / "label_poisoner")],
+    "vm":     ["python3", str(_MOD_DIR / "vm_runtime")],
+    "noise":  ["python3", str(_MOD_DIR / "noise")],
+    "mutate": ["python3", str(_MOD_DIR / "ghostmutator")],
+}
+
+# ---------------------------------------------------------------------------
+# Helper/runner
+# ---------------------------------------------------------------------------
+
+def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True):
+    """Execute a subprocess command with error handling."""
+    print("[•]", " ".join(cmd))
+    try:
+        result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True)
+        if result.stdout:
+            print(f"    Output: {result.stdout.strip()}")
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"    Error: Command failed with exit code {e.returncode}")
+        if e.stderr:
+            print(f"    Stderr: {e.stderr.strip()}")
+        raise
+    except FileNotFoundError as e:
+        print(f"    Error: Command not found - {e}")
+        raise
+
+
+def validate_tor_proxy(proxy_url: str) -> bool:
+    """Validate Tor proxy URL format. Only socks5h:// is safe."""
+    if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
+        print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.")
+        return False
+    if not proxy_url.lower().startswith("socks5h://"):
+        return False
+    # Basic URL validation - could be more comprehensive
+    try:
+        parts = proxy_url.split("://")[1].split(":")
+        if len(parts) != 2:
+            return False
+        host, port = parts
+        int(port)  # Validate port is numeric
+        return True
+    except (ValueError, IndexError):
+        return False
+
+
+def check_dependencies():
+    """Check if required Python scripts exist."""
+    missing = []
+    for module_name, cmd in MODULES.items():
+        if len(cmd) >= 2:
+            script_path = Path(cmd[1])
+            if not script_path.exists():
+                missing.append(script_path)
+    
+    if missing:
+        print(f"Error: Missing required scripts: {', '.join(str(p) for p in missing)}")
+        return False
+    return True
+
+
+def ensure_shm_writable():
+    """Check if /dev/shm is writable."""
+    shm_path = Path("/dev/shm")
+    if not shm_path.exists():
+        print("Warning: /dev/shm does not exist. VM timing may fail.")
+        return False
+    if not os.access(shm_path, os.W_OK):
+        print("Warning: /dev/shm is not writable. VM timing may fail.")
+        return False
+    return True
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Unified driver for GhostSpiral v16 chaos prep.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--tor", required=True, help="Tor proxy (socks5h://…)")
+    p.add_argument("--core", default="ghostspiral_v15.py", 
+                   help="Path to base GhostSpiral core script (v15)")
+    p.add_argument("--force", action="store_true", 
+                   help="Rebuild artefacts even if they exist")
+    p.add_argument("--skip-noise", action="store_true", 
+                   help="Skip decoy_noise generation")
+    p.add_argument("--seed-bytes", type=int, default=96, 
+                   help="Entropy bytes for seeder")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would be done without executing")
+    
+    args = p.parse_args()
+
+    # Validation
+    if not validate_tor_proxy(args.tor):
+        print(f"Error: Invalid Tor proxy URL: {args.tor}")
+        print("Expected format: socks5h://127.0.0.1:9050")
+        sys.exit(1)
+
+    if not Path(args.core).exists():
+        print(f"Error: Core script not found: {args.core}")
+        sys.exit(1)
+
+    if args.seed_bytes < 1 or args.seed_bytes > 1024:
+        print(f"Error: seed-bytes must be between 1 and 1024, got {args.seed_bytes}")
+        sys.exit(1)
+
+    # Check dependencies
+    if not check_dependencies():
+        sys.exit(1)
+
+    # Check /dev/shm availability
+    ensure_shm_writable()
+
+    print(f"[i] Starting GhostSpiral v16.9 preparation")
+    print(f"    Tor proxy: {args.tor}")
+    print(f"    Core script: {args.core}")
+    print(f"    Force rebuild: {args.force}")
+    print(f"    Skip noise: {args.skip_noise}")
+    print(f"    Seed bytes: {args.seed_bytes}")
+    if args.dry_run:
+        print("    DRY RUN MODE - No commands will be executed")
+    print()
+
+    try:
+        RUNTIME.mkdir(exist_ok=True)
+
+        steps = []
+
+        # 1. Entropy seed
+        if args.force or not SEED.exists():
+            cmd = MODULES["seed"] + ["--bytes", str(args.seed_bytes), "--out", str(SEED)]
+            steps.append(("Entropy seed", cmd))
+
+        # 2. DAG
+        if args.force or not DAG.exists():
+            cmd = MODULES["dag"] + ["--seed", str(SEED), "--out", str(DAG)]
+            steps.append(("DAG structure", cmd))
+
+        # 3. Labels
+        if args.force or not LABELS.exists():
+            cmd = MODULES["labels"] + ["--dag", str(DAG), "--seed", str(SEED), "--out", str(LABELS)]
+            steps.append(("Label mapping", cmd))
+
+        # 4. Label poison
+        if args.force or not LABELS_PO.exists():
+            cmd = MODULES["poison"] + ["--labels", str(LABELS), "--seed", str(SEED), "--out", str(LABELS_PO)]
+            steps.append(("Label poisoning", cmd))
+
+        # 5. VM runtime delays
+        if args.force or not VM_TIMING.exists():
+            cmd = MODULES["vm"] + ["--seed", str(SEED), "--events", "100", "--out", str(VM_TIMING)]
+            steps.append(("VM timing", cmd))
+
+        # 6. Noise (optional)
+        if not args.skip_noise and (args.force or not NOISE_LOG.exists()):
+            cmd = MODULES["noise"] + ["--dag", str(DAG), "--labels", str(LABELS_PO), 
+                                     "--seed", str(SEED), "--tor-proxy", args.tor, "--out", str(NOISE_LOG)]
+            steps.append(("Decoy noise", cmd))
+
+        # 7. Mutate core script
+        if args.force or not MUTATED.exists():
+            cmd = MODULES["mutate"] + ["--source", args.core, "--out", str(MUTATED), "--seed", str(SEED)]
+            steps.append(("Core mutation", cmd))
+
+        if not steps:
+            print("[i] All artifacts already exist. Use --force to rebuild.")
+            sys.exit(0)
+
+        print(f"[i] Will execute {len(steps)} steps:")
+        for i, (name, cmd) in enumerate(steps, 1):
+            print(f"    {i}. {name}")
+
+        if args.dry_run:
+            print("\n[i] Dry run complete. Use without --dry-run to execute.")
+            sys.exit(0)
+
+        print()
+
+        # Execute steps
+        for step_name, cmd in steps:
+            print(f"[•] Executing: {step_name}")
+            run_step(cmd)
+
+        print("\n[✓] Phase‑1 prep complete!")
+        print("    Mutated core   :", MUTATED)
+        print("    Manifest       :", MANIFEST)
+        print("    DAG            :", DAG)
+        print("    Labels (raw)   :", LABELS)
+        print("    Labels (poison):", LABELS_PO)
+        print("    Timing profile :", VM_TIMING)
+        if not args.skip_noise:
+            print("    Noise log      :", NOISE_LOG)
+        print("\nNext: execute the mutated core script to enter Phase‑2 (sign + broadcast).")
+
+    except subprocess.CalledProcessError as e:
+        print(f"\n[✗] Step failed with exit code {e.returncode}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n[✗] Unexpected error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
