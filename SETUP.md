@@ -217,35 +217,62 @@ without touching real money.
 
 ## Step 8: Stopping Services (When Done)
 
-### Stop wallet RPC:
+Stop services in reverse order (GhostSpiral artifacts → wallet → node → Tor).
 
-```bash
-# If running in foreground: Ctrl+C
-# If running with --detach:
-kill $(pgrep monero-wallet-rpc)
-```
-
-### Stop monerod:
-
-```bash
-monerod exit
-# Or if detached:
-kill $(pgrep monerod)
-```
-
-### Stop Tor (optional — you probably want to keep it running):
-
-```bash
-sudo systemctl stop tor
-```
-
-### Clean up GhostSpiral artifacts:
+### 8a. Clean up GhostSpiral artifacts FIRST:
 
 ```bash
 # Option 9 (Paranoia Cleanup) in the menu does this automatically.
 # Or manually:
 python3 run paranoia --dry-run   # see what would be deleted
-python3 run paranoia             # actually delete
+python3 run paranoia             # actually delete (needs sudo for full wipe)
+```
+
+This wipes seed files, plans, timing profiles, noise logs, integrity chains,
+shell histories, and Python caches. Run this **before** stopping services so
+the cleanup tools can still talk to Tor for circuit rotation.
+
+### 8b. Stop wallet RPC:
+
+```bash
+# If running in foreground: Ctrl+C
+# If running with --detach:
+kill $(pgrep monero-wallet-rpc)
+# Verify it stopped:
+pgrep monero-wallet-rpc || echo "wallet-rpc stopped"
+```
+
+### 8c. Stop monerod:
+
+```bash
+monerod exit
+# Or if detached:
+kill $(pgrep monerod)
+# Wait for clean shutdown (saves blockchain state):
+sleep 10 && pgrep monerod || echo "monerod stopped"
+```
+
+Do NOT `kill -9` monerod — it may corrupt the blockchain database.
+
+### 8d. Stop Tor (optional — you probably want to keep it running):
+
+```bash
+sudo systemctl stop tor
+# Or if using Tor Browser: just close the browser
+```
+
+### 8e. Unset environment variables in your shell:
+
+```bash
+unset GS_WALLET_PASSWORD TOR_CONTROL_PASSWORD
+history -c && history -w   # clear shell history of passwords
+```
+
+### Verify everything is stopped:
+
+```bash
+pgrep -a monero || echo "No Monero processes"
+ss -tlnp | grep -E '18081|18083|9050' || echo "No GhostSpiral ports open"
 ```
 
 ---
