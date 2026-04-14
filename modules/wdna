@@ -191,7 +191,8 @@ def create_gap_subaddress(rng: random.Random) -> dict:
     95-character format, but with zero balance and 'used: False' to indicate
     it was never funded. No metadata field that reveals this is synthetic.
     """
-    fake_addr = "8" + secrets.token_hex(47)
+    charset = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    fake_addr = "8" + "".join(secrets.choice(charset) for _ in range(94))
     return {
         "label": generate_secure_label(rng),
         "address": fake_addr,

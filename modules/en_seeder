@@ -65,8 +65,8 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
     """Gather entropy from multiple OS / hardware sources."""
     entropy: dict[str, object] = {}
 
-    # 1. OS randomness pool
-    entropy["urandom"] = secrets.token_hex(num_bytes)
+    # 1. OS randomness pool (store hash only — raw CSPRNG output must not leak into JSON)
+    entropy["urandom_hash"] = hashlib.sha256(secrets.token_bytes(num_bytes)).hexdigest()
 
     # 2. High‑precision time snapshot
     entropy["time_ns"] = time.time_ns()
@@ -158,6 +158,7 @@ def write_bundle(bundle: dict, out_path: Path):
         
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         with tmp_path.open("w", encoding="utf-8") as fh:
+            os.chmod(tmp_path, 0o600)
             json.dump(bundle, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())

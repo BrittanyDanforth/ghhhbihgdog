@@ -319,6 +319,7 @@ Examples:
         tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
         
         with tmp_path.open("w", encoding="utf-8") as fh:
+            os.chmod(tmp_path, 0o600)
             json.dump(poisoned, fh, indent=2, sort_keys=True, ensure_ascii=False)
         
         # Atomic rename
