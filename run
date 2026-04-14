@@ -440,9 +440,9 @@ def flow_resume(detected_port=None):
     run_script(CORE / "GhostSpiral", args, "GhostSpiral resume")
 
 
-def flow_create_wallet():
+def flow_create_wallet(detected_port=None):
     heading("Create Receive Wallet")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
