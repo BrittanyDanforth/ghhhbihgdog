@@ -164,6 +164,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             # index and restrict coin selection to that subaddress only.
             src_addr = tx.get("src", "")
             if src_addr:
+                resolved = False
                 try:
                     all_addrs = rpc.raw_request("get_address", {
                         "account_index": acct_idx,
@@ -171,9 +172,15 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                     for entry in all_addrs.get("addresses", []):
                         if entry.get("address") == src_addr:
                             create_params["subaddr_indices"] = [entry["address_index"]]
+                            resolved = True
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"  [!] Cannot resolve src address: {e}")
+                if not resolved:
+                    print(f"  [!] Source address {scrub_address(src_addr)} not found in wallet.")
+                    print(f"  [!] Funds may be sent from the WRONG subaddress. Aborting this TX.")
+                    failed += 1
+                    continue
 
             result = rpc.raw_request("transfer_split", create_params)
 

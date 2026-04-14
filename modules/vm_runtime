@@ -378,9 +378,9 @@ Examples:
               f"Load: {metrics['load_avg'][0]:.2f}")
 
     # Deterministic RNG but uniqueness per host via metrics
-    host_fingerprint = sha256_hex(json.dumps(metrics, sort_keys=True).encode())[:16]
-    combined_seed = seed_sha + host_fingerprint
-    rng_seed = int(combined_seed[:32], 16)
+    host_fingerprint = sha256_hex(json.dumps(metrics, sort_keys=True).encode())
+    combined = sha256_hex((seed_sha + host_fingerprint).encode())
+    rng_seed = int(combined[:32], 16)
     rng = random.Random(rng_seed)
 
     if args.verbose:

@@ -170,10 +170,12 @@ def main():
 
         staging_dir = "tx_staging"
         lock_path = Path(".mixer.lock")
-        if lock_path.exists():
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
             sys.exit("[!] Lock file exists. Another instance may be running.")
-        lock_path.write_text(str(os.getpid()))
-        secure_file_perms(lock_path)
 
         try:
             _stage5_run(args, resume_path, staging_dir, proxy, bal)
@@ -289,8 +291,11 @@ def main():
             # Without this, JM may resolve maker addresses over clearnet.
             from urllib.parse import urlparse as _urlparse
             _parsed_proxy = _urlparse(args.tor_proxy)
+            jm_path = Path(args.joinmarket_wallet).parent / "tumble.py"
+            if not jm_path.exists():
+                jm_path = Path("tumble.py")
             result = subprocess.run(
-                ["python3", "tumble.py",
+                [sys.executable, str(jm_path),
                  "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
                  "--socks5-port", str(_parsed_proxy.port or 9050),
                  args.joinmarket_wallet, btc_addr, "all"],
@@ -709,16 +714,33 @@ def main():
                 old_plan.unlink()
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
-    # Lock file to prevent concurrent runs
+    # Atomic lock file to prevent concurrent runs (O_EXCL = fail if exists)
     lock_path = Path(".mixer.lock")
-    if lock_path.exists():
-        sys.exit(
-            "[!] Lock file exists: .mixer.lock\n"
-            "    Another GhostSpiral instance may be running.\n"
-            "    If not, delete the lock file manually."
-        )
-    lock_path.write_text(str(os.getpid()))
-    secure_file_perms(lock_path)
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        try:
+            stale_pid = lock_path.read_text().strip()
+            if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                lock_path.unlink()
+                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+            else:
+                sys.exit(
+                    f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                    "    Another instance may be running.\n"
+                    "    If not, delete the lock file manually."
+                )
+        except (OSError, ValueError):
+            sys.exit(
+                "[!] Lock file exists: .mixer.lock\n"
+                "    Another instance may be running.\n"
+                "    If not, delete the lock file manually."
+            )
 
     staging_dir = "tx_staging"
 
@@ -817,8 +839,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
                     completed_indices.add(pending_idx)
                 if completed_indices:
                     print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            integrity_log("stage5", f"progress_corrupt:{str(e)[:40]}")
+            print(f"  [!] Corrupt progress file — starting fresh ({e})")
 
     success_count = 0
     fail_count = 0
@@ -835,6 +858,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             continue
 
         tx = plan_txs[tx_idx]
+        if "amt" not in tx or "dst" not in tx:
+            integrity_log("stage5", f"malformed_tx:idx={tx_idx}")
+            print(f"  [!] TX {tx_idx} is malformed (missing amt or dst) — ABORTING.")
+            fail_count += 1
+            break
         print(f"\n  [*] TX {tx_idx}/{total_txs-1}: {tx['amt']} XMR -> {scrub_address(tx['dst'])}")
 
         # Apply planned delay (timing decorrelation)
@@ -857,7 +885,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
         try:
             create_cmd = [
-                "python3", _core_script("airgap_tx_signer"), str(ufile),
+                sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                 "--phase", "create",
                 "--rpc", args.rpc_primary,
                 "--tor-proxy", args.tor_proxy,
@@ -897,7 +925,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             print(f"  [*] Step 2: Signing TX {tx_idx}...")
             try:
                 sign_cmd = [
-                    "python3", _core_script("airgap_tx_signer"), str(ufile),
+                    sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                     "--phase", "sign",
                     "--wallet-file", args.wallet_file,
                     "--outdir", staging_dir,
@@ -975,7 +1003,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         # wallet's internal state (spent outputs). But we must still call
         # refresh so the wallet re-scans and sees the TX in the mempool/chain.
         # Without this, the next transfer_split may reuse spent outputs.
-        time.sleep(5)
+        secure_delay(3.0, 8.0)
         try:
             rpc_primary.raw_request("refresh", {})
         except Exception as e:
@@ -1010,9 +1038,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
 
     try:
         print("  [*] Exit strategy simulation...")
-        exit_amt = str(sum(Decimal(t["amt"]) for t in plan_txs))
+        exit_amt = str(sum(Decimal(t.get("amt", "0")) for t in plan_txs))
         subprocess.run(
-            ["python3", _core_script("exit_strategy_simulator"), exit_amt,
+            [sys.executable, _core_script("exit_strategy_simulator"), exit_amt,
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
         )

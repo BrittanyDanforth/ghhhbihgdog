@@ -350,14 +350,16 @@ class PolymorphicGenerator:
         
         # Post-processing
         if self.obfuscation_level > 2:
-            # Add phantom edges (non-tree edges)
-            num_phantom = rng.randint(0, len(edges) // 10)
+            # Add phantom edges (non-tree edges) — only from earlier to later
+            # nodes in the list to preserve DAG acyclicity.
+            num_phantom = rng.randint(0, max(1, len(edges) // 10))
+            node_order = {n['id']: i for i, n in enumerate(nodes)}
             for _ in range(num_phantom):
                 if len(nodes) > 2:
-                    n1 = rng.choice(nodes[1:])  # Not root
-                    n2 = rng.choice(nodes[1:])  # Not root
-                    if n1['id'] != n2['id']:
-                        edges.append([n1['id'], n2['id']])
+                    i1 = rng.randint(1, len(nodes) - 1)
+                    i2 = rng.randint(1, len(nodes) - 1)
+                    if i1 < i2:
+                        edges.append([nodes[i1]['id'], nodes[i2]['id']])
         
         # Clean internal data
         for node in nodes:
@@ -518,7 +520,7 @@ def main():
         except:
             pass
     
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(description="Generate polymorphic DAG structure")
     parser.add_argument("--seed", "-s", type=Path, 
                        default=Path("entropy_seed.json"))
     parser.add_argument("--out", "-o", type=Path, 

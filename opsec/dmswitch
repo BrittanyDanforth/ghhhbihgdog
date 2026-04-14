@@ -545,16 +545,22 @@ class DeadManSwitch:
         try:
             # Load and verify metadata
             metadata = json.loads(LOCK_METADATA.read_text())
+            for required_key in ("expires_at", "encrypted_size", "data_hash"):
+                if required_key not in metadata:
+                    print(f"[!] Lock metadata missing required field: {required_key}")
+                    print("[!] Bundle preserved — metadata may be corrupt. Check manually.")
+                    return False
+
             expires_at = datetime.fromisoformat(metadata["expires_at"].replace('Z', '+00:00'))
-            
+
             if datetime.now(timezone.utc) > expires_at:
                 print("[!] Unlock token expired - initiating self-destruct")
                 self._secure_cleanup()
                 return False
-            
+
             # Attempt decryption
             encrypted_data = LOCKED_BUNDLE.read_bytes()
-            
+
             if len(encrypted_data) != metadata["encrypted_size"]:
                 print("[!] Data integrity check failed - possible tampering")
                 self._secure_cleanup()
