@@ -34,7 +34,11 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from collections import defaultdict, deque
 import base64
 import pickle
-import numpy as np
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -334,9 +338,9 @@ class HardwareOPSEC:
                 
                 for iface in interfaces:
                     if iface not in ['lo', 'docker0']:
-                        # Generate random MAC
-                        mac = ":".join([f"{random.randint(0, 255):02x}" for _ in range(6)])
-                        mac = f"{mac[0:1]}2{mac[2:]}"  # Set local bit
+                        octets = [secrets.randbelow(256) for _ in range(6)]
+                        octets[0] = (octets[0] | 0x02) & 0xFE  # locally administered, unicast
+                        mac = ":".join(f"{b:02x}" for b in octets)
                         
                         # Apply MAC
                         subprocess.run(['ip', 'link', 'set', iface, 'down'])
@@ -1547,10 +1551,14 @@ class SecureDataProcessor:
         """Split encryption key using Shamir's Secret Sharing"""
         try:
             from Crypto.Protocol.SecretSharing import Shamir
-            
+        except ImportError:
+            logger.warning("PyCryptodome Shamir not available — skipping secret sharing")
+            return
+
+        try:
             shares = Shamir.split(
-                CONFIG['DATA_HANDLING']['SHAMIR_SHARES'],
                 CONFIG['DATA_HANDLING']['SHAMIR_THRESHOLD'],
+                CONFIG['DATA_HANDLING']['SHAMIR_SHARES'],
                 self.encryption_key
             )
             

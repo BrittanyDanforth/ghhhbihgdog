@@ -213,6 +213,41 @@ without touching real money.
 
 ---
 
+## Step 8: Stopping Services (When Done)
+
+### Stop wallet RPC:
+
+```bash
+# If running in foreground: Ctrl+C
+# If running with --detach:
+kill $(pgrep monero-wallet-rpc)
+```
+
+### Stop monerod:
+
+```bash
+monerod exit
+# Or if detached:
+kill $(pgrep monerod)
+```
+
+### Stop Tor (optional — you probably want to keep it running):
+
+```bash
+sudo systemctl stop tor
+```
+
+### Clean up GhostSpiral artifacts:
+
+```bash
+# Option 9 (Paranoia Cleanup) in the menu does this automatically.
+# Or manually:
+python3 run paranoia --dry-run   # see what would be deleted
+python3 run paranoia             # actually delete
+```
+
+---
+
 ## Common Workflows
 
 ### Receive XMR (someone sends you BTC):
