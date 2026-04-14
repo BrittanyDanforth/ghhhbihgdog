@@ -1,205 +1,162 @@
-# GhostSpiral v10.7 — Complete Setup & Operations Guide
+# GhostSpiral — Setup
 
-## Project Structure
-
-```
-ghostspiral/
-├── run                          # Unified launcher (python3 run <tool> [args])
-├── requirements.txt             # All Python dependencies
-├── SETUP.md                     # This file
-├── AUDIT.md                     # Full audit trail (BUG 1-79)
-├── DEEP_AUDIT.md                # Deep audit (BUG 80-114)
-│
-├── core/                        # Core pipeline — handles real money
-│   ├── gs_common.py             #   Shared OPSEC library (Tor, crypto, RPC)
-│   ├── GhostSpiral              #   Main orchestrator (BTC→XMR mixing)
-│   ├── airgap_tx_signer         #   Cold-signing (create unsigned / sign offline)
-│   ├── broadcast_signed_xmr     #   Tor-only Monero TX broadcaster
-│   ├── create_receive_wallet    #   Generate receive subaddress
-│   ├── thor_swap_preparer       #   ThorChain BTC→XMR deposit generator
-│   └── exit_strategy_simulator  #   XMR off-ramp planner
-│
-├── modules/                     # Mixing & chaos modules
-│   ├── PAG                      #   Polymorphic DAG generator
-│   ├── labelmask                #   Label map generator
-│   ├── label_poisoner           #   Forensic label injection
-│   ├── fake_leaf_inserter       #   Decoy leaf nodes
-│   ├── noise                    #   Decoy network traffic
-│   ├── ghostmutator             #   Source code mutation
-│   ├── wdna                     #   Wallet DNA mutation
-│   ├── en_seeder                #   Entropy seed generator
-│   ├── ghost_unifier            #   Module pipeline orchestrator
-│   ├── swap_retry_guard         #   Swap retry with circuit rotation
-│   ├── tor_endpoint_juggler     #   Onion RPC validator + rotation
-│   └── vm_runtime               #   VM timing metrics
-│
-├── opsec/                       # OPSEC & anti-forensics
-│   ├── paranoia_mode            #   Post-op host sanitization
-│   ├── error_log_poisoner       #   Decoy log injection
-│   ├── mirrormask               #   Forensic log mutation
-│   ├── dmswitch                 #   Deadman switch (QR-locked)
-│   ├── SML                      #   Secure memory-locked seeds
-│   ├── integrity_faker          #   Integrity chain decoys
-│   └── idk                      #   Entropy verifier + YubiKey
-│
-└── intel/                       # Intelligence collection
-    ├── collectgrab              #   OSINT collector (Tor-routed)
-    └── testergatherSystem       #   Advanced intel framework
-```
-
----
-
-## Running Tools
-
-### Option 1: Unified Launcher (recommended)
+## Quick Install (one command)
 
 ```bash
-# List all tools:
-python3 run list
-
-# Run any tool by short name:
-python3 run ghostspiral --receive-wallet wallet.json --tor-proxy socks5h://127.0.0.1:9050
-python3 run signer unsigned.json --phase sign --wallet-file wallet
-python3 run broadcast tx_staging/signed/ --tor-proxy socks5h://127.0.0.1:9050
-python3 run paranoia --dry-run
-python3 run swap --amounts 0.05 --dests <XMR_ADDR> --tor-proxy socks5h://127.0.0.1:9050
+git clone <repo> ghostspiral && cd ghostspiral && bash install.sh
 ```
 
-### Option 2: Direct invocation
+That installs everything: system packages, Python deps, Tor config, and verifies it all works.
+
+## Manual Install (if you prefer)
 
 ```bash
-python3 core/GhostSpiral --help
-python3 core/airgap_tx_signer plan.json --phase create --help
-python3 opsec/paranoia_mode --dry-run
-python3 modules/ghost_unifier --tor socks5h://127.0.0.1:9050
-```
+# 1. System packages
+sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl
 
----
+# 2. Python deps
+pip install -r requirements.txt
 
-## System Requirements
+# 3. Enable Tor control port (needed for circuit rotation)
+echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
+sudo systemctl restart tor
 
-- **OS:** Kali Linux (or any Debian-based Linux)
-- **Python:** 3.10+
-- **Tor:** Running with ControlPort 9051 enabled
-- **Monero:** `monerod`, `monero-wallet-rpc`, `monero-wallet-cli`
-
----
-
-## 1. Install System Packages
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y tor torsocks jq gnupg python3-pip
-
-# Monero CLI tools — download from https://www.getmonero.org/downloads/
+# 4. Download Monero CLI tools
+#    Go to https://www.getmonero.org/downloads/
+#    Then:
 tar xf monero-linux-x64-*.tar.bz2
 sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
 
-# Verify
-monerod --version && monero-wallet-cli --version && monero-wallet-rpc --version
-```
-
-## 2. Install Python Dependencies
-
-```bash
-pip install -r requirements.txt
-python3 -c "import requests, stem, monero, psutil; print('Core deps OK')"
-```
-
-## 3. Configure Tor
-
-```bash
-# Enable ControlPort for NEWNYM circuit rotation
-sudo tee -a /etc/tor/torrc << 'EOF'
-ControlPort 9051
-CookieAuthentication 1
-EOF
-sudo systemctl restart tor
-
-# Verify Tor
+# 5. Verify everything works
+python3 -c "import requests, stem, monero, psutil; print('OK')"
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
-
-# If using password auth instead of cookie:
-export TOR_CONTROL_PASSWORD="your_password"
+monerod --version
 ```
 
-## 4. Configure Monero
+## Start Monero (before running GhostSpiral)
 
 ```bash
-# Start daemon (local node):
-monerod --detach --data-dir ~/.bitmonero
+# Start the daemon (syncs blockchain — first run takes hours)
+monerod --detach
 
-# Start wallet-rpc (hot wallet for auto-mode):
+# Start wallet RPC (needed by all core tools)
 monero-wallet-rpc --rpc-bind-port 18083 \
-  --wallet-file /path/to/wallet \
-  --password "password" \
+  --wallet-file /path/to/your/wallet \
+  --password "yourpassword" \
   --daemon-address 127.0.0.1:18081 \
   --disable-rpc-login
+```
 
-# Verify:
-curl -s http://127.0.0.1:18083/json_rpc \
-  -d '{"jsonrpc":"2.0","id":"0","method":"get_height"}' \
-  -H 'Content-Type: application/json'
+## Environment Variables (set before running)
+
+```bash
+export GS_WALLET_PASSWORD="your_wallet_password"   # avoids leaking via /proc
+export SWAPKIT_API_KEY="your_key"                   # for ThorChain swaps
+export TOR_CONTROL_PASSWORD="tor_pass"              # only if Tor uses password auth
 ```
 
 ---
 
-## Environment Variables
+## Project Layout
 
-| Variable | When Needed | Description |
-|----------|-------------|-------------|
-| `TOR_CONTROL_PASSWORD` | HashedControlPassword in torrc | Tor control port password |
-| `GS_WALLET_PASSWORD` | Auto-mode signing | Wallet password (avoids /proc leak) |
-| `SWAPKIT_API_KEY` | ThorChain swaps | SwapKit API key (swapkit.dev) |
+```
+ghostspiral/
+├── run                    ← launcher: python3 run <tool> [args]
+├── install.sh             ← one-command installer
+├── requirements.txt       ← pip dependencies
+│
+├── core/                  ← main pipeline (handles real money)
+│   ├── gs_common.py           shared library (Tor, crypto, RPC)
+│   ├── GhostSpiral            main mixer orchestrator
+│   ├── airgap_tx_signer       cold-signing (online create / offline sign)
+│   ├── broadcast_signed_xmr   broadcast signed TXs through Tor
+│   ├── create_receive_wallet  generate XMR receive address
+│   ├── thor_swap_preparer     ThorChain BTC→XMR deposit setup
+│   └── exit_strategy_simulator  plan XMR off-ramp
+│
+├── modules/               ← mixing & chaos tools
+│   ├── PAG, labelmask, label_poisoner, fake_leaf_inserter
+│   ├── noise, ghostmutator, wdna, en_seeder
+│   ├── ghost_unifier, swap_retry_guard
+│   └── tor_endpoint_juggler, vm_runtime
+│
+├── opsec/                 ← cleanup & anti-forensics
+│   ├── paranoia_mode          wipe everything after operation
+│   ├── error_log_poisoner, mirrormask, dmswitch
+│   └── SML, integrity_faker, idk
+│
+└── intel/                 ← collection tools
+    ├── collectgrab            OSINT (runs through Tor)
+    └── testergatherSystem     advanced intel framework
+```
 
 ---
 
-## Workflows
-
-### 1. Receive XMR (sender gives you BTC)
+## How to Run Tools
 
 ```bash
-# Create receive address
+# See all available tools
+python3 run list
+
+# Run any tool by its short name
+python3 run ghostspiral --help
+python3 run wallet --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050
+python3 run paranoia --dry-run
+python3 run signer plan.json --phase sign --wallet-file wallet
+
+# Or call directly
+python3 core/GhostSpiral --help
+python3 opsec/paranoia_mode --dry-run
+```
+
+---
+
+## Common Workflows
+
+### Receive XMR (someone sends you BTC, you get mixed XMR)
+
+```bash
+# 1. Create a receive address
 python3 run wallet --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050
 
-# Generate ThorChain deposit for sender
+# 2. Generate deposit address for the BTC sender
 python3 run swap --amounts 0.05 \
   --dests $(jq -r .address wallet_*.json) \
   --tor-proxy socks5h://127.0.0.1:9050
 
-# After XMR arrives, run mixing:
+# 3. Give the deposit address + memo to the sender
+# 4. Wait for XMR to arrive
+
+# 5. Mix it
 python3 run ghostspiral --receive-wallet wallet_*.json \
   --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083
 
-# Clean up
+# 6. Clean up
 python3 run paranoia --iface wlan0
 ```
 
-### 2. Send BTC, get mixed XMR (auto-mode)
+### Cold-signing (air-gap)
 
 ```bash
-python3 run ghostspiral --btc-entry bc1q... --btc-amount 0.1 --split 3 \
-  --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083
-```
-
-### 3. Cold-signing (air-gap workflow)
-
-```bash
-# ONLINE machine (view-only wallet):
+# Online machine:
 python3 run ghostspiral --receive-wallet wallet.json \
   --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083 --cold
 
-# Copy unsigned/ to USB → OFFLINE machine:
-python3 run signer unsigned/unsigned_*.json --phase sign \
-  --wallet-file /path/to/full_wallet --outdir tx_staging
+# Copy unsigned/ folder to USB → offline machine
 
-# Copy tx_staging/signed/ back → ONLINE machine:
+# Offline machine:
+python3 run signer unsigned/unsigned_*.json --phase sign \
+  --wallet-file /mnt/usb/wallet --outdir tx_staging
+
+# Copy tx_staging/signed/ back to USB → online machine
+
+# Online machine:
 python3 run broadcast tx_staging/signed/ \
   --tor-proxy socks5h://127.0.0.1:9050 \
   --rpc http://127.0.0.1:18081 --wallet-rpc http://127.0.0.1:18083
 ```
 
-### 4. Resume after crash
+### Resume after crash
 
 ```bash
 python3 run ghostspiral --receive-wallet wallet.json \
@@ -207,35 +164,17 @@ python3 run ghostspiral --receive-wallet wallet.json \
   --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083
 ```
 
-### 5. Chaos modules pipeline
-
-```bash
-python3 run seed                                          # Generate entropy
-python3 run unify --tor socks5h://127.0.0.1:9050          # Run full chaos pipeline
-# Or individual modules:
-python3 run dag && python3 run labels && python3 run noise --tor-proxy socks5h://127.0.0.1:9050
-```
-
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `socks5:// leaks DNS` | Change to `socks5h://` |
+| Error | Fix |
+|-------|-----|
+| `ModuleNotFoundError` | `pip install -r requirements.txt` or `bash install.sh` |
 | `Tor leak detected` | `sudo systemctl start tor` |
-| `NEWNYM failed` | Add `ControlPort 9051` to `/etc/tor/torrc` |
-| `No wallet file` | Start `monero-wallet-rpc` with `--wallet-file` |
-| `unsigned file not created` | Check wallet balance |
-| `Method not found` | Use `--wallet-rpc` for submit_transfer |
-| `No swap routes` | Set `SWAPKIT_API_KEY` env var |
-| `Plan fingerprint mismatch` | Delete `stage5_progress.json` |
-| `ModuleNotFoundError` | `pip install -r requirements.txt` |
-
-## Security Notes
-
-- All traffic routes through Tor (`socks5h://`). Plain `socks5://` is rejected.
-- Wallet passwords pass via `GS_WALLET_PASSWORD` env var, never CLI args.
-- `paranoia_mode` wipes ALL artifacts — run it last.
-- All output files are 0600 (owner-only permissions).
-- Terminal output shows scrubbed addresses (first/last 6 chars only).
+| `NEWNYM failed` | `echo "ControlPort 9051" \| sudo tee -a /etc/tor/torrc && sudo systemctl restart tor` |
+| `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
+| `No wallet file` | Start monero-wallet-rpc with `--wallet-file` |
+| `Method not found` | You're hitting monerod (18081) not wallet-rpc (18083) |
+| `No swap routes` | `export SWAPKIT_API_KEY="your_key"` |
+| `Plan fingerprint mismatch` | `rm stage5_progress.json` and retry |
