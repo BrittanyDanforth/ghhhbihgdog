@@ -1502,8 +1502,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 tx_hashes = result.get("tx_hash_list", [])
             if not tx_hashes:
                 integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
-            print(f"  [!] TX {tx_idx} submitted but no txid returned.")
-            print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+                print(f"  [!] TX {tx_idx} submitted but no txid returned.")
+                print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
                 fail_count += 1
                 break
             txid = tx_hashes[0]
