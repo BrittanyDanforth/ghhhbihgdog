@@ -206,10 +206,6 @@ def flow_full_pipeline():
     wallets = prompt("Number of mix wallets", "10")
     depth = prompt("Mix depth", "2")
 
-    api_key = os.environ.get("SWAPKIT_API_KEY", "")
-    if not api_key:
-        api_key = prompt("SwapKit API key (or press Enter to skip)", "")
-
     print()
     info("Starting GhostSpiral full pipeline...")
     info("This will: fetch quotes → build mixing DAG → sign → broadcast → clean up")
@@ -224,8 +220,6 @@ def flow_full_pipeline():
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
     ]
-    if api_key:
-        args += ["--swapkit-api-key", api_key]
 
     run_script(CORE / "GhostSpiral", args, "GhostSpiral")
 
@@ -368,13 +362,7 @@ def flow_swap_preparer():
             err(f"Failed to read address from {dest}: {e}")
             return
 
-    api_key = os.environ.get("SWAPKIT_API_KEY", "")
-    if not api_key:
-        api_key = prompt("SwapKit API key", "")
-
     args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor]
-    if api_key:
-        args += ["--api-key", api_key]
     run_script(CORE / "thor_swap_preparer", args, "Swap preparer")
 
 

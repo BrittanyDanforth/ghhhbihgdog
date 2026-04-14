@@ -171,15 +171,11 @@ Should return something with `"height":` and a number.
 
 ```bash
 export GS_WALLET_PASSWORD="YOUR_WALLET_PASSWORD"
-export SWAPKIT_API_KEY="your_swapkit_key"
 ```
 
 - `GS_WALLET_PASSWORD`: same password you used in step 5c. Setting it here
   prevents it from showing up in `ps aux` output where anyone on the machine
   could see it.
-- `SWAPKIT_API_KEY`: get one from https://swapkit.dev (optional — GhostSpiral
-  now uses THORNode native API as primary, with SwapKit as fallback).
-  Only needed if THORNode endpoints are unreachable.
 
 ---
 
@@ -248,7 +244,7 @@ without touching real money.
 | `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
 | `No wallet file` | Start wallet RPC (Step 5c) |
 | `Method not found` | You're connecting to port 18081 instead of 18083 |
-| `No swap routes` | THORNode and SwapKit both failed. Check Tor, try again later |
+| `No swap routes` | All THORNode endpoints failed. Check Tor connectivity, try again later |
 | `Invalid BTC address` | Must start with `bc1`, `1`, or `3` |
 | System Check shows `[!]` for Monero | Run Step 4 |
 | System Check shows `[!]` for wallet-rpc | Run Step 5c |

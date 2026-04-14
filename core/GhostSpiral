@@ -36,7 +36,7 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, safe_get, connect_rpc, require_resources, lock_memory,
+    safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
@@ -48,10 +48,10 @@ BTC_RE = re.compile(
     r"|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
     re.I
 )
-SWAPKIT_API = "https://api.swapkit.dev"
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
     "https://thornode.thorswap.net",
+    "https://rpc.ninerealms.com",
 ]
 
 def _core_script(name: str) -> str:
@@ -138,8 +138,6 @@ def main():
                           "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
                           "Use after a crash to continue from where the last run stopped. "
                           "The plan's fingerprint must match any existing stage5_progress.json.")
-    cli.add_argument("--swapkit-api-key",
-                     help="SwapKit API key for ThorChain quotes (or set SWAPKIT_API_KEY env var)")
     args = cli.parse_args()
 
     # ---- Resume-plan shortcut: skip Stages 0-4, jump to Stage 5 ----
@@ -220,6 +218,8 @@ def main():
             sys.exit(
                 f"[!] Invalid BTC address: {args.btc_entry}\n"
                 f"    Expected formats:\n"
+                f"      Legacy P2PKH:     1... (25-34 chars)\n"
+                f"      P2SH:             3... (25-34 chars)\n"
                 f"      Bech32 (segwit):  bc1q... (42 chars) or bc1p... (62 chars)\n"
                 f"      Testnet bech32:   tb1q... or tb1p...\n"
                 f"    Your input does not match any valid Bitcoin address format.\n"
@@ -348,70 +348,8 @@ def main():
                 continue
         return None
 
-    def _swapkit_quote(amt: Decimal, xmr_dest: str) -> dict | None:
-        """SwapKit two-step flow: POST /v3/quote then POST /v3/swap."""
-        _api_key = (
-            getattr(args, "swapkit_api_key", "") or
-            os.environ.get("SWAPKIT_API_KEY", "")
-        )
-        _headers = {"x-api-key": _api_key} if _api_key else {}
-
-        quote_payload = {
-            "sellAsset": "BTC.BTC",
-            "buyAsset": "XMR.XMR",
-            "sellAmount": str(amt),
-            "destinationAddress": xmr_dest,
-        }
-
-        quote_resp = safe_post(
-            f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
-            headers=_headers,
-        )
-
-        routes = quote_resp.get("routes", [])
-        if not routes:
-            return None
-
-        route = routes[0]
-        route_id = route.get("routeId", "")
-        expected_output = route.get("expectedOutput", "0")
-
-        if not route_id:
-            return None
-
-        swap_payload = {
-            "routeId": route_id,
-            "destinationAddress": xmr_dest,
-        }
-        swap_resp = safe_post(
-            f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
-            headers=_headers,
-        )
-
-        deposit_addr = (
-            swap_resp.get("depositAddress", "") or
-            swap_resp.get("tx", {}).get("depositAddress", "")
-        )
-        memo = (
-            swap_resp.get("memo", "") or
-            swap_resp.get("tx", {}).get("memo", "")
-        )
-
-        if not deposit_addr:
-            return None
-
-        return {
-            "deposit_address": deposit_addr,
-            "memo": str(memo),
-            "expected_xmr": str(Decimal(str(expected_output))),
-            "quote_id": quote_resp.get("quoteId", ""),
-        }
-
     def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
-        """Get ThorChain swap quotes for each BTC chunk.
-
-        Tries THORNode native API first (no API key, more reliable),
-        then falls back to SwapKit two-step flow (quote + swap).
+        """Get ThorChain swap quotes for each BTC chunk via THORNode native API.
 
         Returns list of deposit instructions for the operator.
         The operator must MANUALLY send BTC to each deposit address.
@@ -429,31 +367,15 @@ def main():
                 newnym()
                 secure_delay(3.0, 10.0)
 
-            result = None
-            source = None
-
-            try:
-                result = _thornode_quote(amt, xmr_dest)
-                if result:
-                    source = "thornode"
-            except Exception:
-                pass
+            result = _thornode_quote(amt, xmr_dest)
 
             if not result:
-                try:
-                    result = _swapkit_quote(amt, xmr_dest)
-                    if result:
-                        source = "swapkit"
-                except Exception as e:
-                    newnym()
-                    integrity_log("stage2", f"all_apis_failed:{i}")
-                    sys.exit(
-                        f"[!] All swap APIs failed for chunk {i}: {str(e)[:60]}"
-                    )
-
-            if not result:
-                integrity_log("stage2", f"no_quote_chunk_{i}")
-                sys.exit(f"[!] No swap quote available for chunk {i}")
+                integrity_log("stage2", f"thornode_failed_all_endpoints:{i}")
+                sys.exit(
+                    f"[!] All THORNode endpoints failed for chunk {i}.\n"
+                    f"    Tried: {', '.join(THORNODE_APIS)}\n"
+                    f"    Check Tor connectivity and try again later."
+                )
 
             deposit_addr = result["deposit_address"]
             memo = result.get("memo", "")
@@ -465,17 +387,16 @@ def main():
                 "deposit_address": deposit_addr,
                 "memo": str(memo),
                 "expected_xmr": str(expected_dec),
-                "quote_id": result.get("quote_id", ""),
-                "source": source,
+                "source": "thornode",
             }
             deposits.append(deposit_info)
 
-            print(f"  [*] Chunk {i}/{len(chunks)-1} (via {source}):")
+            print(f"  [*] Chunk {i}/{len(chunks)-1} (via thornode):")
             print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
             if memo:
                 print(f"      With memo: {str(memo)[:40]}...")
             print(f"      Expected: ~{expected_dec} XMR")
-            integrity_log("stage2", f"quote_ready:{i}:{source}")
+            integrity_log("stage2", f"quote_ready:{i}:thornode")
 
             secure_delay(5.0, 15.0)
 
