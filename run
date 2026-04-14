@@ -227,8 +227,37 @@ def get_rpc() -> str:
     return prompt("Wallet RPC endpoint", "http://127.0.0.1:18083")
 
 
+def _opsec_preflight():
+    """Display OPSEC pre-flight checklist before sensitive operations."""
+    print(f"  {Y}{'=' * 60}{N}")
+    print(f"  {R}OPSEC PRE-FLIGHT CHECKLIST{N}")
+    print(f"  {Y}{'=' * 60}{N}")
+    print(f"  {B}[ ]{N} Tor is running and verified")
+    print(f"  {B}[ ]{N} BTC wallet uses Tor for transactions")
+    print(f"  {B}[ ]{N} BTC was NOT purchased on a KYC exchange")
+    print(f"      (or was moved through intermediate wallets first)")
+    print(f"  {B}[ ]{N} You are not on a monitored network")
+    print(f"      (employer/school/public WiFi)")
+    print(f"  {B}[ ]{N} Screen recording/sharing is disabled")
+    print(f"  {Y}{'=' * 60}{N}")
+    print()
+    print(f"  {R}CRITICAL:{N} Do NOT send BTC to ThorChain deposit addresses")
+    print(f"  from a KYC exchange (Coinbase, Kraken, etc.).")
+    print(f"  KYC exchanges record your identity with every transaction.")
+    print(f"  Use an intermediate non-KYC wallet (e.g., Sparrow, Electrum")
+    print(f"  with Tor) to break the direct link between your identity")
+    print(f"  and the ThorChain deposit.")
+    print()
+    if not confirm("I have reviewed the checklist and understand the risks"):
+        warn("Aborted by operator.")
+        return False
+    return True
+
+
 def flow_full_pipeline(detected_port=None):
     heading("Full Pipeline: BTC → Mixed XMR")
+    if not _opsec_preflight():
+        return
     tor = get_tor_proxy(detected_port)
     if not tor:
         return
@@ -451,6 +480,8 @@ def flow_create_wallet(detected_port=None):
 
 def flow_swap_preparer(detected_port=None):
     heading("ThorChain Swap Preparer")
+    if not _opsec_preflight():
+        return
     tor = get_tor_proxy(detected_port)
     if not tor:
         return

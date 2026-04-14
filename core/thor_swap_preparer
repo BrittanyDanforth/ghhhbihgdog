@@ -287,6 +287,14 @@ def main():
     print(f"\n  [+] {len(pairs)} pair(s) written to {_out} (fsync'd, 0600 permissions)")
 
     print()
+    print(f"  {'=' * 68}")
+    print("  CRITICAL OPSEC WARNING:")
+    print("  Do NOT send BTC to these deposit addresses from a KYC exchange.")
+    print("  KYC exchanges record your identity with every transaction.")
+    print("  Use an intermediate non-KYC wallet (e.g., Sparrow, Electrum with Tor)")
+    print("  to break the direct link between your identity and the ThorChain deposit.")
+    print(f"  {'=' * 68}")
+    print()
     print("  SENDER INSTRUCTIONS:")
     for i, pair in enumerate(pairs):
         print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
@@ -309,6 +317,12 @@ def main():
     print()
     print("  [!] Sender must include memo in the BTC transaction's OP_RETURN field.")
     print("  [!] Quotes expire. Send BTC before the expiry shown above.")
+    print()
+    print(f"  {'─' * 68}")
+    print("  IMPORTANT: When sending BTC, use a Bitcoin wallet configured with Tor.")
+    print("  If your BTC wallet connects directly to the internet, your IP address")
+    print("  will be logged by Bitcoin nodes and can be linked to this deposit.")
+    print(f"  {'─' * 68}")
 
     if args.gpg_recipient:
         try:

@@ -166,6 +166,18 @@ def main():
                      help="Minimum inter-TX delay in seconds (default: 180)")
     cli.add_argument("--delay-max", type=int, default=720,
                      help="Maximum inter-TX delay in seconds (default: 720)")
+    cli.add_argument("--pre-mix-delay", type=int, default=0,
+                     help="Seconds to wait after XMR arrives before mixing begins "
+                          "(default: 0). Set to hours (3600+) or days (86400+) to "
+                          "break timing correlation between the ThorChain swap and "
+                          "mixing activity. A forensics firm monitoring ThorChain can "
+                          "trivially correlate a BTC→XMR swap with mixing that starts "
+                          "minutes later.")
+    cli.add_argument("--mix-fraction", type=Decimal, default=Decimal("0.9"),
+                     help="Fraction of balance to mix in this session (default: 0.9). "
+                          "Mixing the full swap output in one session creates amount "
+                          "correlation with the public ThorChain swap record. Mix a "
+                          "partial amount now and the rest in a separate session days later.")
     cli.add_argument("--resume-plan",
                      help="Resume Stage 5 on an existing unsigned plan JSON file. "
                           "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
@@ -331,6 +343,27 @@ def main():
         sys.exit("[!] --delay-min and --delay-max must be non-negative")
     if args.delay_min >= args.delay_max:
         sys.exit(f"[!] --delay-min ({args.delay_min}) must be less than --delay-max ({args.delay_max})")
+
+    if args.pre_mix_delay < 0:
+        sys.exit("[!] --pre-mix-delay must be non-negative")
+    if args.pre_mix_delay == 0:
+        print(f"  [!] WARNING: --pre-mix-delay is 0 (mixing starts immediately after XMR arrives).")
+        print(f"  [!] TIMING CORRELATION RISK: A forensics firm monitoring ThorChain sees your")
+        print(f"  [!] BTC→XMR swap complete, then observes mixing activity from the receiving")
+        print(f"  [!] address within minutes. This is the #1 deanonymization vector.")
+        print(f"  [!] Recommended: --pre-mix-delay 3600 (1 hour) or more. Days are better.")
+        integrity_log("stage0", "pre_mix_delay_zero_warning")
+
+    if args.mix_fraction <= Decimal("0") or args.mix_fraction > Decimal("1"):
+        sys.exit(f"[!] --mix-fraction must be between 0 (exclusive) and 1 (inclusive), got {args.mix_fraction}")
+    if args.mix_fraction > Decimal("0.95"):
+        print(f"  [!] WARNING: --mix-fraction {args.mix_fraction} mixes nearly the entire balance in one session.")
+        print(f"  [!] AMOUNT CORRELATION RISK: The total mixed amount will closely match the")
+        print(f"  [!] ThorChain swap output (which is publicly visible). This makes it trivial")
+        print(f"  [!] to link the BTC deposit to the XMR mixing activity by total amount.")
+        print(f"  [!] Recommended: --mix-fraction 0.7-0.85, then mix the rest in a separate")
+        print(f"  [!] session days later with different timing and wallet parameters.")
+        integrity_log("stage0", f"high_mix_fraction_warning:{args.mix_fraction}")
 
     if args.btc_amount is not None and args.btc_amount <= 0:
         sys.exit(f"[!] --btc-amount must be positive, got {args.btc_amount}")
@@ -685,6 +718,16 @@ def main():
         print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
         print(f"  [+] Entry address: {scrub_address(ENTRY)}")
     else:
+        print()
+        print(f"  {'=' * 68}")
+        print(f"  CRITICAL OPSEC WARNING:")
+        print(f"  Do NOT send BTC to these deposit addresses from a KYC exchange.")
+        print(f"  KYC exchanges record your identity with every transaction.")
+        print(f"  Use an intermediate non-KYC wallet (e.g., Sparrow, Electrum with Tor)")
+        print(f"  to break the direct link between your identity and the ThorChain deposit.")
+        print(f"  {'=' * 68}")
+        print()
+        integrity_log("stage2", "kyc_opsec_warning_shown")
         btc_chunks = []
 
         if jm_utxos:
@@ -724,6 +767,33 @@ def main():
             swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
             integrity_log("stage2", "swap_quotes_generated")
             total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+
+            print()
+            print("  " + "=" * 72)
+            print("  THORCHAIN PUBLIC VISIBILITY WARNING")
+            print("  " + "=" * 72)
+            print("  The following information is PERMANENTLY recorded on PUBLIC blockchains")
+            print("  (Bitcoin AND ThorChain) and CANNOT be erased:")
+            print()
+            for dep in swap_deposits:
+                print(f"    Chunk {dep['chunk']}: {dep['btc_amount']} BTC → ~{dep['expected_xmr']} XMR")
+            print()
+            print(f"    Total: {args.btc_amount} BTC → ~{total_expected} XMR")
+            print()
+            print("  Any blockchain analyst can see these exact amounts and timestamps.")
+            print("  This is the primary attack surface for deanonymization.")
+            print()
+            print("  TO REDUCE CORRELATION RISK:")
+            print("  1. Wait a RANDOM period (hours or days) before sending BTC to the")
+            print("     deposit address. Do NOT send immediately after generating this quote.")
+            print("  2. Do NOT send BTC from a KYC exchange directly to the deposit address.")
+            print("     Use an intermediate non-KYC wallet (e.g. Sparrow, Electrum over Tor).")
+            print("  3. If using --split, space out deposits over HOURS or DAYS, not minutes.")
+            print(f"     Sending {len(swap_deposits)} deposits in rapid succession creates a")
+            print("     distinctive pattern on ThorChain visible to any observer.")
+            print("  " + "=" * 72)
+            integrity_log("stage2", "thorchain_visibility_warning_shown")
+
             print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
             print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
             print()
@@ -732,11 +802,8 @@ def main():
             for dep in swap_deposits:
                 print(f"\n  --- Chunk {dep['chunk']} ---")
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
-                # Show full deposit address — the operator needs it to send BTC.
-                # These are THORChain vault addresses, not the operator's own.
                 print(f"  To address:   {dep['deposit_address']}")
                 if dep.get("memo"):
-                    # Truncate memo in terminal to reduce log exposure
                     print(f"  With memo:    {dep['memo'][:40]}…")
                 print(f"  Expected XMR: ~{dep['expected_xmr']}")
                 dep_expiry = dep.get("expiry", 0)
@@ -753,6 +820,20 @@ def main():
             print("  [!] Manually send BTC to each deposit address above.")
             print("  [!] Include the memo in the OP_RETURN field.")
             print("  [!] Quotes expire. Send before the expiry time shown.")
+            if len(swap_deposits) > 1:
+                print()
+                print("  [!] SPLIT DEPOSIT TIMING GUIDANCE:")
+                print(f"  [!] You have {len(swap_deposits)} chunks. Do NOT send them all at once.")
+                print("  [!] Space deposits hours or days apart. Sending multiple BTC transactions")
+                print("  [!] to ThorChain vaults in a short window is a distinctive on-chain")
+                print("  [!] fingerprint that links all chunks to a single operator.")
+                integrity_log("stage2", "split_timing_guidance_shown")
+            print()
+            print(f"  {'─' * 68}")
+            print("  IMPORTANT: When sending BTC, use a Bitcoin wallet configured with Tor.")
+            print("  If your BTC wallet connects directly to the internet, your IP address")
+            print("  will be logged by Bitcoin nodes and can be linked to this deposit.")
+            print(f"  {'─' * 68}")
         else:
             integrity_log("stage2", "manual_mode")
             print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
@@ -837,6 +918,32 @@ def main():
                 f"    Total balance: {total_bal} XMR (may be locked/unconfirmed).\n"
                 f"    Use --cold or --airgap for dry-run planning."
             )
+
+    mix_bal = (bal * args.mix_fraction).quantize(Decimal("0.0001"))
+    unmixed = bal - mix_bal
+    if unmixed > DUST_XMR:
+        print(f"  [*] --mix-fraction {args.mix_fraction}: mixing {mix_bal} XMR of {bal} XMR available.")
+        print(f"  [*] {unmixed} XMR will remain unmixed in this session.")
+        print(f"  [*] Mix the remainder in a SEPARATE session days later to break amount correlation.")
+        integrity_log("stage4", f"mix_fraction:{args.mix_fraction}:mixing={mix_bal}:unmixed={unmixed}")
+    bal = mix_bal
+
+    if args.pre_mix_delay > 0:
+        hours = args.pre_mix_delay / 3600
+        print(f"\n  [*] PRE-MIX DELAY: Waiting {args.pre_mix_delay}s ({hours:.1f} hours) before mixing.")
+        print(f"  [*] This breaks the timing correlation between the ThorChain swap and mixing.")
+        print(f"  [*] Press Ctrl+C to abort (progress is saved; rerun to resume).")
+        integrity_log("stage4", f"pre_mix_delay_start:{args.pre_mix_delay}s")
+        waited = 0
+        while waited < args.pre_mix_delay:
+            if shutdown_requested():
+                integrity_log("stage4", f"pre_mix_delay_interrupted:{waited}s_of_{args.pre_mix_delay}s")
+                sys.exit(f"[!] Shutdown during pre-mix delay ({waited}s of {args.pre_mix_delay}s elapsed).")
+            chunk = min(60, args.pre_mix_delay - waited)
+            time.sleep(chunk)
+            waited += chunk
+        integrity_log("stage4", "pre_mix_delay_complete")
+        print(f"  [+] Pre-mix delay complete. Proceeding with mixing.")
 
     rounds = args.wallets * 2 * args.deep
     priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))

@@ -244,11 +244,29 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
 def verify_tor(proxy: Dict[str, str]) -> None:
-    """Verify we are exiting through Tor. Aborts on failure."""
+    """Verify we are exiting through Tor. Aborts on failure.
+
+    Validates both the IsTor flag AND the response structure to detect
+    compromised/cached/spoofed responses from check.torproject.org.
+    """
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
                      headers=_BROWSER_HEADERS)
     r.raise_for_status()
     data = r.json()
+    if not isinstance(data, dict):
+        integrity_log("tor", "VERIFY_INVALID_RESPONSE_TYPE")
+        sys.exit("[!] Tor check returned non-dict response — endpoint may be compromised. Aborting.")
+    if "IsTor" not in data or "IP" not in data:
+        integrity_log("tor", "VERIFY_MISSING_FIELDS")
+        sys.exit(
+            "[!] Tor check response missing expected fields (IsTor, IP).\n"
+            "    The check.torproject.org endpoint may be compromised or returning\n"
+            "    a cached/spoofed response. Aborting for safety."
+        )
+    ip_val = data.get("IP", "")
+    if not isinstance(ip_val, str) or len(ip_val) < 7:
+        integrity_log("tor", "VERIFY_INVALID_IP")
+        sys.exit("[!] Tor check returned invalid IP field — response may be spoofed. Aborting.")
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
         sys.exit("[!] Tor leak detected - traffic NOT exiting via Tor. Aborting.")

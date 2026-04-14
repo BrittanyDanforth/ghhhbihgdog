@@ -186,6 +186,13 @@ def main():
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
+    print()
+    print(f"  {'=' * 68}")
+    print("  OPSEC: Do NOT send mixed XMR to a KYC exchange under your real identity.")
+    print("  Use P2P methods (Bisq, Haveno) or atomic swaps for off-ramp.")
+    print(f"  {'=' * 68}")
+    print()
+
     kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
     print(f"  Method      : {args.method} ({kyc_label})")
     print(f"  Gross       : {gross} XMR")
