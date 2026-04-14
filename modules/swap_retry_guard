@@ -75,9 +75,9 @@ except ImportError as e:
     print("Install with: pip install requests pyyaml tenacity stem psutil cryptography", file=sys.stderr)
     sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 # File paths
 SEED_FILE = Path("entropy_seed.json")
@@ -110,9 +110,9 @@ STEALTH_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # ADVANCED SECURITY UTILITIES
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 class SecureMemory:
     """Military-grade memory management with secure deletion."""
@@ -396,9 +396,9 @@ class TrafficObfuscator:
         self.request_history.append(entry)
 
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # ENHANCED SWAP ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 class AdvancedSwapOrchestrator:
     """Military-grade swap execution with zero-failure guarantee."""
@@ -749,13 +749,13 @@ class AdvancedSwapOrchestrator:
             total_swaps = len(plan)
             successful_swaps = 0
             
-            print(f"[•] Starting swap execution: {total_swaps} swaps")
-            print(f"[•] Using {len(self.aggregator_pool)} aggregators")
-            print(f"[•] Proxy chain: {len(self.proxy_chain)} hops")
+            print(f"[*] Starting swap execution: {total_swaps} swaps")
+            print(f"[*] Using {len(self.aggregator_pool)} aggregators")
+            print(f"[*] Proxy chain: {len(self.proxy_chain)} hops")
             
             # Execute swaps
             for i, swap_entry in enumerate(plan):
-                print(f"\n[•] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
+                print(f"\n[*] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
                 
                 try:
                     result = self._execute_single_swap(swap_entry)
@@ -766,7 +766,7 @@ class AdvancedSwapOrchestrator:
                             successful_swaps += 1
                             print(f"[+] Swap {swap_entry.get('idx', i)} quote fetched")
                         else:
-                            print(f"[·] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
+                            print(f"[*] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
                     else:
                         print(f"[!] Swap {swap_entry.get('idx', i)} failed")
                         
@@ -907,7 +907,7 @@ Examples:
         print("    burn triggers). Consider re-enabling --force-circuit-burn.")
         
     if args.phantom_prob > 0:
-        print(f"[•] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
+        print(f"[*] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
     
     # Memory locking (requires root on most systems)
     if args.memory_lock:
@@ -915,13 +915,13 @@ Examples:
             import ctypes as _ctypes
             _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
             if _libc.mlockall(1 | 2) == 0:
-                print("[•] Memory locking enabled")
+                print("[+] Memory locking enabled")
             else:
                 print("[!] Memory locking failed (need root or CAP_IPC_LOCK)")
         except Exception as e:
             print(f"[!] Memory locking failed: {e}")
     
-    print("[•] Swap Orchestrator Starting")
+    print("[*] Swap orchestrator starting")
     print(f"    Plan file: {args.plan}")
     print(f"    Proxy chain: {len(args.proxy_chain.split(','))} hops")
     print(f"    Stealth mode: {'enabled' if args.stealth_mode else 'disabled'}")

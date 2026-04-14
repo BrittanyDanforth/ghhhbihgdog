@@ -476,7 +476,7 @@ def main():
                                 in_pool = txs[0].get("in_pool", True)
                                 ht = txs[0].get("block_height", 0)
                                 if not in_pool and ht > 0:
-                                    print(f"  [Mined] TX {idx} at height {ht}")
+                                    print(f"  [+] TX {idx} confirmed at height {ht}")
                                     integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
                                     confirmed = True
                                     block_height = ht

@@ -120,7 +120,7 @@ def cmd_load(args):
     # Clean old seed if present
     if SEED_SHM.exists():
         _secure_wipe_bytes(SEED_SHM)
-        print("  [·] Previous seed wiped")
+        print("  [*] Previous seed wiped")
 
     # Compute the hash of the raw seed bytes for the SHM bundle
     loaded_seed_hash = hashlib.sha256(seed_bytes).hexdigest()
@@ -168,7 +168,7 @@ def cmd_load(args):
                 LOCK_SHM.unlink()
             sys.exit(0)
         else:
-            print(f"  [·] Wiper process started (PID {pid})")
+            print(f"  [*] Wiper process started (PID {pid})")
 
 
 def cmd_verify(args):
@@ -233,7 +233,7 @@ def cmd_wipe(args):
         LOCK_SHM.unlink()
         wiped = True
     if not wiped:
-        print("  [·] No seed was loaded")
+        print("  [*] No seed was loaded")
     else:
         try:
             libc = ctypes.CDLL("libc.so.6", use_errno=True)

@@ -1902,10 +1902,9 @@ async def main():
     """Main execution with maximum OPSEC"""
     try:
         print("""
-        ╔══════════════════════════════════════════════╗
-        ║     Ultimate Intelligence System v20+ASF      ║
-        ║            Maximum OPSEC Edition              ║
-        ╚══════════════════════════════════════════════╝
+        ====================================================
+            Intelligence System - Maximum OPSEC Edition
+        ====================================================
         """)
         
         # Create orchestrator

@@ -97,7 +97,7 @@ def main():
         print(f"  [!] Invalid JSON: {e}")
         sys.exit(1)
 
-    print(f"  [·] Checking: {seed_path}")
+    print(f"  [*] Checking: {seed_path}")
 
     # Support both formats:
     #   Format A (SML/manual): {"seed_hex": "abcd...", "sha256": "...", "timestamp": N}
@@ -109,16 +109,16 @@ def main():
 
     if not seed_hex and "sources" in data:
         # en_seeder format: hash covers the whole bundle, no separate seed_hex
-        print(f"  [·] Detected en_seeder format (bundle hash)")
+        print(f"  [*] Detected en_seeder format (bundle hash)")
         bundle_for_hash = json.dumps(
             {k: v for k, v in data.items() if k != "sha256"},
             sort_keys=True,
         ).encode()
         actual_hash = hashlib.sha256(bundle_for_hash).hexdigest()
         if actual_hash == claimed_hash:
-            print(f"  [✓] Bundle SHA-256 hash matches")
+            print(f"  [+] Bundle SHA-256 hash matches")
         else:
-            print(f"  [✗] Bundle SHA-256 MISMATCH!")
+            print(f"  [!] Bundle SHA-256 MISMATCH!")
             print(f"      Claimed: {claimed_hash}")
             print(f"      Actual:  {actual_hash}")
             errors.append("Hash mismatch — seed file may be tampered")
@@ -136,9 +136,9 @@ def main():
         if seed_raw and claimed_hash:
             actual_hash = hashlib.sha256(seed_raw).hexdigest()
             if actual_hash == claimed_hash:
-                print(f"  [✓] SHA-256 hash matches")
+                print(f"  [+] SHA-256 hash matches")
             else:
-                print(f"  [✗] SHA-256 MISMATCH!")
+                print(f"  [!] SHA-256 MISMATCH!")
                 print(f"      Claimed: {claimed_hash}")
                 print(f"      Actual:  {actual_hash}")
                 errors.append("Hash mismatch — seed file may be tampered")
@@ -152,18 +152,18 @@ def main():
         seed_bytes = 0
         entropy_bits = 0.0
 
-    print(f"  [·] Seed size: {seed_bytes} bytes")
+    print(f"  [*] Seed size: {seed_bytes} bytes")
     if seed_bytes * 8 < args.min_bits and seed_bytes > 0:
         warnings.append(f"Seed data below {args.min_bits} bits")
 
-    print(f"  [·] Shannon entropy: {entropy_bits:.1f} bits")
+    print(f"  [*] Shannon entropy: {entropy_bits:.1f} bits")
 
     # Check weak patterns (only for seed_hex format)
     weak = check_weak_patterns(seed_hex) if seed_hex else []
     for w in weak:
         if w.startswith("CRITICAL"):
             errors.append(w)
-            print(f"  [✗] {w}")
+            print(f"  [!] {w}")
         else:
             warnings.append(w)
             print(f"  [!] {w}")
@@ -176,14 +176,14 @@ def main():
         age_hours = (_time.time() - ts) / 3600
         if age_hours > 24:
             warnings.append(f"Seed is {age_hours:.0f} hours old — consider regenerating")
-        print(f"  [·] Age: {age_hours:.1f} hours")
+        print(f"  [*] Age: {age_hours:.1f} hours")
     elif created_utc:
-        print(f"  [·] Created: {created_utc}")
+        print(f"  [*] Created: {created_utc}")
 
     # Check extra fields
     sources = data.get("sources", [])
     if sources:
-        print(f"  [·] Entropy sources: {len(sources)}")
+        print(f"  [*] Entropy sources: {len(sources)}")
 
     # Summary
     print()
@@ -201,7 +201,7 @@ def main():
         if warnings:
             for w in warnings:
                 print(f"  [!] {w}")
-        print(f"  [✓] Seed verification PASSED")
+        print(f"  [+] Seed verification PASSED")
         print(f"      {seed_bytes} bytes, {entropy_bits:.0f} bits entropy, hash verified")
 
 

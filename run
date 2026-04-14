@@ -30,10 +30,9 @@ def clear():
 
 def banner():
     print(f"""
-{M}  ╔══════════════════════════════════════════════════════╗
-  ║{B}              ★  Toolkit  ★                          {M}║
-  ║{D}                Operations Menu                      {M}║
-  ╚══════════════════════════════════════════════════════╝{N}
+{M}  ===================================================={N}
+  {B}                Operations Menu{N}
+{M}  ===================================================={N}
 """)
 
 
@@ -57,7 +56,7 @@ def heading(text: str):
 
 
 def ok(text: str):
-    print(f"  {G}[✓]{N} {text}")
+    print(f"  {G}[+]{N} {text}")
 
 
 def warn(text: str):
@@ -65,11 +64,11 @@ def warn(text: str):
 
 
 def err(text: str):
-    print(f"  {R}[✗]{N} {text}")
+    print(f"  {R}[!]{N} {text}")
 
 
 def info(text: str):
-    print(f"  {D}[·]{N} {text}")
+    print(f"  {D}[*]{N} {text}")
 
 
 def run_script(path: Path, args: list, label: str = ""):

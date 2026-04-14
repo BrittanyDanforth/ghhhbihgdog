@@ -563,7 +563,7 @@ class DeadManSwitch:
                 AntiForensics.cleanup_decoys()
             sys.exit(0)
         else:
-            print(f"  [·] TTL wiper started (PID {pid})")
+            print(f"  [*] TTL wiper started (PID {pid})")
     
     def unlock_entropy_seed(self, token: str) -> bool:
         """Unlock the entropy seed with verification"""

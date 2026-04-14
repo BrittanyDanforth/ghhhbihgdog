@@ -191,7 +191,7 @@ def main():
     print(f"  Gross       : {gross} XMR")
     print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
     print(f"  Slippage    : {slip:.4f} XMR")
-    print(f"  ----------------------------------------")
+    print(f"  ---")
     print(f"  Net         : {net:.4f} XMR")
     print(f"  Value       : {fiat_val} {args.currency.upper()}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")

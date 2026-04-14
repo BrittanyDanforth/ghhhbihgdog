@@ -163,11 +163,9 @@ def main():
                      help="Password for the wallet file (empty for no password). "
                           "WARNING: visible in /proc/PID/cmdline — prefer GS_WALLET_PASSWORD env var")
     cli.add_argument("--delay-min", type=int, default=180,
-                     help="Minimum inter-TX delay in seconds (default: 180). "
-                          "Customise to avoid the default 180-720s fingerprint.")
+                     help="Minimum inter-TX delay in seconds (default: 180)")
     cli.add_argument("--delay-max", type=int, default=720,
-                     help="Maximum inter-TX delay in seconds (default: 720). "
-                          "Customise to avoid the default 180-720s fingerprint.")
+                     help="Maximum inter-TX delay in seconds (default: 720)")
     cli.add_argument("--resume-plan",
                      help="Resume Stage 5 on an existing unsigned plan JSON file. "
                           "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
@@ -711,9 +709,8 @@ def main():
             print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
             print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
             print()
-            print("  ============================================================")
-            print("  SENDER INSTRUCTIONS — send BTC to these deposit addresses:")
-            print("  ============================================================")
+            print()
+            print("  SENDER INSTRUCTIONS: send BTC to deposit addresses below.")
             for dep in swap_deposits:
                 print(f"\n  --- Chunk {dep['chunk']} ---")
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
@@ -734,13 +731,10 @@ def main():
                     else:
                         print(f"  Expires in:   {dep_remaining // 60}m {dep_remaining % 60}s")
             print()
-            print("  ============================================================")
-            print("  [!] YOU MUST manually send BTC to each deposit address above!")
-            print("  [!] Include the memo in the BTC transaction OP_RETURN field!")
-            print("  [!] Quotes EXPIRE — send BTC BEFORE the expiry time above!")
-            print("  [!] Sending after expiry = funds stuck in ThorChain vault!")
-            print("  [!] Wait for XMR to arrive and confirm before proceeding!")
-            print("  ============================================================")
+            print()
+            print("  [!] Manually send BTC to each deposit address above.")
+            print("  [!] Include the memo in the OP_RETURN field.")
+            print("  [!] Quotes expire. Send before the expiry time shown.")
         else:
             integrity_log("stage2", "manual_mode")
             print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
@@ -1120,20 +1114,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
     if _is_view_only:
         integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
-        print(f"  [!] ╔══════════════════════════════════════════════════╗")
-        print(f"  [!] ║  VIEW-ONLY WALLET DETECTED                     ║")
-        print(f"  [!] ║                                                  ║")
-        print(f"  [!] ║  Auto-mode with a view-only wallet requires     ║")
-        print(f"  [!] ║  key image sync after each broadcast, which     ║")
-        print(f"  [!] ║  needs the offline wallet's cooperation.        ║")
-        print(f"  [!] ║                                                  ║")
-        print(f"  [!] ║  After each TX broadcast, this pipeline will    ║")
-        print(f"  [!] ║  call export_outputs and attempt import of key  ║")
-        print(f"  [!] ║  images. If sync fails, the pipeline aborts.   ║")
-        print(f"  [!] ║                                                  ║")
-        print(f"  [!] ║  For full air-gap operation, use --airgap mode  ║")
-        print(f"  [!] ║  and manually cycle each TX.                    ║")
-        print(f"  [!] ╚══════════════════════════════════════════════════╝")
+        print(f"  [!] View-only wallet detected.")
+        print(f"  [!] Key image sync is required after each broadcast.")
+        print(f"  [!] If sync fails, the pipeline will abort.")
+        print(f"  [!] For full air-gap operation, use --airgap mode.")
 
     if not lock_memory():
         print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
@@ -1168,17 +1152,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         if _remaining <= 0:
             _expired_ago = abs(_remaining)
             integrity_log("stage5", f"THORCHAIN_QUOTE_EXPIRED:{_expired_ago}s_ago")
-            print(f"  [!] ╔══════════════════════════════════════════════════╗")
-            print(f"  [!] ║  THORCHAIN QUOTE EXPIRED!                       ║")
-            print(f"  [!] ║                                                  ║")
-            print(f"  [!] ║  The ThorChain deposit address in this plan     ║")
-            print(f"  [!] ║  expired {str(_expired_ago // 60).ljust(5)} minutes ago.                  ║")
-            print(f"  [!] ║                                                  ║")
-            print(f"  [!] ║  If you already sent BTC: check ThorChain       ║")
-            print(f"  [!] ║  explorer for your TX status.                   ║")
-            print(f"  [!] ║  If you have NOT sent BTC: regenerate the plan  ║")
-            print(f"  [!] ║  to get a fresh quote with a new deposit addr.  ║")
-            print(f"  [!] ╚══════════════════════════════════════════════════╝")
+            print(f"  [!] Quote expired {_expired_ago // 60} minutes ago.")
+            print(f"  [!] If BTC already sent: check explorer for TX status.")
+            print(f"  [!] If NOT sent: regenerate the plan for fresh quote.")
         elif _remaining < 600:
             print(f"  [!] WARNING: ThorChain quote expires in {_remaining // 60}m {_remaining % 60}s!")
             print(f"  [!] Send BTC to the deposit address IMMEDIATELY or regenerate the plan.")
@@ -1222,14 +1198,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 _height_diff = _cur_height - _plan_height
                 if _height_diff < -10:
                     integrity_log("stage5", f"DAEMON_HEIGHT_REGRESSED:{_plan_height}->{_cur_height}")
-                    print(f"  [!] ╔══════════════════════════════════════════════════╗")
-                    print(f"  [!] ║  WARNING: Daemon height REGRESSED!              ║")
-                    print(f"  [!] ║  Plan created at height: {str(_plan_height).ljust(22)} ║")
-                    print(f"  [!] ║  Current daemon height:  {str(_cur_height).ljust(22)} ║")
-                    print(f"  [!] ║  Diff: {str(_height_diff).ljust(39)} ║")
-                    print(f"  [!] ║  This may indicate a different daemon or reorg. ║")
-                    print(f"  [!] ║  Confirmed outputs may no longer be valid.      ║")
-                    print(f"  [!] ╚══════════════════════════════════════════════════╝")
+                    print(f"  [!] Daemon height regressed: {_plan_height} -> {_cur_height} (diff: {_height_diff})")
+                    print(f"  [!] This may indicate a different daemon or chain reorg.")
+                    print(f"  [!] Confirmed outputs may no longer be valid.")
         except Exception:
             pass
 
@@ -1320,11 +1291,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     _expected = _progress_hmac(progress, _saved_nonce)
                     if not _hmac.compare_digest(_saved_hmac, _expected):
                         integrity_log("stage5", "PROGRESS_HMAC_MISMATCH:tampering")
-                        print(f"  [!] ╔══════════════════════════════════════════════════╗")
-                        print(f"  [!] ║  PROGRESS FILE TAMPERED OR CORRUPT!             ║")
-                        print(f"  [!] ║  HMAC verification failed.                      ║")
-                        print(f"  [!] ║  Discarding progress and starting fresh.        ║")
-                        print(f"  [!] ╚══════════════════════════════════════════════════╝")
+                        print(f"  [!] Progress file HMAC mismatch (tampered or corrupt).")
+                        print(f"  [!] Discarding progress and starting fresh.")
                         progress_file.unlink()
                         progress = {}
                     else:
@@ -1336,15 +1304,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 # completed to prevent double-payment on resume.
                 pending_idx = progress.get("broadcast_pending")
                 if pending_idx is not None and pending_idx not in completed_indices:
-                    print(f"  [!] ╔══════════════════════════════════════════════════╗")
-                    print(f"  [!] ║  WARNING: TX {str(pending_idx).ljust(4)} MAY have been broadcast       ║")
-                    print(f"  [!] ║  before the crash. It is also possible the      ║")
-                    print(f"  [!] ║  crash occurred BEFORE the broadcast call,       ║")
-                    print(f"  [!] ║  meaning this TX was NEVER actually sent.        ║")
-                    print(f"  [!] ║                                                  ║")
-                    print(f"  [!] ║  SKIPPING to prevent double-payment.             ║")
-                    print(f"  [!] ║  CHECK YOUR WALLET BALANCE before proceeding!    ║")
-                    print(f"  [!] ╚══════════════════════════════════════════════════╝")
+                    print(f"  [!] TX {pending_idx} may have been broadcast before crash.")
+                    print(f"  [!] Skipping to prevent double-payment.")
+                    print(f"  [!] Check wallet balance before proceeding.")
                     integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
                     completed_indices.add(pending_idx)
                 if completed_indices:
@@ -1428,12 +1390,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         except subprocess.CalledProcessError as e:
             integrity_log("stage5", f"create_fail:tx={tx_idx}:rc={e.returncode}")
             print(f"  [!] TX {tx_idx} create failed (exit {e.returncode})")
-            print(f"  [!] ABORTING — subsequent TXs depend on change from this TX.")
+            print(f"  [!] Stopping: subsequent TXs depend on change from this TX.")
             fail_count += 1
             break
         except subprocess.TimeoutExpired:
             integrity_log("stage5", f"create_timeout:tx={tx_idx}")
-            print(f"  [!] TX {tx_idx} create timed out — ABORTING pipeline.")
+            print(f"  [!] TX {tx_idx} create timed out.")
             fail_count += 1
             break
 
@@ -1444,7 +1406,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         is_presigned = presigned_file.exists() and not unsigned_file.exists()
 
         if not unsigned_file.exists() and not presigned_file.exists():
-            print(f"  [!] TX {tx_idx}: neither unsigned nor presigned file created — ABORTING.")
+            print(f"  [!] TX {tx_idx}: neither unsigned nor presigned file created.")
             fail_count += 1
             break
 
@@ -1488,18 +1450,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                                capture_output=True)
             except subprocess.CalledProcessError as e:
                 integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
-                print(f"  [!] TX {tx_idx} signing failed — ABORTING pipeline.")
+                print(f"  [!] TX {tx_idx} signing failed.")
                 fail_count += 1
                 break
             except subprocess.TimeoutExpired:
                 integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
-                print(f"  [!] TX {tx_idx} sign timed out — ABORTING pipeline.")
+                print(f"  [!] TX {tx_idx} sign timed out.")
                 fail_count += 1
                 break
 
             signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
             if not signed_file.exists():
-                print(f"  [!] TX {tx_idx}: signed file not created — ABORTING.")
+                print(f"  [!] TX {tx_idx}: signed file not created.")
                 fail_count += 1
                 break
 
@@ -1540,8 +1502,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 tx_hashes = result.get("tx_hash_list", [])
             if not tx_hashes:
                 integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
-                print(f"  [!] TX {tx_idx} submitted but no txid returned — ABORTING pipeline.")
-                print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+            print(f"  [!] TX {tx_idx} submitted but no txid returned.")
+            print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
                 fail_count += 1
                 break
             txid = tx_hashes[0]
@@ -1551,7 +1513,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
-            print(f"  [!] ABORTING pipeline — wallet state may be inconsistent.")
+            print(f"  [!] Stopping. Check if TX was actually broadcast before rerunning.")
             print(f"  [!] Check if the TX was actually broadcast before rerunning.")
             _save_progress({
                 "plan_fingerprint": plan_fingerprint,
@@ -1584,7 +1546,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         if not refresh_ok:
             integrity_log("stage5", f"refresh_FATAL:tx={tx_idx}")
             print(f"  [!] Wallet refresh FAILED after 5 attempts for TX {tx_idx}.")
-            print(f"  [!] ABORTING — next TX would reuse spent outputs (double-spend).")
+            print(f"  [!] Next TX would reuse spent outputs. Resume after fixing RPC.")
             print(f"  [!] The successfully broadcast TXs are safe. Resume after fixing RPC.")
             fail_count += 1
             break
@@ -1621,20 +1583,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
             if not _ki_synced:
                 integrity_log("stage5", f"KEY_IMAGE_SYNC_MISSING:tx={tx_idx}")
-                print(f"  [!] ╔══════════════════════════════════════════════════╗")
-                print(f"  [!] ║  KEY IMAGE SYNC FAILED for TX {str(tx_idx).ljust(17)} ║")
-                print(f"  [!] ║                                                  ║")
-                print(f"  [!] ║  View-only wallet cannot track spent outputs     ║")
-                print(f"  [!] ║  without key image import. The next TX will      ║")
-                print(f"  [!] ║  likely fail (double-spend of same outputs).     ║")
-                print(f"  [!] ║                                                  ║")
-                print(f"  [!] ║  To continue:                                    ║")
-                print(f"  [!] ║  1. Transfer outputs file to offline signer      ║")
-                print(f"  [!] ║  2. Export key images from offline wallet         ║")
-                print(f"  [!] ║  3. Place key_images.hex in {staging_dir}/       ║")
-                print(f"  [!] ║  4. Re-run with --resume-plan                    ║")
-                print(f"  [!] ╚══════════════════════════════════════════════════╝")
-                print(f"  [!] ABORTING — key image sync required for view-only wallet.")
+                print(f"  [!] Key image sync failed for TX {tx_idx}.")
+                print(f"  [!] Next TX will likely fail (double-spend).")
+                print(f"  [!] Transfer outputs to offline signer, export key images,")
+                print(f"  [!] place key_images.hex in {staging_dir}/, re-run with --resume-plan.")
+                print(f"  [!] Aborting: key image sync required for view-only wallet.")
                 fail_count += 1
                 break
 

@@ -77,7 +77,7 @@ MODULES = {
 def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True,
              timeout: int = 600):
     """Execute a subprocess command with error handling."""
-    print("[•]", " ".join(cmd))
+    print("[*]", " ".join(cmd))
     if env is None:
         env = os.environ.copy()
         for _k in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
@@ -267,10 +267,10 @@ def main():
 
         # Execute steps
         for step_name, cmd in steps:
-            print(f"[•] Executing: {step_name}")
+            print(f"[*] Executing: {step_name}")
             run_step(cmd)
 
-        print("\n[✓] Phase‑1 prep complete!")
+        print("\n[+] Phase 1 prep complete.")
         print("    Mutated core   :", MUTATED)
         if MANIFEST.exists():
             print("    Manifest       :", MANIFEST)
@@ -284,13 +284,13 @@ def main():
         print("\nNext: execute the mutated core script to enter Phase‑2 (sign + broadcast).")
 
     except subprocess.CalledProcessError as e:
-        print(f"\n[✗] Step failed with exit code {e.returncode}")
+        print(f"\n[!] Step failed with exit code {e.returncode}")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
         sys.exit(130)
     except Exception as e:
-        print(f"\n[✗] Unexpected error: {e}")
+        print(f"\n[!] Unexpected error: {e}")
         sys.exit(1)
 
 

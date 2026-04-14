@@ -287,9 +287,7 @@ def main():
     print(f"\n  [+] {len(pairs)} pair(s) written to {_out} (fsync'd, 0600 permissions)")
 
     print()
-    print("  ============================================================")
-    print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
-    print("  ============================================================")
+    print("  SENDER INSTRUCTIONS:")
     for i, pair in enumerate(pairs):
         print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
         print(f"  Send exactly: {pair['btc_in']} BTC")
@@ -309,13 +307,8 @@ def main():
             else:
                 print(f"  Expires in:   {pair_remaining // 60}m {pair_remaining % 60}s")
     print()
-    print("  ============================================================")
-    print("  IMPORTANT: The sender must include the memo in the BTC")
-    print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
-    print("  route the swap.")
-    print("  QUOTES EXPIRE — send BTC BEFORE the expiry shown above!")
-    print("  Sending after expiry = funds stuck in ThorChain vault!")
-    print("  ============================================================")
+    print("  [!] Sender must include memo in the BTC transaction's OP_RETURN field.")
+    print("  [!] Quotes expire. Send BTC before the expiry shown above.")
 
     if args.gpg_recipient:
         try:
