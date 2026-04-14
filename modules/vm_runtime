@@ -135,30 +135,30 @@ def probe_network_latency(host: str = "127.0.0.1", timeout: float = 2.0) -> floa
 
 def probe_disk_io() -> float:
     """Measure disk I/O latency via small write/read test. Returns ms."""
+    tmp_path = None
     try:
         test_data = b"timing_test_" + os.urandom(1024)  # 1KB test
         
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
             start = time.perf_counter()
             tmp.write(test_data)
             tmp.flush()
-            os.fsync(tmp.fileno())  # Force write to disk
+            os.fsync(tmp.fileno())
             
-            # Read back
             tmp.seek(0)
             _ = tmp.read()
             elapsed = (time.perf_counter() - start) * 1000
-            tmp_path = tmp.name
         
-        # Cleanup
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-            
         return round(elapsed, 1)
     except (OSError, IOError):
         return 0.0
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
@@ -434,6 +434,8 @@ Examples:
     try:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(args.out)
         os.chmod(args.out, 0o600)
         
@@ -444,6 +446,12 @@ Examples:
             print(f"[+] Tor status: {tor_status}")
             
     except (OSError, IOError) as e:
+        # Clean up stale .tmp on failure to avoid leaving timing data on disk
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         print(f"[!] Failed to write output: {e}", file=sys.stderr)
         sys.exit(1)
 

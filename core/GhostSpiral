@@ -154,15 +154,17 @@ def main():
         proxy = validate_proxy(args.tor_proxy)
         require_resources(min_disk_gb=2.0)
         verify_tor(proxy)
+        newnym()
 
         print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
         print(f"  [*] Skipping Stages 0-4, jumping to Stage 5.")
         integrity_log("stage5", f"resume_plan:{resume_path.name}")
 
         rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        _acct_idx = _rp.get("meta", {}).get("account_index", 0)
         bal = Decimal("0")
         try:
-            res = rpc_primary.raw_request("get_balance", {"account_index": 0})
+            res = rpc_primary.raw_request("get_balance", {"account_index": _acct_idx})
             bal = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
         except Exception:
             pass
@@ -174,7 +176,26 @@ def main():
             os.write(fd, str(os.getpid()).encode())
             os.close(fd)
         except FileExistsError:
-            sys.exit("[!] Lock file exists. Another instance may be running.")
+            try:
+                stale_pid = lock_path.read_text().strip()
+                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                    lock_path.unlink()
+                    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
+                else:
+                    sys.exit(
+                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "    Another instance may be running.\n"
+                        "    If not, delete the lock file manually."
+                    )
+            except (OSError, ValueError):
+                sys.exit(
+                    "[!] Lock file exists: .mixer.lock\n"
+                    "    Another instance may be running.\n"
+                    "    If not, delete the lock file manually."
+                )
 
         try:
             _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
@@ -786,10 +807,17 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     """
     sign_env = os.environ.copy()
     sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
+    # Pass wallet-file path via env var instead of CLI arg.
+    # CLI args are visible to all local users via /proc/PID/cmdline and
+    # `ps aux`. A wallet filename like "cold_storage_2024.wallet" reveals
+    # operational details. Env vars are only readable by the same uid.
+    sign_env["GS_WALLET_FILE"] = args.wallet_file or ""
 
     if not lock_memory():
         print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
         print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
+        print("  [!] Mitigation: ensure full-disk encryption (LUKS) is enabled so")
+        print("  [!] swap contents cannot be read from a seized disk.")
 
     # Read the plan to get TX count
     with open(str(ufile)) as _pf:
@@ -837,10 +865,15 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 # completed to prevent double-payment on resume.
                 pending_idx = progress.get("broadcast_pending")
                 if pending_idx is not None and pending_idx not in completed_indices:
-                    print(f"  [!] TX {pending_idx} was broadcast but not confirmed "
-                          f"as complete (crash during broadcast?).")
-                    print(f"  [!] Treating TX {pending_idx} as completed to prevent "
-                          f"double-payment. Verify wallet state manually.")
+                    print(f"  [!] ╔══════════════════════════════════════════════════╗")
+                    print(f"  [!] ║  WARNING: TX {str(pending_idx).ljust(4)} MAY have been broadcast       ║")
+                    print(f"  [!] ║  before the crash. It is also possible the      ║")
+                    print(f"  [!] ║  crash occurred BEFORE the broadcast call,       ║")
+                    print(f"  [!] ║  meaning this TX was NEVER actually sent.        ║")
+                    print(f"  [!] ║                                                  ║")
+                    print(f"  [!] ║  SKIPPING to prevent double-payment.             ║")
+                    print(f"  [!] ║  CHECK YOUR WALLET BALANCE before proceeding!    ║")
+                    print(f"  [!] ╚══════════════════════════════════════════════════╝")
                     integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
                     completed_indices.add(pending_idx)
                 if completed_indices:
@@ -891,7 +924,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
         try:
             create_env = os.environ.copy()
-            for sensitive_key in ("GS_WALLET_PASSWORD",):
+            for sensitive_key in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                  "COINGECKO_API_KEY"):
                 create_env.pop(sensitive_key, None)
             create_cmd = [
                 sys.executable, _core_script("airgap_tx_signer"), str(ufile),
@@ -940,7 +974,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     "--outdir", staging_dir,
                     "--tx-index", str(tx_idx),
                 ]
-                subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env)
+                subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env,
+                               capture_output=True)
             except subprocess.CalledProcessError as e:
                 integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
                 print(f"  [!] TX {tx_idx} signing failed — ABORTING pipeline.")
@@ -1048,10 +1083,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     try:
         print("  [*] Exit strategy simulation...")
         exit_amt = str(sum(Decimal(t.get("amt", "0")) for t in plan_txs))
+        exit_env = os.environ.copy()
+        for _ek in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE", "COINGECKO_API_KEY"):
+            exit_env.pop(_ek, None)
         subprocess.run(
             [sys.executable, _core_script("exit_strategy_simulator"), exit_amt,
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
-            check=True, timeout=300,
+            check=True, timeout=300, env=exit_env,
         )
         integrity_log("stage5", "exit_sim_ok")
     except Exception as e:

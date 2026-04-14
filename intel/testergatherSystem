@@ -322,9 +322,10 @@ class HardwareOPSEC:
         if CONFIG['OPSEC']['RANDOM_HOSTNAME']:
             hostname = f"host-{secrets.token_hex(4)}"
             try:
-                subprocess.run(['hostname', hostname], check=True)
+                subprocess.run(['hostname', hostname], check=True,
+                               capture_output=True, timeout=10)
                 logger.info(f"Hostname randomized: {hostname}")
-            except:
+            except Exception:
                 pass
     
     @staticmethod
@@ -333,7 +334,8 @@ class HardwareOPSEC:
         if CONFIG['OPSEC']['RANDOM_MAC']:
             try:
                 # Get interfaces
-                result = subprocess.run(['ip', 'link'], capture_output=True, text=True)
+                result = subprocess.run(['ip', 'link'], capture_output=True, text=True,
+                                       timeout=10)
                 interfaces = re.findall(r'^\d+: (\w+):', result.stdout, re.MULTILINE)
                 
                 for iface in interfaces:
@@ -342,10 +344,12 @@ class HardwareOPSEC:
                         octets[0] = (octets[0] | 0x02) & 0xFE  # locally administered, unicast
                         mac = ":".join(f"{b:02x}" for b in octets)
                         
-                        # Apply MAC
-                        subprocess.run(['ip', 'link', 'set', iface, 'down'])
-                        subprocess.run(['ip', 'link', 'set', iface, 'address', mac])
-                        subprocess.run(['ip', 'link', 'set', iface, 'up'])
+                        subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                                       check=True, capture_output=True, timeout=10)
+                        subprocess.run(['ip', 'link', 'set', iface, 'address', mac],
+                                       check=True, capture_output=True, timeout=10)
+                        subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                                       check=True, capture_output=True, timeout=10)
                         
                         logger.info(f"MAC randomized for {iface}: {mac}")
             except:

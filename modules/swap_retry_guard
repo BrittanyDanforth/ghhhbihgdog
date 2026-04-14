@@ -194,7 +194,16 @@ class QuantumEntropyFusion:
             return kdf.derive(combined)
     
     def get_secure_random(self) -> random.Random:
-        """Get cryptographically secure random generator."""
+        """Get seeded PRNG for reproducible jitter/ordering.
+
+        WARNING: Despite the name, this is NOT cryptographically secure.
+        random.Random is a Mersenne Twister PRNG. Anyone with the seed file
+        (entropy_seed.json) can reproduce the exact sequence of timing
+        delays, endpoint selection, and header choices. Do NOT use this
+        for key generation or nonces — use secrets/os.urandom for those.
+        The seed file sits on disk by default; delete it after use or
+        store it only in RAM (/dev/shm) via the SML module.
+        """
         entropy = self.harvest_entropy()
         seed = int.from_bytes(entropy, 'big')
         return random.Random(seed)
@@ -809,7 +818,11 @@ Examples:
     
     # Security options
     parser.add_argument("--stealth-mode", action="store_true",
-                       help="Enable maximum stealth with traffic obfuscation")
+                       help="Add timing jitter before first request per swap. "
+                            "NOTE: this only affects request timing, not traffic "
+                            "content, headers, endpoints, or Tor circuit behaviour. "
+                            "An observer analysing encrypted traffic volume/patterns "
+                            "will see identical request shapes with shifted timing.")
     
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
@@ -835,6 +848,13 @@ Examples:
         print(f"[!] Entropy seed file not found: {SEED_FILE}", file=sys.stderr)
         print("    Run entropy_seeder.py first to generate entropy seed", file=sys.stderr)
         sys.exit(1)
+
+    if not str(SEED_FILE.resolve()).startswith("/dev/shm"):
+        print("[!] WARNING: entropy_seed.json is on persistent storage.", file=sys.stderr)
+        print("    Anyone who seizes this file can reproduce all PRNG-derived", file=sys.stderr)
+        print("    timing jitter, endpoint ordering, and header selection.", file=sys.stderr)
+        print("    Use 'python3 SML load entropy_seed.json' to keep it RAM-only,", file=sys.stderr)
+        print("    or delete it immediately after operations complete.", file=sys.stderr)
         
     if args.phantom_prob < 0.0 or args.phantom_prob > 1.0:
         print(f"[!] phantom-prob must be between 0.0 and 1.0, got {args.phantom_prob}", file=sys.stderr)
@@ -913,18 +933,14 @@ Examples:
     finally:
         # Secure cleanup
         try:
-            # Clear sensitive environment variables
-            for var in ['TOR_PASSWORD', 'SWAP_API_KEY', 'PRIVATE_KEY']:
+            for var in ['TOR_PASSWORD', 'TOR_CONTROL_PASSWORD',
+                        'SWAP_API_KEY', 'PRIVATE_KEY',
+                        'GS_WALLET_PASSWORD', 'GS_WALLET_FILE',
+                        'COINGECKO_API_KEY']:
                 if var in os.environ:
-                    os.environ[var] = '0' * len(os.environ[var])
                     del os.environ[var]
                     
-            # Force garbage collection
             gc.collect()
-            
-            # Memory barrier
-            if hasattr(os, 'sync'):
-                os.sync()
                 
         except Exception:
             pass

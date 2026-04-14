@@ -74,12 +74,18 @@ def info(text: str):
 def run_script(path: Path, args: list, label: str = ""):
     if label:
         info(f"Running {label}...")
-    # Use the same Python interpreter that is running this script (honours venv)
     python = sys.executable
+    # Build a sanitized env: drop secrets that child scripts don't need.
+    # Each child that *does* need a secret should read it from its own
+    # env var (e.g. GS_WALLET_PASSWORD for the signer).
+    child_env = os.environ.copy()
+    for _k in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE"):
+        child_env.pop(_k, None)
     try:
         result = subprocess.run(
             [python, str(path)] + args,
             timeout=7200,
+            env=child_env,
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -384,13 +390,34 @@ def flow_resume():
     try:
         with open(plan) as _pf:
             _plan_data = json.load(_pf)
-        if _plan_data.get("meta", {}).get("btc_entry"):
+
+        _meta = _plan_data.get("meta")
+        _txs = _plan_data.get("txs")
+        if not isinstance(_meta, dict):
+            err("Plan file is missing 'meta' key — not a valid GhostSpiral plan.")
+            return
+        if not isinstance(_txs, list) or len(_txs) == 0:
+            err("Plan file has no 'txs' list (empty or missing) — nothing to resume.")
+            return
+        _schema = _meta.get("schema", "")
+        if _schema not in ("plan_v1", "unsigned_v1"):
+            err(f"Unrecognized plan schema: {_schema}")
+            return
+        for i, _tx in enumerate(_txs):
+            if not isinstance(_tx, dict) or "dst" not in _tx or "amt" not in _tx:
+                err(f"TX {i} in plan is malformed (missing 'dst' or 'amt').")
+                return
+
+        if _meta.get("btc_entry"):
             resume_flag = "--btc-entry"
-            wf_arg = _plan_data["meta"]["btc_entry"]
+            wf_arg = _meta["btc_entry"]
             info(f"Sender resume detected (BTC entry: {wf_arg[:8]}...)")
         else:
             wf_arg = wf
-    except (json.JSONDecodeError, OSError, KeyError) as e:
+    except json.JSONDecodeError as e:
+        err(f"Plan file is not valid JSON (corrupt or truncated): {e}")
+        return
+    except (OSError, KeyError) as e:
         warn(f"Could not read plan metadata ({e}), defaulting to receive-wallet mode")
         wf_arg = wf
 
