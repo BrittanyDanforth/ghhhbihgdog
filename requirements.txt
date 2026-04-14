@@ -1,22 +1,22 @@
 # GhostSpiral — Python Dependencies
-# Install everything: pip install -r requirements.txt
-# Or use the installer: bash install.sh
+# Install: python3 -m pip install -r requirements.txt
+# Or just run: bash install.sh
 
-# --- CORE (required for main pipeline) ---
-requests[socks]
+# Core (required)
+requests
 PySocks
 tenacity
 stem
 monero
 psutil
 
-# --- OPSEC / MODULES ---
+# OPSEC / Modules
 python-gnupg
 pycryptodomex
 qrcode
 pyyaml
 
-# --- INTEL / OPTIONAL ---
+# Intel (optional)
 beautifulsoup4
 aiohttp
 aiohttp-socks

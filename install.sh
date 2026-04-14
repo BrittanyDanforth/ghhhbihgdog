@@ -19,11 +19,23 @@ ok()   { echo -e "  ${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "  ${YELLOW}[!]${NC} $1"; }
 fail() { echo -e "  ${RED}[✗]${NC} $1"; }
 
+# ---------- Find python3 + pip ----------
+PY=$(command -v python3 || command -v python)
+if [ -z "$PY" ]; then
+    fail "python3 not found. Install it first: sudo apt install python3"
+    exit 1
+fi
+PIP="$PY -m pip"
+
+PY_VER=$($PY --version 2>&1)
+echo "  Using: $PY ($PY_VER)"
+
 # ---------- Step 1: System packages ----------
+echo ""
 echo "  [1/5] Installing system packages..."
 if command -v apt-get &>/dev/null; then
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq tor torsocks jq gnupg python3-pip curl wget >/dev/null 2>&1
+    sudo apt-get update -qq 2>/dev/null
+    sudo apt-get install -y -qq tor torsocks jq gnupg python3-pip curl wget 2>/dev/null
     ok "System packages installed"
 else
     warn "Not Debian/Ubuntu — install tor, jq, gnupg, python3-pip manually"
@@ -31,34 +43,30 @@ fi
 
 # ---------- Step 2: Python dependencies ----------
 echo "  [2/5] Installing Python dependencies..."
-pip install --quiet --upgrade pip
 
-# Core (required)
-pip install --quiet \
-    'requests[socks]>=2.28' \
-    'PySocks>=1.7' \
-    'tenacity>=8.0' \
-    'stem>=1.8' \
-    'monero>=1.1' \
-    'psutil>=5.9'
-ok "Core Python deps installed"
+# Upgrade pip itself first
+$PIP install --upgrade pip 2>/dev/null || true
+
+# Core (required) — install one by one so failures are clear
+CORE_DEPS="requests PySocks tenacity stem monero psutil"
+for dep in $CORE_DEPS; do
+    $PIP install --quiet "$dep" 2>/dev/null && ok "$dep" || fail "$dep — run: $PIP install $dep"
+done
 
 # OPSEC tools
-pip install --quiet \
-    'python-gnupg>=0.5' \
-    'pycryptodomex>=3.19' \
-    'qrcode>=7.0' \
-    'pyyaml>=6.0' 2>/dev/null || warn "Some OPSEC deps failed (non-critical)"
-ok "OPSEC Python deps installed"
+OPSEC_DEPS="python-gnupg pycryptodomex qrcode pyyaml"
+for dep in $OPSEC_DEPS; do
+    $PIP install --quiet "$dep" 2>/dev/null && ok "$dep" || warn "$dep (optional)"
+done
 
-# Intel/modules (optional, some may fail)
-pip install --quiet \
-    'beautifulsoup4>=4.12' \
-    'aiohttp>=3.9' \
-    'aiohttp-socks>=0.8' 2>/dev/null || warn "Some optional deps failed"
-ok "Optional Python deps installed"
+# Intel (optional)
+OPTIONAL_DEPS="beautifulsoup4 aiohttp aiohttp-socks"
+for dep in $OPTIONAL_DEPS; do
+    $PIP install --quiet "$dep" 2>/dev/null && ok "$dep" || warn "$dep (optional)"
+done
 
 # ---------- Step 3: Tor configuration ----------
+echo ""
 echo "  [3/5] Configuring Tor..."
 if [ -f /etc/tor/torrc ]; then
     if ! grep -q "^ControlPort 9051" /etc/tor/torrc 2>/dev/null; then
@@ -76,18 +84,19 @@ else
 fi
 
 # Verify Tor
-if curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+if curl -s --max-time 15 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
     ok "Tor is running and working"
 else
-    warn "Tor check failed — make sure Tor is running (sudo systemctl start tor)"
+    warn "Tor check failed — run: sudo systemctl start tor"
 fi
 
 # ---------- Step 4: Check Monero tools ----------
+echo ""
 echo "  [4/5] Checking Monero CLI tools..."
 MONERO_OK=true
 for tool in monerod monero-wallet-cli monero-wallet-rpc; do
     if command -v $tool &>/dev/null; then
-        ok "$tool found: $(command -v $tool)"
+        ok "$tool found"
     else
         warn "$tool NOT found"
         MONERO_OK=false
@@ -95,16 +104,17 @@ for tool in monerod monero-wallet-cli monero-wallet-rpc; do
 done
 if [ "$MONERO_OK" = false ]; then
     echo ""
-    warn "Download Monero CLI from: https://www.getmonero.org/downloads/"
-    echo "  Then extract and copy to /usr/local/bin/:"
-    echo "    tar xf monero-linux-x64-*.tar.bz2"
+    echo "  To install Monero CLI tools:"
+    echo "    wget https://downloads.getmonero.org/cli/linux64"
+    echo "    tar xf linux64"
     echo "    sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/"
     echo ""
 fi
 
 # ---------- Step 5: Verify Python imports ----------
+echo ""
 echo "  [5/5] Verifying Python imports..."
-VERIFY=$(python3 -c "
+$PY -c "
 fails = []
 for mod, name in [
     ('requests', 'requests'),
@@ -119,17 +129,11 @@ for mod, name in [
     except ImportError:
         fails.append(name)
 if fails:
-    print('MISSING: ' + ', '.join(fails))
+    print('  MISSING: ' + ', '.join(fails))
+    print('  Fix: $PIP install ' + ' '.join(fails))
 else:
-    print('OK')
-" 2>&1)
-
-if [ "$VERIFY" = "OK" ]; then
-    ok "All core Python imports verified"
-else
-    fail "$VERIFY"
-    echo "  Run: pip install $(echo $VERIFY | sed 's/MISSING: //')"
-fi
+    print('  All core imports OK!')
+"
 
 # ---------- Done ----------
 echo ""
@@ -138,9 +142,9 @@ echo "  ║   Installation complete!                  ║"
 echo "  ╚═══════════════════════════════════════════╝"
 echo ""
 echo "  Quick start:"
-echo "    python3 run list                    # see all tools"
-echo "    python3 run ghostspiral --help      # main pipeline help"
-echo "    python3 run paranoia --dry-run      # test cleanup (safe)"
+echo "    $PY run list                    # see all tools"
+echo "    $PY run ghostspiral --help      # main pipeline"
+echo "    $PY run paranoia --dry-run      # test cleanup"
 echo ""
 echo "  Before using the core pipeline, start monero-wallet-rpc:"
 echo "    monero-wallet-rpc --rpc-bind-port 18083 \\"

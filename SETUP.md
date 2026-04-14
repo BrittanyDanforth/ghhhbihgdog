@@ -14,8 +14,8 @@ That installs everything: system packages, Python deps, Tor config, and verifies
 # 1. System packages
 sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl
 
-# 2. Python deps
-pip install -r requirements.txt
+# 2. Python deps (use python3 -m pip, NOT bare pip which may be python2)
+python3 -m pip install -r requirements.txt
 
 # 3. Enable Tor control port (needed for circuit rotation)
 echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
@@ -170,7 +170,7 @@ python3 run ghostspiral --receive-wallet wallet.json \
 
 | Error | Fix |
 |-------|-----|
-| `ModuleNotFoundError` | `pip install -r requirements.txt` or `bash install.sh` |
+| `ModuleNotFoundError` | `python3 -m pip install -r requirements.txt` or `bash install.sh` |
 | `Tor leak detected` | `sudo systemctl start tor` |
 | `NEWNYM failed` | `echo "ControlPort 9051" \| sudo tee -a /etc/tor/torrc && sudo systemctl restart tor` |
 | `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
