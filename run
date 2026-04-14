@@ -1,95 +1,552 @@
 #!/usr/bin/env python3
 """
-GhostSpiral Toolkit — Unified Launcher
-=======================================
-Run any tool from the project root:
-
-    python3 run ghostspiral --help
-    python3 run broadcast --help
-    python3 run paranoia --dry-run
-    python3 run signer plan.json --phase create ...
-    python3 run list                    # show all tools
-
-All tools are resolved to their actual paths in core/, modules/, opsec/, intel/.
+GhostSpiral Toolkit — Interactive Launcher
 """
-import os, sys
+from __future__ import annotations
+import os, sys, subprocess, shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+CORE = ROOT / "core"
+MODS = ROOT / "modules"
+OPSEC = ROOT / "opsec"
+INTEL = ROOT / "intel"
+
+# ── Colors ──────────────────────────────────────────────────────────────────
+R = "\033[0;31m"    # red
+G = "\033[0;32m"    # green
+Y = "\033[1;33m"    # yellow
+C = "\033[0;36m"    # cyan
+B = "\033[1;37m"    # bold white
+M = "\033[0;35m"    # magenta
+D = "\033[0;90m"    # dim
+N = "\033[0m"       # reset
+
+
+def clear():
+    os.system("clear" if os.name != "nt" else "cls")
+
+
+def banner():
+    print(f"""
+{M}  ╔══════════════════════════════════════════════════════╗
+  ║{B}         ★  G H O S T S P I R A L  ★                {M}║
+  ║{D}            BTC → XMR Mixing Toolkit                 {M}║
+  ╚══════════════════════════════════════════════════════╝{N}
+""")
+
+
+def prompt(text: str, default: str = "") -> str:
+    if default:
+        r = input(f"  {C}>{N} {text} {D}[{default}]{N}: ").strip()
+        return r if r else default
+    return input(f"  {C}>{N} {text}: ").strip()
+
+
+def confirm(text: str) -> bool:
+    r = input(f"  {Y}?{N} {text} {D}(y/n){N}: ").strip().lower()
+    return r in ("y", "yes")
+
+
+def heading(text: str):
+    w = max(len(text) + 4, 40)
+    print(f"\n  {C}{'─' * w}{N}")
+    print(f"  {B}  {text}{N}")
+    print(f"  {C}{'─' * w}{N}\n")
+
+
+def ok(text: str):
+    print(f"  {G}[✓]{N} {text}")
+
+
+def warn(text: str):
+    print(f"  {Y}[!]{N} {text}")
+
+
+def err(text: str):
+    print(f"  {R}[✗]{N} {text}")
+
+
+def info(text: str):
+    print(f"  {D}[·]{N} {text}")
+
+
+def run_script(path: Path, args: list, label: str = ""):
+    if label:
+        info(f"Running {label}...")
+    try:
+        result = subprocess.run(
+            ["python3", str(path)] + args,
+            timeout=7200,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        err(f"{label or path.name} timed out")
+        return False
+    except KeyboardInterrupt:
+        warn("Interrupted")
+        return False
+
+
+# ── Check prerequisites ────────────────────────────────────────────────────
+
+def check_prereqs() -> dict:
+    """Check what's available on this system."""
+    status = {}
+
+    # Python deps
+    for mod, name in [("requests","requests"),("socks","PySocks"),("stem","stem"),
+                      ("monero","monero"),("psutil","psutil"),("tenacity","tenacity")]:
+        try:
+            __import__(mod)
+            status[name] = True
+        except ImportError:
+            status[name] = False
+
+    # Tor
+    try:
+        import requests as _r
+        resp = _r.get("https://check.torproject.org/api/ip",
+                       proxies={"http":"socks5h://127.0.0.1:9050","https":"socks5h://127.0.0.1:9050"},
+                       timeout=10)
+        status["tor"] = resp.json().get("IsTor", False)
+    except Exception:
+        status["tor"] = False
+
+    # Monero
+    for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
+        status[tool] = shutil.which(tool) is not None
+
+    # Wallet RPC running?
+    try:
+        import requests as _r
+        resp = _r.post("http://127.0.0.1:18083/json_rpc",
+                        json={"jsonrpc":"2.0","id":"0","method":"get_height"},
+                        timeout=3)
+        status["wallet_rpc"] = resp.status_code == 200
+    except Exception:
+        status["wallet_rpc"] = False
+
+    return status
+
+
+def show_status(st: dict):
+    heading("System Status")
+    for name, ok_val in [
+        ("Python: requests", st.get("requests")),
+        ("Python: PySocks", st.get("PySocks")),
+        ("Python: stem", st.get("stem")),
+        ("Python: monero", st.get("monero")),
+        ("Python: psutil", st.get("psutil")),
+        ("Python: tenacity", st.get("tenacity")),
+    ]:
+        (ok if ok_val else err)(name)
+
+    print()
+    (ok if st.get("tor") else err)("Tor SOCKS proxy (127.0.0.1:9050)")
+    for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
+        (ok if st.get(tool) else warn)(f"{tool}")
+    (ok if st.get("wallet_rpc") else warn)("wallet-rpc responding (127.0.0.1:18083)")
+
+    missing = [n for n in ["requests","PySocks","stem","monero","psutil","tenacity"] if not st.get(n)]
+    if missing:
+        print(f"\n  {R}Missing deps:{N} python3 -m pip install {' '.join(missing)}")
+    if not st.get("tor"):
+        print(f"  {R}Tor not running:{N} sudo systemctl start tor")
+
+    return len(missing) == 0 and st.get("tor", False)
+
+
+# ── Main Menu ──────────────────────────────────────────────────────────────
+
+def menu_main():
+    clear()
+    banner()
+    print(f"  {B}1{N}  {G}Full Pipeline{N}          BTC → mixed XMR (guided setup)")
+    print(f"  {B}2{N}  {G}Receive Mode{N}           Mix XMR that already arrived")
+    print(f"  {B}3{N}  {G}Cold / Air-Gap{N}          Create unsigned plan for offline signing")
+    print(f"  {B}4{N}  {G}Broadcast{N}              Send signed TXs to network")
+    print(f"  {B}5{N}  {G}Resume{N}                 Continue from a crash")
+    print()
+    print(f"  {B}6{N}  {C}Create Wallet{N}          Generate new receive address")
+    print(f"  {B}7{N}  {C}Swap Preparer{N}          Get ThorChain deposit address")
+    print(f"  {B}8{N}  {C}Exit Planner{N}           Plan XMR off-ramp")
+    print()
+    print(f"  {B}9{N}  {M}Paranoia Cleanup{N}       Wipe all traces from this machine")
+    print(f"  {B}0{N}  {M}System Check{N}           Verify deps, Tor, Monero")
+    print()
+    print(f"  {B}t{N}  {Y}Testnet / Dry Run{N}      Simulate full pipeline (no real funds)")
+    print()
+    print(f"  {D}q  quit{N}")
+    print()
+    return prompt("Choose").strip().lower()
+
+
+# ── Guided flows ───────────────────────────────────────────────────────────
+
+def get_tor_proxy() -> str:
+    p = prompt("Tor SOCKS proxy", "socks5h://127.0.0.1:9050")
+    if p.startswith("socks5://") and not p.startswith("socks5h://"):
+        warn("socks5:// leaks DNS — switching to socks5h://")
+        p = p.replace("socks5://", "socks5h://", 1)
+    return p
+
+
+def get_rpc() -> str:
+    return prompt("Wallet RPC endpoint", "http://127.0.0.1:18083")
+
+
+def flow_full_pipeline():
+    heading("Full Pipeline: BTC → Mixed XMR")
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+    btc = prompt("Your BTC address (bech32, bc1...)")
+    amt = prompt("BTC amount to swap")
+    splits = prompt("Split into how many chunks?", "2")
+    wallets = prompt("Number of mix wallets", "10")
+    depth = prompt("Mix depth", "2")
+
+    api_key = os.environ.get("SWAPKIT_API_KEY", "")
+    if not api_key:
+        api_key = prompt("SwapKit API key (or press Enter to skip)", "")
+
+    print()
+    info("Starting GhostSpiral full pipeline...")
+    info("This will: fetch quotes → build mixing DAG → sign → broadcast → clean up")
+    print()
+
+    args = [
+        "--btc-entry", btc,
+        "--btc-amount", amt,
+        "--split", splits,
+        "--wallets", wallets,
+        "--deep", depth,
+        "--tor-proxy", tor,
+        "--rpc-primary", rpc,
+    ]
+    if api_key:
+        args += ["--swapkit-api-key", api_key]
+
+    run_script(CORE / "GhostSpiral", args, "GhostSpiral")
+
+
+def flow_receive():
+    heading("Receive Mode: Mix XMR Already On Your Address")
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+
+    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    if wallet_files:
+        info(f"Found wallet files: {', '.join(f.name for f in wallet_files)}")
+        wf = prompt("Wallet JSON file", str(wallet_files[0]))
+    else:
+        wf = prompt("Path to wallet JSON file (from 'Create Wallet')")
+
+    wallets = prompt("Number of mix wallets", "10")
+    depth = prompt("Mix depth", "2")
+
+    args = [
+        "--receive-wallet", wf,
+        "--tor-proxy", tor,
+        "--rpc-primary", rpc,
+        "--wallets", wallets,
+        "--deep", depth,
+    ]
+    run_script(CORE / "GhostSpiral", args, "GhostSpiral receive mode")
+
+
+def flow_cold():
+    heading("Cold / Air-Gap Mode")
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+
+    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    if wallet_files:
+        wf = prompt("Wallet JSON file", str(wallet_files[0]))
+    else:
+        wf = prompt("Path to wallet JSON file")
+
+    info("This creates an unsigned plan. Transfer it to your offline machine for signing.")
+    print()
+
+    args = [
+        "--receive-wallet", wf,
+        "--tor-proxy", tor,
+        "--rpc-primary", rpc,
+        "--cold",
+    ]
+    if run_script(CORE / "GhostSpiral", args, "GhostSpiral cold mode"):
+        print()
+        ok("Unsigned plan created in ./unsigned/")
+        info("Next steps:")
+        info("  1. Copy the unsigned/ folder to USB")
+        info("  2. On your offline machine, run:")
+        info(f"     python3 {CORE / 'airgap_tx_signer'} unsigned/unsigned_*.json \\")
+        info(f"       --phase sign --wallet-file /path/to/wallet --outdir tx_staging")
+        info("  3. Copy tx_staging/signed/ back to this machine")
+        info("  4. Choose option 4 (Broadcast) from the main menu")
+
+
+def flow_broadcast():
+    heading("Broadcast Signed TXs")
+    tor = get_tor_proxy()
+
+    signed_dir = Path("tx_staging/signed")
+    if signed_dir.is_dir():
+        path = prompt("Signed blobs directory", str(signed_dir))
+    else:
+        path = prompt("Path to signed blobs (directory or manifest JSON)")
+
+    rpc = prompt("Monero daemon RPC", "http://127.0.0.1:18081")
+    wrpc = prompt("Wallet RPC (for submit_transfer)", "http://127.0.0.1:18083")
+
+    args = [
+        path,
+        "--tor-proxy", tor,
+        "--rpc", rpc,
+        "--wallet-rpc", wrpc,
+    ]
+    run_script(CORE / "broadcast_signed_xmr", args, "Broadcaster")
+
+
+def flow_resume():
+    heading("Resume From Crash")
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+
+    plans = sorted(Path("unsigned").glob("unsigned_*.json")) if Path("unsigned").is_dir() else []
+    if plans:
+        info(f"Found plans: {', '.join(p.name for p in plans)}")
+        plan = prompt("Plan file to resume", str(plans[-1]))
+    else:
+        plan = prompt("Path to unsigned plan JSON")
+
+    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wf = prompt("Wallet JSON file", str(wallet_files[0]) if wallet_files else "")
+
+    args = [
+        "--receive-wallet", wf,
+        "--resume-plan", plan,
+        "--tor-proxy", tor,
+        "--rpc-primary", rpc,
+    ]
+    run_script(CORE / "GhostSpiral", args, "GhostSpiral resume")
+
+
+def flow_create_wallet():
+    heading("Create Receive Wallet")
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+    args = ["--rpc", rpc, "--tor-proxy", tor]
+    run_script(CORE / "create_receive_wallet", args, "Wallet creator")
+
+
+def flow_swap_preparer():
+    heading("ThorChain Swap Preparer")
+    tor = get_tor_proxy()
+
+    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    if wallet_files:
+        info(f"Found: {', '.join(f.name for f in wallet_files)}")
+
+    amt = prompt("BTC amount to swap")
+    dest = prompt("XMR destination address (or wallet JSON path)")
+    if dest.endswith(".json") and Path(dest).exists():
+        import json
+        dest = json.load(open(dest))["address"]
+        info(f"Loaded address from JSON: {dest[:8]}...{dest[-8:]}")
+
+    api_key = os.environ.get("SWAPKIT_API_KEY", "")
+    if not api_key:
+        api_key = prompt("SwapKit API key", "")
+
+    args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor]
+    if api_key:
+        args += ["--api-key", api_key]
+    run_script(CORE / "thor_swap_preparer", args, "Swap preparer")
+
+
+def flow_exit_planner():
+    heading("Exit Strategy Planner")
+    tor = get_tor_proxy()
+    amt = prompt("XMR amount to off-ramp")
+    method = prompt("Method (bisq / haveno / p2p / azteco)", "bisq")
+    args = [amt, "--method", method, "--tor-proxy", tor]
+    run_script(CORE / "exit_strategy_simulator", args, "Exit planner")
+
+
+def flow_paranoia():
+    heading("Paranoia Mode — Wipe All Traces")
+    iface = prompt("Network interface", "wlan0")
+
+    if confirm("Dry run first? (shows what WOULD be deleted without deleting)"):
+        run_script(OPSEC / "paranoia_mode", ["--iface", iface, "--dry-run"], "Paranoia dry-run")
+        print()
+        if not confirm("Proceed with REAL wipe? THIS IS DESTRUCTIVE"):
+            return
+
+    run_script(OPSEC / "paranoia_mode", ["--iface", iface], "Paranoia mode")
+
+
+def flow_testnet():
+    heading("Testnet / Dry Run Mode")
+    print(f"  This simulates the full pipeline without touching real funds.")
+    print(f"  It creates a mock plan with fake 10 XMR balance and runs through")
+    print(f"  all stages except actual broadcast.\n")
+
+    tor = get_tor_proxy()
+    rpc = get_rpc()
+
+    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    if wallet_files:
+        wf = prompt("Wallet JSON (or press Enter to create one)", str(wallet_files[0]))
+    else:
+        info("No wallet found — creating one first...")
+        run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor], "Wallet creator")
+        wallet_files = sorted(Path(".").glob("wallet_*.json"))
+        if not wallet_files:
+            err("Failed to create wallet")
+            return
+        wf = str(wallet_files[0])
+
+    info("Running GhostSpiral in cold mode (creates plan, no broadcast)...")
+    args = [
+        "--receive-wallet", wf,
+        "--tor-proxy", tor,
+        "--rpc-primary", rpc,
+        "--cold",
+    ]
+    if run_script(CORE / "GhostSpiral", args, "GhostSpiral testnet"):
+        ok("Dry-run plan created in ./unsigned/")
+        plans = sorted(Path("unsigned").glob("unsigned_*.json"))
+        if plans:
+            info(f"Plan: {plans[-1]}")
+            import json
+            with open(plans[-1]) as f:
+                p = json.load(f)
+            txs = p.get("txs", [])
+            info(f"TXs in plan: {len(txs)}")
+            if txs:
+                total = sum(float(t["amt"]) for t in txs)
+                info(f"Total amount: {total:.4f} XMR (mock)")
+            if p.get("meta", {}).get("mock"):
+                warn("This is a MOCK plan — cannot be signed/broadcast with real wallet")
+
+        if confirm("Run paranoia cleanup (dry-run) to see what would be wiped?"):
+            run_script(OPSEC / "paranoia_mode", ["--dry-run"], "Paranoia dry-run")
+
+
+def flow_system_check():
+    heading("System Check")
+    st = check_prereqs()
+    ready = show_status(st)
+    print()
+    if ready:
+        ok("System is ready for GhostSpiral!")
+    else:
+        warn("Some components are missing — see above")
+        if confirm("Run installer to fix missing deps?"):
+            subprocess.run(["bash", str(ROOT / "install.sh")])
+
+
+# ── CLI passthrough ────────────────────────────────────────────────────────
 
 TOOLS = {
-    # Core pipeline
-    "ghostspiral":  ROOT / "core" / "GhostSpiral",
-    "gs":           ROOT / "core" / "GhostSpiral",
-    "signer":       ROOT / "core" / "airgap_tx_signer",
-    "broadcast":    ROOT / "core" / "broadcast_signed_xmr",
-    "wallet":       ROOT / "core" / "create_receive_wallet",
-    "swap":         ROOT / "core" / "thor_swap_preparer",
-    "exit":         ROOT / "core" / "exit_strategy_simulator",
-
-    # Modules
-    "dag":          ROOT / "modules" / "PAG",
-    "labels":       ROOT / "modules" / "labelmask",
-    "poison":       ROOT / "modules" / "label_poisoner",
-    "leaves":       ROOT / "modules" / "fake_leaf_inserter",
-    "noise":        ROOT / "modules" / "noise",
-    "mutate":       ROOT / "modules" / "ghostmutator",
-    "wdna":         ROOT / "modules" / "wdna",
-    "seed":         ROOT / "modules" / "en_seeder",
-    "unify":        ROOT / "modules" / "ghost_unifier",
-    "retry":        ROOT / "modules" / "swap_retry_guard",
-    "juggler":      ROOT / "modules" / "tor_endpoint_juggler",
-    "timing":       ROOT / "modules" / "vm_runtime",
-
-    # OPSEC
-    "paranoia":     ROOT / "opsec" / "paranoia_mode",
-    "logpoison":    ROOT / "opsec" / "error_log_poisoner",
-    "mirror":       ROOT / "opsec" / "mirrormask",
-    "deadman":      ROOT / "opsec" / "dmswitch",
-    "memseed":      ROOT / "opsec" / "SML",
-    "intfake":      ROOT / "opsec" / "integrity_faker",
-    "verify":       ROOT / "opsec" / "idk",
-
-    # Intel
-    "collect":      ROOT / "intel" / "collectgrab",
-    "gather":       ROOT / "intel" / "testergatherSystem",
+    "ghostspiral": CORE/"GhostSpiral", "gs": CORE/"GhostSpiral",
+    "signer": CORE/"airgap_tx_signer", "broadcast": CORE/"broadcast_signed_xmr",
+    "wallet": CORE/"create_receive_wallet", "swap": CORE/"thor_swap_preparer",
+    "exit": CORE/"exit_strategy_simulator",
+    "dag": MODS/"PAG", "labels": MODS/"labelmask", "poison": MODS/"label_poisoner",
+    "leaves": MODS/"fake_leaf_inserter", "noise": MODS/"noise",
+    "mutate": MODS/"ghostmutator", "wdna": MODS/"wdna", "seed": MODS/"en_seeder",
+    "unify": MODS/"ghost_unifier", "retry": MODS/"swap_retry_guard",
+    "juggler": MODS/"tor_endpoint_juggler", "timing": MODS/"vm_runtime",
+    "paranoia": OPSEC/"paranoia_mode", "logpoison": OPSEC/"error_log_poisoner",
+    "mirror": OPSEC/"mirrormask", "deadman": OPSEC/"dmswitch",
+    "memseed": OPSEC/"SML", "intfake": OPSEC/"integrity_faker", "verify": OPSEC/"idk",
+    "collect": INTEL/"collectgrab", "gather": INTEL/"testergatherSystem",
 }
 
-def show_tools():
-    print("\n  GhostSpiral Toolkit — Available Tools\n")
-    print("  CORE PIPELINE (handles real money):")
-    for name in ["ghostspiral", "signer", "broadcast", "wallet", "swap", "exit"]:
-        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
-    print("\n  MODULES (mixing / chaos):")
-    for name in ["dag", "labels", "poison", "leaves", "noise", "mutate",
-                 "wdna", "seed", "unify", "retry", "juggler", "timing"]:
-        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
-    print("\n  OPSEC (cleanup / anti-forensics):")
-    for name in ["paranoia", "logpoison", "mirror", "deadman", "memseed", "intfake", "verify"]:
-        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
-    print("\n  INTEL (collection):")
-    for name in ["collect", "gather"]:
-        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
-    print(f"\n  Usage: python3 run <tool> [args...]")
-    print(f"  Example: python3 run ghostspiral --receive-wallet wallet.json --tor-proxy socks5h://127.0.0.1:9050\n")
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("list", "help", "--help", "-h"):
-        show_tools()
-        return
-
+def cli_passthrough():
+    """Direct CLI mode: python3 run <tool> [args...]"""
     tool_name = sys.argv[1].lower()
     if tool_name not in TOOLS:
-        print(f"[!] Unknown tool: {tool_name}")
-        show_tools()
+        print(f"  {R}[!]{N} Unknown tool: {tool_name}")
+        print(f"  Available: {', '.join(sorted(set(TOOLS.keys())))}")
         sys.exit(1)
-
     tool_path = TOOLS[tool_name]
     if not tool_path.exists():
-        print(f"[!] Tool file not found: {tool_path}")
+        print(f"  {R}[!]{N} File not found: {tool_path}")
         sys.exit(1)
-
     os.execvp("python3", ["python3", str(tool_path)] + sys.argv[2:])
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+def main():
+    # If args given, use direct CLI mode
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg in ("list", "--list"):
+            print(f"\n  {B}Available tools:{N}")
+            for name, path in sorted(TOOLS.items()):
+                print(f"    {name:14s} → {path.relative_to(ROOT)}")
+            print(f"\n  Usage: python3 run <tool> [args...]\n")
+            return
+        if arg in ("help", "--help", "-h"):
+            banner()
+            print(f"  {B}Interactive mode:{N}  python3 run")
+            print(f"  {B}Direct mode:{N}       python3 run <tool> [args...]")
+            print(f"  {B}List tools:{N}        python3 run list\n")
+            return
+        cli_passthrough()
+        return
+
+    # Interactive mode
+    while True:
+        try:
+            choice = menu_main()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        try:
+            if choice == "1":
+                flow_full_pipeline()
+            elif choice == "2":
+                flow_receive()
+            elif choice == "3":
+                flow_cold()
+            elif choice == "4":
+                flow_broadcast()
+            elif choice == "5":
+                flow_resume()
+            elif choice == "6":
+                flow_create_wallet()
+            elif choice == "7":
+                flow_swap_preparer()
+            elif choice == "8":
+                flow_exit_planner()
+            elif choice == "9":
+                flow_paranoia()
+            elif choice == "0":
+                flow_system_check()
+            elif choice == "t":
+                flow_testnet()
+            elif choice in ("q", "quit", "exit"):
+                break
+            else:
+                warn(f"Unknown option: {choice}")
+                continue
+        except (EOFError, KeyboardInterrupt):
+            print()
+            continue
+
+        if choice not in ("q", "quit", "exit"):
+            print()
+            input(f"  {D}Press Enter to return to menu...{N}")
+
 
 if __name__ == "__main__":
     main()
