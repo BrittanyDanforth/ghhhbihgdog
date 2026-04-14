@@ -275,10 +275,11 @@ class NoiseEvent:
 
 
 class AdvancedNoiseGenerator:
-    def __init__(self, proxy_url: str, rng: random.Random, intensity: str = "medium"):
+    def __init__(self, proxy_url: str, rng: random.Random, intensity: str = "medium", onion_only: bool = False):
         self.proxy_url = proxy_url
         self.rng = rng
         self.intensity_config = INTENSITY_CONFIGS[intensity]
+        self.onion_only = onion_only
         self.events: List[NoiseEvent] = []
         self.session = create_session(proxy_url, rng)
         self.circuit_refresh_count = 0
@@ -366,12 +367,9 @@ class AdvancedNoiseGenerator:
     
     def generate_burst(self, num_events: int) -> List[NoiseEvent]:
         """Generate a burst of concurrent requests"""
-        actions = [
-            self._dummy_crypto_query,
-            self._dummy_clearnet_browse,
-            self._dummy_onion_access,
-            self._dummy_api_call,
-        ]
+        actions = [self._dummy_onion_access]
+        if not self.onion_only:
+            actions.extend([self._dummy_crypto_query, self._dummy_clearnet_browse, self._dummy_api_call])
         
         events = []
         threads = []
@@ -428,12 +426,9 @@ class AdvancedNoiseGenerator:
                 pause = self.rng.uniform(30, 90)
             else:
                 # Single event
-                actions = [
-                    self._dummy_crypto_query,
-                    self._dummy_clearnet_browse,
-                    self._dummy_onion_access,
-                    self._dummy_api_call,
-                ]
+                actions = [self._dummy_onion_access]
+                if not self.onion_only:
+                    actions.extend([self._dummy_crypto_query, self._dummy_clearnet_browse, self._dummy_api_call])
                 
                 action = self.rng.choice(actions)
                 event = action()
@@ -485,9 +480,6 @@ def main():
     if not args.onion_only:
         print("  [!] WARNING: Noise traffic exits to clearnet via Tor. "
               "Use --onion-only for onion-only traffic.", file=sys.stderr)
-    else:
-        CLEARNET_ENDPOINTS.clear()
-        CRYPTO_ENDPOINTS.clear()
     
     # Validate proxy
     if not args.tor_proxy.startswith("socks5h://"):
@@ -519,7 +511,8 @@ def main():
     
     # Generate noise
     try:
-        generator = AdvancedNoiseGenerator(args.tor_proxy, rng, args.intensity)
+        generator = AdvancedNoiseGenerator(args.tor_proxy, rng, args.intensity,
+                                             onion_only=args.onion_only)
         events = generator.generate_noise(args.duration)
         
         success_count = sum(1 for e in events if e.success)
