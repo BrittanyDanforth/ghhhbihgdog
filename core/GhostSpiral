@@ -42,6 +42,15 @@ from gs_common import (
     scrub_address,
 )
 
+# Monero fee priority multipliers relative to the default (priority 1).
+# Source: wallet2.cpp get_fee_multiplier(). These are approximate.
+FEE_PRIORITY_MULTIPLIER = {
+    1: Decimal("1"),
+    2: Decimal("4"),
+    3: Decimal("20"),
+    4: Decimal("166"),
+}
+
 DUST_XMR = Decimal("0.0001")
 BTC_RE = re.compile(
     r"^(bc1[ac-hj-np-z02-9]{25,59}|tb1[ac-hj-np-z02-9]{25,59}"
@@ -172,8 +181,14 @@ def main():
         try:
             res = rpc_primary.raw_request("get_balance", {"account_index": _acct_idx})
             bal = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
-        except Exception:
-            pass
+        except Exception as _bal_err:
+            integrity_log("stage5", f"resume_rpc_unreachable:{str(_bal_err)[:40]}")
+            sys.exit(
+                f"[!] Cannot reach wallet-rpc at {args.rpc_primary}\n"
+                f"    Error: {str(_bal_err)[:80]}\n"
+                f"    Resume requires a working RPC to create/broadcast TXs.\n"
+                f"    Start monero-wallet-rpc and retry."
+            )
 
         staging_dir = "tx_staging"
         lock_path = Path(".mixer.lock")
@@ -282,8 +297,21 @@ def main():
     # ---- Validate inputs early ----
     if args.btc_amount is not None and args.btc_amount <= 0:
         sys.exit(f"[!] --btc-amount must be positive, got {args.btc_amount}")
+    if args.wallets < MIN_WALLETS:
+        print(f"  [!] --wallets {args.wallets} below minimum {MIN_WALLETS}, clamping up.")
+    if args.deep < MIN_DEEP:
+        print(f"  [!] --deep {args.deep} below minimum {MIN_DEEP}, clamping up.")
     args.wallets = max(args.wallets, MIN_WALLETS)
     args.deep = max(args.deep, MIN_DEEP)
+
+    if args.wallets <= 5 or args.deep <= 1:
+        effective_rounds = args.wallets * 2 * args.deep
+        print(f"  [!] WARNING: Weak mixing parameters (wallets={args.wallets}, "
+              f"depth={args.deep}, rounds={effective_rounds}).")
+        print(f"  [!] Low wallet count and depth produce fewer mixing hops,")
+        print(f"  [!] making transaction graph analysis significantly easier.")
+        print(f"  [!] Recommended: --wallets 10+ --deep 2+ for meaningful privacy.")
+        integrity_log("stage0", f"weak_mixing_params:w={args.wallets}:d={args.deep}")
 
     proxy = validate_proxy(args.tor_proxy)
 
@@ -603,6 +631,7 @@ def main():
     newnym()
     tor_recheck(proxy, "stage2_exec")
 
+    swap_deposits = []
     if receive_mode:
         integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
         print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
@@ -621,6 +650,27 @@ def main():
                 btc_chunks[0] += remainder
             integrity_log("stage2", f"btc_split:{num_splits}_chunks:{per_chunk}_each")
             print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
+
+        # Pre-validate: warn if chunks are suspiciously small (likely below
+        # ThorChain minimum). The actual minimum varies by pool depth and is
+        # checked per-quote inside _thornode_quote, but this catches the
+        # obvious case of --split 50 with 0.01 BTC before burning Tor circuits.
+        THORCHAIN_APPROX_MIN_BTC = Decimal("0.0005")
+        if btc_chunks:
+            small_chunks = [c for c in btc_chunks if c < THORCHAIN_APPROX_MIN_BTC]
+            if small_chunks:
+                print(f"  [!] WARNING: {len(small_chunks)} of {len(btc_chunks)} chunks "
+                      f"are below ~{THORCHAIN_APPROX_MIN_BTC} BTC.")
+                print(f"  [!] Smallest chunk: {min(btc_chunks)} BTC")
+                print(f"  [!] ThorChain has a minimum swap amount that varies by pool depth.")
+                print(f"  [!] These chunks will likely be rejected or refunded minus fees.")
+                print(f"  [!] Consider using fewer --split chunks or a larger --btc-amount.")
+                integrity_log("stage2", f"small_chunks_warning:{len(small_chunks)}_of_{len(btc_chunks)}")
+            if all(c < THORCHAIN_APPROX_MIN_BTC for c in btc_chunks):
+                sys.exit(
+                    f"[!] ALL {len(btc_chunks)} chunks are below ~{THORCHAIN_APPROX_MIN_BTC} BTC.\n"
+                    f"    Every swap will fail. Reduce --split or increase --btc-amount."
+                )
 
         if btc_chunks:
             swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
@@ -722,9 +772,16 @@ def main():
             )
 
     rounds = args.wallets * 2 * args.deep
-    per_round_fee = fee_xmr * Decimal("1.5")  # 1 TX/round + 50% safety margin for fee spikes
+    priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))
+    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")  # base * priority * 50% safety margin
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
+
+    if args.fee_priority >= 3:
+        print(f"  [!] WARNING: Fee priority {args.fee_priority} (multiplier {priority_mult}x) "
+              f"dramatically increases TX costs.")
+        print(f"  [!] Estimated total fees: {total_fees:.6f} XMR for {rounds} rounds.")
+        print(f"  [!] Use priority 1-2 unless the mempool is congested.")
 
     if usable <= DUST_XMR:
         sys.exit(
@@ -814,6 +871,14 @@ def main():
     except Exception:
         pass
 
+    # Collect ThorChain quote expiry for plan metadata. Air-gap operators
+    # need this to know whether quotes are still valid when they return.
+    _earliest_quote_expiry = 0
+    if swap_deposits:
+        _expiries = [d.get("expiry", 0) for d in swap_deposits if d.get("expiry", 0) > 0]
+        if _expiries:
+            _earliest_quote_expiry = min(_expiries)
+
     meta = {
         "schema": "plan_v1",
         "created": int(time.time()) // 600 * 600,
@@ -823,7 +888,10 @@ def main():
         "account_index": bal_account,
         "wallet_primary": _wallet_primary,
         "daemon_height": h1,
+        "fee_priority": args.fee_priority,
     }
+    if _earliest_quote_expiry > 0:
+        meta["thorchain_quote_expiry"] = _earliest_quote_expiry
     if is_mock_plan:
         meta["mock"] = True
     if not receive_mode and args.btc_entry:
@@ -848,6 +916,24 @@ def main():
                 stale_path.unlink()
                 integrity_log("stage4", f"cleaned_stale:{stale}")
         print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
+        if not is_mock_plan:
+            print(f"  [!] ╔══════════════════════════════════════════════════╗")
+            print(f"  [!] ║  OPSEC WARNING: PLAN FILE CONTAINS REAL DATA    ║")
+            print(f"  [!] ║                                                  ║")
+            print(f"  [!] ║  {str(ufile.name).ljust(48)} ║")
+            print(f"  [!] ║  contains the FULL mixing graph: every source   ║")
+            print(f"  [!] ║  and destination XMR address in your pipeline.  ║")
+            print(f"  [!] ║                                                  ║")
+            print(f"  [!] ║  If this file is seized (USB stick, backup,     ║")
+            print(f"  [!] ║  cloud sync, forensic recovery), your entire    ║")
+            print(f"  [!] ║  transaction graph is exposed.                  ║")
+            print(f"  [!] ║                                                  ║")
+            print(f"  [!] ║  AFTER SIGNING AND BROADCAST:                   ║")
+            print(f"  [!] ║  - Securely wipe this file (shred -u)          ║")
+            print(f"  [!] ║  - Wipe the USB transfer medium                 ║")
+            print(f"  [!] ║  - Run paranoia cleanup (option 9)              ║")
+            print(f"  [!] ╚══════════════════════════════════════════════════╝")
+            integrity_log("stage4", "real_balance_plan_opsec_warning")
         integrity_log("stage4", f"{mode}_exit")
         sys.exit(0)
 
@@ -1012,6 +1098,31 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     with open(str(ufile)) as _pf:
         plan_data = json.load(_pf)
     plan_txs = plan_data.get("txs", [])
+
+    # Check ThorChain quote expiry. In air-gap workflows the operator may
+    # return hours after plan creation. Expired quotes mean the deposit
+    # address has rotated — sending BTC to the old address = funds stuck.
+    _quote_expiry = plan_data.get("meta", {}).get("thorchain_quote_expiry", 0)
+    if _quote_expiry > 0:
+        _now = int(time.time())
+        _remaining = _quote_expiry - _now
+        if _remaining <= 0:
+            _expired_ago = abs(_remaining)
+            integrity_log("stage5", f"THORCHAIN_QUOTE_EXPIRED:{_expired_ago}s_ago")
+            print(f"  [!] ╔══════════════════════════════════════════════════╗")
+            print(f"  [!] ║  THORCHAIN QUOTE EXPIRED!                       ║")
+            print(f"  [!] ║                                                  ║")
+            print(f"  [!] ║  The ThorChain deposit address in this plan     ║")
+            print(f"  [!] ║  expired {str(_expired_ago // 60).ljust(5)} minutes ago.                  ║")
+            print(f"  [!] ║                                                  ║")
+            print(f"  [!] ║  If you already sent BTC: check ThorChain       ║")
+            print(f"  [!] ║  explorer for your TX status.                   ║")
+            print(f"  [!] ║  If you have NOT sent BTC: regenerate the plan  ║")
+            print(f"  [!] ║  to get a fresh quote with a new deposit addr.  ║")
+            print(f"  [!] ╚══════════════════════════════════════════════════╝")
+        elif _remaining < 600:
+            print(f"  [!] WARNING: ThorChain quote expires in {_remaining // 60}m {_remaining % 60}s!")
+            print(f"  [!] Send BTC to the deposit address IMMEDIATELY or regenerate the plan.")
 
     # BUG 82 FIX: Wallet identity check — abort if the connected wallet
     # doesn't match the wallet that created the plan. Without this, resuming
