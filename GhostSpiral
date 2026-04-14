@@ -590,7 +590,8 @@ def main():
 
     if args.cold or args.airgap:
         mode = "cold" if args.cold else "airgap"
-        for stale in ["signer_progress.json", "broadcast_progress.json"]:
+        for stale in ["signer_progress.json", "broadcast_progress.json",
+                       "stage5_progress.json"]:
             stale_path = Path(stale)
             if stale_path.exists():
                 stale_path.unlink()
@@ -801,39 +802,48 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             fail_count += 1
             break
 
+        # Hot wallets write presigned TXs directly to signed/tx_N.signed
+        # (no unsigned file created). View-only wallets write tx_N.unsigned.
         unsigned_file = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
-        if not unsigned_file.exists():
-            print(f"  [!] TX {tx_idx}: unsigned file not created — ABORTING.")
+        presigned_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+        is_presigned = presigned_file.exists() and not unsigned_file.exists()
+
+        if not unsigned_file.exists() and not presigned_file.exists():
+            print(f"  [!] TX {tx_idx}: neither unsigned nor presigned file created — ABORTING.")
             fail_count += 1
             break
 
-        # Step 2: Sign the unsigned TX
-        print(f"  [*] Step 2: Signing TX {tx_idx}...")
-        try:
-            sign_cmd = [
-                "python3", "airgap_tx_signer", str(ufile),
-                "--phase", "sign",
-                "--wallet-file", args.wallet_file,
-                "--outdir", staging_dir,
-                "--tx-index", str(tx_idx),
-            ]
-            subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env)
-        except subprocess.CalledProcessError as e:
-            integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
-            print(f"  [!] TX {tx_idx} signing failed — ABORTING pipeline.")
-            fail_count += 1
-            break
-        except subprocess.TimeoutExpired:
-            integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
-            print(f"  [!] TX {tx_idx} sign timed out — ABORTING pipeline.")
-            fail_count += 1
-            break
+        if is_presigned:
+            print(f"  [skip] Step 2: TX {tx_idx} already signed (hot wallet)")
+            signed_file = presigned_file
+        else:
+            # Step 2: Sign the unsigned TX
+            print(f"  [*] Step 2: Signing TX {tx_idx}...")
+            try:
+                sign_cmd = [
+                    "python3", "airgap_tx_signer", str(ufile),
+                    "--phase", "sign",
+                    "--wallet-file", args.wallet_file,
+                    "--outdir", staging_dir,
+                    "--tx-index", str(tx_idx),
+                ]
+                subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env)
+            except subprocess.CalledProcessError as e:
+                integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
+                print(f"  [!] TX {tx_idx} signing failed — ABORTING pipeline.")
+                fail_count += 1
+                break
+            except subprocess.TimeoutExpired:
+                integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
+                print(f"  [!] TX {tx_idx} sign timed out — ABORTING pipeline.")
+                fail_count += 1
+                break
 
-        signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
-        if not signed_file.exists():
-            print(f"  [!] TX {tx_idx}: signed file not created — ABORTING.")
-            fail_count += 1
-            break
+            signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+            if not signed_file.exists():
+                print(f"  [!] TX {tx_idx}: signed file not created — ABORTING.")
+                fail_count += 1
+                break
 
         # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
         # If the process is killed between broadcast and progress save,

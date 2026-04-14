@@ -429,9 +429,9 @@ class EnhancedForensicMirrormask:
         # Introduce timing jitter
         time.sleep(random.uniform(1, 5))
         
-        # Exit with misleading message
-        print("[+] System maintenance completed successfully")
-        sys.exit(0)
+        # Warn but continue — VMs are common for legitimate use (Kali in VirtualBox)
+        print("[!] WARNING: VM/analysis indicators detected. Continuing with caution.")
+        print("[!] If this is intentional (testing in VM), ignore this warning.")
     
     def _generate_decoy_content(self) -> str:
         """Generate convincing decoy log content"""

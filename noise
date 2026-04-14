@@ -151,14 +151,17 @@ def load_json_secure(path: Path) -> Tuple[dict, str]:
 
 
 def validate_proxy(proxy_url: str) -> bool:
-    """Validate proxy connectivity and type"""
-    if not proxy_url.startswith(("socks5h://", "socks5://", "http://", "https://")):
+    """Validate proxy connectivity and type. Only socks5h:// is safe."""
+    if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
+        print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.", file=sys.stderr)
+        return False
+    if not proxy_url.startswith(("socks5h://", "http://", "https://")):
         return False
     
     try:
-        # Quick connectivity test
         proxies = {"http": proxy_url, "https": proxy_url}
-        response = requests.get("http://httpbin.org/ip", proxies=proxies, timeout=10)
+        response = requests.get("https://check.torproject.org/api/ip",
+                                proxies=proxies, timeout=10)
         return response.status_code == 200
     except Exception:
         return False

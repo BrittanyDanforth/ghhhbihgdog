@@ -76,11 +76,15 @@ class CryptoSecureRNG:
                 "version": "2.0"
             }
             
-            # Write atomically
+            # Write atomically with secure permissions
             temp_file = self.seed_file.with_suffix('.tmp')
             with open(temp_file, 'w') as f:
                 json.dump(entropy_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temp_file, 0o600)
             temp_file.replace(self.seed_file)
+            os.chmod(self.seed_file, 0o600)
             
             print(f"[+] Generated cryptographic entropy seed: {self.seed_file}")
     

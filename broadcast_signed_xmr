@@ -137,6 +137,19 @@ def main():
             except (ValueError, IndexError):
                 return 999999
         blobs = sorted(raw_blobs, key=_blob_sort_key)
+        # Warn loudly if no manifest — stale blobs from prior runs could be
+        # broadcast to wrong addresses/amounts without manifest filtering.
+        _dir_manifest = input_path / "signed_manifest_v1.json"
+        if not _dir_manifest.exists() and len(blobs) > 1:
+            print("  [!] WARNING: No signed_manifest_v1.json in directory!")
+            print("  [!] Cannot verify blob integrity or filter stale files.")
+            print("  [!] ALL .signed files in the directory will be broadcast.")
+            print("  [!] If this directory contains blobs from a previous run,")
+            print("  [!] they may send funds to WRONG addresses. Aborting.")
+            print("  [!] To override: use --path with specific file or manifest.")
+            integrity_log("broadcast", "ABORT:no_manifest_in_dir")
+            sys.exit("[!] Refusing to broadcast directory without manifest. "
+                     "See warnings above.")
     elif input_path.exists():
         blobs = [input_path]
 
@@ -173,6 +186,10 @@ def main():
     # Fallback: unsigned plan (only works if same machine/directory)
     if not tx_delays:
         plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+        if len(plan_files) > 1:
+            print(f"  [!] WARNING: {len(plan_files)} unsigned plans found in ./unsigned/")
+            print(f"  [!] Using newest: {plan_files[0].name}")
+            print(f"  [!] Delays may not match these blobs if plans differ.")
         if plan_files:
             try:
                 with open(plan_files[0]) as pf:

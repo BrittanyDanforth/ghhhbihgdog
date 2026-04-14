@@ -60,13 +60,13 @@ MUTATED   = RUNTIME / "ghostspiral_run_v16.py"
 MANIFEST  = MUTATED.with_suffix(".manifest.json")
 
 MODULES = {
-    "seed":   ["python3", "entropy_seeder.py"],
-    "dag":    ["python3", "dag_generator_v2.py"],
-    "labels": ["python3", "label_masker_v3.py"],
-    "poison": ["python3", "label_poisoner.py"],
-    "vm":     ["python3", "vm_runtime.py"],
-    "noise":  ["python3", "decoy_noise_v2.py"],
-    "mutate": ["python3", "ghost_mutator.py"],
+    "seed":   ["python3", "en_seeder"],
+    "dag":    ["python3", "PAG"],
+    "labels": ["python3", "labelmask"],
+    "poison": ["python3", "label_poisoner"],
+    "vm":     ["python3", "vm_runtime"],
+    "noise":  ["python3", "noise"],
+    "mutate": ["python3", "ghostmutator"],
 }
 
 # ---------------------------------------------------------------------------
@@ -92,8 +92,11 @@ def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = Tr
 
 
 def validate_tor_proxy(proxy_url: str) -> bool:
-    """Validate Tor proxy URL format."""
-    if not proxy_url.startswith(("socks5://", "socks5h://")):
+    """Validate Tor proxy URL format. Only socks5h:// is safe."""
+    if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
+        print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.")
+        return False
+    if not proxy_url.lower().startswith("socks5h://"):
         return False
     # Basic URL validation - could be more comprehensive
     try:

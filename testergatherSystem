@@ -75,6 +75,7 @@ except ImportError:
 
 try:
     from telethon.sync import TelegramClient
+    from telethon import events
     from telethon.tl.functions.messages import SearchGlobalRequest
     from telethon.tl.functions.channels import GetFullChannelRequest
     HAS_TELEGRAM = True
@@ -388,27 +389,28 @@ class ProxyChainManager:
         self.residential_proxies = self._get_residential_proxies()
         
     def _get_tor_proxies(self):
-        """Get Tor SOCKS proxies"""
+        """Get Tor SOCKS proxies (socks5h to resolve DNS at proxy)."""
         return [
-            "socks5://127.0.0.1:9050",
-            "socks5://127.0.0.1:9150"
+            "socks5h://127.0.0.1:9050",
+            "socks5h://127.0.0.1:9150"
         ]
         
     def _fetch_socks5_proxies(self):
-        """Fetch public SOCKS5 proxies"""
+        """Fetch public SOCKS5 proxies through Tor to avoid clearnet leak."""
         sources = [
             "https://api.proxyscrape.com/v2/?request=get&protocol=socks5",
             "https://www.proxy-list.download/api/v1/get?type=socks5"
         ]
-        
+        tor_proxy = {"http": "socks5h://127.0.0.1:9050",
+                      "https": "socks5h://127.0.0.1:9050"}
         proxies = []
         for source in sources:
             try:
-                resp = requests.get(source, timeout=10)
+                resp = requests.get(source, timeout=10, proxies=tor_proxy)
                 for line in resp.text.strip().split('\n'):
                     if ':' in line:
-                        proxies.append(f"socks5://{line.strip()}")
-            except:
+                        proxies.append(f"socks5h://{line.strip()}")
+            except Exception:
                 pass
                 
         return proxies[:20]  # Limit
@@ -1756,7 +1758,8 @@ class UltimateIntelOrchestrator:
         return results
         
     async def _generate_decoy_traffic(self):
-        """Generate decoy traffic to mask real activity"""
+        """Generate decoy traffic to mask real activity.
+        Routes through Tor SOCKS proxy to avoid clearnet leaks."""
         decoy_sites = [
             'https://www.amazon.com',
             'https://www.youtube.com',
@@ -1764,21 +1767,21 @@ class UltimateIntelOrchestrator:
             'https://www.nytimes.com',
             'https://www.wikipedia.org'
         ]
-        
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError:
+            logging.warning("aiohttp_socks not installed — decoy traffic disabled to avoid clearnet leak")
+            return
+
         while True:
             try:
-                # Random delay
                 await asyncio.sleep(random.randint(30, 300))
-                
-                # Visit decoy site
                 site = random.choice(decoy_sites)
-                
-                # Use separate session
-                async with aiohttp.ClientSession() as session:
+                connector = ProxyConnector.from_url('socks5://127.0.0.1:9050')
+                async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.get(site) as resp:
                         await resp.text()
-                        
-            except:
+            except Exception:
                 pass
                 
     def _generate_report(self, processed, raw_results):

@@ -108,12 +108,17 @@ def safe_float(value: Union[float, int], default: float = 0.0) -> float:
 # Enhanced metric snapshot functions
 # ---------------------------------------------------------------------------
 
-def probe_network_latency(host: str = "8.8.8.8", timeout: float = 2.0) -> float:
-    """Probe network latency via ping. Returns ms or 0.0 on failure."""
+def probe_network_latency(host: str = "127.0.0.1", timeout: float = 2.0) -> float:
+    """Probe network latency via ping. Returns ms or 0.0 on failure.
+
+    OPSEC: Default host is localhost (no clearnet traffic). ICMP ping to
+    external hosts (8.8.8.8) bypasses Tor and reveals real network path.
+    Only use non-localhost hosts on trusted local networks.
+    """
     try:
-        if os.name == 'nt':  # Windows
+        if os.name == 'nt':
             cmd = ['ping', '-n', '1', '-w', str(int(timeout * 1000)), host]
-        else:  # Unix-like
+        else:
             cmd = ['ping', '-c', '1', '-W', str(int(timeout)), host]
         
         start = time.perf_counter()

@@ -263,7 +263,7 @@ Examples:
         "source_ref": {"file": str(args.labels), "sha256": lbl_sha},
         "seed_ref": {"file": str(args.seed), "sha256": seed_sha},
         "dag_ref": {"file": str(args.dag), "sha256": dag_sha},
-        "rng_seed": rng_seed,  # Store for debugging/verification
+        "rng_seed_hash": hashlib.sha256(rng_seed.encode()).hexdigest()[:16],
         "labels": {},
     }
 

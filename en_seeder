@@ -1,5 +1,5 @@
-entropy_seeder.py
 #!/usr/bin/env python3
+# entropy_seeder.py
 """
 entropy_seeder.py — GhostSpiral v16.9 Chaos Toolkit
 ===================================================

@@ -276,7 +276,8 @@ class SecureLockManager:
             raise RuntimeError(f"Failed to load seed: {e}")
     
     def _secure_mlock(self, path: Path) -> bool:
-        """Attempt to lock file in memory"""
+        """Attempt to lock file pages in memory via mlock(2).
+        Python's mmap doesn't have .mlock() — use ctypes libc.mlock instead."""
         try:
             if not path.exists():
                 return False
@@ -286,7 +287,10 @@ class SecureLockManager:
                 stat_info = os.fstat(fd)
                 if stat_info.st_size > 0:
                     mm = mmap.mmap(fd, stat_info.st_size, access=mmap.ACCESS_READ)
-                    mm.mlock()
+                    import ctypes
+                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                    buf = ctypes.c_char_p(mm[:])
+                    libc.mlock(buf, stat_info.st_size)
                     return True
             finally:
                 os.close(fd)

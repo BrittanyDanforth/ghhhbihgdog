@@ -221,7 +221,7 @@ class PolymorphicGenerator:
         def chaotic(rng, amount):
             depth = secrets.randbelow(6) + 2
             fanout = lambda: secrets.randbelow(5) + 1
-            decoy_prob = secrets.random()
+            decoy_prob = secrets.randbelow(100) / 100.0
             return self._make_graph(rng, amount, depth, fanout, decoy_prob)
         
         strategies.extend([deep_narrow, wide_shallow, irregular, 
@@ -310,11 +310,12 @@ class PolymorphicGenerator:
                 child_amt = max(0.00000001, round(child_amt, 8))
                 child_id = make_id()
                 
-                # Randomly assign node types
-                if rng.random() < 0.1:  # 10% chance of special node
-                    node_type = rng.choice(["mixer", "exchange", "forward"])
+                # Node types compatible with labelmask validator:
+                # "root", "real", "decoy" (see labelmask validate_dag_structure)
+                if rng.random() < 0.15:
+                    node_type = "decoy"
                 else:
-                    node_type = "transfer"
+                    node_type = "real"
                 
                 nodes.append({
                     "id": child_id,

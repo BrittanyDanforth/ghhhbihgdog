@@ -117,23 +117,24 @@ def build_depth_map(nodes: List[Dict[str, Any]], edges: List[List[str]]) -> Dict
         print("[!] No root node found in DAG", file=sys.stderr)
         sys.exit(1)
     
-    root_id = sorted(root_candidates)[0]  # Use first alphabetically as root
-    
     # Build adjacency list
     children: Dict[str, List[str]] = {}
     for parent, child in edges:
         children.setdefault(parent, []).append(child)
     
-    # BFS to calculate depths
-    depth_map: Dict[str, int] = {root_id: 0}
-    queue = [root_id]
+    # BFS from ALL roots to handle multi-root DAGs correctly
+    depth_map: Dict[str, int] = {}
+    queue = []
+    for root_id in sorted(root_candidates):
+        depth_map[root_id] = 0
+        queue.append(root_id)
     
     while queue:
         current = queue.pop(0)
         current_depth = depth_map[current]
         
         for child in children.get(current, []):
-            if child not in depth_map:
+            if child not in depth_map or depth_map[child] > current_depth + 1:
                 depth_map[child] = current_depth + 1
                 queue.append(child)
     

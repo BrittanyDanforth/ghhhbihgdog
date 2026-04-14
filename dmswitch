@@ -484,8 +484,12 @@ class DeadManSwitch:
                 self.qr_manager.display_terminal_qr(token, auto_clear)
             else:
                 print(f"\n[+] UNLOCK TOKEN (keep secure):")
-                print(f"    {token}")
+                print(f"    {token[:8]}...{token[-8:]}")
+                print(f"    Full token written to: /dev/shm/gs_unlock_token")
                 print(f"\n[!] Token will be needed within {ttl} seconds")
+                _tk_path = Path("/dev/shm/gs_unlock_token")
+                _tk_path.write_text(token)
+                os.chmod(_tk_path, 0o600)
             
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)

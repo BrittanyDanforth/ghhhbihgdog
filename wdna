@@ -185,14 +185,17 @@ def create_gap_account(rng: random.Random) -> dict:
 
 
 def create_gap_subaddress(rng: random.Random) -> dict:
-    """Create a gap subaddress with realistic structure."""
+    """Create a gap subaddress with realistic structure.
+    Uses a plausible-looking random hex string as address placeholder
+    instead of empty string, which would crash tools expecting valid addresses."""
+    fake_addr = "4" + "".join(rng.choices("0123456789ABCDEFabcdef", k=94))
     return {
         "label": generate_secure_label(rng),
-        "address": "",  # Empty address for gap
+        "address": fake_addr,
         "balance": 0,
         "unlocked_balance": 0,
         "used": False,
-        "index": 0  # Will be updated during insertion
+        "index": 0
     }
 
 

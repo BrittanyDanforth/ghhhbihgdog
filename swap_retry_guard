@@ -139,11 +139,12 @@ class SecureMemory:
         return ctypes.string_at(self._ptr + offset, length)
         
     def secure_wipe(self):
-        """DoD 5220.22-M compliant wiping."""
-        for pattern in [b'\x00', b'\xFF', secrets.randbits(8 * self.size).to_bytes(self.size, 'big')]:
-            ctypes.memset(self._ptr, pattern[0] if len(pattern) == 1 else 0, self.size)
-            if len(pattern) > 1:
-                self.write(pattern[:self.size])
+        """Overwrite buffer with zeros, then ones, then random bytes."""
+        ctypes.memset(self._ptr, 0x00, self.size)
+        ctypes.memset(self._ptr, 0xFF, self.size)
+        rand_bytes = os.urandom(self.size)
+        self.write(rand_bytes)
+        ctypes.memset(self._ptr, 0x00, self.size)
         
     def __del__(self):
         self.secure_wipe()
@@ -178,13 +179,11 @@ class QuantumEntropyFusion:
             except:
                 pass
                 
-            # Network entropy
+            # Network entropy — use local interface info only (no clearnet traffic)
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                sources.append(s.getsockname()[1].to_bytes(4, 'big'))
-                s.close()
-            except:
+                sources.append(os.urandom(8))
+                sources.append(struct.pack('d', time.monotonic()))
+            except Exception:
                 pass
                 
             # Filesystem entropy
@@ -575,19 +574,18 @@ class AdvancedSwapOrchestrator:
         if idx <= self.progress["last"]:
             return True
             
-        # Phantom failure injection for traffic analysis resistance
+        # Phantom failure injection for traffic analysis resistance.
+        # IMPORTANT: Do NOT advance progress["last"] — phantom failures
+        # are decoy log entries, not real swap results. Advancing progress
+        # would cause this swap index to be silently skipped on resume.
         if self._should_inject_phantom_failure(idx):
             self.integrity_chain.add_entry("PHANTOM_FAIL", f"idx={idx}", {"type": "decoy"})
-            
-            # Update progress
-            self.progress["last"] = idx
             self.progress["log"].append({
                 "idx": idx,
                 "phantom": True,
                 "timestamp": time.time()
             })
             self._save_progress(self.progress)
-            return False
             
         # Dry run mode
         if hasattr(self.args, 'dry_run') and self.args.dry_run:
@@ -810,7 +808,10 @@ Examples:
     # Validate proxy chain
     for proxy_url in args.proxy_chain.split(','):
         proxy_url = proxy_url.strip()
-        if not proxy_url.startswith(('socks5://', 'socks5h://', 'http://', 'https://')):
+        if proxy_url.lower().startswith('socks5://') and not proxy_url.lower().startswith('socks5h://'):
+            print(f"[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead: {proxy_url}")
+            sys.exit(1)
+        if not proxy_url.startswith(('socks5h://', 'http://', 'https://')):
             print(f"[!] Invalid proxy URL format: {proxy_url}", file=sys.stderr)
             sys.exit(1)
             

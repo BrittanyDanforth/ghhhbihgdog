@@ -256,8 +256,8 @@ class TorCircuitManager:
         }
         
         return {
-            'http': f'socks5://{username}:{password}@{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}',
-            'https': f'socks5://{username}:{password}@{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}'
+            'http': f'socks5h://{username}:{password}@{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}',
+            'https': f'socks5h://{username}:{password}@{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}'
         }
 
 class RealEndpointProber:
@@ -306,11 +306,11 @@ class RealEndpointProber:
         }
         
         try:
-            # Real JSON-RPC probe
+            # Real JSON-RPC probe — use get_info (standard monerod method)
             payload = {
                 "jsonrpc": "2.0",
                 "id": int(time.time()),
-                "method": "get_height"
+                "method": "get_info"
             }
             
             response = session.post(

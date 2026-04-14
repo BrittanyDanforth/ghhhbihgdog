@@ -56,22 +56,24 @@ if not os.path.isfile(args.bundle):
 # ---------- YubiKey Challenge-Response (Optional) ----------
 
 if args.yubikey:
-    # OPSEC: Perform offline YubiKey challenge-response to ensure key possession.
     try:
-        # Generate a random 64-byte challenge
-        challenge = os.urandom(64)
-        # Call YubiKey CLI or library to compute response
-        # This is a placeholder: in practice use yubikey-manager or python-yubico
-        # e.g., response = yubikey.calculate_hmac(challenge)
-        # Here we'll simulate (in real script, remove the simulation).
+        from ykman.device import list_all_devices
+        from yubikit.yubiotp import YubiOtpSession
         logger.info("Performing YubiKey challenge-response.")
-        # Simulated response for placeholder purposes
-        response = b"expected_response"  # replace with real device response
-        expected = hashlib.sha1(challenge + b"key").digest()  # example check
-        if response != expected:
-            logger.error("YubiKey response invalid. Aborting.")
+        devices = list_all_devices()
+        if not devices:
+            logger.error("No YubiKey devices found. Aborting.")
             sys.exit(1)
-        logger.info("YubiKey challenge successful.")
+        device, info = devices[0]
+        connection = device.open_connection(type(list(device.list_ccid())[0]))
+        challenge = os.urandom(64)
+        session = YubiOtpSession(connection)
+        response = session.calculate_hmac_sha1(2, challenge)
+        logger.info("YubiKey challenge successful (slot 2 HMAC-SHA1).")
+    except ImportError:
+        logger.error("yubikey-manager (ykman) not installed. "
+                      "Install with: pip install yubikey-manager")
+        sys.exit(1)
     except Exception as e:
         logger.error("YubiKey challenge failed: %s", str(e))
         sys.exit(1)

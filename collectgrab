@@ -1,6 +1,5 @@
-COLLECT AND GRAB
-
 #!/usr/bin/env python3
+# COLLECT AND GRAB
 import os, sys, time, random, json, hashlib, logging, subprocess, shutil, re
 from urllib.parse import quote_plus
 
