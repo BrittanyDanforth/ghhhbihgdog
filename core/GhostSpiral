@@ -692,7 +692,7 @@ def main():
     if is_mock_plan:
         meta["mock"] = True
     if not receive_mode and args.btc_entry:
-        meta["btc_entry"] = args.btc_entry
+        meta["btc_entry"] = scrub_address(args.btc_entry)
     if shutdown_requested():
         meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
@@ -1023,17 +1023,25 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             "broadcast_pending": tx_idx,
         }, progress_file)
 
-        # Step 3: Broadcast via wallet-rpc's submit_transfer
-        # (NOT via monerod — submit_transfer is a wallet-rpc method)
+        # Step 3: Broadcast via wallet-rpc
+        # Hot wallet TXs (presigned from tx_metadata_list) use relay_tx.
+        # View-only wallet TXs (signed via wallet-cli) use submit_transfer.
+        # These are DIFFERENT wallet-rpc methods expecting different data formats.
         print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
         newnym()
         try:
             signed_data = signed_file.read_bytes()
             rpc_primary = rpc
-            result = rpc_primary.raw_request("submit_transfer", {
-                "tx_data_hex": signed_data.hex(),
-            })
-            tx_hashes = result.get("tx_hash_list", [])
+            if is_presigned:
+                result = rpc_primary.raw_request("relay_tx", {
+                    "hex": signed_data.hex(),
+                })
+                tx_hashes = result.get("tx_hash_list", [])
+            else:
+                result = rpc_primary.raw_request("submit_transfer", {
+                    "tx_data_hex": signed_data.hex(),
+                })
+                tx_hashes = result.get("tx_hash_list", [])
             if not tx_hashes:
                 integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
                 print(f"  [!] TX {tx_idx} submitted but no txid returned — ABORTING pipeline.")

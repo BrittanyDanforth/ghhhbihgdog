@@ -280,10 +280,12 @@ class CircuitBurnProtocol:
                     'reason': 'scheduled_burn'
                 })
                 
-                # Write burn log
+                # Write burn log (coarsened timestamp, restricted perms)
                 if CIRCUIT_LOG.parent.exists():
-                    with CIRCUIT_LOG.open('a') as f:
-                        f.write(f"{self.last_burn}|BURN|{self.burn_count}\n")
+                    coarsened_ts = int(self.last_burn) // 600 * 600
+                    fd = os.open(str(CIRCUIT_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    os.write(fd, f"{coarsened_ts}|BURN|{self.burn_count}\n".encode())
+                    os.close(fd)
                 
                 return True
                 
@@ -307,22 +309,26 @@ class IntegrityChainV2:
     def add_entry(self, tag: str, detail: str, metadata: Dict[str, Any] = None):
         """Add integrity chain entry."""
         with self.chain_lock:
-            timestamp = datetime.now(timezone.utc).isoformat()
+            coarsened_ts = int(time.time()) // 600 * 600
             
-            entry_data = f"{timestamp}|{tag}|{detail}"
+            entry_data = f"{coarsened_ts}|{tag}|{detail}"
             if metadata:
-                entry_data += f"|{json.dumps(metadata, sort_keys=True)}"
+                safe_meta = {k: v for k, v in metadata.items()
+                             if k not in ("endpoint", "url")}
+                if safe_meta:
+                    entry_data += f"|{json.dumps(safe_meta, sort_keys=True)}"
                 
             new_hash = self._compute_hash(entry_data)
             
             log_entry = f"{new_hash}|{entry_data}\n"
             
             try:
-                with INTEGRITY_LOG.open('a') as f:
-                    f.write(log_entry)
+                fd = os.open(str(INTEGRITY_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                os.write(fd, log_entry.encode())
+                os.close(fd)
                 self.chain_state = new_hash
             except Exception:
-                pass  # Fail silently for OpSec
+                pass
 
 
 class TrafficObfuscator:
@@ -682,7 +688,7 @@ class AdvancedSwapOrchestrator:
                 if result.get("expected_amount_out") or result.get("transaction_id"):
                     self.integrity_chain.add_entry(
                         "SWAP_SUCCESS", 
-                        f"idx={idx}|endpoint={endpoint}|attempt={attempt}",
+                        f"idx={idx}|attempt={attempt}",
                         {"result_hash": hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()[:16]}
                     )
                     success = True
@@ -697,7 +703,7 @@ class AdvancedSwapOrchestrator:
                 
                 self.integrity_chain.add_entry(
                     "SWAP_ATTEMPT_FAIL",
-                    f"idx={idx}|endpoint={endpoint}|attempt={attempt}",
+                    f"idx={idx}|attempt={attempt}",
                     {"error": str(e)[:100]}
                 )
                 

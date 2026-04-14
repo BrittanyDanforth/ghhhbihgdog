@@ -131,7 +131,7 @@ def main():
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
-    ap.add_argument("--outfile", default="exitplan_v1.json")
+    ap.add_argument("--outfile", default="plan_output.json")
     args = ap.parse_args()
 
     if args.amount <= 0:

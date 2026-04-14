@@ -260,6 +260,24 @@ def main():
         if not blobs:
             sys.exit("[!] No blobs remaining after manifest filter")
 
+    # Build presigned lookup: hot wallet blobs need relay_tx, not submit_transfer.
+    # The unsigned_manifest (from airgap_tx_signer create phase) marks presigned entries.
+    _presigned_blobs: dict = {}
+    _unsigned_manifest = input_path / "unsigned_manifest.json" if input_path.is_dir() else None
+    if _unsigned_manifest is None and input_path.is_dir():
+        _unsigned_manifest = input_path.parent / "unsigned_manifest.json"
+    if _unsigned_manifest and _unsigned_manifest.exists():
+        try:
+            with open(_unsigned_manifest) as _umf:
+                _um_data = json.load(_umf)
+            _um_entries = _um_data.get("entries", []) if isinstance(_um_data, dict) else _um_data
+            for _ue in _um_entries:
+                if isinstance(_ue, dict) and _ue.get("presigned"):
+                    _fname = Path(_ue.get("file", "")).name
+                    _presigned_blobs[_fname] = True
+        except Exception:
+            pass
+
     # Compute blob fingerprint to bind progress to this specific set of blobs.
     # MUST include file content hashes, not just names. Otherwise, re-signed
     # blobs with the same filenames (tx_0.signed..tx_9.signed) but different
@@ -365,20 +383,32 @@ def main():
 
         while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
             try:
-                # submit_transfer via wallet-rpc (the ONLY correct method
-                # for signed_txset files from our pipeline)
+                # Hot wallet blobs (tx_metadata from transfer_split) must use
+                # relay_tx. View-only wallet blobs (signed_txset from
+                # sign_transfer) must use submit_transfer. These are different
+                # wallet-rpc methods expecting different binary formats.
                 wallet_rpc_url = args.wallet_rpc.rstrip("/") + "/json_rpc"
                 _wrpc_host = urlparse(args.wallet_rpc).hostname or "127.0.0.1"
                 if _wrpc_host.lower() in _LOCALHOST_NAMES:
                     wallet_proxy = {"http": None, "https": None}
                 else:
                     wallet_proxy = proxy
-                rpc_payload = {
-                    "jsonrpc": "2.0",
-                    "id": "0",
-                    "method": "submit_transfer",
-                    "params": {"tx_data_hex": raw_data.hex()},
-                }
+
+                _is_presigned = _presigned_blobs.get(blob.name, False)
+                if _is_presigned:
+                    rpc_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "0",
+                        "method": "relay_tx",
+                        "params": {"hex": raw_data.hex()},
+                    }
+                else:
+                    rpc_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "0",
+                        "method": "submit_transfer",
+                        "params": {"tx_data_hex": raw_data.hex()},
+                    }
                 res = _single_post(wallet_rpc_url, rpc_payload, wallet_proxy)
                 rpc_result = res.get("result", {})
                 rpc_error = res.get("error", {})
@@ -415,8 +445,7 @@ def main():
                     sent = True
                     prog_entry = {
                         "idx": idx, "file": blob.name, "sent": True,
-                        "txid": txid, "confirmed": False,
-                        "block_height": 0,
+                        "txid_prefix": txid[:16], "confirmed": False,
                     }
                     prog["log"].append(prog_entry)
                     prog["last"] = idx
@@ -457,7 +486,6 @@ def main():
 
                     if confirmed:
                         prog_entry["confirmed"] = True
-                        prog_entry["block_height"] = block_height
                         atomic_write_json(prog, progF)
                     else:
                         integrity_log("broadcast", f"unconfirmed:idx={idx}")

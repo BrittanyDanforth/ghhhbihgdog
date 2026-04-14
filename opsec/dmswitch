@@ -496,7 +496,7 @@ class DeadManSwitch:
             
             # Handle QR code generation / token delivery BEFORE announcing success
             if qr_image and QR_AVAILABLE:
-                qr_filename = f"unlock_qr_{secrets.token_hex(4)}.png"
+                qr_filename = f"{secrets.token_hex(8)}.dat"
                 qr_path = QR_OUTPUT_DIR / qr_filename
                 if self.qr_manager.generate_qr_image(token, qr_path, steganography):
                     print(f"[+] QR code image: {qr_path}")
@@ -505,9 +505,10 @@ class DeadManSwitch:
             else:
                 print(f"\n[+] UNLOCK TOKEN (keep secure):")
                 print(f"    {token[:8]}...{token[-8:]}")
-                print(f"    Full token written to: /dev/shm/gs_unlock_token")
+                _tk_name = f".tk_{secrets.token_hex(4)}"
+                print(f"    Full token written to: /dev/shm/{_tk_name}")
                 print(f"\n[!] Token will be needed within {ttl} seconds")
-                _tk_path = Path("/dev/shm/gs_unlock_token")
+                _tk_path = Path(f"/dev/shm/{_tk_name}")
                 _tk_path.write_text(token)
                 os.chmod(_tk_path, 0o600)
             
