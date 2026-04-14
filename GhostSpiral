@@ -116,7 +116,58 @@ def main():
     cli.add_argument("--wallet-password", default="",
                      help="Password for the wallet file (empty for no password). "
                           "WARNING: visible in /proc/PID/cmdline — prefer GS_WALLET_PASSWORD env var")
+    cli.add_argument("--resume-plan",
+                     help="Resume Stage 5 on an existing unsigned plan JSON file. "
+                          "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
+                          "Use after a crash to continue from where the last run stopped. "
+                          "The plan's fingerprint must match any existing stage5_progress.json.")
+    cli.add_argument("--swapkit-api-key",
+                     help="SwapKit API key for ThorChain quotes (or set SWAPKIT_API_KEY env var)")
     args = cli.parse_args()
+
+    # ---- Resume-plan shortcut: skip Stages 0-4, jump to Stage 5 ----
+    if args.resume_plan:
+        resume_path = Path(args.resume_plan)
+        if not resume_path.exists():
+            sys.exit(f"[!] Resume plan not found: {resume_path}")
+        with open(resume_path) as f:
+            _rp = json.load(f)
+        if _rp.get("meta", {}).get("schema") != "unsigned_v1":
+            sys.exit("[!] Resume plan is not unsigned_v1 schema")
+        if _rp.get("meta", {}).get("mock"):
+            sys.exit("[!] Cannot resume a mock plan (no real funds)")
+
+        proxy = validate_proxy(args.tor_proxy)
+        require_resources(min_disk_gb=2.0)
+        verify_tor(proxy)
+
+        print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
+        print(f"  [*] Skipping Stages 0-4, jumping to Stage 5.")
+        integrity_log("stage5", f"resume_plan:{resume_path.name}")
+
+        rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        bal = Decimal("0")
+        try:
+            res = rpc_primary.raw_request("get_balance", {"account_index": 0})
+            bal = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        except Exception:
+            pass
+
+        staging_dir = "tx_staging"
+        lock_path = Path(".ghostspiral.lock")
+        if lock_path.exists():
+            sys.exit("[!] Lock file exists. Another instance may be running.")
+        lock_path.write_text(str(os.getpid()))
+        secure_file_perms(lock_path)
+
+        try:
+            _stage5_run(args, resume_path, staging_dir, proxy, bal)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+
+        print("\n  [+] GhostSpiral resume complete.")
+        sys.exit(0)
 
     # ---- Determine mode ----
     receive_mode = bool(args.receive_wallet)
@@ -278,8 +329,13 @@ def main():
                 "destinationAddress": xmr_dest,
             }
 
+            # Pass API key if available (required for most SwapKit endpoints)
+            _api_key = getattr(args, 'swapkit_api_key', '') or os.environ.get("SWAPKIT_API_KEY", "")
+            _headers = {"x-api-key": _api_key} if _api_key else {}
+
             try:
-                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy,
+                                       headers=_headers)
             except Exception as e:
                 newnym()
                 integrity_log("stage2", f"quote_api_error:{i}")

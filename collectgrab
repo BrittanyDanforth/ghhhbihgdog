@@ -47,18 +47,29 @@ targ_script = "targ_graber_v14.py"
 if not (os.path.isfile(targ_script) and os.access(targ_script, os.X_OK)):
     logger.warning("Script '%s' is missing or not executable. Using default targets.", targ_script)
 
-# Setup proxy configuration
+# Setup proxy configuration — ABORT if Tor is not available
+# Running clearnet exposes the operator's real IP to every target
 proxies = {}
 if TOR_AVAILABLE:
     proxies = {
         'http': 'socks5h://127.0.0.1:9050',
         'https': 'socks5h://127.0.0.1:9050'
     }
+else:
+    logger.critical("Tor (stem) not available — refusing to run over clearnet.")
+    logger.critical("Install stem: pip install stem  and ensure Tor is running.")
+    sys.exit(1)
+
+def _secure_perms(path):
+    """Set file to owner-only (0600) to protect collected data."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 # Create a requests session for persistent settings
 session = requests.Session()
-if proxies:
-    session.proxies.update(proxies)
+session.proxies.update(proxies)
 
 # Randomized user agents list
 USER_AGENTS = [
@@ -177,7 +188,7 @@ def load_targets():
                     # Try parsing as newline-separated values
                     lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
                     # Filter out obvious non-target lines (logs, headers, etc.)
-                    targets = [line for line in lines if not line.startswith('[') and '@' in line or ' ' in line]
+                    targets = [line for line in lines if not line.startswith('[') and ('@' in line or ' ' in line)]
                 
                 logger.info("Loaded %d targets from fingerprinting script %s", len(targets), targ_script)
         except Exception as e:
@@ -304,6 +315,7 @@ for target in targets:
     try:
         with open(linkedin_file, 'w', encoding='utf-8') as jf:
             json.dump(entry, jf, indent=2, ensure_ascii=False)
+        _secure_perms(linkedin_file)
     except Exception as e:
         logger.error("Failed to write LinkedIn file for %s: %s", target, e)
         audit_info["errors"].append(f"LinkedIn file write error for {target}: {str(e)}")
@@ -360,6 +372,7 @@ for target in targets:
     try:
         with open(twitter_file, 'w', encoding='utf-8') as tf:
             json.dump(twitter_entry, tf, indent=2, ensure_ascii=False)
+        _secure_perms(twitter_file)
     except Exception as e:
         logger.error("Failed to write Twitter file for %s: %s", target, e)
         audit_info["errors"].append(f"Twitter file write error for {target}: {str(e)}")
@@ -399,6 +412,7 @@ for target in targets:
     try:
         with open(reddit_file, 'w', encoding='utf-8') as rf:
             json.dump(reddit_entry, rf, indent=2, ensure_ascii=False)
+        _secure_perms(reddit_file)
     except Exception as e:
         logger.error("Failed to write Reddit file for %s: %s", target, e)
         audit_info["errors"].append(f"Reddit file write error for {target}: {str(e)}")
@@ -412,6 +426,7 @@ try:
     with open(meta_path, 'w', encoding='utf-8') as mf:
         for rec in meta_entries:
             mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    _secure_perms(meta_path)
     logger.info("Meta file written to %s", meta_path)
 except Exception as e:
     logger.error("Failed to write meta file: %s", e)
@@ -422,6 +437,7 @@ audit_path = os.path.join(RAM_DIR, "audit.json")
 try:
     with open(audit_path, 'w', encoding='utf-8') as af:
         json.dump(audit_info, af, indent=2, ensure_ascii=False)
+    _secure_perms(audit_path)
     logger.info("Audit file written to %s", audit_path)
 except Exception as e:
     logger.error("Failed to write audit file: %s", e)

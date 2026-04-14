@@ -234,3 +234,61 @@ Found **30+ confirmed bugs** across the entire codebase. The most dangerous:
 | BUG 105 | fake_leaf_inserter multi-root depth | MEDIUM | YES |
 | BUG 106 | stage5_progress not cleaned on --cold | LOW | YES |
 | BUG 107 | Delay fallback may use wrong plan | MEDIUM | YES |
+
+---
+
+## Round 5 Bugs (BUG 108-114)
+
+### BUG 108 (FIXED): No way to resume Stage 5 on existing plan after crash
+**File:** `GhostSpiral` CLI args
+**Scenario:** GhostSpiral crashes at TX 15/40. Operator reruns the full command — it generates a NEW plan (new DAG, new fingerprint), discards old progress. No way to resume the old plan.
+**Impact:** HIGH — operator loses progress, may double-send or skip TXs.
+**Fix:** Added `--resume-plan` flag that loads an existing plan and jumps straight to Stage 5.
+
+### BUG 109 (DOCUMENTED): subaddr_indices not enforced in transfer_split
+**File:** `airgap_tx_signer` `phase_create()` line 156
+**Scenario:** `transfer_split` is called with only `account_index` — the wallet picks inputs from ANY subaddress. The plan's `src` field is ignored.
+**Impact:** MEDIUM — mixing graph topology not enforced at RPC level. This requires resolving subaddress strings to indices via `get_address`, which is a significant refactor.
+**Status:** DOCUMENTED as known limitation. Mixing relies on Monero's native ring signatures for privacy rather than src enforcement.
+
+### BUG 110 (FIXED): GhostSpiral Stage 2 doesn't pass SwapKit API key
+**File:** `GhostSpiral` line 333
+**Scenario:** `safe_post(SWAPKIT_API + "/v3/quote", payload, proxy)` — no `headers` parameter. API key never sent to SwapKit, causing 401 errors.
+**Impact:** HIGH — ThorChain quotes fail for authenticated APIs.
+**Fix:** Added `--swapkit-api-key` CLI arg + `SWAPKIT_API_KEY` env var lookup. Passes `x-api-key` header to `safe_post`.
+
+### BUG 111 (FIXED): collectgrab runs clearnet when Tor unavailable
+**File:** `collectgrab` lines 50-56
+**Scenario:** If `stem` not installed (`TOR_AVAILABLE = False`), `proxies = {}` and all HTTP requests go direct clearnet.
+**Impact:** CRITICAL (OPSEC) — real IP exposed to Google, Nitter, Reddit during OSINT collection.
+**Fix:** Abort with clear error message if Tor not available.
+
+### BUG 112 (FIXED): collectgrab output files world-readable (default umask)
+**File:** `collectgrab` all `open(..., 'w')` calls
+**Scenario:** Default umask (0022) → collected data files created at 0644, readable by any local user.
+**Impact:** MEDIUM (OPSEC) — OSINT results exposed to local adversaries.
+**Fix:** Added `_secure_perms()` helper that sets 0600 after each file write.
+
+### BUG 113 (FIXED): Multiple modules write files without 0600 perms
+**Files:** `error_log_poisoner`, `labelmask`, `ghostmutator`
+**Scenario:** Same as BUG 112 — output files use default umask instead of `gs_common`'s 0600 convention.
+**Impact:** MEDIUM (OPSEC) — label maps, mutated scripts, and decoy logs readable by local users.
+**Fix:** Added `os.chmod(path, 0o600)` after writes in all three files.
+
+### BUG 114 (FIXED): collectgrab boolean precedence bug in target parsing
+**File:** `collectgrab` line 191
+**Scenario:** `not line.startswith('[') and '@' in line or ' ' in line` — the `or` has lower precedence than `and`, so ANY line containing a space matches (log lines, errors, etc).
+**Impact:** MEDIUM — spurious "targets" cause wrong queries and extra network activity.
+**Fix:** Added parentheses: `('@' in line or ' ' in line)`.
+
+### Updated Bug Status Table (Round 5)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 108 | No resume-plan mode | HIGH | YES |
+| BUG 109 | subaddr_indices not enforced | MEDIUM | DOCUMENTED |
+| BUG 110 | Stage 2 missing API key headers | HIGH | YES |
+| BUG 111 | collectgrab clearnet when no Tor | CRITICAL | YES |
+| BUG 112 | collectgrab output perms | MEDIUM | YES |
+| BUG 113 | Module output perms (3 files) | MEDIUM | YES |
+| BUG 114 | collectgrab boolean precedence | MEDIUM | YES |

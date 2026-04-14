@@ -340,7 +340,9 @@ def main():
                 os.fsync(fh.fileno())
             
             # Atomic move
+            os.chmod(tmp, 0o600)
             tmp.replace(args.out)
+            os.chmod(args.out, 0o600)
             print(f"[+] Label map saved → {args.out} (labels: {len(label_map)})")
             
         except Exception as e:

@@ -190,6 +190,7 @@ def main():
         with args.out.open(mode, encoding="utf-8") as fh:
             for ln in decoys:
                 fh.write(ln + "\n")
+        os.chmod(args.out, 0o600)
         print(f"[+] Injected {len(decoys)} decoy errors → {args.out}")
     except Exception as e:
         print(f"[!] Failed to write output file: {e}", file=sys.stderr)

@@ -348,6 +348,7 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
         # Write output
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(mutated_src, encoding="utf-8")
+        os.chmod(out_path, 0o600)
         
         # Save manifest
         manifest = {
@@ -367,6 +368,7 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
         }
         man_path = out_path.with_suffix(".manifest.json")
         man_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.chmod(man_path, 0o600)
         
         print(f"[+] Mutated script → {out_path}")
         print(f"[+] Output hash: {sha256_hex(mutated_src.encode())[:16]}…")

@@ -1,175 +1,278 @@
-# GhostSpiral v10.6 — Setup Guide for Kali Linux
+# GhostSpiral v10.7 — Complete Setup & Operations Guide
 
-## Prerequisites
+## System Requirements
 
-### 1. System packages
+- **OS:** Kali Linux (or Debian-based Linux)
+- **Python:** 3.10+
+- **Tor:** Running with ControlPort enabled
+- **Monero:** `monerod`, `monero-wallet-rpc`, `monero-wallet-cli` installed
+
+---
+
+## 1. Install System Packages
 
 ```bash
-# Update system
 sudo apt update && sudo apt upgrade -y
+sudo apt install -y tor torsocks jq gnupg python3-pip
 
-# Install Tor
-sudo apt install -y tor torsocks
+# Monero CLI tools — download from https://www.getmonero.org/downloads/
+# Extract and add to PATH:
+tar xf monero-linux-x64-*.tar.bz2
+sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
 
-# Install Monero CLI tools (wallet-cli, wallet-rpc, monerod)
-# Download from https://www.getmonero.org/downloads/
-# Or use the package manager:
-sudo apt install -y monero
-
-# Optional: GPG for encrypted output
-sudo apt install -y gnupg
-
-# Optional: jq for reading JSON wallet files
-sudo apt install -y jq
+# Verify installation
+monerod --version
+monero-wallet-cli --version
+monero-wallet-rpc --version
 ```
 
-### 2. Python dependencies
+## 2. Install Python Dependencies
 
 ```bash
-# Requires Python 3.10+
-python3 --version
-
-# Install pip if not present
-sudo apt install -y python3-pip
-
-# Install GhostSpiral dependencies
 pip install -r requirements.txt
 
 # Verify critical packages
-python3 -c "import requests; import stem; import monero; print('OK')"
+python3 -c "import requests, stem, monero, psutil; print('Core deps OK')"
 ```
 
-### 3. Tor configuration
+## 3. Configure Tor
 
 ```bash
-# Start Tor service
-sudo systemctl start tor
-sudo systemctl enable tor
+# Enable ControlPort for NEWNYM circuit rotation
+sudo tee -a /etc/tor/torrc << 'EOF'
+ControlPort 9051
+CookieAuthentication 1
+EOF
+sudo systemctl restart tor
 
 # Verify Tor is running
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
 
-# For NEWNYM circuit rotation, enable the control port:
-# Edit /etc/tor/torrc and add:
-#   ControlPort 9051
-#   CookieAuthentication 1
-# Then restart Tor:
-sudo systemctl restart tor
-
-# If using HashedControlPassword instead of CookieAuthentication,
-# set the password in your environment:
-export TOR_CONTROL_PASSWORD="your_tor_control_password"
+# If using HashedControlPassword instead of CookieAuthentication:
+export TOR_CONTROL_PASSWORD="your_password"
 ```
 
-### 4. Monero wallet-rpc setup
+## 4. Configure Monero
 
+### Start monerod (local node):
 ```bash
-# Start monero-wallet-rpc with your wallet
-# For a HOT wallet (auto-mode, has spend key):
+monerod --detach --data-dir ~/.bitmonero
+# Wait for sync (can take hours for first sync)
+```
+
+### Start monero-wallet-rpc:
+```bash
+# For HOT wallet (auto-mode — has spend key):
 monero-wallet-rpc --rpc-bind-port 18083 \
-  --wallet-file /path/to/your/wallet \
-  --password "your_wallet_password" \
+  --wallet-file /path/to/wallet \
+  --password "wallet_password" \
   --daemon-address 127.0.0.1:18081 \
   --disable-rpc-login
 
-# For a VIEW-ONLY wallet (cold-signing workflow):
+# For VIEW-ONLY wallet (cold-signing workflow):
 monero-wallet-rpc --rpc-bind-port 18083 \
   --wallet-file /path/to/view-only-wallet \
   --password "password" \
   --daemon-address 127.0.0.1:18081 \
   --disable-rpc-login
+```
 
-# Verify wallet-rpc is running:
+### Verify wallet-rpc:
+```bash
 curl -s http://127.0.0.1:18083/json_rpc \
   -d '{"jsonrpc":"2.0","id":"0","method":"get_height"}' \
   -H 'Content-Type: application/json'
 ```
 
-### 5. Monerod (daemon) setup
-
-```bash
-# If running your own node:
-monerod --detach --data-dir /path/to/blockchain
-
-# Or connect to a remote node (less private):
-# wallet-rpc --daemon-address node.moneroworld.com:18089
-# WARNING: Remote nodes see your IP unless tunneled through Tor
-```
+---
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TOR_CONTROL_PASSWORD` | If Tor uses password auth | Tor control port password for NEWNYM |
+| `TOR_CONTROL_PASSWORD` | If torrc uses HashedControlPassword | Tor control port password for NEWNYM |
 | `GS_WALLET_PASSWORD` | For auto-mode signing | Monero wallet password (avoids /proc leak) |
 | `SWAPKIT_API_KEY` | For ThorChain swaps | SwapKit API key (get from swapkit.dev) |
 
 ```bash
-# Set in your shell (these are wiped by paranoia_mode Phase 12):
 export TOR_CONTROL_PASSWORD="your_tor_password"
 export GS_WALLET_PASSWORD="your_wallet_password"
 export SWAPKIT_API_KEY="your_swapkit_key"
 ```
 
-## Quick Start — Receiver Workflow
+---
+
+## File Layout
+
+All scripts live at the project root. They are organized by purpose:
+
+### Core Pipeline (handles real money)
+| File | Purpose |
+|------|---------|
+| `gs_common.py` | Shared OPSEC library (Tor, crypto, integrity, RPC) |
+| `GhostSpiral` | Main orchestrator — BTC→XMR mixing pipeline |
+| `airgap_tx_signer` | Two-phase cold-signing (create unsigned / sign offline) |
+| `broadcast_signed_xmr` | Resilient Tor-only Monero TX broadcaster |
+| `create_receive_wallet` | Generate receive subaddress for incoming XMR |
+| `thor_swap_preparer` | ThorChain BTC→XMR swap quote + deposit generator |
+| `exit_strategy_simulator` | XMR off-ramp planner with price oracles |
+
+### OPSEC / Cleanup
+| File | Purpose |
+|------|---------|
+| `paranoia_mode` | Post-op host sanitization (MAC spoof, file wipe, log purge) |
+| `error_log_poisoner` | Inject decoy error entries into logs |
+| `mirrormask` | Forensic log mutation and analysis resistance |
+| `dmswitch` | Deadman switch with QR-locked unlock tokens |
+| `SML` | Secure memory-locked seed management |
+| `idk` | Entropy bundle verifier with optional YubiKey auth |
+
+### Chaos / Mixing Modules
+| File | Purpose |
+|------|---------|
+| `PAG` | Polymorphic DAG generator for mixing graphs |
+| `labelmask` | Label map generator tied to DAG structure |
+| `label_poisoner` | Inject fake labels to confuse forensic analysis |
+| `fake_leaf_inserter` | Add decoy leaf nodes to DAGs |
+| `noise` | Decoy network traffic generator |
+| `ghostmutator` | Source code mutation engine (symbol renaming) |
+| `wdna` | Wallet DNA mutation (subaddress/account shuffling) |
+
+### Infrastructure
+| File | Purpose |
+|------|---------|
+| `en_seeder` | Entropy seed generator from multiple sources |
+| `ghost_unifier` | Pipeline orchestrator for chaos modules |
+| `swap_retry_guard` | Swap retry with circuit rotation and progress tracking |
+| `tor_endpoint_juggler` | Monero onion RPC endpoint validator + rotation |
+| `vm_runtime` | VM timing metrics for deterministic delays |
+| `collectgrab` | OSINT collection tool (Tor-routed) |
+| `testergatherSystem` | Advanced intelligence gathering framework |
+
+---
+
+## Workflows
+
+### Workflow 1: Receive XMR (you receive BTC→XMR swap)
 
 ```bash
-# 1. Create a receive address
+# Step 1: Create receive address
 python3 create_receive_wallet \
   --rpc http://127.0.0.1:18083 \
   --tor-proxy socks5h://127.0.0.1:9050
 
-# 2. Generate ThorChain deposit address for the sender
+# Step 2: Generate ThorChain deposit address for the sender
 python3 thor_swap_preparer \
   --amounts 0.05 \
   --dests $(jq -r .address wallet_*.json) \
   --tor-proxy socks5h://127.0.0.1:9050 \
   --api-key "$SWAPKIT_API_KEY"
 
-# 3. Give the deposit address + memo to the BTC sender
-# 4. Wait for XMR to arrive (check wallet-rpc balance)
+# Step 3: Give deposit address + memo to the BTC sender
+# Step 4: Wait for XMR to arrive (monitor wallet-rpc balance)
 
-# 5. Run GhostSpiral in receive mode
+# Step 5: Run GhostSpiral in receive mode
 python3 GhostSpiral \
   --receive-wallet wallet_*.json \
   --tor-proxy socks5h://127.0.0.1:9050 \
   --rpc-primary http://127.0.0.1:18083
 
-# 6. Clean up
+# Step 6: Clean up
 python3 paranoia_mode --iface wlan0
 ```
 
-## Quick Start — Sender Workflow
+### Workflow 2: Send BTC, receive mixed XMR
 
 ```bash
-# 1. Create receive wallet (same as above)
-# 2. Run GhostSpiral in sender mode with --cold for air-gap signing:
+# Auto-mode (hot wallet):
 python3 GhostSpiral \
   --btc-entry bc1q... \
-  --btc-amount 0.05 \
-  --split 2 \
+  --btc-amount 0.1 \
+  --split 3 \
+  --tor-proxy socks5h://127.0.0.1:9050 \
+  --rpc-primary http://127.0.0.1:18083 \
+  --swapkit-api-key "$SWAPKIT_API_KEY"
+```
+
+### Workflow 3: Cold-signing (air-gap)
+
+```bash
+# On ONLINE machine (view-only wallet):
+python3 GhostSpiral \
+  --receive-wallet wallet_*.json \
   --tor-proxy socks5h://127.0.0.1:9050 \
   --rpc-primary http://127.0.0.1:18083 \
   --cold
 
-# 3. Transfer the unsigned plan to the air-gap machine
-# 4. Sign each TX on the cold wallet (see AUDIT.md for cold-signing protocol)
-# 5. Broadcast signed TXs
-# 6. Clean up with paranoia_mode
+# Copy unsigned/ directory to USB
+
+# On OFFLINE machine (full wallet):
+python3 airgap_tx_signer unsigned/unsigned_*.json \
+  --phase sign \
+  --wallet-file /path/to/full_wallet \
+  --outdir tx_staging
+
+# Copy tx_staging/signed/ back to USB → online machine
+
+# On ONLINE machine:
+python3 broadcast_signed_xmr tx_staging/signed/ \
+  --tor-proxy socks5h://127.0.0.1:9050 \
+  --rpc http://127.0.0.1:18081 \
+  --wallet-rpc http://127.0.0.1:18083
 ```
+
+### Workflow 4: Resume after crash
+
+```bash
+# If GhostSpiral Stage 5 crashed, resume on the SAME plan:
+python3 GhostSpiral \
+  --receive-wallet wallet_*.json \
+  --resume-plan unsigned/unsigned_abc123.json \
+  --tor-proxy socks5h://127.0.0.1:9050 \
+  --rpc-primary http://127.0.0.1:18083
+```
+
+### Workflow 5: Run chaos modules
+
+```bash
+# Generate entropy seed first:
+python3 en_seeder
+
+# Run the chaos pipeline via ghost_unifier:
+python3 ghost_unifier --tor socks5h://127.0.0.1:9050
+
+# Or run individual modules:
+python3 PAG                    # Generate mixing DAG
+python3 labelmask              # Generate label map
+python3 noise --tor-proxy socks5h://127.0.0.1:9050  # Decoy traffic
+python3 ghostmutator           # Mutate source code
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `socks5:// leaks DNS` | Using `socks5://` | Change to `socks5h://` |
+| `Tor leak detected` | Tor not running | `sudo systemctl start tor` |
+| `NEWNYM failed 3 times` | ControlPort not enabled | Add `ControlPort 9051` to torrc |
+| `No wallet file` | wallet-rpc has no wallet | Start wallet-rpc with `--wallet-file` |
+| `unsigned file not created` | Wallet balance too low | Check `get_balance` via wallet-rpc |
+| `Method not found` on submit_transfer | Sending to monerod instead of wallet-rpc | Use `--wallet-rpc http://127.0.0.1:18083` |
+| `No swap routes` | SwapKit API key missing | Set `SWAPKIT_API_KEY` env var |
+| `Plan fingerprint mismatch` | Stale progress from old run | Delete `stage5_progress.json` |
+| Script won't start | Missing Python deps | `pip install -r requirements.txt` |
 
 ## File Permissions
 
 All output files are created with `0600` (owner read/write only).
 Verify with: `ls -la unsigned/ tx_staging/ *.json`
 
-## Troubleshooting
+## Security Notes
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| "socks5:// leaks DNS" | Using socks5:// instead of socks5h:// | Change to `socks5h://` |
-| "Tor leak detected" | Tor proxy not running | `sudo systemctl start tor` |
-| "NEWNYM failed 3 times" | Tor control port not enabled | Enable ControlPort 9051 in torrc |
-| "No wallet file" | wallet-rpc has no wallet loaded | Start wallet-rpc with --wallet-file |
-| "No unsigned_txset" | Wallet is hot, not view-only | OK in auto-mode (uses tx_metadata_list) |
-| "Method not found" on submit_transfer | Using monerod port instead of wallet-rpc | Use --wallet-rpc http://127.0.0.1:18083 |
+- All network traffic goes through Tor (`socks5h://`). Plain `socks5://` is rejected.
+- Wallet passwords are passed via `GS_WALLET_PASSWORD` env var, not CLI args.
+- `paranoia_mode` wipes all artifacts including integrity logs — run LAST.
+- On CoW filesystems (btrfs/ZFS), use `shred` or full-disk encryption for secure deletion.
+- Terminal output only shows scrubbed addresses (first/last 6 chars).
