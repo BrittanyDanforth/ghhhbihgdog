@@ -108,8 +108,11 @@ def main():
         manifest_dir = input_path.parent
         with open(input_path) as f:
             entries = json.load(f)
-        if isinstance(entries, dict) and "manifest" in entries:
-            entries = entries["manifest"]
+        if isinstance(entries, dict):
+            if "manifest" in entries:
+                entries = entries["manifest"]
+            elif "entries" in entries:
+                entries = entries["entries"]
         for e in entries:
             raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
             if raw_path.exists():
@@ -471,7 +474,7 @@ def main():
                         err_msg = str(err_msg)
                     print(f"  Node: {str(err_msg)[:80]}")
 
-                    if res.get("double_spend"):
+                    if res.get("double_spend") or is_double:
                         integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
                         print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
                         prog["log"].append({
@@ -488,6 +491,13 @@ def main():
                         integrity_log("broadcast", f"low_fee_rejected:idx={idx}")
                         print("  [!] TX rejected: fee too low. Re-sign with higher --fee-priority.")
                         print("  [!] Monero does NOT support RBF - cannot bump fee on signed TX.")
+                        prog["log"].append({
+                            "idx": idx, "file": blob.name, "sent": False,
+                            "error": "low_fee",
+                        })
+                        prog["last"] = idx
+                        atomic_write_json(prog, progF)
+                        fail_count += 1
                         break
             except Exception as e:
                 integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")
