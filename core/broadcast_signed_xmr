@@ -22,6 +22,10 @@ from urllib.parse import urlparse
 
 import requests
 
+_CORE_DIR = str(Path(__file__).resolve().parent)
+if _CORE_DIR not in sys.path:
+    sys.path.insert(0, _CORE_DIR)
+
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     safe_post, newnym, secure_delay, atomic_write_json,

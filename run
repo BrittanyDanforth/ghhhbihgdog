@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+GhostSpiral Toolkit — Unified Launcher
+=======================================
+Run any tool from the project root:
+
+    python3 run ghostspiral --help
+    python3 run broadcast --help
+    python3 run paranoia --dry-run
+    python3 run signer plan.json --phase create ...
+    python3 run list                    # show all tools
+
+All tools are resolved to their actual paths in core/, modules/, opsec/, intel/.
+"""
+import os, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+TOOLS = {
+    # Core pipeline
+    "ghostspiral":  ROOT / "core" / "GhostSpiral",
+    "gs":           ROOT / "core" / "GhostSpiral",
+    "signer":       ROOT / "core" / "airgap_tx_signer",
+    "broadcast":    ROOT / "core" / "broadcast_signed_xmr",
+    "wallet":       ROOT / "core" / "create_receive_wallet",
+    "swap":         ROOT / "core" / "thor_swap_preparer",
+    "exit":         ROOT / "core" / "exit_strategy_simulator",
+
+    # Modules
+    "dag":          ROOT / "modules" / "PAG",
+    "labels":       ROOT / "modules" / "labelmask",
+    "poison":       ROOT / "modules" / "label_poisoner",
+    "leaves":       ROOT / "modules" / "fake_leaf_inserter",
+    "noise":        ROOT / "modules" / "noise",
+    "mutate":       ROOT / "modules" / "ghostmutator",
+    "wdna":         ROOT / "modules" / "wdna",
+    "seed":         ROOT / "modules" / "en_seeder",
+    "unify":        ROOT / "modules" / "ghost_unifier",
+    "retry":        ROOT / "modules" / "swap_retry_guard",
+    "juggler":      ROOT / "modules" / "tor_endpoint_juggler",
+    "timing":       ROOT / "modules" / "vm_runtime",
+
+    # OPSEC
+    "paranoia":     ROOT / "opsec" / "paranoia_mode",
+    "logpoison":    ROOT / "opsec" / "error_log_poisoner",
+    "mirror":       ROOT / "opsec" / "mirrormask",
+    "deadman":      ROOT / "opsec" / "dmswitch",
+    "memseed":      ROOT / "opsec" / "SML",
+    "intfake":      ROOT / "opsec" / "integrity_faker",
+    "verify":       ROOT / "opsec" / "idk",
+
+    # Intel
+    "collect":      ROOT / "intel" / "collectgrab",
+    "gather":       ROOT / "intel" / "testergatherSystem",
+}
+
+def show_tools():
+    print("\n  GhostSpiral Toolkit — Available Tools\n")
+    print("  CORE PIPELINE (handles real money):")
+    for name in ["ghostspiral", "signer", "broadcast", "wallet", "swap", "exit"]:
+        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
+    print("\n  MODULES (mixing / chaos):")
+    for name in ["dag", "labels", "poison", "leaves", "noise", "mutate",
+                 "wdna", "seed", "unify", "retry", "juggler", "timing"]:
+        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
+    print("\n  OPSEC (cleanup / anti-forensics):")
+    for name in ["paranoia", "logpoison", "mirror", "deadman", "memseed", "intfake", "verify"]:
+        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
+    print("\n  INTEL (collection):")
+    for name in ["collect", "gather"]:
+        print(f"    {name:14s} → {TOOLS[name].relative_to(ROOT)}")
+    print(f"\n  Usage: python3 run <tool> [args...]")
+    print(f"  Example: python3 run ghostspiral --receive-wallet wallet.json --tor-proxy socks5h://127.0.0.1:9050\n")
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("list", "help", "--help", "-h"):
+        show_tools()
+        return
+
+    tool_name = sys.argv[1].lower()
+    if tool_name not in TOOLS:
+        print(f"[!] Unknown tool: {tool_name}")
+        show_tools()
+        sys.exit(1)
+
+    tool_path = TOOLS[tool_name]
+    if not tool_path.exists():
+        print(f"[!] Tool file not found: {tool_path}")
+        sys.exit(1)
+
+    os.execvp("python3", ["python3", str(tool_path)] + sys.argv[2:])
+
+if __name__ == "__main__":
+    main()

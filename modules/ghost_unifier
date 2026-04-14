@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 ROOT      = Path.cwd()
+_MOD_DIR  = Path(__file__).resolve().parent
 RUNTIME   = ROOT / "runtime"
 SEED      = ROOT / "entropy_seed.json"
 DAG       = ROOT / "dag_structure.json"
@@ -60,13 +61,13 @@ MUTATED   = RUNTIME / "ghostspiral_run_v16.py"
 MANIFEST  = MUTATED.with_suffix(".manifest.json")
 
 MODULES = {
-    "seed":   ["python3", "en_seeder"],
-    "dag":    ["python3", "PAG"],
-    "labels": ["python3", "labelmask"],
-    "poison": ["python3", "label_poisoner"],
-    "vm":     ["python3", "vm_runtime"],
-    "noise":  ["python3", "noise"],
-    "mutate": ["python3", "ghostmutator"],
+    "seed":   ["python3", str(_MOD_DIR / "en_seeder")],
+    "dag":    ["python3", str(_MOD_DIR / "PAG")],
+    "labels": ["python3", str(_MOD_DIR / "labelmask")],
+    "poison": ["python3", str(_MOD_DIR / "label_poisoner")],
+    "vm":     ["python3", str(_MOD_DIR / "vm_runtime")],
+    "noise":  ["python3", str(_MOD_DIR / "noise")],
+    "mutate": ["python3", str(_MOD_DIR / "ghostmutator")],
 }
 
 # ---------------------------------------------------------------------------

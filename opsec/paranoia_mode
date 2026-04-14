@@ -21,6 +21,9 @@ from __future__ import annotations
 import argparse, glob, os, random, shutil, subprocess, sys, time
 from pathlib import Path
 
+# Add core/ to path so gs_common can be found regardless of working directory
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
     shutdown_requested, secure_hex,
@@ -306,7 +309,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "renamethis1",
     ]
     dir_patterns = [
-        "signed_blobs", "unsigned", "tx_staging",
+        "signed_blobs", "unsigned", "tx_staging", "runtime",
     ]
 
     # BUG 51 FIX: Also search common USB mount points where air-gap
