@@ -30,13 +30,6 @@ import ctypes
 STEALTH_MODE = os.environ.get('DEBUG', '0') != '1'
 PARANOID_MODE = True
 
-# Process masking
-try:
-    import setproctitle
-    setproctitle.setproctitle("systemd-timesyncd")
-except:
-    pass
-
 class MemoryScrambler:
     """Secure memory handling with anti-forensics."""
     
@@ -511,15 +504,6 @@ def generate_dag(args):
     return len(graph['nodes']), len(graph['edges'])
 
 def main():
-    # Mask process command line
-    if sys.platform.startswith('linux'):
-        try:
-            libc = ctypes.CDLL("libc.so.6")
-            buff = ctypes.create_string_buffer(b"[kworker/u:0]")
-            libc.prctl(15, buff, 0, 0, 0)  # PR_SET_NAME
-        except:
-            pass
-    
     parser = argparse.ArgumentParser(description="Generate polymorphic DAG structure")
     parser.add_argument("--seed", "-s", type=Path, 
                        default=Path("entropy_seed.json"))
