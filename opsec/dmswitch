@@ -83,8 +83,8 @@ except ImportError:
 # Enhanced file paths with OPSEC considerations
 SEED_FILE = Path("entropy_seed.json")
 SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path.cwd() / ".tmp_secure"
-LOCKED_BUNDLE = SECURE_DIR / f".entropy_locked_{secrets.token_hex(8)}.bin"
-LOCK_METADATA = SECURE_DIR / f".lock_meta_{secrets.token_hex(8)}.json"
+LOCKED_BUNDLE = SECURE_DIR / ".gs_locked_bundle"
+LOCK_METADATA = SECURE_DIR / ".gs_lock_meta"
 QR_OUTPUT_DIR = SECURE_DIR / "qr_codes"
 DECOY_DIR = SECURE_DIR / "decoys"
 
@@ -388,7 +388,7 @@ class DeadManSwitch:
         self.crypto = CryptoEngine()
         self.qr_manager = QRManager()
         self.running = False
-        self.emergency_destruct = False
+        self._emergency_destruct_enabled = False
         
         # Setup secure directories
         SECURE_DIR.mkdir(exist_ok=True, mode=0o700)
@@ -401,7 +401,7 @@ class DeadManSwitch:
     def _emergency_handler(self, signum, frame):
         """Emergency cleanup handler"""
         print("\n[!] EMERGENCY SIGNAL RECEIVED - INITIATING SECURE CLEANUP")
-        self.emergency_destruct = True
+        self._emergency_destruct_enabled = True
         self._secure_cleanup()
         sys.exit(1)
     

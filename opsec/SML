@@ -100,7 +100,8 @@ def cmd_load(args):
         print("  [!] On this system, seed would touch disk. Aborting.")
         sys.exit(1)
 
-    # Lock memory
+    # Lock memory — intentionally kept locked while seed is loaded;
+    # unlocked in cmd_wipe when the seed is erased.
     if _mlock_available():
         print("  [+] Memory locked (mlockall) — seed won't be swapped to disk")
     else:
@@ -141,6 +142,8 @@ def cmd_load(args):
             json.dump(lock_data, f)
         os.chmod(LOCK_SHM, 0o600)
 
+        # Auto-reap child processes to avoid zombies
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         # Fork a background wiper
         pid = os.fork()
         if pid == 0:
@@ -220,6 +223,11 @@ def cmd_wipe(args):
     if not wiped:
         print("  [·] No seed was loaded")
     else:
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc.munlockall()
+        except (OSError, AttributeError):
+            pass
         print("  [+] RAM storage clean")
 
 

@@ -28,6 +28,7 @@ Usage
 from __future__ import annotations
 import argparse
 import datetime as dt
+from datetime import timezone
 import hashlib
 import json
 import os
@@ -83,7 +84,7 @@ def generate_entries(count: int, base_ts: int, rng: random.Random) -> List[str]:
     lines: List[str] = []
     for _ in range(count):
         ts_skew = rng.randint(-3600, 3600)
-        ts = dt.datetime.utcfromtimestamp(base_ts + ts_skew).isoformat()
+        ts = dt.datetime.fromtimestamp(base_ts + ts_skew, tz=timezone.utc).isoformat()
         tag = rng.choice(TAGS)
         msg_tpl = rng.choice(MSG_BANK)
         
