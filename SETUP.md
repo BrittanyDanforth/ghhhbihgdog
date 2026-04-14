@@ -75,6 +75,8 @@ socks5h://127.0.0.1:9050
 This is what you'll enter whenever GhostSpiral asks for a proxy.
 The `h` in `socks5h` means DNS lookups also go through Tor (critical for privacy).
 
+**Ports:** `9050` is the SOCKS port for the system `tor` package (`apt install tor`). **Tor Browser** uses **`9150`** for SOCKS instead — if only the browser is running, use `socks5h://127.0.0.1:9150`. **`9051` is the Tor control port** (for `NEWNYM` / circuit rotation), not a SOCKS proxy; do not pass it as `--tor-proxy` or in a SOCKS proxy chain.
+
 ### DO NOT USE:
 - Free proxy lists from the internet (they log everything)
 - Cheap VPN SOCKS proxies (they see your traffic)
@@ -274,6 +276,7 @@ python3 run paranoia             # actually delete
 | Problem | Solution |
 |---------|----------|
 | `ModuleNotFoundError` | Run Step 2 again |
+| `curl: (7) Failed to connect to 127.0.0.1 port 9050` | Nothing is listening on SOCKS: `sudo systemctl start tor` and check `journalctl -u tor -n 50`. If you use **Tor Browser** only, try port **9150** instead of 9050 |
 | `Tor leak detected` | `sudo systemctl start tor` |
 | `NEWNYM failed` | Run the ControlPort commands from Step 3 |
 | `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
@@ -297,7 +300,7 @@ A malicious proxy can:
   - Log your real IP and correlate with blockchain activity
 
 ONLY use:
-  ✓ Your own local Tor instance (socks5h://127.0.0.1:9050)
+  ✓ Your own local Tor instance (system tor: socks5h://127.0.0.1:9050 — Tor Browser: :9150)
   ✓ A Tor instance you control on a trusted VPS
   ✗ NEVER public proxy lists
   ✗ NEVER "free VPN" SOCKS proxies
@@ -331,7 +334,7 @@ cd -
 
 # 5. Verify everything
 python3 -c "import requests, stem, monero, psutil; print('OK')"
-curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip || curl --socks5-hostname 127.0.0.1:9150 https://check.torproject.org/api/ip
 monerod --version
 monero-wallet-rpc --version
 ```

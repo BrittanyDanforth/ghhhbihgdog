@@ -30,7 +30,7 @@ Core Components:
 Usage:
 ──────
     python3 swap_retry_guard.py swap_plan.json \
-        --proxy-chain socks5h://127.0.0.1:9050,socks5h://127.0.0.1:9051 \
+        --proxy-chain socks5h://127.0.0.1:9050 \
         --aggregator-pool thor_endpoints.yaml \
         --stealth-mode --quantum-entropy
 """
@@ -748,7 +748,7 @@ def main():
         epilog="""
 Examples:
   %(prog)s swap_plan.json --proxy-chain socks5h://127.0.0.1:9050
-  %(prog)s swap_plan.json --proxy-chain socks5h://127.0.0.1:9050,socks5h://127.0.0.1:9051 --stealth-mode
+  %(prog)s swap_plan.json --proxy-chain socks5h://127.0.0.1:9050,socks5h://127.0.0.1:1080 --stealth-mode
   %(prog)s swap_plan.json --proxy-chain socks5h://127.0.0.1:9050 --aggregator-pool custom_endpoints.yaml --quantum-entropy
         """
     )
@@ -758,7 +758,8 @@ Examples:
     
     # Network configuration
     parser.add_argument("--proxy-chain", required=True, 
-                       help="Comma-separated proxy chain (e.g., socks5h://127.0.0.1:9050,socks5h://127.0.0.1:9051)")
+                       help="Comma-separated SOCKS/HTTP proxy chain (e.g. socks5h://127.0.0.1:9050). "
+                            "Tor control is 9051 — never use it as a SOCKS hop.")
     parser.add_argument("--aggregator-pool", 
                        help="YAML file with additional aggregator endpoints")
     
