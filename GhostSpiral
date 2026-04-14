@@ -135,6 +135,14 @@ def main():
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
+        wallet_network = rw_data.get("network")
+        if wallet_network and wallet_network != "mainnet":
+            sys.exit(
+                f"[!] Receive wallet is for {wallet_network.upper()}, not mainnet.\n"
+                f"    Feeding a {wallet_network} address into a mainnet pipeline will\n"
+                f"    cause all swaps/transfers to fail or send funds to the void.\n"
+                f"    Regenerate the wallet against a mainnet monero-wallet-rpc."
+            )
         integrity_log("stage0", "receive_mode:entry_loaded")
         print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
         if args.joinmarket:
