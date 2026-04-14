@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-paranoia_mode v10.0 - Post-Op Host Sanitiser
+paranoia_mode — Post-Op Host Sanitiser
 =============================================
 Focus: footprint erasure + network-fingerprint randomisation.
 
@@ -608,7 +608,7 @@ def main():
     default_iface = _detect_active_interface()
 
     ap = argparse.ArgumentParser(
-        "paranoia_mode v10.0",
+        "paranoia_mode",
         description="Post-operation host sanitisation",
     )
     ap.add_argument("--wipe-days", type=int, default=7,

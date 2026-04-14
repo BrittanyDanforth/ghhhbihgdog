@@ -277,7 +277,7 @@ def flow_full_pipeline(detected_port=None):
         "--rpc-primary", rpc,
     ]
 
-    run_script(CORE / "GhostSpiral", args, "Full pipeline")
+    run_script(CORE / "mixer_core", args, "Full pipeline")
 
 
 def flow_receive(detected_port=None):
@@ -304,7 +304,7 @@ def flow_receive(detected_port=None):
         "--wallets", wallets,
         "--deep", depth,
     ]
-    run_script(CORE / "GhostSpiral", args, "Receive mode")
+    run_script(CORE / "mixer_core", args, "Receive mode")
 
 
 def flow_cold(detected_port=None):
@@ -329,7 +329,7 @@ def flow_cold(detected_port=None):
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "Cold mode"):
+    if run_script(CORE / "mixer_core", args, "Cold mode"):
         print()
         ok("Unsigned plan created in ./unsigned/")
         info("Next steps:")
@@ -437,7 +437,7 @@ def flow_resume(detected_port=None):
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
     ]
-    run_script(CORE / "GhostSpiral", args, "Resume")
+    run_script(CORE / "mixer_core", args, "Resume")
 
 
 def flow_create_wallet(detected_port=None):
@@ -545,7 +545,7 @@ def flow_testnet(detected_port=None):
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "Testnet"):
+    if run_script(CORE / "mixer_core", args, "Testnet"):
         ok("Dry-run plan created in ./unsigned/")
         plans = sorted(Path("unsigned").glob("unsigned_*.json"))
         if plans:
@@ -580,7 +580,7 @@ def flow_system_check():
 # ── CLI passthrough ────────────────────────────────────────────────────────
 
 TOOLS = {
-    "ghostspiral": CORE/"GhostSpiral", "gs": CORE/"GhostSpiral",
+    "mixer": CORE/"mixer_core", "gs": CORE/"mixer_core",
     "signer": CORE/"airgap_tx_signer", "broadcast": CORE/"broadcast_signed_xmr",
     "wallet": CORE/"create_receive_wallet", "swap": CORE/"thor_swap_preparer",
     "exit": CORE/"exit_strategy_simulator",
