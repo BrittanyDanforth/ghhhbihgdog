@@ -487,11 +487,32 @@ class DeadManSwitch:
                 "integrity_token": secrets.token_hex(32)
             }
             
-            # Write encrypted bundle and metadata
-            LOCKED_BUNDLE.write_bytes(encrypted_data)
-            LOCK_METADATA.write_text(json.dumps(metadata, indent=2))
-            
-            # Secure delete original
+            # Write encrypted bundle and metadata with fsync.
+            # On /dev/shm (tmpfs) fsync is a no-op — data is RAM-only by design.
+            # On the disk fallback (.tmp_secure), fsync is essential: without it,
+            # a power loss after secure_delete but before kernel flush = fund loss.
+            _bundle_fd = os.open(str(LOCKED_BUNDLE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_bundle_fd, encrypted_data)
+                os.fsync(_bundle_fd)
+            finally:
+                os.close(_bundle_fd)
+
+            _meta_bytes = json.dumps(metadata, indent=2).encode()
+            _meta_fd = os.open(str(LOCK_METADATA), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_meta_fd, _meta_bytes)
+                os.fsync(_meta_fd)
+            finally:
+                os.close(_meta_fd)
+
+            # Verify both files are readable before destroying the original
+            if LOCKED_BUNDLE.stat().st_size != len(encrypted_data):
+                raise RuntimeError("Encrypted bundle size mismatch after write")
+            if LOCK_METADATA.stat().st_size != len(_meta_bytes):
+                raise RuntimeError("Lock metadata size mismatch after write")
+
+            # Secure delete original — only safe now that the bundle is durable
             AntiForensics.secure_delete_file(SEED_FILE)
             
             # Handle QR code generation / token delivery BEFORE announcing success

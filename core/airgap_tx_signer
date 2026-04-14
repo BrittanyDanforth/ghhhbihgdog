@@ -230,23 +230,21 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 signed_dir = outdir / "signed"
                 signed_dir.mkdir(parents=True, exist_ok=True)
                 tx_file = signed_dir / f"tx_{idx}.signed"
-                _fd = os.open(str(tx_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                try:
-                    os.write(_fd, blob_bytes)
-                    os.fsync(_fd)
-                finally:
-                    os.close(_fd)
-                secure_file_perms(tx_file)
-                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed, fsync'd)")
             else:
                 tx_file = outdir / f"tx_{idx}.unsigned"
-                _fd = os.open(str(tx_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                try:
-                    os.write(_fd, blob_bytes)
-                    os.fsync(_fd)
-                finally:
-                    os.close(_fd)
-                secure_file_perms(tx_file)
+
+            _tmp_blob = tx_file.with_suffix(tx_file.suffix + ".tmp")
+            _fd = os.open(str(_tmp_blob), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_fd, blob_bytes)
+                os.fsync(_fd)
+            finally:
+                os.close(_fd)
+            os.replace(str(_tmp_blob), str(tx_file))
+            secure_file_perms(tx_file)
+
+            if is_presigned:
+                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed, fsync'd)")
 
             sha = hashlib.sha256(blob_bytes).hexdigest()
             manifest.append({
@@ -491,12 +489,14 @@ def phase_sign(args, plan: List[dict]):
             signed_out = Path(work_dir) / "signed_monero_tx"
             if signed_out.exists():
                 signed_data = signed_out.read_bytes()
-                _sfd = os.open(str(signed_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                _tmp_signed = signed_file.with_suffix(signed_file.suffix + ".tmp")
+                _sfd = os.open(str(_tmp_signed), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 try:
                     os.write(_sfd, signed_data)
                     os.fsync(_sfd)
                 finally:
                     os.close(_sfd)
+                os.replace(str(_tmp_signed), str(signed_file))
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()

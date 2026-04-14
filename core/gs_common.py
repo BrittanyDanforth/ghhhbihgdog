@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, signal, sys, time
+import hashlib, json, os, re, secrets, signal, sys, time, threading as _threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -193,6 +193,14 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
     os.replace(tmp, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
 #  Proxy validation
@@ -545,8 +553,6 @@ def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> No
 # ---------------------------------------------------------------------------
 #  Signal handling for graceful shutdown
 # ---------------------------------------------------------------------------
-
-import threading as _threading
 
 _SHUTDOWN_EVENT = _threading.Event()
 
