@@ -98,8 +98,12 @@ def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> dict | None
             inbound = resp.get("inbound_address", "")
             memo = resp.get("memo", "")
             expected_out = resp.get("expected_amount_out", "0")
-            if inbound and memo:
+            if inbound and memo and len(memo) > 5:
                 expected_xmr = Decimal(str(expected_out)) / Decimal("1000000000000")
+                if expected_xmr <= 0:
+                    continue
+                if expected_xmr > 100000:
+                    continue
                 return {
                     "deposit": inbound,
                     "memo": memo,
@@ -116,7 +120,6 @@ def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "thor_swap_preparer v10.0",
         description="Fetch ThorChain BTC->XMR quotes via THORNode native API with OPSEC hardening",
     )
     ap.add_argument("--amounts", nargs="+", required=True, type=Decimal,
