@@ -1477,11 +1477,14 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             "completed": sorted(completed_indices),
         }, _progress_nonce, progress_file)
 
-        print(f"  [+] TX {tx_idx} complete ({success_count}/{total_txs})")
+        print(f"  [+] TX {tx_idx} submitted and wallet refreshed ({success_count}/{total_txs})")
 
     # Summary
     integrity_log("stage5", f"pipeline:{success_count}_ok:{fail_count}_fail")
-    print(f"\n  [+] Stage 5 complete: {success_count} sent, {fail_count} failed out of {total_txs}")
+    if fail_count > 0:
+        print(f"\n  [!] Stage 5 finished with errors: {success_count} submitted, {fail_count} FAILED out of {total_txs}")
+    else:
+        print(f"\n  [+] Stage 5 finished: {success_count}/{total_txs} TXs submitted to mempool")
 
     if fail_count:
         print(f"  [!] {fail_count} TXs failed. Check logs and retry.")

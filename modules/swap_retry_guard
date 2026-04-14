@@ -103,11 +103,11 @@ TIMING_JITTER_RANGE = (0.5, 3.0)
 PHANTOM_TRAFFIC_PROB = 0.0
 MAX_CONCURRENT_SWAPS = 2
 STEALTH_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -764,7 +764,7 @@ class AdvancedSwapOrchestrator:
                         last_log = self.progress["log"][-1] if self.progress["log"] else {}
                         if not last_log.get("phantom") and not last_log.get("dry_run"):
                             successful_swaps += 1
-                            print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                            print(f"[+] Swap {swap_entry.get('idx', i)} quote fetched")
                         else:
                             print(f"[·] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
                     else:
@@ -775,11 +775,11 @@ class AdvancedSwapOrchestrator:
                     self.integrity_chain.add_entry("SWAP_EXCEPTION", f"idx={swap_entry.get('idx', i)}", {"error": str(e)})
                     
             # Final statistics
-            print(f"\n[✓] Swap plan execution complete")
-            print(f"    Total swaps: {total_swaps}")
-            print(f"    Successful: {successful_swaps}")
+            print(f"\n[*] Swap quote fetching finished")
+            print(f"    Total quotes requested: {total_swaps}")
+            print(f"    Quotes received: {successful_swaps}")
             print(f"    Failed: {total_swaps - successful_swaps}")
-            print(f"    Success rate: {(successful_swaps/total_swaps)*100:.1f}%")
+            print(f"    [!] These are QUOTES, not executed swaps. Operator must still send BTC.")
             print(f"    Circuit burns: {self.circuit_burn.burn_count}")
             
             self.integrity_chain.add_entry(
@@ -824,12 +824,12 @@ Examples:
                        help="Tor control socket path")
     
     # Security options
-    parser.add_argument("--stealth-mode", action="store_true",
-                       help="Add timing jitter before first request per swap. "
+    parser.add_argument("--stealth-mode", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="Add timing jitter before first request per swap (default: on). "
+                            "Disable with --no-stealth-mode. "
                             "NOTE: this only affects request timing, not traffic "
-                            "content, headers, endpoints, or Tor circuit behaviour. "
-                            "An observer analysing encrypted traffic volume/patterns "
-                            "will see identical request shapes with shifted timing.")
+                            "content, headers, endpoints, or Tor circuit behaviour.")
     
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
@@ -837,8 +837,10 @@ Examples:
     # Operational modes
     parser.add_argument("--dry-run", action="store_true",
                        help="Simulate swaps without actual execution")
-    parser.add_argument("--force-circuit-burn", action="store_true",
-                       help="Force circuit burn before each swap")
+    parser.add_argument("--force-circuit-burn", action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help="Force Tor circuit rotation before each swap for per-swap isolation (default: on). "
+                            "Disable with --no-force-circuit-burn.")
     # Advanced options
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")
@@ -863,6 +865,10 @@ Examples:
         print("    Use 'python3 SML load entropy_seed.json' to keep it RAM-only,", file=sys.stderr)
         print("    or delete it immediately after operations complete.", file=sys.stderr)
         
+    import math as _math
+    if _math.isnan(args.phantom_prob) or _math.isinf(args.phantom_prob):
+        print(f"[!] phantom-prob must be a finite number, got {args.phantom_prob}", file=sys.stderr)
+        sys.exit(1)
     if args.phantom_prob < 0.0 or args.phantom_prob > 1.0:
         print(f"[!] phantom-prob must be between 0.0 and 1.0, got {args.phantom_prob}", file=sys.stderr)
         sys.exit(1)
@@ -891,12 +897,12 @@ Examples:
     
     # Security warnings
     if not args.stealth_mode:
-        print("[!] Warning: Stealth mode disabled. Traffic patterns may be detectable.")
+        print("[!] WARNING: Stealth mode disabled (--no-stealth-mode). Traffic timing patterns may be detectable.")
 
     if len(args.proxy_chain.split(',')) == 1 and not args.force_circuit_burn:
-        print("[!] WARNING: Single-proxy chain without --force-circuit-burn means all")
+        print("[!] WARNING: Single-proxy chain with --no-force-circuit-burn means all")
         print("    swap requests in a batch share the same Tor circuit (until periodic")
-        print("    burn triggers). Use --force-circuit-burn for per-swap circuit isolation.")
+        print("    burn triggers). Consider re-enabling --force-circuit-burn.")
         
     if args.phantom_prob > 0:
         print(f"[•] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
@@ -930,10 +936,10 @@ Examples:
         success = orchestrator.execute_swap_plan(Path(args.plan))
         
         if success:
-            print("\n[✓] All swaps completed successfully")
+            print("\n[+] All swap quotes fetched. Operator must send BTC to complete swaps.")
             sys.exit(0)
         else:
-            print("\n[!] Some swaps failed - check logs for details")
+            print("\n[!] Some swap quotes failed - check logs for details")
             sys.exit(1)
             
     except KeyboardInterrupt:

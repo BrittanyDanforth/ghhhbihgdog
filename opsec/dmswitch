@@ -515,9 +515,10 @@ class DeadManSwitch:
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)
 
-            print(f"[+] Entropy seed locked successfully")
+            print(f"[+] Entropy seed encrypted and original securely deleted")
             print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
             print(f"[+] Expires: {metadata['expires_at']}")
+            print(f"[!] VERIFY: Run unlock with the token BEFORE relying on this lock.")
 
             return True
             
@@ -585,13 +586,18 @@ class DeadManSwitch:
                 print("[!] Locked bundle is PRESERVED — you can retry with the correct token.")
                 return False
 
-            # Restore entropy seed
-            SEED_FILE.write_bytes(decrypted_data)
+            # Restore entropy seed with fsync to ensure durability
+            fd = os.open(str(SEED_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, decrypted_data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
-            # Only now that restore succeeded, clean up the encrypted copies
+            # Only now that restore is durable on disk, clean up the encrypted copies
             self._secure_cleanup()
 
-            print("[+] Entropy seed successfully unlocked and restored")
+            print("[+] Entropy seed decrypted and restored (fsync'd)")
             print(f"[+] File restored: {SEED_FILE}")
 
             return True
@@ -633,7 +639,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     
     # Lock options
     parser.add_argument("--ttl", type=int, default=300,
-                       help="Time-to-live in seconds (default: 300)")
+                       help="Time-to-live in seconds (default: 300, min: 10)")
     
     # QR code options
     parser.add_argument("--show-qr", action="store_true",
@@ -655,6 +661,12 @@ def main():
     # Initialize dead man's switch
     switch = DeadManSwitch()
     
+    if args.lock and args.ttl < 10:
+        print("[!] --ttl must be at least 10 seconds (got {})".format(args.ttl))
+        print("[!] A TTL below 10s risks immediate self-destruct before the token")
+        print("[!] can be saved, causing irreversible loss of the entropy seed.")
+        sys.exit(1)
+
     try:
         if args.emergency_destruct:
             # Emergency destruction

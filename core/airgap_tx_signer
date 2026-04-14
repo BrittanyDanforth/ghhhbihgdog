@@ -230,12 +230,22 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 signed_dir = outdir / "signed"
                 signed_dir.mkdir(parents=True, exist_ok=True)
                 tx_file = signed_dir / f"tx_{idx}.signed"
-                tx_file.write_bytes(blob_bytes)
+                _fd = os.open(str(tx_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_fd, blob_bytes)
+                    os.fsync(_fd)
+                finally:
+                    os.close(_fd)
                 secure_file_perms(tx_file)
-                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed)")
+                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed, fsync'd)")
             else:
                 tx_file = outdir / f"tx_{idx}.unsigned"
-                tx_file.write_bytes(blob_bytes)
+                _fd = os.open(str(tx_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_fd, blob_bytes)
+                    os.fsync(_fd)
+                finally:
+                    os.close(_fd)
                 secure_file_perms(tx_file)
 
             sha = hashlib.sha256(blob_bytes).hexdigest()
@@ -481,7 +491,12 @@ def phase_sign(args, plan: List[dict]):
             signed_out = Path(work_dir) / "signed_monero_tx"
             if signed_out.exists():
                 signed_data = signed_out.read_bytes()
-                signed_file.write_bytes(signed_data)
+                _sfd = os.open(str(signed_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_sfd, signed_data)
+                    os.fsync(_sfd)
+                finally:
+                    os.close(_sfd)
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()

@@ -235,7 +235,7 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 def verify_tor(proxy: Dict[str, str]) -> None:
     """Verify we are exiting through Tor. Aborts on failure."""
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
-                     headers={"User-Agent": _BROWSER_UA})
+                     headers=_BROWSER_HEADERS)
     r.raise_for_status()
     data = r.json()
     if not data.get("IsTor"):
@@ -248,7 +248,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
     """Re-verify Tor mid-operation. Logs but doesn't retry as aggressively."""
     try:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
-                         headers={"User-Agent": _BROWSER_UA})
+                         headers=_BROWSER_HEADERS)
         r.raise_for_status()
         if not r.json().get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
@@ -351,11 +351,21 @@ def _newnym_between_retries(retry_state):
 
 _BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
 
+_BROWSER_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
        before_sleep=_newnym_between_retries)
 def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r = requests.get(url, timeout=20, proxies=proxies,
-                     headers={"User-Agent": _BROWSER_UA})
+                     headers=_BROWSER_HEADERS)
     r.raise_for_status()
     return r.json()
 
@@ -372,7 +382,7 @@ def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
        before_sleep=_newnym_between_retries)
 def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
                      headers: Dict[str, str] = None) -> dict:
-    h = {"User-Agent": _BROWSER_UA}
+    h = dict(_BROWSER_HEADERS)
     if headers:
         h.update(headers)
     r = requests.post(url, json=payload, timeout=25, proxies=proxies, headers=h)

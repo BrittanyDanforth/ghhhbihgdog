@@ -253,7 +253,7 @@ def main():
     load_p = sub.add_parser("load", help="Load seed into RAM-locked storage")
     load_p.add_argument("seed_file", help="Path to entropy_seed.json")
     load_p.add_argument("--ttl", type=int, default=None,
-                        help="Auto-wipe after N seconds")
+                        help="Auto-wipe after N seconds (min: 10)")
 
     sub.add_parser("verify", help="Check if seed is loaded and intact")
     sub.add_parser("wipe", help="Securely erase seed from RAM")
@@ -264,6 +264,10 @@ def main():
         sys.exit(0)
 
     if args.command == "load":
+        if args.ttl is not None and args.ttl < 10:
+            print(f"  [!] --ttl must be at least 10 seconds (got {args.ttl})")
+            print(f"  [!] A TTL below 10s risks immediate wipe before seed can be used.")
+            sys.exit(1)
         cmd_load(args)
     elif args.command == "verify":
         cmd_verify(args)

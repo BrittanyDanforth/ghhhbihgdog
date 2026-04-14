@@ -546,7 +546,10 @@ def main():
             atomic_write_json(prog, progF)
 
     integrity_log("broadcast", "done")
-    print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed, {skip_count} resumed.")
+    if fail_count > 0:
+        print(f"\n  [!] Broadcast finished with errors: {success_count} submitted, {fail_count} FAILED, {skip_count} skipped.")
+    else:
+        print(f"\n  [+] Broadcast finished: {success_count} submitted to mempool, {skip_count} skipped (prior run).")
     if skip_count > 0:
         print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
     print(f"  [+] Progress: {progF}")

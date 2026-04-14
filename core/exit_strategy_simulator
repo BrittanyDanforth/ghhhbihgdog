@@ -208,7 +208,7 @@ def main():
     print(f"  Liquidity   : {liq_guidance}")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan saved -> {args.outfile}")
+    print(f"  [+] Plan written -> {args.outfile} (fsync'd)")
 
 
 if __name__ == "__main__":

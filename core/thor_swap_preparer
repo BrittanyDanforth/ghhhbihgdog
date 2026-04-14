@@ -284,7 +284,7 @@ def main():
         )
     atomic_write_json(pairs, _out)
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
-    print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
+    print(f"\n  [+] {len(pairs)} pair(s) written to {_out} (fsync'd, 0600 permissions)")
 
     print()
     print("  ============================================================")
