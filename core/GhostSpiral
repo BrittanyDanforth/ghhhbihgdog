@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse, json, os, re, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 # Ensure gs_common is found when run from any working directory
 _CORE_DIR = str(Path(__file__).resolve().parent)
@@ -404,7 +404,7 @@ def main():
     # Stage 2 - ThorChain swap definition
     ###########################################################################
 
-    def _thornode_quote(amt: Decimal, xmr_dest: str) -> dict | None:
+    def _thornode_quote(amt: Decimal, xmr_dest: str) -> Optional[dict]:
         """Try THORNode native API for a swap quote (no API key needed)."""
         from urllib.parse import quote as _url_quote
         amount_sats = int(amt * Decimal("1e8"))
@@ -739,7 +739,7 @@ def main():
 
     bal_account = receive_account_index if receive_mode else 0
 
-    def xmr_balance() -> tuple[Decimal, Decimal]:
+    def xmr_balance() -> Tuple[Decimal, Decimal]:
         """Returns (total_balance, unlocked_balance) in XMR."""
         res = rpc_primary.raw_request(
             "get_balance", {"account_index": bal_account, "address_indices": []}
@@ -1237,7 +1237,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         """Write progress with HMAC for tamper detection."""
         data["hmac"] = _progress_hmac(data, nonce)
         data["nonce"] = nonce
-        _awj(data, path)
+        atomic_write_json(data, path)
 
     # Progress tracking for resume
     progress_file = Path("stage5_progress.json")
@@ -1452,7 +1452,6 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         # resume, the wallet picks different inputs → double-payment.
         # By persisting broadcast_pending first, the resume path can
         # detect this and verify wallet state before re-creating.
-        from gs_common import atomic_write_json as _awj
         broadcast_pending = set(completed_indices)
         broadcast_pending.add(tx_idx)
         _save_progress({

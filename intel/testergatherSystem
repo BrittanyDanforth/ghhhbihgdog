@@ -352,7 +352,7 @@ class HardwareOPSEC:
                                        check=True, capture_output=True, timeout=10)
                         
                         logger.info(f"MAC randomized for {iface}: {mac}")
-            except:
+            except Exception:
                 pass
     
     @staticmethod
@@ -676,7 +676,7 @@ class TelegramIntelligence:
                             'date': datetime.now().isoformat()
                         })
                         
-            except:
+            except Exception:
                 pass
                 
         except Exception as e:
@@ -774,7 +774,7 @@ class AIEnhancedDetector:
                 sentiment = self.sentiment_analyzer(text[:512])[0]
                 if sentiment['label'] == 'negative':
                     score += sentiment['score'] * 0.3
-            except:
+            except Exception:
                 pass
                 
         # ML classification if available
@@ -782,7 +782,7 @@ class AIEnhancedDetector:
             try:
                 proba = self.victim_classifier.predict_proba([features])[0][1]
                 score = (score + proba) / 2
-            except:
+            except Exception:
                 pass
                 
         return {
@@ -1122,7 +1122,7 @@ class UltraStealthBrowser:
             self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': stealth_js
             })
-        except:
+        except Exception:
             self.driver.execute_script(stealth_js)
 
 # ========== DISTRIBUTED SCRAPER ENGINE ==========
@@ -1318,7 +1318,7 @@ class DistributedScraperEngine:
                 action.move_by_offset(x, y)
                 
             action.perform()
-        except:
+        except Exception:
             pass
             
     async def _enrich_high_value(self, result):
@@ -1419,14 +1419,14 @@ class SecureDataProcessor:
         try:
             with open('/proc/cpuinfo', 'rb') as f:
                 sources.append(f.read())
-        except:
+        except Exception:
             pass
             
         # Machine ID
         try:
             with open('/etc/machine-id', 'rb') as f:
                 sources.append(f.read())
-        except:
+        except Exception:
             pass
             
         # Random
@@ -1891,10 +1891,10 @@ class UltimateIntelOrchestrator:
                 for container in self.scraper.container_pool:
                     try:
                         container.kill()
-                    except:
+                    except Exception:
                         pass
                         
-        except:
+        except Exception:
             pass
 
 # ========== MAIN EXECUTION ==========

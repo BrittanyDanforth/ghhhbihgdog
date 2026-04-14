@@ -28,14 +28,12 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
-    safe_post, newnym, secure_delay, atomic_write_json,
+    newnym, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested,
+    _BROWSER_HEADERS,
 )
 
 _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
-
-
-_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
 
 
 def _single_post(url: str, payload: dict, proxies=None) -> dict:
@@ -50,7 +48,7 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     if proxies is None:
         sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies,
-                      headers={"User-Agent": _BROWSER_UA})
+                      headers=_BROWSER_HEADERS)
     r.raise_for_status()
     try:
         return r.json()

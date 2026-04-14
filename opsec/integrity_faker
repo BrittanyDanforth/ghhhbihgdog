@@ -411,6 +411,8 @@ def main():
         temp_path = output_path.with_suffix('.tmp')
         with open(temp_path, 'w') as f:
             f.write('\n'.join(fake_chain) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
         
         temp_path.replace(output_path)
         os.chmod(output_path, 0o600)

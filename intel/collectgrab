@@ -102,12 +102,14 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-# Nitter instances — the original project shut down early 2024.
-# Only a handful of community forks remain; this list must be maintained.
+# Nitter instances — the original project shut down Feb 2024 after Twitter
+# disabled guest accounts. Most community forks are non-functional or rate-
+# limited. These are best-effort; the code gracefully handles failures.
+# If all fail, no tweets are collected (not a fatal error).
 NITTER_INSTANCES = [
+    "https://xcancel.com",
     "https://nitter.privacydev.net",
     "https://nitter.poast.org",
-    "https://xcancel.com",
 ]
 
 # Define base directories for outputs - fallback to current directory if /dev/shm unavailable

@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse, json, os, sys, time, re
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 _CORE_DIR = str(Path(__file__).resolve().parent)
 if _CORE_DIR not in sys.path:
@@ -57,7 +57,7 @@ BTC_RE = re.compile(
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
 
 
-def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
+def _btc_per_xmr(proxy: Optional[Dict[str, str]]) -> Decimal:
     """Fetch current BTC/XMR rate from CoinGecko.
     Set COINGECKO_API_KEY env var for reliable access (free demo key).
     """
@@ -90,7 +90,7 @@ def _validate_xmr_addr(addr: str) -> None:
         sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
 
 
-def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> dict | None:
+def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> Optional[dict]:
     """Try THORNode native API for a swap quote. Returns deposit info or None."""
     amt_sats = int(amt_btc * Decimal("100000000"))
     for node in THORNODE_APIS:

@@ -132,7 +132,7 @@ class SecureMemory:
                     mm.write(secrets.token_bytes(size))
                     mm.flush()
                 mm.close()
-            except:
+            except Exception:
                 pass
         self._allocations.clear()
 
@@ -224,7 +224,7 @@ class AntiForensics:
                 AntiForensics.secure_delete_file(decoy_file)
             try:
                 DECOY_DIR.rmdir()
-            except:
+            except Exception:
                 pass
 
 class CryptoEngine:
@@ -350,7 +350,7 @@ class QRManager:
         try:
             # Try to use a system font
             font = ImageFont.load_default()
-        except:
+        except Exception:
             font = None
         
         # Add fake document header
@@ -389,8 +389,7 @@ class QRManager:
             
             if auto_clear:
                 time.sleep(30)
-                # Clear terminal
-                os.system('clear' if os.name == 'posix' else 'cls')
+                print("\033[2J\033[H", end="", flush=True)
                 print("[+] QR code cleared from terminal")
             
             return True
@@ -449,7 +448,7 @@ class DeadManSwitch:
             try:
                 if SECURE_DIR.exists() and not any(SECURE_DIR.iterdir()):
                     SECURE_DIR.rmdir()
-            except:
+            except Exception:
                 pass
                 
             print("[+] Secure cleanup completed")
