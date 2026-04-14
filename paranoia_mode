@@ -295,7 +295,8 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     common subdirectories, and any --search-dir paths provided."""
     file_patterns = [
         "unsigned_*.json", "signer_progress.json",
-        "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
+        "broadcast_progress.json", "stage5_progress.json",
+        "wallet_*.json", "thor_pairs_*.json",
         "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
         "exitplan_*.json", "exitplan_v1.json",
         "integrity_chain.log", "integrity.log",

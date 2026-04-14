@@ -320,9 +320,8 @@ def main():
             bytes.fromhex(raw_hex)
             use_raw_hex = True
         except (UnicodeDecodeError, ValueError):
-            # Binary signed_txset — need to base64-encode for submit_transfer
-            import base64
-            signed_txset_b64 = base64.b64encode(raw_data).decode('ascii')
+            # Binary signed_txset — will hex-encode for submit_transfer's
+            # tx_data_hex parameter (see line where rpc_payload is built).
             use_raw_hex = False
 
         # NEWNYM + planned delay before each TX for circuit isolation and
