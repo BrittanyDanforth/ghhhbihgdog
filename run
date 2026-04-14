@@ -103,15 +103,23 @@ def check_prereqs() -> dict:
         except ImportError:
             status[name] = False
 
-    # Tor
-    try:
-        import requests as _r
-        resp = _r.get("https://check.torproject.org/api/ip",
-                       proxies={"http":"socks5h://127.0.0.1:9050","https":"socks5h://127.0.0.1:9050"},
-                       timeout=10)
-        status["tor"] = resp.json().get("IsTor", False)
-    except Exception:
-        status["tor"] = False
+    # Tor (system tor SOCKS 9050; Tor Browser embedded tor 9150)
+    status["tor"] = False
+    status["tor_port"] = None
+    import requests as _r
+    for _tor_port in (9050, 9150):
+        try:
+            _px = {
+                "http": f"socks5h://127.0.0.1:{_tor_port}",
+                "https": f"socks5h://127.0.0.1:{_tor_port}",
+            }
+            resp = _r.get("https://check.torproject.org/api/ip", proxies=_px, timeout=10)
+            if resp.json().get("IsTor"):
+                status["tor"] = True
+                status["tor_port"] = _tor_port
+                break
+        except Exception:
+            continue
 
     # Monero
     for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
@@ -143,7 +151,13 @@ def show_status(st: dict):
         (ok if ok_val else err)(name)
 
     print()
-    (ok if st.get("tor") else err)("Tor SOCKS proxy (127.0.0.1:9050)")
+    _tp = st.get("tor_port")
+    _tor_line = (
+        f"Tor SOCKS proxy (127.0.0.1:{_tp})"
+        if _tp
+        else "Tor SOCKS proxy (127.0.0.1:9050 or :9150)"
+    )
+    (ok if st.get("tor") else err)(_tor_line)
     for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
         (ok if st.get(tool) else warn)(f"{tool}")
     (ok if st.get("wallet_rpc") else warn)("wallet-rpc responding (127.0.0.1:18083)")
@@ -152,7 +166,10 @@ def show_status(st: dict):
     if missing:
         print(f"\n  {R}Missing deps:{N} python3 -m pip install {' '.join(missing)}")
     if not st.get("tor"):
-        print(f"  {R}Tor not running:{N} sudo systemctl start tor")
+        print(
+            f"  {R}Tor not running:{N} sudo systemctl start tor (:9050) "
+            f"or start Tor Browser (:9150)"
+        )
 
     return len(missing) == 0 and st.get("tor", False)
 

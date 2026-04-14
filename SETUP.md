@@ -75,7 +75,7 @@ socks5h://127.0.0.1:9050
 This is what you'll enter whenever GhostSpiral asks for a proxy.
 The `h` in `socks5h` means DNS lookups also go through Tor (critical for privacy).
 
-**Ports:** `9050` is the SOCKS port for the system `tor` package (`apt install tor`). **Tor Browser** uses **`9150`** for SOCKS instead — if only the browser is running, use `socks5h://127.0.0.1:9150`. **`9051` is the Tor control port** (for `NEWNYM` / circuit rotation), not a SOCKS proxy; do not pass it as `--tor-proxy` or in a SOCKS proxy chain.
+**Ports:** `9050` is the SOCKS port for the system `tor` package (`apt install tor`). **Tor Browser** uses **`9150`** for SOCKS instead — if only the browser is running, use `socks5h://127.0.0.1:9150`. **`9051`** (system tor) and **`9151`** (Tor Browser) are **control** ports for `NEWNYM` / circuit rotation, not SOCKS; do not pass them as `--tor-proxy` or in a SOCKS proxy chain. GhostSpiral tries control **9051** then **9151** when the Unix control socket is missing.
 
 ### DO NOT USE:
 - Free proxy lists from the internet (they log everything)
