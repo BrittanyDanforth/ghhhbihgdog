@@ -142,8 +142,8 @@ def cmd_load(args):
     os.replace(tmp, SEED_SHM)
     os.chmod(SEED_SHM, 0o600)
 
-    seed_bytes = len(seed_hex) // 2
-    print(f"  [+] Seed loaded into RAM: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    seed_len = len(seed_hex) // 2
+    print(f"  [+] Seed loaded into RAM: {seed_len} bytes ({seed_len * 8} bits)")
     print(f"  [+] Location: {SEED_SHM} (RAM-only, 0600 permissions)")
 
     if args.ttl:

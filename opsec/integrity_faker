@@ -204,8 +204,8 @@ class IntegrityChainFaker:
             # Generate realistic detail
             detail = self._generate_realistic_detail(tag)
             
-            # Match gs_common.integrity_log format: ts|VERSION|stage|msg
-            entry_data = f"{timestamp}|10.5|{tag}|{detail}"
+            # Match gs_common.integrity_log format: ts|stage|msg
+            entry_data = f"{timestamp}|{tag}|{detail}"
             
             # Compute chain hash (previous hash + current data)
             hash_input = (previous_hash + entry_data).encode()
@@ -287,7 +287,7 @@ class IntegrityChainFaker:
         previous_hash = "0" * 64
         for entry in self.chain_data:
             # Reconstruct hash
-            entry_data = f"{entry['timestamp']}|10.5|{entry['tag']}|{entry['detail']}"
+            entry_data = f"{entry['timestamp']}|{entry['tag']}|{entry['detail']}"
             expected_hash = sha256_hex((previous_hash + entry_data).encode())
             
             if expected_hash != entry['hash']:

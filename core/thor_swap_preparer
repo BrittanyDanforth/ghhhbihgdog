@@ -44,7 +44,7 @@ THORNODE_APIS = [
     "https://thornode-v1.ninerealms.com",
 ]
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
-PAIR_SCHEMA = "thor_pairs_v1"
+PAIR_SCHEMA = "swap_pairs_v1"
 # BUG 66 FIX: Accept all valid BTC address formats including legacy (1...),
 # P2SH (3...), and bech32 (bc1...). ThorChain vaults can use any format.
 BTC_RE = re.compile(

@@ -706,8 +706,10 @@ class AdvancedSwapOrchestrator:
                 {"last_error": str(last_error)[:100] if last_error else "unknown"}
             )
             
-        # Update progress
-        self.progress["last"] = idx
+        # Only advance progress["last"] on success — failed swaps must be
+        # retried on the next run, not silently skipped.
+        if success:
+            self.progress["last"] = idx
         self.progress["log"].append({
             "idx": idx,
             "success": success,
@@ -716,7 +718,7 @@ class AdvancedSwapOrchestrator:
             "error_count": error_count
         })
         self._save_progress(self.progress)
-        
+
         return success
         
     def execute_swap_plan(self, plan_file: Path) -> bool:
@@ -781,7 +783,7 @@ class AdvancedSwapOrchestrator:
 def main():
     """Main entry point with enhanced argument parsing."""
     parser = argparse.ArgumentParser(
-        description="GhostSpiral v16.9 Advanced Swap Orchestrator",
+        description="Advanced Swap Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -888,7 +890,7 @@ Examples:
         except Exception as e:
             print(f"[!] Memory locking failed: {e}")
     
-    print("[•] GhostSpiral v16.9 Swap Orchestrator Starting")
+    print("[•] Swap Orchestrator Starting")
     print(f"    Plan file: {args.plan}")
     print(f"    Proxy chain: {len(args.proxy_chain.split(','))} hops")
     print(f"    Stealth mode: {'enabled' if args.stealth_mode else 'disabled'}")

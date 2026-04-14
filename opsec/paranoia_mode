@@ -322,7 +322,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "integrity_chain.log", "integrity.log",
         "*.blob", "*.signed", "*.unsigned",
         "signed_manifest_v1.json", "unsigned_manifest.json",
-        ".ghostspiral.lock",
+        ".ghostspiral.lock", ".mixer.lock",
         # Entropy + chaos pipeline
         "entropy_seed.json", "entropy_seed.json.tmp",
         "dag_structure.json", "dag_augmented.json",

@@ -169,7 +169,7 @@ def main():
             pass
 
         staging_dir = "tx_staging"
-        lock_path = Path(".ghostspiral.lock")
+        lock_path = Path(".mixer.lock")
         if lock_path.exists():
             sys.exit("[!] Lock file exists. Another instance may be running.")
         lock_path.write_text(str(os.getpid()))
@@ -340,6 +340,8 @@ def main():
                 expected_out = resp.get("expected_amount_out", "0")
                 if inbound and memo:
                     expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
+                    if expected_xmr <= 0:
+                        continue
                     return {
                         "deposit_address": inbound,
                         "memo": memo,
@@ -642,8 +644,7 @@ def main():
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
     meta = {
-        "schema": "unsigned_v1",
-        "version": VERSION,
+        "schema": "plan_v1",
         "created": int(time.time()) // 600 * 600,
         "rounds": len(plan),
         "fee_per_round": str(per_round_fee),
@@ -709,10 +710,10 @@ def main():
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
     # Lock file to prevent concurrent runs
-    lock_path = Path(".ghostspiral.lock")
+    lock_path = Path(".mixer.lock")
     if lock_path.exists():
         sys.exit(
-            "[!] Lock file exists: .ghostspiral.lock\n"
+            "[!] Lock file exists: .mixer.lock\n"
             "    Another GhostSpiral instance may be running.\n"
             "    If not, delete the lock file manually."
         )

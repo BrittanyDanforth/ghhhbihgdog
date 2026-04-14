@@ -74,11 +74,13 @@ MODULES = {
 # Helper/runner
 # ---------------------------------------------------------------------------
 
-def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True):
+def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True,
+             timeout: int = 600):
     """Execute a subprocess command with error handling."""
     print("[•]", " ".join(cmd))
     try:
-        result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True)
+        result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True,
+                                timeout=timeout)
         if result.stdout:
             print(f"    Output: {result.stdout.strip()}")
         return result
@@ -86,6 +88,9 @@ def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = Tr
         print(f"    Error: Command failed with exit code {e.returncode}")
         if e.stderr:
             print(f"    Stderr: {e.stderr.strip()}")
+        raise
+    except subprocess.TimeoutExpired:
+        print(f"    Error: Command timed out after {timeout}s")
         raise
     except FileNotFoundError as e:
         print(f"    Error: Command not found - {e}")

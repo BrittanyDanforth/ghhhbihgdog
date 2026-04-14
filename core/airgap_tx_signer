@@ -64,17 +64,17 @@ def _validate_plan(plan: List[dict]) -> None:
 
 
 def _load_unsigned(path: Path) -> tuple:
-    """Load unsigned_v1 bundle. Returns (plan_list, metadata_dict)."""
+    """Load plan bundle. Returns (plan_list, metadata_dict)."""
     with open(path) as f:
         raw = json.load(f)
     if isinstance(raw, dict):
         if "txs" in raw and isinstance(raw["txs"], list):
             meta = raw.get("meta", {})
             return raw["txs"], meta
-        sys.exit("[!] unsigned_v1 dict format missing 'txs' list")
+        sys.exit("[!] Plan JSON missing 'txs' list")
     if isinstance(raw, list):
         return raw, {}
-    sys.exit("[!] unsigned_v1 has unexpected format")
+    sys.exit("[!] Plan JSON has unexpected format")
 
 
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
@@ -522,7 +522,7 @@ def main():
         description="Two-phase Monero TX signer (create unsigned / sign offline)",
     )
     cli.add_argument("unsigned_json",
-                     help="unsigned_v1 JSON plan from GhostSpiral")
+                     help="Plan JSON from the pipeline")
     cli.add_argument("--phase", required=True, choices=["create", "sign"],
                      help="'create' = online: create unsigned TXs via RPC; "
                           "'sign' = offline: sign with wallet-cli")
