@@ -198,6 +198,8 @@ def main():
 
         print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
         print(f"  [*] Skipping Stages 0-4, jumping to Stage 5.")
+        print(f"  [!] OPSEC: Ensure monero-wallet-rpc was started with --log-level 0")
+        print(f"  [!]   to suppress RPC call logging (see Stage 0 warnings).")
         integrity_log("stage5", f"resume_plan:{resume_path.name}")
 
         rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
@@ -250,6 +252,11 @@ def main():
                 lock_path.unlink()
 
         print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
+        print()
+        print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
+        print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
+        print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
+        print("  [!]   Or run:  python3 opsec/paranoia_mode")
         sys.exit(0)
 
     # ---- Determine mode ----
@@ -352,6 +359,17 @@ def main():
 
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
+
+    # OPSEC WARNING: monero-wallet-rpc logs every JSON-RPC call by default.
+    # The call sequence (get_height, get_balance, new_address * N,
+    # get_fee_estimate, transfer_split * N, refresh * N) is a distinctive
+    # fingerprint of this toolkit. An adversary reading the wallet-rpc log
+    # file can identify the toolkit from the API call pattern alone.
+    print(f"  [!] OPSEC: Ensure monero-wallet-rpc was started with --log-level 0")
+    print(f"  [!]   to suppress RPC call logging. Default logging records every")
+    print(f"  [!]   JSON-RPC method call with timestamps — a forensic fingerprint.")
+    print(f"  [!]   Example: monero-wallet-rpc --wallet-file w --log-level 0 ...")
+    integrity_log("stage0", "wallet_rpc_log_warning_shown")
 
     # Sync guard: wait for nodes to agree on height
     # BUG 39 FIX: h1 was referenced after the for/else but only assigned
@@ -1060,6 +1078,12 @@ def main():
             lock_path.unlink()
 
     print("\n  [*] Pipeline finished. Check Stage 5 summary above for failures.")
+    print()
+    print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
+    print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
+    print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
+    print("  [!]   Or run:  python3 opsec/paranoia_mode")
+    print("  [!]   Also check: ~/.python_history, ~/.lesshst, ~/.viminfo")
 
 
 def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
@@ -1638,6 +1662,54 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 integrity_log("stage5", "tx_staging_wiped_after_success")
         except OSError:
             integrity_log("stage5", "tx_staging_wipe_failed")
+
+        # Wipe integrity_chain.log — it's a forensic roadmap of every stage,
+        # recording timestamps (10-min bucketed), stage transitions, TX counts,
+        # wallet addresses (scrubbed), fee estimates, and RPC interactions.
+        # An adversary with this file can reconstruct the entire operation
+        # timeline even if all other artifacts are gone.
+        for _log_artifact in (Path("integrity_chain.log"),
+                              Path("integrity_chain.log.lock")):
+            if _log_artifact.exists():
+                try:
+                    _lsize = _log_artifact.stat().st_size
+                    if _lsize > 0:
+                        with open(_log_artifact, "r+b") as _lf:
+                            _lf.write(b"\x00" * _lsize)
+                            _lf.flush()
+                            os.fsync(_lf.fileno())
+                    _log_artifact.unlink()
+                except OSError:
+                    pass
+
+        # Clean /dev/shm artifacts left by submodules (SML, dmswitch, signer).
+        # These survive until reboot and reveal toolkit usage.
+        _shm = Path("/dev/shm")
+        if _shm.is_dir():
+            import shutil as _shutil_shm
+            for _shm_pat in (".gs_seed_active", ".gs_seed_active.tmp",
+                             ".gs_seed_lock", ".gs_locked_bundle",
+                             ".gs_lock_meta", "gs_paranoia_wipe",
+                             "gs_unlock_token"):
+                _shm_f = _shm / _shm_pat
+                if _shm_f.exists():
+                    try:
+                        _shm_f.unlink()
+                    except OSError:
+                        pass
+            for _shm_glob in ("tx_*", ".tk_*"):
+                for _shm_f in _shm.glob(_shm_glob):
+                    try:
+                        if _shm_f.is_dir():
+                            _shutil_shm.rmtree(_shm_f, ignore_errors=True)
+                        else:
+                            _shm_f.unlink()
+                    except OSError:
+                        pass
+            for _shm_dir in ("qr_codes", "decoys"):
+                _sd = _shm / _shm_dir
+                if _sd.is_dir():
+                    _shutil_shm.rmtree(_sd, ignore_errors=True)
 
     # Exit strategy simulation
     newnym()
