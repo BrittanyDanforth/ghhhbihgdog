@@ -474,3 +474,64 @@ Added THORNode native API (`GET /thorchain/quote/swap`) as the primary swap quot
 - Direct protocol access (no intermediary)
 - Multiple endpoint fallbacks
 - SwapKit still available as backup
+
+---
+
+## Round 7 — Final Hardening Audit (BUG 146-150)
+
+**Date:** 2026-04-14
+**Scope:** Remaining integration issues in swap_retry_guard, vm_runtime, en_seeder
+**Method:** Endpoint verification, protocol correctness, cross-version portability
+
+### SwapKit Removal Confirmed
+
+SwapKit aggregator endpoints have been **permanently removed** from the codebase. Multiple sources (including Malwarebytes) flagged SwapKit-associated domains as hosting phishing/malicious content. THORNode native API is now the **only** swap quote source across all modules.
+
+### BUG 146 (FIXED): swap_retry_guard — THOR_APIS contained dead/wrong aggregator URLs
+**File:** `swap_retry_guard` THOR_APIS constant
+**Scenario:** `THOR_APIS` listed aggregator-style URLs (`api.thorswap.net/aggregator`, `thorchain.net/api/aggregator`, `midgard.ninerealms.com/v2/thorchain`) that are either defunct, return 404, or serve a different API format than expected.
+**Impact:** HIGH — swap quotes fail on most endpoints; only 1 of 5 URLs was partially functional.
+**Fix:** Replaced with verified THORNode native API base URLs: `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com`.
+
+### BUG 147 (FIXED): swap_retry_guard — _execute_swap_request POSTs to /swap (wrong method & path)
+**File:** `swap_retry_guard` `_execute_swap_request` method
+**Scenario:** Method did `session.post(f"{endpoint}/swap", json=payload)`. THORNode's quote endpoint is `GET /thorchain/quote/swap` with query parameters, not a POST endpoint. Every request returned 404 or 405.
+**Impact:** HIGH — swap execution completely broken against THORNode.
+**Fix:** Changed to `session.get()` with `GET /thorchain/quote/swap?from_asset=...&to_asset=...&amount=...&destination=...` using proper query parameter encoding.
+
+### BUG 148 (FIXED): swap_retry_guard — PHANTOM_TRAFFIC_PROB default 0.15 too aggressive
+**File:** `swap_retry_guard` constant + argparse default
+**Scenario:** 15% of swaps randomly get phantom-failed as decoys. While progress advancement was already fixed (Round 6, BUG 121), the high default still confuses operators who see frequent "failures" in logs with no explanation.
+**Impact:** MEDIUM (UX) — operators assume real failures and abort or restart unnecessarily.
+**Fix:** Changed default to `0.0` (disabled). Operators can opt in with `--phantom-prob 0.15`.
+
+### BUG 149 (FIXED): vm_runtime — Tor connectivity test uses httpbin.org (third-party, unreliable)
+**File:** `vm_runtime` `test_tor_connectivity` function
+**Scenario:** Used `http://httpbin.org/ip` to verify Tor connectivity. httpbin.org is a third-party service that may be down, rate-limited, or blocked. It also cannot confirm whether traffic is actually routed through Tor — only that a connection succeeded.
+**Impact:** MEDIUM (reliability + correctness) — false positives (connected but not via Tor) and false negatives (httpbin down).
+**Fix:** Changed to `https://check.torproject.org/api/ip` (official Tor Project endpoint). Now validates `"IsTor": true` in the JSON response to confirm actual Tor routing.
+
+### BUG 150 (FIXED): en_seeder — pickle serialization of random state is brittle
+**File:** `en_seeder` `collect_system_entropy` function
+**Scenario:** `pickle.dumps(random.getstate())` serializes Python's internal RNG state using pickle, then base64-encodes it into the seed file. Pickle format is not stable across Python versions — a seed generated on Python 3.11 may fail to deserialize on 3.12+, breaking seed portability.
+**Impact:** MEDIUM (portability) — seed files not portable across Python versions; `pickle.loads` is also a deserialization attack vector if seed files are shared.
+**Fix:** Replaced with `hashlib.sha256(str(random.getstate()).encode()).hexdigest()`. Stores a stable hash of the RNG state instead of raw pickle bytes. Removed unused `pickle` and `base64` imports.
+
+### Complete Bug Status Table (Round 7)
+
+| Bug | Description | Severity | Fixed? |
+|-----|-------------|----------|--------|
+| BUG 146 | swap_retry_guard dead/wrong THOR_APIS URLs | HIGH | YES |
+| BUG 147 | swap_retry_guard POST to /swap (wrong method) | HIGH | YES |
+| BUG 148 | swap_retry_guard PHANTOM_TRAFFIC_PROB too high | MEDIUM | YES |
+| BUG 149 | vm_runtime httpbin.org Tor test unreliable | MEDIUM | YES |
+| BUG 150 | en_seeder pickle serialization brittle | MEDIUM | YES |
+
+### Final Architecture State
+
+- **Swap source:** THORNode native API only (`GET /thorchain/quote/swap`). SwapKit removed entirely (confirmed malicious/phishing by Malwarebytes).
+- **Endpoints:** `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com` — all verified THORNode instances.
+- **Tor verification:** Uses official `check.torproject.org/api/ip` with `IsTor` validation.
+- **Entropy:** Portable SHA-256 hash of RNG state; no pickle dependency.
+- **Phantom traffic:** Disabled by default; opt-in via `--phantom-prob`.
+- **All files compile cleanly** under Python 3.10+.

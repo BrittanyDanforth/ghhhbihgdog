@@ -162,16 +162,19 @@ def probe_disk_io() -> float:
 
 
 def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
-    """Test Tor connectivity if proxy is specified."""
+    """Test Tor connectivity via the official Tor Project check endpoint."""
     if not proxy_url or not requests:
         return "unknown"
     
     try:
         proxies = {'http': proxy_url, 'https': proxy_url}
-        response = requests.get('http://httpbin.org/ip', 
-                              proxies=proxies, timeout=10)
+        url = "https://check.torproject.org/api/ip"
+        response = requests.get(url, proxies=proxies, timeout=10)
         if response.status_code == 200:
-            return "connected"
+            data = response.json()
+            if data.get("IsTor") is True:
+                return "connected"
+            return "not_tor"
         else:
             return "failed"
     except Exception:

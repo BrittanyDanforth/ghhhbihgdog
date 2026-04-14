@@ -55,7 +55,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 # Advanced imports with fallback handling
 try:
@@ -87,11 +87,9 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 
 # Network configuration
 THOR_APIS = [
-    "https://api.thorswap.net/aggregator",
-    "https://thorchain.net/api/aggregator", 
-    "https://thornode.ninerealms.com/aggregator",
-    "https://midgard.ninerealms.com/v2/thorchain",
-    "https://thornode.thorswap.net/thorchain"
+    "https://thornode.ninerealms.com",
+    "https://thornode.thorswap.net",
+    "https://rpc.ninerealms.com",
 ]
 
 # Security parameters
@@ -102,7 +100,7 @@ MEMORY_WIPE_PASSES = 3
 QUANTUM_ENTROPY_BITS = 256
 INTEGRITY_CHAIN_DEPTH = 8
 TIMING_JITTER_RANGE = (0.5, 3.0)
-PHANTOM_TRAFFIC_PROB = 0.15
+PHANTOM_TRAFFIC_PROB = 0.0
 MAX_CONCURRENT_SWAPS = 2
 STEALTH_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -520,7 +518,7 @@ class AdvancedSwapOrchestrator:
         retry=retry_if_exception_type((requests.RequestException, ConnectionError, TimeoutError))
     )
     def _execute_swap_request(self, endpoint: str, payload: Dict[str, Any], proxy: Dict[str, str]) -> Dict[str, Any]:
-        """Execute swap request with advanced error handling."""
+        """Execute swap quote request via THORNode GET /thorchain/quote/swap."""
         headers = self.traffic_obfuscator.get_stealth_headers()
         
         start_time = time.time()
@@ -529,9 +527,21 @@ class AdvancedSwapOrchestrator:
             session = requests.Session()
             session.proxies.update(proxy)
             
-            response = session.post(
-                f"{endpoint}/swap",
-                json=payload,
+            query_params = {
+                "from_asset": payload.get("from", ""),
+                "to_asset": payload.get("to", ""),
+                "amount": payload.get("amount", ""),
+                "destination": payload.get("destination", ""),
+            }
+            if payload.get("affiliate"):
+                query_params["affiliate"] = payload["affiliate"]
+            if payload.get("memo"):
+                query_params["memo"] = payload["memo"]
+            
+            url = f"{endpoint}/thorchain/quote/swap?{urlencode(query_params)}"
+            
+            response = session.get(
+                url,
                 headers=headers,
                 timeout=30,
                 verify=True
@@ -539,13 +549,11 @@ class AdvancedSwapOrchestrator:
             
             response_time = time.time() - start_time
             
-            # Log request for pattern analysis
             self.traffic_obfuscator.record_request(endpoint, response_time, response.status_code < 400)
             
             response.raise_for_status()
             result = response.json()
             
-            # Validate response structure
             if not isinstance(result, dict):
                 raise ValueError("Invalid response format")
                 
@@ -763,8 +771,8 @@ Examples:
                        help="Enable maximum stealth with traffic obfuscation")
     parser.add_argument("--quantum-entropy", action="store_true",
                        help="Use quantum-resistant entropy fusion")
-    parser.add_argument("--phantom-prob", type=float, default=0.15,
-                       help="Probability of phantom failure injection (0.0-1.0)")
+    parser.add_argument("--phantom-prob", type=float, default=0.0,
+                       help="Probability of phantom failure injection (0.0-1.0, default disabled)")
     
     # Operational modes
     parser.add_argument("--dry-run", action="store_true",
@@ -825,8 +833,8 @@ Examples:
     if not args.stealth_mode:
         print("[!] Warning: Stealth mode disabled. Traffic patterns may be detectable.")
         
-    if args.phantom_prob < 0.1:
-        print("[!] Warning: Low phantom failure rate may reduce traffic analysis resistance.")
+    if args.phantom_prob > 0:
+        print(f"[•] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
     
     # Memory locking (requires root on most systems)
     if args.memory_lock:
