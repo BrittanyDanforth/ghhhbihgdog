@@ -1148,14 +1148,14 @@ state corruption bugs.
 - Reports failed TXs separately (doesn't advance progress on failure)
 - Output files use `.signed` extension instead of `.blob`
 
-### ThorSwap API: COMPLETE REWRITE
+### ThorSwap API: COMPLETE REWRITE (SwapKit REMOVED — confirmed malicious)
 
-**What was wrong:** Code used `POST /aggregator/swap` with fields `{from, to, amount, destination}`. The real SwapKit API is `POST /v3/quote` with fields `{sellAsset, buyAsset, sellAmount, destinationAddress}`. Response contains `{quoteId, routes: [{expectedOutput, transaction: {depositAddress, memo}}]}`.
+**What was wrong:** Original code used wrong API endpoints. SwapKit (api.swapkit.dev) was later confirmed as **malicious/phishing** by Malwarebytes Browser Guard.
 
-**Fix:** Both `GhostSpiral` and `thor_swap_preparer` now use:
-- Correct endpoint: `https://api.swapkit.dev/v3/quote`
-- Correct request fields: `sellAsset`, `buyAsset`, `sellAmount`, `destinationAddress`
-- Correct response parsing: routes array, expectedOutput, transaction.depositAddress
+**Fix (Round 7):** SwapKit completely removed from codebase. Both `GhostSpiral` and `thor_swap_preparer` now use **THORNode native API only**:
+- Endpoint: `GET {thornode}/thorchain/quote/swap?from_asset=BTC.BTC&to_asset=XMR.XMR&amount={sats}&destination={xmr_addr}`
+- No API key required — direct protocol access
+- Multiple fallback endpoints: `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com`
 
 ### Fee Bumping: REMOVED (Monero has no RBF)
 
