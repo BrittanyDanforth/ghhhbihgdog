@@ -296,9 +296,12 @@ def main():
     dag, dag_sha = load_json(args.dag)
     seed_bundle, seed_sha = load_json(args.seed)
 
-    if args.verify and not validate_dag_structure(dag):
-        print("[!] Invalid DAG structure", file=sys.stderr)
-        sys.exit(1)
+    if not validate_dag_structure(dag):
+        if args.verify:
+            print("[!] Invalid DAG structure — aborting (--verify)", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("[!] WARNING: DAG structure validation failed. Processing anyway...", file=sys.stderr)
 
     # Enhanced deterministic RNG seeding
     # Mix seed hash + dag hash + version for better entropy distribution

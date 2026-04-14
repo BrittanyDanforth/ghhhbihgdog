@@ -186,16 +186,18 @@ def create_gap_account(rng: random.Random) -> dict:
 
 def create_gap_subaddress(rng: random.Random) -> dict:
     """Create a gap subaddress with realistic structure.
-    Uses a plausible-looking random hex string as address placeholder
-    instead of empty string, which would crash tools expecting valid addresses."""
-    fake_addr = "4" + "".join(rng.choices("0123456789ABCDEFabcdef", k=94))
+    Address is an empty placeholder — downstream tools should skip entries
+    with zero balance. Using an empty string avoids any tool misinterpreting
+    a fake hex string as a real Monero address and attempting transactions.
+    """
     return {
         "label": generate_secure_label(rng),
-        "address": fake_addr,
+        "address": "",
         "balance": 0,
         "unlocked_balance": 0,
         "used": False,
-        "index": 0
+        "index": 0,
+        "_gap": True,
     }
 
 

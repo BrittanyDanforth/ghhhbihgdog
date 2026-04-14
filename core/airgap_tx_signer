@@ -152,11 +152,6 @@ def phase_create(args, plan: List[dict], meta: dict = None):
               f"{tx['amt']} XMR -> {scrub_address(dst)}...")
 
         try:
-            # BUG 57 FIX: Pass subaddr_indices to restrict which subaddress
-            # the wallet selects inputs from. Without this, the wallet picks
-            # inputs from ANY subaddress in the account, ignoring the plan's
-            # src field entirely. The src address must be resolved to a
-            # subaddress index for this to work.
             create_params = {
                 "destinations": [{"amount": amt_atomic, "address": dst}],
                 "account_index": acct_idx,
@@ -164,6 +159,21 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "get_tx_hex": False,
                 "do_not_relay": True,
             }
+
+            # BUG 57 FIX: If the plan specifies a src subaddress, resolve its
+            # index and restrict coin selection to that subaddress only.
+            src_addr = tx.get("src", "")
+            if src_addr:
+                try:
+                    all_addrs = rpc.raw_request("get_address", {
+                        "account_index": acct_idx,
+                    })
+                    for entry in all_addrs.get("addresses", []):
+                        if entry.get("address") == src_addr:
+                            create_params["subaddr_indices"] = [entry["address_index"]]
+                            break
+                except Exception:
+                    pass
 
             result = rpc.raw_request("transfer_split", create_params)
 

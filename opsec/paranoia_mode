@@ -540,6 +540,12 @@ def main():
     require_resources(min_disk_gb=1.0)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
 
+    if os.geteuid() != 0:
+        print("  [!] WARNING: Not running as root. Some operations will silently fail:")
+        print("  [!]   MAC spoof, system log wipe, journal clear, swap wipe")
+        print("  [!]   Run with: sudo python3 paranoia_mode ...")
+        print()
+
     print("  [*] Phase 1: MAC spoof")
     spoof_mac(args.iface, args.dry_run)
 

@@ -81,18 +81,27 @@ def cmd_load(args):
         print("  [!] Seed file has no seed_hex field")
         sys.exit(1)
 
-    # Verify integrity
+    # Verify integrity: en_seeder's sha256 is over the bundle JSON (minus sha256 key),
+    # NOT over the raw seed_hex bytes. Verify the bundle hash if present.
     try:
         seed_bytes = bytes.fromhex(seed_hex)
     except ValueError:
         print("  [!] seed_hex is not valid hexadecimal — file may be corrupt")
         sys.exit(1)
-    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
-    if claimed_hash and actual_hash != claimed_hash:
-        print("  [!] Seed hash MISMATCH — file may be tampered!")
-        print(f"      Expected: {claimed_hash}")
-        print(f"      Actual:   {actual_hash}")
-        sys.exit(1)
+
+    if claimed_hash:
+        bundle_for_hash = {k: v for k, v in data.items() if k != "sha256"}
+        bundle_json = json.dumps(bundle_for_hash, sort_keys=True).encode()
+        actual_bundle_hash = hashlib.sha256(bundle_json).hexdigest()
+        if actual_bundle_hash != claimed_hash:
+            # Fallback: maybe sha256 was computed over seed_hex bytes directly
+            seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+            if seed_hash != claimed_hash:
+                print("  [!] Seed hash MISMATCH — file may be tampered!")
+                print(f"      Expected: {claimed_hash}")
+                print(f"      Bundle:   {actual_bundle_hash}")
+                print(f"      SeedHex:  {seed_hash}")
+                sys.exit(1)
 
     # Check /dev/shm availability
     if not SHM_DIR.is_dir():

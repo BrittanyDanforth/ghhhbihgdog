@@ -249,10 +249,10 @@ def main():
         try:
             import gnupg
             g = gnupg.GPG()
-            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient, armor=True)
             if enc.ok:
                 gpg_path = Path(str(_out) + ".gpg")
-                gpg_path.write_text(str(enc))
+                gpg_path.write_bytes(enc.data if isinstance(enc.data, bytes) else str(enc).encode())
                 os.chmod(gpg_path, 0o600)
                 integrity_log("thor", f"gpg_ok:{gpg_path.name}")
                 print(f"  [+] GPG bundle -> {gpg_path}")

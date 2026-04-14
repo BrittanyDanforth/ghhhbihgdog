@@ -481,9 +481,12 @@ def main():
             for dep in swap_deposits:
                 print(f"\n  --- Chunk {dep['chunk']} ---")
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
+                # Show full deposit address — the operator needs it to send BTC.
+                # These are THORChain vault addresses, not the operator's own.
                 print(f"  To address:   {dep['deposit_address']}")
                 if dep.get("memo"):
-                    print(f"  With memo:    {dep['memo'][:60]}...")
+                    # Truncate memo in terminal to reduce log exposure
+                    print(f"  With memo:    {dep['memo'][:40]}…")
                 print(f"  Expected XMR: ~{dep['expected_xmr']}")
             print()
             print("  ============================================================")
