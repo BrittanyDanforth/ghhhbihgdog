@@ -36,15 +36,23 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, require_resources, lock_memory,
+    safe_post, safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
 )
 
 DUST_XMR = Decimal("0.0001")
-BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
+BTC_RE = re.compile(
+    r"^(bc1[ac-hj-np-z02-9]{25,59}|tb1[ac-hj-np-z02-9]{25,59}"
+    r"|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
+    re.I
+)
 SWAPKIT_API = "https://api.swapkit.dev"
+THORNODE_APIS = [
+    "https://thornode.ninerealms.com",
+    "https://thornode.thorswap.net",
+]
 
 def _core_script(name: str) -> str:
     """Resolve path to a sibling script in core/ directory."""
@@ -313,13 +321,97 @@ def main():
     # Stage 2 - ThorChain swap definition
     ###########################################################################
 
-    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
-        """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
+    def _thornode_quote(amt: Decimal, xmr_dest: str) -> dict | None:
+        """Try THORNode native API for a swap quote (no API key needed)."""
+        amount_sats = int(amt * Decimal("1e8"))
+        params = (
+            f"from_asset=BTC.BTC&to_asset=XMR.XMR"
+            f"&amount={amount_sats}&destination={xmr_dest}"
+        )
+        for base_url in THORNODE_APIS:
+            try:
+                url = f"{base_url}/thorchain/quote/swap?{params}"
+                resp = safe_get(url, proxy)
+                if resp.get("error"):
+                    continue
+                inbound = resp.get("inbound_address", "")
+                memo = resp.get("memo", "")
+                expected_out = resp.get("expected_amount_out", "0")
+                if inbound and memo:
+                    expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
+                    return {
+                        "deposit_address": inbound,
+                        "memo": memo,
+                        "expected_xmr": str(expected_xmr),
+                    }
+            except Exception:
+                continue
+        return None
 
-        Uses the REAL SwapKit v3 API (https://docs.swapkit.dev):
-          POST /v3/quote
-          Body: {sellAsset, buyAsset, sellAmount, destinationAddress}
-          Response: {quoteId, routes: [{..., expectedOutput, depositAddress, memo}]}
+    def _swapkit_quote(amt: Decimal, xmr_dest: str) -> dict | None:
+        """SwapKit two-step flow: POST /v3/quote then POST /v3/swap."""
+        _api_key = (
+            getattr(args, "swapkit_api_key", "") or
+            os.environ.get("SWAPKIT_API_KEY", "")
+        )
+        _headers = {"x-api-key": _api_key} if _api_key else {}
+
+        quote_payload = {
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": xmr_dest,
+        }
+
+        quote_resp = safe_post(
+            f"{SWAPKIT_API}/v3/quote", quote_payload, proxy,
+            headers=_headers,
+        )
+
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            return None
+
+        route = routes[0]
+        route_id = route.get("routeId", "")
+        expected_output = route.get("expectedOutput", "0")
+
+        if not route_id:
+            return None
+
+        swap_payload = {
+            "routeId": route_id,
+            "destinationAddress": xmr_dest,
+        }
+        swap_resp = safe_post(
+            f"{SWAPKIT_API}/v3/swap", swap_payload, proxy,
+            headers=_headers,
+        )
+
+        deposit_addr = (
+            swap_resp.get("depositAddress", "") or
+            swap_resp.get("tx", {}).get("depositAddress", "")
+        )
+        memo = (
+            swap_resp.get("memo", "") or
+            swap_resp.get("tx", {}).get("memo", "")
+        )
+
+        if not deposit_addr:
+            return None
+
+        return {
+            "deposit_address": deposit_addr,
+            "memo": str(memo),
+            "expected_xmr": str(Decimal(str(expected_output))),
+            "quote_id": quote_resp.get("quoteId", ""),
+        }
+
+    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
+        """Get ThorChain swap quotes for each BTC chunk.
+
+        Tries THORNode native API first (no API key, more reliable),
+        then falls back to SwapKit two-step flow (quote + swap).
 
         Returns list of deposit instructions for the operator.
         The operator must MANUALLY send BTC to each deposit address.
@@ -337,52 +429,35 @@ def main():
                 newnym()
                 secure_delay(3.0, 10.0)
 
-            # SwapKit v3 API uses sellAsset/buyAsset not from/to
-            payload = {
-                "sellAsset": "BTC.BTC",
-                "buyAsset": "XMR.XMR",
-                "sellAmount": str(amt),
-                "destinationAddress": xmr_dest,
-            }
-
-            # Pass API key if available (required for most SwapKit endpoints)
-            _api_key = getattr(args, 'swapkit_api_key', '') or os.environ.get("SWAPKIT_API_KEY", "")
-            _headers = {"x-api-key": _api_key} if _api_key else {}
+            result = None
+            source = None
 
             try:
-                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy,
-                                       headers=_headers)
-            except Exception as e:
-                newnym()
-                integrity_log("stage2", f"quote_api_error:{i}")
-                sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
+                result = _thornode_quote(amt, xmr_dest)
+                if result:
+                    source = "thornode"
+            except Exception:
+                pass
 
-            # Parse the routes from the response
-            routes = quote_resp.get("routes", [])
-            if not routes:
-                error = quote_resp.get("error", "unknown")
-                provider_errors = quote_resp.get("providerErrors", [])
-                integrity_log("stage2", f"no_routes_chunk_{i}")
-                sys.exit(
-                    f"[!] No swap routes available for chunk {i}.\n"
-                    f"    Error: {str(error)[:80]}\n"
-                    f"    Provider errors: {str(provider_errors)[:120]}"
-                )
+            if not result:
+                try:
+                    result = _swapkit_quote(amt, xmr_dest)
+                    if result:
+                        source = "swapkit"
+                except Exception as e:
+                    newnym()
+                    integrity_log("stage2", f"all_apis_failed:{i}")
+                    sys.exit(
+                        f"[!] All swap APIs failed for chunk {i}: {str(e)[:60]}"
+                    )
 
-            # Use the first (best) route
-            route = routes[0]
-            expected_output = route.get("expectedOutput", "0")
-            # The actual deposit details come from executing the route
-            # For THORChain routes, the deposit info is in the route's transaction object
-            tx_info = route.get("transaction", route.get("calldata", {}))
-            deposit_addr = tx_info.get("depositAddress", tx_info.get("to", ""))
-            memo = tx_info.get("memo", tx_info.get("data", ""))
+            if not result:
+                integrity_log("stage2", f"no_quote_chunk_{i}")
+                sys.exit(f"[!] No swap quote available for chunk {i}")
 
-            if not deposit_addr:
-                integrity_log("stage2", f"no_deposit_in_route_{i}")
-                sys.exit(f"[!] Route has no deposit address for chunk {i}")
-
-            expected_dec = Decimal(str(expected_output))
+            deposit_addr = result["deposit_address"]
+            memo = result.get("memo", "")
+            expected_dec = Decimal(result.get("expected_xmr", "0"))
 
             deposit_info = {
                 "chunk": i,
@@ -390,16 +465,17 @@ def main():
                 "deposit_address": deposit_addr,
                 "memo": str(memo),
                 "expected_xmr": str(expected_dec),
-                "quote_id": quote_resp.get("quoteId", ""),
+                "quote_id": result.get("quote_id", ""),
+                "source": source,
             }
             deposits.append(deposit_info)
 
-            print(f"  [*] Chunk {i}/{len(chunks)-1}:")
+            print(f"  [*] Chunk {i}/{len(chunks)-1} (via {source}):")
             print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
             if memo:
                 print(f"      With memo: {str(memo)[:40]}...")
             print(f"      Expected: ~{expected_dec} XMR")
-            integrity_log("stage2", f"quote_ready:{i}")
+            integrity_log("stage2", f"quote_ready:{i}:{source}")
 
             secure_delay(5.0, 15.0)
 

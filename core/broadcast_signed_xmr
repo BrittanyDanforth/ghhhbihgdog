@@ -290,7 +290,6 @@ def main():
         prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
         last_idx = -1
 
-    import secrets as _secrets
     last_tor_check = time.time()
     success_count = 0
     fail_count = 0
@@ -424,7 +423,7 @@ def main():
                     # BUG 48 FIX: /gettransactions is a daemon REST endpoint,
                     # NOT a JSON-RPC method. Use _single_post (no retry)
                     # since we're polling in a loop anyway.
-                    check_url = rpc_url.rstrip("/") + "/gettransactions"
+                    check_url = args.rpc.rstrip("/") + "/gettransactions"
                     mine_start = time.time()
                     confirmed = False
                     block_height = 0
