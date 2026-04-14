@@ -1,206 +1,270 @@
-# GhostSpiral — Setup
+# GhostSpiral — Complete Setup Guide
 
-## Quick Install (one command)
+If you know nothing, start here. Every command is copy-paste ready.
+
+---
+
+## Step 1: Install system packages
+
+Open a terminal on your Kali Linux machine and run:
 
 ```bash
-git clone <repo> ghostspiral && cd ghostspiral && bash install.sh
+sudo apt update
+sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
 ```
 
-That installs everything: system packages, Python deps, Tor config, and verifies it all works.
+---
 
-## Manual Install (if you prefer)
+## Step 2: Install Python libraries
 
 ```bash
-# 1. System packages
-sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
+python3 -m pip install requests PySocks tenacity stem monero psutil
+python3 -m pip install python-gnupg pycryptodomex qrcode pyyaml
+python3 -m pip install beautifulsoup4 aiohttp aiohttp-socks
+```
 
-# 2. Python deps (use python3 -m pip, NOT bare pip which may be python2)
-python3 -m pip install -r requirements.txt
+Check they all installed:
 
-# 3. Enable Tor control port (needed for circuit rotation)
-echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
-sudo systemctl restart tor
+```bash
+python3 -c "import requests, socks, stem, monero, psutil, tenacity; print('ALL OK')"
+```
 
-# 4. Download + install Monero CLI tools (monerod, wallet-cli, wallet-rpc)
-cd /tmp
-wget https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
-tar xf monero-cli.tar.bz2
-sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
-rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2
-cd -
+If it prints `ALL OK` you're good. If it says `ModuleNotFoundError`, install whichever one it says is missing.
 
-# 5. Verify everything
-python3 -c "import requests, stem, monero, psutil; print('OK')"
+---
+
+## Step 3: Set up Tor (this IS your proxy)
+
+GhostSpiral uses Tor as its proxy. Tor routes ALL your traffic through 3 encrypted
+hops so nobody (not your ISP, not police, not data companies) can see what you're
+doing. You do NOT need any other proxy service. Tor is free and runs locally.
+
+### Start Tor:
+
+```bash
+sudo systemctl start tor
+sudo systemctl enable tor
+```
+
+### Verify Tor is working:
+
+```bash
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+```
+
+You should see `{"IsTor":true, ...}`. If you see an error, Tor isn't running.
+
+### Enable circuit rotation (REQUIRED):
+
+GhostSpiral rotates your Tor circuit (changes your anonymous identity)
+between each operation. This needs the Tor control port:
+
+```bash
+sudo bash -c 'echo "" >> /etc/tor/torrc'
+sudo bash -c 'echo "ControlPort 9051" >> /etc/tor/torrc'
+sudo bash -c 'echo "CookieAuthentication 1" >> /etc/tor/torrc'
+sudo systemctl restart tor
+```
+
+### Your proxy address is:
+
+```
+socks5h://127.0.0.1:9050
+```
+
+This is what you'll enter whenever GhostSpiral asks for a proxy.
+The `h` in `socks5h` means DNS lookups also go through Tor (critical for privacy).
+
+### DO NOT USE:
+- Free proxy lists from the internet (they log everything)
+- Cheap VPN SOCKS proxies (they see your traffic)
+- Any proxy you don't control (they can steal your funds)
+- `socks5://` without the `h` (leaks DNS to your ISP)
+
+Tor is the only proxy you need. It runs locally, it's free, and nobody
+in the middle can see your traffic.
+
+---
+
+## Step 4: Install Monero CLI tools
+
+GhostSpiral needs three Monero programs: `monerod` (blockchain node),
+`monero-wallet-rpc` (wallet server), and `monero-wallet-cli` (signing tool).
+
+### Download and install:
+
+```bash
+cd /tmp
+wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
+tar xf monero.tar.bz2
+sudo cp monero-x86_64-linux-gnu-*/monerod /usr/local/bin/
+sudo cp monero-x86_64-linux-gnu-*/monero-wallet-cli /usr/local/bin/
+sudo cp monero-x86_64-linux-gnu-*/monero-wallet-rpc /usr/local/bin/
+rm -rf monero-x86_64-linux-gnu-* monero.tar.bz2
+cd -
+```
+
+### Verify:
+
+```bash
 monerod --version
+monero-wallet-cli --version
 monero-wallet-rpc --version
 ```
 
-## IMPORTANT: Proxy Safety
+All three should print a version number.
 
-```
-NEVER use free/cheap/public SOCKS proxies with GhostSpiral.
+---
 
-A malicious proxy can:
-  - See ALL your traffic (destinations, amounts, addresses)
-  - Modify RPC responses (change destination addresses = steal funds)
-  - Log your real IP and correlate with blockchain activity
-  - Inject transactions on your behalf
+## Step 5: Start Monero (do this before each session)
 
-ONLY use:
-  ✓ Your own local Tor instance (socks5h://127.0.0.1:9050)
-  ✓ A Tor instance you control on a trusted VPS
-  ✗ NEVER public proxy lists
-  ✗ NEVER "free VPN" SOCKS proxies
-  ✗ NEVER shared proxies from unknown providers
-
-GhostSpiral verifies Tor exit at startup, but a MITM proxy can
-fake the check.torproject.org response. The ONLY safe proxy is
-one YOU control end-to-end.
-```
-
-## Start Monero (before running GhostSpiral)
+### 5a. Start the blockchain node:
 
 ```bash
-# Start the daemon (syncs blockchain — first run takes hours)
-monerod --detach
+monerod --detach --data-dir ~/.bitmonero
+```
 
-# Start wallet RPC (needed by all core tools)
+First time: this downloads the full Monero blockchain (~170 GB). Takes hours.
+After that: starts in seconds.
+
+To check sync progress:
+```bash
+monerod status
+```
+
+### 5b. Create a wallet (first time only):
+
+```bash
+monero-wallet-cli --generate-new-wallet ~/my_wallet
+```
+
+It will ask you for a password. Remember this password. It will show you a
+25-word seed phrase. Write it down on paper and store it safely. This is
+the ONLY way to recover your funds if something goes wrong.
+
+### 5c. Start the wallet RPC server:
+
+```bash
 monero-wallet-rpc --rpc-bind-port 18083 \
-  --wallet-file /path/to/your/wallet \
-  --password "yourpassword" \
+  --wallet-file ~/my_wallet \
+  --password "YOUR_WALLET_PASSWORD" \
   --daemon-address 127.0.0.1:18081 \
   --disable-rpc-login
 ```
 
-## Environment Variables (set before running)
+Keep this terminal open (or run with `--detach`). This is the wallet server
+that GhostSpiral talks to.
+
+### 5d. Verify wallet RPC is running:
 
 ```bash
-export GS_WALLET_PASSWORD="your_wallet_password"   # avoids leaking via /proc
-export SWAPKIT_API_KEY="your_key"                   # for ThorChain swaps
-export TOR_CONTROL_PASSWORD="tor_pass"              # only if Tor uses password auth
+curl -s http://127.0.0.1:18083/json_rpc \
+  -d '{"jsonrpc":"2.0","id":"0","method":"get_height"}' \
+  -H 'Content-Type: application/json'
 ```
+
+Should return something with `"height":` and a number.
 
 ---
 
-## Project Layout
+## Step 6: Set environment variables
 
+```bash
+export GS_WALLET_PASSWORD="YOUR_WALLET_PASSWORD"
+export SWAPKIT_API_KEY="your_swapkit_key"
 ```
-ghostspiral/
-├── run                    ← launcher: python3 run <tool> [args]
-├── install.sh             ← one-command installer
-├── requirements.txt       ← pip dependencies
-│
-├── core/                  ← main pipeline (handles real money)
-│   ├── gs_common.py           shared library (Tor, crypto, RPC)
-│   ├── GhostSpiral            main mixer orchestrator
-│   ├── airgap_tx_signer       cold-signing (online create / offline sign)
-│   ├── broadcast_signed_xmr   broadcast signed TXs through Tor
-│   ├── create_receive_wallet  generate XMR receive address
-│   ├── thor_swap_preparer     ThorChain BTC→XMR deposit setup
-│   └── exit_strategy_simulator  plan XMR off-ramp
-│
-├── modules/               ← mixing & chaos tools
-│   ├── PAG, labelmask, label_poisoner, fake_leaf_inserter
-│   ├── noise, ghostmutator, wdna, en_seeder
-│   ├── ghost_unifier, swap_retry_guard
-│   └── tor_endpoint_juggler, vm_runtime
-│
-├── opsec/                 ← cleanup & anti-forensics
-│   ├── paranoia_mode          wipe everything after operation
-│   ├── error_log_poisoner, mirrormask, dmswitch
-│   └── SML, integrity_faker, idk
-│
-└── intel/                 ← collection tools
-    ├── collectgrab            OSINT (runs through Tor)
-    └── testergatherSystem     advanced intel framework
-```
+
+- `GS_WALLET_PASSWORD`: same password you used in step 5c. Setting it here
+  prevents it from showing up in `ps aux` output where anyone on the machine
+  could see it.
+- `SWAPKIT_API_KEY`: get one from https://swapkit.dev (needed for BTC→XMR swaps).
+  Free tier works.
 
 ---
 
-## How to Run Tools
+## Step 7: Run GhostSpiral
 
 ```bash
-# See all available tools
-python3 run list
-
-# Run any tool by its short name
-python3 run ghostspiral --help
-python3 run wallet --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050
-python3 run paranoia --dry-run
-python3 run signer plan.json --phase sign --wallet-file wallet
-
-# Or call directly
-python3 core/GhostSpiral --help
-python3 opsec/paranoia_mode --dry-run
+cd /path/to/ghostspiral
+python3 run
 ```
+
+This opens the interactive menu. Choose what you want to do:
+
+```
+  1  Full Pipeline          BTC → mixed XMR
+  2  Receive Mode           Mix XMR that already arrived
+  3  Cold / Air-Gap         Offline signing
+  4  Broadcast              Send signed TXs
+  5  Resume                 Continue after crash
+  6  Create Wallet          New receive address
+  7  Swap Preparer          ThorChain deposit address
+  8  Exit Planner           Plan XMR off-ramp
+  9  Paranoia Cleanup       Wipe all traces
+  0  System Check           Verify everything works
+  t  Testnet / Dry Run      Test without real funds
+```
+
+### First time? Start with option `0` (System Check):
+
+It verifies Python deps, Tor, Monero tools, and wallet RPC are all working.
+
+### Want to test safely? Use option `t` (Testnet):
+
+Creates a mock plan with fake balance so you can see how the pipeline works
+without touching real money.
 
 ---
 
 ## Common Workflows
 
-### Receive XMR (someone sends you BTC, you get mixed XMR)
+### Receive XMR (someone sends you BTC):
 
-```bash
-# 1. Create a receive address
-python3 run wallet --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050
+1. Choose `6` (Create Wallet) — generates a fresh XMR receive address
+2. Choose `7` (Swap Preparer) — generates a BTC deposit address via ThorChain
+3. Give the BTC deposit address + memo to the sender
+4. Wait for XMR to arrive in your wallet
+5. Choose `2` (Receive Mode) — mixes the XMR through multiple hops
+6. Choose `9` (Paranoia Cleanup) — wipes all traces
 
-# 2. Generate deposit address for the BTC sender
-python3 run swap --amounts 0.05 \
-  --dests $(jq -r .address wallet_*.json) \
-  --tor-proxy socks5h://127.0.0.1:9050
+### Cold-signing (maximum security):
 
-# 3. Give the deposit address + memo to the sender
-# 4. Wait for XMR to arrive
-
-# 5. Mix it
-python3 run ghostspiral --receive-wallet wallet_*.json \
-  --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083
-
-# 6. Clean up
-python3 run paranoia --iface wlan0
-```
-
-### Cold-signing (air-gap)
-
-```bash
-# Online machine:
-python3 run ghostspiral --receive-wallet wallet.json \
-  --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083 --cold
-
-# Copy unsigned/ folder to USB → offline machine
-
-# Offline machine:
-python3 run signer unsigned/unsigned_*.json --phase sign \
-  --wallet-file /mnt/usb/wallet --outdir tx_staging
-
-# Copy tx_staging/signed/ back to USB → online machine
-
-# Online machine:
-python3 run broadcast tx_staging/signed/ \
-  --tor-proxy socks5h://127.0.0.1:9050 \
-  --rpc http://127.0.0.1:18081 --wallet-rpc http://127.0.0.1:18083
-```
-
-### Resume after crash
-
-```bash
-python3 run ghostspiral --receive-wallet wallet.json \
-  --resume-plan unsigned/unsigned_abc123.json \
-  --tor-proxy socks5h://127.0.0.1:9050 --rpc-primary http://127.0.0.1:18083
-```
+1. On ONLINE machine: choose `3` (Cold) — creates unsigned plan
+2. Copy the `unsigned/` folder to a USB drive
+3. On OFFLINE machine: run the signer tool on the USB files
+4. Copy `tx_staging/signed/` back to USB
+5. On ONLINE machine: choose `4` (Broadcast) — sends the signed TXs
 
 ---
 
 ## Troubleshooting
 
-| Error | Fix |
-|-------|-----|
-| `ModuleNotFoundError` | `python3 -m pip install -r requirements.txt` or `bash install.sh` |
+| Problem | Solution |
+|---------|----------|
+| `ModuleNotFoundError` | Run Step 2 again |
 | `Tor leak detected` | `sudo systemctl start tor` |
-| `NEWNYM failed` | `echo "ControlPort 9051" \| sudo tee -a /etc/tor/torrc && sudo systemctl restart tor` |
+| `NEWNYM failed` | Run the ControlPort commands from Step 3 |
 | `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
-| `No wallet file` | Start monero-wallet-rpc with `--wallet-file` |
-| `Method not found` | You're hitting monerod (18081) not wallet-rpc (18083) |
-| `No swap routes` | `export SWAPKIT_API_KEY="your_key"` |
-| `Plan fingerprint mismatch` | `rm stage5_progress.json` and retry |
+| `No wallet file` | Start wallet RPC (Step 5c) |
+| `Method not found` | You're connecting to port 18081 instead of 18083 |
+| `No swap routes` | Set `SWAPKIT_API_KEY` (Step 6) |
+| `Invalid BTC address` | Must start with `bc1` (bech32 format) |
+| System Check shows `[!]` for Monero | Run Step 4 |
+| System Check shows `[!]` for wallet-rpc | Run Step 5c |
+
+---
+
+## File Layout
+
+```
+ghostspiral/
+├── run                    ← interactive launcher
+├── install.sh             ← auto-installer
+├── requirements.txt       ← Python dependencies
+├── core/                  ← main pipeline
+├── modules/               ← mixing & chaos
+├── opsec/                 ← cleanup & anti-forensics
+└── intel/                 ← OSINT collection
+```
+
+Run `python3 run list` to see all available tools.

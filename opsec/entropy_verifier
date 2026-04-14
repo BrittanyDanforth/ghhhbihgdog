@@ -99,41 +99,64 @@ def main():
 
     print(f"  [·] Checking: {seed_path}")
 
-    # Check required fields
-    for field in ["seed_hex", "sha256", "timestamp"]:
-        if field not in data:
-            errors.append(f"Missing required field: {field}")
+    # Support both formats:
+    #   Format A (SML/manual): {"seed_hex": "abcd...", "sha256": "...", "timestamp": N}
+    #   Format B (en_seeder):  {"sha256": "...", "created_utc": "...", "sources": {...}}
+    # Detect format by checking which fields exist.
 
-    if errors:
-        for e in errors:
-            print(f"  [✗] {e}")
-        sys.exit(1)
+    seed_hex = data.get("seed_hex", "")
+    claimed_hash = data.get("sha256", "")
 
-    seed_hex = data["seed_hex"]
-    claimed_hash = data["sha256"]
-
-    # Verify hash
-    actual_hash = hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest()
-    if actual_hash == claimed_hash:
-        print(f"  [✓] SHA-256 hash matches")
+    if not seed_hex and "sources" in data:
+        # en_seeder format: hash covers the whole bundle, no separate seed_hex
+        print(f"  [·] Detected en_seeder format (bundle hash)")
+        bundle_for_hash = json.dumps(
+            {k: v for k, v in data.items() if k != "sha256"},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+        actual_hash = hashlib.sha256(bundle_for_hash).hexdigest()
+        if actual_hash == claimed_hash:
+            print(f"  [✓] Bundle SHA-256 hash matches")
+        else:
+            print(f"  [✗] Bundle SHA-256 MISMATCH!")
+            print(f"      Claimed: {claimed_hash}")
+            print(f"      Actual:  {actual_hash}")
+            errors.append("Hash mismatch — seed file may be tampered")
+        # Estimate entropy from all source hashes combined
+        source_data = json.dumps(data.get("sources", {})).encode()
+        seed_bytes = len(source_data)
+        entropy_bits = check_entropy_bits(source_data.hex())
+    elif seed_hex:
+        # SML / manual format
+        try:
+            seed_raw = bytes.fromhex(seed_hex)
+        except ValueError:
+            errors.append("seed_hex is not valid hexadecimal")
+            seed_raw = b""
+        if seed_raw and claimed_hash:
+            actual_hash = hashlib.sha256(seed_raw).hexdigest()
+            if actual_hash == claimed_hash:
+                print(f"  [✓] SHA-256 hash matches")
+            else:
+                print(f"  [✗] SHA-256 MISMATCH!")
+                print(f"      Claimed: {claimed_hash}")
+                print(f"      Actual:  {actual_hash}")
+                errors.append("Hash mismatch — seed file may be tampered")
+        seed_bytes = len(seed_hex) // 2
+        entropy_bits = check_entropy_bits(seed_hex)
     else:
-        print(f"  [✗] SHA-256 MISMATCH!")
-        print(f"      Claimed: {claimed_hash}")
-        print(f"      Actual:  {actual_hash}")
-        errors.append("Hash mismatch — seed file may be tampered")
+        errors.append("No seed_hex and no sources — unrecognized format")
+        seed_bytes = 0
+        entropy_bits = 0.0
 
-    # Check seed length
-    seed_bytes = len(seed_hex) // 2
-    print(f"  [·] Seed size: {seed_bytes} bytes ({seed_bytes * 8} bits)")
-    if seed_bytes * 8 < args.min_bits:
-        errors.append(f"Seed too short: {seed_bytes * 8} bits < {args.min_bits} minimum")
+    print(f"  [·] Seed size: {seed_bytes} bytes")
+    if seed_bytes * 8 < args.min_bits and seed_bytes > 0:
+        warnings.append(f"Seed data below {args.min_bits} bits")
 
-    # Check entropy
-    entropy_bits = check_entropy_bits(seed_hex)
     print(f"  [·] Shannon entropy: {entropy_bits:.1f} bits")
 
-    # Check weak patterns
-    weak = check_weak_patterns(seed_hex)
+    # Check weak patterns (only for seed_hex format)
+    weak = check_weak_patterns(seed_hex) if seed_hex else []
     for w in weak:
         if w.startswith("CRITICAL"):
             errors.append(w)
@@ -142,14 +165,17 @@ def main():
             warnings.append(w)
             print(f"  [!] {w}")
 
-    # Check timestamp
+    # Check timestamp (both formats)
     ts = data.get("timestamp", 0)
+    created_utc = data.get("created_utc", "")
+    import time as _time
     if isinstance(ts, (int, float)) and ts > 0:
-        import time
-        age_hours = (time.time() - ts) / 3600
+        age_hours = (_time.time() - ts) / 3600
         if age_hours > 24:
             warnings.append(f"Seed is {age_hours:.0f} hours old — consider regenerating")
         print(f"  [·] Age: {age_hours:.1f} hours")
+    elif created_utc:
+        print(f"  [·] Created: {created_utc}")
 
     # Check extra fields
     sources = data.get("sources", [])

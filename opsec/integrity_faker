@@ -94,7 +94,10 @@ class CryptoSecureRNG:
         with open(self.seed_file, 'r') as f:
             entropy_data = json.load(f)
         
-        primary_seed = entropy_data["primary_seed"]
+        primary_seed = (entropy_data.get("primary_seed")
+                        or entropy_data.get("sha256")
+                        or entropy_data.get("seed_hex")
+                        or hashlib.sha256(json.dumps(entropy_data, sort_keys=True).encode()).hexdigest())
         
         # Combine with source file hash if available
         source_hash = "0" * 128

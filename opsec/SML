@@ -82,7 +82,12 @@ def cmd_load(args):
         sys.exit(1)
 
     # Verify integrity
-    actual_hash = hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest()
+    try:
+        seed_bytes = bytes.fromhex(seed_hex)
+    except ValueError:
+        print("  [!] seed_hex is not valid hexadecimal — file may be corrupt")
+        sys.exit(1)
+    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
     if claimed_hash and actual_hash != claimed_hash:
         print("  [!] Seed hash MISMATCH — file may be tampered!")
         print(f"      Expected: {claimed_hash}")
@@ -170,7 +175,12 @@ def cmd_verify(args):
     ttl = data.get("ttl")
 
     # Verify hash
-    actual_hash = hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest()
+    try:
+        seed_bytes = bytes.fromhex(seed_hex)
+    except ValueError:
+        print("  [!] seed_hex in RAM is not valid hex — data is corrupt!")
+        sys.exit(1)
+    actual_hash = hashlib.sha256(seed_bytes).hexdigest()
     if actual_hash != claimed_hash:
         print("  [!] INTEGRITY FAILURE — seed in RAM has been modified!")
         sys.exit(1)

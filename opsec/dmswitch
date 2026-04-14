@@ -106,13 +106,13 @@ class SecureMemory:
     @contextmanager
     def secure_bytes(self, size: int):
         """Allocate secure memory that gets wiped on exit"""
+        mm = None
         try:
-            # Use mmap for secure memory allocation
             mm = mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)
             self._allocations.append(mm)
             yield mm
         finally:
-            if mm:
+            if mm is not None:
                 # Secure wipe
                 for _ in range(SECURE_WIPE_PASSES):
                     mm.seek(0)
