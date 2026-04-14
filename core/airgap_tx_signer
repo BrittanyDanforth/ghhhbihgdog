@@ -432,7 +432,7 @@ def phase_sign(args, plan: List[dict]):
         if _tmpdir is None:
             print("  [!] WARNING: /dev/shm not available — using disk-backed /tmp.")
             print("  [!] Unsigned TX data and wallet password may persist on disk.")
-        work_dir = tempfile.mkdtemp(prefix="gs_sign_", dir=_tmpdir)
+        work_dir = tempfile.mkdtemp(prefix="tx_", dir=_tmpdir)
         try:
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
             unsigned_in.write_bytes(unsigned_file.read_bytes())

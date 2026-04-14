@@ -98,7 +98,7 @@ def main():
     mode_group.add_argument("--btc-entry",
                             help="BTC entry address (bech32) — SENDER mode: you own the BTC")
     mode_group.add_argument("--receive-wallet",
-                            help="gs_receive_wallet_v1 JSON from create_receive_wallet — "
+                            help="Wallet JSON from create_receive_wallet — "
                                  "RECEIVER mode: XMR already arrived on this address")
 
     cli.add_argument("--tor-proxy", required=True,
@@ -195,8 +195,8 @@ def main():
             sys.exit(f"[!] Receive wallet file not found: {rw_path}")
         with open(rw_path) as f:
             rw_data = json.load(f)
-        if rw_data.get("schema") != "gs_receive_wallet_v1":
-            sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
+        if rw_data.get("schema") not in ("receive_wallet_v1", "gs_receive_wallet_v1"):
+            sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:

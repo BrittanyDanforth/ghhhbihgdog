@@ -117,7 +117,7 @@ def main():
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
-        "schema": "gs_receive_wallet_v1",
+        "schema": "receive_wallet_v1",
         "created": int(time.time()) // 600 * 600,
         "address": addr_str,
         "account_index": acct_idx,

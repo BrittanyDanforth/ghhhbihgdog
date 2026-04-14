@@ -189,7 +189,7 @@ class QuantumEntropyFusion:
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
-                salt=b'GhostSpiral_v16.9_Quantum',
+                salt=b'entropy_fusion_kdf_v1',
                 iterations=100000,
             )
             return kdf.derive(combined)
