@@ -81,6 +81,10 @@ def rand_mac() -> str:
 
 
 def spoof_mac(iface: str, dry: bool):
+    if not dry and os.geteuid() != 0:
+        print("  [!] WARNING: MAC spoof requires root — skipping (run with sudo for full wipe)")
+        integrity_log("paranoia", f"mac_skip:not_root")
+        return
     new_mac = rand_mac()
     if dry:
         print(f"  [dry] MAC {iface} -> {new_mac}")
@@ -158,7 +162,7 @@ def wipe_pycache(dry: bool):
     # Also .pyc in home
     for pyc in Path.home().rglob("*.pyc"):
         if dry:
-            pass
+            print(f"  [dry] would remove {pyc}")
         else:
             try:
                 pyc.unlink()
@@ -169,6 +173,10 @@ def wipe_pycache(dry: bool):
 
 
 def wipe_system_logs(days: int, dry: bool):
+    if not dry and os.geteuid() != 0:
+        print("  [!] WARNING: wipe_system_logs requires root — skipping (run with sudo for full wipe)")
+        integrity_log("paranoia", "logs_skip:not_root")
+        return
     cutoff = time.time() - days * 86400
     count = 0
     for f in glob.glob("/var/log/**/*.log", recursive=True):
@@ -188,6 +196,10 @@ def wipe_system_logs(days: int, dry: bool):
 
 def clear_journal(dry: bool):
     """Clear systemd journal if journalctl is available."""
+    if not dry and os.geteuid() != 0:
+        print("  [!] WARNING: clear_journal requires root — skipping (run with sudo for full wipe)")
+        integrity_log("paranoia", "journal_skip:not_root")
+        return
     if dry:
         print("  [dry] would run journalctl --vacuum-time=1s")
         integrity_log("paranoia", "journal_dry")
@@ -221,6 +233,10 @@ def flush_dns_cache(dry: bool):
 
 
 def wipe_swap_ram(dry: bool):
+    if not dry and os.geteuid() != 0:
+        print("  [!] WARNING: wipe_swap_ram requires root — skipping (run with sudo for full wipe)")
+        integrity_log("paranoia", "ram_skip:not_root")
+        return
     if dry:
         print("  [dry] would wipe swap+shm")
         integrity_log("paranoia", "ram_dry")

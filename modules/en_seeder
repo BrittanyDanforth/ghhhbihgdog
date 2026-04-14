@@ -121,9 +121,10 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
     except Exception as e:
         entropy["random_state"] = f"error: {str(e)}"
 
-    # 8. Additional entropy sources for better randomness
-    entropy["env_hash"] = hashlib.sha256(str(dict(os.environ)).encode()).hexdigest()
-    entropy["cwd_hash"] = hashlib.sha256(str(os.getcwd()).encode()).hexdigest()
+    # 8. Additional non-identifying entropy (PID, time, urandom only — no env
+    #    vars or CWD which leak workspace/user fingerprints)
+    extra_entropy = f"{os.getpid()}:{time.time_ns()}:{secrets.token_hex(32)}"
+    entropy["extra_entropy"] = hashlib.sha256(extra_entropy.encode()).hexdigest()
     
     return entropy
 

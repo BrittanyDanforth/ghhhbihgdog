@@ -7,26 +7,26 @@ single command prepares an entire leak‑proof session workspace.
 
 Current pipeline (Phase‑1):
 ──────────────────────────
-1. **entropy_seeder.py**          → `entropy_seed.json`
-2. **dag_generator_v2.py**        → `dag_structure.json`
-3. **label_masker_v3.py**         → `label_map.json`
-4. **label_poisoner.py**          → `label_map_poisoned.json`
-5. **vm_runtime.py**              → `/dev/shm/vm_timing.json`
-6. **decoy_noise_v2.py**          → `decoy_noise.json`
-7. **ghost_mutator.py**           → `runtime/ghostspiral_run_v16.py`
+1. **en_seeder**          → `entropy_seed.json`
+2. **PAG**                → `dag_structure.json`
+3. **labelmask**          → `label_map.json`
+4. **label_poisoner**     → `label_map_poisoned.json`
+5. **vm_runtime**         → `/dev/shm/vm_timing.json`
+6. **noise**              → `decoy_noise.json`
+7. **ghostmutator**       → `runtime/ghostspiral_run_v16.py`
 
 (Downstream modules — airgap signer, broadcaster, etc. — are triggered in
 Phase‑2 by `runtime/ghostspiral_run_v16.py` itself.)
 
 Usage
 ─────
-    python3 ghost_unifier.py --tor socks5h://127.0.0.1:9050 \
-                             --core ghostspiral_v15.py
+    python3 ghost_unifier --tor socks5h://127.0.0.1:9050 \
+                          --core ghostspiral_v15.py
 
 CLI Flags (excerpt)
 ───────────────────
 --force         Re‑run modules even if outputs exist
---skip-noise    Skip decoy_noise_v2 (offline prep)
+--skip-noise    Skip noise module (offline prep)
 --seed-bytes    Override entropy byte count (default 96)
 
 All steps are **deterministic** per entropy seed + host metrics, so re‑running
