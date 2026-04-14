@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+vm_runtime.py — GhostSpiral v16.9 Chaos Toolkit (Enhanced)
+=========================================================
+Derives **broadcast‑delay timing parameters** from the *live virtual‑machine /
+host state* so that every session's timing pattern is:
+
+1. **Coupled to real hardware jitter** (CPU %, RAM load, clock drift), and
+2. **Deterministically reproducible** by any cooperating module using the same
+   entropy seed **on the same host** during the session.
+3. **Enhanced with network latency probing** and **disk I/O metrics**
+
+Why? Forensic timing analysis looks for *fixed* or *pseudo‑random* delays.
+Coupling delays to live system metrics makes every user's pattern unique while
+still allowing deterministic replay *within* that single run.
+
+Output (default `vm_timing.json`)
+────────────────────────────────
+```json
+{
+  "version": "2.0",
+  "sha256": "…",              // hash of this file
+  "seed_ref": { … },          // entropy_seed.json metadata
+  "metrics": {                // snapshot of host metrics
+      "cpu_percent": 17.5,
+      "load_avg": [0.64,0.72,0.68],
+      "mem_used_gb": 6.9,
+      "clock_drift_ms": 14.2,
+      "disk_io_ms": 3.2,
+      "network_latency_ms": 45.6
+  },
+  "base_delay_sec": 7.8,      // core delay derived from metrics
+  "jitter": "expovariate/λ=0.18",
+  "delays": [7.1, 19.4, 4.8, …],   // length == --events
+  "tor_status": "connected"
+}
+```
+
+Usage
+─────
+    python3 vm_runtime.py --events 60 --tor-proxy socks5h://127.0.0.1:9050
+    python3 vm_runtime.py --events 100 --network-probe 8.8.8.8 --disk-test
+
+Downstream Usage
+────────────────
+`broadcast_signed_xmr_v16.py` imports this JSON and, for each TX, sleeps the
+corresponding delay (wrap‑around if more TXs than delays).
+
+Security / OPSEC Notes
+──────────────────────
+* Only *summary* metrics saved (no hostname, no PID list).
+* If psutil is absent, falls back to minimal metrics → still works.
+* All data written to `/dev/shm` by default; override with `--out` for disk.
+* Network probes are minimal ICMP pings to avoid fingerprinting.
+* Disk I/O tests use temporary files in /tmp with immediate cleanup.
+"""
+from __future__ import annotations
+import argparse, json, math, os, random, sys, time, hashlib, statistics
+import socket, subprocess, tempfile, threading
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple, Union
+
+try:
+    import psutil  # optional but recommended
+except ImportError:
+    psutil = None
+
+try:
+    import requests  # for network testing
+except ImportError:
+    requests = None
+
+VERSION = "2.0"
+DEFAULT_EVENTS = 50
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_seed(seed_path: Path) -> Tuple[Dict, str]:
+    """Load entropy seed and return (parsed_json, sha256_hex)."""
+    if not seed_path.exists():
+        print(f"[!] entropy seed not found → {seed_path}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        raw = seed_path.read_bytes()
+        parsed = json.loads(raw.decode('utf-8'))
+        return parsed, sha256_hex(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print(f"[!] Invalid seed file format: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def safe_float(value: Union[float, int], default: float = 0.0) -> float:
+    """Safely convert to float with fallback."""
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Enhanced metric snapshot functions
+# ---------------------------------------------------------------------------
+
+def probe_network_latency(host: str = "8.8.8.8", timeout: float = 2.0) -> float:
+    """Probe network latency via ping. Returns ms or 0.0 on failure."""
+    try:
+        if os.name == 'nt':  # Windows
+            cmd = ['ping', '-n', '1', '-w', str(int(timeout * 1000)), host]
+        else:  # Unix-like
+            cmd = ['ping', '-c', '1', '-W', str(int(timeout)), host]
+        
+        start = time.perf_counter()
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout + 1)
+        elapsed = (time.perf_counter() - start) * 1000
+        
+        if result.returncode == 0:
+            return round(elapsed, 1)
+        else:
+            return 0.0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return 0.0
+
+
+def probe_disk_io() -> float:
+    """Measure disk I/O latency via small write/read test. Returns ms."""
+    try:
+        test_data = b"timing_test_" + os.urandom(1024)  # 1KB test
+        
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            start = time.perf_counter()
+            tmp.write(test_data)
+            tmp.flush()
+            os.fsync(tmp.fileno())  # Force write to disk
+            
+            # Read back
+            tmp.seek(0)
+            _ = tmp.read()
+            elapsed = (time.perf_counter() - start) * 1000
+            tmp_path = tmp.name
+        
+        # Cleanup
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+            
+        return round(elapsed, 1)
+    except (OSError, IOError):
+        return 0.0
+
+
+def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
+    """Test Tor connectivity if proxy is specified."""
+    if not proxy_url or not requests:
+        return "unknown"
+    
+    try:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+        response = requests.get('http://httpbin.org/ip', 
+                              proxies=proxies, timeout=10)
+        if response.status_code == 200:
+            return "connected"
+        else:
+            return "failed"
+    except Exception:
+        return "failed"
+
+
+def snapshot_metrics(network_probe: Optional[str] = None, 
+                    disk_test: bool = False,
+                    tor_proxy: Optional[str] = None) -> Dict:
+    """Return enhanced host metrics used for timing derivation."""
+    metrics: Dict[str, Union[float, List[float], str]] = {}
+
+    # CPU usage
+    if psutil:
+        try:
+            metrics["cpu_percent"] = safe_float(psutil.cpu_percent(interval=0.2))
+        except Exception:
+            metrics["cpu_percent"] = 0.0
+    else:
+        metrics["cpu_percent"] = 0.0
+
+    # Load averages (POSIX only)
+    try:
+        load_avg = list(os.getloadavg())
+        metrics["load_avg"] = [safe_float(x) for x in load_avg]
+    except (AttributeError, OSError):
+        metrics["load_avg"] = [0.0, 0.0, 0.0]
+
+    # Memory usage
+    if psutil:
+        try:
+            vm = psutil.virtual_memory()
+            metrics["mem_used_gb"] = round(safe_float(vm.used) / (1024**3), 2)
+            metrics["mem_percent"] = safe_float(vm.percent)
+        except Exception:
+            metrics["mem_used_gb"] = 0.0
+            metrics["mem_percent"] = 0.0
+    else:
+        metrics["mem_used_gb"] = 0.0
+        metrics["mem_percent"] = 0.0
+
+    # Clock drift estimator
+    try:
+        drift = abs(time.time() - (time.perf_counter() + time.process_time()))
+        metrics["clock_drift_ms"] = round(drift * 1000, 1)
+    except Exception:
+        metrics["clock_drift_ms"] = 0.0
+
+    # Network latency probe
+    if network_probe:
+        metrics["network_latency_ms"] = probe_network_latency(network_probe)
+    else:
+        metrics["network_latency_ms"] = 0.0
+
+    # Disk I/O test
+    if disk_test:
+        metrics["disk_io_ms"] = probe_disk_io()
+    else:
+        metrics["disk_io_ms"] = 0.0
+
+    # Process count (if available)
+    if psutil:
+        try:
+            metrics["process_count"] = len(psutil.pids())
+        except Exception:
+            metrics["process_count"] = 0
+    else:
+        metrics["process_count"] = 0
+
+    # Boot time influence (adds some host-specific entropy)
+    if psutil:
+        try:
+            boot_time = psutil.boot_time()
+            metrics["boot_time_hash"] = hash(str(boot_time)) % 10000
+        except Exception:
+            metrics["boot_time_hash"] = 0
+    else:
+        metrics["boot_time_hash"] = 0
+
+    return metrics
+
+
+def derive_base_delay(metrics: Dict) -> float:
+    """Map enhanced metrics → baseline delay in seconds."""
+    cpu = safe_float(metrics.get("cpu_percent", 0))
+    load = statistics.mean([safe_float(x) for x in metrics.get("load_avg", [0, 0, 0])])
+    mem_gb = safe_float(metrics.get("mem_used_gb", 0))
+    mem_pct = safe_float(metrics.get("mem_percent", 0))
+    net_lat = safe_float(metrics.get("network_latency_ms", 0))
+    disk_io = safe_float(metrics.get("disk_io_ms", 0))
+    proc_count = safe_float(metrics.get("process_count", 0))
+    
+    # Enhanced formula incorporating all metrics
+    base = (5.0 +                          # baseline
+            (cpu / 15.0) +                 # CPU influence
+            (load * 1.2) +                 # load average
+            (mem_gb / 16.0) +              # memory usage
+            (mem_pct / 100.0) +            # memory percentage
+            (net_lat / 1000.0) +           # network latency
+            (disk_io / 1000.0) +           # disk I/O
+            (proc_count / 500.0))          # process density
+    
+    # Add some non-linearity to make it less predictable
+    base += math.sin(base) * 0.5
+    
+    # Ensure reasonable bounds
+    base = max(2.0, min(base, 30.0))
+    
+    return round(base, 2)
+
+
+def generate_delay_pattern(base_delay: float, events: int, rng: random.Random) -> List[float]:
+    """Generate sophisticated delay pattern with multiple distributions."""
+    delays = []
+    
+    # Use multiple distribution types for better unpredictability
+    patterns = ['exponential', 'gamma', 'weibull', 'normal']
+    
+    for i in range(events):
+        pattern = patterns[i % len(patterns)]
+        
+        if pattern == 'exponential':
+            lam = 1.0 / (base_delay * 0.9)
+            delay = rng.expovariate(lam)
+        elif pattern == 'gamma':
+            alpha, beta = 2.0, base_delay / 2.0
+            delay = rng.gammavariate(alpha, beta)
+        elif pattern == 'weibull':
+            alpha, beta = 1.5, base_delay
+            delay = rng.weibullvariate(alpha, beta)
+        else:  # normal
+            mu, sigma = base_delay, base_delay * 0.3
+            delay = rng.normalvariate(mu, sigma)
+            delay = max(0.1, delay)  # Ensure positive
+        
+        # Add some jitter based on position
+        jitter = math.sin(i * 0.1) * 0.5
+        delay += jitter
+        
+        delays.append(round(max(0.1, delay), 2))
+    
+    return delays
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Generate timing delays based on host VM metrics for GhostSpiral network ops.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --events 60 --network-probe 1.1.1.1 --disk-test
+  %(prog)s --events 100 --tor-proxy socks5h://127.0.0.1:9050
+  %(prog)s --seed custom_seed.json --out /tmp/timing.json
+        """
+    )
+    p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
+                   help="entropy_seed.json path")
+    p.add_argument("--events", type=int, default=DEFAULT_EVENTS, 
+                   help="How many delay values to generate")
+    p.add_argument("--out", "-o", type=Path, default=Path("/dev/shm/vm_timing.json"), 
+                   help="Output JSON (default RAM path)")
+    p.add_argument("--network-probe", type=str, default=None,
+                   help="Host to probe for network latency (e.g., 8.8.8.8)")
+    p.add_argument("--disk-test", action="store_true",
+                   help="Perform disk I/O latency test")
+    p.add_argument("--tor-proxy", type=str, default=None,
+                   help="Tor proxy URL for connectivity test (e.g., socks5h://127.0.0.1:9050)")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Verbose output")
+    
+    args = p.parse_args()
+
+    if args.verbose:
+        print(f"[*] Loading entropy seed from {args.seed}")
+    
+    seed_bundle, seed_sha = load_seed(args.seed)
+
+    if args.verbose:
+        print("[*] Collecting system metrics...")
+    
+    # Collect enhanced metrics
+    metrics = snapshot_metrics(
+        network_probe=args.network_probe,
+        disk_test=args.disk_test,
+        tor_proxy=args.tor_proxy
+    )
+    
+    if args.verbose:
+        print(f"[*] CPU: {metrics['cpu_percent']}%, "
+              f"Mem: {metrics['mem_used_gb']}GB, "
+              f"Load: {metrics['load_avg'][0]:.2f}")
+
+    # Deterministic RNG but uniqueness per host via metrics
+    host_fingerprint = sha256_hex(json.dumps(metrics, sort_keys=True).encode())[:16]
+    combined_seed = seed_sha + host_fingerprint
+    rng_seed = int(combined_seed[:32], 16)
+    rng = random.Random(rng_seed)
+
+    if args.verbose:
+        print(f"[*] Host fingerprint: {host_fingerprint}")
+        print(f"[*] RNG seed: {hex(rng_seed)[:16]}...")
+
+    # Derive timing parameters
+    base_delay = derive_base_delay(metrics)
+    delays = generate_delay_pattern(base_delay, args.events, rng)
+
+    if args.verbose:
+        print(f"[*] Base delay: {base_delay}s")
+        print(f"[*] Generated {len(delays)} delay values")
+
+    # Test Tor connectivity if requested
+    tor_status = "not_tested"
+    if args.tor_proxy:
+        if args.verbose:
+            print(f"[*] Testing Tor connectivity via {args.tor_proxy}")
+        tor_status = test_tor_connectivity(args.tor_proxy)
+
+    # Build output payload
+    payload = {
+        "version": VERSION,
+        "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+        "seed_ref": {
+            "file": str(args.seed), 
+            "sha256": seed_sha,
+            "host_fingerprint": host_fingerprint
+        },
+        "metrics": metrics,
+        "base_delay_sec": base_delay,
+        "jitter_info": {
+            "patterns": ["exponential", "gamma", "weibull", "normal"],
+            "base_lambda": round(1.0 / (base_delay * 0.9), 4)
+        },
+        "delays": delays,
+        "tor_status": tor_status,
+        "stats": {
+            "min_delay": min(delays),
+            "max_delay": max(delays),
+            "mean_delay": round(statistics.mean(delays), 2),
+            "median_delay": round(statistics.median(delays), 2)
+        }
+    }
+    
+    # Add self-hash
+    payload_json = json.dumps(payload, sort_keys=True)
+    payload["sha256"] = sha256_hex(payload_json.encode())
+
+    # Atomic write
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = args.out.with_suffix(".tmp")
+    
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        tmp.replace(args.out)
+        
+        print(f"[+] VM timing profile → {args.out}")
+        print(f"[+] Events: {len(delays)}, Base delay: {base_delay}s")
+        print(f"[+] Delay range: {min(delays):.1f}s - {max(delays):.1f}s")
+        if args.tor_proxy:
+            print(f"[+] Tor status: {tor_status}")
+            
+    except (OSError, IOError) as e:
+        print(f"[!] Failed to write output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

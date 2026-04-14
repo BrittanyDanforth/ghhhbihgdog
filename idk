@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import tempfile
+import subprocess
+import shutil
+import logging
+import hashlib
+import json
+import datetime
+import tarfile
+from Crypto.Protocol.SecretSharing import Shamir
+import qrcode
+
+# ---------- Configuration and Initialization ----------
+
+# Set up logging (default WARNING to minimize noise/leakage)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+def compute_sha256(file_path):
+    """Compute SHA-256 digest of a file (for integrity checks)."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+# ---------- Command-Line Interface ----------
+
+parser = argparse.ArgumentParser(
+    description="OPSEC-hardened decryptor for targ_graber bundles (v17)."
+)
+parser.add_argument("bundle", help="Path to encrypted input bundle")
+parser.add_argument("-o", "--output", default="output", help="Output directory")
+parser.add_argument("--target-id", help="Expected target/capsule ID for verification")
+parser.add_argument("--yubikey", action="store_true", help="Require YubiKey HMAC challenge-response")
+parser.add_argument("--shamir-shares", nargs="+",
+                    help="Provide Shamir shares to reconstruct the key (format 'index:hexvalue')")
+parser.add_argument("--verbose", action="store_true", help="Enable detailed logging")
+args = parser.parse_args()
+
+if args.verbose:
+    logger.setLevel(logging.INFO)
+
+# Check input bundle exists
+if not os.path.isfile(args.bundle):
+    logger.error("Bundle file not found: %s", args.bundle)
+    sys.exit(1)
+
+# ---------- YubiKey Challenge-Response (Optional) ----------
+
+if args.yubikey:
+    # OPSEC: Perform offline YubiKey challenge-response to ensure key possession.
+    try:
+        # Generate a random 64-byte challenge
+        challenge = os.urandom(64)
+        # Call YubiKey CLI or library to compute response
+        # This is a placeholder: in practice use yubikey-manager or python-yubico
+        # e.g., response = yubikey.calculate_hmac(challenge)
+        # Here we'll simulate (in real script, remove the simulation).
+        logger.info("Performing YubiKey challenge-response.")
+        # Simulated response for placeholder purposes
+        response = b"expected_response"  # replace with real device response
+        expected = hashlib.sha1(challenge + b"key").digest()  # example check
+        if response != expected:
+            logger.error("YubiKey response invalid. Aborting.")
+            sys.exit(1)
+        logger.info("YubiKey challenge successful.")
+    except Exception as e:
+        logger.error("YubiKey challenge failed: %s", str(e))
+        sys.exit(1)
+
+# ---------- Shamir Secret Sharing (Optional) ----------
+
+decryption_key = None
+if args.shamir_shares:
+    # OPSEC: Reconstruct key from Shamir shares (e.g., 5-of-7).
+    # Shares provided as "index:hexvalue".
+    shares = []
+    for share_str in args.shamir_shares:
+        try:
+            idx_str, hexval = share_str.split(":")
+            idx = int(idx_str)
+            share = bytes.fromhex(hexval)
+            shares.append((idx, share))
+        except ValueError:
+            logger.error("Invalid share format: %s", share_str)
+            sys.exit(1)
+    try:
+        decryption_key = Shamir.combine(shares)
+        logger.info("Shamir key reconstruction successful.")
+    except Exception as e:
+        logger.error("Failed to combine Shamir shares: %s", str(e))
+        sys.exit(1)
+
+# ---------- Prepare Ephemeral TMPFS ----------
+
+# Create a secure temporary directory (using tmpfs or similar)
+# In practice, /dev/shm or /tmp (if tmpfs) is used. Here we use tempfile for demonstration.
+tmpdir = tempfile.mkdtemp(prefix="targ_decrypt_")
+# On Linux, consider mounting tmpfs explicitly for stronger isolation.
+
+try:
+    # ---------- Decryption / Extraction ----------
+
+    logger.info("Starting decryption process...")
+    # Use GPG or subprocess to decrypt the bundle into tmpdir.
+    # This example assumes a symmetric GPG-encrypted tar.gz; modify as needed.
+    decrypted_path = os.path.join(tmpdir, "decrypted.tar.bz2")
+    gpg_cmd = [
+        "gpg", "--batch", "--yes", "--output", decrypted_path,
+        "--decrypt", args.bundle
+    ]
+    # If a passphrase or key is needed, handle it here (prompt offline).
+    result = subprocess.run(gpg_cmd, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        logger.error("GPG decryption failed: %s", result.stderr.decode())
+        sys.exit(1)
+    logger.info("Decryption succeeded, extracted to tmpfs.")
+
+    # Unpack the decrypted archive
+    unpack_dir = os.path.join(tmpdir, "decrypted")
+    os.makedirs(unpack_dir, exist_ok=True)
+    
+    try:
+        with tarfile.open(decrypted_path, "r:bz2") as tar:
+            tar.extractall(path=unpack_dir)
+        logger.info("Archive unpacked into tmpfs.")
+    except (tarfile.TarError, OSError) as e:
+        logger.error("Failed to extract archive: %s", str(e))
+        sys.exit(1)
+
+    # Verify target ID if given
+    if args.target_id:
+        # Example: suppose decrypted data has a file "target_id.txt"
+        id_file = os.path.join(unpack_dir, "target_id.txt")
+        try:
+            with open(id_file, "r") as f:
+                found_id = f.read().strip()
+            if found_id != args.target_id:
+                logger.error("Target ID mismatch (expected %s, found %s). Aborting.", args.target_id, found_id)
+                sys.exit(1)
+            logger.info("Target ID verified: %s", found_id)
+        except FileNotFoundError:
+            logger.warning("No target_id.txt found; skipping ID check.")
+
+    # ---------- Output Handling ----------
+
+    # Ensure output directory exists
+    os.makedirs(args.output, exist_ok=True)
+    metadata = {
+        "target_id": args.target_id or None,
+        "bundle": os.path.basename(args.bundle),
+        "files_extracted": [],
+        "timestamp": None  # to fill
+    }
+
+    # Iterate over extracted files and process
+    for root, dirs, files in os.walk(unpack_dir):
+        for fname in files:
+            src_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(src_path, unpack_dir)
+            dest_path = os.path.join(args.output, rel_path)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            # Move file out of tmpfs (if needed)
+            shutil.move(src_path, dest_path)
+            metadata["files_extracted"].append(rel_path)
+            logger.info("File extracted: %s", rel_path)
+
+    # Record timestamp and compute metadata hash
+    metadata["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
+    
+    # Write metadata JSONL (one line) to output
+    metadata_file = os.path.join(args.output, "metadata.jsonl")
+    with open(metadata_file, "w") as mf:
+        json.dump(metadata, mf)
+        mf.write("\n")
+    
+    # Compute SHA-256 of metadata for integrity
+    metadata_digest = compute_sha256(metadata_file)
+    with open(metadata_file, "a") as mf:
+        json.dump({"metadata_sha256": metadata_digest}, mf)
+        mf.write("\n")
+    logger.info("Metadata and integrity hash written.")
+
+    # ---------- QR Code (if needed) ----------
+    # Example: generate QR of target ID only (anonymized)
+    if metadata["target_id"]:
+        qr_content = f'{{"target_id": "{metadata["target_id"]}"}}'
+        qr = qrcode.QRCode(error_correction=qrcode.ERROR_CORRECT_Q)
+        qr.add_data(qr_content)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        qr_img_path = os.path.join(args.output, "target_id_qr.png")
+        qr_img.save(qr_img_path)
+        logger.info("QR code generated (anonymized target ID).")
+
+finally:
+    # ---------- Cleanup and Shredding ----------
+
+    # Remove tmpfs files
+    try:
+        shutil.rmtree(tmpdir)
+        logger.info("Temporary data wiped (tmpfs unmounted).")
+    except Exception:
+        pass
+
+    # Shred the original bundle to prevent recovery
+    try:
+        subprocess.run(["shred", "-u", "-z", args.bundle], check=False)
+        logger.info("Input bundle shredded and removed.")
+    except Exception as e:
+        logger.warning("Failed to shred bundle (could already be removed): %s", e)
+
+logger.info("Decryption process completed successfully.")

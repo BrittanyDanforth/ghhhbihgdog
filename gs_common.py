@@ -49,6 +49,9 @@ def secure_hex(n_bytes: int) -> str:
 
 def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
     """Sleep a CSPRNG-uniform duration to decorrelate timing."""
+    if hi <= lo:
+        time.sleep(max(lo, 0))
+        return
     delay = lo + (secrets.randbelow(int((hi - lo) * 1000)) / 1000.0)
     time.sleep(delay)
 
@@ -61,26 +64,69 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
 
     Timestamp is coarsened to 600-second (10-min) buckets to reduce the
     correlation window between the log and blockchain/network timestamps.
-    An attacker with the log can only narrow the operation to a 10-min window
-    instead of the exact second.
     """
-    prev = "0" * 64
-    if log_path.exists():
-        text = log_path.read_text()
-        lines = text.splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0].strip()
-    ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
-    line = f"{ts}|{VERSION}|{stage}|{msg}"
-    h = hashlib.sha256((prev + line).encode()).hexdigest()
+    import fcntl
+    # BUG 61 FIX: Sanitize inputs — newlines in stage/msg would break the
+    # hash chain and allow log injection attacks.
+    stage = stage.replace("\n", " ").replace("\r", " ")[:64]
+    msg = msg.replace("\n", " ").replace("\r", " ")[:200]
+
+    # BUG 62 FIX: File locking — concurrent processes writing to the same
+    # log would read the same prev-hash and create a forked chain.
     with log_path.open("a") as f:
-        f.write(f"{h} | {line}\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            prev = "0" * 64
+            if log_path.exists():
+                try:
+                    text = log_path.read_text()
+                    lines = [l for l in text.splitlines() if l.strip()]
+                    if lines:
+                        parts = lines[-1].split(" | ", 1)
+                        candidate = parts[0].strip()
+                        if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                            prev = candidate
+                except (OSError, UnicodeDecodeError):
+                    pass
+            ts = int(time.time()) // 600 * 600
+            line = f"{ts}|{VERSION}|{stage}|{msg}"
+            h = hashlib.sha256((prev + line).encode()).hexdigest()
+            f.write(f"{h} | {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     secure_file_perms(log_path)
     return h
 
 # ---------------------------------------------------------------------------
 #  File security
 # ---------------------------------------------------------------------------
+
+def lock_memory() -> bool:
+    """Call mlockall() to prevent Python heap from being swapped to disk.
+
+    Without this, secrets held in Python str/bytes objects (wallet passwords,
+    spend keys) can be written to the swap partition and recovered forensically
+    from a seized machine. Requires CAP_IPC_LOCK or root on Linux.
+    Returns True if successful, False otherwise (non-fatal).
+    """
+    try:
+        import ctypes
+        MCL_CURRENT = 1
+        MCL_FUTURE = 2
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        rc = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+        if rc == 0:
+            integrity_log("opsec", "mlockall_ok")
+            return True
+        errno = ctypes.get_errno()
+        integrity_log("opsec", f"mlockall_fail:errno={errno}")
+        return False
+    except (OSError, AttributeError):
+        integrity_log("opsec", "mlockall_unavailable")
+        return False
+
 
 def secure_file_perms(path: Path, mode: int = 0o600) -> None:
     """Set file to owner-read/write only."""
@@ -90,17 +136,49 @@ def secure_file_perms(path: Path, mode: int = 0o600) -> None:
         pass
 
 
+def _json_safe_default(o):
+    """JSON serializer that handles Decimal but rejects dangerous types.
+
+    BUG 75 FIX: The old `default=str` silently converted Path objects to
+    strings like 'PosixPath(/home/user/...)' leaking filesystem paths.
+    This only allows Decimal (common in Monero amounts) and rejects
+    everything else loudly.
+    """
+    if isinstance(o, Decimal):
+        return str(o)
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable "
+                    f"(and would leak data if converted via str())")
+
+
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
-    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    BUG 35 FIX: The old verify-by-reload silently swallowed parse errors
+    (truncated JSON from disk-full, etc). If the reload fails, that means
+    the file on disk is corrupt — we must crash loudly, not continue.
+    Also fsync the parent directory to ensure the rename is durable.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
+        json.dump(obj, f, indent=2, default=_json_safe_default)
         f.flush()
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
     os.replace(tmp, path)
-    with open(path) as f:
-        json.load(f)
+    try:
+        with open(path) as f:
+            json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(f"[!] CRITICAL: Atomic write to {path} produced corrupt JSON: {e}")
+    # fsync parent dir to make the rename durable across power loss
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
@@ -123,17 +201,27 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
     ONLY socks5h:// is accepted. Plain socks5:// resolves DNS locally,
     leaking every destination hostname to the ISP's DNS resolver.
     """
-    if proxy_url.startswith("socks5://") and not proxy_url.startswith("socks5h://"):
+    # BUG 63 FIX: Case-insensitive check to prevent SOCKS5:// bypass
+    proxy_lower = proxy_url.lower()
+    if proxy_lower.startswith("socks5://") and not proxy_lower.startswith("socks5h://"):
         sys.exit(
             f"[!] CRITICAL: socks5:// leaks DNS locally!\n"
             f"    Use socks5h:// so DNS resolves through the proxy.\n"
             f"    Change: {proxy_url} -> {proxy_url.replace('socks5://', 'socks5h://')}"
         )
-    if not SOCKS_RE.match(proxy_url):
+    if not SOCKS_RE.match(proxy_lower):
         sys.exit(
             f"[!] Invalid proxy format: {proxy_url}\n"
             f"    Expected: socks5h://host:port  (NOT socks5://)"
         )
+    # Extract and validate port range
+    port_str = proxy_lower.rsplit(":", 1)[-1]
+    try:
+        port = int(port_str)
+        if port < 1 or port > 65535:
+            sys.exit(f"[!] Invalid proxy port: {port}. Must be 1-65535.")
+    except ValueError:
+        sys.exit(f"[!] Invalid proxy port: {port_str}")
     return {"http": proxy_url, "https": proxy_url}
 
 # ---------------------------------------------------------------------------
@@ -177,14 +265,35 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 
     If NEWNYM fails _NEWNYM_MAX_FAILURES times in a row and required=True,
     the process aborts to prevent all operations going over one circuit.
+
+    BUG 34 FIX: The old code only tried the Unix socket file at
+    /var/run/tor/control. Most Tor installations (especially on non-Debian
+    or when installed via Tor Browser) use TCP control port 9051 instead.
+    Now tries socket file first, then falls back to TCP port 9051.
     """
     global _NEWNYM_CONSECUTIVE_FAILURES
     try:
         from stem import Signal as StemSignal
         from stem.control import Controller
-        with Controller.from_socket_file(ctrl) as c:
-            c.authenticate()
+
+        c = None
+        try:
+            if os.path.exists(ctrl):
+                c = Controller.from_socket_file(ctrl)
+            else:
+                c = Controller.from_port(port=9051)
+            # BUG 73 FIX: Support password auth for Tor control port.
+            # stem.authenticate() tries NONE, SAFECOOKIE, COOKIE by default.
+            # If torrc uses HashedControlPassword, we need the password.
+            tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
+            if tor_pw:
+                c.authenticate(password=tor_pw)
+            else:
+                c.authenticate()
             c.signal(StemSignal.NEWNYM)
+        finally:
+            if c is not None:
+                c.close()
         time.sleep(5)
         _NEWNYM_CONSECUTIVE_FAILURES = 0
         return True
@@ -204,20 +313,47 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 #  Retry-wrapped HTTP
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
+    """GET with retry. Aborts if proxies is None (clearnet leak prevention).
+
+    BUG 33 FIX: The proxy-None check must happen BEFORE the @retry decorator,
+    because tenacity retries SystemExit (it inherits from BaseException), so
+    the abort would be retried 4 times before propagating. Check first, then
+    call the retry-wrapped inner function.
+    """
     if proxies is None:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
+    return _safe_get_inner(url, proxies)
+
+
+def _newnym_between_retries(retry_state):
+    """Called by tenacity before each retry sleep to rotate Tor circuit.
+    BUG 74 FIX: Without this, all retries hit the same blocked exit node."""
+    newnym()
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
+       before_sleep=_newnym_between_retries)
+def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r = requests.get(url, timeout=20, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
-def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
+def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
+              headers: Dict[str, str] = None) -> dict:
+    """POST with retry. Aborts if proxies is None (clearnet leak prevention)."""
     if proxies is None:
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies)
+    return _safe_post_inner(url, payload, proxies, headers or {})
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
+       before_sleep=_newnym_between_retries)
+def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
+                     headers: Dict[str, str] = None) -> dict:
+    r = requests.post(url, json=payload, timeout=25, proxies=proxies,
+                      headers=headers or {})
     r.raise_for_status()
     return r.json()
 
@@ -242,8 +378,13 @@ class MoneroRPC:
         from monero.wallet import Wallet as XMRWallet
         from monero.backends.jsonrpc import JSONRPCWallet
         parsed = urlparse(url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 18083
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            sys.exit(
+                f"[!] Invalid RPC URL: {url}\n"
+                f"    Expected format: http://host:port (e.g., http://127.0.0.1:18083)"
+            )
 
         if host.lower() not in _LOCALHOST_NAMES:
             if not proxy_url:
@@ -256,12 +397,45 @@ class MoneroRPC:
                 )
             integrity_log("rpc", f"WARN:non_local_rpc:{host}:{port}:proxy_patched")
 
-        self._backend = JSONRPCWallet(host=host, port=port)
+        # BUG 60 FIX: Pass proxy_url directly to JSONRPCWallet constructor
+        # (monero-python natively supports it). ALSO patch self.proxies
+        # because raw_request() passes proxies=self.proxies to session.post(),
+        # which overrides session.proxies. The old BUG 56 fix only patched
+        # session.proxies but raw_request bypasses it.
+        # Also extract auth credentials from URL if present.
+        protocol = parsed.scheme or "http"
+        user = parsed.username or ""
+        password = parsed.password or ""
+
+        backend_kwargs = {
+            "host": host, "port": port, "protocol": protocol,
+        }
+        if user:
+            backend_kwargs["user"] = user
+        if password:
+            backend_kwargs["password"] = password
+        if proxy_url and host.lower() not in _LOCALHOST_NAMES:
+            backend_kwargs["proxy_url"] = proxy_url
+
+        try:
+            self._backend = JSONRPCWallet(**backend_kwargs)
+        except TypeError:
+            # BUG 79 FIX: Only strip proxy_url from kwargs on TypeError,
+            # not auth credentials or protocol.
+            fallback_kwargs = {k: v for k, v in backend_kwargs.items()
+                               if k != "proxy_url"}
+            self._backend = JSONRPCWallet(**fallback_kwargs)
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
-            proxies = {"http": proxy_url, "https": proxy_url}
-            if hasattr(self._backend, '_session'):
-                self._backend._session.proxies.update(proxies)
+            proxy_dict = {"http": proxy_url, "https": proxy_url}
+            # Patch self.proxies (used by raw_request's session.post call)
+            if hasattr(self._backend, 'proxies'):
+                self._backend.proxies = proxy_dict
+            # Also patch session.proxies as belt-and-suspenders
+            for attr in ('session', '_session'):
+                if hasattr(self._backend, attr):
+                    getattr(self._backend, attr).proxies.update(proxy_dict)
+                    break
 
         self._wallet = XMRWallet(self._backend)
 
@@ -317,7 +491,10 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
 
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
     """Return True if resources are OK. False if system is stressed."""
-    import psutil
+    try:
+        import psutil
+    except ImportError:
+        return True  # Can't check — assume OK rather than crashing mid-operation
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage(".")
     return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
@@ -356,7 +533,17 @@ def shutdown_requested() -> bool:
 # ---------------------------------------------------------------------------
 
 def scrub_address(addr: str, visible: int = 8) -> str:
-    """Truncate an address for safe terminal display."""
-    if len(addr) <= visible * 2:
-        return addr
+    """Truncate an address for safe terminal display.
+
+    BUG 36 FIX: For Monero addresses (95 chars), 8+8=16 visible chars is
+    already enough to uniquely identify a subaddress on-chain. Reduce to
+    6 visible chars for addresses over 40 chars (Monero), and ensure we
+    never return the full address even for short inputs.
+    """
+    if not addr:
+        return "<empty>"
+    if len(addr) > 40:
+        visible = min(visible, 6)
+    if len(addr) <= visible * 2 + 3:
+        return f"{addr[:4]}...{addr[-4:]}" if len(addr) > 11 else "****"
     return f"{addr[:visible]}...{addr[-visible:]}"

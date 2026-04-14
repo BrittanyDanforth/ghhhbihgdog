@@ -25,6 +25,35 @@ from gs_common import (
 )
 
 
+def _detect_network(addr_str: str) -> str:
+    """Detect which Monero network an address belongs to.
+
+    Mainnet standard addresses start with '4', subaddresses with '8'.
+    Testnet standard starts with '9', subaddresses with 'B'.
+    Stagenet standard starts with '5', subaddresses with '7'.
+    Falls back to monero-python's address parser if available.
+    """
+    try:
+        from monero.address import address as parse_address
+        a = parse_address(addr_str)
+        net = getattr(a, "net", None)
+        if net == "main":
+            return "mainnet"
+        elif net == "test":
+            return "testnet"
+        elif net == "stage":
+            return "stagenet"
+    except Exception:
+        pass
+    if addr_str and addr_str[0] in ("4", "8"):
+        return "mainnet"
+    elif addr_str and addr_str[0] in ("9", "B"):
+        return "testnet"
+    elif addr_str and addr_str[0] in ("5", "7"):
+        return "stagenet"
+    return "unknown"
+
+
 def main():
     install_signal_handlers()
 
@@ -38,6 +67,8 @@ def main():
                     help="socks5h://host:port if routing via Tor")
     ap.add_argument("--label", default="GhostSpiral_entry",
                     help="label for the new subaddress")
+    ap.add_argument("--account-index", type=int, default=0,
+                    help="wallet account index to create subaddress on (default: 0)")
     ap.add_argument("--output-dir", default=".",
                     help="directory for wallet JSON output")
     args = ap.parse_args()
@@ -58,22 +89,34 @@ def main():
         integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
-    if not wallet_rpc.accounts:
-        wallet_rpc.new_account(label="GhostSpiral")
+    acct_idx = args.account_index
+    accounts = wallet_rpc.accounts
+    if acct_idx >= len(accounts):
+        sys.exit(
+            f"[!] Account index {acct_idx} does not exist "
+            f"(wallet has {len(accounts)} account(s), indices 0-{len(accounts)-1}).\n"
+            f"    Create the account first via monero-wallet-rpc's create_account."
+        )
     addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
-        account_index=0, label=args.label,
+        account_index=acct_idx, label=args.label,
     )
+
+    network = _detect_network(addr_str)
+    if network != "mainnet":
+        print(f"  [!] WARNING: Address belongs to {network.upper()}, not mainnet.")
+        print(f"  [!] Do NOT feed this wallet JSON into a mainnet GhostSpiral pipeline.")
+        integrity_log("wallet", f"network_warning:{network}")
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
         "schema": "gs_receive_wallet_v1",
-        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "created": int(time.time()) // 600 * 600,
         "address": addr_str,
-        "account_index": 0,
+        "account_index": acct_idx,
         "subaddress_index": sub_idx,
         "label": args.label,
-        "rpc_endpoint": args.rpc,
+        "network": network,
     }
 
     outdir = Path(args.output_dir)
@@ -82,9 +125,10 @@ def main():
     atomic_write_json(out, fname)
 
     print(f"  [+] Wallet saved -> {fname}")
-    print(f"  [+] Address (full): {addr_str}")
-    print(f"  [+] Subaddress index: {sub_idx} (account 0)")
     print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
+    print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
+    print(f"  [+] Network: {network}")
+    print(f"  [+] Full address is in the JSON file (0600 permissions).")
 
     integrity_log("wallet", f"saved:{fname.name}")
 
@@ -93,11 +137,14 @@ def main():
 
     print(f"  [+] Integrity chain updated.")
     print()
+    # BUG 55 FIX: Don't print full XMR address in terminal output.
+    # Terminal scrollback, screen recordings, and shoulder-surfing can
+    # capture it. Instead, reference the JSON file which has 0600 perms.
     print(f"  === RECEIVER FLOW: NEXT STEPS ===")
     print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
     print(f"       python3 thor_swap_preparer \\")
     print(f"         --amounts <BTC_AMOUNT> \\")
-    print(f"         --dests {addr_str} \\")
+    print(f"         --dests $(jq -r .address {fname}) \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
     print(f"  2. Give the BTC deposit address + memo to the sender")
     print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")

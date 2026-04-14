@@ -1,7 +1,14 @@
-requests>=2.28
-tenacity>=8.0
-stem>=1.8
-monero>=0.8
-psutil>=5.9
-python-gnupg>=0.5
-PyYAML>=6.0
+# GhostSpiral v10.6 - Python Dependencies
+# Install: pip install -r requirements.txt
+#
+# CRITICAL: Also install PySocks for SOCKS5 proxy support:
+#   pip install PySocks
+# Without it, requests through Tor will fail silently.
+
+requests[socks]>=2.28    # HTTP library + SOCKS proxy support (via PySocks)
+tenacity>=8.0            # Retry logic with exponential backoff
+stem>=1.8                # Tor control protocol (NEWNYM circuit rotation)
+monero>=1.1              # Monero wallet RPC client (monero-python)
+psutil>=5.9              # System resource monitoring (optional but recommended)
+python-gnupg>=0.5        # GPG encryption for thor_swap_preparer (optional)
+PySocks>=1.7             # SOCKS5 proxy support for requests library

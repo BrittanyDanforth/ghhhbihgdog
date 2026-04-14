@@ -18,7 +18,7 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, shutil, socket, subprocess, sys, time
+import argparse, glob, os, random, shutil, subprocess, sys, time
 from pathlib import Path
 
 from gs_common import (
@@ -42,23 +42,32 @@ PYCACHE_GLOBS = [
 ]
 
 
-def dns_check() -> None:
+def connectivity_check(iface: str) -> None:
     """Verify basic network connectivity after MAC spoof.
 
-    OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
-    over clearnet DNS — that links the new MAC address to Tor usage in
-    ISP DNS logs. Instead, resolve a benign, high-traffic domain that
-    reveals nothing about the operator's intent.
+    BUG 52 FIX: ANY clearnet DNS resolution immediately after MAC spoof
+    creates a timing correlation between the new MAC and network activity.
+    Instead of DNS resolution, just check that the network interface is up
+    and has an IP address. This proves connectivity without generating any
+    traffic that could be logged by the ISP or network observer.
     """
     try:
-        res = socket.getaddrinfo("www.google.com", 443)
-        if not res:
-            raise RuntimeError("DNS returned empty")
-        integrity_log("paranoia", "dns_check_ok")
-    except socket.gaierror as e:
-        integrity_log("paranoia", f"dns_fail:{e}")
-        print(f"  [!] DNS resolution failed post-spoof: {e}")
-        sys.exit(1)
+        result = subprocess.run(
+            ["ip", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            integrity_log("paranoia", "connectivity_check_fail:iface_down")
+            print(f"  [!] Interface {iface} appears to be down after MAC spoof")
+            return
+        if "inet " in result.stdout:
+            integrity_log("paranoia", "connectivity_check_ok")
+        else:
+            integrity_log("paranoia", "connectivity_check_warn:no_ip")
+            print(f"  [!] Interface {iface} has no IP address (DHCP may need renewal)")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        integrity_log("paranoia", f"connectivity_check_fail:{e}")
+        print(f"  [!] Connectivity check failed: {e}")
 
 
 def rand_mac() -> str:
@@ -81,8 +90,33 @@ def spoof_mac(iface: str, dry: bool):
                        check=True, capture_output=True)
         subprocess.run(["ip", "link", "set", iface, "up"], check=True,
                        capture_output=True)
-        print(f"  [+] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_spoof:{iface}->{new_mac}")
+
+        # Verify the MAC was actually applied. Some wireless drivers
+        # (Intel AX200/AX201, some Realtek) accept the command but
+        # silently revert to the hardware MAC.
+        verify = subprocess.run(
+            ["ip", "link", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        if verify.returncode == 0:
+            import re as _re
+            mac_match = _re.search(
+                r"link/ether\s+([0-9a-f:]{17})", verify.stdout
+            )
+            if mac_match:
+                actual_mac = mac_match.group(1).lower()
+                if actual_mac != new_mac.lower():
+                    integrity_log("paranoia",
+                                  f"mac_verify_FAIL:{iface}:wanted={new_mac}:got={actual_mac}")
+                    print(f"  [!] MAC spoof FAILED verification!")
+                    print(f"      Requested: {new_mac}")
+                    print(f"      Actual:    {actual_mac}")
+                    print(f"      Your wireless driver may reject programmatic MAC changes.")
+                    print(f"      Try: macchanger -r {iface}")
+                    return
+
+        print(f"  [+] MAC {iface} -> {new_mac} (verified)")
+        integrity_log("paranoia", f"mac_spoof_verified:{iface}->{new_mac}")
     except subprocess.CalledProcessError as e:
         integrity_log("paranoia", f"mac_fail:{iface}:{e}")
         print(f"  [!] MAC spoof failed: {e}")
@@ -212,16 +246,38 @@ def wipe_swap_ram(dry: bool):
 
 
 def _secure_delete_file(path: Path):
-    """Overwrite file content with nulls before unlinking."""
+    """Overwrite file content with nulls before unlinking.
+
+    BUG 53 FIX: The old code only overwrote the first 64KB. Now overwrites
+    the full file size in 64KB chunks.
+
+    Limitations acknowledged and warned about:
+    - Hardlinks: if nlink > 1, data persists via other links. We warn.
+    - CoW filesystems (btrfs/ZFS): overwrite allocates new blocks; old
+      data remains until GC. We warn and suggest shred.
+    - Journaling (ext4): journal may contain original data for recent
+      writes. fsync + overwrite helps but doesn't guarantee journal purge.
+    """
     try:
-        size = path.stat().st_size
-        with open(path, "wb") as f:
-            f.write(b"\x00" * min(size, 65536))
+        stat = path.stat()
+        size = stat.st_size
+        if stat.st_nlink > 1:
+            print(f"  [!] WARNING: {path} has {stat.st_nlink} hardlinks — "
+                  f"data persists via other links after deletion")
+            integrity_log("paranoia", f"hardlink_warn:{path.name}:nlinks={stat.st_nlink}")
+        with open(path, "r+b") as f:
+            remaining = size
+            chunk_size = 65536
+            while remaining > 0:
+                write_size = min(remaining, chunk_size)
+                f.write(b"\x00" * write_size)
+                remaining -= write_size
             f.flush()
             os.fsync(f.fileno())
         path.unlink()
-    except (PermissionError, OSError):
-        pass
+    except (PermissionError, OSError) as e:
+        integrity_log("paranoia", f"secure_delete_fail:{path.name}:{e}")
+        print(f"  [!] Secure delete failed for {path}: {e}")
 
 
 def _secure_delete_dir(path: Path):
@@ -239,7 +295,8 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     common subdirectories, and any --search-dir paths provided."""
     file_patterns = [
         "unsigned_*.json", "signer_progress.json",
-        "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
+        "broadcast_progress.json", "stage5_progress.json",
+        "wallet_*.json", "thor_pairs_*.json",
         "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
         "exitplan_*.json", "exitplan_v1.json",
         "integrity_chain.log", "integrity.log",
@@ -252,11 +309,18 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "signed_blobs", "unsigned", "tx_staging",
     ]
 
+    # BUG 51 FIX: Also search common USB mount points where air-gap
+    # signed files may have been left (operator may forget to clean USB).
     search_roots = list(set([
         Path("."),
         Path.home(),
         Path.home() / "ghostspiral",
         Path.home() / "GhostSpiral",
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+        Path("/media"),
+        Path("/mnt"),
+        Path("/run/media"),
     ] + [Path(d) for d in (extra_dirs or [])]))
 
     count = 0
@@ -264,36 +328,35 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         if not root.is_dir():
             continue
 
+        # Use recursive glob (**/) to find artifacts at any depth.
+        # The old code only searched one level deep, missing artifacts
+        # in nested directories (e.g. ~/projects/ghostspiral/run3/unsigned/).
+        # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
+        depth_patterns = [
+            "",          # root itself
+            "*/",        # 1 level
+            "*/*/",      # 2 levels
+            "*/*/*/",    # 3 levels
+        ]
+
         for pattern in file_patterns:
-            for f in root.glob(pattern):
-                if dry:
-                    print(f"  [dry] would securely delete {f}")
-                else:
-                    _secure_delete_file(f)
-                count += 1
-            # Also search one level of subdirectories
-            for f in root.glob(f"*/{pattern}"):
-                if dry:
-                    print(f"  [dry] would securely delete {f}")
-                else:
-                    _secure_delete_file(f)
-                count += 1
+            for depth in depth_patterns:
+                for f in root.glob(f"{depth}{pattern}"):
+                    if dry:
+                        print(f"  [dry] would securely delete {f}")
+                    else:
+                        _secure_delete_file(f)
+                    count += 1
 
         for dirname in dir_patterns:
-            for d in root.glob(dirname):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
-                    count += 1
-            for d in root.glob(f"*/{dirname}"):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
-                    count += 1
+            for depth in depth_patterns:
+                for d in root.glob(f"{depth}{dirname}"):
+                    if d.is_dir():
+                        if dry:
+                            print(f"  [dry] would securely delete dir {d}")
+                        else:
+                            _secure_delete_dir(d)
+                        count += 1
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
     integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
@@ -428,11 +491,11 @@ def main():
     print("  [*] Phase 1: MAC spoof")
     spoof_mac(args.iface, args.dry_run)
 
-    print("  [*] Phase 2: DNS check")
+    print("  [*] Phase 2: Connectivity check (no DNS — avoids MAC-to-activity correlation)")
     if args.dry_run:
-        print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
+        print("  [dry] would check interface connectivity")
     else:
-        dns_check()
+        connectivity_check(args.iface)
 
     print("  [*] Phase 3: DNS cache flush")
     flush_dns_cache(args.dry_run)
@@ -455,19 +518,27 @@ def main():
     print("  [*] Phase 9: Swap/RAM")
     wipe_swap_ram(args.dry_run)
 
-    print("  [*] Phase 11: Clipboard")
+    print("  [*] Phase 10: Clipboard")
     wipe_clipboard(args.dry_run)
 
-    print("  [*] Phase 12: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
+    print("  [*] Phase 11: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
     wipe_xdg_traces(args.dry_run)
 
-    print("  [*] Phase 13: Environment variables")
+    print("  [*] Phase 12: Environment variables")
     scrub_env_vars(args.dry_run)
+    print("  [!] NOTE: env var scrubbing only affects THIS process. Your parent")
+    print("  [!] shell still has the original variables. Close the terminal or run:")
+    print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
+    print("  [!]   history -c && history -w  # clear shell history of unset commands")
 
-    # Phase 14 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 14: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
+    print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
+    print("  [!] encryption instead. On ext4 with journaling, recently-written file")
+    print("  [!] data may persist in the journal even after secure deletion.")
     wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
 
     # DO NOT call integrity_log() here — it would recreate the wiped log file

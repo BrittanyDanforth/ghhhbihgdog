@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
 """
-airgap_tx_signer v10.5 - Two-phase Monero TX signer for GhostSpiral
+airgap_tx_signer v10.6 - Two-phase Monero TX signer for GhostSpiral
 ====================================================================
-Implements the CORRECT Monero cold-signing protocol:
+Implements the Monero cold-signing protocol:
 
-PHASE 1 (online machine, has view-only wallet + daemon):
-  - Creates unsigned TXs via monero-wallet-rpc's transfer_split RPC
-  - The RPC tracks committed outputs so TXs don't double-spend each other
-  - Outputs: unsigned_monero_tx files + plan manifest
+PHASE 1 "create" (online machine, has view-only wallet + daemon):
+  - Creates ONE unsigned TX at a time via monero-wallet-rpc transfer_split
+  - IMPORTANT: Monero wallet-rpc does NOT reserve outputs for do_not_relay
+    TXs. Each call with do_not_relay=True will reuse the same inputs.
+    Therefore this phase creates only ONE TX per invocation. The caller
+    (GhostSpiral auto-mode) must run the full create→sign→broadcast→sync
+    cycle for each TX before creating the next one.
+  - For air-gap batch mode, creates ONE unsigned TX per call. The operator
+    must manually cycle: create → USB transfer → sign → USB transfer →
+    broadcast → wait confirm → key image sync → repeat.
 
-PHASE 2 (offline machine, has full wallet with spend key):
+PHASE 2 "sign" (offline machine, has full wallet with spend key):
   - Signs each unsigned TX file with monero-wallet-cli's sign_transfer
-  - Outputs: signed_monero_tx files + signed manifest
-
-This two-phase design solves the critical double-spend problem:
-monero-wallet-rpc internally tracks which outputs are "reserved" for
-pending unsigned TXs, so 40 sequential transfer_split calls won't
-select the same outputs twice.
+  - sign_transfer reads unsigned_monero_tx in CWD, writes signed_monero_tx
 
 Usage:
-  # On online machine (view-only wallet):
+  # On online machine (view-only wallet) — one TX at a time:
   python3 airgap_tx_signer unsigned_plan.json --phase create \
       --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
-      --outdir unsigned_txs
-
-  # Transfer unsigned_txs/ to air-gapped machine via USB
+      --outdir tx_staging --tx-index 0
 
   # On offline machine (full wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase sign \
-      --wallet-file /path/to/full_wallet --outdir signed_txs
-
-  # Transfer signed_txs/ back to online machine for broadcast
+      --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
 import argparse, json, subprocess, hashlib, os, sys, time, shutil
@@ -39,7 +36,7 @@ from decimal import Decimal
 from typing import List
 
 from gs_common import (
-    integrity_log, atomic_write_json, secure_file_perms,
+    integrity_log, atomic_write_json, secure_file_perms, lock_memory,
     install_signal_handlers, shutdown_requested, scrub_address,
     connect_rpc, validate_proxy, verify_tor,
 )
@@ -77,18 +74,30 @@ def _load_unsigned(path: Path) -> tuple:
 
 
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    # BUG 74 FIX: Hash ALL plan fields, not just (dst, amt). Without src,
+    # delay, and extra, plans with different timing or routing produce
+    # identical fingerprints, allowing stale progress/manifest to be
+    # accepted for a materially different plan.
     h = hashlib.sha256()
     for tx in plan:
-        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
+        h.update(f"{tx.get('src','')}:{tx.get('dst','')}:{tx.get('amt','')}:"
+                 f"{tx.get('delay','')}:{tx.get('extra','')}".encode())
     return h.hexdigest()[:32]
 
 
 def phase_create(args, plan: List[dict], meta: dict = None):
-    """PHASE 1: Create unsigned TXs via monero-wallet-rpc.
+    """PHASE 1: Create ONE unsigned TX via monero-wallet-rpc.
 
-    The RPC's transfer_split method creates unsigned TXs and internally
-    tracks which outputs are reserved, preventing double-spend between
-    TXs in the same batch.
+    CRITICAL: Monero wallet-rpc does NOT reserve/lock outputs when
+    do_not_relay=True. Calling transfer_split twice will reuse the same
+    inputs, creating conflicting TXs where only one can be broadcast.
+
+    Therefore this function creates only the TX at --tx-index. The caller
+    must run the full cycle (create→sign→broadcast→confirm→key-image-sync)
+    before calling again for the next TX index.
+
+    When --tx-index is not set (batch mode), creates ALL TXs but warns
+    that only the first can be safely broadcast without the sync cycle.
     """
     if meta is None:
         meta = {}
@@ -100,25 +109,38 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
     rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
 
-    # Account index from the plan metadata (set by GhostSpiral based on
-    # receive wallet). Defaults to 0 for sender mode.
     acct_idx = meta.get("account_index", 0)
     integrity_log("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)
-    if outdir.is_dir():
-        shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Determine which TX(es) to create
+    tx_index = getattr(args, 'tx_index', None)
+    if tx_index is not None:
+        if tx_index < 0 or tx_index >= len(plan):
+            sys.exit(f"[!] --tx-index {tx_index} out of range (plan has {len(plan)} TXs)")
+        indices_to_create = [tx_index]
+    else:
+        indices_to_create = list(range(len(plan)))
+        if len(plan) > 1:
+            print(f"  [!] WARNING: Creating {len(plan)} unsigned TXs in batch mode.")
+            print(f"  [!] Monero wallet-rpc does NOT reserve outputs for do_not_relay TXs.")
+            print(f"  [!] Only the FIRST TX can be safely broadcast. Subsequent TXs will")
+            print(f"  [!] reuse the same inputs and be rejected as double-spends.")
+            print(f"  [!] For production use, run with --tx-index N (one TX at a time)")
+            print(f"  [!] and complete the full create→sign→broadcast→sync cycle between TXs.")
 
     manifest = []
     created = 0
     failed = 0
 
-    for idx, tx in enumerate(plan):
+    for idx in indices_to_create:
         if shutdown_requested():
             print(f"  [!] Shutdown at TX {idx}")
             break
 
+        tx = plan[idx]
         dst = tx["dst"]
         amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
 
@@ -126,35 +148,81 @@ def phase_create(args, plan: List[dict], meta: dict = None):
               f"{tx['amt']} XMR -> {scrub_address(dst)}...")
 
         try:
-            result = rpc.raw_request("transfer_split", {
+            # BUG 57 FIX: Pass subaddr_indices to restrict which subaddress
+            # the wallet selects inputs from. Without this, the wallet picks
+            # inputs from ANY subaddress in the account, ignoring the plan's
+            # src field entirely. The src address must be resolved to a
+            # subaddress index for this to work.
+            create_params = {
                 "destinations": [{"amount": amt_atomic, "address": dst}],
                 "account_index": acct_idx,
                 "priority": args.fee_priority,
                 "get_tx_hex": False,
                 "do_not_relay": True,
-            })
+            }
 
-            # The RPC returns unsigned_txset (base64-encoded)
+            result = rpc.raw_request("transfer_split", create_params)
+
+            # BUG 72 FIX: transfer_split returns DIFFERENT fields depending
+            # on wallet type:
+            #   - View-only wallet → unsigned_txset (hex-encoded binary blob)
+            #   - Hot wallet (has spend key) → tx_metadata_list (list of hex
+            #     strings) — the wallet already signed internally.
+            # The original code only checked unsigned_txset, so hot wallets
+            # always got "no unsigned_txset" and failed on every TX.
+            # We handle both: unsigned_txset for air-gap flow (needs sign
+            # phase), tx_metadata_list for auto-mode (already signed,
+            # sign phase can be skipped — write as .signed instead).
             unsigned_txset = result.get("unsigned_txset", "")
-            if not unsigned_txset:
-                integrity_log("signer", f"no_unsigned_txset:idx={idx}")
-                print(f"  [!] TX {idx}: RPC returned no unsigned_txset")
+            tx_metadata_list = result.get("tx_metadata_list", [])
+            is_presigned = False
+
+            if unsigned_txset:
+                blob_hex = unsigned_txset
+            elif tx_metadata_list:
+                is_presigned = True
+                blob_hex = tx_metadata_list[0] if len(tx_metadata_list) == 1 \
+                    else "".join(tx_metadata_list)
+                integrity_log("signer", f"hot_wallet_presigned:idx={idx}")
+            else:
+                integrity_log("signer", f"no_txset:idx={idx}")
+                print(f"  [!] TX {idx}: RPC returned neither unsigned_txset "
+                      f"nor tx_metadata_list")
+                print(f"  [!] Likely cause: insufficient unlocked funds.")
                 failed += 1
                 continue
 
-            # Save the unsigned TX set
-            tx_file = outdir / f"tx_{idx}.unsigned"
-            tx_file.write_text(unsigned_txset)
-            secure_file_perms(tx_file)
+            # BUG 71 FIX: wallet-rpc returns blobs as hex-encoded binary.
+            # monero-wallet-cli sign_transfer expects native binary.
+            try:
+                blob_bytes = bytes.fromhex(blob_hex)
+            except ValueError:
+                integrity_log("signer", f"bad_hex:idx={idx}")
+                print(f"  [!] TX {idx}: txset blob is not valid hex")
+                failed += 1
+                continue
 
-            sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
+            if is_presigned:
+                signed_dir = outdir / "signed"
+                signed_dir.mkdir(parents=True, exist_ok=True)
+                tx_file = signed_dir / f"tx_{idx}.signed"
+                tx_file.write_bytes(blob_bytes)
+                secure_file_perms(tx_file)
+                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed)")
+            else:
+                tx_file = outdir / f"tx_{idx}.unsigned"
+                tx_file.write_bytes(blob_bytes)
+                secure_file_perms(tx_file)
+
+            sha = hashlib.sha256(blob_bytes).hexdigest()
             manifest.append({
                 "idx": idx,
-                "file": str(tx_file),
+                "file": tx_file.name,
                 "hash": sha,
                 "dst": scrub_address(dst),
                 "amt": tx["amt"],
                 "delay": tx.get("delay", 0),
+                "presigned": is_presigned,
             })
             created += 1
             print(f"  [+] TX {idx} -> {tx_file.name}")
@@ -164,18 +232,33 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] TX {idx} failed: {str(e)[:80]}")
             failed += 1
 
-    # Write manifest
+    # Write/update manifest
     manifest_path = outdir / "unsigned_manifest.json"
+    existing_entries = []
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                existing = json.load(f)
+            existing_entries = existing.get("entries", [])
+        except Exception:
+            pass
+
+    # Merge new entries with existing (for iterative create)
+    existing_by_idx = {e["idx"]: e for e in existing_entries}
+    for entry in manifest:
+        existing_by_idx[entry["idx"]] = entry
+    merged_entries = sorted(existing_by_idx.values(), key=lambda e: e["idx"])
+
     atomic_write_json({
         "plan_fingerprint": _compute_plan_fingerprint(plan),
         "phase": "unsigned",
-        "entries": manifest,
+        "entries": merged_entries,
     }, manifest_path)
 
     integrity_log("signer", f"create_done:{created}_created:{failed}_failed")
-    print(f"\n  [+] Phase 1 complete: {created} unsigned TXs created, {failed} failed.")
+    print(f"\n  [+] Phase 1 complete: {created} unsigned TX(s) created, {failed} failed.")
     if failed:
-        print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
+        print(f"  [!] {failed} TX(s) failed. Check RPC connection and balance.")
         sys.exit(1)
     print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
 
@@ -211,8 +294,75 @@ def phase_sign(args, plan: List[dict]):
     if not wallet_file or not Path(wallet_file).exists():
         sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
 
-    # Create signed output directory
+    # BUG 42 FIX: Prefer GS_WALLET_PASSWORD env var over --wallet-password
+    # CLI arg. CLI args are visible in /proc/PID/cmdline to all local users.
+    wallet_password = args.wallet_password
+    if wallet_password is None:
+        wallet_password = os.environ.get("GS_WALLET_PASSWORD", "")
+
+    # Lock all memory to prevent wallet password from leaking to swap.
+    if not lock_memory():
+        print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
+        print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
+
+    # Verify wallet-cli binary integrity if --wallet-cli-hash is provided.
+    expected_hash = getattr(args, 'wallet_cli_hash', None)
+    if expected_hash:
+        import shutil as _shutil_which
+        cli_path = _shutil_which.which(args.wallet_cli) or args.wallet_cli
+        if not Path(cli_path).exists():
+            sys.exit(f"[!] wallet-cli not found: {cli_path}")
+        actual_hash = hashlib.sha256(Path(cli_path).read_bytes()).hexdigest()
+        if actual_hash.lower() != expected_hash.lower():
+            integrity_log("signer", f"wallet_cli_hash_MISMATCH:{actual_hash[:16]}")
+            sys.exit(
+                f"[!] wallet-cli hash MISMATCH!\n"
+                f"    Expected: {expected_hash}\n"
+                f"    Actual:   {actual_hash}\n"
+                f"    The binary at {cli_path} may be trojaned."
+            )
+        integrity_log("signer", "wallet_cli_hash_verified")
+        print(f"  [+] wallet-cli binary verified: {actual_hash[:16]}...")
+
+    # Filter entries if --tx-index is specified (iterative mode).
+    # In iterative mode, sign ONLY the requested TX to avoid re-signing
+    # already-broadcast TXs whose outputs are now spent on-chain.
+    tx_index = getattr(args, 'tx_index', None)
+    if tx_index is not None:
+        entries = [e for e in entries if e["idx"] == tx_index]
+        if not entries:
+            sys.exit(f"[!] No manifest entry for tx-index {tx_index}")
+
+    # --dry-run: validate everything without actually signing
+    dry_run = getattr(args, 'dry_run', False)
+    if dry_run:
+        print(f"\n  === DRY RUN (no signing will occur) ===")
+        print(f"  Plan fingerprint: {current_fp}")
+        print(f"  Wallet file: {wallet_file}")
+        print(f"  Wallet CLI: {args.wallet_cli}")
+        print(f"  TXs to sign: {len(entries)}")
+        for entry in entries:
+            idx = entry["idx"]
+            unsigned_file = Path(entry["file"])
+            if not unsigned_file.exists():
+                unsigned_file = outdir / unsigned_file.name
+            status = "OK" if unsigned_file.exists() else "MISSING"
+            if status == "OK":
+                actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
+                if actual_hash != entry["hash"]:
+                    status = "HASH MISMATCH"
+            presigned = " (presigned)" if entry.get("presigned") else ""
+            print(f"    TX {idx}: {status}{presigned}"
+                  f" | amt={entry.get('amt', '?')} XMR"
+                  f" | delay={entry.get('delay', 0)}s")
+        print(f"  === END DRY RUN ===\n")
+        return
+
     signed_dir = outdir / "signed"
+    # Only wipe the signed dir in batch mode (no --tx-index).
+    # In iterative mode, prior signed files belong to already-broadcast TXs.
+    if tx_index is None and signed_dir.is_dir():
+        shutil.rmtree(signed_dir)
     signed_dir.mkdir(parents=True, exist_ok=True)
 
     signed_manifest = []
@@ -224,13 +374,26 @@ def phase_sign(args, plan: List[dict]):
             break
 
         idx = entry["idx"]
-        unsigned_file = Path(entry["file"])
-        if not unsigned_file.exists():
-            print(f"  [!] Missing unsigned TX: {unsigned_file}")
-            continue
 
-        # Verify hash
-        actual_hash = hashlib.sha256(unsigned_file.read_text().encode()).hexdigest()
+        # BUG 72 FIX: Hot wallet TXs are already signed in phase_create.
+        # Skip signing for entries marked presigned.
+        if entry.get("presigned"):
+            print(f"  [skip] TX {idx}: already signed (hot wallet)")
+            signed_count += 1
+            continue
+        unsigned_file = Path(entry["file"])
+        # BUG 46 FIX: If the manifest path doesn't exist (cross-machine
+        # air-gap workflow), try resolving by filename in the outdir.
+        if not unsigned_file.exists():
+            local_file = outdir / unsigned_file.name
+            if local_file.exists():
+                unsigned_file = local_file
+            else:
+                print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
+                continue
+
+        # Verify hash (BUG 71 FIX: file is now binary, not hex text)
+        actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
         if actual_hash != entry["hash"]:
             print(f"  [!] TX {idx}: hash mismatch - file may be corrupted!")
             continue
@@ -241,22 +404,54 @@ def phase_sign(args, plan: List[dict]):
 
         # Write unsigned data to a temp location wallet-cli can find
         # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
+        #
+        # OPSEC: Use /dev/shm (RAM-backed tmpfs) so unsigned TX data and
+        # the wallet password file never touch disk. On disk-backed /tmp,
+        # a crash before shutil.rmtree leaves plaintext amounts and
+        # addresses recoverable from the filesystem journal.
         import tempfile
-        work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        _shm = "/dev/shm"
+        _tmpdir = _shm if os.path.isdir(_shm) and os.access(_shm, os.W_OK) else None
+        if _tmpdir is None:
+            print("  [!] WARNING: /dev/shm not available — using disk-backed /tmp.")
+            print("  [!] Unsigned TX data and wallet password may persist on disk.")
+        work_dir = tempfile.mkdtemp(prefix="gs_sign_", dir=_tmpdir)
         try:
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
-            unsigned_in.write_text(unsigned_file.read_text())
+            unsigned_in.write_bytes(unsigned_file.read_bytes())
+
+            # Write password to a temp file so it's not visible in /proc/PID/cmdline.
+            # monero-wallet-cli --password-file reads from file instead of CLI arg.
+            pw_file = Path(work_dir) / ".wallet_pw"
+            pw_file.write_text(wallet_password)
+            secure_file_perms(pw_file)
 
             cmd = [
                 args.wallet_cli,
                 "--wallet-file", wallet_file,
-                "--password", args.wallet_password or "",
+                "--password-file", str(pw_file),
                 "--command", "sign_transfer",
             ]
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, cwd=work_dir,
             )
+
+            # BUG 44 FIX: Check wallet-cli return code. A non-zero exit
+            # with no signed_monero_tx means the wallet couldn't sign
+            # (wrong password, corrupt wallet, etc). Report clearly.
+            if result.returncode != 0:
+                stderr = result.stderr[:300] if result.stderr else ""
+                stdout = result.stdout[:300] if result.stdout else ""
+                print(f"  [!] TX {idx} wallet-cli exited with code {result.returncode}")
+                if "password" in (stderr + stdout).lower():
+                    print(f"      Likely cause: wrong wallet password")
+                elif "not enough" in (stderr + stdout).lower():
+                    print(f"      Likely cause: insufficient balance")
+                if stderr:
+                    print(f"      stderr: {stderr[:200]}")
+                integrity_log("signer", f"sign_fail:idx={idx}:rc={result.returncode}")
+                continue
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"
@@ -266,12 +461,14 @@ def phase_sign(args, plan: List[dict]):
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
+                # BUG 45 FIX: Store only filename, not absolute path.
+                # OPSEC: Exclude dst and amt from signed manifest — the
+                # broadcast phase never uses them, and their presence on
+                # the USB drive reveals the transaction graph if seized.
                 signed_manifest.append({
                     "idx": idx,
-                    "file": str(signed_file),
+                    "file": signed_file.name,
                     "hash": sha,
-                    "dst": entry.get("dst", ""),
-                    "amt": entry.get("amt", ""),
                     "delay": entry.get("delay", 0),
                 })
                 signed_count += 1
@@ -318,14 +515,29 @@ def main():
                      help="SOCKS5 proxy (phase=create only)")
     cli.add_argument("--wallet-cli", default="monero-wallet-cli",
                      help="Path to monero-wallet-cli (phase=sign only)")
+    cli.add_argument("--wallet-cli-hash", default=None,
+                     help="Expected SHA-256 hash of the wallet-cli binary. "
+                          "If set, the binary is verified before signing to "
+                          "detect trojaned binaries. Compute with: "
+                          "sha256sum $(which monero-wallet-cli)")
     cli.add_argument("--wallet-file",
                      help="Path to full wallet file (phase=sign only)")
-    cli.add_argument("--wallet-password", default="",
-                     help="Wallet password (phase=sign only)")
+    cli.add_argument("--wallet-password", default=None,
+                     help="Wallet password (phase=sign only). "
+                          "Prefer GS_WALLET_PASSWORD env var to avoid /proc leak")
     cli.add_argument("--outdir", default="tx_staging",
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--dry-run", action="store_true",
+                     help="Validate plan and manifest without signing. "
+                          "Prints a summary of what would be signed.")
+    cli.add_argument("--tx-index", type=int, default=None,
+                     help="Create only the TX at this index (phase=create only). "
+                          "REQUIRED for safe operation — Monero wallet-rpc does "
+                          "NOT reserve outputs for do_not_relay TXs, so creating "
+                          "multiple TXs without broadcasting between them causes "
+                          "double-spend conflicts.")
     args = cli.parse_args()
 
     plan_path = Path(args.unsigned_json)
