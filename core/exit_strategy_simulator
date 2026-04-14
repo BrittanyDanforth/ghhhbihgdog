@@ -197,6 +197,14 @@ def main():
     print(f"  Net         : {net:.4f} XMR")
     print(f"  Value       : {fiat_val} {args.currency.upper()}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
+    # BUG 82 FIX: Show when prices were fetched so the operator can judge
+    # staleness. The plan JSON has a coarsened timestamp, but the terminal
+    # output had no time indicator — an operator reading the plan hours
+    # later would act on stale prices without realizing it.
+    import datetime as _dt
+    print(f"  Fetched at  : {_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  [!] PRICES ARE VOLATILE — this plan is only valid near the fetch time.")
+    print(f"  [!] If more than 15 minutes have passed, re-run to get fresh prices.")
     print(f"  Liquidity   : {liq_guidance}")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")

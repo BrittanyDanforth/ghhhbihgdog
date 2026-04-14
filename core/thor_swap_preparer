@@ -99,20 +99,57 @@ def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> dict | None
                    f"?from_asset=BTC.BTC&to_asset=XMR.XMR"
                    f"&amount={amt_sats}&destination={xmr_dest}")
             resp = safe_get(url, proxy)
+            # BUG 77 FIX: Check for error key presence, not truthiness.
+            # {"error": ""} has a falsy value but still indicates an error.
+            if "error" in resp:
+                integrity_log("thor", f"thornode_error:{node}:{str(resp['error'])[:60]}")
+                continue
             inbound = resp.get("inbound_address", "")
             memo = resp.get("memo", "")
             expected_out = resp.get("expected_amount_out", "0")
             if inbound and memo and len(memo) > 5:
+                # BUG 78 FIX: Check memo length against BTC OP_RETURN limit.
+                memo_bytes = len(memo.encode("utf-8"))
+                if memo_bytes > 80:
+                    integrity_log("thor", f"memo_too_long:{node}:{memo_bytes}B")
+                    print(f"  [!] WARNING: ThorChain memo is {memo_bytes} bytes "
+                          f"(BTC OP_RETURN limit is 80 bytes). Skipping endpoint.")
+                    continue
+
+                # BUG 79 FIX: Enforce recommended_min_amount_in.
+                rec_min = resp.get("recommended_min_amount_in")
+                if rec_min:
+                    try:
+                        min_sats = int(rec_min)
+                        if amt_sats < min_sats:
+                            min_btc = Decimal(str(min_sats)) / Decimal("1e8")
+                            integrity_log("thor", f"below_min:{amt_btc}<{min_btc}")
+                            print(f"  [!] WARNING: {amt_btc} BTC is below ThorChain "
+                                  f"minimum of {min_btc} BTC. Swap will likely fail.")
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
                 expected_xmr = Decimal(str(expected_out)) / Decimal("1000000000000")
                 if expected_xmr <= 0:
                     continue
                 if expected_xmr > 100000:
                     continue
+
+                # BUG 80 FIX: Extract quote expiry.
+                expiry = resp.get("expiry", 0)
+                try:
+                    expiry = int(expiry)
+                except (ValueError, TypeError):
+                    expiry = 0
+
                 return {
                     "deposit": inbound,
                     "memo": memo,
                     "expected_xmr": expected_xmr,
                     "source": "thornode",
+                    "expiry": expiry,
+                    "memo_bytes": memo_bytes,
                 }
         except Exception as e:
             integrity_log("thor", f"thornode_fail:{node}:{str(e)[:40]}")
@@ -204,6 +241,9 @@ def main():
                 print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
                 integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
 
+        expiry = tn_result.get("expiry", 0)
+        memo_bytes = tn_result.get("memo_bytes", 0)
+
         pair = {
             "schema": PAIR_SCHEMA,
             "btc_in": str(amt),
@@ -212,11 +252,20 @@ def main():
             "dest_xmr": dest,
             "expected_xmr": str(expected_xmr),
             "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+            "expiry": expiry,
+            "memo_bytes": memo_bytes,
         }
         pairs.append(pair)
         integrity_log("thor", f"pair_{i}:ready")
         print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
               f"(expected {expected_xmr} XMR)")
+        if expiry:
+            remaining = expiry - int(time.time())
+            if remaining <= 0:
+                print(f"  [!] PAIR {i} QUOTE ALREADY EXPIRED — do NOT send BTC!")
+                integrity_log("thor", f"pair_{i}_expired_at_print")
+            else:
+                print(f"  [*] Pair {i} expires in {remaining // 60}m {remaining % 60}s")
 
     if not pairs:
         sys.exit("[!] No pairs generated")
@@ -250,11 +299,22 @@ def main():
         else:
             print(f"  Memo:         (none required)")
         print(f"  Expected XMR: ~{pair['expected_xmr']}")
+        pair_expiry = pair.get("expiry", 0)
+        if pair_expiry:
+            pair_remaining = pair_expiry - int(time.time())
+            if pair_remaining <= 0:
+                print(f"  *** EXPIRED — DO NOT SEND — request new quote! ***")
+            elif pair_remaining < 600:
+                print(f"  *** URGENT: expires in {pair_remaining // 60}m {pair_remaining % 60}s ***")
+            else:
+                print(f"  Expires in:   {pair_remaining // 60}m {pair_remaining % 60}s")
     print()
     print("  ============================================================")
     print("  IMPORTANT: The sender must include the memo in the BTC")
     print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
-    print("  route the swap. Quotes expire — send promptly.")
+    print("  route the swap.")
+    print("  QUOTES EXPIRE — send BTC BEFORE the expiry shown above!")
+    print("  Sending after expiry = funds stuck in ThorChain vault!")
     print("  ============================================================")
 
     if args.gpg_recipient:
