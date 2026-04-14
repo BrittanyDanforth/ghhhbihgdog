@@ -103,6 +103,31 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
 #  File security
 # ---------------------------------------------------------------------------
 
+def lock_memory() -> bool:
+    """Call mlockall() to prevent Python heap from being swapped to disk.
+
+    Without this, secrets held in Python str/bytes objects (wallet passwords,
+    spend keys) can be written to the swap partition and recovered forensically
+    from a seized machine. Requires CAP_IPC_LOCK or root on Linux.
+    Returns True if successful, False otherwise (non-fatal).
+    """
+    try:
+        import ctypes
+        MCL_CURRENT = 1
+        MCL_FUTURE = 2
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        rc = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+        if rc == 0:
+            integrity_log("opsec", "mlockall_ok")
+            return True
+        errno = ctypes.get_errno()
+        integrity_log("opsec", f"mlockall_fail:errno={errno}")
+        return False
+    except (OSError, AttributeError):
+        integrity_log("opsec", "mlockall_unavailable")
+        return False
+
+
 def secure_file_perms(path: Path, mode: int = 0o600) -> None:
     """Set file to owner-read/write only."""
     try:

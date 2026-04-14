@@ -31,7 +31,7 @@ from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, require_resources,
+    safe_post, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
@@ -673,6 +673,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
     """
     sign_env = os.environ.copy()
     sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
+
+    if not lock_memory():
+        print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
+        print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
 
     # Read the plan to get TX count
     with open(str(ufile)) as _pf:

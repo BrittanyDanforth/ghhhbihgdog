@@ -36,7 +36,7 @@ from decimal import Decimal
 from typing import List
 
 from gs_common import (
-    integrity_log, atomic_write_json, secure_file_perms,
+    integrity_log, atomic_write_json, secure_file_perms, lock_memory,
     install_signal_handlers, shutdown_requested, scrub_address,
     connect_rpc, validate_proxy, verify_tor,
 )
@@ -300,6 +300,30 @@ def phase_sign(args, plan: List[dict]):
     if wallet_password is None:
         wallet_password = os.environ.get("GS_WALLET_PASSWORD", "")
 
+    # Lock all memory to prevent wallet password from leaking to swap.
+    if not lock_memory():
+        print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
+        print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
+
+    # Verify wallet-cli binary integrity if --wallet-cli-hash is provided.
+    expected_hash = getattr(args, 'wallet_cli_hash', None)
+    if expected_hash:
+        import shutil as _shutil_which
+        cli_path = _shutil_which.which(args.wallet_cli) or args.wallet_cli
+        if not Path(cli_path).exists():
+            sys.exit(f"[!] wallet-cli not found: {cli_path}")
+        actual_hash = hashlib.sha256(Path(cli_path).read_bytes()).hexdigest()
+        if actual_hash.lower() != expected_hash.lower():
+            integrity_log("signer", f"wallet_cli_hash_MISMATCH:{actual_hash[:16]}")
+            sys.exit(
+                f"[!] wallet-cli hash MISMATCH!\n"
+                f"    Expected: {expected_hash}\n"
+                f"    Actual:   {actual_hash}\n"
+                f"    The binary at {cli_path} may be trojaned."
+            )
+        integrity_log("signer", "wallet_cli_hash_verified")
+        print(f"  [+] wallet-cli binary verified: {actual_hash[:16]}...")
+
     # Filter entries if --tx-index is specified (iterative mode).
     # In iterative mode, sign ONLY the requested TX to avoid re-signing
     # already-broadcast TXs whose outputs are now spent on-chain.
@@ -308,6 +332,31 @@ def phase_sign(args, plan: List[dict]):
         entries = [e for e in entries if e["idx"] == tx_index]
         if not entries:
             sys.exit(f"[!] No manifest entry for tx-index {tx_index}")
+
+    # --dry-run: validate everything without actually signing
+    dry_run = getattr(args, 'dry_run', False)
+    if dry_run:
+        print(f"\n  === DRY RUN (no signing will occur) ===")
+        print(f"  Plan fingerprint: {current_fp}")
+        print(f"  Wallet file: {wallet_file}")
+        print(f"  Wallet CLI: {args.wallet_cli}")
+        print(f"  TXs to sign: {len(entries)}")
+        for entry in entries:
+            idx = entry["idx"]
+            unsigned_file = Path(entry["file"])
+            if not unsigned_file.exists():
+                unsigned_file = outdir / unsigned_file.name
+            status = "OK" if unsigned_file.exists() else "MISSING"
+            if status == "OK":
+                actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
+                if actual_hash != entry["hash"]:
+                    status = "HASH MISMATCH"
+            presigned = " (presigned)" if entry.get("presigned") else ""
+            print(f"    TX {idx}: {status}{presigned}"
+                  f" | amt={entry.get('amt', '?')} XMR"
+                  f" | delay={entry.get('delay', 0)}s")
+        print(f"  === END DRY RUN ===\n")
+        return
 
     signed_dir = outdir / "signed"
     # Only wipe the signed dir in batch mode (no --tx-index).
@@ -355,8 +404,18 @@ def phase_sign(args, plan: List[dict]):
 
         # Write unsigned data to a temp location wallet-cli can find
         # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
+        #
+        # OPSEC: Use /dev/shm (RAM-backed tmpfs) so unsigned TX data and
+        # the wallet password file never touch disk. On disk-backed /tmp,
+        # a crash before shutil.rmtree leaves plaintext amounts and
+        # addresses recoverable from the filesystem journal.
         import tempfile
-        work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        _shm = "/dev/shm"
+        _tmpdir = _shm if os.path.isdir(_shm) and os.access(_shm, os.W_OK) else None
+        if _tmpdir is None:
+            print("  [!] WARNING: /dev/shm not available — using disk-backed /tmp.")
+            print("  [!] Unsigned TX data and wallet password may persist on disk.")
+        work_dir = tempfile.mkdtemp(prefix="gs_sign_", dir=_tmpdir)
         try:
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
             unsigned_in.write_bytes(unsigned_file.read_bytes())
@@ -402,13 +461,14 @@ def phase_sign(args, plan: List[dict]):
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
-                # BUG 45 FIX: Store only filename, not absolute path
+                # BUG 45 FIX: Store only filename, not absolute path.
+                # OPSEC: Exclude dst and amt from signed manifest — the
+                # broadcast phase never uses them, and their presence on
+                # the USB drive reveals the transaction graph if seized.
                 signed_manifest.append({
                     "idx": idx,
                     "file": signed_file.name,
                     "hash": sha,
-                    "dst": entry.get("dst", ""),
-                    "amt": entry.get("amt", ""),
                     "delay": entry.get("delay", 0),
                 })
                 signed_count += 1
@@ -455,6 +515,11 @@ def main():
                      help="SOCKS5 proxy (phase=create only)")
     cli.add_argument("--wallet-cli", default="monero-wallet-cli",
                      help="Path to monero-wallet-cli (phase=sign only)")
+    cli.add_argument("--wallet-cli-hash", default=None,
+                     help="Expected SHA-256 hash of the wallet-cli binary. "
+                          "If set, the binary is verified before signing to "
+                          "detect trojaned binaries. Compute with: "
+                          "sha256sum $(which monero-wallet-cli)")
     cli.add_argument("--wallet-file",
                      help="Path to full wallet file (phase=sign only)")
     cli.add_argument("--wallet-password", default=None,
@@ -464,6 +529,9 @@ def main():
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--dry-run", action="store_true",
+                     help="Validate plan and manifest without signing. "
+                          "Prints a summary of what would be signed.")
     cli.add_argument("--tx-index", type=int, default=None,
                      help="Create only the TX at this index (phase=create only). "
                           "REQUIRED for safe operation — Monero wallet-rpc does "
