@@ -24,7 +24,7 @@ OPSEC hardening:
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, os, re, secrets, sys, time, subprocess
+import argparse, json, math, os, re, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -62,6 +62,27 @@ THORNODE_APIS = [
     "https://thornode-v1.ninerealms.com",
     "https://thornode.thorswap.net",
 ]
+
+def _exponential_delay(delay_min: int, delay_max: int) -> int:
+    """Sample a delay from a truncated exponential distribution.
+
+    Exponential is harder to fingerprint than uniform because it has no
+    sharp cut-off at the boundaries.  Lambda is chosen so that ~95% of
+    the distribution falls within [delay_min, delay_max].
+    """
+    span = delay_max - delay_min
+    if span <= 0:
+        return delay_min
+    lam = 3.0 / span
+    while True:
+        u = secrets.randbelow(1_000_000) / 1_000_000.0
+        if u == 0.0:
+            continue
+        sample = -math.log(u) / lam
+        delay = int(delay_min + sample)
+        if delay_min <= delay <= delay_max:
+            return delay
+
 
 def _core_script(name: str) -> str:
     """Resolve path to a sibling script in core/ directory."""
@@ -141,6 +162,12 @@ def main():
     cli.add_argument("--wallet-password", default="",
                      help="Password for the wallet file (empty for no password). "
                           "WARNING: visible in /proc/PID/cmdline — prefer GS_WALLET_PASSWORD env var")
+    cli.add_argument("--delay-min", type=int, default=180,
+                     help="Minimum inter-TX delay in seconds (default: 180). "
+                          "Customise to avoid the default 180-720s fingerprint.")
+    cli.add_argument("--delay-max", type=int, default=720,
+                     help="Maximum inter-TX delay in seconds (default: 720). "
+                          "Customise to avoid the default 180-720s fingerprint.")
     cli.add_argument("--resume-plan",
                      help="Resume Stage 5 on an existing unsigned plan JSON file. "
                           "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
@@ -243,7 +270,7 @@ def main():
             )
         with open(rw_path) as f:
             rw_data = json.load(f)
-        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1", "gs_receive_wallet_v1"):
+        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
             sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
@@ -295,6 +322,11 @@ def main():
         integrity_log("stage0", "btc_entry_validated")
 
     # ---- Validate inputs early ----
+    if args.delay_min < 0 or args.delay_max < 0:
+        sys.exit("[!] --delay-min and --delay-max must be non-negative")
+    if args.delay_min >= args.delay_max:
+        sys.exit(f"[!] --delay-min ({args.delay_min}) must be less than --delay-max ({args.delay_max})")
+
     if args.btc_amount is not None and args.btc_amount <= 0:
         sys.exit(f"[!] --btc-amount must be positive, got {args.btc_amount}")
     if args.wallets < MIN_WALLETS:
@@ -735,6 +767,29 @@ def main():
 
     ###########################################################################
     # Stage 4 - Balance, amounts, plan
+    #
+    # INHERENT BLOCKCHAIN CORRELATION LIMITATIONS (cannot be fixed):
+    #
+    # 1. Fee priority: All TXs in a batch use the same --fee-priority.
+    #    Monero fees are per-byte and set by wallet-rpc; the operator cannot
+    #    vary fee per individual TX.  An analyst seeing many TXs with the
+    #    same fee tier in a window can cluster them.  Mitigation: use the
+    #    default priority (1) so TXs blend with normal traffic.
+    #
+    # 2. NEWNYM cadence: A NEWNYM circuit rotation happens before every TX.
+    #    An observer at the Tor entry guard sees circuit-creation bursts that
+    #    may correlate with blockchain broadcast timestamps.  The per-TX
+    #    delay (now exponentially distributed and configurable via
+    #    --delay-min/--delay-max) reduces this, but cannot eliminate it.
+    #
+    # 3. Stage ordering: The pipeline always runs fan-out-then-DAG.  This
+    #    structural pattern (one source → N targets, then random hops) is
+    #    inherent to the mixing design and cannot be reordered without
+    #    breaking the balance prerequisites for later stages.
+    #
+    # 4. RPC refresh pattern: After each broadcast, refresh() + short
+    #    pause + next TX creation produces a distinctive cadence.  This is
+    #    required for correctness (wallet must see spent outputs).
     ###########################################################################
 
     bal_account = receive_account_index if receive_mode else 0
@@ -824,14 +879,21 @@ def main():
         if shutdown_requested():
             integrity_log("stage4", f"shutdown_at_fanout_{fi}")
             break
+        # Per-TX jitter breaks identical-amount clustering on the blockchain.
+        # ±0.00005 XMR is small enough to be invisible to the operator but
+        # ensures no two fan-out TXs share the exact same amount on-chain.
+        jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+        actual_fanout_amt = fanout_amt + jitter
+        if actual_fanout_amt <= DUST_XMR:
+            actual_fanout_amt = fanout_amt
         plan.append({
             "src": ENTRY,
             "dst": mix_targets[fi],
-            "amt": str(fanout_amt),
-            "delay": secrets.randbelow(540) + 180,
+            "amt": str(actual_fanout_amt),
+            "delay": _exponential_delay(args.delay_min, args.delay_max),
             "extra": secure_hex(16),
         })
-    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:amt_each={fanout_amt}")
+    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:base_amt={fanout_amt}:jittered")
 
     # Phase B: DAG mixing — random hops between mix subaddresses.
     # Recalculate per-round amount from the remaining balance after fan-out.
@@ -852,11 +914,16 @@ def main():
                 continue
             dst_idx = secrets.randbelow(len(dst_candidates))
             d = dst_candidates[dst_idx]
+            # Per-TX jitter breaks identical-amount clustering (same rationale as fan-out)
+            dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+            actual_dag_amt = dag_split + dag_jitter
+            if actual_dag_amt <= DUST_XMR:
+                actual_dag_amt = dag_split
             plan.append({
                 "src": s,
                 "dst": d,
-                "amt": str(dag_split),
-                "delay": secrets.randbelow(540) + 180,
+                "amt": str(actual_dag_amt),
+                "delay": _exponential_delay(args.delay_min, args.delay_max),
                 "extra": secure_hex(16),
             })
     else:
@@ -889,6 +956,8 @@ def main():
         "wallet_primary": _wallet_primary,
         "daemon_height": h1,
         "fee_priority": args.fee_priority,
+        "delay_min": args.delay_min,
+        "delay_max": args.delay_max,
     }
     if _earliest_quote_expiry > 0:
         meta["thorchain_quote_expiry"] = _earliest_quote_expiry
@@ -917,23 +986,13 @@ def main():
                 integrity_log("stage4", f"cleaned_stale:{stale}")
         print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
         if not is_mock_plan:
-            print(f"  [!] ╔══════════════════════════════════════════════════╗")
-            print(f"  [!] ║  OPSEC WARNING: PLAN FILE CONTAINS REAL DATA    ║")
-            print(f"  [!] ║                                                  ║")
-            print(f"  [!] ║  {str(ufile.name).ljust(48)} ║")
-            print(f"  [!] ║  contains the FULL mixing graph: every source   ║")
-            print(f"  [!] ║  and destination XMR address in your pipeline.  ║")
-            print(f"  [!] ║                                                  ║")
-            print(f"  [!] ║  If this file is seized (USB stick, backup,     ║")
-            print(f"  [!] ║  cloud sync, forensic recovery), your entire    ║")
-            print(f"  [!] ║  transaction graph is exposed.                  ║")
-            print(f"  [!] ║                                                  ║")
-            print(f"  [!] ║  AFTER SIGNING AND BROADCAST:                   ║")
-            print(f"  [!] ║  - Securely wipe this file (shred -u)          ║")
-            print(f"  [!] ║  - Wipe the USB transfer medium                 ║")
-            print(f"  [!] ║  - Run paranoia cleanup (option 9)              ║")
-            print(f"  [!] ╚══════════════════════════════════════════════════╝")
-            integrity_log("stage4", "real_balance_plan_opsec_warning")
+            print(f"  [!] WARNING: Plan file contains real data.")
+            print(f"  [!] {ufile.name} has the full mixing graph.")
+            print(f"  [!] After signing and broadcast:")
+            print(f"  [!]   - Securely wipe this file (shred -u)")
+            print(f"  [!]   - Wipe the USB transfer medium")
+            print(f"  [!]   - Run cleanup")
+            integrity_log("stage4", "real_balance_plan_warning")
         integrity_log("stage4", f"{mode}_exit")
         sys.exit(0)
 
