@@ -474,7 +474,11 @@ class AdvancedSwapOrchestrator:
                 self.integrity_chain.add_entry("PROGRESS_CORRUPT", "integrity_check_failed")
                 return default_progress
                 
-        except Exception:
+        except json.JSONDecodeError:
+            print(f"[!] WARNING: Corrupt progress file {RAM_PROGRESS} — starting fresh", file=sys.stderr)
+            return default_progress
+        except Exception as e:
+            print(f"[!] WARNING: Cannot read progress file: {e} — starting fresh", file=sys.stderr)
             return default_progress
             
     def _verify_progress_integrity(self, progress: Dict[str, Any]) -> bool:

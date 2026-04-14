@@ -193,8 +193,19 @@ def main():
 
         steps = []
 
-        # 1. Entropy seed
-        if args.force or not SEED.exists():
+        # 1. Entropy seed — also regenerate if file exists but is corrupt
+        regen_seed = args.force or not SEED.exists()
+        if not regen_seed and SEED.exists():
+            try:
+                import json as _j
+                _s = _j.loads(SEED.read_text())
+                if not _s.get("seed_hex") or not _s.get("sha256"):
+                    print(f"[!] Seed file exists but is incomplete — regenerating")
+                    regen_seed = True
+            except (ValueError, OSError):
+                print(f"[!] Seed file exists but is corrupt — regenerating")
+                regen_seed = True
+        if regen_seed:
             cmd = MODULES["seed"] + ["--bytes", str(args.seed_bytes), "--out", str(SEED)]
             steps.append(("Entropy seed", cmd))
 

@@ -332,17 +332,11 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
             print("[!] Mutation resulted in invalid Python syntax")
             sys.exit(1)
         
-        # Add metadata banner
+        # Add minimal banner (no source/seed hashes — those are de-obfuscation aids)
         banner = textwrap.dedent(f"""
-        # =============================================================
-        #  Auto‑mutated by ghost_mutator.py v{VERSION}
-        #  Timestamp: {datetime.now(timezone.utc).isoformat()}
-        #  Source SHA‑256: {sha256_hex(raw_src.encode())[:16]}…
-        #  Seed SHA‑256:   {seed_sha[:16]}…
-        #  Mutations: {len(rename_map)} renames, string obfuscation, code shuffle
-        # =============================================================
+        # Auto-generated — do not edit
         """).strip()
-        
+
         mutated_src = banner + "\n\n" + mutated_src
         
         # Write output
@@ -350,30 +344,32 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
         out_path.write_text(mutated_src, encoding="utf-8")
         os.chmod(out_path, 0o600)
         
-        # Save manifest
-        manifest = {
-            "version": VERSION,
-            "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
-            "source": str(source_path),
-            "output": str(out_path),
-            "seed_sha256": seed_sha,
-            "rename_map": rename_map,
-            "mutations_applied": [
-                "identifier_renaming",
-                "string_obfuscation",
-                "code_shuffling",
-                "comment_injection",
-                "whitespace_variance"
-            ]
-        }
-        man_path = out_path.with_suffix(".manifest.json")
-        man_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        os.chmod(man_path, 0o600)
-        
         print(f"[+] Mutated script → {out_path}")
-        print(f"[+] Output hash: {sha256_hex(mutated_src.encode())[:16]}…")
         print(f"[+] Rename count: {len(rename_map)}")
-        print(f"[i] Manifest saved → {man_path} (delete for stealth)")
+
+        # Manifest contains the full rename map — a de-obfuscation key.
+        # Only write it if explicitly requested.
+        if getattr(args, 'manifest', False):
+            manifest = {
+                "version": VERSION,
+                "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+                "output": str(out_path),
+                "rename_map": rename_map,
+                "mutations_applied": [
+                    "identifier_renaming",
+                    "string_obfuscation",
+                    "code_shuffling",
+                    "comment_injection",
+                    "whitespace_variance"
+                ]
+            }
+            man_path = out_path.with_suffix(".manifest.json")
+            man_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            os.chmod(man_path, 0o600)
+            print(f"[!] Manifest saved → {man_path}")
+            print(f"[!] WARNING: Manifest is a de-obfuscation key. Delete after use.")
+        else:
+            print(f"[+] No manifest written (use --manifest to save rename map)")
         
     except Exception as e:
         print(f"[!] Unexpected error during mutation: {e}")
@@ -402,7 +398,9 @@ def main():
                    help="Output path (default: runtime/<name>_<random>.py)")
     p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
                    help="Entropy seed file (default: entropy_seed.json)")
-    p.add_argument("--version", "-v", action="version", 
+    p.add_argument("--manifest", action="store_true",
+                   help="Write rename map manifest (WARNING: de-obfuscation key)")
+    p.add_argument("--version", "-v", action="version",
                    version=f"%(prog)s {VERSION}")
     
     args = p.parse_args()

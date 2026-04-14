@@ -307,6 +307,13 @@ def main():
         "fake_count": len(manifest),
     }
     
+    # Recompute PAG's integrity field if present (it's now stale after augmentation)
+    if "integrity" in dag_data:
+        integrity_hashable = {k: v for k, v in dag_data.items() if k != "integrity"}
+        dag_data["integrity"] = hashlib.sha3_256(
+            json.dumps(integrity_hashable, sort_keys=True).encode()
+        ).hexdigest()
+
     # Calculate final hash (over all fields except content_hash itself)
     hashable = {k: v for k, v in dag_data.items() if k != "content_hash"}
     dag_json = json.dumps(hashable, sort_keys=True, ensure_ascii=False)
