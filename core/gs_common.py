@@ -62,12 +62,15 @@ def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     """Append a SHA-256-chained line to the integrity log. Returns the hash.
 
+    Stage and message are hashed before writing so the log cannot be used
+    as a forensic roadmap when matched against leaked source code.  The
+    operator can still verify an entry by hashing the same stage+msg pair.
+
     Timestamp is coarsened to 600-second (10-min) buckets to reduce the
     correlation window between the log and blockchain/network timestamps.
     """
     import fcntl
-    stage = stage.replace("\n", " ").replace("\r", " ").replace("|", "_")[:64]
-    msg = msg.replace("\n", " ").replace("\r", " ").replace("|", "_")[:200]
+    tag = hashlib.sha256(f"{stage}:{msg}".encode()).hexdigest()[:12]
 
     lock_path = log_path.with_suffix(log_path.suffix + ".lock")
     with open(lock_path, "w") as lf:
@@ -86,7 +89,7 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
                 except (OSError, UnicodeDecodeError):
                     pass
             ts = int(time.time()) // 600 * 600
-            line = f"{ts}|{stage}|{msg}"
+            line = f"{ts}|{tag}"
             h = hashlib.sha256((prev + line).encode()).hexdigest()
             with log_path.open("a") as f:
                 f.write(f"{h} | {line}\n")
