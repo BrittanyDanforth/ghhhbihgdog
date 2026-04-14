@@ -215,7 +215,8 @@ def main():
 
         # 5. VM runtime delays
         if args.force or not VM_TIMING.exists():
-            cmd = MODULES["vm"] + ["--seed", str(SEED), "--events", "100", "--out", str(VM_TIMING)]
+            cmd = MODULES["vm"] + ["--seed", str(SEED), "--events", "100", "--out", str(VM_TIMING),
+                                   "--tor-proxy", args.tor]
             steps.append(("VM timing", cmd))
 
         # 6. Noise (optional)

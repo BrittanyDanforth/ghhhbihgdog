@@ -40,8 +40,8 @@ except ImportError:
 
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
     "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"

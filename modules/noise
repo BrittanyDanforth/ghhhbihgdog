@@ -158,18 +158,27 @@ def load_json_secure(path: Path) -> Tuple[dict, str]:
 
 
 def validate_proxy(proxy_url: str) -> bool:
-    """Validate proxy connectivity and type. Only socks5h:// is safe."""
+    """Validate proxy connectivity. Only socks5h:// is accepted for OPSEC.
+    http/https proxies are rejected because they don't provide DNS privacy.
+    """
     if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
         print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.", file=sys.stderr)
         return False
-    if not proxy_url.startswith(("socks5h://", "http://", "https://")):
+    if not proxy_url.lower().startswith("socks5h://"):
+        print("[!] Only socks5h:// proxies are accepted (DNS privacy).", file=sys.stderr)
         return False
-    
+
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
         response = requests.get("https://check.torproject.org/api/ip",
                                 proxies=proxies, timeout=10)
-        return response.status_code == 200
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("IsTor"):
+                return True
+            print("[!] Proxy connected but NOT exiting via Tor.", file=sys.stderr)
+            return False
+        return False
     except Exception:
         return False
 
@@ -205,17 +214,36 @@ def create_session(proxy_url: str, rng: random.Random) -> requests.Session:
 
 
 def new_tor_circuit():
-    """Request new TOR circuit if stem is available"""
+    """Request new Tor circuit if stem is available.
+    Tries Unix socket, then TCP 9051 (system tor), then 9151 (Tor Browser).
+    """
     if not stem:
         return False
-    
+
+    ctrl_socket = "/var/run/tor/control"
+    import os as _os
     try:
-        with stem.control.Controller.from_port(port=9051) as controller:
-            controller.authenticate()
-            controller.signal(stem.Signal.NEWNYM)
-            return True
+        if _os.path.exists(ctrl_socket):
+            with stem.control.Controller.from_socket_file(ctrl_socket) as controller:
+                controller.authenticate()
+                controller.signal(stem.Signal.NEWNYM)
+                return True
     except Exception:
-        return False
+        pass
+
+    for port in (9051, 9151):
+        try:
+            with stem.control.Controller.from_port(port=port) as controller:
+                tor_pw = _os.environ.get("TOR_CONTROL_PASSWORD", "")
+                if tor_pw:
+                    controller.authenticate(password=tor_pw)
+                else:
+                    controller.authenticate()
+                controller.signal(stem.Signal.NEWNYM)
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------

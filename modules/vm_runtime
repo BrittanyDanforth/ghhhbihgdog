@@ -395,12 +395,8 @@ Examples:
         print(f"[*] Base delay: {base_delay}s")
         print(f"[*] Generated {len(delays)} delay values")
 
-    # Test Tor connectivity if requested
-    tor_status = "not_tested"
-    if args.tor_proxy:
-        if args.verbose:
-            print(f"[*] Testing Tor connectivity via {args.tor_proxy}")
-        tor_status = test_tor_connectivity(args.tor_proxy)
+    # Tor status already captured in metrics (no duplicate test)
+    tor_status = metrics.get("tor_status", "not_tested")
 
     # Build output payload
     payload = {

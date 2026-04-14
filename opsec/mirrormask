@@ -385,20 +385,26 @@ class StatisticalAuthenticator:
                 timestamps.append(int(match.group(1)))
         return sorted(timestamps)
     
-    def generate_authentic_timestamps(self, count: int, base_time: int) -> List[int]:
-        """Generate statistically authentic timestamps"""
+    def generate_authentic_timestamps(self, count: int, base_time: int,
+                                       rng: Optional[CryptoSecureRNG] = None) -> List[int]:
+        """Generate statistically authentic timestamps.
+        Uses provided CryptoSecureRNG for deterministic reproducibility;
+        falls back to secrets-based choices if no RNG given.
+        """
         if not self.patterns['timestamp_intervals']:
-            # Default intervals if no pattern detected
-            intervals = [30, 60, 120, 300, 600]  # Common log intervals
+            intervals = [30, 60, 120, 300, 600]
         else:
             intervals = self.patterns['timestamp_intervals']
-        
+
+        _choice = rng.choice if rng else (lambda seq: secrets.choice(seq))
+        _randint = rng.randint if rng else (lambda a, b: secrets.randbelow(b - a + 1) + a)
+
         timestamps = [base_time]
         for _ in range(count - 1):
-            interval = random.choice(intervals)
-            jitter = random.randint(-interval//4, interval//4)
+            interval = _choice(intervals)
+            jitter = _randint(-interval // 4, interval // 4) if interval > 0 else 0
             timestamps.append(timestamps[-1] + interval + jitter)
-        
+
         return timestamps
 
 class EnhancedForensicMirrormask:
@@ -425,6 +431,7 @@ class EnhancedForensicMirrormask:
             decoy_file = TEMP_DIR / f"decoy_{secrets.token_hex(8)}.log"
             decoy_content = self._generate_decoy_content()
             decoy_file.write_text(decoy_content)
+            os.chmod(decoy_file, 0o600)
         
         # Introduce timing jitter
         time.sleep(random.uniform(1, 5))
@@ -499,9 +506,10 @@ class EnhancedForensicMirrormask:
             base_time = int(time.time()) - 86400
             timestamps = [base_time + i * 300 for i in range(100)]
         
-        # Generate authentic timestamp sequence
+        # Generate authentic timestamp sequence (using crypto RNG for reproducibility)
         auth_timestamps = authenticator.generate_authentic_timestamps(
-            target_count, min(timestamps) if timestamps else int(time.time()) - 86400
+            target_count, min(timestamps) if timestamps else int(time.time()) - 86400,
+            rng=rng
         )
         
         # Create mirror entries
@@ -575,9 +583,10 @@ class EnhancedForensicMirrormask:
                 f.flush()
                 os.fsync(f.fileno())  # Ensure data is written to disk
             
-            # Atomic move
+            # Atomic move + restrict permissions
             temp_file.replace(output_path)
-            
+            os.chmod(output_path, 0o600)
+
             print(f"[+] Mirror log written: {output_path} ({len(mirror_lines)} lines)")
             
             # Secure cleanup

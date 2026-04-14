@@ -125,19 +125,26 @@ def collect_system_entropy(num_bytes: int, extra_path: Path | None) -> dict:
 
 
 def build_seed_bundle(entropy: dict, num_bytes: int) -> dict:
-    """Wrap collected entropy into final bundle with metadata."""
+    """Wrap collected entropy into final bundle with metadata.
+    Includes top-level ``seed_hex`` so that SML and other modules can
+    load the primary seed directly without digging into ``sources``.
+    """
+    # Derive a primary seed from all collected entropy
+    combined = json.dumps(entropy, sort_keys=True).encode()
+    primary_seed = hashlib.sha256(combined).hexdigest()
+
     bundle = {
         "version": VERSION,
         "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
         "bytes_len": num_bytes,
+        "seed_hex": primary_seed,
         "sources": entropy,
     }
-    
-    # Create a copy without the sha256 field for hashing
-    bundle_for_hash = bundle.copy()
+
+    bundle_for_hash = {k: v for k, v in bundle.items() if k != "sha256"}
     bundle_bytes = json.dumps(bundle_for_hash, sort_keys=True).encode()
     bundle["sha256"] = hashlib.sha256(bundle_bytes).hexdigest()
-    
+
     return bundle
 
 

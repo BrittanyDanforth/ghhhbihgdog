@@ -1155,7 +1155,8 @@ state corruption bugs.
 **Fix (Round 7):** SwapKit completely removed from codebase. Both `GhostSpiral` and `thor_swap_preparer` now use **THORNode native API only**:
 - Endpoint: `GET {thornode}/thorchain/quote/swap?from_asset=BTC.BTC&to_asset=XMR.XMR&amount={sats}&destination={xmr_addr}`
 - No API key required — direct protocol access
-- Multiple fallback endpoints: `thornode.ninerealms.com`, `thornode.thorswap.net`, `rpc.ninerealms.com`
+- Multiple fallback endpoints: `thornode.ninerealms.com`, `rpc.ninerealms.com`, `thornode-v1.ninerealms.com`
+- **ThorSwap domain (`thornode.thorswap.net`) removed** — untrusted third-party intermediary
 
 ### Fee Bumping: REMOVED (Monero has no RBF)
 

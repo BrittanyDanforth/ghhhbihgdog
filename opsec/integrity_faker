@@ -261,23 +261,23 @@ class IntegrityChainFaker:
     
     def _select_weighted_tag(self, weights: Dict[str, float], position: int, total: int) -> str:
         """Select tag based on weights and chain position"""
-        # Adjust weights based on position
         adjusted_weights = weights.copy()
-        
-        # More INIT tags at the beginning
-        if position < total * 0.1:
-            adjusted_weights["INIT"] *= 3
+
+        if total > 0 and position < total * 0.1:
+            adjusted_weights["INIT"] = adjusted_weights.get("INIT", 0.01) * 3
             adjusted_weights["BOOT"] = adjusted_weights.get("BOOT", 0.01) * 5
-        
-        # More COMPLETE tags at the end
-        if position > total * 0.8:
-            adjusted_weights["COMPLETE"] *= 2
+
+        if total > 0 and position > total * 0.8:
+            adjusted_weights["COMPLETE"] = adjusted_weights.get("COMPLETE", 0.01) * 2
             adjusted_weights["SHUTDOWN"] = adjusted_weights.get("SHUTDOWN", 0.01) * 3
-        
-        # Select based on weights
-        tags = list(adjusted_weights.keys())
-        tag_weights = list(adjusted_weights.values())
-        
+
+        # Filter out zero/negative weights to avoid random.choices ValueError
+        tags = [t for t, w in adjusted_weights.items() if w > 0]
+        tag_weights = [adjusted_weights[t] for t in tags]
+
+        if not tags:
+            return "INFO"
+
         return self.rng.choices(tags, weights=tag_weights, k=1)[0]
     
     def verify_chain_integrity(self) -> bool:

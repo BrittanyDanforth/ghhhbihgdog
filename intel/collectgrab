@@ -50,11 +50,31 @@ if not (os.path.isfile(targ_script) and os.access(targ_script, os.X_OK)):
 # Setup proxy configuration — ABORT if Tor is not available
 # Running clearnet exposes the operator's real IP to every target
 proxies = {}
+_tor_socks_port = None
 if TOR_AVAILABLE:
-    proxies = {
-        'http': 'socks5h://127.0.0.1:9050',
-        'https': 'socks5h://127.0.0.1:9050'
-    }
+    for _candidate_port in (9050, 9150):
+        try:
+            _test_px = {
+                'http': f'socks5h://127.0.0.1:{_candidate_port}',
+                'https': f'socks5h://127.0.0.1:{_candidate_port}',
+            }
+            _r = requests.get("https://check.torproject.org/api/ip",
+                              proxies=_test_px, timeout=10)
+            if _r.json().get("IsTor"):
+                _tor_socks_port = _candidate_port
+                break
+        except Exception:
+            continue
+    if _tor_socks_port:
+        proxies = {
+            'http': f'socks5h://127.0.0.1:{_tor_socks_port}',
+            'https': f'socks5h://127.0.0.1:{_tor_socks_port}',
+        }
+        logger.info("Tor SOCKS active on port %d", _tor_socks_port)
+    else:
+        logger.critical("Tor SOCKS not responding on 9050 or 9150 — refusing to run over clearnet.")
+        logger.critical("Start Tor: sudo systemctl start tor  or open Tor Browser.")
+        sys.exit(1)
 else:
     logger.critical("Tor (stem) not available — refusing to run over clearnet.")
     logger.critical("Install stem: pip install stem  and ensure Tor is running.")
@@ -131,9 +151,16 @@ def tor_newnym_session(session):
                     continue
         
         if controller is None:
-            # Try default port
-            controller = Controller.from_port(port=9051)
-        
+            for _ctrl_port in (9051, 9151):
+                try:
+                    controller = Controller.from_port(port=_ctrl_port)
+                    break
+                except Exception:
+                    continue
+        if controller is None:
+            logger.warning("Cannot connect to Tor control on any port")
+            return
+
         with controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)

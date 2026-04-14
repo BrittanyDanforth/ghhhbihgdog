@@ -342,8 +342,24 @@ def flow_resume():
         err("Wallet JSON file is required for resume")
         return
 
+    # Detect resume mode: check if the plan has btc_entry (sender) or
+    # receive_wallet (receiver) to pass the right CLI flag.
+    resume_flag = "--receive-wallet"
+    try:
+        import json as _j
+        with open(plan) as _pf:
+            _plan_data = _j.load(_pf)
+        if _plan_data.get("meta", {}).get("btc_entry"):
+            resume_flag = "--btc-entry"
+            wf_arg = _plan_data["meta"]["btc_entry"]
+            info(f"Sender resume detected (BTC entry: {wf_arg[:8]}...)")
+        else:
+            wf_arg = wf
+    except Exception:
+        wf_arg = wf
+
     args = [
-        "--receive-wallet", wf,
+        resume_flag, wf_arg,
         "--resume-plan", plan,
         "--tor-proxy", tor,
         "--rpc-primary", rpc,

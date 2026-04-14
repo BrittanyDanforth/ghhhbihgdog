@@ -88,8 +88,8 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 # Network configuration
 THOR_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
     "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 
 # Security parameters
@@ -233,12 +233,30 @@ class CircuitBurnProtocol:
         return False
         
     def burn_circuit(self) -> bool:
-        """Execute circuit burn with full identity rotation."""
+        """Execute circuit burn with full identity rotation.
+        Tries Unix socket first, then TCP 9051 (system tor), then 9151 (Tor Browser).
+        """
         try:
-            with Controller.from_socket_file(self.control_socket) as controller:
-                controller.authenticate()
-                
-                # Signal new identity
+            controller = None
+            if os.path.exists(self.control_socket):
+                controller = Controller.from_socket_file(self.control_socket)
+            else:
+                for port in (9051, 9151):
+                    try:
+                        controller = Controller.from_port(port=port)
+                        break
+                    except Exception:
+                        continue
+            if controller is None:
+                return False
+
+            with controller:
+                tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
+                if tor_pw:
+                    controller.authenticate(password=tor_pw)
+                else:
+                    controller.authenticate()
+
                 controller.signal(Signal.NEWNYM)
                 
                 # Wait for circuit establishment
@@ -402,16 +420,18 @@ class AdvancedSwapOrchestrator:
         signal.signal(signal.SIGTERM, self._cleanup_handler)
         
     def _build_proxy_chain(self, proxy_string: str) -> List[Dict[str, str]]:
-        """Build multi-hop proxy chain."""
+        """Build multi-hop proxy chain. Never returns empty proxy dicts
+        (that would allow direct clearnet connections)."""
         proxies = []
         if proxy_string:
             for proxy_url in proxy_string.split(','):
-                proxy = {
-                    'http': proxy_url.strip(),
-                    'https': proxy_url.strip()
-                }
-                proxies.append(proxy)
-        return proxies or [{}]
+                url = proxy_url.strip()
+                if url:
+                    proxies.append({'http': url, 'https': url})
+        if not proxies:
+            print("[!] CRITICAL: No valid proxies in chain — would leak to clearnet.", file=sys.stderr)
+            sys.exit(1)
+        return proxies
         
     def _build_aggregator_pool(self) -> List[str]:
         """Build aggregator endpoint pool."""
@@ -618,6 +638,11 @@ class AdvancedSwapOrchestrator:
         if "affiliate" in swap_entry:
             payload["affiliate"] = swap_entry["affiliate"]
             
+        # Force circuit burn before every swap if requested
+        if getattr(self.args, 'force_circuit_burn', False):
+            if self.circuit_burn.burn_circuit():
+                self.integrity_chain.add_entry("FORCED_CIRCUIT_BURN", f"idx={idx}")
+
         # Execute swap with retry logic
         success = False
         last_error = None
@@ -629,8 +654,8 @@ class AdvancedSwapOrchestrator:
             proxy = self.rng.choice(self.proxy_chain)
             
             try:
-                # Anti-correlation timing delay
-                if attempt > 1:
+                # Anti-correlation timing delay (always in stealth mode, only after first attempt otherwise)
+                if attempt > 1 or getattr(self.args, 'stealth_mode', False):
                     delay = self.traffic_obfuscator.calculate_timing_delay()
                     time.sleep(delay)
                     
@@ -772,7 +797,7 @@ Examples:
     parser.add_argument("--stealth-mode", action="store_true",
                        help="Enable maximum stealth with traffic obfuscation")
     parser.add_argument("--quantum-entropy", action="store_true",
-                       help="Use quantum-resistant entropy fusion")
+                       help="(Always enabled) PBKDF2-based entropy fusion from multiple sources")
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
     
@@ -789,8 +814,8 @@ Examples:
                        help="Enable deep integrity verification")
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")
-    parser.add_argument("--timing-analysis-resist", action="store_true", default=True,
-                       help="Enable timing analysis resistance")
+    parser.add_argument("--no-timing-jitter", action="store_true",
+                       help="Disable timing jitter between swaps (not recommended)")
     
     args = parser.parse_args()
     

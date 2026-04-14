@@ -50,8 +50,8 @@ BTC_RE = re.compile(
 )
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://thornode.thorswap.net",
     "https://rpc.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
 ]
 
 def _core_script(name: str) -> str:
