@@ -36,11 +36,8 @@ import json
 import os
 import random
 import secrets
-import socket
-import ssl
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any

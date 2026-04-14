@@ -39,7 +39,7 @@ Security Notes
   debugging; delete it if maximum stealth is required.
 """
 from __future__ import annotations
-import argparse, ast, hashlib, json, os, random, re, sys, textwrap
+import argparse, ast, hashlib, json, os, random, sys, textwrap
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple

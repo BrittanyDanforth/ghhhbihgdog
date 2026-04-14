@@ -417,6 +417,7 @@ def main():
             f.write('\n'.join(fake_chain) + '\n')
         
         temp_path.replace(output_path)
+        os.chmod(output_path, 0o600)
         
         print(f"[+] Fake integrity chain written → {output_path}")
         print(f"[+] Entries: {len(fake_chain)}")

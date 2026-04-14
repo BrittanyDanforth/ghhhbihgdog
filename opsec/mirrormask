@@ -55,7 +55,6 @@ from typing import Dict, List, Optional, Tuple, Set
 import threading
 import subprocess
 import tempfile
-import shutil
 
 # Enhanced configuration
 SEED_FILE = Path("entropy_seed.json")
@@ -228,6 +227,7 @@ class CryptoSecureRNG:
                 "runtime_entropy": SystemFingerprint.get_runtime_entropy()
             }
             self.seed_file.write_text(json.dumps(seed_data, indent=2))
+            os.chmod(self.seed_file, 0o600)
             entropy_components.append(secure_seed)
         
         # Source file hashes
@@ -614,12 +614,6 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     # Security options
     parser.add_argument("--paranoid", action="store_true",
                        help="Enable maximum paranoia mode")
-    parser.add_argument("--anti-forensics", action="store_true",
-                       help="Enable anti-forensics protections")
-    parser.add_argument("--decoy-injection", action="store_true",
-                       help="Inject decoy processes and files")
-    parser.add_argument("--statistical-masking", action="store_true",
-                       help="Enable statistical authenticity masking")
     
     return parser
 

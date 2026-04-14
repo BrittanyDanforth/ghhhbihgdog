@@ -37,7 +37,7 @@ import pickle
 import numpy as np
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # Advanced imports with fallback
 try:
@@ -505,8 +505,10 @@ class BreachDatabaseManager:
         prefix = sha1[:5]
         
         try:
+            from aiohttp_socks import ProxyConnector
+            connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
             # Use k-anonymity API
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=connector) as session:
                 url = f"https://api.pwnedpasswords.com/range/{prefix}"
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
@@ -540,7 +542,9 @@ class BreachDatabaseManager:
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
+            from aiohttp_socks import ProxyConnector
+            connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
+            async with aiohttp.ClientSession(connector=connector) as session:
                 url = f"https://api.dehashed.com/search?query=email:{email}"
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
@@ -1416,7 +1420,7 @@ class SecureDataProcessor:
         
         # Derive key
         combined = b''.join(sources)
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=b'intel_system_v20',
@@ -1777,7 +1781,7 @@ class UltimateIntelOrchestrator:
             try:
                 await asyncio.sleep(random.randint(30, 300))
                 site = random.choice(decoy_sites)
-                connector = ProxyConnector.from_url('socks5://127.0.0.1:9050')
+                connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
                 async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.get(site) as resp:
                         await resp.text()
@@ -1903,8 +1907,11 @@ async def main():
         print("="*50)
         
     except KeyboardInterrupt:
-        print("\n[!] Operation cancelled")
-        await orchestrator._emergency_cleanup()
+        print("\n[!] Operation interrupted by user")
+        try:
+            await orchestrator._emergency_cleanup()
+        except NameError:
+            pass
         
     except Exception as e:
         print(f"\n[!] Critical error: {e}")
