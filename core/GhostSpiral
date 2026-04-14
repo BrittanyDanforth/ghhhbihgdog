@@ -144,6 +144,11 @@ def main():
         resume_path = Path(args.resume_plan)
         if not resume_path.exists():
             sys.exit(f"[!] Resume plan not found: {resume_path}")
+        if resume_path.is_symlink():
+            sys.exit(
+                f"[!] Resume plan is a symlink: {resume_path}\n"
+                f"    Symlinks can point to sensitive files. Use the real path."
+            )
         with open(resume_path) as f:
             _rp = json.load(f)
         _schema = _rp.get("meta", {}).get("schema", "")
@@ -204,7 +209,7 @@ def main():
             if lock_path.exists():
                 lock_path.unlink()
 
-        print("\n  [+] GhostSpiral resume complete.")
+        print("\n  [*] GhostSpiral resume finished. Check Stage 5 summary above for failures.")
         sys.exit(0)
 
     # ---- Determine mode ----
@@ -216,6 +221,11 @@ def main():
         rw_path = Path(args.receive_wallet)
         if not rw_path.exists():
             sys.exit(f"[!] Receive wallet file not found: {rw_path}")
+        if rw_path.is_symlink():
+            sys.exit(
+                f"[!] Receive wallet file is a symlink: {rw_path}\n"
+                f"    Symlinks can point to sensitive files. Use the real path."
+            )
         with open(rw_path) as f:
             rw_data = json.load(f)
         if rw_data.get("schema") not in ("receive_wallet_v1", "gs_receive_wallet_v1"):
@@ -230,6 +240,18 @@ def main():
                 f"[!] Receive wallet address fails format check: "
                 f"{scrub_address(receive_entry_addr)}\n"
                 f"    Expected a 95-char Monero address starting with 4 or 8."
+            )
+        try:
+            from monero.address import Address as _XMRAddr
+            _XMRAddr(receive_entry_addr)
+        except ImportError:
+            pass  # monero-python not available; regex check is the best we can do
+        except Exception:
+            sys.exit(
+                f"[!] Receive wallet address fails checksum validation: "
+                f"{scrub_address(receive_entry_addr)}\n"
+                f"    The address format looks correct but the checksum is invalid.\n"
+                f"    This means a typo or corruption — funds sent here would be LOST."
             )
         wallet_network = rw_data.get("network")
         if wallet_network and wallet_network != "mainnet":
@@ -258,6 +280,8 @@ def main():
         integrity_log("stage0", "btc_entry_validated")
 
     # ---- Validate inputs early ----
+    if args.btc_amount is not None and args.btc_amount <= 0:
+        sys.exit(f"[!] --btc-amount must be positive, got {args.btc_amount}")
     args.wallets = max(args.wallets, MIN_WALLETS)
     args.deep = max(args.deep, MIN_DEEP)
 
@@ -781,6 +805,15 @@ def main():
     else:
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
+    # BUG 82 FIX: Bind plan to wallet identity. Without this, resuming
+    # with a different wallet connected silently uses wrong subaddresses.
+    _wallet_primary = ""
+    try:
+        _wa = rpc_primary.raw_request("get_address", {"account_index": 0})
+        _wallet_primary = _wa.get("address", "")
+    except Exception:
+        pass
+
     meta = {
         "schema": "plan_v1",
         "created": int(time.time()) // 600 * 600,
@@ -788,6 +821,8 @@ def main():
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
         "account_index": bal_account,
+        "wallet_primary": _wallet_primary,
+        "daemon_height": h1,
     }
     if is_mock_plan:
         meta["mock"] = True
@@ -885,7 +920,7 @@ def main():
         if lock_path.exists():
             lock_path.unlink()
 
-    print("\n  [+] GhostSpiral v10.5 pipeline complete.")
+    print("\n  [*] GhostSpiral v10.5 pipeline finished. Check Stage 5 summary above for failures.")
 
 
 def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
@@ -921,6 +956,40 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     # operational details. Env vars are only readable by the same uid.
     sign_env["GS_WALLET_FILE"] = args.wallet_file or ""
 
+    # BUG 83 FIX: Detect view-only wallet early. View-only wallets cannot
+    # track spent outputs without key image sync (export_outputs from
+    # view-only + import_key_images after offline signing). The docstring
+    # at line ~910 mentions this step but it was NEVER IMPLEMENTED.
+    # Without it, the wallet's balance is WRONG after the first broadcast:
+    # spent outputs still appear available, so the next transfer_split
+    # reuses them → double-spend rejection → stuck pipeline.
+    _is_view_only = False
+    try:
+        _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
+        _spend_key = _qk.get("key", "")
+        _is_view_only = (not _spend_key or
+                         _spend_key == "0" * 64 or
+                         _spend_key == "0000000000000000000000000000000000000000000000000000000000000000")
+    except Exception:
+        pass
+
+    if _is_view_only:
+        integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
+        print(f"  [!] ╔══════════════════════════════════════════════════╗")
+        print(f"  [!] ║  VIEW-ONLY WALLET DETECTED                     ║")
+        print(f"  [!] ║                                                  ║")
+        print(f"  [!] ║  Auto-mode with a view-only wallet requires     ║")
+        print(f"  [!] ║  key image sync after each broadcast, which     ║")
+        print(f"  [!] ║  needs the offline wallet's cooperation.        ║")
+        print(f"  [!] ║                                                  ║")
+        print(f"  [!] ║  After each TX broadcast, this pipeline will    ║")
+        print(f"  [!] ║  call export_outputs and attempt import of key  ║")
+        print(f"  [!] ║  images. If sync fails, the pipeline aborts.   ║")
+        print(f"  [!] ║                                                  ║")
+        print(f"  [!] ║  For full air-gap operation, use --airgap mode  ║")
+        print(f"  [!] ║  and manually cycle each TX.                    ║")
+        print(f"  [!] ╚══════════════════════════════════════════════════╝")
+
     if not lock_memory():
         print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
         print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
@@ -943,6 +1012,79 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     with open(str(ufile)) as _pf:
         plan_data = json.load(_pf)
     plan_txs = plan_data.get("txs", [])
+
+    # BUG 82 FIX: Wallet identity check — abort if the connected wallet
+    # doesn't match the wallet that created the plan. Without this, resuming
+    # with wallet B after plan was built with wallet A causes:
+    #   - src subaddresses not found → silent fallback to wrong addresses
+    #   - dst addresses valid but belong to wallet A → funds irrecoverable
+    _plan_wallet = plan_data.get("meta", {}).get("wallet_primary", "")
+    if _plan_wallet:
+        try:
+            _cur_wallet = rpc.raw_request(
+                "get_address", {"account_index": 0}
+            ).get("address", "")
+            if _cur_wallet and _cur_wallet != _plan_wallet:
+                integrity_log("stage5", "WALLET_MISMATCH_DETECTED")
+                sys.exit(
+                    f"[!] WALLET MISMATCH: Connected wallet does not match the plan!\n"
+                    f"    Plan wallet:    {scrub_address(_plan_wallet)}\n"
+                    f"    Current wallet: {scrub_address(_cur_wallet)}\n"
+                    f"    The plan's subaddresses belong to a different wallet.\n"
+                    f"    Proceeding would send funds to unreachable addresses.\n"
+                    f"    Connect the original wallet and retry."
+                )
+            integrity_log("stage5", "wallet_identity_verified")
+        except SystemExit:
+            raise
+        except Exception as _wid_err:
+            integrity_log("stage5", f"wallet_identity_check_warn:{str(_wid_err)[:40]}")
+            print(f"  [!] WARNING: Could not verify wallet identity: {_wid_err}")
+
+    # BUG 82 FIX: Daemon height drift check — warn if daemon height has
+    # diverged significantly from plan creation time. Large backward drift
+    # suggests a different daemon or chain reorg.
+    _plan_height = plan_data.get("meta", {}).get("daemon_height", 0)
+    if _plan_height > 0:
+        try:
+            _cur_height = rpc.raw_request("get_height", {}).get("height", 0)
+            if _cur_height > 0:
+                _height_diff = _cur_height - _plan_height
+                if _height_diff < -10:
+                    integrity_log("stage5", f"DAEMON_HEIGHT_REGRESSED:{_plan_height}->{_cur_height}")
+                    print(f"  [!] ╔══════════════════════════════════════════════════╗")
+                    print(f"  [!] ║  WARNING: Daemon height REGRESSED!              ║")
+                    print(f"  [!] ║  Plan created at height: {str(_plan_height).ljust(22)} ║")
+                    print(f"  [!] ║  Current daemon height:  {str(_cur_height).ljust(22)} ║")
+                    print(f"  [!] ║  Diff: {str(_height_diff).ljust(39)} ║")
+                    print(f"  [!] ║  This may indicate a different daemon or reorg. ║")
+                    print(f"  [!] ║  Confirmed outputs may no longer be valid.      ║")
+                    print(f"  [!] ╚══════════════════════════════════════════════════╝")
+        except Exception:
+            pass
+
+    # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
+    # If accounts were added/removed between plan creation and resume,
+    # the account_index may now point to a different account or not exist.
+    _plan_acct_idx = plan_data.get("meta", {}).get("account_index", 0)
+    try:
+        _accts = rpc.raw_request("get_accounts", {})
+        _acct_list = _accts.get("subaddress_accounts", [])
+        _max_acct = len(_acct_list) - 1
+        if _plan_acct_idx > _max_acct:
+            integrity_log("stage5", f"ACCOUNT_INDEX_INVALID:{_plan_acct_idx}>{_max_acct}")
+            sys.exit(
+                f"[!] Plan's account_index={_plan_acct_idx} does not exist in wallet!\n"
+                f"    Wallet has {len(_acct_list)} account(s) (max index: {_max_acct}).\n"
+                f"    Accounts may have been modified since the plan was created.\n"
+                f"    Connect the original wallet or regenerate the plan."
+            )
+        integrity_log("stage5", f"account_index_valid:{_plan_acct_idx}")
+    except SystemExit:
+        raise
+    except Exception as _acct_err:
+        integrity_log("stage5", f"account_check_warn:{str(_acct_err)[:40]}")
+
     total_txs = len(plan_txs)
 
     if total_txs == 0:
@@ -964,9 +1106,32 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                   f"{_tx.get('delay','')}:{_tx.get('extra','')}".encode())
     plan_fingerprint = _h.hexdigest()[:32]
 
+    # BUG 85 FIX: HMAC on progress file to detect manual tampering.
+    # Without this, an operator (or malware) can add TX indices to
+    # "completed" to skip TXs, or remove them to cause double-spends.
+    import hmac as _hmac
+
+    def _progress_hmac(data: dict, nonce: str) -> str:
+        """Compute HMAC over progress file's semantic content."""
+        _msg = json.dumps({
+            "fp": data.get("plan_fingerprint", ""),
+            "completed": sorted(data.get("completed", [])),
+            "broadcast_pending": data.get("broadcast_pending"),
+        }, sort_keys=True).encode()
+        return _hmac.new(
+            (plan_fingerprint + nonce).encode(), _msg, _hl.sha256
+        ).hexdigest()[:32]
+
+    def _save_progress(data: dict, nonce: str, path: Path):
+        """Write progress with HMAC for tamper detection."""
+        data["hmac"] = _progress_hmac(data, nonce)
+        data["nonce"] = nonce
+        _awj(data, path)
+
     # Progress tracking for resume
     progress_file = Path("stage5_progress.json")
     completed_indices = set()
+    _progress_nonce = secure_hex(16)
     if progress_file.exists():
         try:
             with open(progress_file) as pf:
@@ -978,6 +1143,22 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 integrity_log("stage5", "progress_fingerprint_mismatch:discarded")
                 progress_file.unlink()
             else:
+                # BUG 85 FIX: Verify HMAC before trusting progress contents.
+                _saved_hmac = progress.pop("hmac", None)
+                _saved_nonce = progress.get("nonce", "")
+                if _saved_hmac and _saved_nonce:
+                    _expected = _progress_hmac(progress, _saved_nonce)
+                    if not _hmac.compare_digest(_saved_hmac, _expected):
+                        integrity_log("stage5", "PROGRESS_HMAC_MISMATCH:tampering")
+                        print(f"  [!] ╔══════════════════════════════════════════════════╗")
+                        print(f"  [!] ║  PROGRESS FILE TAMPERED OR CORRUPT!             ║")
+                        print(f"  [!] ║  HMAC verification failed.                      ║")
+                        print(f"  [!] ║  Discarding progress and starting fresh.        ║")
+                        print(f"  [!] ╚══════════════════════════════════════════════════╝")
+                        progress_file.unlink()
+                        progress = {}
+                    else:
+                        _progress_nonce = _saved_nonce
                 completed_indices = set(progress.get("completed", []))
                 # BUG 73 FIX: Detect broadcast_pending — a TX that was
                 # broadcast but progress wasn't finalized (crash/kill
@@ -1044,6 +1225,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
         newnym()
         secure_delay(3.0, 8.0)
+
+        # BUG 86 FIX: Delete stale artifacts from a prior failed attempt.
+        # If a previous run created .unsigned/.signed files for this TX but
+        # crashed before broadcast, those files reference outputs that may
+        # now be spent (by TXs that DID broadcast). Re-signing the stale
+        # .unsigned would produce a TX spending invalid outputs.
+        _stale_unsigned = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
+        _stale_signed = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+        for _stale in (_stale_unsigned, _stale_signed):
+            if _stale.exists():
+                _stale.unlink()
+                integrity_log("stage5", f"cleaned_stale_artifact:{_stale.name}")
 
         # Step 1: Create unsigned TX
         print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
@@ -1151,11 +1344,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         from gs_common import atomic_write_json as _awj
         broadcast_pending = set(completed_indices)
         broadcast_pending.add(tx_idx)
-        _awj({
+        _save_progress({
             "plan_fingerprint": plan_fingerprint,
             "completed": sorted(completed_indices),
             "broadcast_pending": tx_idx,
-        }, progress_file)
+        }, _progress_nonce, progress_file)
 
         # Step 3: Broadcast via wallet-rpc
         # Hot wallet TXs (presigned from tx_metadata_list) use relay_tx.
@@ -1183,17 +1376,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 fail_count += 1
                 break
             txid = tx_hashes[0]
-            print(f"  [+] TX {tx_idx} broadcast OK | txid: {txid[:16]}...")
-            integrity_log("stage5", f"broadcast_ok:tx={tx_idx}")
+            print(f"  [+] TX {tx_idx} submitted to wallet-rpc | txid: {txid[:16]}...")
+            print(f"  [!] Note: submitted != confirmed. TX is in local mempool, not yet mined.")
+            integrity_log("stage5", f"broadcast_submitted:tx={tx_idx}")
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
             print(f"  [!] ABORTING pipeline — wallet state may be inconsistent.")
             print(f"  [!] Check if the TX was actually broadcast before rerunning.")
-            _awj({
+            _save_progress({
                 "plan_fingerprint": plan_fingerprint,
                 "completed": sorted(completed_indices),
-            }, progress_file)
+            }, _progress_nonce, progress_file)
             fail_count += 1
             break
 
@@ -1226,13 +1420,62 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             fail_count += 1
             break
 
+        # BUG 83 FIX: Key image sync for view-only wallets.
+        # After broadcast, the view-only wallet doesn't know which outputs
+        # are spent. Without importing key images, the next transfer_split
+        # will try to spend the same outputs → double-spend rejection.
+        # In a full air-gap setup, key images come from the offline signer.
+        # In auto-mode with a view-only wallet, we export outputs and
+        # attempt to import key images if they've been provided.
+        if _is_view_only:
+            _ki_synced = False
+            try:
+                _eo_resp = rpc.raw_request("export_outputs", {"all": False})
+                _outputs_data = _eo_resp.get("outputs_data_hex", "")
+                if _outputs_data:
+                    _eo_path = Path(staging_dir) / f"outputs_after_tx_{tx_idx}.hex"
+                    _eo_path.write_text(_outputs_data)
+                    secure_file_perms(_eo_path)
+                    integrity_log("stage5", f"exported_outputs:tx={tx_idx}")
+
+                    _ki_path = Path(staging_dir) / "key_images.hex"
+                    if _ki_path.exists():
+                        _ki_hex = _ki_path.read_text().strip()
+                        if _ki_hex:
+                            rpc.raw_request("import_key_images", {
+                                "signed_key_images": _ki_hex,
+                            })
+                            _ki_synced = True
+                            integrity_log("stage5", f"key_images_imported:tx={tx_idx}")
+            except Exception as _ki_err:
+                integrity_log("stage5", f"key_image_sync_err:tx={tx_idx}:{str(_ki_err)[:40]}")
+
+            if not _ki_synced:
+                integrity_log("stage5", f"KEY_IMAGE_SYNC_MISSING:tx={tx_idx}")
+                print(f"  [!] ╔══════════════════════════════════════════════════╗")
+                print(f"  [!] ║  KEY IMAGE SYNC FAILED for TX {str(tx_idx).ljust(17)} ║")
+                print(f"  [!] ║                                                  ║")
+                print(f"  [!] ║  View-only wallet cannot track spent outputs     ║")
+                print(f"  [!] ║  without key image import. The next TX will      ║")
+                print(f"  [!] ║  likely fail (double-spend of same outputs).     ║")
+                print(f"  [!] ║                                                  ║")
+                print(f"  [!] ║  To continue:                                    ║")
+                print(f"  [!] ║  1. Transfer outputs file to offline signer      ║")
+                print(f"  [!] ║  2. Export key images from offline wallet         ║")
+                print(f"  [!] ║  3. Place key_images.hex in {staging_dir}/       ║")
+                print(f"  [!] ║  4. Re-run with --resume-plan                    ║")
+                print(f"  [!] ╚══════════════════════════════════════════════════╝")
+                print(f"  [!] ABORTING — key image sync required for view-only wallet.")
+                fail_count += 1
+                break
+
         success_count += 1
         completed_indices.add(tx_idx)
 
-        _awj({
+        _save_progress({
             "plan_fingerprint": plan_fingerprint,
             "completed": sorted(completed_indices),
-        }, progress_file)
+        }, _progress_nonce, progress_file)
 
         print(f"  [+] TX {tx_idx} complete ({success_count}/{total_txs})")
 
