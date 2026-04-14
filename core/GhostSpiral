@@ -50,7 +50,6 @@ BTC_RE = re.compile(
 )
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://rpc.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
 ]
 
@@ -147,8 +146,9 @@ def main():
             sys.exit(f"[!] Resume plan not found: {resume_path}")
         with open(resume_path) as f:
             _rp = json.load(f)
-        if _rp.get("meta", {}).get("schema") != "unsigned_v1":
-            sys.exit("[!] Resume plan is not unsigned_v1 schema")
+        _schema = _rp.get("meta", {}).get("schema", "")
+        if _schema not in ("plan_v1", "unsigned_v1"):
+            sys.exit(f"[!] Unrecognized plan schema: {_schema}")
         if _rp.get("meta", {}).get("mock"):
             sys.exit("[!] Cannot resume a mock plan (no real funds)")
 
@@ -343,9 +343,16 @@ def main():
                 inbound = resp.get("inbound_address", "")
                 memo = resp.get("memo", "")
                 expected_out = resp.get("expected_amount_out", "0")
-                if inbound and memo:
+                if inbound and memo and len(memo) > 5:
+                    # THORNode returns expected_amount_out in target asset's
+                    # native precision. For XMR that's piconero (1e12).
                     expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
                     if expected_xmr <= 0:
+                        continue
+                    # Sanity: if the result looks wildly wrong (e.g. millions of XMR
+                    # for a normal BTC amount), the API may have changed units
+                    if expected_xmr > 100000:
+                        integrity_log("stage2", f"suspicious_quote:{expected_xmr}")
                         continue
                     return {
                         "deposit_address": inbound,

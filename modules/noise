@@ -84,11 +84,11 @@ CLEARNET_ENDPOINTS = [
 
 # Real onion services (check if still active)
 ONION_ENDPOINTS = [
-    "http://duckduckgogg42ts72.onion/",
-    "http://3g2upl4pq6kufc4m.onion/",
+    "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/",
     "http://facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion/",
-    "http://expyuzz4wqqyqhjn.onion/",
-    "http://www.facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion/",
+    "http://2gzyxa5ihm7nsber64py5ztdnwp2tpwk6dktsekwrlzjzb2n4dgwkiad.onion/",
+    "http://nytimesn7cgmftshazwhfgzm37qxb44r64ytbb2dj3x62d2lbd7toad.onion/",
+    "http://prolonenev5otybsmuvy4jiakv6mplp6tp2ydlqgywnfb6q3gg2svqd.onion/",
 ]
 
 # WARNING: CLEARNET EXIT — Same caveat as CLEARNET_ENDPOINTS above.

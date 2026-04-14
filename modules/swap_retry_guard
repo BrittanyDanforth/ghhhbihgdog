@@ -88,7 +88,6 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 # Network configuration
 THOR_APIS = [
     "https://thornode.ninerealms.com",
-    "https://rpc.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
 ]
 

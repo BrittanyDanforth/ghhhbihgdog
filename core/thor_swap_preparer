@@ -40,7 +40,6 @@ except ImportError:
 
 THORNODE_APIS = [
     "https://thornode.ninerealms.com",
-    "https://rpc.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
 ]
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
@@ -58,10 +57,16 @@ _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
 
 
 def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
-    """Fetch current BTC/XMR rate from CoinGecko."""
+    """Fetch current BTC/XMR rate from CoinGecko.
+    Set COINGECKO_API_KEY env var for reliable access (free demo key).
+    """
     try:
-        p = safe_get(CG_PRICE, proxy)
-        rate = Decimal(str(p["monero"]["btc"]))
+        url = CG_PRICE
+        cg_key = os.environ.get("COINGECKO_API_KEY", "")
+        if cg_key:
+            url += f"&x_cg_demo_api_key={cg_key}"
+        p = safe_get(url, proxy)
+        rate = Decimal(str(p.get("monero", {}).get("btc", 0)))
         if rate <= 0:
             raise ValueError("Non-positive rate")
         return rate

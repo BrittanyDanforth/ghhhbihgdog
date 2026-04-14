@@ -274,7 +274,8 @@ def add_whitespace_variance(src: str, rng: random.Random) -> str:
 # Main processing
 # ---------------------------------------------------------------------------
 
-def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
+def mutate(source_path: Path, out_path: Path, seed_path: Path,
+           write_manifest: bool = False) -> None:
     """Main mutation logic."""
     try:
         # Load seed and initialize RNG
@@ -349,7 +350,7 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path) -> None:
 
         # Manifest contains the full rename map — a de-obfuscation key.
         # Only write it if explicitly requested.
-        if getattr(args, 'manifest', False):
+        if write_manifest:
             manifest = {
                 "version": VERSION,
                 "created_utc": datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
@@ -415,7 +416,7 @@ def main():
         rnd = rand_name(random.Random(), 6)
         args.out = Path("runtime") / f"{args.source.stem}_{rnd}.py"
     
-    mutate(args.source, args.out, args.seed)
+    mutate(args.source, args.out, args.seed, write_manifest=args.manifest)
 
 
 if __name__ == "__main__":
