@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-label_masker_v3.py — GhostSpiral v16.9 Chaos Toolkit
-===================================================
+label_masker — Forensic-poisoning label and memo generation for DAG nodes
+=========================================================================
 Creates **forensic‑poisoning labels, memos, and tx_notes** for every *real*
 node in a DAG.  Output is a `label_map.json` consumed by broadcast and signer
 modules so that **on‑chain metadata matches no known wallet pattern**.
@@ -285,7 +285,7 @@ def validate_dag_structure(dag: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate randomized label_map.json for a GhostSpiral DAG.")
+    parser = argparse.ArgumentParser(description="Generate randomized label_map.json for a DAG structure.")
     parser.add_argument("--dag", "-d", type=Path, default=Path("dag_structure.json"), 
                        help="Path to DAG JSON from dag_generator_v2.py")
     parser.add_argument("--seed", "-s", type=Path, default=Path("entropy_seed.json"), 

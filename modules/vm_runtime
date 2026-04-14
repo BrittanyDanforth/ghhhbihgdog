@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-vm_runtime.py — GhostSpiral v16.9 Chaos Toolkit (Enhanced)
-=========================================================
+vm_runtime — Broadcast-delay timing derivation from live host metrics
+=====================================================================
 Derives **broadcast‑delay timing parameters** from the *live virtual‑machine /
 host state* so that every session's timing pattern is:
 
@@ -344,7 +344,7 @@ def generate_delay_pattern(base_delay: float, events: int, rng: random.Random) -
 
 def main():
     p = argparse.ArgumentParser(
-        description="Generate timing delays based on host VM metrics for GhostSpiral network ops.",
+        description="Generate timing delays based on host VM metrics for network operations.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

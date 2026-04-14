@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-decoy_noise_v3.py — GhostSpiral v16.9 Chaos Toolkit
-===================================================
+decoy_noise — Advanced operational noise injection and traffic obfuscation
+==========================================================================
 Advanced **operational noise injection** system that creates realistic network
-traffic patterns to obscure real GhostSpiral transactions. Features:
+traffic patterns to obscure real transactions. Features:
 
 1. **Multi-protocol noise** — TOR, I2P, clearnet endpoints
 2. **Realistic user patterns** — Browser-like requests with proper headers
@@ -455,7 +455,7 @@ class AdvancedNoiseGenerator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced decoy noise generator for GhostSpiral operations"
+        description="Advanced decoy noise generator for network traffic obfuscation"
     )
     parser.add_argument("--dag", type=Path, default=Path("dag_structure.json"),
                        help="DAG structure file")

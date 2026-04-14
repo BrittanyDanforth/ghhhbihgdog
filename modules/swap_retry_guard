@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-swap_retry_guard.py — GhostSpiral v16.9 Chaos Toolkit
-====================================================
+swap_retry_guard — Advanced swap orchestration with adaptive retry logic
+========================================================================
 Advanced swap orchestrator with military-grade OpSec, chaos engineering,
 and zero-failure guarantees. Features adaptive anonymity, quantum-resistant
 entropy, multi-layer obfuscation, and real-time traffic analysis evasion.
@@ -469,7 +469,7 @@ class AdvancedSwapOrchestrator:
     def _load_progress(self) -> Dict[str, Any]:
         """Load progress with integrity verification."""
         default_progress = {
-            "schema": "swap_v2_secure",
+            "schema": "progress",
             "last": -1,
             "log": [],
             "integrity_hash": "",

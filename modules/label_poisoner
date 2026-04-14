@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-label_poisoner.py — GhostSpiral v16.9 Chaos Toolkit
-==================================================
+label_poisoner — Multi-wallet fingerprint blender and UTF-8 obfuscation
+========================================================================
 Takes the **initial `label_map.json`** produced by `label_masker_v3.py` and
 performs a second‑stage mutation so that each label/note pair is *further*
 obfuscated to resemble data emitted by **multiple wallet brands at once**.
@@ -238,7 +238,7 @@ Examples:
     
     args = parser.parse_args()
 
-    print(f"[*] Label Poisoner v{VERSION}")
+    print(f"[*] Loading label poisoning pipeline...")
     print(f"[*] Loading files...")
 
     # Load input files

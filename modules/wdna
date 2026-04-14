@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-wallet_dna_mutator.py — GhostSpiral v16.9 Chaos Toolkit
-======================================================
+wallet_dna_mutator — Deterministic wallet structure mutation engine
+===================================================================
 Rewrites the **account / sub‑address layout** (the "DNA") inside a Monero CLI
 `wallet.json` export to ensure every run has a *unique* structural footprint
 while preserving all keys and balances.

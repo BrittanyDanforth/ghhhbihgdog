@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # entropy_seeder.py
 """
-entropy_seeder.py — GhostSpiral v16.9 Chaos Toolkit
-===================================================
+entropy_seeder — High-grade entropy collection and seed generation
+===================================================================
 Collects **high‑grade runtime entropy** from multiple independent sources and
 persists it as a self‑describing JSON bundle.  The bundle becomes the single
 source of randomness for the entire session (DAG generation, label masking,
@@ -174,7 +174,7 @@ def write_bundle(bundle: dict, out_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate high‑grade entropy_seed.json for GhostSpiral chaos modules."
+        description="Generate high‑grade entropy seed bundle from multiple system sources."
     )
     parser.add_argument(
         "--out", "-o", 
