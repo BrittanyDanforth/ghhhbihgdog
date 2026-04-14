@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-integrity_faker.py — GhostSpiral v16.9 Chaos Toolkit
-===================================================
+integrity_faker.py — Chaos Toolkit
+====================================
 Creates a *plausible yet false* integrity chain that forensic teams may trust,
 thereby masking or replacing the real hash‑chain logs. Works by:
 1. **Mirroring structure** of an existing integrity log (`--source`).
@@ -355,7 +355,7 @@ def main():
     """Main execution function with comprehensive error handling"""
     parser = argparse.ArgumentParser(
         prog="integrity_faker",
-        description="GhostSpiral Integrity Chain Faker v16.9 - Production OPSEC Tool"
+        description="Integrity Chain Faker - Production OPSEC Tool"
     )
     
     parser.add_argument("--source", type=Path, 

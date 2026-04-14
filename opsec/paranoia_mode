@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse, glob, os, random, shutil, subprocess, sys, time
 from pathlib import Path
 
-# Add core/ to path so gs_common can be found regardless of working directory
+# Add core/ to path so shared utilities can be found regardless of working directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from gs_common import (
@@ -327,8 +327,8 @@ def _secure_delete_dir(path: Path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
-    """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
+def wipe_artifacts(dry: bool, extra_dirs: list = None):
+    """Wipe ALL toolkit output files. Searches cwd, home dir,
     common subdirectories, and any --search-dir paths provided."""
     file_patterns = [
         # Core pipeline
@@ -385,6 +385,8 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         Path.home(),
         Path.home() / "ghostspiral",
         Path.home() / "GhostSpiral",
+        Path.home() / "toolkit",
+        Path.home() / "ops",
         Path.home() / "Desktop",
         Path.home() / "Downloads",
         Path("/media"),
@@ -394,7 +396,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
 
     count = 0
 
-    # Wipe GhostSpiral files in /dev/shm (RAM-only storage)
+    # Wipe toolkit files in /dev/shm (RAM-only storage)
     shm = Path("/dev/shm")
     if shm.is_dir():
         shm_patterns = [
@@ -432,7 +434,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
 
         # Use recursive glob (**/) to find artifacts at any depth.
         # The old code only searched one level deep, missing artifacts
-        # in nested directories (e.g. ~/projects/ghostspiral/run3/unsigned/).
+        # in nested directories (e.g. ~/projects/toolkit/run3/unsigned/).
         # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
         depth_patterns = [
             "",          # root itself
@@ -461,7 +463,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
                         count += 1
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
-    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
+    integrity_log("paranoia", f"artifacts:{'dry' if dry else 'wiped'}:{count}")
 
 
 def wipe_tmp_files(dry: bool):
@@ -548,7 +550,7 @@ def wipe_xdg_traces(dry: bool):
 
 
 def scrub_env_vars(dry: bool):
-    """Remove GhostSpiral-related environment variables from the current process.
+    """Remove sensitive environment variables from the current process.
 
     /proc/self/environ is immutable on Linux, so we can only clear the
     variables in the current process. The parent shell's env persists until
@@ -616,7 +618,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print actions without executing")
     ap.add_argument("--search-dir", action="append", default=[],
-                    help="additional directories to search for GhostSpiral artifacts "
+                    help="additional directories to search for toolkit artifacts "
                          "(can be specified multiple times)")
     args = ap.parse_args()
 
@@ -672,15 +674,15 @@ def main():
     print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
     print("  [!]   history -c && history -w  # clear shell history of unset commands")
 
-    # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # Phase 13 (toolkit artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [*] Phase 13: Toolkit artifacts (runs last — wipes integrity log)")
     print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
     print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
     print("  [!] encryption instead. On ext4 with journaling, recently-written file")
     print("  [!] data may persist in the journal even after secure deletion.")
-    wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
+    wipe_artifacts(args.dry_run, extra_dirs=args.search_dir)
 
     # DO NOT call integrity_log() here — it would recreate the wiped log file
     print("\n  [+] paranoia_mode complete.")

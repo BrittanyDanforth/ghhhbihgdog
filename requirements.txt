@@ -1,4 +1,4 @@
-# GhostSpiral — Python Dependencies
+# Python Dependencies
 # Install: python3 -m pip install -r requirements.txt
 # Or just run: bash install.sh
 

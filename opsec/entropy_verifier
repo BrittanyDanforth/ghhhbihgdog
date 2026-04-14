@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-entropy_verifier — Verify GhostSpiral entropy seed integrity
-=============================================================
+entropy_verifier — Verify entropy seed integrity
+==================================================
 Validates that an entropy_seed.json bundle:
   1. Exists and is valid JSON
   2. Has required fields (seed_hex, sha256, timestamp)
@@ -63,7 +63,7 @@ def check_weak_patterns(seed_hex: str) -> list:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Verify GhostSpiral entropy seed integrity",
+        description="Verify entropy seed integrity",
     )
     ap.add_argument("seed_file", help="Path to entropy_seed.json")
     ap.add_argument("--strict", action="store_true",

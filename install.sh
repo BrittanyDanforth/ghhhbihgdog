@@ -1,5 +1,5 @@
 #!/bin/bash
-# GhostSpiral — One-command installer for Kali Linux / Debian
+# Toolkit — One-command installer for Kali Linux / Debian
 # Usage: bash install.sh
 set -e
 
@@ -8,7 +8,7 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 
 echo ""
 echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║   GhostSpiral Toolkit — Installer         ║"
+echo "  ║   Toolkit Installer                       ║"
 echo "  ╚═══════════════════════════════════════════╝"
 echo ""
 
@@ -182,7 +182,7 @@ else:
 WRAPPER="$SCRIPT_DIR/gs"
 cat > "$WRAPPER" << 'GSEOF'
 #!/bin/bash
-# Shortcut: runs GhostSpiral inside the venv automatically
+# Shortcut: runs toolkit inside the venv automatically
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/.venv/bin/python3"
 if [ ! -f "$VENV" ]; then
@@ -199,7 +199,7 @@ echo "  ╔═══════════════════════
 echo "  ║   Installation complete!                  ║"
 echo "  ╚═══════════════════════════════════════════╝"
 echo ""
-echo "  Two ways to run GhostSpiral:"
+echo "  Two ways to run the toolkit:"
 echo ""
 echo "    ${GREEN}./gs${NC}                          <- easiest (uses venv automatically)"
 echo "    ${GREEN}./gs list${NC}                     <- see all tools"

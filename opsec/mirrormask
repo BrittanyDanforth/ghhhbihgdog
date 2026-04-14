@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-forensic_mirrormask.py — Enhanced GhostSpiral v2.0 Anti-Forensics Toolkit
-========================================================================
+forensic_mirrormask.py — Enhanced Anti-Forensics Toolkit
+=========================================================
 Advanced log obfuscation system that generates sophisticated alternate timelines
 to mislead forensic analysis. Uses military-grade OPSEC principles with multiple
 layers of protection against detection and reverse engineering.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GhostSpiral Toolkit — Interactive Launcher
+Toolkit — Interactive Launcher
 """
 from __future__ import annotations
 import json, os, sys, subprocess, shutil
@@ -263,7 +263,7 @@ def flow_full_pipeline(detected_port=None):
     depth = prompt("Mix depth", "2")
 
     print()
-    info("Starting GhostSpiral full pipeline...")
+    info("Starting full pipeline...")
     info("This will: fetch quotes → build mixing DAG → sign → broadcast → clean up")
     print()
 
@@ -277,7 +277,7 @@ def flow_full_pipeline(detected_port=None):
         "--rpc-primary", rpc,
     ]
 
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral")
+    run_script(CORE / "GhostSpiral", args, "Full pipeline")
 
 
 def flow_receive(detected_port=None):
@@ -304,7 +304,7 @@ def flow_receive(detected_port=None):
         "--wallets", wallets,
         "--deep", depth,
     ]
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral receive mode")
+    run_script(CORE / "GhostSpiral", args, "Receive mode")
 
 
 def flow_cold(detected_port=None):
@@ -329,7 +329,7 @@ def flow_cold(detected_port=None):
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "GhostSpiral cold mode"):
+    if run_script(CORE / "GhostSpiral", args, "Cold mode"):
         print()
         ok("Unsigned plan created in ./unsigned/")
         info("Next steps:")
@@ -400,7 +400,7 @@ def flow_resume(detected_port=None):
         _meta = _plan_data.get("meta")
         _txs = _plan_data.get("txs")
         if not isinstance(_meta, dict):
-            err("Plan file is missing 'meta' key — not a valid GhostSpiral plan.")
+            err("Plan file is missing 'meta' key — not a valid plan.")
             info("This should be an unsigned_*.json file from the 'unsigned/' directory.")
             return
         if not isinstance(_txs, list) or len(_txs) == 0:
@@ -437,7 +437,7 @@ def flow_resume(detected_port=None):
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
     ]
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral resume")
+    run_script(CORE / "GhostSpiral", args, "Resume")
 
 
 def flow_create_wallet(detected_port=None):
@@ -538,14 +538,14 @@ def flow_testnet(detected_port=None):
             return
         wf = str(wallet_files[0])
 
-    info("Running GhostSpiral in cold mode (creates plan, no broadcast)...")
+    info("Running in cold mode (creates plan, no broadcast)...")
     args = [
         "--receive-wallet", wf,
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "GhostSpiral testnet"):
+    if run_script(CORE / "GhostSpiral", args, "Testnet"):
         ok("Dry-run plan created in ./unsigned/")
         plans = sorted(Path("unsigned").glob("unsigned_*.json"))
         if plans:
@@ -570,7 +570,7 @@ def flow_system_check():
     ready = show_status(st)
     print()
     if ready:
-        ok("System is ready for GhostSpiral!")
+        ok("System is ready!")
     else:
         warn("Some components are missing — see above")
         if confirm("Run installer to fix missing deps?"):
