@@ -12,7 +12,7 @@ That installs everything: system packages, Python deps, Tor config, and verifies
 
 ```bash
 # 1. System packages
-sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl
+sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
 
 # 2. Python deps (use python3 -m pip, NOT bare pip which may be python2)
 python3 -m pip install -r requirements.txt
@@ -21,16 +21,42 @@ python3 -m pip install -r requirements.txt
 echo -e "\nControlPort 9051\nCookieAuthentication 1" | sudo tee -a /etc/tor/torrc
 sudo systemctl restart tor
 
-# 4. Download Monero CLI tools
-#    Go to https://www.getmonero.org/downloads/
-#    Then:
-tar xf monero-linux-x64-*.tar.bz2
+# 4. Download + install Monero CLI tools (monerod, wallet-cli, wallet-rpc)
+cd /tmp
+wget https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+tar xf monero-cli.tar.bz2
 sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/
+rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2
+cd -
 
-# 5. Verify everything works
+# 5. Verify everything
 python3 -c "import requests, stem, monero, psutil; print('OK')"
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
 monerod --version
+monero-wallet-rpc --version
+```
+
+## IMPORTANT: Proxy Safety
+
+```
+NEVER use free/cheap/public SOCKS proxies with GhostSpiral.
+
+A malicious proxy can:
+  - See ALL your traffic (destinations, amounts, addresses)
+  - Modify RPC responses (change destination addresses = steal funds)
+  - Log your real IP and correlate with blockchain activity
+  - Inject transactions on your behalf
+
+ONLY use:
+  ✓ Your own local Tor instance (socks5h://127.0.0.1:9050)
+  ✓ A Tor instance you control on a trusted VPS
+  ✗ NEVER public proxy lists
+  ✗ NEVER "free VPN" SOCKS proxies
+  ✗ NEVER shared proxies from unknown providers
+
+GhostSpiral verifies Tor exit at startup, but a MITM proxy can
+fake the check.torproject.org response. The ONLY safe proxy is
+one YOU control end-to-end.
 ```
 
 ## Start Monero (before running GhostSpiral)

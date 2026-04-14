@@ -18,6 +18,11 @@ NC='\033[0m'
 ok()   { echo -e "  ${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "  ${YELLOW}[!]${NC} $1"; }
 fail() { echo -e "  ${RED}[✗]${NC} $1"; }
+confirm() {
+    read -p "  $1 (y/n): " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]]
+}
 
 # ---------- Find python3 + pip ----------
 PY=$(command -v python3 || command -v python)
@@ -104,11 +109,23 @@ for tool in monerod monero-wallet-cli monero-wallet-rpc; do
 done
 if [ "$MONERO_OK" = false ]; then
     echo ""
-    echo "  To install Monero CLI tools:"
-    echo "    wget https://downloads.getmonero.org/cli/linux64"
-    echo "    tar xf linux64"
-    echo "    sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/"
-    echo ""
+    if confirm "  Download and install Monero CLI tools now?"; then
+        echo "  Downloading from getmonero.org..."
+        cd /tmp
+        wget -q https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2 && \
+        tar xf monero-cli.tar.bz2 && \
+        sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/ && \
+        rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2 && \
+        ok "Monero CLI tools installed" || \
+        fail "Monero download failed — install manually from https://www.getmonero.org/downloads/"
+        cd - >/dev/null
+    else
+        echo "  To install manually:"
+        echo "    wget https://downloads.getmonero.org/cli/linux64 -O /tmp/monero.tar.bz2"
+        echo "    cd /tmp && tar xf monero.tar.bz2"
+        echo "    sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/"
+        echo ""
+    fi
 fi
 
 # ---------- Step 5: Verify Python imports ----------

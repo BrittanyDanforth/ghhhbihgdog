@@ -470,8 +470,41 @@ def scrub_env_vars(dry: bool):
     integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
 
 
+def _detect_active_interface() -> str:
+    """Detect the active network interface (the one with a default route).
+    Falls back to first non-loopback interface, then 'eth0'."""
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and "dev " in result.stdout:
+            import re as _re
+            m = _re.search(r"dev\s+(\S+)", result.stdout)
+            if m:
+                return m.group(1)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "link", "show", "up"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2:
+                iface = parts[1].strip()
+                if iface != "lo":
+                    return iface
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "eth0"
+
+
 def main():
     install_signal_handlers()
+
+    default_iface = _detect_active_interface()
 
     ap = argparse.ArgumentParser(
         "paranoia_mode v10.0",
@@ -479,8 +512,8 @@ def main():
     )
     ap.add_argument("--wipe-days", type=int, default=7,
                     help="truncate logs older than N days")
-    ap.add_argument("--iface", default="wlan0",
-                    help="network interface to spoof")
+    ap.add_argument("--iface", default=default_iface,
+                    help=f"network interface to spoof (detected: {default_iface})")
     ap.add_argument("--dry-run", action="store_true",
                     help="print actions without executing")
     ap.add_argument("--search-dir", action="append", default=[],

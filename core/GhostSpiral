@@ -209,7 +209,14 @@ def main():
             sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
     else:
         if not BTC_RE.match(args.btc_entry):
-            sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
+            sys.exit(
+                f"[!] Invalid BTC address: {args.btc_entry}\n"
+                f"    Expected formats:\n"
+                f"      Bech32 (segwit):  bc1q... (42 chars) or bc1p... (62 chars)\n"
+                f"      Testnet bech32:   tb1q... or tb1p...\n"
+                f"    Your input does not match any valid Bitcoin address format.\n"
+                f"    Double-check for typos or extra characters."
+            )
         integrity_log("stage0", "btc_entry_validated")
 
     # ---- Validate inputs early ----

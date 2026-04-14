@@ -375,9 +375,25 @@ def flow_exit_planner():
     run_script(CORE / "exit_strategy_simulator", args, "Exit planner")
 
 
+def _detect_iface() -> str:
+    """Auto-detect active network interface."""
+    try:
+        r = subprocess.run(["ip", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and "dev " in r.stdout:
+            import re
+            m = re.search(r"dev\s+(\S+)", r.stdout)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return "eth0"
+
+
 def flow_paranoia():
     heading("Paranoia Mode — Wipe All Traces")
-    iface = prompt("Network interface", "wlan0")
+    detected = _detect_iface()
+    iface = prompt(f"Network interface", detected)
 
     if confirm("Dry run first? (shows what WOULD be deleted without deleting)"):
         run_script(OPSEC / "paranoia_mode", ["--iface", iface, "--dry-run"], "Paranoia dry-run")
@@ -463,7 +479,7 @@ TOOLS = {
     "juggler": MODS/"tor_endpoint_juggler", "timing": MODS/"vm_runtime",
     "paranoia": OPSEC/"paranoia_mode", "logpoison": OPSEC/"error_log_poisoner",
     "mirror": OPSEC/"mirrormask", "deadman": OPSEC/"dmswitch",
-    "memseed": OPSEC/"SML", "intfake": OPSEC/"integrity_faker", "verify": OPSEC/"idk",
+    "memseed": OPSEC/"SML", "intfake": OPSEC/"integrity_faker", "verify": OPSEC/"entropy_verifier",
     "collect": INTEL/"collectgrab", "gather": INTEL/"testergatherSystem",
 }
 

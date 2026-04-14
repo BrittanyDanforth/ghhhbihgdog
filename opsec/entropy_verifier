@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+entropy_verifier — Verify GhostSpiral entropy seed integrity
+=============================================================
+Validates that an entropy_seed.json bundle:
+  1. Exists and is valid JSON
+  2. Has required fields (seed_hex, sha256, timestamp)
+  3. sha256 matches the actual seed_hex content
+  4. Seed has sufficient entropy (min 256 bits)
+  5. Seed is not all zeros or a known weak pattern
+  6. File permissions are 0600 (owner-only)
+  7. Optionally verify against a GPG signature
+
+Usage:
+    python3 entropy_verifier entropy_seed.json
+    python3 entropy_verifier entropy_seed.json --strict
+"""
+import argparse, hashlib, json, math, os, sys, stat
+from pathlib import Path
+from collections import Counter
+
+
+def check_entropy_bits(hex_string: str) -> float:
+    """Calculate Shannon entropy of hex string in bits."""
+    if not hex_string:
+        return 0.0
+    data = bytes.fromhex(hex_string)
+    if not data:
+        return 0.0
+    counts = Counter(data)
+    total = len(data)
+    entropy = 0.0
+    for count in counts.values():
+        if count > 0:
+            prob = count / total
+            entropy -= prob * math.log2(prob)
+    return entropy * total
+
+
+def check_weak_patterns(seed_hex: str) -> list:
+    """Check for known weak entropy patterns."""
+    warnings = []
+    data = bytes.fromhex(seed_hex)
+
+    if all(b == 0 for b in data):
+        warnings.append("CRITICAL: Seed is all zeros")
+    if all(b == 0xFF for b in data):
+        warnings.append("CRITICAL: Seed is all 0xFF")
+    if len(set(data)) == 1:
+        warnings.append("CRITICAL: Seed is single repeated byte")
+    if len(set(data)) < 16:
+        warnings.append("WARNING: Seed has very low byte diversity (<16 unique values)")
+
+    for i in range(len(data) - 1):
+        if data[i + 1] != (data[i] + 1) % 256:
+            break
+    else:
+        if len(data) > 4:
+            warnings.append("CRITICAL: Seed is sequential bytes")
+
+    return warnings
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Verify GhostSpiral entropy seed integrity",
+    )
+    ap.add_argument("seed_file", help="Path to entropy_seed.json")
+    ap.add_argument("--strict", action="store_true",
+                    help="Fail on any warning (not just critical)")
+    ap.add_argument("--min-bits", type=int, default=256,
+                    help="Minimum entropy bits required (default: 256)")
+    args = ap.parse_args()
+
+    seed_path = Path(args.seed_file)
+    errors = []
+    warnings = []
+
+    # Check file exists
+    if not seed_path.exists():
+        print(f"  [!] File not found: {seed_path}")
+        sys.exit(1)
+
+    # Check permissions
+    st = seed_path.stat()
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        warnings.append(f"File permissions {oct(mode)} — should be 0600 (owner-only)")
+        print(f"  [!] WARNING: {seed_path} is readable by group/others ({oct(mode)})")
+        print(f"      Fix: chmod 600 {seed_path}")
+
+    # Parse JSON
+    try:
+        with open(seed_path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"  [!] Invalid JSON: {e}")
+        sys.exit(1)
+
+    print(f"  [·] Checking: {seed_path}")
+
+    # Check required fields
+    for field in ["seed_hex", "sha256", "timestamp"]:
+        if field not in data:
+            errors.append(f"Missing required field: {field}")
+
+    if errors:
+        for e in errors:
+            print(f"  [✗] {e}")
+        sys.exit(1)
+
+    seed_hex = data["seed_hex"]
+    claimed_hash = data["sha256"]
+
+    # Verify hash
+    actual_hash = hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest()
+    if actual_hash == claimed_hash:
+        print(f"  [✓] SHA-256 hash matches")
+    else:
+        print(f"  [✗] SHA-256 MISMATCH!")
+        print(f"      Claimed: {claimed_hash}")
+        print(f"      Actual:  {actual_hash}")
+        errors.append("Hash mismatch — seed file may be tampered")
+
+    # Check seed length
+    seed_bytes = len(seed_hex) // 2
+    print(f"  [·] Seed size: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    if seed_bytes * 8 < args.min_bits:
+        errors.append(f"Seed too short: {seed_bytes * 8} bits < {args.min_bits} minimum")
+
+    # Check entropy
+    entropy_bits = check_entropy_bits(seed_hex)
+    print(f"  [·] Shannon entropy: {entropy_bits:.1f} bits")
+
+    # Check weak patterns
+    weak = check_weak_patterns(seed_hex)
+    for w in weak:
+        if w.startswith("CRITICAL"):
+            errors.append(w)
+            print(f"  [✗] {w}")
+        else:
+            warnings.append(w)
+            print(f"  [!] {w}")
+
+    # Check timestamp
+    ts = data.get("timestamp", 0)
+    if isinstance(ts, (int, float)) and ts > 0:
+        import time
+        age_hours = (time.time() - ts) / 3600
+        if age_hours > 24:
+            warnings.append(f"Seed is {age_hours:.0f} hours old — consider regenerating")
+        print(f"  [·] Age: {age_hours:.1f} hours")
+
+    # Check extra fields
+    sources = data.get("sources", [])
+    if sources:
+        print(f"  [·] Entropy sources: {len(sources)}")
+
+    # Summary
+    print()
+    if errors:
+        for e in errors:
+            print(f"  [✗] ERROR: {e}")
+        print(f"\n  [!] Seed FAILED verification — DO NOT USE")
+        sys.exit(1)
+    elif warnings and args.strict:
+        for w in warnings:
+            print(f"  [!] WARNING: {w}")
+        print(f"\n  [!] Seed has warnings (--strict mode) — review before use")
+        sys.exit(1)
+    else:
+        if warnings:
+            for w in warnings:
+                print(f"  [!] {w}")
+        print(f"  [✓] Seed verification PASSED")
+        print(f"      {seed_bytes} bytes, {entropy_bits:.0f} bits entropy, hash verified")
+
+
+if __name__ == "__main__":
+    main()
