@@ -323,10 +323,11 @@ def main():
 
     def _thornode_quote(amt: Decimal, xmr_dest: str) -> dict | None:
         """Try THORNode native API for a swap quote (no API key needed)."""
+        from urllib.parse import quote as _url_quote
         amount_sats = int(amt * Decimal("1e8"))
         params = (
             f"from_asset=BTC.BTC&to_asset=XMR.XMR"
-            f"&amount={amount_sats}&destination={xmr_dest}"
+            f"&amount={amount_sats}&destination={_url_quote(xmr_dest, safe='')}"
         )
         for base_url in THORNODE_APIS:
             try:
@@ -417,11 +418,11 @@ def main():
         address if the wallet file is inspected forensically (BUG 37 FIX)."""
         subs = []
         for i in range(n):
-            label = f"gs_{secure_hex(4)}"
+            label = secure_hex(6)
             addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         for d in range(decoys):
-            label = f"gs_{secure_hex(4)}"
+            label = secure_hex(6)
             addr = rpc.new_subaddress(account_index=acct_idx, label=label)
             subs.append(addr)
         return subs
@@ -651,6 +652,8 @@ def main():
     }
     if is_mock_plan:
         meta["mock"] = True
+    if shutdown_requested():
+        meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)
@@ -959,6 +962,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
             print(f"  [!] ABORTING pipeline — wallet state may be inconsistent.")
             print(f"  [!] Check if the TX was actually broadcast before rerunning.")
+            _awj({
+                "plan_fingerprint": plan_fingerprint,
+                "completed": sorted(completed_indices),
+            }, progress_file)
             fail_count += 1
             break
 
