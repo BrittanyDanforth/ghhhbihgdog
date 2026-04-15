@@ -441,10 +441,24 @@ def phase_sign(args, plan: List[dict]):
         return
 
     signed_dir = outdir / "signed"
-    # Only wipe the signed dir in batch mode (no --tx-index).
     # In iterative mode, prior signed files belong to already-broadcast TXs.
+    # In batch mode, only remove unsigned-origin files (NOT presigned blobs
+    # from phase_create which are already valid signed blobs).
     if tx_index is None and signed_dir.is_dir():
-        shutil.rmtree(signed_dir)
+        for old_file in signed_dir.iterdir():
+            if old_file.suffix == ".signed":
+                # Check if this blob is from a presigned entry — keep those
+                _is_presigned_blob = False
+                for _e in entries:
+                    if _e.get("presigned") and old_file.name == _e.get("file"):
+                        _is_presigned_blob = True
+                        break
+                    if _e.get("presigned") and _e.get("split_files"):
+                        if old_file.name in _e["split_files"]:
+                            _is_presigned_blob = True
+                            break
+                if not _is_presigned_blob:
+                    old_file.unlink(missing_ok=True)
     signed_dir.mkdir(parents=True, exist_ok=True)
 
     signed_manifest = []
@@ -462,6 +476,12 @@ def phase_sign(args, plan: List[dict]):
         # Skip signing for entries marked presigned.
         if entry.get("presigned"):
             print(f"  [skip] TX {idx}: already signed (hot wallet)")
+            signed_manifest.append({
+                "idx": idx,
+                "file": entry.get("file", f"tx_{idx}.signed"),
+                "hash": entry.get("hash", ""),
+                "delay": entry.get("delay", 0),
+            })
             signed_count += 1
             continue
         unsigned_file = Path(entry["file"])

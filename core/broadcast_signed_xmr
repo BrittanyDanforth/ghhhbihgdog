@@ -304,8 +304,8 @@ def main():
                 if isinstance(_ue, dict) and _ue.get("presigned"):
                     _fname = Path(_ue.get("file", "")).name
                     _presigned_blobs[_fname] = True
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+            print(f"  [!] Warning: could not load unsigned manifest for presigned detection: {e}")
 
     # Compute blob fingerprint to bind progress to this specific set of blobs.
     # MUST include file content hashes, not just names. Otherwise, re-signed

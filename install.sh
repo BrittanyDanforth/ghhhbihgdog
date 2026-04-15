@@ -128,7 +128,7 @@ if [ ! -f /etc/tor/torrc ]; then
     fi
 fi
 if [ -f /etc/tor/torrc ]; then
-    if ! grep -q "^ControlPort 9051" /etc/tor/torrc 2>/dev/null; then
+    if ! grep -qE "^\s*ControlPort\s+9051" /etc/tor/torrc 2>/dev/null; then
         echo "" | sudo tee -a /etc/tor/torrc >/dev/null
         echo "ControlPort 9051" | sudo tee -a /etc/tor/torrc >/dev/null
         echo "CookieAuthentication 1" | sudo tee -a /etc/tor/torrc >/dev/null

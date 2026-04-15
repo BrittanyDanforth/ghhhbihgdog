@@ -216,7 +216,7 @@ def main():
 
         proxy = validate_proxy(args.tor_proxy)
         require_resources(min_disk_gb=2.0)
-        verify_tor(proxy)
+        opsec_preflight(proxy, "resume_init")
         newnym()
 
         print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")

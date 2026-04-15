@@ -752,7 +752,9 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print()
             continue
-        except SystemExit:
+        except SystemExit as _se:
+            if _se.code and str(_se.code).startswith("[!]"):
+                print(f"\n  {R}{_se.code}{N}")
             pass
         except Exception as _menu_err:
             print()
