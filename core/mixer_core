@@ -582,7 +582,7 @@ def main():
                         "memo_bytes": memo_bytes,
                     }
             except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-                integrity_log("thornode", f"quote_fail:{node.split('/')[-1]}:{str(e)[:40]}")
+                integrity_log("thornode", f"quote_fail:{base_url.split('/')[-1]}:{str(e)[:40]}")
                 continue
         return None
 
@@ -1337,8 +1337,15 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         print(f"  [!] If resuming after a crash, TXs may fail due to stale wallet state.")
 
     # Read the plan to get TX count
-    with open(str(ufile)) as _pf:
-        plan_data = json.load(_pf)
+    try:
+        with open(str(ufile)) as _pf:
+            plan_data = json.load(_pf)
+    except json.JSONDecodeError as e:
+        sys.exit(f"[!] Plan file is corrupt or not valid JSON: {e}\n"
+                 f"    File: {ufile}\n"
+                 f"    Re-generate the plan with option 1 or 3.")
+    except OSError as e:
+        sys.exit(f"[!] Cannot read plan file: {e}")
     plan_txs = plan_data.get("txs", [])
 
     # Check ThorChain quote expiry. In air-gap workflows the operator may

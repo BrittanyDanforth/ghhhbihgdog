@@ -305,6 +305,16 @@ def flow_full_pipeline(detected_port=None):
     wallets = prompt("Number of mix wallets", "10")
     depth = prompt("Mix depth", "2")
 
+    for label, val, min_val in [("Split", splits, 1), ("Wallets", wallets, 3), ("Depth", depth, 1)]:
+        try:
+            v = int(val)
+            if v < min_val:
+                err(f"{label} must be at least {min_val} (got {val})")
+                return
+        except ValueError:
+            err(f"{label} must be a number (got '{val}')")
+            return
+
     print()
     info("Starting full pipeline...")
     info("This will: fetch quotes → build mixing DAG → sign → broadcast → clean up")
@@ -742,6 +752,12 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print()
             continue
+        except SystemExit:
+            pass
+        except Exception as _menu_err:
+            print()
+            err(f"Operation failed: {_menu_err}")
+            info("Returning to menu. Check the error above.")
 
         if choice not in ("q", "quit", "exit"):
             print()

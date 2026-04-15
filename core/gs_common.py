@@ -252,13 +252,27 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 #  Tor verification
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
 def verify_tor(proxy: Dict[str, str]) -> None:
     """Verify we are exiting through Tor. Aborts on failure.
 
     Validates both the IsTor flag AND the response structure to detect
     compromised/cached/spoofed responses from check.torproject.org.
+    Retries up to 4 times with exponential backoff before aborting.
     """
+    try:
+        _verify_tor_inner(proxy)
+    except Exception:
+        integrity_log("tor", "VERIFY_EXHAUSTED")
+        sys.exit(
+            "[!] Cannot verify Tor after 4 attempts.\n"
+            "    check.torproject.org may be down, or Tor is not working.\n"
+            "    Check: sudo systemctl status tor\n"
+            "    Check: curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip"
+        )
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
+def _verify_tor_inner(proxy: Dict[str, str]) -> None:
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
                      headers=_BROWSER_HEADERS)
     r.raise_for_status()

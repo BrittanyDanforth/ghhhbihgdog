@@ -121,6 +121,14 @@ def main():
                 entries = entries["manifest"]
             elif "entries" in entries:
                 entries = entries["entries"]
+            else:
+                sys.exit(
+                    f"[!] Manifest JSON has no 'manifest' or 'entries' key.\n"
+                    f"    Keys found: {list(entries.keys())[:10]}\n"
+                    f"    Expected format: {{\"entries\": [...]}}"
+                )
+        if not isinstance(entries, list):
+            sys.exit(f"[!] Manifest entries is not a list (got {type(entries).__name__})")
         for e in entries:
             raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
             # Handle split TX files: if the entry has split_files, use those instead
@@ -327,14 +335,21 @@ def main():
         with open(progF) as f:
             prog = json.load(f)
         saved_fp = prog.get("blob_fingerprint", "")
-        if saved_fp and saved_fp != blob_fp:
+        if not saved_fp:
+            integrity_log("broadcast", "STALE_PROGRESS:no_fingerprint")
+            print("  [!] WARNING: Progress file has no blob fingerprint (old format).")
+            print("  [!] Cannot verify it matches this blob set. Resetting progress.")
+            prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
+            last_idx = -1
+        elif saved_fp != blob_fp:
             integrity_log("broadcast", "STALE_PROGRESS:blob_set_changed")
             sys.exit(
                 "[!] Broadcast progress is from a DIFFERENT set of blobs!\n"
                 "    Delete the progress file or use the matching blob set.\n"
                 "    Stale progress would silently skip TXs."
             )
-        last_idx = prog.get("last", -1)
+        else:
+            last_idx = prog.get("last", -1)
     else:
         prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
         last_idx = -1

@@ -163,8 +163,28 @@ do_undo() {
     sysctl -w net.ipv6.conf.all.disable_ipv6=0      >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.default.disable_ipv6=0   >/dev/null 2>&1 || true
 
+    # Re-enable kernel settings changed by apply_firewall
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0        >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_timestamps=1              >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.all.log_martians=0       >/dev/null 2>&1 || true
+
     # Remove modprobe blocks
     rm -f /etc/modprobe.d/tor-firewall-block-tunnels.conf 2>/dev/null || true
+
+    # Restart services that were stopped by apply_firewall
+    for svc in systemd-resolved avahi-daemon cups-browsed; do
+        if systemctl list-unit-files "$svc.service" &>/dev/null 2>&1; then
+            systemctl start "$svc" 2>/dev/null || true
+        fi
+    done
+
+    # Restore resolv.conf if we replaced it
+    if [[ -f /etc/resolv.conf ]] && grep -q "^nameserver 127.0.0.1$" /etc/resolv.conf 2>/dev/null; then
+        if systemctl is-active systemd-resolved &>/dev/null 2>&1; then
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+            info "Restored resolv.conf to systemd-resolved"
+        fi
+    fi
 
     echo ""
     pass "Firewall removed. Normal networking restored."
@@ -194,9 +214,9 @@ Wants=tor.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $self_path
+ExecStart=/bin/bash "$self_path"
 RemainAfterExit=yes
-ExecStop=/bin/bash $self_path --undo
+ExecStop=/bin/bash "$self_path" --undo
 
 [Install]
 WantedBy=multi-user.target
