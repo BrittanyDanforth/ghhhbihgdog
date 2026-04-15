@@ -682,9 +682,10 @@ run_tests() {
     echo -e "  ${BOLD}=== Leak Tests ===${NC}"
     echo ""
 
-    # Test 1: Direct TCP
+    # Test 1: Direct TCP (must bypass proxy env vars to test raw connectivity)
     info "Test 1/9: Direct TCP to clearnet (should be blocked)..."
-    if curl -s --max-time 5 --connect-timeout 3 https://1.1.1.1 &>/dev/null 2>&1; then
+    if env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+        curl -s --noproxy '*' --max-time 5 --connect-timeout 3 https://1.1.1.1 &>/dev/null 2>&1; then
         fail "Direct TCP to clearnet is OPEN"
         failures=$((failures + 1))
     else

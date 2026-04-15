@@ -1,10 +1,10 @@
 # GhostSpiral — Setup Guide
 
-Everything is copy-paste ready. You need a Debian/Kali VM with `sudo`.
+Everything is copy-paste. You need a Debian/Kali VM with `sudo`.
 
 ---
 
-## First time ever? Run these 3 commands:
+## Step 1: Install
 
 ```
 sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip python3-venv curl wget bzip2
@@ -12,23 +12,49 @@ bash install.sh
 sudo systemctl start tor && sudo systemctl enable tor
 ```
 
-Done. Now run `./gs` to open the menu.
+---
+
+## Step 2: Lock down the VM (do this FIRST, before anything else)
+
+```
+sudo bash tor_firewall.sh
+```
+
+This blocks ALL direct internet. Only Tor traffic gets out.
+
+Then fix your browser and CLI tools:
+
+```
+sudo bash tor_firewall.sh --setup-browser
+```
+
+This automatically configures:
+- **wget, curl, apt, pip** — work through Tor immediately
+- **Firefox** — SOCKS5 proxy + DNS privacy + WebRTC disabled
+
+**For your current terminal** (if wget still fails after the above):
+
+```
+. /etc/profile.d/tor-proxy.sh
+```
+
+New terminals get it automatically.
+
+**Make firewall survive reboots:**
+
+```
+sudo bash tor_firewall.sh --persist
+```
+
+**If Malwarebytes on your host PC flags Tor traffic:**
+
+```
+sudo bash tor_firewall.sh --setup-bridges
+```
 
 ---
 
-## Already set up? Just run:
-
-```
-./gs
-```
-
-If something broke: `bash install.sh` (only fixes what's missing).
-
----
-
-## Monero setup (first time only)
-
-### Step 1: Install Monero tools
+## Step 3: Install Monero tools
 
 ```
 cd /tmp
@@ -41,31 +67,29 @@ rm -rf monero-x86_64-linux-gnu-* monero.tar.bz2
 cd -
 ```
 
-### Step 2: Create a wallet
+---
+
+## Step 4: Create a wallet (first time only)
 
 ```
 monero-wallet-cli --generate-new-wallet ~/my_wallet
 ```
 
-It asks for a password — **remember it.**
-It shows a 25-word seed phrase — **write it on paper and store it safely.**
-That seed is the ONLY way to recover your funds.
+- Pick a password — **remember it**
+- Write down the 25-word seed — **on paper, store safely**
+- That seed is the ONLY way to recover funds
 
-### Step 3: Start the blockchain node
+---
+
+## Step 5: Start services (before each session)
+
+**Start blockchain node** (first time downloads ~170 GB):
 
 ```
 monerod --detach --data-dir ~/.bitmonero
 ```
 
-First time downloads ~170 GB. After that, starts in seconds.
-
----
-
-## Before each session
-
-### Start wallet-rpc (the thing that talks to your wallet)
-
-Replace `YOUR_PASSWORD` with the password you chose in Step 2:
+**Start wallet server** — replace `YOUR_PASSWORD` with your wallet password:
 
 ```
 monero-wallet-rpc \
@@ -78,36 +102,36 @@ monero-wallet-rpc \
   --detach
 ```
 
-**What each flag does:**
-- `--rpc-bind-port 18083` — the port the toolkit connects to
-- `--wallet-file ~/my_wallet` — path to your wallet from Step 2
-- `--password` — the password you set when creating the wallet
-- `--daemon-address` — your local blockchain node from Step 3
-- `--disable-rpc-login` — no extra login needed (it only listens on localhost)
-- `--log-level 0` — **OPSEC: prevents wallet-rpc from logging your operations to disk**
-- `--detach` — runs in background so you can close the terminal
+What the flags mean:
+| Flag | Why |
+|------|-----|
+| `--rpc-bind-port 18083` | Port the toolkit connects to |
+| `--wallet-file` | Your wallet from Step 4 |
+| `--password` | Same password from Step 4 |
+| `--daemon-address` | Your local node from above |
+| `--disable-rpc-login` | Safe — only listens on localhost |
+| `--log-level 0` | **OPSEC:** prevents logging your operations |
+| `--detach` | Runs in background |
 
-### Set your password as environment variable
-
-This passes it to the toolkit without it showing in `ps aux`:
+**Set password as env var** (hides it from `ps aux`):
 
 ```
 export GS_WALLET_PASSWORD="YOUR_PASSWORD"
 ```
 
-### Launch the toolkit
+---
+
+## Step 6: Run the toolkit
 
 ```
 ./gs
 ```
 
-Choose `0` (System Check) to verify everything is connected.
+Choose `0` to verify everything is connected.
 
 ---
 
 ## When you're done
-
-### Quick shutdown (copy-paste this whole block):
 
 ```
 ./gs
@@ -122,35 +146,13 @@ unset GS_WALLET_PASSWORD
 history -c && history -w
 ```
 
-**What each line does:**
-- `./gs` → `9` — wipes all toolkit artifacts, temp files, logs
-- `pkill monero-wallet-rpc` — stops the wallet server
-- `monerod exit` — stops the blockchain node cleanly (don't kill -9 it)
-- `unset GS_WALLET_PASSWORD` — removes password from shell memory
-- `history -c && history -w` — clears command history
-
----
-
-## Tor firewall (lock down the VM)
-
-Blocks ALL internet except through Tor. Nothing leaks — not DNS, not IPv6, nothing.
-
-**CLI tools (wget, curl, apt, pip) are auto-configured to use Tor** — no manual proxy setup needed.
-
-| What | Command |
-|------|---------|
-| **Enable** | `sudo bash tor_firewall.sh` |
-| **Fix browser** | `sudo bash tor_firewall.sh --setup-browser` |
-| **Fix Malwarebytes alerts** | `sudo bash tor_firewall.sh --setup-bridges` |
-| **Survive reboots** | `sudo bash tor_firewall.sh --persist` |
-| **Disable** | `sudo bash tor_firewall.sh --undo` |
-| **Check status** | `sudo bash tor_firewall.sh --status` |
-
-After enabling:
-- **Terminal commands** (wget, curl, apt, pip) work through Tor automatically
-- **Browser** needs one extra step: run `--setup-browser`
-- **To source proxy in current terminal:** `. /etc/profile.d/tor-proxy.sh`
-- New terminal windows get it automatically
+| Command | What it does |
+|---------|-------------|
+| `./gs` → `9` | Wipes all toolkit artifacts and logs |
+| `pkill monero-wallet-rpc` | Stops the wallet server |
+| `monerod exit` | Stops the blockchain node cleanly |
+| `unset GS_WALLET_PASSWORD` | Removes password from shell memory |
+| `history -c && history -w` | Clears command history |
 
 ---
 
@@ -158,14 +160,19 @@ After enabling:
 
 | What | Command |
 |------|---------|
-| First install | `bash install.sh` |
 | Run toolkit | `./gs` |
-| System check | `./gs` then `0` |
-| Start monerod | `monerod --detach --data-dir ~/.bitmonero` |
-| Start wallet-rpc | See "Before each session" above |
+| System check | `./gs` → `0` |
+| Enable firewall | `sudo bash tor_firewall.sh` |
+| Fix browser + CLI | `sudo bash tor_firewall.sh --setup-browser` |
+| Fix Malwarebytes | `sudo bash tor_firewall.sh --setup-bridges` |
+| Keep after reboot | `sudo bash tor_firewall.sh --persist` |
+| Disable firewall | `sudo bash tor_firewall.sh --undo` |
+| Check firewall | `sudo bash tor_firewall.sh --status` |
+| Start node | `monerod --detach --data-dir ~/.bitmonero` |
+| Stop node | `monerod exit` |
+| Start wallet-rpc | See Step 5 |
 | Stop wallet-rpc | `pkill monero-wallet-rpc` |
-| Stop monerod | `monerod exit` |
-| Cleanup everything | `./gs` then `9` |
+| Cleanup | `./gs` → `9` |
 
 ---
 
@@ -173,24 +180,10 @@ After enabling:
 
 | Problem | Fix |
 |---------|-----|
-| `curl: (7) ... port 9050` | Tor not running. `sudo systemctl start tor` |
-| Browser says "can't connect" | `sudo bash tor_firewall.sh --setup-browser` |
+| `wget: unable to resolve` | `sudo bash tor_firewall.sh --setup-browser` then `. /etc/profile.d/tor-proxy.sh` |
+| Browser can't connect | `sudo bash tor_firewall.sh --setup-browser` then restart Firefox |
 | Malwarebytes flags on host | `sudo bash tor_firewall.sh --setup-bridges` |
 | `ModuleNotFoundError` | `bash install.sh` |
-| `NEWNYM failed` | `sudo systemctl restart tor` |
-| `No wallet file` | Start wallet-rpc (see above) |
-| `Cannot reach wallet-rpc` | Start wallet-rpc (see above) |
+| `Cannot reach wallet-rpc` | Start wallet-rpc (Step 5) |
+| `Tor is NOT running` | `sudo systemctl start tor` |
 | Firewall locked me out | `sudo bash tor_firewall.sh --undo` |
-| monerod sync is slow | Normal first time (~170 GB). Check: `monerod status` |
-
----
-
-## Proxy safety
-
-```
-ONLY use: socks5h://127.0.0.1:9050 (system Tor)
-     or:  socks5h://127.0.0.1:9150 (Tor Browser)
-
-The "h" in socks5h routes DNS through Tor.
-Without it, your ISP sees every domain you visit.
-```
