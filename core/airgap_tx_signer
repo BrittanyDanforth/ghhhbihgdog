@@ -311,8 +311,9 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             with open(manifest_path) as f:
                 existing = json.load(f)
             existing_entries = existing.get("entries", [])
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  [!] Warning: corrupt existing manifest, starting fresh: {e}")
+            existing_entries = []
 
     # Merge new entries with existing (for iterative create)
     existing_by_idx = {e["idx"]: e for e in existing_entries}
@@ -442,6 +443,7 @@ def phase_sign(args, plan: List[dict]):
 
     signed_manifest = []
     signed_count = 0
+    failed = 0
 
     for entry in entries:
         if shutdown_requested():
@@ -596,8 +598,10 @@ def phase_sign(args, plan: List[dict]):
     final_manifest = signed_dir / "signed_manifest_v1.json"
     atomic_write_json(signed_manifest, final_manifest)
 
-    integrity_log("signer", f"sign_done:{signed_count}_signed")
+    integrity_log("signer", f"sign_done:{signed_count}_signed:{failed}_failed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
+    if failed:
+        print(f"  [!] {failed} TX(s) failed during signing. Check wallet password and file integrity.")
     print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
 
 

@@ -237,46 +237,45 @@ def main():
 
         staging_dir = "tx_staging"
         lock_path = Path(".mixer.lock")
-    # BUG 100 FIX: Use atomic lock acquisition to close TOCTOU window.
-    # The old unlink+O_EXCL sequence has a race between the two calls.
-    _lock_acquired = False
-    for _lock_attempt in range(3):
-        try:
-            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            _lock_acquired = True
-            break
-        except FileExistsError:
+
+        _lock_acquired = False
+        for _lock_attempt in range(3):
             try:
-                stale_pid = lock_path.read_text().strip()
-                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
-                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
-                    try:
-                        lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                else:
+                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                _lock_acquired = True
+                break
+            except FileExistsError:
+                try:
+                    stale_pid = lock_path.read_text().strip()
+                    if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                        print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                        try:
+                            lock_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        continue
+                    else:
+                        sys.exit(
+                            f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                            "    Another instance may be running.\n"
+                            "    If not, delete the lock file manually."
+                        )
+                except (OSError, ValueError):
                     sys.exit(
-                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "[!] Lock file exists: .mixer.lock\n"
                         "    Another instance may be running.\n"
                         "    If not, delete the lock file manually."
                     )
-            except (OSError, ValueError):
-                sys.exit(
-                    "[!] Lock file exists: .mixer.lock\n"
-                    "    Another instance may be running.\n"
-                    "    If not, delete the lock file manually."
-                )
-    if not _lock_acquired:
-        sys.exit("[!] Could not acquire lock after 3 attempts.")
+        if not _lock_acquired:
+            sys.exit("[!] Could not acquire lock after 3 attempts.")
 
-    try:
-        _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
-    finally:
-        if lock_path.exists():
-            lock_path.unlink()
+        try:
+            _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
 
         print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
         print()

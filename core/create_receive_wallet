@@ -166,7 +166,7 @@ def main():
     print(f"  2. Give the BTC deposit address + memo to the sender")
     print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")
     print(f"  4. Run the mixer pipeline in receive mode:")
-    print(f"       python3 mixer \\")
+    print(f"       ./gs mixer \\")
     print(f"         --receive-wallet {fname} \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
 

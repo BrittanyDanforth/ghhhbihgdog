@@ -114,20 +114,23 @@ def check_prereqs() -> dict:
     # Tor (system tor SOCKS 9050; Tor Browser embedded tor 9150)
     status["tor"] = False
     status["tor_port"] = None
-    import requests as _r
-    for _tor_port in (9050, 9150):
-        try:
-            _px = {
-                "http": f"socks5h://127.0.0.1:{_tor_port}",
-                "https": f"socks5h://127.0.0.1:{_tor_port}",
-            }
-            resp = _r.get("https://check.torproject.org/api/ip", proxies=_px, timeout=10)
-            if resp.json().get("IsTor"):
-                status["tor"] = True
-                status["tor_port"] = _tor_port
-                break
-        except Exception:
-            continue
+    try:
+        import requests as _r
+        for _tor_port in (9050, 9150):
+            try:
+                _px = {
+                    "http": f"socks5h://127.0.0.1:{_tor_port}",
+                    "https": f"socks5h://127.0.0.1:{_tor_port}",
+                }
+                resp = _r.get("https://check.torproject.org/api/ip", proxies=_px, timeout=10)
+                if resp.json().get("IsTor"):
+                    status["tor"] = True
+                    status["tor_port"] = _tor_port
+                    break
+            except Exception:
+                continue
+    except ImportError:
+        pass
 
     # Monero
     for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
@@ -135,8 +138,8 @@ def check_prereqs() -> dict:
 
     # Wallet RPC running?
     try:
-        import requests as _r
-        resp = _r.post("http://127.0.0.1:18083/json_rpc",
+        import requests as _r2
+        resp = _r2.post("http://127.0.0.1:18083/json_rpc",
                         json={"jsonrpc":"2.0","id":"0","method":"get_height"},
                         timeout=3)
         status["wallet_rpc"] = resp.status_code == 200

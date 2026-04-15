@@ -374,7 +374,7 @@ BRIDGES_BLOCK
             tor_ok=true
             break
         fi
-        ((retries++))
+        retries=$((retries + 1))
         info "Waiting for Tor to bootstrap via bridges... (attempt $retries/6)"
         sleep 5
     done
@@ -488,7 +488,7 @@ run_tests() {
     info "Test 1/9: Direct TCP to clearnet (should be blocked)..."
     if curl -s --max-time 5 --connect-timeout 3 https://1.1.1.1 &>/dev/null 2>&1; then
         fail "Direct TCP to clearnet is OPEN"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "Direct TCP blocked"
     fi
@@ -513,7 +513,7 @@ run_tests() {
     fi
     if $dns_leaked; then
         fail "Direct DNS (UDP 53) is OPEN — DNS leak!"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "Direct DNS blocked"
     fi
@@ -522,7 +522,7 @@ run_tests() {
     info "Test 3/9: DNS-over-TLS TCP 853 (should be blocked)..."
     if (echo "" | timeout 3 openssl s_client -connect 1.1.1.1:853 2>/dev/null | grep -q "CONNECTED") 2>/dev/null; then
         fail "DNS-over-TLS (TCP 853) is OPEN — leak!"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "DNS-over-TLS blocked"
     fi
@@ -531,7 +531,7 @@ run_tests() {
     info "Test 4/9: ICMP ping (should be blocked)..."
     if ping -c 1 -W 3 8.8.8.8 &>/dev/null 2>&1; then
         fail "ICMP ping is OPEN"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "ICMP blocked"
     fi
@@ -546,7 +546,7 @@ run_tests() {
     fi
     if $ipv6_leaked; then
         fail "IPv6 is OPEN"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "IPv6 blocked"
     fi
@@ -556,7 +556,7 @@ run_tests() {
     if command -v ntpdate &>/dev/null; then
         if ntpdate -q -t 3 pool.ntp.org &>/dev/null 2>&1; then
             fail "NTP (UDP 123) is OPEN — timing leak!"
-            ((failures++))
+            failures=$((failures + 1))
         else
             pass "NTP blocked"
         fi
@@ -568,7 +568,7 @@ run_tests() {
     info "Test 7/9: mDNS/multicast (should be blocked)..."
     if (echo "test" > /dev/udp/224.0.0.251/5353) 2>/dev/null; then
         fail "mDNS multicast (UDP 5353) is OPEN — LAN leak!"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "mDNS/multicast blocked"
     fi
@@ -577,7 +577,7 @@ run_tests() {
     info "Test 8/9: Arbitrary outbound TCP (should be blocked)..."
     if (echo "test" > /dev/tcp/1.1.1.1/8443) 2>/dev/null; then
         fail "Arbitrary outbound TCP is OPEN"
-        ((failures++))
+        failures=$((failures + 1))
     else
         pass "Arbitrary outbound TCP blocked"
     fi
@@ -593,15 +593,15 @@ run_tests() {
     if echo "$tor_response" | grep -q '"IsTor":true' 2>/dev/null; then
         pass "Tor is working (confirmed by check.torproject.org)"
         local tor_ip
-        tor_ip=$(echo "$tor_response" | grep -oP '"IP":"[^"]*"' 2>/dev/null || echo "")
+        tor_ip=$(echo "$tor_response" | sed -n 's/.*"IP":"\([^"]*\)".*/\1/p' 2>/dev/null || echo "")
         if [[ -n "$tor_ip" ]]; then
-            info "Exit node: $tor_ip"
+            info "Exit node: \"IP\":\"$tor_ip\""
         fi
     else
         fail "Tor is NOT working through SOCKS"
         warn "Check: sudo systemctl status tor"
         warn "Check: sudo journalctl -u tor --no-pager -n 20"
-        ((failures++))
+        failures=$((failures + 1))
     fi
 
     echo ""
