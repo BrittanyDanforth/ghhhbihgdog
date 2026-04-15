@@ -29,13 +29,25 @@ echo ""
 echo "  Setup"
 echo "  -----"
 
-# ---------- Detect if this is first run or re-run ----------
+# ---------- Detect if this is first run, re-run, or broken ----------
 FIRST_RUN=false
+REBUILD_VENV=false
 if [ ! -d "$VENV_DIR" ]; then
     FIRST_RUN=true
     echo "  First time setup. This will install everything you need."
+elif [ ! -f "$VENV_DIR/bin/python3" ]; then
+    REBUILD_VENV=true
+    echo "  Virtual environment is broken (no python3 binary). Rebuilding..."
+elif ! "$VENV_DIR/bin/python3" -c "import requests" 2>/dev/null; then
+    REBUILD_VENV=true
+    echo "  Virtual environment is broken (missing packages). Rebuilding..."
 else
     echo "  Checking your setup. Already-installed stuff will be skipped."
+fi
+
+if [ "$REBUILD_VENV" = true ]; then
+    rm -rf "$VENV_DIR"
+    FIRST_RUN=true
 fi
 echo ""
 
@@ -109,8 +121,20 @@ else
     done
     if [ -n "$MISSING" ]; then
         dim "Installing missing:$MISSING"
-        $PIP install --quiet $MISSING 2>/dev/null || true
-        ok "Missing packages installed"
+        $PIP install $MISSING 2>&1 | tail -5
+        # Verify they actually installed
+        STILL_MISSING=""
+        for mod_pkg in "requests:requests" "socks:PySocks" "tenacity:tenacity" "stem:stem" "monero:monero" "psutil:psutil"; do
+            mod="${mod_pkg%%:*}"
+            pkg="${mod_pkg##*:}"
+            $PY -c "import $mod" 2>/dev/null || STILL_MISSING="$STILL_MISSING $pkg"
+        done
+        if [ -n "$STILL_MISSING" ]; then
+            fail "Still missing after install:$STILL_MISSING"
+            fail "Try: rm -rf $VENV_DIR && bash install.sh"
+        else
+            ok "Missing packages installed"
+        fi
     else
         ok "All Python packages present"
     fi
@@ -239,16 +263,30 @@ PYCHECK
 
 # ---------- Create/update launcher ----------
 WRAPPER="$SCRIPT_DIR/gs"
-cat > "$WRAPPER" << 'EOF'
+cat > "$WRAPPER" << 'LAUNCHER'
 #!/bin/bash
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="$DIR/.venv/bin/python3"
-if [ ! -f "$PY" ]; then
-    echo "Setup not done yet. Run: bash install.sh"
+VENV_PY="$DIR/.venv/bin/python3"
+SYS_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+
+# Try venv first, fall back to system Python, fail clearly
+if [ -f "$VENV_PY" ] && "$VENV_PY" -c "import requests" 2>/dev/null; then
+    exec "$VENV_PY" "$DIR/run" "$@"
+elif [ -n "$SYS_PY" ] && "$SYS_PY" -c "import requests" 2>/dev/null; then
+    exec "$SYS_PY" "$DIR/run" "$@"
+elif [ -f "$VENV_PY" ]; then
+    echo ""
+    echo "  [!] Virtual environment exists but is broken (missing packages)."
+    echo "  [!] Fix: bash install.sh"
+    echo ""
+    exit 1
+else
+    echo ""
+    echo "  [!] Setup not done yet. Run: bash install.sh"
+    echo ""
     exit 1
 fi
-exec "$PY" "$DIR/run" "$@"
-EOF
+LAUNCHER
 chmod +x "$WRAPPER"
 
 # ---------- Done ----------

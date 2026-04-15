@@ -3,11 +3,61 @@
 Toolkit — Interactive Launcher
 """
 from __future__ import annotations
-import json, os, sys, subprocess, shutil
-from decimal import Decimal, InvalidOperation
+import os, sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# ── Auto-activate venv if available ─────────────────────────────────────────
+# The toolkit can be launched three ways:
+#   1. ./gs           → bash wrapper, uses .venv/bin/python3
+#   2. python3 run    → whatever python3 is on PATH (system or venv)
+#   3. .venv/bin/python3 run → directly inside venv
+#
+# Problem: if the user runs "python3 run" with system Python but packages
+# are only in .venv, every import fails. Fix: detect venv, re-exec if needed.
+_ROOT = Path(__file__).resolve().parent
+_VENV_PY = _ROOT / ".venv" / "bin" / "python3"
+
+def _venv_works() -> bool:
+    """Check if the venv Python can import the critical dep (requests)."""
+    if not _VENV_PY.exists():
+        return False
+    try:
+        import subprocess as _sp
+        r = _sp.run([str(_VENV_PY), "-c", "import requests"], 
+                    capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _system_has_deps() -> bool:
+    """Check if current Python has the critical deps."""
+    try:
+        import requests, tenacity
+        return True
+    except ImportError:
+        return False
+
+# If we're NOT in the venv and venv works, re-exec under venv Python
+if _VENV_PY.exists() and str(_VENV_PY) != sys.executable:
+    if _venv_works():
+        os.execv(str(_VENV_PY), [str(_VENV_PY), __file__] + sys.argv[1:])
+    elif not _system_has_deps():
+        print("\n  [!] Python packages are missing and the virtual environment is broken.")
+        print(f"  [!] Fix: run 'bash install.sh' to rebuild everything cleanly.")
+        print(f"  [!] Or manually: python3 -m pip install requests PySocks tenacity stem monero psutil")
+        sys.exit(1)
+
+# If venv doesn't exist at all and system has no deps, guide the user
+if not _VENV_PY.exists() and not _system_has_deps():
+    print("\n  [!] Required Python packages are not installed.")
+    print(f"  [!] Run 'bash install.sh' first, or:")
+    print(f"  [!]   python3 -m pip install requests PySocks tenacity stem monero psutil")
+    sys.exit(1)
+
+import json, subprocess, shutil
+from decimal import Decimal, InvalidOperation
+
+ROOT = _ROOT
 CORE = ROOT / "core"
 MODS = ROOT / "modules"
 OPSEC = ROOT / "opsec"
@@ -175,7 +225,9 @@ def show_status(st: dict):
 
     missing = [n for n in ["requests","PySocks","stem","monero","psutil","tenacity"] if not st.get(n)]
     if missing:
-        print(f"\n  {R}Missing deps:{N} python3 -m pip install {' '.join(missing)}")
+        _pip_cmd = ".venv/bin/pip" if (ROOT / ".venv" / "bin" / "pip").exists() else "python3 -m pip"
+        print(f"\n  {R}Missing deps:{N} {_pip_cmd} install {' '.join(missing)}")
+        print(f"  Or run: bash install.sh")
     if not st.get("tor"):
         print()
         print(f"  {R}Tor is NOT running.{N} The toolkit cannot work without Tor.")
