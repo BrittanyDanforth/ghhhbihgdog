@@ -119,10 +119,14 @@ def main():
         sys.exit("[!] wallet-rpc returned empty address — wallet may not be open.")
 
     network = _detect_network(addr_str)
-    if network != "mainnet":
-        print(f"  [!] WARNING: Address belongs to {network.upper()}, not mainnet.")
-        print(f"  [!] Do NOT feed this wallet JSON into a mainnet pipeline.")
-        integrity_log("wallet", f"network_warning:{network}")
+    if network not in ("mainnet", "unknown"):
+        integrity_log("wallet", f"network_BLOCK:{network}")
+        sys.exit(
+            f"[!] Address belongs to {network.upper()}, not mainnet.\n"
+            f"    A {network} wallet JSON fed into a mainnet pipeline will cause\n"
+            f"    all transfers to fail or send funds to unreachable addresses.\n"
+            f"    Connect monero-wallet-rpc to a mainnet wallet and retry."
+        )
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 

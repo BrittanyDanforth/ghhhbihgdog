@@ -7,7 +7,7 @@ Never use on main-net coins you do not own.
 
 End-to-end pipeline:
   Stage 0: Validate inputs, Tor, RPC sync
-  Stage 1: JoinMarket receive (optional BTC tumble)
+  Stage 1: (reserved — JoinMarket integration removed; was never wired)
   Stage 2: ThorChain BTC->XMR swap
   Stage 3: Build wallets & DAG mixing graph
   Stage 4: Build unsigned TX plan with fee-aware amounts
@@ -102,9 +102,16 @@ NUM_DECOYS = 4
 FALLBACK_FEE_XMR = Decimal("0.00005")
 
 
-def fetch_fee_from_rpc(rpc) -> Decimal:
+def fetch_fee_from_rpc(rpc, allow_fallback: bool = False) -> Decimal:
     """Ask monero-wallet-rpc for current fee estimate (the only reliable source).
-    Returns fee per TX in XMR, assuming ~2kB typical TX weight at default priority."""
+    Returns fee per TX in XMR, assuming ~2kB typical TX weight at default priority.
+
+    If the RPC fails and allow_fallback is False, aborts. The fallback fee is
+    a stale constant that can be wrong by orders of magnitude if network
+    conditions changed. Using a wrong fee either gets TXs rejected (too low)
+    or wastes operator funds (too high). Only cold/airgap mock plans may
+    use the fallback since they don't broadcast real TXs.
+    """
     try:
         resp = rpc.raw_request("get_fee_estimate", {})
         fee_per_byte = resp.get("fee", 0)
@@ -115,22 +122,35 @@ def fetch_fee_from_rpc(rpc) -> Decimal:
                 integrity_log("fee", "rpc_fee_estimate_ok")
                 return fee_xmr
             integrity_log("fee", f"rpc_fee_suspicious:{fee_xmr}")
-
+            sys.exit(
+                f"[!] RPC returned suspicious fee estimate: {fee_xmr} XMR per TX.\n"
+                f"    This is outside the expected range (0 < fee < 1 XMR).\n"
+                f"    The daemon may be misconfigured or on a different network.\n"
+                f"    Fix monerod and retry."
+            )
+    except SystemExit:
+        raise
     except Exception as e:
         integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
-    integrity_log("fee", "using_fallback_fee")
-    print(f"  [!] WARNING: Using fallback fee estimate ({FALLBACK_FEE_XMR} XMR/TX).")
-    print(f"  [!] The RPC fee estimate failed or returned suspicious values.")
-    print(f"  [!] If the actual network fee is higher, TXs may be rejected.")
-    print(f"  [!] If lower, you'll overpay. Check monerod status.")
-    return FALLBACK_FEE_XMR
+
+    if allow_fallback:
+        integrity_log("fee", "using_fallback_fee:cold_mode")
+        print(f"  [!] Using fallback fee estimate ({FALLBACK_FEE_XMR} XMR/TX) for planning only.")
+        return FALLBACK_FEE_XMR
+
+    sys.exit(
+        f"[!] Cannot get fee estimate from wallet-rpc.\n"
+        f"    The fee estimate is required to build a valid TX plan.\n"
+        f"    Without it, TX amounts and fee reserves will be wrong.\n"
+        f"    Ensure monerod is synced and monero-wallet-rpc is connected to it."
+    )
 
 
 def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
+        description="BTC->XMR mixing pipeline with Tor and ThorChain",
     )
 
     mode_group = cli.add_mutually_exclusive_group(required=True)
@@ -142,8 +162,11 @@ def main():
 
     cli.add_argument("--tor-proxy", required=True,
                      help="SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050)")
-    cli.add_argument("--joinmarket", action="store_true",
-                     help="Enable JoinMarket tumble before ThorChain swap")
+    # --joinmarket was REMOVED: the integration was never fully wired.
+    # JM tumble ran but outputs were not parsed or fed into ThorChain sizing.
+    # Keeping a half-wired money-path integration is dangerous: operators
+    # think the tumble affected the pipeline when it did not.
+    # Re-add only after JM UTXO parsing is fully implemented and tested.
     cli.add_argument("--split", type=int, default=1,
                      help="Number of BTC chunks to split across ThorChain")
     cli.add_argument("--btc-amount", type=Decimal,
@@ -160,11 +183,12 @@ def main():
     cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
                      help="Primary monero-wallet-rpc endpoint")
     cli.add_argument("--rpc-alt",
-                     help="Fallback monero-wallet-rpc endpoint")
+                     help="Secondary monero-wallet-rpc endpoint for height sync check "
+                          "only. NOT used as a fallback for TX creation or broadcast — "
+                          "all TX operations use --rpc-primary exclusively.")
     cli.add_argument("--output", default="./unsigned",
                      help="Output directory for unsigned TX plans")
-    cli.add_argument("--joinmarket-wallet",
-                     help="JoinMarket wallet file for tumbles")
+    # --joinmarket-wallet removed with --joinmarket (see above)
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--wallet-file", default="offline.wallet",
@@ -358,8 +382,6 @@ def main():
             )
         integrity_log("stage0", "receive_mode:entry_loaded")
         print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
-        if args.joinmarket:
-            sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
     else:
         if not BTC_RE.match(args.btc_entry):
             sys.exit(
@@ -466,61 +488,21 @@ def main():
     integrity_log("stage0", "rpc_sync_ok")
     integrity_log("stage0", "env_checks_ok")
 
-    fee_xmr = fetch_fee_from_rpc(rpc_primary)
+    _allow_fee_fallback = bool(args.cold or args.airgap)
+    fee_xmr = fetch_fee_from_rpc(rpc_primary, allow_fallback=_allow_fee_fallback)
     integrity_log("stage0", "fee_fetched")
 
     ###########################################################################
-    # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
+    # Stage 1 - Reserved (JoinMarket integration removed)
+    #
+    # JoinMarket was half-wired: the tumble subprocess ran but its UTXO
+    # outputs were never parsed or fed into ThorChain BTC chunk sizing.
+    # The pipeline always used --btc-amount/--split regardless of JM output.
+    # This created false confidence that JM tumbling affected the pipeline.
+    # Removed entirely until full UTXO parsing is implemented.
     ###########################################################################
     newnym()
-
-    def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
-        if not args.joinmarket:
-            integrity_log("stage1", "JM_skipped")
-            return []
-        if not args.joinmarket_wallet:
-            sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
-
-        print(f"  [!] IMPORTANT: JoinMarket integration is EXPERIMENTAL.")
-        print(f"  [!] The tumble will run but its UTXO outputs are NOT automatically")
-        print(f"  [!] fed into the ThorChain split amounts. After JoinMarket completes,")
-        print(f"  [!] the pipeline uses --btc-amount and --split for ThorChain sizing.")
-        print(f"  [!] Verify JoinMarket output manually before proceeding.")
-        integrity_log("stage1", "JM_experimental_warning_shown")
-
-        try:
-            from urllib.parse import urlparse as _urlparse
-            _parsed_proxy = _urlparse(args.tor_proxy)
-            jm_path = Path(args.joinmarket_wallet).parent / "tumble.py"
-            if not jm_path.exists():
-                jm_path = Path("tumble.py")
-            result = subprocess.run(
-                [sys.executable, str(jm_path),
-                 "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
-                 "--socks5-port", str(_parsed_proxy.port or 9050),
-                 args.joinmarket_wallet, btc_addr, "all"],
-                check=True, capture_output=True, text=True, timeout=3600,
-            )
-            integrity_log("stage1", "JM_tumble_OK")
-            print(f"  [+] JoinMarket tumble completed successfully.")
-            print(f"  [!] UTXO parsing not implemented — pipeline will use --btc-amount for sizing.")
-            return []
-        except subprocess.TimeoutExpired:
-            integrity_log("stage1", "JM_timeout")
-            sys.exit("[!] JoinMarket tumble timed out after 1 hour")
-        except FileNotFoundError:
-            integrity_log("stage1", "JM_not_found")
-            sys.exit("[!] tumble.py not found - JoinMarket not installed?")
-        except subprocess.CalledProcessError as e:
-            integrity_log("stage1", f"JM_fail:{e.returncode}")
-            sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
-
-    if receive_mode:
-        jm_utxos = []
-        integrity_log("stage1", "skipped:receive_mode")
-    else:
-        jm_utxos = stage1_joinmarket(args.btc_entry)
-    integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
+    integrity_log("stage1", "skipped:joinmarket_removed")
 
     ###########################################################################
     # Stage 2 - ThorChain swap definition
@@ -795,9 +777,7 @@ def main():
         integrity_log("stage2", "kyc_opsec_warning_shown")
         btc_chunks = []
 
-        if jm_utxos:
-            btc_chunks = jm_utxos
-        elif args.btc_amount and args.btc_amount > 0:
+        if args.btc_amount and args.btc_amount > 0:
             num_splits = max(args.split, 1)
             per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
             btc_chunks = [per_chunk] * num_splits
@@ -2266,29 +2246,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 integrity_log("stage5", f"pycache_workspace_fail:{_pyc_err}")
         integrity_log("stage5", "pycache_cleaned")
 
-    # Exit strategy simulation
-    newnym()
-    secure_delay(5.0, 15.0)
-
-    try:
-        print("  [*] Exit strategy simulation...")
-        exit_amt = str(sum(Decimal(t.get("amt", "0")) for t in plan_txs))
-        exit_env = os.environ.copy()
-        for _ek in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE", "COINGECKO_API_KEY"):
-            exit_env.pop(_ek, None)
-        # BUG 97 FIX: Pass amount via env var instead of CLI arg.
-        # CLI args are visible to all local users via /proc/PID/cmdline.
-        # The total mixed amount is sensitive — it reveals the operation scale.
-        exit_env["GS_EXIT_AMOUNT"] = exit_amt
-        subprocess.run(
-            [sys.executable, _core_script("exit_strategy_simulator"),
-             "--method", "bisq", "--tor-proxy", args.tor_proxy],
-            check=True, timeout=300, env=exit_env,
-        )
-        integrity_log("stage5", "exit_sim_ok")
-    except Exception as e:
-        integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
-        print(f"  [!] Exit simulation failed (non-fatal): {type(e).__name__}")
+    # Exit strategy simulation was removed from the automatic pipeline.
+    # It was non-fatal (failure swallowed), used a hardcoded method (bisq),
+    # and its output was never consumed by any subsequent step. Running an
+    # informational-only subprocess inside a money-critical pipeline creates
+    # false confidence that the exit plan is validated or integrated.
+    # Use option 8 (Exit Planner) from the menu for exit planning.
 
     integrity_log("stage5", "full_pipeline_complete")
 

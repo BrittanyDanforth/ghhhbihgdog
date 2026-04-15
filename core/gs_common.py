@@ -8,13 +8,18 @@ every companion script uses battle-tested, consistent implementations.
 
 OPSEC design principles
 -----------------------
-- All network I/O goes through Tor or aborts.
-- Every sensitive file is written 0600 (owner-only).
-- Integrity log uses SHA-256 hash-chain for tamper evidence.
+- All network I/O goes through validated socks5h proxy or aborts.
+- Every sensitive file is written 0600 (owner-only); write aborts if
+  chmod fails.
+- Integrity log uses SHA-256 hash-chain for tamper evidence (forensic
+  artifact, not a runtime gate — no code reads the chain for decisions).
 - CSPRNG (secrets module) for all security-critical randomness.
 - Timing jitter between operations to frustrate traffic analysis.
 - Proxy format validated before first use.
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
+- newnym() circuit rotation: hard-fails after 3 consecutive failures
+  only when called with required=True (mixer_core broadcast uses this).
+  Other callers get best-effort rotation.
 """
 from __future__ import annotations
 import hashlib, json, os, re, secrets, signal, sys, time, threading as _threading
@@ -168,10 +173,10 @@ def _json_safe_default(o):
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
 
-    BUG 35 FIX: The old verify-by-reload silently swallowed parse errors
-    (truncated JSON from disk-full, etc). If the reload fails, that means
-    the file on disk is corrupt — we must crash loudly, not continue.
-    Also fsync the parent directory to ensure the rename is durable.
+    Aborts if chmod fails: sensitive files (wallet JSON, TX plans, progress
+    files) remaining world-readable is a hard security violation, not a
+    warning. If chmod cannot be set, the file stays as .tmp and is not
+    committed.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
@@ -179,7 +184,16 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         f.flush()
         os.fsync(f.fileno())
     if not secure_file_perms(tmp, perms):
-        integrity_log("opsec", f"WARN:atomic_write_chmod_fail:{path.name}")
+        integrity_log("opsec", f"HARD_FAIL:atomic_write_chmod_fail:{path.name}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        sys.exit(
+            f"[!] Cannot set secure permissions (0600) on {path.name}.\n"
+            f"    The file would remain world-readable, exposing sensitive data.\n"
+            f"    Check filesystem permissions and disk space."
+        )
     os.replace(tmp, path)
     try:
         with open(path) as f:
@@ -199,14 +213,26 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
 
 
 def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
-    """Write text atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write text atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    Aborts if chmod fails (same rationale as atomic_write_json).
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
     if not secure_file_perms(tmp, perms):
-        integrity_log("opsec", f"WARN:atomic_write_text_chmod_fail:{path.name}")
+        integrity_log("opsec", f"HARD_FAIL:atomic_write_text_chmod_fail:{path.name}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        sys.exit(
+            f"[!] Cannot set secure permissions (0600) on {path.name}.\n"
+            f"    The file would remain world-readable, exposing sensitive data.\n"
+            f"    Check filesystem permissions and disk space."
+        )
     os.replace(tmp, path)
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -433,24 +459,10 @@ def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     return r.json()
 
 
-def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
-              headers: Dict[str, str] = None) -> dict:
-    """POST with retry. Aborts if proxies is None or empty (clearnet leak prevention)."""
-    if not proxies or not proxies.get("https"):
-        sys.exit("[!] safe_post called without valid proxies — clearnet leak. Aborting.")
-    return _safe_post_inner(url, payload, proxies, headers or {})
-
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
-       before_sleep=_newnym_between_retries)
-def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
-                     headers: Dict[str, str] = None) -> dict:
-    h = dict(_BROWSER_HEADERS)
-    if headers:
-        h.update(headers)
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies, headers=h)
-    r.raise_for_status()
-    return r.json()
+    # safe_post and _safe_post_inner were removed: defined but never called
+    # anywhere in the codebase. Dead code in a security library creates
+    # false confidence that POST operations use hardened retry/proxy logic
+    # when they actually don't. Re-add only when a real caller exists.
 
 # ---------------------------------------------------------------------------
 #  RPC connection (monero-wallet-rpc)
@@ -704,8 +716,9 @@ def validate_wallet_json(data: dict) -> None:
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
     """Return True if resources are OK. False if system is stressed.
 
-    Falls back to basic os.statvfs disk check if psutil is unavailable,
-    rather than blindly returning True.
+    Falls back to os.statvfs for disk check if psutil is unavailable.
+    If neither psutil nor statvfs works, returns False (fail closed)
+    because we cannot verify system health.
     """
     try:
         import psutil
@@ -713,14 +726,13 @@ def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
         disk = psutil.disk_usage(".")
         return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
     except ImportError:
-        try:
-            st = os.statvfs(".")
-            free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
-            if free_gb < min_disk_gb:
-                return False
-        except (OSError, AttributeError):
-            pass
-        return True
+        pass
+    try:
+        st = os.statvfs(".")
+        free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+        return free_gb >= min_disk_gb
+    except (OSError, AttributeError):
+        return False
 
 
 def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> None:

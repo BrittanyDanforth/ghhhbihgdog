@@ -330,7 +330,9 @@ def flow_full_pipeline(detected_port=None):
         "--rpc-primary", rpc,
     ]
 
-    run_script(CORE / "mixer_core", args, "Full pipeline")
+    if not run_script(CORE / "mixer_core", args, "Full pipeline"):
+        err("Pipeline failed. Check the output above for details.")
+        info("If the pipeline crashed mid-run, use option 5 (Resume) to continue.")
 
 
 def flow_receive(detected_port=None):
@@ -357,7 +359,9 @@ def flow_receive(detected_port=None):
         "--wallets", wallets,
         "--deep", depth,
     ]
-    run_script(CORE / "mixer_core", args, "Receive mode")
+    if not run_script(CORE / "mixer_core", args, "Receive mode"):
+        err("Receive mode failed. Check the output above for details.")
+        info("If the pipeline crashed mid-run, use option 5 (Resume) to continue.")
 
 
 def flow_cold(detected_port=None):
