@@ -392,8 +392,8 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     the abort would be retried 4 times before propagating. Check first, then
     call the retry-wrapped inner function.
     """
-    if proxies is None:
-        sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
+    if not proxies or not proxies.get("https"):
+        sys.exit("[!] safe_get called without valid proxies — clearnet leak. Aborting.")
     return _safe_get_inner(url, proxies)
 
 
@@ -433,9 +433,9 @@ def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
 
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
               headers: Dict[str, str] = None) -> dict:
-    """POST with retry. Aborts if proxies is None (clearnet leak prevention)."""
-    if proxies is None:
-        sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
+    """POST with retry. Aborts if proxies is None or empty (clearnet leak prevention)."""
+    if not proxies or not proxies.get("https"):
+        sys.exit("[!] safe_post called without valid proxies — clearnet leak. Aborting.")
     return _safe_post_inner(url, payload, proxies, headers or {})
 
 
@@ -474,8 +474,9 @@ class MoneroRPC:
         host = parsed.hostname
         port = parsed.port
         if not host or not port:
+            safe_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}" if parsed.hostname else "(unparseable)"
             sys.exit(
-                f"[!] Invalid RPC URL: {url}\n"
+                f"[!] Invalid RPC URL: {safe_url}\n"
                 f"    Expected format: http://host:port (e.g., http://127.0.0.1:18083)"
             )
 

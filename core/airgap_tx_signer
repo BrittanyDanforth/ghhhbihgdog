@@ -296,7 +296,8 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "split_files": split_files if len(all_blobs) > 1 else [],
             })
             created += 1
-            print(f"  [+] TX {idx} -> {tx_file.name}")
+            if not is_presigned:
+                print(f"  [+] TX {idx} -> {tx_file.name} (unsigned, needs signing)")
 
         except Exception as e:
             integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")

@@ -588,7 +588,8 @@ def main():
                         break
             except requests.exceptions.ConnectionError as e:
                 integrity_log("broadcast", f"rpc_down:idx={idx}:{str(e)[:40]}")
-                print(f"  [!] Cannot reach wallet-rpc at {args.wallet_rpc} — is it running?")
+                _wrpc_safe = f"{urlparse(args.wallet_rpc).hostname}:{urlparse(args.wallet_rpc).port}"
+                print(f"  [!] Cannot reach wallet-rpc at {_wrpc_safe} — is it running?")
                 print(f"  [!] Error: {str(e)[:80]}")
             except Exception as e:
                 integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")

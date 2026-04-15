@@ -24,7 +24,7 @@ OPSEC hardening:
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, math, os, re, secrets, sys, time, subprocess
+import argparse, json, math, os, re, requests, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -299,12 +299,24 @@ def main():
                 f"[!] Receive wallet file is a symlink: {rw_path}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
-        with open(rw_path) as f:
-            rw_data = json.load(f)
+        try:
+            with open(rw_path) as f:
+                rw_data = json.load(f)
+        except json.JSONDecodeError as e:
+            sys.exit(f"[!] Receive wallet file is not valid JSON: {e}\n"
+                     f"    File: {rw_path}\n"
+                     f"    Re-create with option 6 (Create Wallet).")
+        except OSError as e:
+            sys.exit(f"[!] Cannot read receive wallet file: {e}")
+        if not isinstance(rw_data, dict):
+            sys.exit(f"[!] Receive wallet file has wrong format (expected JSON object)")
         if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
             sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
+        if not isinstance(receive_account_index, int) or receive_account_index < 0:
+            sys.exit(f"[!] Invalid account_index in wallet JSON: {receive_account_index}\n"
+                     f"    Must be a non-negative integer.")
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
         _XMR_RECV_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
@@ -1435,7 +1447,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     except SystemExit:
         raise
     except Exception as _acct_err:
-        integrity_log("stage5", f"account_check_warn:{str(_acct_err)[:40]}")
+        integrity_log("stage5", f"account_check_FAIL:{str(_acct_err)[:40]}")
+        sys.exit(
+            f"[!] Cannot verify account_index={_plan_acct_idx} exists in wallet: {str(_acct_err)[:60]}\n"
+            f"    Wallet-rpc must be accessible to validate the plan's account.\n"
+            f"    Fix the RPC connection and retry."
+        )
 
     total_txs = len(plan_txs)
 
