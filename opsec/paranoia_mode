@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-paranoia_mode v10.0 - Post-Op Host Sanitiser
+paranoia_mode — Post-Op Host Sanitiser
 =============================================
 Focus: footprint erasure + network-fingerprint randomisation.
 
@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse, glob, os, random, shutil, subprocess, sys, time
 from pathlib import Path
 
-# Add core/ to path so gs_common can be found regardless of working directory
+# Add core/ to path so shared utilities can be found regardless of working directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
 
 from gs_common import (
@@ -92,11 +92,11 @@ def spoof_mac(iface: str, dry: bool):
         return
     try:
         subprocess.run(["ip", "link", "set", iface, "down"], check=True,
-                       capture_output=True)
+                       capture_output=True, timeout=10)
         subprocess.run(["ip", "link", "set", iface, "address", new_mac],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, timeout=10)
         subprocess.run(["ip", "link", "set", iface, "up"], check=True,
-                       capture_output=True)
+                       capture_output=True, timeout=10)
 
         # Verify the MAC was actually applied. Some wireless drivers
         # (Intel AX200/AX201, some Realtek) accept the command but
@@ -276,6 +276,10 @@ def _secure_delete_file(path: Path):
       data remains until GC. We warn and suggest shred.
     - Journaling (ext4): journal may contain original data for recent
       writes. fsync + overwrite helps but doesn't guarantee journal purge.
+    - SSD/NVMe: firmware wear-levelling remaps blocks, so overwritten
+      data may persist on unmapped pages. Only ATA Secure Erase,
+      blkdiscard --secure, or full-disk encryption (LUKS) guarantees
+      erasure on flash storage.
     """
     try:
         stat = path.stat()
@@ -284,6 +288,20 @@ def _secure_delete_file(path: Path):
             print(f"  [!] WARNING: {path} has {stat.st_nlink} hardlinks — "
                   f"data persists via other links after deletion")
             integrity_log("paranoia", f"hardlink_warn:{path.name}:nlinks={stat.st_nlink}")
+        try:
+            dev = os.stat(path).st_dev
+            dev_path = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+            rotational = (dev_path / "queue" / "rotational").resolve()
+            if not rotational.exists():
+                parent = dev_path.resolve()
+                rotational = parent.parent / "queue" / "rotational"
+            if rotational.exists() and rotational.read_text().strip() == "0":
+                print(f"  [!] WARNING: {path} is on SSD/NVMe — overwrite may not erase "
+                      f"original blocks due to wear-levelling. Use full-disk encryption "
+                      f"(LUKS) or blkdiscard --secure for reliable erasure.")
+                integrity_log("paranoia", f"ssd_warn:{path.name}")
+        except (OSError, ValueError):
+            pass
         with open(path, "r+b") as f:
             remaining = size
             chunk_size = 65536
@@ -309,8 +327,8 @@ def _secure_delete_dir(path: Path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
-    """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
+def wipe_artifacts(dry: bool, extra_dirs: list = None):
+    """Wipe ALL toolkit output files. Searches cwd, home dir,
     common subdirectories, and any --search-dir paths provided."""
     file_patterns = [
         # Core pipeline
@@ -319,23 +337,44 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         "wallet_*.json", "thor_pairs_*.json",
         "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
         "exitplan_*.json", "exitplan_v1.json",
+        "plan_output.json",
         "integrity_chain.log", "integrity.log",
+        "integrity_chain.log.lock",
         "*.blob", "*.signed", "*.unsigned",
         "signed_manifest_v1.json", "unsigned_manifest.json",
         ".ghostspiral.lock", ".mixer.lock",
+        # Stale .tmp files from atomic_write_json/atomic_write_text crash.
+        # If the process is killed between tmp write and os.replace(), the
+        # .tmp file persists with the SAME sensitive data as the final file.
+        "unsigned_*.json.tmp", "signer_progress.json.tmp",
+        "stage5_progress.json.tmp", "broadcast_progress.json.tmp",
+        "wallet_*.json.tmp", "exitplan_*.json.tmp",
+        "plan_output.json.tmp",
+        "integrity_chain.log.tmp",
+        "unsigned_manifest.json.tmp", "signed_manifest_v1.json.tmp",
+        "swap_progress_secure.json.tmp",
         # Entropy + chaos pipeline
         "entropy_seed.json", "entropy_seed.json.tmp",
-        "dag_structure.json", "dag_augmented.json",
-        "label_map.json", "label_map_poisoned.json",
-        "decoy_noise.json",
+        "dag_structure.json", "dag_structure.json.tmp",
+        "dag_augmented.json", "dag_augmented.json.tmp",
+        "label_map.json", "label_map.json.tmp",
+        "label_map_poisoned.json", "label_map_poisoned.json.tmp",
+        "decoy_noise.json", "decoy_noise.json.tmp",
         "swap_integrity_v2.log", "swap_progress_secure.json",
-        "tor_operations.log", "operational_endpoints.json",
+        "tor_operations.log", "tor_operations.log.tmp",
+        "operational_endpoints.json", "operational_endpoints.json.tmp",
         # Mutator output + manifests (smoking gun if left on disk)
-        "*.manifest.json",
+        "*.manifest.json", "*.manifest.json.tmp",
         "wallet_mutation_manifest_v1.json",
+        "fake_leaf_manifest_v1.json",
+        "mutated_wallet.json", "mutated_wallet.json.tmp",
         # Fake/decoy logs
-        "mirror_exec.log", "fake_errors.log",
+        "mirror_exec.log", "mirror_exec.log.tmp",
+        "fake_errors.log",
         "fake_integrity_chain.log",
+        "integrity_fake.log", "integrity_fake.log.tmp",
+        # Catch-all for any remaining .tmp from atomic writes
+        "thor_pairs_batch.json.tmp",
     ]
     dir_patterns = [
         "signed_blobs", "unsigned", "tx_staging", "runtime",
@@ -346,6 +385,8 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         Path.home(),
         Path.home() / "ghostspiral",
         Path.home() / "GhostSpiral",
+        Path.home() / "toolkit",
+        Path.home() / "ops",
         Path.home() / "Desktop",
         Path.home() / "Downloads",
         Path("/media"),
@@ -355,15 +396,22 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
 
     count = 0
 
-    # Wipe GhostSpiral files in /dev/shm (RAM-only storage)
+    # Wipe toolkit files in /dev/shm (RAM-only storage)
     shm = Path("/dev/shm")
     if shm.is_dir():
         shm_patterns = [
             ".gs_seed_active", ".gs_seed_active.tmp",
+            ".gs_seed_lock",
             "gs_*", "vm_timing.json", "vm_timing.tmp",
             "swap_progress_secure.json", "swap_progress_secure.tmp",
             "circuit_burn.log", "gs_unlock_token", "gs_paranoia_wipe",
             ".gs_locked_bundle", ".gs_lock_meta",
+            ".tk_*",
+            "fake_errors.log",
+        ]
+        shm_dir_patterns = [
+            "qr_codes",
+            "decoys",
         ]
         for pat in shm_patterns:
             for f in shm.glob(pat):
@@ -372,13 +420,21 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
                 else:
                     _secure_delete_file(f)
                 count += 1
+        for dirname in shm_dir_patterns:
+            d = shm / dirname
+            if d.is_dir():
+                if dry:
+                    print(f"  [dry] would securely delete dir {d}")
+                else:
+                    _secure_delete_dir(d)
+                count += 1
     for root in search_roots:
         if not root.is_dir():
             continue
 
         # Use recursive glob (**/) to find artifacts at any depth.
         # The old code only searched one level deep, missing artifacts
-        # in nested directories (e.g. ~/projects/ghostspiral/run3/unsigned/).
+        # in nested directories (e.g. ~/projects/toolkit/run3/unsigned/).
         # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
         depth_patterns = [
             "",          # root itself
@@ -407,7 +463,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
                         count += 1
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
-    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
+    integrity_log("paranoia", f"artifacts:{'dry' if dry else 'wiped'}:{count}")
 
 
 def wipe_tmp_files(dry: bool):
@@ -494,7 +550,7 @@ def wipe_xdg_traces(dry: bool):
 
 
 def scrub_env_vars(dry: bool):
-    """Remove GhostSpiral-related environment variables from the current process.
+    """Remove sensitive environment variables from the current process.
 
     /proc/self/environ is immutable on Linux, so we can only clear the
     variables in the current process. The parent shell's env persists until
@@ -552,7 +608,7 @@ def main():
     default_iface = _detect_active_interface()
 
     ap = argparse.ArgumentParser(
-        "paranoia_mode v10.0",
+        "paranoia_mode",
         description="Post-operation host sanitisation",
     )
     ap.add_argument("--wipe-days", type=int, default=7,
@@ -562,7 +618,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print actions without executing")
     ap.add_argument("--search-dir", action="append", default=[],
-                    help="additional directories to search for GhostSpiral artifacts "
+                    help="additional directories to search for toolkit artifacts "
                          "(can be specified multiple times)")
     args = ap.parse_args()
 
@@ -618,15 +674,15 @@ def main():
     print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
     print("  [!]   history -c && history -w  # clear shell history of unset commands")
 
-    # Phase 13 (GhostSpiral artifacts) MUST run LAST because it wipes
+    # Phase 13 (toolkit artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 13: GhostSpiral artifacts (runs last — wipes integrity log)")
+    print("  [*] Phase 13: Toolkit artifacts (runs last — wipes integrity log)")
     print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
     print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
     print("  [!] encryption instead. On ext4 with journaling, recently-written file")
     print("  [!] data may persist in the journal even after secure deletion.")
-    wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
+    wipe_artifacts(args.dry_run, extra_dirs=args.search_dir)
 
     # DO NOT call integrity_log() here — it would recreate the wiped log file
     print("\n  [+] paranoia_mode complete.")

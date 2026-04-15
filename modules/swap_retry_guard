@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-swap_retry_guard.py — GhostSpiral v16.9 Chaos Toolkit
-====================================================
+swap_retry_guard — Advanced swap orchestration with adaptive retry logic
+========================================================================
 Advanced swap orchestrator with military-grade OpSec, chaos engineering,
 and zero-failure guarantees. Features adaptive anonymity, quantum-resistant
 entropy, multi-layer obfuscation, and real-time traffic analysis evasion.
@@ -75,9 +75,9 @@ except ImportError as e:
     print("Install with: pip install requests pyyaml tenacity stem psutil cryptography", file=sys.stderr)
     sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 # File paths
 SEED_FILE = Path("entropy_seed.json")
@@ -89,6 +89,7 @@ RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").ex
 THOR_APIS = [
     "https://thornode.ninerealms.com",
     "https://thornode-v1.ninerealms.com",
+    "https://thornode.thorswap.net",
 ]
 
 # Security parameters
@@ -102,16 +103,16 @@ TIMING_JITTER_RANGE = (0.5, 3.0)
 PHANTOM_TRAFFIC_PROB = 0.0
 MAX_CONCURRENT_SWAPS = 2
 STEALTH_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # ADVANCED SECURITY UTILITIES
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 class SecureMemory:
     """Military-grade memory management with secure deletion."""
@@ -169,7 +170,7 @@ class QuantumEntropyFusion:
                 proc = psutil.Process()
                 sources.append(struct.pack('f', proc.cpu_percent()))
                 sources.append(struct.pack('Q', proc.memory_info().rss))
-            except:
+            except (OSError, psutil.Error):
                 pass
                 
             # Network entropy — use local interface info only (no clearnet traffic)
@@ -194,7 +195,16 @@ class QuantumEntropyFusion:
             return kdf.derive(combined)
     
     def get_secure_random(self) -> random.Random:
-        """Get cryptographically secure random generator."""
+        """Get seeded PRNG for reproducible jitter/ordering.
+
+        WARNING: Despite the name, this is NOT cryptographically secure.
+        random.Random is a Mersenne Twister PRNG. Anyone with the seed file
+        (entropy_seed.json) can reproduce the exact sequence of timing
+        delays, endpoint selection, and header choices. Do NOT use this
+        for key generation or nonces — use secrets/os.urandom for those.
+        The seed file sits on disk by default; delete it after use or
+        store it only in RAM (/dev/shm) via the SML module.
+        """
         entropy = self.harvest_entropy()
         seed = int.from_bytes(entropy, 'big')
         return random.Random(seed)
@@ -226,7 +236,7 @@ class CircuitBurnProtocol:
             return True
             
         # Random burns for unpredictability
-        if random.random() < 0.05:  # 5% chance
+        if secrets.randbelow(100) < 5:  # 5% chance
             return True
             
         return False
@@ -259,7 +269,7 @@ class CircuitBurnProtocol:
                 controller.signal(Signal.NEWNYM)
                 
                 # Wait for circuit establishment
-                time.sleep(random.uniform(2, 5))
+                time.sleep(2 + secrets.randbelow(3000) / 1000.0)
                 
                 # Log burn event
                 self.burn_count += 1
@@ -270,10 +280,14 @@ class CircuitBurnProtocol:
                     'reason': 'scheduled_burn'
                 })
                 
-                # Write burn log
+                # Write burn log (coarsened timestamp, restricted perms)
                 if CIRCUIT_LOG.parent.exists():
-                    with CIRCUIT_LOG.open('a') as f:
-                        f.write(f"{self.last_burn}|BURN|{self.burn_count}\n")
+                    coarsened_ts = int(self.last_burn) // 600 * 600
+                    fd = os.open(str(CIRCUIT_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    try:
+                        os.write(fd, f"{coarsened_ts}|BURN|{self.burn_count}\n".encode())
+                    finally:
+                        os.close(fd)
                 
                 return True
                 
@@ -297,22 +311,30 @@ class IntegrityChainV2:
     def add_entry(self, tag: str, detail: str, metadata: Dict[str, Any] = None):
         """Add integrity chain entry."""
         with self.chain_lock:
-            timestamp = datetime.now(timezone.utc).isoformat()
+            coarsened_ts = int(time.time()) // 600 * 600
             
-            entry_data = f"{timestamp}|{tag}|{detail}"
+            entry_data = f"{coarsened_ts}|{tag}|{detail}"
             if metadata:
-                entry_data += f"|{json.dumps(metadata, sort_keys=True)}"
+                safe_meta = {k: v for k, v in metadata.items()
+                             if k not in ("endpoint", "url")}
+                if safe_meta:
+                    entry_data += f"|{json.dumps(safe_meta, sort_keys=True)}"
                 
             new_hash = self._compute_hash(entry_data)
             
             log_entry = f"{new_hash}|{entry_data}\n"
             
             try:
-                with INTEGRITY_LOG.open('a') as f:
-                    f.write(log_entry)
+                fd = os.open(str(INTEGRITY_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try:
+                    os.write(fd, log_entry.encode())
+                finally:
+                    os.close(fd)
                 self.chain_state = new_hash
-            except Exception:
-                pass  # Fail silently for OpSec
+            except OSError:
+                # Advance chain_state even on write failure to keep hash chain
+                # consistent for future entries that may succeed.
+                self.chain_state = new_hash
 
 
 class TrafficObfuscator:
@@ -380,9 +402,9 @@ class TrafficObfuscator:
         self.request_history.append(entry)
 
 
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 # ENHANCED SWAP ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------
 
 class AdvancedSwapOrchestrator:
     """Military-grade swap execution with zero-failure guarantee."""
@@ -443,8 +465,10 @@ class AdvancedSwapOrchestrator:
                     additional = yaml.safe_load(pool_file.read_text())
                     if isinstance(additional, list):
                         pool.extend(additional)
-                except Exception:
-                    pass
+                    else:
+                        print(f"[!] WARNING: {pool_file} is not a YAML list — ignoring", file=sys.stderr)
+                except Exception as e:
+                    print(f"[!] WARNING: Failed to parse aggregator pool {pool_file}: {e}", file=sys.stderr)
                     
         # Shuffle for unpredictability
         self.rng.shuffle(pool)
@@ -453,7 +477,7 @@ class AdvancedSwapOrchestrator:
     def _load_progress(self) -> Dict[str, Any]:
         """Load progress with integrity verification."""
         default_progress = {
-            "schema": "swap_v2_secure",
+            "schema": "progress",
             "last": -1,
             "log": [],
             "integrity_hash": "",
@@ -672,7 +696,7 @@ class AdvancedSwapOrchestrator:
                 if result.get("expected_amount_out") or result.get("transaction_id"):
                     self.integrity_chain.add_entry(
                         "SWAP_SUCCESS", 
-                        f"idx={idx}|endpoint={endpoint}|attempt={attempt}",
+                        f"idx={idx}|attempt={attempt}",
                         {"result_hash": hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()[:16]}
                     )
                     success = True
@@ -687,7 +711,7 @@ class AdvancedSwapOrchestrator:
                 
                 self.integrity_chain.add_entry(
                     "SWAP_ATTEMPT_FAIL",
-                    f"idx={idx}|endpoint={endpoint}|attempt={attempt}",
+                    f"idx={idx}|attempt={attempt}",
                     {"error": str(e)[:100]}
                 )
                 
@@ -733,13 +757,13 @@ class AdvancedSwapOrchestrator:
             total_swaps = len(plan)
             successful_swaps = 0
             
-            print(f"[•] Starting swap execution: {total_swaps} swaps")
-            print(f"[•] Using {len(self.aggregator_pool)} aggregators")
-            print(f"[•] Proxy chain: {len(self.proxy_chain)} hops")
+            print(f"[*] Starting swap execution: {total_swaps} swaps")
+            print(f"[*] Using {len(self.aggregator_pool)} aggregators")
+            print(f"[*] Proxy chain: {len(self.proxy_chain)} hops")
             
             # Execute swaps
             for i, swap_entry in enumerate(plan):
-                print(f"\n[•] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
+                print(f"\n[*] Processing swap {i+1}/{total_swaps} (idx={swap_entry.get('idx', i)})")
                 
                 try:
                     result = self._execute_single_swap(swap_entry)
@@ -748,9 +772,9 @@ class AdvancedSwapOrchestrator:
                         last_log = self.progress["log"][-1] if self.progress["log"] else {}
                         if not last_log.get("phantom") and not last_log.get("dry_run"):
                             successful_swaps += 1
-                            print(f"[✓] Swap {swap_entry.get('idx', i)} completed successfully")
+                            print(f"[+] Swap {swap_entry.get('idx', i)} quote fetched")
                         else:
-                            print(f"[·] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
+                            print(f"[*] Swap {swap_entry.get('idx', i)} — {'phantom decoy' if last_log.get('phantom') else 'dry run'}")
                     else:
                         print(f"[!] Swap {swap_entry.get('idx', i)} failed")
                         
@@ -759,11 +783,11 @@ class AdvancedSwapOrchestrator:
                     self.integrity_chain.add_entry("SWAP_EXCEPTION", f"idx={swap_entry.get('idx', i)}", {"error": str(e)})
                     
             # Final statistics
-            print(f"\n[✓] Swap plan execution complete")
-            print(f"    Total swaps: {total_swaps}")
-            print(f"    Successful: {successful_swaps}")
+            print(f"\n[*] Swap quote fetching finished")
+            print(f"    Total quotes requested: {total_swaps}")
+            print(f"    Quotes received: {successful_swaps}")
             print(f"    Failed: {total_swaps - successful_swaps}")
-            print(f"    Success rate: {(successful_swaps/total_swaps)*100:.1f}%")
+            print(f"    [!] These are QUOTES, not executed swaps. Operator must still send BTC.")
             print(f"    Circuit burns: {self.circuit_burn.burn_count}")
             
             self.integrity_chain.add_entry(
@@ -798,7 +822,7 @@ Examples:
     
     # Network configuration
     parser.add_argument("--proxy-chain", required=True, 
-                       help="Comma-separated SOCKS/HTTP proxy chain (e.g. socks5h://127.0.0.1:9050). "
+                       help="Comma-separated socks5h:// proxy chain (e.g. socks5h://127.0.0.1:9050). "
                             "Tor control is 9051 (system) or 9151 (Tor Browser) — never use those as SOCKS hops.")
     parser.add_argument("--aggregator-pool", 
                        help="YAML file with additional aggregator endpoints")
@@ -808,8 +832,13 @@ Examples:
                        help="Tor control socket path")
     
     # Security options
-    parser.add_argument("--stealth-mode", action="store_true",
-                       help="Enable maximum stealth with traffic obfuscation")
+    stealth_group = parser.add_mutually_exclusive_group()
+    stealth_group.add_argument("--stealth-mode", action="store_true", dest="stealth_mode", default=True,
+                               help="Add timing jitter before first request per swap (default: on). "
+                                    "NOTE: this only affects request timing, not traffic "
+                                    "content, headers, endpoints, or Tor circuit behaviour.")
+    stealth_group.add_argument("--no-stealth-mode", action="store_false", dest="stealth_mode",
+                               help="Disable stealth mode timing jitter")
     
     parser.add_argument("--phantom-prob", type=float, default=0.0,
                        help="Probability of phantom failure injection (0.0-1.0, default disabled)")
@@ -817,8 +846,11 @@ Examples:
     # Operational modes
     parser.add_argument("--dry-run", action="store_true",
                        help="Simulate swaps without actual execution")
-    parser.add_argument("--force-circuit-burn", action="store_true",
-                       help="Force circuit burn before each swap")
+    burn_group = parser.add_mutually_exclusive_group()
+    burn_group.add_argument("--force-circuit-burn", action="store_true", dest="force_circuit_burn", default=True,
+                            help="Force Tor circuit rotation before each swap for per-swap isolation (default: on)")
+    burn_group.add_argument("--no-force-circuit-burn", action="store_false", dest="force_circuit_burn",
+                            help="Disable forced circuit rotation before each swap")
     # Advanced options
     parser.add_argument("--memory-lock", action="store_true",
                        help="Lock sensitive data in memory (requires privileges)")
@@ -835,7 +867,18 @@ Examples:
         print(f"[!] Entropy seed file not found: {SEED_FILE}", file=sys.stderr)
         print("    Run entropy_seeder.py first to generate entropy seed", file=sys.stderr)
         sys.exit(1)
+
+    if not str(SEED_FILE.resolve()).startswith("/dev/shm"):
+        print("[!] WARNING: entropy_seed.json is on persistent storage.", file=sys.stderr)
+        print("    Anyone who seizes this file can reproduce all PRNG-derived", file=sys.stderr)
+        print("    timing jitter, endpoint ordering, and header selection.", file=sys.stderr)
+        print("    Use 'python3 SML load entropy_seed.json' to keep it RAM-only,", file=sys.stderr)
+        print("    or delete it immediately after operations complete.", file=sys.stderr)
         
+    import math as _math
+    if _math.isnan(args.phantom_prob) or _math.isinf(args.phantom_prob):
+        print(f"[!] phantom-prob must be a finite number, got {args.phantom_prob}", file=sys.stderr)
+        sys.exit(1)
     if args.phantom_prob < 0.0 or args.phantom_prob > 1.0:
         print(f"[!] phantom-prob must be between 0.0 and 1.0, got {args.phantom_prob}", file=sys.stderr)
         sys.exit(1)
@@ -847,8 +890,10 @@ Examples:
         if proxy_url.lower().startswith('socks5://') and not proxy_url.lower().startswith('socks5h://'):
             print(f"[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead: {proxy_url}")
             sys.exit(1)
-        if not proxy_url.startswith(('socks5h://', 'http://', 'https://')):
-            print(f"[!] Invalid proxy URL format: {proxy_url}", file=sys.stderr)
+        if not proxy_url.lower().startswith('socks5h://'):
+            print(f"[!] Only socks5h:// proxies are accepted (Tor DNS privacy).", file=sys.stderr)
+            print(f"    Got: {proxy_url}", file=sys.stderr)
+            print(f"    http/https proxies leak DNS and don't route through Tor.", file=sys.stderr)
             sys.exit(1)
             
         # Parse URL to validate
@@ -862,10 +907,15 @@ Examples:
     
     # Security warnings
     if not args.stealth_mode:
-        print("[!] Warning: Stealth mode disabled. Traffic patterns may be detectable.")
+        print("[!] WARNING: Stealth mode disabled (--no-stealth-mode). Traffic timing patterns may be detectable.")
+
+    if len(args.proxy_chain.split(',')) == 1 and not args.force_circuit_burn:
+        print("[!] WARNING: Single-proxy chain with --no-force-circuit-burn means all")
+        print("    swap requests in a batch share the same Tor circuit (until periodic")
+        print("    burn triggers). Consider re-enabling --force-circuit-burn.")
         
     if args.phantom_prob > 0:
-        print(f"[•] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
+        print(f"[*] Phantom traffic enabled at {args.phantom_prob:.0%} probability.")
     
     # Memory locking (requires root on most systems)
     if args.memory_lock:
@@ -873,13 +923,13 @@ Examples:
             import ctypes as _ctypes
             _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
             if _libc.mlockall(1 | 2) == 0:
-                print("[•] Memory locking enabled")
+                print("[+] Memory locking enabled")
             else:
                 print("[!] Memory locking failed (need root or CAP_IPC_LOCK)")
         except Exception as e:
             print(f"[!] Memory locking failed: {e}")
     
-    print("[•] Swap Orchestrator Starting")
+    print("[*] Swap orchestrator starting")
     print(f"    Plan file: {args.plan}")
     print(f"    Proxy chain: {len(args.proxy_chain.split(','))} hops")
     print(f"    Stealth mode: {'enabled' if args.stealth_mode else 'disabled'}")
@@ -896,10 +946,10 @@ Examples:
         success = orchestrator.execute_swap_plan(Path(args.plan))
         
         if success:
-            print("\n[✓] All swaps completed successfully")
+            print("\n[+] All swap quotes fetched. Operator must send BTC to complete swaps.")
             sys.exit(0)
         else:
-            print("\n[!] Some swaps failed - check logs for details")
+            print("\n[!] Some swap quotes failed - check logs for details")
             sys.exit(1)
             
     except KeyboardInterrupt:
@@ -911,21 +961,17 @@ Examples:
     finally:
         # Secure cleanup
         try:
-            # Clear sensitive environment variables
-            for var in ['TOR_PASSWORD', 'SWAP_API_KEY', 'PRIVATE_KEY']:
+            for var in ['TOR_PASSWORD', 'TOR_CONTROL_PASSWORD',
+                        'SWAP_API_KEY', 'PRIVATE_KEY',
+                        'GS_WALLET_PASSWORD', 'GS_WALLET_FILE',
+                        'COINGECKO_API_KEY']:
                 if var in os.environ:
-                    os.environ[var] = '0' * len(os.environ[var])
                     del os.environ[var]
                     
-            # Force garbage collection
             gc.collect()
-            
-            # Memory barrier
-            if hasattr(os, 'sync'):
-                os.sync()
                 
-        except Exception:
-            pass
+        except Exception as _cleanup_err:
+            print(f"[!] Cleanup error (non-fatal): {_cleanup_err}", file=sys.stderr)
 
 
 if __name__ == "__main__":

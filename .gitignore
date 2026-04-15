@@ -11,7 +11,7 @@ entropy_seed.json
 stage5_progress.json
 broadcast_progress.json
 signer_progress.json
-.ghostspiral.lock
+.mixer.lock
 tx_staging/
 signed_blobs/
 unsigned/

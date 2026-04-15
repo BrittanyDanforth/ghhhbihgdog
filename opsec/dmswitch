@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-deadman_entropy_qr.py — Enhanced GhostSpiral v2.0 Dead Man's Switch
-==================================================================
+deadman_entropy_qr.py — Enhanced Dead Man's Switch
+===================================================
  dead man's switch for entropy seed protection with advanced OPSEC.
 
 Enhanced Security Features:
@@ -132,7 +132,7 @@ class SecureMemory:
                     mm.write(secrets.token_bytes(size))
                     mm.flush()
                 mm.close()
-            except:
+            except Exception:
                 pass
         self._allocations.clear()
 
@@ -141,13 +141,37 @@ class AntiForensics:
     
     @staticmethod
     def secure_delete_file(filepath: Path) -> bool:
-        """DOD 5220.22-M standard file wiping"""
+        """DOD 5220.22-M standard file wiping.
+
+        WARNING: Multi-pass overwrite is ineffective on:
+        - SSD/NVMe: firmware wear-levelling remaps blocks; original data may
+          persist on unmapped pages. Use full-disk encryption (LUKS) or
+          blkdiscard --secure instead.
+        - CoW filesystems (btrfs/ZFS): overwrite allocates new blocks; old
+          data remains in snapshots/CoW until garbage collected.
+        - Journaling (ext4 default): journal may retain original data.
+        Only full-disk encryption guarantees erasure on modern hardware.
+        """
         if not filepath.exists():
             return True
         
         try:
             file_size = filepath.stat().st_size
             
+            try:
+                dev = os.stat(filepath).st_dev
+                dev_path = Path(f"/sys/dev/block/{os.major(dev)}:{os.minor(dev)}")
+                rotational = (dev_path / "queue" / "rotational").resolve()
+                if not rotational.exists():
+                    parent = dev_path.resolve()
+                    rotational = parent.parent / "queue" / "rotational"
+                if rotational.exists() and rotational.read_text().strip() == "0":
+                    print(f"[!] WARNING: {filepath} is on SSD/NVMe — overwrite may not erase "
+                          f"original blocks. Use full-disk encryption (LUKS) or "
+                          f"blkdiscard --secure for reliable erasure.")
+            except (OSError, ValueError):
+                pass
+
             # Multiple pass overwriting
             patterns = [
                 b'\x00' * 1024,  # Zeros
@@ -186,7 +210,7 @@ class AntiForensics:
         for i in range(count):
             decoy_path = DECOY_DIR / f"backup_{secrets.token_hex(4)}.json"
             decoy_data = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": secrets.token_hex(64),
                 "checksum": secrets.token_hex(32)
             }
@@ -200,7 +224,7 @@ class AntiForensics:
                 AntiForensics.secure_delete_file(decoy_file)
             try:
                 DECOY_DIR.rmdir()
-            except:
+            except Exception:
                 pass
 
 class CryptoEngine:
@@ -326,13 +350,13 @@ class QRManager:
         try:
             # Try to use a system font
             font = ImageFont.load_default()
-        except:
+        except Exception:
             font = None
         
         # Add fake document header
         if font:
             draw.text((20, 20), "System Configuration Backup", fill='black', font=font)
-            draw.text((20, 40), f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", fill='gray', font=font)
+            draw.text((20, 40), f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}", fill='gray', font=font)
             draw.text((20, 60), "Checksum verification required", fill='gray', font=font)
         
         # Embed QR code
@@ -365,8 +389,7 @@ class QRManager:
             
             if auto_clear:
                 time.sleep(30)
-                # Clear terminal
-                os.system('clear' if os.name == 'posix' else 'cls')
+                print("\033[2J\033[H", end="", flush=True)
                 print("[+] QR code cleared from terminal")
             
             return True
@@ -425,7 +448,7 @@ class DeadManSwitch:
             try:
                 if SECURE_DIR.exists() and not any(SECURE_DIR.iterdir()):
                     SECURE_DIR.rmdir()
-            except:
+            except Exception:
                 pass
                 
             print("[+] Secure cleanup completed")
@@ -463,16 +486,37 @@ class DeadManSwitch:
                 "integrity_token": secrets.token_hex(32)
             }
             
-            # Write encrypted bundle and metadata
-            LOCKED_BUNDLE.write_bytes(encrypted_data)
-            LOCK_METADATA.write_text(json.dumps(metadata, indent=2))
-            
-            # Secure delete original
+            # Write encrypted bundle and metadata with fsync.
+            # On /dev/shm (tmpfs) fsync is a no-op — data is RAM-only by design.
+            # On the disk fallback (.tmp_secure), fsync is essential: without it,
+            # a power loss after secure_delete but before kernel flush = fund loss.
+            _bundle_fd = os.open(str(LOCKED_BUNDLE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_bundle_fd, encrypted_data)
+                os.fsync(_bundle_fd)
+            finally:
+                os.close(_bundle_fd)
+
+            _meta_bytes = json.dumps(metadata, indent=2).encode()
+            _meta_fd = os.open(str(LOCK_METADATA), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_meta_fd, _meta_bytes)
+                os.fsync(_meta_fd)
+            finally:
+                os.close(_meta_fd)
+
+            # Verify both files are readable before destroying the original
+            if LOCKED_BUNDLE.stat().st_size != len(encrypted_data):
+                raise RuntimeError("Encrypted bundle size mismatch after write")
+            if LOCK_METADATA.stat().st_size != len(_meta_bytes):
+                raise RuntimeError("Lock metadata size mismatch after write")
+
+            # Secure delete original — only safe now that the bundle is durable
             AntiForensics.secure_delete_file(SEED_FILE)
             
             # Handle QR code generation / token delivery BEFORE announcing success
             if qr_image and QR_AVAILABLE:
-                qr_filename = f"unlock_qr_{secrets.token_hex(4)}.png"
+                qr_filename = f"{secrets.token_hex(8)}.dat"
                 qr_path = QR_OUTPUT_DIR / qr_filename
                 if self.qr_manager.generate_qr_image(token, qr_path, steganography):
                     print(f"[+] QR code image: {qr_path}")
@@ -481,18 +525,26 @@ class DeadManSwitch:
             else:
                 print(f"\n[+] UNLOCK TOKEN (keep secure):")
                 print(f"    {token[:8]}...{token[-8:]}")
-                print(f"    Full token written to: /dev/shm/gs_unlock_token")
+                _tk_name = f".tk_{secrets.token_hex(4)}"
+                print(f"    Full token written to: /dev/shm/{_tk_name}")
                 print(f"\n[!] Token will be needed within {ttl} seconds")
-                _tk_path = Path("/dev/shm/gs_unlock_token")
-                _tk_path.write_text(token)
-                os.chmod(_tk_path, 0o600)
+                print(f"[!] WARNING: Token file is PLAINTEXT in /dev/shm. Any process running")
+                print(f"[!] as the same UID can read it. Delete immediately after copying.")
+                _tk_path = Path(f"/dev/shm/{_tk_name}")
+                _tk_fd = os.open(str(_tk_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(_tk_fd, token.encode())
+                    os.fsync(_tk_fd)
+                finally:
+                    os.close(_tk_fd)
             
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)
 
-            print(f"[+] Entropy seed locked successfully")
+            print(f"[+] Entropy seed encrypted and original securely deleted")
             print(f"[+] TTL: {ttl} seconds ({ttl//60}m {ttl%60}s)")
             print(f"[+] Expires: {metadata['expires_at']}")
+            print(f"[!] VERIFY: Run unlock with the token BEFORE relying on this lock.")
 
             return True
             
@@ -502,38 +554,37 @@ class DeadManSwitch:
             return False
     
     def _start_ttl_countdown(self, ttl: int):
-        """Start TTL countdown with periodic warnings"""
-        def countdown():
-            intervals = [ttl//2, ttl//4, 60, 30, 10, 5, 3, 2, 1]  # Warning intervals
-            start_time = time.time()
-            
-            while time.time() - start_time < ttl:
-                elapsed = time.time() - start_time
-                remaining = ttl - elapsed
-                
-                # Check for warning intervals
-                for interval in intervals:
-                    if abs(remaining - interval) < 1:  # Within 1 second
-                        if interval >= 60:
-                            print(f"[!] WARNING: {int(remaining//60)}m {int(remaining%60)}s remaining until auto-destruct")
-                        else:
-                            print(f"[!] WARNING: {int(remaining)}s remaining until auto-destruct")
-                        break
-                
-                time.sleep(1)
-                
-                # Check if files were unlocked externally
-                if not LOCKED_BUNDLE.exists():
-                    return
-            
-            # TTL expired - self destruct
+        """Start TTL countdown as a separate process (survives parent exit).
+
+        LIMITATION: If the child is SIGKILL'd before TTL expires, no
+        automatic destruction occurs. The lock metadata records expires_at
+        so unlock will refuse after expiry, but the encrypted bundle
+        persists on /dev/shm until reboot (tmpfs) or manual cleanup.
+        There is no reliable fix for SIGKILL — it cannot be caught.
+        Mitigation: lock metadata stores the expiry timestamp, and the
+        unlock path checks it.  paranoia_mode also wipes /dev/shm/.gs_*.
+        """
+        import signal as _sig
+        _sig.signal(_sig.SIGCHLD, _sig.SIG_IGN)  # Auto-reap
+        pid = os.fork()
+        if pid == 0:
+            # Child process
+            _sig.signal(_sig.SIGTERM, lambda *_: sys.exit(0))
+            time.sleep(ttl)
             if LOCKED_BUNDLE.exists():
                 print("\n[!] TTL EXPIRED - INITIATING SELF-DESTRUCT")
-                self._secure_cleanup()
-        
-        # Run countdown in background thread
-        countdown_thread = threading.Thread(target=countdown, daemon=True)
-        countdown_thread.start()
+                AntiForensics.secure_delete_file(LOCKED_BUNDLE)
+                AntiForensics.secure_delete_file(LOCK_METADATA)
+                AntiForensics.cleanup_decoys()
+            # Also wipe any lingering token files
+            for tk_file in Path("/dev/shm").glob(".tk_*"):
+                try:
+                    AntiForensics.secure_delete_file(tk_file)
+                except Exception:
+                    pass
+            sys.exit(0)
+        else:
+            print(f"  [*] TTL wiper started (PID {pid})")
     
     def unlock_entropy_seed(self, token: str) -> bool:
         """Unlock the entropy seed with verification"""
@@ -576,13 +627,18 @@ class DeadManSwitch:
                 print("[!] Locked bundle is PRESERVED — you can retry with the correct token.")
                 return False
 
-            # Restore entropy seed
-            SEED_FILE.write_bytes(decrypted_data)
+            # Restore entropy seed with fsync to ensure durability
+            fd = os.open(str(SEED_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, decrypted_data)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
-            # Only now that restore succeeded, clean up the encrypted copies
+            # Only now that restore is durable on disk, clean up the encrypted copies
             self._secure_cleanup()
 
-            print("[+] Entropy seed successfully unlocked and restored")
+            print("[+] Entropy seed decrypted and restored (fsync'd)")
             print(f"[+] File restored: {SEED_FILE}")
 
             return True
@@ -624,7 +680,7 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     
     # Lock options
     parser.add_argument("--ttl", type=int, default=300,
-                       help="Time-to-live in seconds (default: 300)")
+                       help="Time-to-live in seconds (default: 300, min: 10)")
     
     # QR code options
     parser.add_argument("--show-qr", action="store_true",
@@ -646,6 +702,12 @@ def main():
     # Initialize dead man's switch
     switch = DeadManSwitch()
     
+    if args.lock and args.ttl < 10:
+        print("[!] --ttl must be at least 10 seconds (got {})".format(args.ttl))
+        print("[!] A TTL below 10s risks immediate self-destruct before the token")
+        print("[!] can be saved, causing irreversible loss of the entropy seed.")
+        sys.exit(1)
+
     try:
         if args.emergency_destruct:
             # Emergency destruction

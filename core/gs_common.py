@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-gs_common.py - Shared OPSEC library for the GhostSpiral v10 toolchain
-=====================================================================
+gs_common.py - Shared OPSEC library for the core toolchain
+===========================================================
 Centralises integrity logging, Tor verification, atomic I/O, secure
 file permissions, CSPRNG helpers, and timing decorrelation so that
 every companion script uses battle-tested, consistent implementations.
@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, signal, sys, time
+import hashlib, json, os, re, secrets, signal, sys, time, threading as _threading
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -62,19 +62,19 @@ def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     """Append a SHA-256-chained line to the integrity log. Returns the hash.
 
+    Stage and message are hashed before writing so the log cannot be used
+    as a forensic roadmap when matched against leaked source code.  The
+    operator can still verify an entry by hashing the same stage+msg pair.
+
     Timestamp is coarsened to 600-second (10-min) buckets to reduce the
     correlation window between the log and blockchain/network timestamps.
     """
     import fcntl
-    # BUG 61 FIX: Sanitize inputs — newlines in stage/msg would break the
-    # hash chain and allow log injection attacks.
-    stage = stage.replace("\n", " ").replace("\r", " ")[:64]
-    msg = msg.replace("\n", " ").replace("\r", " ")[:200]
+    tag = hashlib.sha256(f"{stage}:{msg}".encode()).hexdigest()[:12]
 
-    # BUG 62 FIX: File locking — concurrent processes writing to the same
-    # log would read the same prev-hash and create a forked chain.
-    with log_path.open("a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             prev = "0" * 64
             if log_path.exists():
@@ -89,13 +89,14 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
                 except (OSError, UnicodeDecodeError):
                     pass
             ts = int(time.time()) // 600 * 600
-            line = f"{ts}|{stage}|{msg}"
+            line = f"{ts}|{tag}"
             h = hashlib.sha256((prev + line).encode()).hexdigest()
-            f.write(f"{h} | {line}\n")
-            f.flush()
-            os.fsync(f.fileno())
+            with log_path.open("a") as f:
+                f.write(f"{h} | {line}\n")
+                f.flush()
+                os.fsync(f.fileno())
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            fcntl.flock(lf, fcntl.LOCK_UN)
     secure_file_perms(log_path)
     return h
 
@@ -110,6 +111,11 @@ def lock_memory() -> bool:
     spend keys) can be written to the swap partition and recovered forensically
     from a seized machine. Requires CAP_IPC_LOCK or root on Linux.
     Returns True if successful, False otherwise (non-fatal).
+
+    NOTE: Even with mlockall, Python's immutable strings and garbage collector
+    cannot guarantee when secret data is freed from memory. The only reliable
+    mitigation for at-rest exposure is full-disk encryption (LUKS/dm-crypt)
+    so that swap contents are encrypted on disk.
     """
     try:
         import ctypes
@@ -128,12 +134,21 @@ def lock_memory() -> bool:
         return False
 
 
-def secure_file_perms(path: Path, mode: int = 0o600) -> None:
-    """Set file to owner-read/write only."""
+def secure_file_perms(path: Path, mode: int = 0o600) -> bool:
+    """Set file to owner-read/write only. Returns True on success.
+
+    BUG 94 FIX: The old except-pass silently ate chmod failures. If this
+    fails on a password file or unsigned TX blob, those files remain
+    world-readable (default umask-based permissions). Callers that handle
+    sensitive data (password files, TX blobs) should check the return value
+    and abort if permissions cannot be set.
+    """
     try:
         os.chmod(path, mode)
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        integrity_log("opsec", f"chmod_fail:{path.name}:{e}")
+        return False
 
 
 def _json_safe_default(o):
@@ -169,7 +184,8 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         with open(path) as f:
             json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        sys.exit(f"[!] CRITICAL: Atomic write to {path} produced corrupt JSON: {e}")
+        # BUG 95 FIX: Don't print full path in error — reveals filesystem layout.
+        sys.exit(f"[!] CRITICAL: Atomic write to {path.name} produced corrupt JSON: {e}")
     # fsync parent dir to make the rename durable across power loss
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -190,6 +206,14 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
         os.fsync(f.fileno())
     secure_file_perms(tmp, perms)
     os.replace(tmp, path)
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
 #  Proxy validation
@@ -230,11 +254,29 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
 def verify_tor(proxy: Dict[str, str]) -> None:
-    """Verify we are exiting through Tor. Aborts on failure."""
+    """Verify we are exiting through Tor. Aborts on failure.
+
+    Validates both the IsTor flag AND the response structure to detect
+    compromised/cached/spoofed responses from check.torproject.org.
+    """
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
-                     headers={"User-Agent": _BROWSER_UA})
+                     headers=_BROWSER_HEADERS)
     r.raise_for_status()
     data = r.json()
+    if not isinstance(data, dict):
+        integrity_log("tor", "VERIFY_INVALID_RESPONSE_TYPE")
+        sys.exit("[!] Tor check returned non-dict response — endpoint may be compromised. Aborting.")
+    if "IsTor" not in data or "IP" not in data:
+        integrity_log("tor", "VERIFY_MISSING_FIELDS")
+        sys.exit(
+            "[!] Tor check response missing expected fields (IsTor, IP).\n"
+            "    The check.torproject.org endpoint may be compromised or returning\n"
+            "    a cached/spoofed response. Aborting for safety."
+        )
+    ip_val = data.get("IP", "")
+    if not isinstance(ip_val, str) or len(ip_val) < 7:
+        integrity_log("tor", "VERIFY_INVALID_IP")
+        sys.exit("[!] Tor check returned invalid IP field — response may be spoofed. Aborting.")
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
         sys.exit("[!] Tor leak detected - traffic NOT exiting via Tor. Aborting.")
@@ -245,7 +287,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
     """Re-verify Tor mid-operation. Logs but doesn't retry as aggressively."""
     try:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
-                         headers={"User-Agent": _BROWSER_UA})
+                         headers=_BROWSER_HEADERS)
         r.raise_for_status()
         if not r.json().get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
@@ -260,6 +302,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
 
 _NEWNYM_CONSECUTIVE_FAILURES = 0
 _NEWNYM_MAX_FAILURES = 3
+_NEWNYM_LOCK = _threading.Lock()
 
 
 def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
@@ -294,9 +337,6 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                         c = None
                 if c is None and last_err is not None:
                     raise last_err
-            # BUG 73 FIX: Support password auth for Tor control port.
-            # stem.authenticate() tries NONE, SAFECOOKIE, COOKIE by default.
-            # If torrc uses HashedControlPassword, we need the password.
             tor_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
             if tor_pw:
                 c.authenticate(password=tor_pw)
@@ -308,12 +348,15 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                 c.close()
         # Jittered wait for circuit establishment (fixed 5s was a timing fingerprint)
         time.sleep(3 + secrets.randbelow(5000) / 1000.0)
-        _NEWNYM_CONSECUTIVE_FAILURES = 0
+        with _NEWNYM_LOCK:
+            _NEWNYM_CONSECUTIVE_FAILURES = 0
         return True
     except Exception as e:
-        _NEWNYM_CONSECUTIVE_FAILURES += 1
-        integrity_log("tor", f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(e)[:40]}")
-        if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
+        with _NEWNYM_LOCK:
+            _NEWNYM_CONSECUTIVE_FAILURES += 1
+            fail_count = _NEWNYM_CONSECUTIVE_FAILURES
+        integrity_log("tor", f"NEWNYM_fail:{fail_count}:{str(e)[:40]}")
+        if fail_count >= _NEWNYM_MAX_FAILURES:
             msg = (f"[!] NEWNYM failed {_NEWNYM_MAX_FAILURES} consecutive times. "
                    f"Tor circuit rotation is NOT working.")
             if required:
@@ -345,13 +388,30 @@ def _newnym_between_retries(retry_state):
     newnym()
 
 
-_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+# BUG 99 FIX: Match Tor Browser's actual fingerprint. Tor Browser bundles
+# Firefox ESR — using a non-ESR UA or mismatched version makes requests
+# stand out to exit node observers and destination servers. The headers
+# below match Tor Browser 13.5+ (Firefox ESR 128).
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+_BROWSER_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
        before_sleep=_newnym_between_retries)
 def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r = requests.get(url, timeout=20, proxies=proxies,
-                     headers={"User-Agent": _BROWSER_UA})
+                     headers=_BROWSER_HEADERS)
     r.raise_for_status()
     return r.json()
 
@@ -368,7 +428,7 @@ def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
        before_sleep=_newnym_between_retries)
 def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
                      headers: Dict[str, str] = None) -> dict:
-    h = {"User-Agent": _BROWSER_UA}
+    h = dict(_BROWSER_HEADERS)
     if headers:
         h.update(headers)
     r = requests.post(url, json=payload, timeout=25, proxies=proxies, headers=h)
@@ -532,12 +592,11 @@ def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> No
 #  Signal handling for graceful shutdown
 # ---------------------------------------------------------------------------
 
-_SHUTDOWN_REQUESTED = False
+_SHUTDOWN_EVENT = _threading.Event()
 
 
 def _shutdown_handler(signum, frame):
-    global _SHUTDOWN_REQUESTED
-    _SHUTDOWN_REQUESTED = True
+    _SHUTDOWN_EVENT.set()
     integrity_log("signal", f"shutdown_requested_sig={signum}")
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
@@ -549,11 +608,59 @@ def install_signal_handlers():
 
 
 def shutdown_requested() -> bool:
-    return _SHUTDOWN_REQUESTED
+    return _SHUTDOWN_EVENT.is_set()
 
 # ---------------------------------------------------------------------------
 #  Sensitive data scrubbing
 # ---------------------------------------------------------------------------
+
+def normalize_broadcast_result(result: dict, method: str) -> list:
+    """Extract transaction IDs from wallet-rpc broadcast response.
+
+    Different methods return txids in different fields:
+      - submit_transfer -> result["tx_hash_list"] (list of hex strings)
+      - relay_tx        -> result["tx_hash"] (single hex string)
+      - transfer_split  -> result["tx_hash_list"] (list of hex strings)
+
+    Returns a non-empty list of txid strings.
+    Raises ValueError with full diagnostic info if extraction fails.
+    """
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"{method} returned non-dict: {type(result).__name__}. "
+            f"Raw value (truncated): {str(result)[:200]}"
+        )
+
+    txids = []
+    if "tx_hash_list" in result:
+        raw = result["tx_hash_list"]
+        if isinstance(raw, list):
+            txids = [h for h in raw if isinstance(h, str) and len(h) >= 16]
+    if not txids and "tx_hash" in result:
+        val = result["tx_hash"]
+        if isinstance(val, list):
+            txids = [h for h in val if isinstance(h, str) and len(h) >= 16]
+        elif isinstance(val, str) and len(val) >= 16:
+            txids = [val]
+
+    if not txids:
+        raise ValueError(
+            f"No valid transaction IDs in {method} response. "
+            f"Keys: {sorted(result.keys())}. "
+            f"tx_hash_list={result.get('tx_hash_list', '<missing>')}. "
+            f"tx_hash={result.get('tx_hash', '<missing>')}"
+        )
+
+    for txid in txids:
+        if not isinstance(txid, str) or len(txid) != 64:
+            raise ValueError(
+                f"Invalid txid format from {method}: "
+                f"'{txid[:20]}...' (len={len(txid) if isinstance(txid, str) else 'N/A'}). "
+                f"Expected 64-char hex string."
+            )
+
+    return txids
+
 
 def scrub_address(addr: str, visible: int = 8) -> str:
     """Truncate an address for safe terminal display.

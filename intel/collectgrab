@@ -59,7 +59,8 @@ if TOR_AVAILABLE:
                 'https': f'socks5h://127.0.0.1:{_candidate_port}',
             }
             _r = requests.get("https://check.torproject.org/api/ip",
-                              proxies=_test_px, timeout=10)
+                              proxies=_test_px, timeout=10,
+                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"})
             if _r.json().get("IsTor"):
                 _tor_socks_port = _candidate_port
                 break
@@ -94,23 +95,21 @@ session.proxies.update(proxies)
 # Randomized user agents list
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-    " Chrome/111.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:111.0) Gecko/20100101 Firefox/111.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+    " Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-# List of Nitter instances to rotate through
+# Nitter instances — the original project shut down Feb 2024 after Twitter
+# disabled guest accounts. Most community forks are non-functional or rate-
+# limited. These are best-effort; the code gracefully handles failures.
+# If all fail, no tweets are collected (not a fatal error).
 NITTER_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.42l.fr",
-    "https://nitter.pussthecat.org",
-    "https://nitter.kavin.rocks",
+    "https://xcancel.com",
+    "https://nitter.privacydev.net",
     "https://nitter.poast.org",
-    "https://nitter.unixfox.eu",
-    "https://nitter.mint.lgbt",
-    "https://nitter.tiekoetter.com"
 ]
 
 # Define base directories for outputs - fallback to current directory if /dev/shm unavailable
@@ -125,8 +124,12 @@ for d in source_dirs.values():
 
 # Delay utilities
 def random_sleep(min_seconds, max_seconds):
-    """Sleep a random amount of time between min_seconds and max_seconds."""
-    wait = random.uniform(min_seconds, max_seconds)
+    """Sleep a random amount of time between min_seconds and max_seconds.
+    Uses secrets module for CSPRNG to avoid predictable timing patterns.
+    """
+    import secrets as _secrets
+    range_ms = int((max_seconds - min_seconds) * 1000)
+    wait = min_seconds + (_secrets.randbelow(max(range_ms, 1)) / 1000.0)
     logger.debug("Sleeping for %.2f seconds", wait)
     time.sleep(wait)
 
@@ -168,7 +171,8 @@ def tor_newnym_session(session):
     except Exception as e:
         logger.warning("Failed to rotate Tor circuit: %s", e)
     
-    time.sleep(5)
+    import secrets as _secrets
+    time.sleep(3 + _secrets.randbelow(5000) / 1000.0)
     session.cookies.clear()
 
 def safe_filename(name):
@@ -179,6 +183,15 @@ def extract_emails(text):
     """Extract email addresses from text."""
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     return list(set(re.findall(email_pattern, text)))
+
+def _scrub_target(target):
+    """Truncate target for safe logging — never log full identifiers."""
+    if not target:
+        return "<empty>"
+    t = str(target)
+    if len(t) <= 4:
+        return t[0] + "***"
+    return t[:4] + "***"
 
 # Load targets from targ_graber_v14 fingerprinting script or other sources
 def load_targets():
@@ -273,8 +286,9 @@ def _run_pipeline():
     targets = load_targets()
 
     meta_entries = []
+    _coarsened_ts = int(time.time()) // 600 * 600
     audit_info = {
-        "timestamp": time.ctime(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_coarsened_ts)),
         "targets_processed": 0,
         "errors": [],
         "tor_available": TOR_AVAILABLE,
@@ -282,7 +296,7 @@ def _run_pipeline():
     }
 
     for target in targets:
-        logger.info("Processing target: %s", target)
+        logger.info("Processing target: %s", _scrub_target(target))
         # Rate-limit / Tor rotation every 2 HTTP calls
         if len(meta_entries) and len(meta_entries) % 2 == 0:
             tor_newnym_session(session)
@@ -306,7 +320,8 @@ def _run_pipeline():
             query = f"site:linkedin.com \"{target}\""
 
         url = f"https://www.google.com/search?q={quote_plus(query)}"
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        import secrets as _secrets
+        headers = {'User-Agent': _secrets.choice(USER_AGENTS)}
 
         try:
             random_sleep(5, 10)
@@ -322,7 +337,7 @@ def _run_pipeline():
                     res = session.get(url, headers=headers, timeout=30)
                     content = res.text
                 except Exception as retry_e:
-                    logger.error("Retry failed for %s: %s", target, retry_e)
+                    logger.error("Retry failed for %s: %s", _scrub_target(target), retry_e)
                     content = ""
 
             # Extract email addresses from content
@@ -330,13 +345,13 @@ def _run_pipeline():
             entry["emails"] = emails
 
         except requests.exceptions.Timeout:
-            logger.error("Timeout during Google search for %s", target)
+            logger.error("Timeout during Google search for %s", _scrub_target(target))
             entry["emails"] = []
-            audit_info["errors"].append(f"Google search timeout for {target}")
+            audit_info["errors"].append(f"Google search timeout for {_scrub_target(target)}")
         except Exception as e:
-            logger.error("Exception during Google search for %s: %s", target, e)
+            logger.error("Exception during Google search for %s: %s", _scrub_target(target), e)
             entry["emails"] = []
-            audit_info["errors"].append(f"Google search error for {target}: {str(e)}")
+            audit_info["errors"].append(f"Google search error for {_scrub_target(target)}: {str(e)}")
 
         safe_name = safe_filename(target)
         linkedin_file = os.path.join(source_dirs['linkedin'], f"{safe_name}.json")
@@ -345,8 +360,8 @@ def _run_pipeline():
                 json.dump(entry, jf, indent=2, ensure_ascii=False)
             _secure_perms(linkedin_file)
         except Exception as e:
-            logger.error("Failed to write LinkedIn file for %s: %s", target, e)
-            audit_info["errors"].append(f"LinkedIn file write error for {target}: {str(e)}")
+            logger.error("Failed to write LinkedIn file for %s: %s", _scrub_target(target), e)
+            audit_info["errors"].append(f"LinkedIn file write error for {_scrub_target(target)}: {str(e)}")
 
         meta_entries.append(entry)
 
@@ -372,7 +387,7 @@ def _run_pipeline():
             twitter_url = f"{base}/search?f=tweets&q={encoded_query}"
             try:
                 random_sleep(1, 3)
-                r = session.get(twitter_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+                r = session.get(twitter_url, headers={'User-Agent': _secrets.choice(USER_AGENTS)}, timeout=15)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.text, 'html.parser')
                     # Try multiple selectors for different Nitter versions
@@ -384,7 +399,7 @@ def _run_pipeline():
 
                     if tweets:  # Only use if we found tweets
                         tweets_data = tweets
-                        logger.info("Found %d tweets from %s for target: %s", len(tweets), base, target)
+                        logger.info("Found %d tweets from %s for target: %s", len(tweets), base, _scrub_target(target))
                         break
                 else:
                     logger.warning("Nitter instance %s returned status %s", base, r.status_code)
@@ -402,8 +417,8 @@ def _run_pipeline():
                 json.dump(twitter_entry, tf, indent=2, ensure_ascii=False)
             _secure_perms(twitter_file)
         except Exception as e:
-            logger.error("Failed to write Twitter file for %s: %s", target, e)
-            audit_info["errors"].append(f"Twitter file write error for {target}: {str(e)}")
+            logger.error("Failed to write Twitter file for %s: %s", _scrub_target(target), e)
+            audit_info["errors"].append(f"Twitter file write error for {_scrub_target(target)}: {str(e)}")
 
         meta_entries.append(twitter_entry)
 
@@ -417,7 +432,8 @@ def _run_pipeline():
                 f"https://api.pullpush.io/reddit/search/comment/"
                 f"?q={quote_plus(target)}&size=50"
             )
-            response = session.get(push_url, timeout=30)
+            response = session.get(push_url, timeout=30,
+                                   headers={'User-Agent': _secrets.choice(USER_AGENTS)})
 
             if response.status_code == 200:
                 data = response.json().get("data", [])
@@ -425,16 +441,16 @@ def _run_pipeline():
                     {"author": c.get("author", "unknown"), "body": c.get("body", "")}
                     for c in data if isinstance(c, dict)
                 ]
-                logger.info("Found %d Reddit comments for %s", len(reddit_entry["comments"]), target)
+                logger.info("Found %d Reddit comments for %s", len(reddit_entry["comments"]), _scrub_target(target))
             else:
                 logger.warning("Reddit API returned status %s", response.status_code)
 
         except requests.exceptions.Timeout:
-            logger.warning("Reddit API timeout for %s", target)
-            audit_info["errors"].append(f"Reddit API timeout for {target}")
+            logger.warning("Reddit API timeout for %s", _scrub_target(target))
+            audit_info["errors"].append(f"Reddit API timeout for {_scrub_target(target)}")
         except Exception as e:
-            logger.warning("Reddit API error for %s: %s", target, e)
-            audit_info["errors"].append(f"Reddit API error for {target}: {str(e)}")
+            logger.warning("Reddit API error for %s: %s", _scrub_target(target), e)
+            audit_info["errors"].append(f"Reddit API error for {_scrub_target(target)}: {str(e)}")
 
         reddit_file = os.path.join(source_dirs['reddit'], f"{safe_name}.json")
         try:
@@ -442,8 +458,8 @@ def _run_pipeline():
                 json.dump(reddit_entry, rf, indent=2, ensure_ascii=False)
             _secure_perms(reddit_file)
         except Exception as e:
-            logger.error("Failed to write Reddit file for %s: %s", target, e)
-            audit_info["errors"].append(f"Reddit file write error for {target}: {str(e)}")
+            logger.error("Failed to write Reddit file for %s: %s", _scrub_target(target), e)
+            audit_info["errors"].append(f"Reddit file write error for {_scrub_target(target)}: {str(e)}")
 
         meta_entries.append(reddit_entry)
         audit_info["targets_processed"] += 1
@@ -494,6 +510,7 @@ def _run_pipeline():
             sha_file = filepath + ".sha256"
             with open(sha_file, 'w') as sf:
                 sf.write(f"{sha_digest}  {os.path.basename(filepath)}\n")
+            _secure_perms(sha_file)
 
             logger.info("SHA256 for %s: %s", os.path.basename(filepath), sha_digest)
 

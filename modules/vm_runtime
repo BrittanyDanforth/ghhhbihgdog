@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-vm_runtime.py — GhostSpiral v16.9 Chaos Toolkit (Enhanced)
-=========================================================
+vm_runtime — Broadcast-delay timing derivation from live host metrics
+=====================================================================
 Derives **broadcast‑delay timing parameters** from the *live virtual‑machine /
 host state* so that every session's timing pattern is:
 
@@ -108,13 +108,22 @@ def safe_float(value: Union[float, int], default: float = 0.0) -> float:
 # Enhanced metric snapshot functions
 # ---------------------------------------------------------------------------
 
+_LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
 def probe_network_latency(host: str = "127.0.0.1", timeout: float = 2.0) -> float:
     """Probe network latency via ping. Returns ms or 0.0 on failure.
 
-    OPSEC: Default host is localhost (no clearnet traffic). ICMP ping to
-    external hosts (8.8.8.8) bypasses Tor and reveals real network path.
-    Only use non-localhost hosts on trusted local networks.
+    OPSEC CRITICAL: ICMP ping bypasses Tor entirely. Pinging external hosts
+    (8.8.8.8) reveals your real IP to the target and to every router on the
+    path. Only localhost is safe; non-localhost requests are refused.
     """
+    if host not in _LOCALHOST_NAMES:
+        print(f"[!] REFUSED: probe_network_latency('{host}') would bypass Tor via ICMP.",
+              file=sys.stderr)
+        print(f"    ICMP ping goes over clearnet, leaking your real IP.", file=sys.stderr)
+        print(f"    Only 127.0.0.1/localhost is allowed.", file=sys.stderr)
+        return 0.0
     try:
         if os.name == 'nt':
             cmd = ['ping', '-n', '1', '-w', str(int(timeout * 1000)), host]
@@ -135,30 +144,33 @@ def probe_network_latency(host: str = "127.0.0.1", timeout: float = 2.0) -> floa
 
 def probe_disk_io() -> float:
     """Measure disk I/O latency via small write/read test. Returns ms."""
+    tmp_path = None
     try:
         test_data = b"timing_test_" + os.urandom(1024)  # 1KB test
         
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
             start = time.perf_counter()
             tmp.write(test_data)
             tmp.flush()
-            os.fsync(tmp.fileno())  # Force write to disk
+            os.fsync(tmp.fileno())
             
-            # Read back
             tmp.seek(0)
             _ = tmp.read()
             elapsed = (time.perf_counter() - start) * 1000
-            tmp_path = tmp.name
         
-        # Cleanup
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-            
         return round(elapsed, 1)
     except (OSError, IOError):
         return 0.0
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
 
 
 def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
@@ -169,7 +181,8 @@ def test_tor_connectivity(proxy_url: Optional[str] = None) -> str:
     try:
         proxies = {'http': proxy_url, 'https': proxy_url}
         url = "https://check.torproject.org/api/ip"
-        response = requests.get(url, proxies=proxies, timeout=10)
+        response = requests.get(url, proxies=proxies, timeout=10,
+                                headers={"User-Agent": _BROWSER_UA})
         if response.status_code == 200:
             data = response.json()
             if data.get("IsTor") is True:
@@ -331,11 +344,11 @@ def generate_delay_pattern(base_delay: float, events: int, rng: random.Random) -
 
 def main():
     p = argparse.ArgumentParser(
-        description="Generate timing delays based on host VM metrics for GhostSpiral network ops.",
+        description="Generate timing delays based on host VM metrics for network operations.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --events 60 --network-probe 1.1.1.1 --disk-test
+  %(prog)s --events 60 --network-probe 127.0.0.1 --disk-test
   %(prog)s --events 100 --tor-proxy socks5h://127.0.0.1:9050
   %(prog)s --seed custom_seed.json --out /tmp/timing.json
         """
@@ -361,6 +374,14 @@ Examples:
         print(f"[*] Loading entropy seed from {args.seed}")
     
     seed_bundle, seed_sha = load_seed(args.seed)
+
+    if args.tor_proxy:
+        if args.tor_proxy.lower().startswith("socks5://") and not args.tor_proxy.lower().startswith("socks5h://"):
+            print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.", file=sys.stderr)
+            sys.exit(1)
+        if not args.tor_proxy.lower().startswith("socks5h://"):
+            print("[!] Only socks5h:// proxies are accepted (DNS privacy).", file=sys.stderr)
+            sys.exit(1)
 
     if args.verbose:
         print("[*] Collecting system metrics...")
@@ -434,6 +455,8 @@ Examples:
     try:
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(args.out)
         os.chmod(args.out, 0o600)
         
@@ -444,6 +467,12 @@ Examples:
             print(f"[+] Tor status: {tor_status}")
             
     except (OSError, IOError) as e:
+        # Clean up stale .tmp on failure to avoid leaving timing data on disk
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         print(f"[!] Failed to write output: {e}", file=sys.stderr)
         sys.exit(1)
 

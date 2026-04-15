@@ -25,6 +25,19 @@ SEED_SHM = SHM_DIR / ".gs_seed_active"
 LOCK_SHM = SHM_DIR / ".gs_seed_lock"
 
 
+def _disable_core_dumps() -> bool:
+    """Disable core dumps to prevent seed leakage via /proc/sys/kernel/core_pattern.
+    Without this, mlockall only prevents swap — a core dump still captures all
+    process memory (including the seed) to disk.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return True
+    except (ImportError, ValueError, OSError):
+        return False
+
+
 def _mlock_available() -> bool:
     """Check if mlockall is available and working."""
     try:
@@ -109,6 +122,14 @@ def cmd_load(args):
         print("  [!] On this system, seed would touch disk. Aborting.")
         sys.exit(1)
 
+    # Disable core dumps BEFORE loading seed into memory — a core dump
+    # captures all process memory and writes it to disk, bypassing mlockall.
+    if _disable_core_dumps():
+        print("  [+] Core dumps disabled (RLIMIT_CORE=0)")
+    else:
+        print("  [!] WARNING: Could not disable core dumps — seed may leak via core dump")
+        print("  [!] Check /proc/sys/kernel/core_pattern and disable if possible")
+
     # Lock memory — intentionally kept locked while seed is loaded;
     # unlocked in cmd_wipe when the seed is erased.
     if _mlock_available():
@@ -120,7 +141,7 @@ def cmd_load(args):
     # Clean old seed if present
     if SEED_SHM.exists():
         _secure_wipe_bytes(SEED_SHM)
-        print("  [·] Previous seed wiped")
+        print("  [*] Previous seed wiped")
 
     # Compute the hash of the raw seed bytes for the SHM bundle
     loaded_seed_hash = hashlib.sha256(seed_bytes).hexdigest()
@@ -131,7 +152,7 @@ def cmd_load(args):
         "sha256": loaded_seed_hash,
         "loaded_at": int(time.time()),
         "ttl": args.ttl if args.ttl else None,
-        "source": str(seed_path.name),
+        "source": hashlib.sha256(str(seed_path.name).encode()).hexdigest()[:16],
     }
     tmp = SEED_SHM.with_suffix(".tmp")
     with open(tmp, "w") as f:
@@ -168,7 +189,7 @@ def cmd_load(args):
                 LOCK_SHM.unlink()
             sys.exit(0)
         else:
-            print(f"  [·] Wiper process started (PID {pid})")
+            print(f"  [*] Wiper process started (PID {pid})")
 
 
 def cmd_verify(args):
@@ -233,7 +254,7 @@ def cmd_wipe(args):
         LOCK_SHM.unlink()
         wiped = True
     if not wiped:
-        print("  [·] No seed was loaded")
+        print("  [*] No seed was loaded")
     else:
         try:
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -253,7 +274,7 @@ def main():
     load_p = sub.add_parser("load", help="Load seed into RAM-locked storage")
     load_p.add_argument("seed_file", help="Path to entropy_seed.json")
     load_p.add_argument("--ttl", type=int, default=None,
-                        help="Auto-wipe after N seconds")
+                        help="Auto-wipe after N seconds (min: 10)")
 
     sub.add_parser("verify", help="Check if seed is loaded and intact")
     sub.add_parser("wipe", help="Securely erase seed from RAM")
@@ -264,6 +285,10 @@ def main():
         sys.exit(0)
 
     if args.command == "load":
+        if args.ttl is not None and args.ttl < 10:
+            print(f"  [!] --ttl must be at least 10 seconds (got {args.ttl})")
+            print(f"  [!] A TTL below 10s risks immediate wipe before seed can be used.")
+            sys.exit(1)
         cmd_load(args)
     elif args.command == "verify":
         cmd_verify(args)

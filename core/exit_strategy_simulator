@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 - Off-Ramp Planner w/ Liquidity Probe
-====================================================================
-Part of the GhostSpiral v10 tool-chain. Generates a schema-tagged
-exitplan_v1.json bundle.
+exit_strategy_simulator - Off-Ramp Planner w/ Liquidity Probe
+==============================================================
+Generates a schema-tagged exit plan JSON bundle.
 
 OPSEC hardening:
   - Tor verified before any API access
@@ -31,6 +30,11 @@ from gs_common import (
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
 # Bisq and Haveno are P2P DEXs without centralized market APIs.
 # The Bisq price oracle is the closest to an official data source.
+# NOTE: The wiz-operated pricenode (price.bisq.wiz.biz) was removed from
+# the Bisq network in Oct 2023 (PR #6938). Bisq pricenodes now run as
+# Tor hidden services only. This URL will likely time out or 404.
+# Kept as best-effort fallback; the code already aborts gracefully if
+# both CoinGecko and Bisq fail (no silent wrong prices).
 BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
 
 METHODS: Dict[str, Dict] = {
@@ -118,7 +122,6 @@ def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "exit_strategy_simulator v10.0",
         description="Plan XMR off-ramp with liquidity analysis",
     )
     ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
@@ -126,7 +129,7 @@ def main():
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
-    ap.add_argument("--outfile", default="exitplan_v1.json")
+    ap.add_argument("--outfile", default="plan_output.json")
     args = ap.parse_args()
 
     if args.amount <= 0:
@@ -162,7 +165,7 @@ def main():
     # kyc_required=false would mislead the operator into thinking they can
     # use a KYC method without KYC.
     plan = {
-        "schema": "exitplan_v1",
+        "schema": "exit_plan",
         "timestamp": int(time.time()) // 600 * 600,
         "method": args.method,
         "kyc_required": cfg["kyc"],
@@ -183,19 +186,34 @@ def main():
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
+    print()
+    print(f"  {'=' * 68}")
+    print("  OPSEC: Do NOT send mixed XMR to a KYC exchange under your real identity.")
+    print("  Use P2P methods (Bisq, Haveno) or atomic swaps for off-ramp.")
+    print(f"  {'=' * 68}")
+    print()
+
     kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
     print(f"  Method      : {args.method} ({kyc_label})")
     print(f"  Gross       : {gross} XMR")
     print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
     print(f"  Slippage    : {slip:.4f} XMR")
-    print(f"  ----------------------------------------")
+    print(f"  ---")
     print(f"  Net         : {net:.4f} XMR")
     print(f"  Value       : {fiat_val} {args.currency.upper()}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
+    # BUG 82 FIX: Show when prices were fetched so the operator can judge
+    # staleness. The plan JSON has a coarsened timestamp, but the terminal
+    # output had no time indicator — an operator reading the plan hours
+    # later would act on stale prices without realizing it.
+    import datetime as _dt
+    print(f"  Fetched at  : {_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  [!] PRICES ARE VOLATILE — this plan is only valid near the fetch time.")
+    print(f"  [!] If more than 15 minutes have passed, re-run to get fresh prices.")
     print(f"  Liquidity   : {liq_guidance}")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan saved -> {args.outfile}")
+    print(f"  [+] Plan written -> {args.outfile} (fsync'd)")
 
 
 if __name__ == "__main__":

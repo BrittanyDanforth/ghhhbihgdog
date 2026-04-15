@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-GhostSpiral Toolkit — Interactive Launcher
+Toolkit — Interactive Launcher
 """
 from __future__ import annotations
 import json, os, sys, subprocess, shutil
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -24,15 +25,14 @@ N = "\033[0m"       # reset
 
 
 def clear():
-    os.system("clear" if os.name != "nt" else "cls")
+    print("\033[2J\033[H", end="", flush=True)
 
 
 def banner():
     print(f"""
-{M}  ╔══════════════════════════════════════════════════════╗
-  ║{B}         ★  G H O S T S P I R A L  ★                {M}║
-  ║{D}            BTC → XMR Mixing Toolkit                 {M}║
-  ╚══════════════════════════════════════════════════════╝{N}
+{M}  ===================================================={N}
+  {B}                Operations Menu{N}
+{M}  ===================================================={N}
 """)
 
 
@@ -56,7 +56,7 @@ def heading(text: str):
 
 
 def ok(text: str):
-    print(f"  {G}[✓]{N} {text}")
+    print(f"  {G}[+]{N} {text}")
 
 
 def warn(text: str):
@@ -64,22 +64,28 @@ def warn(text: str):
 
 
 def err(text: str):
-    print(f"  {R}[✗]{N} {text}")
+    print(f"  {R}[!]{N} {text}")
 
 
 def info(text: str):
-    print(f"  {D}[·]{N} {text}")
+    print(f"  {D}[*]{N} {text}")
 
 
 def run_script(path: Path, args: list, label: str = ""):
     if label:
         info(f"Running {label}...")
-    # Use the same Python interpreter that is running this script (honours venv)
     python = sys.executable
+    # Build a sanitized env: drop secrets that child scripts don't need.
+    # Each child that *does* need a secret should read it from its own
+    # env var (e.g. GS_WALLET_PASSWORD for the signer).
+    child_env = os.environ.copy()
+    for _k in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE"):
+        child_env.pop(_k, None)
     try:
         result = subprocess.run(
             [python, str(path)] + args,
             timeout=7200,
+            env=child_env,
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -168,9 +174,19 @@ def show_status(st: dict):
     if missing:
         print(f"\n  {R}Missing deps:{N} python3 -m pip install {' '.join(missing)}")
     if not st.get("tor"):
-        print(
-            f"  {R}Tor not running:{N} sudo systemctl start tor (:9050) "
-            f"or start Tor Browser (:9150)"
+        print()
+        print(f"  {R}Tor is NOT running.{N} The toolkit cannot work without Tor.")
+        print()
+        print(f"  How to fix:")
+        print(f"    {B}sudo systemctl start tor{N}     <- start system Tor (port 9050)")
+        print(f"    {B}sudo systemctl status tor{N}    <- check if it's running")
+        print(f"    {B}sudo journalctl -u tor{N}       <- check for errors")
+        print()
+        print(f"  Or: open Tor Browser (uses port 9150 instead of 9050)")
+        print()
+        print(f"  If Tor keeps failing:")
+        print(f"    sudo apt purge tor && sudo apt install tor")
+        print(f"    sudo systemctl enable tor && sudo systemctl start tor"
         )
 
     return len(missing) == 0 and st.get("tor", False)
@@ -203,14 +219,16 @@ def menu_main():
 
 # ── Guided flows ───────────────────────────────────────────────────────────
 
-def get_tor_proxy() -> str:
-    p = prompt("Tor SOCKS proxy", "socks5h://127.0.0.1:9050")
+def get_tor_proxy(detected_port: int = None) -> str:
+    default_port = detected_port if detected_port else 9050
+    p = prompt("Tor SOCKS proxy", f"socks5h://127.0.0.1:{default_port}")
     if p.startswith("socks5://") and not p.startswith("socks5h://"):
         warn("socks5:// leaks DNS — auto-correcting to socks5h://")
         p = p.replace("socks5://", "socks5h://", 1)
     if not p.startswith("socks5h://"):
         err(f"Proxy must be socks5h:// (got: {p[:20]}...)")
-        err("Other proxy types risk DNS leaks. Use socks5h://127.0.0.1:9050")
+        info("Only socks5h:// is safe — it routes DNS through Tor.")
+        info("Default: socks5h://127.0.0.1:9050 (system Tor) or :9150 (Tor Browser)")
         return ""
     return p
 
@@ -219,32 +237,63 @@ def get_rpc() -> str:
     return prompt("Wallet RPC endpoint", "http://127.0.0.1:18083")
 
 
-def flow_full_pipeline():
+def _opsec_preflight():
+    """Display OPSEC pre-flight checklist before sensitive operations."""
+    print(f"  {Y}{'=' * 60}{N}")
+    print(f"  {R}OPSEC PRE-FLIGHT CHECKLIST{N}")
+    print(f"  {Y}{'=' * 60}{N}")
+    print(f"  {B}[ ]{N} Tor is running and verified")
+    print(f"  {B}[ ]{N} BTC wallet uses Tor for transactions")
+    print(f"  {B}[ ]{N} BTC was NOT purchased on a KYC exchange")
+    print(f"      (or was moved through intermediate wallets first)")
+    print(f"  {B}[ ]{N} You are not on a monitored network")
+    print(f"      (employer/school/public WiFi)")
+    print(f"  {B}[ ]{N} Screen recording/sharing is disabled")
+    print(f"  {Y}{'=' * 60}{N}")
+    print()
+    print(f"  {R}CRITICAL:{N} Do NOT send BTC to ThorChain deposit addresses")
+    print(f"  from a KYC exchange (Coinbase, Kraken, etc.).")
+    print(f"  KYC exchanges record your identity with every transaction.")
+    print(f"  Use an intermediate non-KYC wallet (e.g., Sparrow, Electrum")
+    print(f"  with Tor) to break the direct link between your identity")
+    print(f"  and the ThorChain deposit.")
+    print()
+    if not confirm("I have reviewed the checklist and understand the risks"):
+        warn("Aborted by operator.")
+        return False
+    return True
+
+
+def flow_full_pipeline(detected_port=None):
     heading("Full Pipeline: BTC → Mixed XMR")
-    tor = get_tor_proxy()
+    if not _opsec_preflight():
+        return
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
     btc = prompt("Your BTC address (bc1..., 1..., or 3...)")
     if not btc:
-        err("BTC address is required")
+        err("BTC address is required.")
+        info("Expected formats: bc1... (Bech32, 42-62 chars), 1... (25-34 chars), or 3... (P2SH, 34 chars)")
         return
     if not (btc.startswith("bc1") or btc.startswith("1") or btc.startswith("3")):
         err(f"Invalid BTC address format: {btc[:12]}...")
-        err("Must start with bc1, 1, or 3")
+        info("Must start with bc1 (Bech32), 1 (legacy), or 3 (P2SH).")
+        info("Example: bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh")
         return
 
-    amt = prompt("BTC amount to swap")
+    amt = prompt("BTC amount to swap (e.g. 0.1)")
     try:
-        amt_f = float(amt)
-        if amt_f <= 0:
+        amt_d = Decimal(amt)
+        if amt_d <= 0:
             raise ValueError
-        if amt_f < 0.0001:
+        if amt_d < Decimal("0.0001"):
             warn(f"Very small amount ({amt} BTC) — fees may consume most of it")
-        if amt_f > 10:
+        if amt_d > Decimal("10"):
             warn(f"Large amount ({amt} BTC) — consider splitting into smaller swaps")
-    except (ValueError, TypeError):
-        err(f"Invalid BTC amount: {amt}")
+    except (ValueError, TypeError, InvalidOperation):
+        err(f"Invalid BTC amount: '{amt}'. Must be a positive number like 0.1 or 0.005")
         return
 
     splits = prompt("Split into how many chunks?", "2")
@@ -252,7 +301,7 @@ def flow_full_pipeline():
     depth = prompt("Mix depth", "2")
 
     print()
-    info("Starting GhostSpiral full pipeline...")
+    info("Starting full pipeline...")
     info("This will: fetch quotes → build mixing DAG → sign → broadcast → clean up")
     print()
 
@@ -266,12 +315,12 @@ def flow_full_pipeline():
         "--rpc-primary", rpc,
     ]
 
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral")
+    run_script(CORE / "mixer_core", args, "Full pipeline")
 
 
-def flow_receive():
+def flow_receive(detected_port=None):
     heading("Receive Mode: Mix XMR Already On Your Address")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
@@ -293,12 +342,12 @@ def flow_receive():
         "--wallets", wallets,
         "--deep", depth,
     ]
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral receive mode")
+    run_script(CORE / "mixer_core", args, "Receive mode")
 
 
-def flow_cold():
+def flow_cold(detected_port=None):
     heading("Cold / Air-Gap Mode")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
@@ -318,7 +367,7 @@ def flow_cold():
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "GhostSpiral cold mode"):
+    if run_script(CORE / "mixer_core", args, "Cold mode"):
         print()
         ok("Unsigned plan created in ./unsigned/")
         info("Next steps:")
@@ -330,9 +379,9 @@ def flow_cold():
         info("  4. Choose option 4 (Broadcast) from the main menu")
 
 
-def flow_broadcast():
+def flow_broadcast(detected_port=None):
     heading("Broadcast Signed TXs")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
 
@@ -354,9 +403,9 @@ def flow_broadcast():
     run_script(CORE / "broadcast_signed_xmr", args, "Broadcaster")
 
 
-def flow_resume():
+def flow_resume(detected_port=None):
     heading("Resume From Crash")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
@@ -368,6 +417,14 @@ def flow_resume():
     else:
         plan = prompt("Path to unsigned plan JSON")
 
+    if not plan:
+        err("Plan file path is required.")
+        return
+    if not Path(plan).exists():
+        err(f"Plan file does not exist: {plan}")
+        info("Run option 1 or 3 first to generate a plan, then resume.")
+        return
+
     wallet_files = sorted(Path(".").glob("wallet_*.json"))
     if wallet_files:
         wf = prompt("Wallet JSON file", str(wallet_files[0]))
@@ -375,7 +432,8 @@ def flow_resume():
         wf = prompt("Path to wallet JSON file")
 
     if not wf:
-        err("Wallet JSON file is required for resume")
+        err("Wallet JSON file is required for resume.")
+        info("Create one first with option 6 (Create Wallet), or provide a path to an existing wallet_*.json")
         return
 
     # Detect resume mode: check if the plan has btc_entry (sender) or
@@ -384,13 +442,41 @@ def flow_resume():
     try:
         with open(plan) as _pf:
             _plan_data = json.load(_pf)
-        if _plan_data.get("meta", {}).get("btc_entry"):
+
+        _meta = _plan_data.get("meta")
+        _txs = _plan_data.get("txs")
+        if not isinstance(_meta, dict):
+            err("Plan file is missing 'meta' key — not a valid plan.")
+            info("This should be an unsigned_*.json file from the 'unsigned/' directory.")
+            return
+        if not isinstance(_txs, list) or len(_txs) == 0:
+            err("Plan file has no 'txs' list (empty or missing) — nothing to resume.")
+            info("Re-run the pipeline (option 1 or 3) to generate a fresh plan.")
+            return
+        _schema = _meta.get("schema", "")
+        if _schema not in ("plan_v1", "unsigned_v1"):
+            err(f"Unrecognized plan schema: '{_schema}'. Expected 'plan_v1' or 'unsigned_v1'.")
+            info("This file may be from an incompatible version. Re-generate with this toolkit version.")
+            return
+        for i, _tx in enumerate(_txs):
+            if not isinstance(_tx, dict) or "dst" not in _tx or "amt" not in _tx:
+                err(f"TX {i} in plan is malformed (missing 'dst' or 'amt').")
+                info("The plan file may be corrupt. Re-generate it with option 1 or 3.")
+                return
+
+        if _meta.get("btc_entry"):
             resume_flag = "--btc-entry"
-            wf_arg = _plan_data["meta"]["btc_entry"]
+            wf_arg = _meta["btc_entry"]
             info(f"Sender resume detected (BTC entry: {wf_arg[:8]}...)")
         else:
             wf_arg = wf
-    except (json.JSONDecodeError, OSError, KeyError) as e:
+    except json.JSONDecodeError as e:
+        err(f"Plan file is not valid JSON (corrupt or truncated): {e}")
+        return
+    except OSError as e:
+        err(f"Cannot read plan file: {e}")
+        return
+    except KeyError as e:
         warn(f"Could not read plan metadata ({e}), defaulting to receive-wallet mode")
         wf_arg = wf
 
@@ -400,12 +486,12 @@ def flow_resume():
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
     ]
-    run_script(CORE / "GhostSpiral", args, "GhostSpiral resume")
+    run_script(CORE / "mixer_core", args, "Resume")
 
 
-def flow_create_wallet():
+def flow_create_wallet(detected_port=None):
     heading("Create Receive Wallet")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
@@ -413,9 +499,11 @@ def flow_create_wallet():
     run_script(CORE / "create_receive_wallet", args, "Wallet creator")
 
 
-def flow_swap_preparer():
+def flow_swap_preparer(detected_port=None):
     heading("ThorChain Swap Preparer")
-    tor = get_tor_proxy()
+    if not _opsec_preflight():
+        return
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
 
@@ -438,9 +526,9 @@ def flow_swap_preparer():
     run_script(CORE / "thor_swap_preparer", args, "Swap preparer")
 
 
-def flow_exit_planner():
+def flow_exit_planner(detected_port=None):
     heading("Exit Strategy Planner")
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     amt = prompt("XMR amount to off-ramp")
@@ -478,13 +566,13 @@ def flow_paranoia():
     run_script(OPSEC / "paranoia_mode", ["--iface", iface], "Paranoia mode")
 
 
-def flow_testnet():
+def flow_testnet(detected_port=None):
     heading("Testnet / Dry Run Mode")
     print(f"  This simulates the full pipeline without touching real funds.")
     print(f"  It creates a mock plan with fake 10 XMR balance and runs through")
     print(f"  all stages except actual broadcast.\n")
 
-    tor = get_tor_proxy()
+    tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
@@ -501,14 +589,14 @@ def flow_testnet():
             return
         wf = str(wallet_files[0])
 
-    info("Running GhostSpiral in cold mode (creates plan, no broadcast)...")
+    info("Running in cold mode (creates plan, no broadcast)...")
     args = [
         "--receive-wallet", wf,
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
         "--cold",
     ]
-    if run_script(CORE / "GhostSpiral", args, "GhostSpiral testnet"):
+    if run_script(CORE / "mixer_core", args, "Testnet"):
         ok("Dry-run plan created in ./unsigned/")
         plans = sorted(Path("unsigned").glob("unsigned_*.json"))
         if plans:
@@ -518,7 +606,7 @@ def flow_testnet():
             txs = p.get("txs", [])
             info(f"TXs in plan: {len(txs)}")
             if txs:
-                total = sum(float(t["amt"]) for t in txs)
+                total = sum(Decimal(t["amt"]) for t in txs)
                 info(f"Total amount: {total:.4f} XMR (mock)")
             if p.get("meta", {}).get("mock"):
                 warn("This is a MOCK plan — cannot be signed/broadcast with real wallet")
@@ -533,7 +621,7 @@ def flow_system_check():
     ready = show_status(st)
     print()
     if ready:
-        ok("System is ready for GhostSpiral!")
+        ok("System is ready!")
     else:
         warn("Some components are missing — see above")
         if confirm("Run installer to fix missing deps?"):
@@ -543,7 +631,7 @@ def flow_system_check():
 # ── CLI passthrough ────────────────────────────────────────────────────────
 
 TOOLS = {
-    "ghostspiral": CORE/"GhostSpiral", "gs": CORE/"GhostSpiral",
+    "mixer": CORE/"mixer_core", "gs": CORE/"mixer_core",
     "signer": CORE/"airgap_tx_signer", "broadcast": CORE/"broadcast_signed_xmr",
     "wallet": CORE/"create_receive_wallet", "swap": CORE/"thor_swap_preparer",
     "exit": CORE/"exit_strategy_simulator",
@@ -594,6 +682,22 @@ def main():
         cli_passthrough()
         return
 
+    # Detect Tor port once at startup so get_tor_proxy() can default to it
+    _startup_status = check_prereqs()
+    _detected_tor_port = _startup_status.get("tor_port")
+    if _detected_tor_port:
+        ok(f"Tor working on port {_detected_tor_port}")
+    else:
+        print()
+        err("Tor is NOT running. Most features will not work.")
+        print()
+        info("How to fix:")
+        info(f"  {B}sudo systemctl start tor{N}     start system Tor (port 9050)")
+        info(f"  {B}sudo systemctl status tor{N}    check if it's running")
+        info(f"  Or open Tor Browser (uses port 9150)")
+        print()
+        info("After starting Tor, choose option 0 (System Check) to verify.")
+
     # Interactive mode
     while True:
         try:
@@ -604,27 +708,27 @@ def main():
 
         try:
             if choice == "1":
-                flow_full_pipeline()
+                flow_full_pipeline(_detected_tor_port)
             elif choice == "2":
-                flow_receive()
+                flow_receive(_detected_tor_port)
             elif choice == "3":
-                flow_cold()
+                flow_cold(_detected_tor_port)
             elif choice == "4":
-                flow_broadcast()
+                flow_broadcast(_detected_tor_port)
             elif choice == "5":
-                flow_resume()
+                flow_resume(_detected_tor_port)
             elif choice == "6":
-                flow_create_wallet()
+                flow_create_wallet(_detected_tor_port)
             elif choice == "7":
-                flow_swap_preparer()
+                flow_swap_preparer(_detected_tor_port)
             elif choice == "8":
-                flow_exit_planner()
+                flow_exit_planner(_detected_tor_port)
             elif choice == "9":
                 flow_paranoia()
             elif choice == "0":
                 flow_system_check()
             elif choice == "t":
-                flow_testnet()
+                flow_testnet(_detected_tor_port)
             elif choice in ("q", "quit", "exit"):
                 break
             else:

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-decoy_noise_v3.py — GhostSpiral v16.9 Chaos Toolkit
-===================================================
+decoy_noise — Advanced operational noise injection and traffic obfuscation
+==========================================================================
 Advanced **operational noise injection** system that creates realistic network
-traffic patterns to obscure real GhostSpiral transactions. Features:
+traffic patterns to obscure real transactions. Features:
 
 1. **Multi-protocol noise** — TOR, I2P, clearnet endpoints
 2. **Realistic user patterns** — Browser-like requests with proper headers
@@ -171,7 +171,8 @@ def validate_proxy(proxy_url: str) -> bool:
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
         response = requests.get("https://check.torproject.org/api/ip",
-                                proxies=proxies, timeout=10)
+                                proxies=proxies, timeout=10,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"})
         if response.status_code == 200:
             data = response.json()
             if data.get("IsTor"):
@@ -275,10 +276,11 @@ class NoiseEvent:
 
 
 class AdvancedNoiseGenerator:
-    def __init__(self, proxy_url: str, rng: random.Random, intensity: str = "medium"):
+    def __init__(self, proxy_url: str, rng: random.Random, intensity: str = "medium", onion_only: bool = False):
         self.proxy_url = proxy_url
         self.rng = rng
         self.intensity_config = INTENSITY_CONFIGS[intensity]
+        self.onion_only = onion_only
         self.events: List[NoiseEvent] = []
         self.session = create_session(proxy_url, rng)
         self.circuit_refresh_count = 0
@@ -366,12 +368,9 @@ class AdvancedNoiseGenerator:
     
     def generate_burst(self, num_events: int) -> List[NoiseEvent]:
         """Generate a burst of concurrent requests"""
-        actions = [
-            self._dummy_crypto_query,
-            self._dummy_clearnet_browse,
-            self._dummy_onion_access,
-            self._dummy_api_call,
-        ]
+        actions = [self._dummy_onion_access]
+        if not self.onion_only:
+            actions.extend([self._dummy_crypto_query, self._dummy_clearnet_browse, self._dummy_api_call])
         
         events = []
         threads = []
@@ -428,12 +427,9 @@ class AdvancedNoiseGenerator:
                 pause = self.rng.uniform(30, 90)
             else:
                 # Single event
-                actions = [
-                    self._dummy_crypto_query,
-                    self._dummy_clearnet_browse,
-                    self._dummy_onion_access,
-                    self._dummy_api_call,
-                ]
+                actions = [self._dummy_onion_access]
+                if not self.onion_only:
+                    actions.extend([self._dummy_crypto_query, self._dummy_clearnet_browse, self._dummy_api_call])
                 
                 action = self.rng.choice(actions)
                 event = action()
@@ -459,7 +455,7 @@ class AdvancedNoiseGenerator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced decoy noise generator for GhostSpiral operations"
+        description="Advanced decoy noise generator for network traffic obfuscation"
     )
     parser.add_argument("--dag", type=Path, default=Path("dag_structure.json"),
                        help="DAG structure file")
@@ -475,8 +471,11 @@ def main():
                        default="medium", help="Traffic intensity level")
     parser.add_argument("--out", "-o", type=Path,
                        help="Output log file (optional)")
-    parser.add_argument("--verify-proxy", action="store_true",
-                       help="Verify proxy connectivity before starting")
+    verify_group = parser.add_mutually_exclusive_group()
+    verify_group.add_argument("--verify-proxy", action="store_true", dest="verify_proxy", default=True,
+                              help="Verify proxy is routing through Tor before starting (default: on)")
+    verify_group.add_argument("--no-verify-proxy", action="store_false", dest="verify_proxy",
+                              help="Skip proxy verification")
     parser.add_argument("--onion-only", action="store_true",
                        help="Restrict noise traffic to .onion endpoints only (no clearnet exit)")
     
@@ -485,9 +484,6 @@ def main():
     if not args.onion_only:
         print("  [!] WARNING: Noise traffic exits to clearnet via Tor. "
               "Use --onion-only for onion-only traffic.", file=sys.stderr)
-    else:
-        CLEARNET_ENDPOINTS.clear()
-        CRYPTO_ENDPOINTS.clear()
     
     # Validate proxy
     if not args.tor_proxy.startswith("socks5h://"):
@@ -510,7 +506,11 @@ def main():
         print(f"[!] Failed to load configuration: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Initialize deterministic RNG
+    # Initialize deterministic RNG.
+    # WARNING: This PRNG is deterministic from the seed file. Anyone who
+    # obtains entropy_seed.json + dag + labels can reproduce the exact
+    # timing pattern of every noise event, defeating traffic obfuscation.
+    # Delete the seed file after operations or use SML to keep it RAM-only.
     combined_hash = hashlib.sha256(
         (seed_sha + dag_sha + lbl_sha + VERSION + args.intensity).encode()
     ).hexdigest()
@@ -519,7 +519,8 @@ def main():
     
     # Generate noise
     try:
-        generator = AdvancedNoiseGenerator(args.tor_proxy, rng, args.intensity)
+        generator = AdvancedNoiseGenerator(args.tor_proxy, rng, args.intensity,
+                                             onion_only=args.onion_only)
         events = generator.generate_noise(args.duration)
         
         success_count = sum(1 for e in events if e.success)

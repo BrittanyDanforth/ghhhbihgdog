@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ghost_unifier.py — GhostSpiral v16.9 Chaos Toolkit
-=================================================
-Master **orchestrator** that wires together the first‑phase chaos modules so a
+ghost_unifier — Master orchestrator for session workspace preparation
+=====================================================================
+Master **orchestrator** that wires together the first‑phase modules so a
 single command prepares an entire leak‑proof session workspace.
 
 Current pipeline (Phase‑1):
@@ -13,15 +13,15 @@ Current pipeline (Phase‑1):
 4. **label_poisoner**     → `label_map_poisoned.json`
 5. **vm_runtime**         → `/dev/shm/vm_timing.json`
 6. **noise**              → `decoy_noise.json`
-7. **ghostmutator**       → `runtime/ghostspiral_run_v16.py`
+7. **ghostmutator**       → `runtime/runtime_core.py`
 
 (Downstream modules — airgap signer, broadcaster, etc. — are triggered in
-Phase‑2 by `runtime/ghostspiral_run_v16.py` itself.)
+Phase‑2 by `runtime/runtime_core.py` itself.)
 
 Usage
 ─────
     python3 ghost_unifier --tor socks5h://127.0.0.1:9050 \
-                          --core ghostspiral_v15.py
+                          --core core_script.py
 
 CLI Flags (excerpt)
 ───────────────────
@@ -57,7 +57,7 @@ LABELS_PO = ROOT / "label_map_poisoned.json"
 VM_TIMING = Path("/dev/shm/vm_timing.json")
 NOISE_LOG = ROOT / "decoy_noise.json"
 
-MUTATED   = RUNTIME / "ghostspiral_run_v16.py"
+MUTATED   = RUNTIME / "runtime_core.py"
 MANIFEST  = MUTATED.with_suffix(".manifest.json")
 
 MODULES = {
@@ -77,7 +77,12 @@ MODULES = {
 def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = True,
              timeout: int = 600):
     """Execute a subprocess command with error handling."""
-    print("[•]", " ".join(cmd))
+    print("[*]", " ".join(cmd))
+    if env is None:
+        env = os.environ.copy()
+        for _k in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                    "COINGECKO_API_KEY", "TOR_CONTROL_PASSWORD"):
+            env.pop(_k, None)
     try:
         result = subprocess.run(cmd, check=check, env=env, capture_output=True, text=True,
                                 timeout=timeout)
@@ -145,12 +150,12 @@ def ensure_shm_writable():
 
 def main():
     p = argparse.ArgumentParser(
-        description="Unified driver for GhostSpiral v16 chaos prep.",
+        description="Unified driver for session preparation pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--tor", required=True, help="Tor proxy (socks5h://…)")
-    p.add_argument("--core", default="ghostspiral_v15.py", 
-                   help="Path to base GhostSpiral core script (v15)")
+    p.add_argument("--core", default="core_script.py", 
+                   help="Path to base core script for mutation")
     p.add_argument("--force", action="store_true", 
                    help="Rebuild artefacts even if they exist")
     p.add_argument("--skip-noise", action="store_true", 
@@ -183,7 +188,7 @@ def main():
     # Check /dev/shm availability
     ensure_shm_writable()
 
-    print(f"[i] Starting GhostSpiral v16.9 preparation")
+    print(f"[i] Starting session preparation")
     print(f"    Tor proxy: {args.tor}")
     print(f"    Core script: {args.core}")
     print(f"    Force rebuild: {args.force}")
@@ -262,12 +267,14 @@ def main():
 
         # Execute steps
         for step_name, cmd in steps:
-            print(f"[•] Executing: {step_name}")
+            print(f"[*] Executing: {step_name}")
             run_step(cmd)
 
-        print("\n[✓] Phase‑1 prep complete!")
+        print("\n[+] Phase 1 prep complete.")
         print("    Mutated core   :", MUTATED)
-        print("    Manifest       :", MANIFEST)
+        if MANIFEST.exists():
+            print("    Manifest       :", MANIFEST)
+            print("    [!] WARNING: Manifest is a de-obfuscation key. Delete after use.")
         print("    DAG            :", DAG)
         print("    Labels (raw)   :", LABELS)
         print("    Labels (poison):", LABELS_PO)
@@ -277,13 +284,13 @@ def main():
         print("\nNext: execute the mutated core script to enter Phase‑2 (sign + broadcast).")
 
     except subprocess.CalledProcessError as e:
-        print(f"\n[✗] Step failed with exit code {e.returncode}")
+        print(f"\n[!] Step failed with exit code {e.returncode}")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
         sys.exit(130)
     except Exception as e:
-        print(f"\n[✗] Unexpected error: {e}")
+        print(f"\n[!] Unexpected error: {e}")
         sys.exit(1)
 
 

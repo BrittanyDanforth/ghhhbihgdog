@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-label_poisoner.py — GhostSpiral v16.9 Chaos Toolkit
-==================================================
+label_poisoner — Multi-wallet fingerprint blender and UTF-8 obfuscation
+========================================================================
 Takes the **initial `label_map.json`** produced by `label_masker_v3.py` and
 performs a second‑stage mutation so that each label/note pair is *further*
 obfuscated to resemble data emitted by **multiple wallet brands at once**.
@@ -238,7 +238,7 @@ Examples:
     
     args = parser.parse_args()
 
-    print(f"[*] Label Poisoner v{VERSION}")
+    print(f"[*] Loading label poisoning pipeline...")
     print(f"[*] Loading files...")
 
     # Load input files
@@ -331,12 +331,18 @@ Examples:
         print(f"[+] File size: {args.out.stat().st_size} bytes")
         
     except PermissionError:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] Permission denied writing to {args.out}")
         sys.exit(1)
     except OSError as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] OS error writing output file: {e}")
         sys.exit(1)
     except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] Unexpected error writing output file: {e}")
         sys.exit(1)
 

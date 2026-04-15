@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-forensic_mirrormask.py — Enhanced GhostSpiral v2.0 Anti-Forensics Toolkit
-========================================================================
+forensic_mirrormask.py — Enhanced Anti-Forensics Toolkit
+=========================================================
 Advanced log obfuscation system that generates sophisticated alternate timelines
 to mislead forensic analysis. Uses military-grade OPSEC principles with multiple
 layers of protection against detection and reverse engineering.
@@ -49,7 +49,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 import threading
@@ -104,7 +104,7 @@ class SystemFingerprint:
             with open('/proc/cpuinfo', 'r') as f:
                 cpu_info = f.read()
             cpu_hash = hashlib.sha256(cpu_info.encode()).hexdigest()[:16]
-        except:
+        except Exception:
             cpu_hash = platform.processor()
         
         # System info
@@ -115,7 +115,7 @@ class SystemFingerprint:
             import subprocess
             result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
             network_hash = hashlib.sha256(result.stdout.encode()).hexdigest()[:16]
-        except:
+        except Exception:
             network_hash = str(uuid.getnode())
         
         combined = f"{cpu_hash}-{system_info}-{network_hash}"
@@ -167,7 +167,7 @@ class AntiAnalysis:
             for proc in suspicious_processes:
                 if proc in result.stdout.lower():
                     indicators.append(f"Analysis tool detected: {proc}")
-        except:
+        except Exception:
             pass
         
         # Timing analysis detection
@@ -196,7 +196,7 @@ class AntiAnalysis:
                         temp_file.touch()
                         time.sleep(random.uniform(0.1, 1.0))
                         temp_file.unlink(missing_ok=True)
-                    except:
+                    except Exception:
                         pass
             
             thread = threading.Thread(target=decoy_worker, args=(proc_name,), daemon=True)
@@ -222,7 +222,7 @@ class CryptoSecureRNG:
             secure_seed = secrets.token_bytes(64)
             seed_data = {
                 "primary_seed": secure_seed.hex(),
-                "created": datetime.now().isoformat(),
+                "created": datetime.now(timezone.utc).isoformat(),
                 "hardware_id": SystemFingerprint.get_hardware_id(),
                 "runtime_entropy": SystemFingerprint.get_runtime_entropy()
             }
@@ -706,6 +706,9 @@ def main():
                 temp_file.unlink(missing_ok=True)
             for temp_file in TEMP_DIR.glob("decoy_*.log"):
                 temp_file.unlink(missing_ok=True)
+            for proc_name in DECOY_PROCESSES:
+                for temp_file in TEMP_DIR.glob(f".{proc_name}_*"):
+                    temp_file.unlink(missing_ok=True)
         except Exception:
             pass
 

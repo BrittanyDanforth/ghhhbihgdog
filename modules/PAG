@@ -23,19 +23,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Callable, Dict, List, Tuple, Optional, Any
 import ctypes
 
 # Stealth configuration
 STEALTH_MODE = os.environ.get('DEBUG', '0') != '1'
 PARANOID_MODE = True
-
-# Process masking
-try:
-    import setproctitle
-    setproctitle.setproctitle("systemd-timesyncd")
-except:
-    pass
 
 class MemoryScrambler:
     """Secure memory handling with anti-forensics."""
@@ -45,7 +38,12 @@ class MemoryScrambler:
         self._lock_memory()
     
     def _lock_memory(self):
-        """Lock memory pages to prevent swapping."""
+        """Lock memory pages to prevent swapping and disable core dumps."""
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except (ImportError, ValueError, OSError):
+            pass
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_MEMLOCK, 
@@ -55,7 +53,7 @@ class MemoryScrambler:
             MCL_CURRENT = 1
             MCL_FUTURE = 2
             libc.mlockall(MCL_CURRENT | MCL_FUTURE)
-        except:
+        except (OSError, AttributeError):
             pass
     
     def register(self, data: Any):
@@ -75,7 +73,7 @@ class MemoryScrambler:
                         del item[k]
                 elif isinstance(item, list):
                     item.clear()
-            except:
+            except (TypeError, AttributeError):
                 pass
         
         self._sensitive.clear()
@@ -100,7 +98,7 @@ class EntropyMixer:
         try:
             with open('/dev/hwrng', 'rb') as f:
                 sources.append(f.read(1024))
-        except:
+        except (OSError, PermissionError):
             pass
         
         # Timing jitter
@@ -119,7 +117,7 @@ class EntropyMixer:
                 if pid.isdigit():
                     proc_data.append(pid.encode())
             sources.append(b''.join(proc_data[:100]))
-        except:
+        except (OSError, PermissionError):
             pass
         
         # System entropy
@@ -182,7 +180,7 @@ class PolymorphicGenerator:
         self.strategies = self._build_strategies()
         self.obfuscation_level = secrets.randbelow(5) + 1
     
-    def _build_strategies(self) -> List[callable]:
+    def _build_strategies(self) -> List[Callable]:
         """Build randomized generation strategies."""
         # Each strategy produces different graph characteristics
         strategies = []
@@ -419,7 +417,7 @@ class StealthWriter:
                     subprocess.run(['sync'], capture_output=True)
                     with open('/proc/sys/vm/drop_caches', 'w') as f:
                         f.write('3')
-                except:
+                except (OSError, PermissionError, FileNotFoundError):
                     pass
             
         except Exception as e:
@@ -431,9 +429,9 @@ class StealthWriter:
                         f.seek(0)
                         f.write(secrets.token_bytes(size))
                     temp_path.unlink()
-                except:
+                except OSError:
                     pass
-            raise e
+            raise
 
 def load_seed_secure(seed_path: Path) -> Tuple[dict, str]:
     """Load seed file with verification."""
@@ -488,7 +486,7 @@ def generate_dag(args):
     # Build output structure
     output = {
         "version": "3.0-poly",
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "timestamp": "redacted",
         "seed_ref": {
             "sha256": seed_hash
         },
@@ -511,15 +509,6 @@ def generate_dag(args):
     return len(graph['nodes']), len(graph['edges'])
 
 def main():
-    # Mask process command line
-    if sys.platform.startswith('linux'):
-        try:
-            libc = ctypes.CDLL("libc.so.6")
-            buff = ctypes.create_string_buffer(b"[kworker/u:0]")
-            libc.prctl(15, buff, 0, 0, 0)  # PR_SET_NAME
-        except:
-            pass
-    
     parser = argparse.ArgumentParser(description="Generate polymorphic DAG structure")
     parser.add_argument("--seed", "-s", type=Path, 
                        default=Path("entropy_seed.json"))

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-airgap_tx_signer v10.6 - Two-phase Monero TX signer for GhostSpiral
-====================================================================
+airgap_tx_signer - Two-phase Monero TX signer
+===============================================
 Implements the Monero cold-signing protocol:
 
 PHASE 1 "create" (online machine, has view-only wallet + daemon):
@@ -9,7 +9,7 @@ PHASE 1 "create" (online machine, has view-only wallet + daemon):
   - IMPORTANT: Monero wallet-rpc does NOT reserve outputs for do_not_relay
     TXs. Each call with do_not_relay=True will reuse the same inputs.
     Therefore this phase creates only ONE TX per invocation. The caller
-    (GhostSpiral auto-mode) must run the full create→sign→broadcast→sync
+    (auto-mode) must run the full create→sign→broadcast→sync
     cycle for each TX before creating the next one.
   - For air-gap batch mode, creates ONE unsigned TX per call. The operator
     must manually cycle: create → USB transfer → sign → USB transfer →
@@ -203,9 +203,18 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             elif tx_metadata_list:
                 is_presigned = True
                 if len(tx_metadata_list) > 1:
+                    # BUG 88 FIX: transfer_split may split a single logical
+                    # TX into multiple on-chain TXs (e.g. when input count
+                    # requires it). Each entry in tx_metadata_list is a
+                    # separate signed TX that MUST be broadcast independently.
+                    # The old code silently dropped all but the first —
+                    # meaning partial funds never moved.
+                    # Concatenate all metadata items with a separator so the
+                    # broadcast phase can split and relay each one. We use a
+                    # manifest field to record the count.
                     integrity_log("signer", f"multi_metadata:idx={idx}:count={len(tx_metadata_list)}")
                     print(f"  [!] TX {idx}: transfer_split returned {len(tx_metadata_list)} "
-                          f"metadata items (split TX). Using first item only.")
+                          f"metadata items (split TX). Saving ALL items.")
                 blob_hex = tx_metadata_list[0]
                 integrity_log("signer", f"hot_wallet_presigned:idx={idx}")
             else:
@@ -226,19 +235,55 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 failed += 1
                 continue
 
+            # BUG 88 FIX: Save ALL split TX parts, not just the first.
+            all_blobs = []
+            if is_presigned and len(tx_metadata_list) > 1:
+                for split_idx, split_hex in enumerate(tx_metadata_list):
+                    try:
+                        all_blobs.append(bytes.fromhex(split_hex))
+                    except ValueError:
+                        integrity_log("signer", f"bad_hex_split:idx={idx}:split={split_idx}")
+                        print(f"  [!] TX {idx} split {split_idx}: invalid hex — ABORTING TX.")
+                        print(f"  [!] ALL splits must be saved or funds are lost.")
+                        all_blobs = []
+                        break
+                if not all_blobs:
+                    failed += 1
+                    continue
+            else:
+                all_blobs = [blob_bytes]
+
             if is_presigned:
                 signed_dir = outdir / "signed"
                 signed_dir.mkdir(parents=True, exist_ok=True)
                 tx_file = signed_dir / f"tx_{idx}.signed"
-                tx_file.write_bytes(blob_bytes)
-                secure_file_perms(tx_file)
-                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed)")
             else:
                 tx_file = outdir / f"tx_{idx}.unsigned"
-                tx_file.write_bytes(blob_bytes)
-                secure_file_perms(tx_file)
 
-            sha = hashlib.sha256(blob_bytes).hexdigest()
+            split_files = []
+            for split_idx, split_bytes in enumerate(all_blobs):
+                if len(all_blobs) > 1:
+                    suffix = tx_file.suffix
+                    split_file = tx_file.with_name(f"tx_{idx}_split{split_idx}{suffix}")
+                else:
+                    split_file = tx_file
+
+                _tmp_blob = split_file.with_suffix(split_file.suffix + ".tmp")
+                _fd = os.open(str(_tmp_blob), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_fd, split_bytes)
+                    os.fsync(_fd)
+                finally:
+                    os.close(_fd)
+                os.replace(str(_tmp_blob), str(split_file))
+                secure_file_perms(split_file)
+                split_files.append(split_file.name)
+
+            if is_presigned:
+                part_info = f" ({len(all_blobs)} splits)" if len(all_blobs) > 1 else ""
+                print(f"  [+] TX {idx} -> {tx_file.name}{part_info} (hot wallet, already signed, fsync'd)")
+
+            sha = hashlib.sha256(all_blobs[0]).hexdigest()
             manifest.append({
                 "idx": idx,
                 "file": tx_file.name,
@@ -247,6 +292,8 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "amt": tx["amt"],
                 "delay": tx.get("delay", 0),
                 "presigned": is_presigned,
+                "split_parts": len(all_blobs),
+                "split_files": split_files if len(all_blobs) > 1 else [],
             })
             created += 1
             print(f"  [+] TX {idx} -> {tx_file.name}")
@@ -314,9 +361,12 @@ def phase_sign(args, plan: List[dict]):
     if not entries:
         sys.exit("[!] No unsigned TX entries in manifest")
 
-    wallet_file = args.wallet_file
+    # BUG 101 FIX: Check GS_WALLET_FILE env var first. mixer_core sets
+    # this to avoid passing the wallet path via CLI (visible in
+    # /proc/PID/cmdline). But the old code never read it.
+    wallet_file = os.environ.get("GS_WALLET_FILE", "") or args.wallet_file
     if not wallet_file or not Path(wallet_file).exists():
-        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
+        sys.exit(f"[!] Wallet file required for signing (not found or not set)")
 
     # BUG 42 FIX: Prefer GS_WALLET_PASSWORD env var over --wallet-password
     # CLI arg. CLI args are visible in /proc/PID/cmdline to all local users.
@@ -339,11 +389,12 @@ def phase_sign(args, plan: List[dict]):
         actual_hash = hashlib.sha256(Path(cli_path).read_bytes()).hexdigest()
         if actual_hash.lower() != expected_hash.lower():
             integrity_log("signer", f"wallet_cli_hash_MISMATCH:{actual_hash[:16]}")
+            # BUG 95 FIX: Don't print full path — reveals filesystem layout.
             sys.exit(
                 f"[!] wallet-cli hash MISMATCH!\n"
                 f"    Expected: {expected_hash}\n"
                 f"    Actual:   {actual_hash}\n"
-                f"    The binary at {cli_path} may be trojaned."
+                f"    The wallet-cli binary may be trojaned."
             )
         integrity_log("signer", "wallet_cli_hash_verified")
         print(f"  [+] wallet-cli binary verified: {actual_hash[:16]}...")
@@ -447,8 +498,16 @@ def phase_sign(args, plan: List[dict]):
             # Write password to a temp file so it's not visible in /proc/PID/cmdline.
             # monero-wallet-cli --password-file reads from file instead of CLI arg.
             pw_file = Path(work_dir) / ".wallet_pw"
-            pw_file.write_text(wallet_password)
-            secure_file_perms(pw_file)
+            _pw_fd = os.open(str(pw_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_pw_fd, wallet_password.encode())
+                os.fsync(_pw_fd)
+            finally:
+                os.close(_pw_fd)
+            if not secure_file_perms(pw_file):
+                print(f"  [!] CRITICAL: Cannot set 0600 on password file — aborting TX {idx}")
+                failed += 1
+                continue
 
             cmd = [
                 args.wallet_cli,
@@ -481,7 +540,14 @@ def phase_sign(args, plan: List[dict]):
             signed_out = Path(work_dir) / "signed_monero_tx"
             if signed_out.exists():
                 signed_data = signed_out.read_bytes()
-                signed_file.write_bytes(signed_data)
+                _tmp_signed = signed_file.with_suffix(signed_file.suffix + ".tmp")
+                _sfd = os.open(str(_tmp_signed), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_sfd, signed_data)
+                    os.fsync(_sfd)
+                finally:
+                    os.close(_sfd)
+                os.replace(str(_tmp_signed), str(signed_file))
                 secure_file_perms(signed_file)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
@@ -510,6 +576,20 @@ def phase_sign(args, plan: List[dict]):
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
         finally:
+            # Overwrite sensitive files before unlinking. shutil.rmtree only
+            # unlinks — on disk-backed /tmp the data remains recoverable from
+            # the journal or unallocated blocks until overwritten by the OS.
+            for sensitive_name in (".wallet_pw", "unsigned_monero_tx", "signed_monero_tx"):
+                _sf = Path(work_dir) / sensitive_name
+                if _sf.exists():
+                    try:
+                        _sz = _sf.stat().st_size
+                        with open(_sf, "r+b") as _wf:
+                            _wf.write(b"\x00" * _sz)
+                            _wf.flush()
+                            os.fsync(_wf.fileno())
+                    except OSError:
+                        pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
     # Write signed manifest
@@ -525,7 +605,6 @@ def main():
     install_signal_handlers()
 
     cli = argparse.ArgumentParser(
-        "airgap_tx_signer v10.5",
         description="Two-phase Monero TX signer (create unsigned / sign offline)",
     )
     cli.add_argument("unsigned_json",

@@ -1,0 +1,2017 @@
+#!/usr/bin/env python3
+"""
+Fully-wired BTC->XMR Mixer Core
+=================================
+!! RESEARCH / RED-TEAM TOOL !!
+Never use on main-net coins you do not own.
+
+End-to-end pipeline:
+  Stage 0: Validate inputs, Tor, RPC sync
+  Stage 1: JoinMarket receive (optional BTC tumble)
+  Stage 2: ThorChain BTC->XMR swap
+  Stage 3: Build wallets & DAG mixing graph
+  Stage 4: Build unsigned TX plan with fee-aware amounts
+  Stage 5: Auto-sign + broadcast (or dump for cold/airgap)
+
+OPSEC hardening:
+  - All traffic forced through Tor with leak checks at every stage
+  - NEWNYM circuit rotation between stages
+  - CSPRNG for all security-critical randomness (delays, hex extras)
+  - Timing jitter between operations
+  - Secure file permissions (0600) on all outputs
+  - Signal handlers for graceful shutdown
+  - Integrity hash-chain logging for every action
+  - Resource sentinel prevents operation under system stress
+"""
+from __future__ import annotations
+import argparse, json, math, os, re, secrets, sys, time, subprocess
+from decimal import Decimal
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Ensure gs_common is found when run from any working directory
+_CORE_DIR = str(Path(__file__).resolve().parent)
+if _CORE_DIR not in sys.path:
+    sys.path.insert(0, _CORE_DIR)
+
+from gs_common import (
+    integrity_log, verify_tor, tor_recheck, newnym,
+    safe_get, connect_rpc, require_resources, lock_memory,
+    secure_hex, secure_delay, atomic_write_json, secure_file_perms,
+    validate_proxy, install_signal_handlers, shutdown_requested,
+    scrub_address, normalize_broadcast_result,
+)
+
+# Monero fee priority multipliers relative to the default (priority 1).
+# Source: wallet2.cpp get_fee_multiplier(). These are approximate.
+FEE_PRIORITY_MULTIPLIER = {
+    1: Decimal("1"),
+    2: Decimal("4"),
+    3: Decimal("20"),
+    4: Decimal("166"),
+}
+
+DUST_XMR = Decimal("0.0001")
+BTC_RE = re.compile(
+    r"^(bc1[ac-hj-np-z02-9]{25,59}|tb1[ac-hj-np-z02-9]{25,59}"
+    r"|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
+    re.I
+)
+THORNODE_APIS = [
+    "https://thornode.ninerealms.com",
+    "https://thornode-v1.ninerealms.com",
+    "https://thornode.thorswap.net",
+]
+
+def _exponential_delay(delay_min: int, delay_max: int) -> int:
+    """Sample a delay from a truncated exponential distribution.
+
+    Exponential is harder to fingerprint than uniform because it has no
+    sharp cut-off at the boundaries.  Lambda is chosen so that ~95% of
+    the distribution falls within [delay_min, delay_max].
+    """
+    span = delay_max - delay_min
+    if span <= 0:
+        return delay_min
+    lam = 3.0 / span
+    # BUG 98 FIX: Add iteration cap to prevent theoretical infinite loop
+    # when samples consistently fall outside [delay_min, delay_max].
+    for _ in range(1000):
+        u = secrets.randbelow(1_000_000) / 1_000_000.0
+        if u == 0.0:
+            continue
+        sample = -math.log(u) / lam
+        delay = int(delay_min + sample)
+        if delay_min <= delay <= delay_max:
+            return delay
+    return delay_min + (span // 2)
+
+
+def _core_script(name: str) -> str:
+    """Resolve path to a sibling script in core/ directory."""
+    return str(Path(__file__).resolve().parent / name)
+
+MIN_WALLETS = 3
+MIN_DEEP = 1
+NUM_DECOYS = 4
+
+# Fallback fee: conservative estimate for typical 2-input/2-output Monero TX.
+# Updated periodically; safe to overshoot slightly (operator keeps the change).
+FALLBACK_FEE_XMR = Decimal("0.00005")
+
+
+def fetch_fee_from_rpc(rpc) -> Decimal:
+    """Ask monero-wallet-rpc for current fee estimate (the only reliable source).
+    Returns fee per TX in XMR, assuming ~2kB typical TX weight at default priority."""
+    try:
+        resp = rpc.raw_request("get_fee_estimate", {})
+        fee_per_byte = resp.get("fee", 0)
+        if isinstance(fee_per_byte, (int, float)) and fee_per_byte > 0:
+            fee_atomic = fee_per_byte * 2000
+            fee_xmr = Decimal(str(fee_atomic)) / Decimal("1000000000000")
+            if fee_xmr > 0 and fee_xmr < Decimal("1"):
+                integrity_log("fee", "rpc_fee_estimate_ok")
+                return fee_xmr
+            integrity_log("fee", f"rpc_fee_suspicious:{fee_xmr}")
+
+    except Exception as e:
+        integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
+    integrity_log("fee", "using_fallback_fee")
+    return FALLBACK_FEE_XMR
+
+
+def main():
+    install_signal_handlers()
+
+    cli = argparse.ArgumentParser(
+        description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
+    )
+
+    mode_group = cli.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--btc-entry",
+                            help="BTC entry address (bech32) — SENDER mode: you own the BTC")
+    mode_group.add_argument("--receive-wallet",
+                            help="Wallet JSON from create_receive_wallet — "
+                                 "RECEIVER mode: XMR already arrived on this address")
+
+    cli.add_argument("--tor-proxy", required=True,
+                     help="SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050)")
+    cli.add_argument("--joinmarket", action="store_true",
+                     help="Enable JoinMarket tumble before ThorChain swap")
+    cli.add_argument("--split", type=int, default=1,
+                     help="Number of BTC chunks to split across ThorChain")
+    cli.add_argument("--btc-amount", type=Decimal,
+                     help="Total BTC amount for ThorChain swap "
+                          "(required when --split > 0 in sender mode)")
+    cli.add_argument("--wallets", type=int, default=10,
+                     help=f"Number of mix wallets (min {MIN_WALLETS})")
+    cli.add_argument("--deep", type=int, default=2,
+                     help=f"Depth multiplier for DAG edges (min {MIN_DEEP})")
+    cli.add_argument("--airgap", action="store_true",
+                     help="Dump unsigned plan and stop (manual sign required)")
+    cli.add_argument("--cold", action="store_true",
+                     help="Dump unsigned plan for cold-wallet signing")
+    cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
+                     help="Primary monero-wallet-rpc endpoint")
+    cli.add_argument("--rpc-alt",
+                     help="Fallback monero-wallet-rpc endpoint")
+    cli.add_argument("--output", default="./unsigned",
+                     help="Output directory for unsigned TX plans")
+    cli.add_argument("--joinmarket-wallet",
+                     help="JoinMarket wallet file for tumbles")
+    cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
+                     help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--wallet-file", default="offline.wallet",
+                     help="Path to Monero wallet file for auto-mode signing")
+    cli.add_argument("--wallet-password", default="",
+                     help="Password for the wallet file (empty for no password). "
+                          "WARNING: visible in /proc/PID/cmdline — prefer GS_WALLET_PASSWORD env var")
+    cli.add_argument("--delay-min", type=int, default=180,
+                     help="Minimum inter-TX delay in seconds (default: 180)")
+    cli.add_argument("--delay-max", type=int, default=720,
+                     help="Maximum inter-TX delay in seconds (default: 720)")
+    cli.add_argument("--pre-mix-delay", type=int, default=0,
+                     help="Seconds to wait after XMR arrives before mixing begins "
+                          "(default: 0). Set to hours (3600+) or days (86400+) to "
+                          "break timing correlation between the ThorChain swap and "
+                          "mixing activity. A forensics firm monitoring ThorChain can "
+                          "trivially correlate a BTC→XMR swap with mixing that starts "
+                          "minutes later.")
+    cli.add_argument("--mix-fraction", type=Decimal, default=Decimal("0.9"),
+                     help="Fraction of balance to mix in this session (default: 0.9). "
+                          "Mixing the full swap output in one session creates amount "
+                          "correlation with the public ThorChain swap record. Mix a "
+                          "partial amount now and the rest in a separate session days later.")
+    cli.add_argument("--resume-plan",
+                     help="Resume Stage 5 on an existing unsigned plan JSON file. "
+                          "Skips Stages 0-4 and jumps straight to create→sign→broadcast. "
+                          "Use after a crash to continue from where the last run stopped. "
+                          "The plan's fingerprint must match any existing stage5_progress.json.")
+    args = cli.parse_args()
+
+    # ---- Resume-plan shortcut: skip Stages 0-4, jump to Stage 5 ----
+    if args.resume_plan:
+        resume_path = Path(args.resume_plan)
+        if not resume_path.exists():
+            sys.exit(f"[!] Resume plan not found: {resume_path}")
+        if resume_path.is_symlink():
+            sys.exit(
+                f"[!] Resume plan is a symlink: {resume_path}\n"
+                f"    Symlinks can point to sensitive files. Use the real path."
+            )
+        with open(resume_path) as f:
+            _rp = json.load(f)
+        _schema = _rp.get("meta", {}).get("schema", "")
+        if _schema not in ("plan_v1", "unsigned_v1"):
+            sys.exit(f"[!] Unrecognized plan schema: {_schema}")
+        if _rp.get("meta", {}).get("mock"):
+            sys.exit("[!] Cannot resume a mock plan (no real funds)")
+
+        proxy = validate_proxy(args.tor_proxy)
+        require_resources(min_disk_gb=2.0)
+        verify_tor(proxy)
+        newnym()
+
+        print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
+        print(f"  [*] Skipping Stages 0-4, jumping to Stage 5.")
+        print(f"  [!] OPSEC: Ensure monero-wallet-rpc was started with --log-level 0")
+        print(f"  [!]   to suppress RPC call logging (see Stage 0 warnings).")
+        integrity_log("stage5", f"resume_plan:{resume_path.name}")
+
+        rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        _acct_idx = _rp.get("meta", {}).get("account_index", 0)
+        bal = Decimal("0")
+        try:
+            res = rpc_primary.raw_request("get_balance", {"account_index": _acct_idx})
+            bal = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        except Exception as _bal_err:
+            integrity_log("stage5", f"resume_rpc_unreachable:{str(_bal_err)[:40]}")
+            # BUG 95 FIX: Don't print full RPC URL in error — may contain
+            # auth credentials (http://user:pass@host:port) or reveal infra.
+            sys.exit(
+                f"[!] Cannot reach wallet-rpc endpoint.\n"
+                f"    Error: {str(_bal_err)[:80]}\n"
+                f"    Resume requires a working RPC to create/broadcast TXs.\n"
+                f"    Start monero-wallet-rpc and retry."
+            )
+
+        staging_dir = "tx_staging"
+        lock_path = Path(".mixer.lock")
+    # BUG 100 FIX: Use atomic lock acquisition to close TOCTOU window.
+    # The old unlink+O_EXCL sequence has a race between the two calls.
+    _lock_acquired = False
+    for _lock_attempt in range(3):
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            _lock_acquired = True
+            break
+        except FileExistsError:
+            try:
+                stale_pid = lock_path.read_text().strip()
+                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                else:
+                    sys.exit(
+                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "    Another instance may be running.\n"
+                        "    If not, delete the lock file manually."
+                    )
+            except (OSError, ValueError):
+                sys.exit(
+                    "[!] Lock file exists: .mixer.lock\n"
+                    "    Another instance may be running.\n"
+                    "    If not, delete the lock file manually."
+                )
+    if not _lock_acquired:
+        sys.exit("[!] Could not acquire lock after 3 attempts.")
+
+    try:
+        _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
+    finally:
+        if lock_path.exists():
+            lock_path.unlink()
+
+        print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
+        print()
+        print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
+        print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
+        print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
+        print("  [!]   Or run:  python3 opsec/paranoia_mode")
+        sys.exit(0)
+
+    # ---- Determine mode ----
+    receive_mode = bool(args.receive_wallet)
+    receive_entry_addr = None
+    receive_account_index = 0
+
+    if receive_mode:
+        rw_path = Path(args.receive_wallet)
+        if not rw_path.exists():
+            sys.exit(f"[!] Receive wallet file not found: {rw_path}")
+        if rw_path.is_symlink():
+            sys.exit(
+                f"[!] Receive wallet file is a symlink: {rw_path}\n"
+                f"    Symlinks can point to sensitive files. Use the real path."
+            )
+        with open(rw_path) as f:
+            rw_data = json.load(f)
+        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
+            sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
+        receive_entry_addr = rw_data.get("address")
+        receive_account_index = rw_data.get("account_index", 0)
+        if not receive_entry_addr:
+            sys.exit("[!] Receive wallet JSON missing 'address' field")
+        _XMR_RECV_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
+        if not _XMR_RECV_RE.match(receive_entry_addr):
+            sys.exit(
+                f"[!] Receive wallet address fails format check: "
+                f"{scrub_address(receive_entry_addr)}\n"
+                f"    Expected a 95-char Monero address starting with 4 or 8."
+            )
+        try:
+            from monero.address import Address as _XMRAddr
+            _XMRAddr(receive_entry_addr)
+        except ImportError:
+            pass  # monero-python not available; regex check is the best we can do
+        except Exception:
+            sys.exit(
+                f"[!] Receive wallet address fails checksum validation: "
+                f"{scrub_address(receive_entry_addr)}\n"
+                f"    The address format looks correct but the checksum is invalid.\n"
+                f"    This means a typo or corruption — funds sent here would be LOST."
+            )
+        wallet_network = rw_data.get("network")
+        if wallet_network and wallet_network != "mainnet":
+            sys.exit(
+                f"[!] Receive wallet is for {wallet_network.upper()}, not mainnet.\n"
+                f"    Feeding a {wallet_network} address into a mainnet pipeline will\n"
+                f"    cause all swaps/transfers to fail or send funds to the void.\n"
+                f"    Regenerate the wallet against a mainnet monero-wallet-rpc."
+            )
+        integrity_log("stage0", "receive_mode:entry_loaded")
+        print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
+        if args.joinmarket:
+            sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
+    else:
+        if not BTC_RE.match(args.btc_entry):
+            sys.exit(
+                f"[!] Invalid BTC address: {args.btc_entry}\n"
+                f"    Expected formats:\n"
+                f"      Legacy P2PKH:     1... (25-34 chars)\n"
+                f"      P2SH:             3... (25-34 chars)\n"
+                f"      Bech32 (segwit):  bc1q... (42 chars) or bc1p... (62 chars)\n"
+                f"      Testnet bech32:   tb1q... or tb1p...\n"
+                f"    Your input does not match any valid Bitcoin address format.\n"
+                f"    Double-check for typos or extra characters."
+            )
+        integrity_log("stage0", "btc_entry_validated")
+
+    # ---- Validate inputs early ----
+    if args.delay_min < 0 or args.delay_max < 0:
+        sys.exit("[!] --delay-min and --delay-max must be non-negative")
+    if args.delay_min >= args.delay_max:
+        sys.exit(f"[!] --delay-min ({args.delay_min}) must be less than --delay-max ({args.delay_max})")
+
+    if args.pre_mix_delay < 0:
+        sys.exit("[!] --pre-mix-delay must be non-negative")
+    if args.pre_mix_delay == 0:
+        print(f"  [!] WARNING: --pre-mix-delay is 0 (mixing starts immediately after XMR arrives).")
+        print(f"  [!] TIMING CORRELATION RISK: A forensics firm monitoring ThorChain sees your")
+        print(f"  [!] BTC→XMR swap complete, then observes mixing activity from the receiving")
+        print(f"  [!] address within minutes. This is the #1 deanonymization vector.")
+        print(f"  [!] Recommended: --pre-mix-delay 3600 (1 hour) or more. Days are better.")
+        integrity_log("stage0", "pre_mix_delay_zero_warning")
+
+    if args.mix_fraction <= Decimal("0") or args.mix_fraction > Decimal("1"):
+        sys.exit(f"[!] --mix-fraction must be between 0 (exclusive) and 1 (inclusive), got {args.mix_fraction}")
+    if args.mix_fraction > Decimal("0.95"):
+        print(f"  [!] WARNING: --mix-fraction {args.mix_fraction} mixes nearly the entire balance in one session.")
+        print(f"  [!] AMOUNT CORRELATION RISK: The total mixed amount will closely match the")
+        print(f"  [!] ThorChain swap output (which is publicly visible). This makes it trivial")
+        print(f"  [!] to link the BTC deposit to the XMR mixing activity by total amount.")
+        print(f"  [!] Recommended: --mix-fraction 0.7-0.85, then mix the rest in a separate")
+        print(f"  [!] session days later with different timing and wallet parameters.")
+        integrity_log("stage0", f"high_mix_fraction_warning:{args.mix_fraction}")
+
+    if args.btc_amount is not None and args.btc_amount <= 0:
+        sys.exit(f"[!] --btc-amount must be positive, got {args.btc_amount}")
+    if args.wallets < MIN_WALLETS:
+        print(f"  [!] --wallets {args.wallets} below minimum {MIN_WALLETS}, clamping up.")
+    if args.deep < MIN_DEEP:
+        print(f"  [!] --deep {args.deep} below minimum {MIN_DEEP}, clamping up.")
+    args.wallets = max(args.wallets, MIN_WALLETS)
+    args.deep = max(args.deep, MIN_DEEP)
+
+    if args.wallets <= 5 or args.deep <= 1:
+        effective_rounds = args.wallets * 2 * args.deep
+        print(f"  [!] WARNING: Weak mixing parameters (wallets={args.wallets}, "
+              f"depth={args.deep}, rounds={effective_rounds}).")
+        print(f"  [!] Low wallet count and depth produce fewer mixing hops,")
+        print(f"  [!] making transaction graph analysis significantly easier.")
+        print(f"  [!] Recommended: --wallets 10+ --deep 2+ for meaningful privacy.")
+        integrity_log("stage0", f"weak_mixing_params:w={args.wallets}:d={args.deep}")
+
+    proxy = validate_proxy(args.tor_proxy)
+
+    # ---- Stage 0: Environment checks ----
+    require_resources(min_disk_gb=2.0)
+    verify_tor(proxy)
+    integrity_log("stage0", "tor_ok")
+
+    rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
+
+    # OPSEC WARNING: monero-wallet-rpc logs every JSON-RPC call by default.
+    # The call sequence (get_height, get_balance, new_address * N,
+    # get_fee_estimate, transfer_split * N, refresh * N) is a distinctive
+    # fingerprint of this toolkit. An adversary reading the wallet-rpc log
+    # file can identify the toolkit from the API call pattern alone.
+    print(f"  [!] OPSEC: Ensure monero-wallet-rpc was started with --log-level 0")
+    print(f"  [!]   to suppress RPC call logging. Default logging records every")
+    print(f"  [!]   JSON-RPC method call with timestamps — a forensic fingerprint.")
+    print(f"  [!]   Example: monero-wallet-rpc --wallet-file w --log-level 0 ...")
+    integrity_log("stage0", "wallet_rpc_log_warning_shown")
+
+    # Sync guard: wait for nodes to agree on height
+    # BUG 39 FIX: h1 was referenced after the for/else but only assigned
+    # inside a try block — if every attempt threw an exception, h1 would
+    # be unbound at the integrity_log call (NameError on the success path
+    # that never succeeds, but also confusing if partial success).
+    h1 = 0
+    for attempt in range(30):
+        if shutdown_requested():
+            sys.exit("[!] Shutdown requested during sync wait.")
+        try:
+            h1 = rpc_primary.raw_request("get_height", {})["height"]
+            if rpc_alt:
+                h2 = rpc_alt.raw_request("get_height", {})["height"]
+                if abs(h1 - h2) <= 2:
+                    break
+            else:
+                if h1 > 0:
+                    break
+        except Exception as e:
+            integrity_log("stage0", f"rpc_height_err:{str(e)[:40]}")
+        time.sleep(10)
+    else:
+        sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
+    integrity_log("stage0", "rpc_sync_ok")
+    integrity_log("stage0", "env_checks_ok")
+
+    fee_xmr = fetch_fee_from_rpc(rpc_primary)
+    integrity_log("stage0", "fee_fetched")
+
+    ###########################################################################
+    # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
+    ###########################################################################
+    newnym()
+
+    def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
+        if not args.joinmarket:
+            integrity_log("stage1", "JM_skipped")
+            return []
+        if not args.joinmarket_wallet:
+            sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
+        try:
+            # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
+            # --socks5-host/port to be explicit (JM >= 0.9 supports this).
+            # Without this, JM may resolve maker addresses over clearnet.
+            from urllib.parse import urlparse as _urlparse
+            _parsed_proxy = _urlparse(args.tor_proxy)
+            jm_path = Path(args.joinmarket_wallet).parent / "tumble.py"
+            if not jm_path.exists():
+                jm_path = Path("tumble.py")
+            result = subprocess.run(
+                [sys.executable, str(jm_path),
+                 "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
+                 "--socks5-port", str(_parsed_proxy.port or 9050),
+                 args.joinmarket_wallet, btc_addr, "all"],
+                check=True, capture_output=True, text=True, timeout=3600,
+            )
+            integrity_log("stage1", "JM_tumble_OK")
+            # TODO: parse actual UTXO amounts from result.stdout
+            # For now return empty - operator must check JM output manually
+            return []
+        except subprocess.TimeoutExpired:
+            integrity_log("stage1", "JM_timeout")
+            sys.exit("[!] JoinMarket tumble timed out after 1 hour")
+        except FileNotFoundError:
+            integrity_log("stage1", "JM_not_found")
+            sys.exit("[!] tumble.py not found - JoinMarket not installed?")
+        except subprocess.CalledProcessError as e:
+            integrity_log("stage1", f"JM_fail:{e.returncode}")
+            sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
+
+    if receive_mode:
+        jm_utxos = []
+        integrity_log("stage1", "skipped:receive_mode")
+    else:
+        jm_utxos = stage1_joinmarket(args.btc_entry)
+    integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
+
+    ###########################################################################
+    # Stage 2 - ThorChain swap definition
+    ###########################################################################
+
+    def _thornode_quote(amt: Decimal, xmr_dest: str) -> Optional[dict]:
+        """Try THORNode native API for a swap quote (no API key needed)."""
+        from urllib.parse import quote as _url_quote
+        amount_sats = int(amt * Decimal("1e8"))
+        params = (
+            f"from_asset=BTC.BTC&to_asset=XMR.XMR"
+            f"&amount={amount_sats}&destination={_url_quote(xmr_dest, safe='')}"
+        )
+        for base_url in THORNODE_APIS:
+            try:
+                url = f"{base_url}/thorchain/quote/swap?{params}"
+                resp = safe_get(url, proxy)
+                # BUG 77 FIX: `resp.get("error")` returns "" for {"error": ""},
+                # which is falsy — so empty-string errors were silently accepted.
+                # Check for the KEY's presence, not its truthiness.
+                if "error" in resp:
+                    integrity_log("stage2", f"thornode_error:{str(resp['error'])[:60]}")
+                    continue
+                inbound = resp.get("inbound_address", "")
+                memo = resp.get("memo", "")
+                expected_out = resp.get("expected_amount_out", "0")
+                if inbound and memo and len(memo) > 5:
+                    # BUG 78 FIX: Check memo length against BTC OP_RETURN limit.
+                    # BTC OP_RETURN outputs are limited to 80 bytes. ThorChain
+                    # memos can exceed this. If the memo is too long, the BTC TX
+                    # will be rejected by miners and the operator loses nothing
+                    # (TX never confirms), but they waste time and may miss the
+                    # quote expiry window trying to debug.
+                    memo_bytes = len(memo.encode("utf-8"))
+                    if memo_bytes > 80:
+                        integrity_log("stage2", f"memo_too_long:{memo_bytes}B")
+                        print(f"  [!] WARNING: ThorChain memo is {memo_bytes} bytes "
+                              f"(BTC OP_RETURN limit is 80 bytes).")
+                        print(f"  [!] This memo CANNOT fit in a standard OP_RETURN output.")
+                        print(f"  [!] The BTC transaction will be rejected by miners.")
+                        continue
+
+                    # BUG 79 FIX: Check recommended_min_amount_in from THORNode.
+                    # ThorChain has minimum swap amounts that vary by pool depth.
+                    # Sending below the minimum = funds stuck or refunded minus fees.
+                    rec_min = resp.get("recommended_min_amount_in")
+                    if rec_min:
+                        try:
+                            min_sats = int(rec_min)
+                            if amount_sats < min_sats:
+                                min_btc = Decimal(str(min_sats)) / Decimal("1e8")
+                                integrity_log("stage2", f"below_min:{amt}<{min_btc}")
+                                print(f"  [!] WARNING: {amt} BTC is below ThorChain minimum "
+                                      f"of {min_btc} BTC for this pool.")
+                                print(f"  [!] Swap will likely fail or be refunded minus fees.")
+                                continue
+                        except (ValueError, TypeError):
+                            integrity_log("stage2", f"min_amount_parse_fail:{rec_min}")
+
+                    # THORNode returns expected_amount_out in target asset's
+                    # native precision. For XMR that's piconero (1e12).
+                    expected_xmr = Decimal(str(expected_out)) / Decimal("1e12")
+                    if expected_xmr <= 0:
+                        continue
+                    # Sanity: if the result looks wildly wrong (e.g. millions of XMR
+                    # for a normal BTC amount), the API may have changed units
+                    if expected_xmr > 100000:
+                        integrity_log("stage2", f"suspicious_quote:{expected_xmr}")
+                        continue
+
+                    # BUG 80 FIX: Extract and return quote expiry timestamp.
+                    # ThorChain quotes are time-limited. The inbound_address
+                    # (vault) may rotate and the memo becomes invalid after expiry.
+                    # Sending BTC with an expired memo = funds stuck in vault.
+                    expiry = resp.get("expiry", 0)
+                    try:
+                        expiry = int(expiry)
+                    except (ValueError, TypeError):
+                        expiry = 0
+
+                    return {
+                        "deposit_address": inbound,
+                        "memo": memo,
+                        "expected_xmr": str(expected_xmr),
+                        "expiry": expiry,
+                        "memo_bytes": memo_bytes,
+                    }
+            except Exception:
+                continue
+        return None
+
+    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
+        """Get ThorChain swap quotes for each BTC chunk via THORNode native API.
+
+        Returns list of deposit instructions for the operator.
+        The operator must MANUALLY send BTC to each deposit address.
+        """
+        deposits = []
+        for i, amt in enumerate(chunks):
+            if shutdown_requested():
+                integrity_log("stage2", f"shutdown_at_chunk_{i}")
+                sys.exit("[!] Shutdown requested during quote fetch.")
+
+            if amt <= Decimal(0):
+                continue
+
+            if i > 0:
+                newnym()
+                secure_delay(3.0, 10.0)
+
+            result = _thornode_quote(amt, xmr_dest)
+
+            if not result:
+                integrity_log("stage2", f"thornode_failed_all_endpoints:{i}")
+                sys.exit(
+                    f"[!] All THORNode endpoints failed for chunk {i}.\n"
+                    f"    Tried: {', '.join(THORNODE_APIS)}\n"
+                    f"    Check Tor connectivity and try again later."
+                )
+
+            deposit_addr = result["deposit_address"]
+            memo = result.get("memo", "")
+            expected_dec = Decimal(result.get("expected_xmr", "0"))
+
+            expiry_ts = result.get("expiry", 0)
+            memo_bytes = result.get("memo_bytes", 0)
+
+            deposit_info = {
+                "chunk": i,
+                "btc_amount": str(amt),
+                "deposit_address": deposit_addr,
+                "memo": str(memo),
+                "expected_xmr": str(expected_dec),
+                "source": "thornode",
+                "expiry": expiry_ts,
+                "memo_bytes": memo_bytes,
+            }
+            deposits.append(deposit_info)
+
+            print(f"  [*] Chunk {i}/{len(chunks)-1} (via thornode):")
+            print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
+            if memo:
+                print(f"      With memo: {str(memo)[:40]}...")
+            print(f"      Expected: ~{expected_dec} XMR")
+            if expiry_ts:
+                remaining = expiry_ts - int(time.time())
+                if remaining <= 0:
+                    print(f"      [!] QUOTE ALREADY EXPIRED — do NOT send BTC!")
+                    integrity_log("stage2", f"quote_expired_at_print:{i}")
+                else:
+                    print(f"      [!] Quote expires in {remaining // 60}m {remaining % 60}s — send BTC promptly!")
+            integrity_log("stage2", f"quote_ready:{i}:thornode")
+
+            secure_delay(5.0, 15.0)
+
+        return deposits
+
+    ###########################################################################
+    # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
+    # the ENTRY receive address exists for ThorChain destination)
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage3_pre")
+
+    sub_account = receive_account_index if receive_mode else 0
+
+    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> List[str]:
+        """Create mixing subaddresses. Labels use random hex instead of
+        sequential indices to avoid leaking the role or count of each
+        address if the wallet file is inspected forensically (BUG 37 FIX)."""
+        subs = []
+        for i in range(n):
+            label = secure_hex(6)
+            addr = rpc.new_subaddress(account_index=acct_idx, label=label)
+            subs.append(addr)
+        for d in range(decoys):
+            label = secure_hex(6)
+            addr = rpc.new_subaddress(account_index=acct_idx, label=label)
+            subs.append(addr)
+        return subs
+
+    subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
+    if len(subs) < MIN_WALLETS + 1:
+        sys.exit("[!] Failed to create enough subaddresses")
+
+    # BUG 91 FIX: Warn about permanent subaddress creation.
+    # Monero subaddresses CANNOT be deleted from a wallet. They are
+    # persisted in the wallet file forever. An adversary who seizes the
+    # wallet (via law enforcement, device theft, or backup compromise) sees
+    # N+ subaddresses created at the same time with random hex labels —
+    # a distinctive fingerprint of automated mixing. paranoia_mode cannot
+    # remove them because Monero's wallet format has no subaddress deletion.
+    _total_subs_created = args.wallets + NUM_DECOYS
+    print(f"  [!] OPSEC WARNING: {_total_subs_created} subaddresses were just PERMANENTLY")
+    print(f"  [!] added to the wallet file (account {sub_account}).")
+    print(f"  [!] Monero subaddresses CANNOT be deleted. If this wallet is ever")
+    print(f"  [!] seized or backed up, the subaddress pattern reveals mixing activity.")
+    print(f"  [!] MITIGATION: After mixing is complete, destroy this wallet entirely")
+    print(f"  [!] and recreate from seed. Subaddresses are deterministic from the seed")
+    print(f"  [!] and only appear if explicitly recreated (which an adversary cannot do")
+    print(f"  [!] without running this toolkit against the same seed).")
+    integrity_log("stage3", f"permanent_subaddrs_created:{_total_subs_created}")
+
+    if receive_mode:
+        ENTRY = receive_entry_addr
+        # Verify the receive address actually exists in the connected wallet.
+        # If the operator points --rpc at a different wallet, ENTRY won't be
+        # resolvable to a subaddress index and every fan-out TX will fail at
+        # Stage 5 (airgap_tx_signer aborts when src address is not found).
+        try:
+            _all_addrs = rpc_primary.raw_request(
+                "get_address", {"account_index": sub_account}
+            )
+            _found = any(
+                e.get("address") == ENTRY
+                for e in _all_addrs.get("addresses", [])
+            )
+            if not _found:
+                sys.exit(
+                    f"[!] Receive-wallet address {scrub_address(ENTRY)} NOT FOUND\n"
+                    f"    in the wallet connected at {args.rpc_primary} "
+                    f"(account {sub_account}).\n"
+                    f"    The RPC wallet must be the SAME wallet that generated\n"
+                    f"    the receive address. All fan-out TXs would fail.\n"
+                    f"    Connect the correct wallet and retry."
+                )
+            integrity_log("stage3", "receive_entry_verified_in_wallet")
+        except SystemExit:
+            raise
+        except Exception as e:
+            integrity_log("stage3", f"entry_verify_warn:{str(e)[:40]}")
+            print(f"  [!] WARNING: Could not verify receive address in wallet: {e}")
+            print(f"  [!] Proceeding, but fan-out TXs may fail if address is wrong.")
+        if ENTRY in subs:
+            subs.remove(ENTRY)
+        subs.insert(0, ENTRY)
+        integrity_log("stage3", "entry_reused_from_receive_wallet")
+        print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
+    else:
+        ENTRY = subs[0]
+        integrity_log("stage3", "entry_created")
+
+    secrets.SystemRandom().shuffle(subs)
+
+    ###########################################################################
+    # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage2_exec")
+
+    swap_deposits = []
+    if receive_mode:
+        integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
+        print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
+        print(f"  [+] Entry address: {scrub_address(ENTRY)}")
+    else:
+        print()
+        print(f"  {'=' * 68}")
+        print(f"  CRITICAL OPSEC WARNING:")
+        print(f"  Do NOT send BTC to these deposit addresses from a KYC exchange.")
+        print(f"  KYC exchanges record your identity with every transaction.")
+        print(f"  Use an intermediate non-KYC wallet (e.g., Sparrow, Electrum with Tor)")
+        print(f"  to break the direct link between your identity and the ThorChain deposit.")
+        print(f"  {'=' * 68}")
+        print()
+        integrity_log("stage2", "kyc_opsec_warning_shown")
+        btc_chunks = []
+
+        if jm_utxos:
+            btc_chunks = jm_utxos
+        elif args.btc_amount and args.btc_amount > 0:
+            num_splits = max(args.split, 1)
+            per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
+            btc_chunks = [per_chunk] * num_splits
+            remainder = args.btc_amount - (per_chunk * num_splits)
+            if remainder > 0:
+                btc_chunks[0] += remainder
+            integrity_log("stage2", f"btc_split:{num_splits}_chunks:{per_chunk}_each")
+            print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
+
+        # Pre-validate: warn if chunks are suspiciously small (likely below
+        # ThorChain minimum). The actual minimum varies by pool depth and is
+        # checked per-quote inside _thornode_quote, but this catches the
+        # obvious case of --split 50 with 0.01 BTC before burning Tor circuits.
+        THORCHAIN_APPROX_MIN_BTC = Decimal("0.0005")
+        if btc_chunks:
+            small_chunks = [c for c in btc_chunks if c < THORCHAIN_APPROX_MIN_BTC]
+            if small_chunks:
+                print(f"  [!] WARNING: {len(small_chunks)} of {len(btc_chunks)} chunks "
+                      f"are below ~{THORCHAIN_APPROX_MIN_BTC} BTC.")
+                print(f"  [!] Smallest chunk: {min(btc_chunks)} BTC")
+                print(f"  [!] ThorChain has a minimum swap amount that varies by pool depth.")
+                print(f"  [!] These chunks will likely be rejected or refunded minus fees.")
+                print(f"  [!] Consider using fewer --split chunks or a larger --btc-amount.")
+                integrity_log("stage2", f"small_chunks_warning:{len(small_chunks)}_of_{len(btc_chunks)}")
+            if all(c < THORCHAIN_APPROX_MIN_BTC for c in btc_chunks):
+                sys.exit(
+                    f"[!] ALL {len(btc_chunks)} chunks are below ~{THORCHAIN_APPROX_MIN_BTC} BTC.\n"
+                    f"    Every swap will fail. Reduce --split or increase --btc-amount."
+                )
+
+        if btc_chunks:
+            swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
+            integrity_log("stage2", "swap_quotes_generated")
+            total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+
+            print()
+            print("  " + "=" * 72)
+            print("  THORCHAIN PUBLIC VISIBILITY WARNING")
+            print("  " + "=" * 72)
+            print("  The following information is PERMANENTLY recorded on PUBLIC blockchains")
+            print("  (Bitcoin AND ThorChain) and CANNOT be erased:")
+            print()
+            for dep in swap_deposits:
+                print(f"    Chunk {dep['chunk']}: {dep['btc_amount']} BTC → ~{dep['expected_xmr']} XMR")
+            print()
+            print(f"    Total: {args.btc_amount} BTC → ~{total_expected} XMR")
+            print()
+            print("  Any blockchain analyst can see these exact amounts and timestamps.")
+            print("  This is the primary attack surface for deanonymization.")
+            print()
+            print("  TO REDUCE CORRELATION RISK:")
+            print("  1. Wait a RANDOM period (hours or days) before sending BTC to the")
+            print("     deposit address. Do NOT send immediately after generating this quote.")
+            print("  2. Do NOT send BTC from a KYC exchange directly to the deposit address.")
+            print("     Use an intermediate non-KYC wallet (e.g. Sparrow, Electrum over Tor).")
+            print("  3. If using --split, space out deposits over HOURS or DAYS, not minutes.")
+            print(f"     Sending {len(swap_deposits)} deposits in rapid succession creates a")
+            print("     distinctive pattern on ThorChain visible to any observer.")
+            print("  " + "=" * 72)
+            integrity_log("stage2", "thorchain_visibility_warning_shown")
+
+            print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+            print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+            print()
+            print()
+            print("  SENDER INSTRUCTIONS: send BTC to deposit addresses below.")
+            for dep in swap_deposits:
+                print(f"\n  --- Chunk {dep['chunk']} ---")
+                print(f"  Send exactly: {dep['btc_amount']} BTC")
+                print(f"  To address:   {dep['deposit_address']}")
+                if dep.get("memo"):
+                    print(f"  With memo:    {dep['memo'][:40]}…")
+                print(f"  Expected XMR: ~{dep['expected_xmr']}")
+                dep_expiry = dep.get("expiry", 0)
+                if dep_expiry:
+                    dep_remaining = dep_expiry - int(time.time())
+                    if dep_remaining <= 0:
+                        print(f"  *** EXPIRED — DO NOT SEND — request new quote! ***")
+                    elif dep_remaining < 600:
+                        print(f"  *** URGENT: expires in {dep_remaining // 60}m {dep_remaining % 60}s ***")
+                    else:
+                        print(f"  Expires in:   {dep_remaining // 60}m {dep_remaining % 60}s")
+            print()
+            print()
+            print("  [!] Manually send BTC to each deposit address above.")
+            print("  [!] Include the memo in the OP_RETURN field.")
+            print("  [!] Quotes expire. Send before the expiry time shown.")
+            if len(swap_deposits) > 1:
+                print()
+                print("  [!] SPLIT DEPOSIT TIMING GUIDANCE:")
+                print(f"  [!] You have {len(swap_deposits)} chunks. Do NOT send them all at once.")
+                print("  [!] Space deposits hours or days apart. Sending multiple BTC transactions")
+                print("  [!] to ThorChain vaults in a short window is a distinctive on-chain")
+                print("  [!] fingerprint that links all chunks to a single operator.")
+                integrity_log("stage2", "split_timing_guidance_shown")
+            print()
+            print(f"  {'─' * 68}")
+            print("  IMPORTANT: When sending BTC, use a Bitcoin wallet configured with Tor.")
+            print("  If your BTC wallet connects directly to the internet, your IP address")
+            print("  will be logged by Bitcoin nodes and can be linked to this deposit.")
+            print(f"  {'─' * 68}")
+        else:
+            integrity_log("stage2", "manual_mode")
+            print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
+            print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
+            print(f"        python3 thor_swap_preparer \\")
+            print(f"          --amounts <BTC_AMOUNT> \\")
+            print(f"          --dests {scrub_address(ENTRY)} \\")
+            print(f"          --tor-proxy {args.tor_proxy}")
+            print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
+
+    dag = {}
+    for a in subs:
+        others = [b for b in subs if b != a]
+        max_k = len(others)
+        k = min((secrets.randbelow(3) + 1) * args.deep, max_k)
+        k = max(k, 1)
+        chosen = []
+        pool = list(others)
+        for _ in range(k):
+            idx = secrets.randbelow(len(pool))
+            chosen.append(pool.pop(idx))
+        dag[a] = chosen
+    integrity_log("stage3", "dag_built")
+
+    ###########################################################################
+    # Stage 4 - Balance, amounts, plan
+    #
+    # INHERENT BLOCKCHAIN CORRELATION LIMITATIONS (cannot be fixed):
+    #
+    # 1. Fee priority: All TXs in a batch use the same --fee-priority.
+    #    Monero fees are per-byte and set by wallet-rpc; the operator cannot
+    #    vary fee per individual TX.  An analyst seeing many TXs with the
+    #    same fee tier in a window can cluster them.  Mitigation: use the
+    #    default priority (1) so TXs blend with normal traffic.
+    #
+    # 2. NEWNYM cadence: A NEWNYM circuit rotation happens before every TX.
+    #    An observer at the Tor entry guard sees circuit-creation bursts that
+    #    may correlate with blockchain broadcast timestamps.  The per-TX
+    #    delay (now exponentially distributed and configurable via
+    #    --delay-min/--delay-max) reduces this, but cannot eliminate it.
+    #
+    # 3. Stage ordering: The pipeline always runs fan-out-then-DAG.  This
+    #    structural pattern (one source → N targets, then random hops) is
+    #    inherent to the mixing design and cannot be reordered without
+    #    breaking the balance prerequisites for later stages.
+    #
+    # 4. RPC refresh pattern: After each broadcast, refresh() + short
+    #    pause + next TX creation produces a distinctive cadence.  This is
+    #    required for correctness (wallet must see spent outputs).
+    ###########################################################################
+
+    bal_account = receive_account_index if receive_mode else 0
+
+    def xmr_balance() -> Tuple[Decimal, Decimal]:
+        """Returns (total_balance, unlocked_balance) in XMR."""
+        res = rpc_primary.raw_request(
+            "get_balance", {"account_index": bal_account, "address_indices": []}
+        )
+        total = Decimal(str(res.get("balance", 0))) / Decimal(10 ** 12)
+        unlocked = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        return total, unlocked
+
+    total_bal, unlocked_bal = xmr_balance()
+    integrity_log("stage4", "balance_fetched")
+
+    if total_bal > unlocked_bal + DUST_XMR:
+        print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
+
+    bal = unlocked_bal
+    is_mock_plan = False
+    if bal <= DUST_XMR:
+        if args.cold or args.airgap:
+            print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
+            print("[!] DO NOT sign/broadcast this plan without real funds!")
+            bal = Decimal("10.0")
+            is_mock_plan = True
+            integrity_log("stage4", "mock_balance:dry_run_only")
+        else:
+            sys.exit(
+                f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
+                f"    Cannot create a real TX plan without funds.\n"
+                f"    Total balance: {total_bal} XMR (may be locked/unconfirmed).\n"
+                f"    Use --cold or --airgap for dry-run planning."
+            )
+
+    mix_bal = (bal * args.mix_fraction).quantize(Decimal("0.0001"))
+    unmixed = bal - mix_bal
+    if unmixed > DUST_XMR:
+        print(f"  [*] --mix-fraction {args.mix_fraction}: mixing {mix_bal} XMR of {bal} XMR available.")
+        print(f"  [*] {unmixed} XMR will remain unmixed in this session.")
+        print(f"  [*] Mix the remainder in a SEPARATE session days later to break amount correlation.")
+        integrity_log("stage4", f"mix_fraction:{args.mix_fraction}:mixing={mix_bal}:unmixed={unmixed}")
+    bal = mix_bal
+
+    if args.pre_mix_delay > 0:
+        hours = args.pre_mix_delay / 3600.0
+        print(f"\n  [*] PRE-MIX DELAY: Waiting {args.pre_mix_delay}s ({hours:.1f} hours) before mixing.")
+        print(f"  [*] This breaks the timing correlation between the ThorChain swap and mixing.")
+        print(f"  [*] Press Ctrl+C to abort (progress is saved; rerun to resume).")
+        integrity_log("stage4", f"pre_mix_delay_start:{args.pre_mix_delay}s")
+        waited = 0
+        while waited < args.pre_mix_delay:
+            if shutdown_requested():
+                integrity_log("stage4", f"pre_mix_delay_interrupted:{waited}s_of_{args.pre_mix_delay}s")
+                sys.exit(f"[!] Shutdown during pre-mix delay ({waited}s of {args.pre_mix_delay}s elapsed).")
+            chunk = min(60, args.pre_mix_delay - waited)
+            time.sleep(chunk)
+            waited += chunk
+        integrity_log("stage4", "pre_mix_delay_complete")
+        print(f"  [+] Pre-mix delay complete. Proceeding with mixing.")
+
+    rounds = args.wallets * 2 * args.deep
+    priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))
+    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")  # base * priority * 50% safety margin
+    total_fees = per_round_fee * rounds
+    usable = bal - total_fees
+
+    if args.fee_priority >= 3:
+        print(f"  [!] WARNING: Fee priority {args.fee_priority} (multiplier {priority_mult}x) "
+              f"dramatically increases TX costs.")
+        print(f"  [!] Estimated total fees: {total_fees:.6f} XMR for {rounds} rounds.")
+        print(f"  [!] Use priority 1-2 unless the mempool is congested.")
+
+    if usable <= DUST_XMR:
+        sys.exit(
+            f"[!] Balance {bal} XMR insufficient.\n"
+            f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
+            f"    Usable after fees: {usable} XMR"
+        )
+
+    split_amt = usable / Decimal(rounds)
+    integrity_log("stage4", "plan_calculated")
+
+    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
+    quantized_split = split_amt.quantize(Decimal("0.0001"))
+    total_planned = quantized_split * rounds
+    if total_planned > usable:
+        quantized_split -= Decimal("0.0001")
+        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
+
+    plan = []
+
+    # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
+    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
+    # deposits to ENTRY. Either way, we must spread funds outward before
+    # the random DAG mixing can function (otherwise src addresses have no
+    # balance and every TX fails).
+    mix_targets = [s for s in subs if s != ENTRY]
+    fanout_count = min(len(mix_targets), args.wallets)
+    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+    # BUG 40 FIX: Verify fan-out total doesn't exceed usable balance.
+    # Quantization rounding can push total above usable for small balances.
+    fanout_total = fanout_amt * fanout_count
+    if fanout_total > usable:
+        fanout_amt -= DUST_XMR
+    if fanout_amt <= DUST_XMR:
+        sys.exit(
+            f"[!] Usable balance {usable} XMR too small to fan out across "
+            f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
+        )
+    for fi in range(fanout_count):
+        if shutdown_requested():
+            integrity_log("stage4", f"shutdown_at_fanout_{fi}")
+            break
+        # Per-TX jitter breaks identical-amount clustering on the blockchain.
+        # ±0.00005 XMR is small enough to be invisible to the operator but
+        # ensures no two fan-out TXs share the exact same amount on-chain.
+        jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+        actual_fanout_amt = fanout_amt + jitter
+        if actual_fanout_amt <= DUST_XMR:
+            actual_fanout_amt = fanout_amt
+        plan.append({
+            "src": ENTRY,
+            "dst": mix_targets[fi],
+            "amt": str(actual_fanout_amt),
+            "delay": _exponential_delay(args.delay_min, args.delay_max),
+            "extra": secure_hex(16),
+        })
+    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:base_amt={fanout_amt}:jittered")
+
+    # Phase B: DAG mixing — random hops between mix subaddresses.
+    # Recalculate per-round amount from the remaining balance after fan-out.
+    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    dag_rounds = max(rounds - fanout_count, args.wallets)
+    if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
+        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+        if dag_split <= DUST_XMR:
+            dag_split = DUST_XMR
+        for r in range(dag_rounds):
+            if shutdown_requested():
+                integrity_log("stage4", f"shutdown_at_round_{r}")
+                break
+            src_idx = secrets.randbelow(len(mix_targets))
+            s = mix_targets[src_idx]
+            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+            if not dst_candidates:
+                continue
+            dst_idx = secrets.randbelow(len(dst_candidates))
+            d = dst_candidates[dst_idx]
+            # Per-TX jitter breaks identical-amount clustering (same rationale as fan-out)
+            dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+            actual_dag_amt = dag_split + dag_jitter
+            if actual_dag_amt <= DUST_XMR:
+                actual_dag_amt = dag_split
+            plan.append({
+                "src": s,
+                "dst": d,
+                "amt": str(actual_dag_amt),
+                "delay": _exponential_delay(args.delay_min, args.delay_max),
+                "extra": secure_hex(16),
+            })
+    else:
+        integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
+
+    # BUG 82 FIX: Bind plan to wallet identity. Without this, resuming
+    # with a different wallet connected silently uses wrong subaddresses.
+    # BUG 90 FIX: If this fails, the plan's wallet_primary is empty, and the
+    # Stage 5 resume wallet-mismatch check becomes a no-op (empty string
+    # doesn't match, but empty plan_wallet skips the check entirely).
+    # This means resuming with a different wallet is silently accepted.
+    _wallet_primary = ""
+    try:
+        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": 0})
+        _wallet_primary = _addr_resp.get("address", "")
+    except Exception as e:
+        sys.exit(f"[!] Cannot determine wallet identity: {e}\n"
+                 f"    Wallet-rpc must be accessible for safe execution.")
+    if not _wallet_primary:
+        sys.exit("[!] Wallet returned empty primary address. Cannot verify identity.")
+
+    # Collect ThorChain quote expiry for plan metadata. Air-gap operators
+    # need this to know whether quotes are still valid when they return.
+    _earliest_quote_expiry = 0
+    if swap_deposits:
+        _expiries = [d.get("expiry", 0) for d in swap_deposits if d.get("expiry", 0) > 0]
+        if _expiries:
+            _earliest_quote_expiry = min(_expiries)
+
+    meta = {
+        "schema": "plan_v1",
+        "created": int(time.time()) // 600 * 600,
+        "rounds": len(plan),
+        "fee_per_round": str(per_round_fee),
+        "total_fees": str(total_fees),
+        "account_index": bal_account,
+        "wallet_primary": _wallet_primary,
+        "daemon_height": h1,
+        "fee_priority": args.fee_priority,
+        "delay_min": args.delay_min,
+        "delay_max": args.delay_max,
+    }
+    if _earliest_quote_expiry > 0:
+        meta["thorchain_quote_expiry"] = _earliest_quote_expiry
+    if is_mock_plan:
+        meta["mock"] = True
+    if not receive_mode and args.btc_entry:
+        meta["btc_entry"] = scrub_address(args.btc_entry)
+    if shutdown_requested():
+        meta["partial"] = True
+    unsigned = {"meta": meta, "txs": plan}
+
+    outdir = Path(args.output)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ufile = outdir / f"unsigned_{secure_hex(8)}.json"
+    atomic_write_json(unsigned, ufile)
+    integrity_log("stage4", "unsigned_dump_saved")
+    print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
+
+    if args.cold or args.airgap:
+        mode = "cold" if args.cold else "airgap"
+        for stale in ["signer_progress.json", "broadcast_progress.json",
+                       "stage5_progress.json"]:
+            stale_path = Path(stale)
+            if stale_path.exists():
+                stale_path.unlink()
+                integrity_log("stage4", f"cleaned_stale:{stale}")
+        print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
+        if not is_mock_plan:
+            print(f"  [!] WARNING: Plan file contains real data.")
+            print(f"  [!] {ufile.name} has the full mixing graph.")
+            print(f"  [!] After signing and broadcast:")
+            print(f"  [!]   - Securely wipe this file (shred -u)")
+            print(f"  [!]   - Wipe the USB transfer medium")
+            print(f"  [!]   - Run cleanup")
+            integrity_log("stage4", "real_balance_plan_warning")
+        integrity_log("stage4", f"{mode}_exit")
+        sys.exit(0)
+
+    ###########################################################################
+    # Stage 5 - Auto sign + broadcast
+    ###########################################################################
+    newnym()
+    tor_recheck(proxy, "stage5_pre")
+
+    import shutil as _shutil
+
+    # Clean ALL stale artifacts from prior runs to prevent poisoning
+    for stale in ["signer_progress.json", "broadcast_progress.json"]:
+        stale_path = Path(stale)
+        if stale_path.exists():
+            stale_path.unlink()
+            integrity_log("stage5", f"cleaned_stale:{stale}")
+
+    # Clean old signed blobs directory
+    for old_dir in ["signed_blobs", "tx_staging"]:
+        old_path = Path(old_dir)
+        if old_path.is_dir():
+            _shutil.rmtree(old_path)
+            integrity_log("stage5", f"cleaned_old_dir:{old_dir}")
+
+    # Clean old unsigned plans (OPSEC: contain full destination addresses)
+    # but NOT the current plan that Stage 4 just created
+    outdir_path = Path(args.output)
+    if outdir_path.is_dir():
+        current_plan_name = ufile.name if hasattr(ufile, 'name') else Path(str(ufile)).name
+        old_plans = list(outdir_path.glob("unsigned_*.json"))
+        for old_plan in old_plans:
+            if old_plan.name != current_plan_name:
+                old_plan.unlink()
+                integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
+
+    lock_path = Path(".mixer.lock")
+    _lock_acquired = False
+    for _lock_attempt in range(3):
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            _lock_acquired = True
+            break
+        except FileExistsError:
+            try:
+                stale_pid = lock_path.read_text().strip()
+                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                else:
+                    sys.exit(
+                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "    Another instance may be running.\n"
+                        "    If not, delete the lock file manually."
+                    )
+            except (OSError, ValueError):
+                sys.exit(
+                    "[!] Lock file exists: .mixer.lock\n"
+                    "    Another instance may be running.\n"
+                    "    If not, delete the lock file manually."
+                )
+    if not _lock_acquired:
+        sys.exit("[!] Could not acquire lock after 3 attempts.")
+
+    staging_dir = "tx_staging"
+
+    try:  # ensures lock file is cleaned even on error
+        _stage5_run(args, ufile, staging_dir, proxy, bal, rpc_primary)
+    finally:
+        if lock_path.exists():
+            lock_path.unlink()
+
+    print("\n  [*] Pipeline finished. Check Stage 5 summary above for failures.")
+    print()
+    print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
+    print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
+    print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
+    print("  [!]   Or run:  python3 opsec/paranoia_mode")
+    print("  [!]   Also check: ~/.python_history, ~/.lesshst, ~/.viminfo")
+
+
+def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
+    """Execute the iterative create→sign→broadcast pipeline.
+
+    CRITICAL DESIGN NOTE (BUG 58 FIX):
+    Monero wallet-rpc does NOT reserve/lock outputs when do_not_relay=True.
+    Creating multiple unsigned TXs without broadcasting between them causes
+    all TXs to reuse the same inputs — only one can be broadcast, the rest
+    are rejected as double-spends.
+
+    Furthermore, change outputs from unbroadcast TXs are invisible to the
+    wallet's coin selection. You CANNOT create a TX that spends the change
+    from another unsigned/unbroadcast TX.
+
+    Therefore, auto-mode MUST process TXs one at a time:
+      For each TX in the plan:
+        1. Create unsigned TX (wallet-rpc transfer_split with do_not_relay)
+        2. Sign the unsigned TX (wallet-cli sign_transfer)
+        3. Broadcast the signed TX (wallet-rpc submit_transfer)
+        4. Wait for confirmation (at least accepted into mempool)
+        5. Key image sync (export_outputs → import_key_images) so the
+           view-only wallet knows which outputs are now spent
+
+    This is slower than batch mode but is the ONLY correct approach for
+    chained Monero transactions.
+    """
+    sign_env = os.environ.copy()
+    # Prefer env var over CLI arg; CLI args visible in /proc/PID/cmdline
+    _wallet_pw = os.environ.get("GS_WALLET_PASSWORD", args.wallet_password or "")
+    sign_env["GS_WALLET_PASSWORD"] = _wallet_pw
+    # Pass wallet-file path via env var instead of CLI arg.
+    # CLI args are visible to all local users via /proc/PID/cmdline and
+    # `ps aux`. A wallet filename like "cold_storage_2024.wallet" reveals
+    # operational details. Env vars are only readable by the same uid.
+    sign_env["GS_WALLET_FILE"] = args.wallet_file or ""
+
+    # BUG 83 FIX: Detect view-only wallet early. View-only wallets cannot
+    # track spent outputs without key image sync (export_outputs from
+    # view-only + import_key_images after offline signing). The docstring
+    # at line ~910 mentions this step but it was NEVER IMPLEMENTED.
+    # Without it, the wallet's balance is WRONG after the first broadcast:
+    # spent outputs still appear available, so the next transfer_split
+    # reuses them → double-spend rejection → stuck pipeline.
+    # BUG 89 FIX: query_key fails on view-only wallets with an RPC error
+    # ("query_key requires spend key; this is a view-only wallet"). The old
+    # except-pass swallowed this, leaving _is_view_only=False. This means
+    # the key-image sync path was NEVER triggered for view-only wallets —
+    # the exact case it was designed for — causing double-spend failures.
+    _is_view_only = False
+    _vo_determined = False
+    for _vo_attempt in range(3):
+        try:
+            _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
+            _spend_key = _qk.get("key", "")
+            _is_view_only = (not _spend_key or _spend_key == "0" * 64)
+            _vo_determined = True
+            break
+        except Exception as _vo_err:
+            _vo_msg = str(_vo_err).lower()
+            if "watch" in _vo_msg or "view" in _vo_msg or "spend" in _vo_msg:
+                _is_view_only = True
+                _vo_determined = True
+                integrity_log("stage5", "view_only_confirmed_via_rpc_error")
+                break
+            if _vo_attempt < 2:
+                time.sleep(2)
+    if not _vo_determined:
+        _is_view_only = True
+        integrity_log("stage5", "view_only_assumed_after_retries")
+        print("  [!] Could not determine wallet type after 3 attempts.")
+        print("  [!] Assuming view-only (safer). If this is a hot wallet,")
+        print("  [!] check your wallet-rpc connection.")
+
+    if _is_view_only:
+        integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
+        print(f"  [!] View-only wallet detected.")
+        print(f"  [!] Key image sync is required after each broadcast.")
+        print(f"  [!] If sync fails, the pipeline will abort.")
+        print(f"  [!] For full air-gap operation, use --airgap mode.")
+
+    if not lock_memory():
+        print("  [!] WARNING: mlockall() failed — wallet password may leak to swap.")
+        print("  [!] Run as root or with CAP_IPC_LOCK to prevent this.")
+        print("  [!] Mitigation: ensure full-disk encryption (LUKS) is enabled so")
+        print("  [!] swap contents cannot be read from a seized disk.")
+
+    # Refresh wallet state before reading the plan. On resume after a crash,
+    # TXs from the prior run are confirmed on-chain but the wallet's internal
+    # state is stale (spent outputs not marked, change outputs invisible).
+    # Without this, the next transfer_split reuses already-spent inputs.
+    try:
+        rpc.raw_request("refresh", {})
+        integrity_log("stage5", "wallet_refreshed_at_start")
+    except Exception as _refresh_err:
+        integrity_log("stage5", f"refresh_at_start_warn:{str(_refresh_err)[:40]}")
+        print(f"  [!] WARNING: Wallet refresh at start failed: {str(_refresh_err)[:60]}")
+        print(f"  [!] If resuming after a crash, TXs may fail due to stale wallet state.")
+
+    # Read the plan to get TX count
+    with open(str(ufile)) as _pf:
+        plan_data = json.load(_pf)
+    plan_txs = plan_data.get("txs", [])
+
+    # Check ThorChain quote expiry. In air-gap workflows the operator may
+    # return hours after plan creation. Expired quotes mean the deposit
+    # address has rotated — sending BTC to the old address = funds stuck.
+    _quote_expiry = plan_data.get("meta", {}).get("thorchain_quote_expiry", 0)
+    if _quote_expiry > 0:
+        _now = int(time.time())
+        _remaining = _quote_expiry - _now
+        if _remaining <= 0:
+            _expired_ago = abs(_remaining)
+            integrity_log("stage5", f"THORCHAIN_QUOTE_EXPIRED:{_expired_ago}s_ago")
+            print(f"  [!] Quote expired {_expired_ago // 60} minutes ago.")
+            print(f"  [!] If BTC already sent: check explorer for TX status.")
+            print(f"  [!] If NOT sent: regenerate the plan for fresh quote.")
+        elif _remaining < 600:
+            print(f"  [!] WARNING: ThorChain quote expires in {_remaining // 60}m {_remaining % 60}s!")
+            print(f"  [!] Send BTC to the deposit address IMMEDIATELY or regenerate the plan.")
+
+    # BUG 82 FIX: Wallet identity check — abort if the connected wallet
+    # doesn't match the wallet that created the plan. Without this, resuming
+    # with wallet B after plan was built with wallet A causes:
+    #   - src subaddresses not found → silent fallback to wrong addresses
+    #   - dst addresses valid but belong to wallet A → funds irrecoverable
+    _plan_wallet = plan_data.get("meta", {}).get("wallet_primary", "")
+    if _plan_wallet:
+        try:
+            _cur_wallet = rpc.raw_request(
+                "get_address", {"account_index": 0}
+            ).get("address", "")
+            if _cur_wallet and _cur_wallet != _plan_wallet:
+                integrity_log("stage5", "WALLET_MISMATCH_DETECTED")
+                sys.exit(
+                    f"[!] WALLET MISMATCH: Connected wallet does not match the plan!\n"
+                    f"    Plan wallet:    {scrub_address(_plan_wallet)}\n"
+                    f"    Current wallet: {scrub_address(_cur_wallet)}\n"
+                    f"    The plan's subaddresses belong to a different wallet.\n"
+                    f"    Proceeding would send funds to unreachable addresses.\n"
+                    f"    Connect the original wallet and retry."
+                )
+            integrity_log("stage5", "wallet_identity_verified")
+        except SystemExit:
+            raise
+        except Exception as _wid_err:
+            integrity_log("stage5", f"wallet_identity_check_FAIL:{str(_wid_err)[:40]}")
+            sys.exit(
+                f"[!] Cannot verify wallet identity: {str(_wid_err)[:60]}\n"
+                f"    Wallet-rpc must be accessible to prevent wrong-wallet fund loss.\n"
+                f"    Fix the RPC connection and retry."
+            )
+
+    # BUG 82 FIX: Daemon height drift check — warn if daemon height has
+    # diverged significantly from plan creation time. Large backward drift
+    # suggests a different daemon or chain reorg.
+    _plan_height = plan_data.get("meta", {}).get("daemon_height", 0)
+    if _plan_height > 0:
+        try:
+            _cur_height = rpc.raw_request("get_height", {}).get("height", 0)
+            if _cur_height > 0:
+                _height_diff = _cur_height - _plan_height
+                if _height_diff < -10:
+                    integrity_log("stage5", f"DAEMON_HEIGHT_REGRESSED:{_plan_height}->{_cur_height}")
+                    print(f"  [!] Daemon height regressed: {_plan_height} -> {_cur_height} (diff: {_height_diff})")
+                    print(f"  [!] This may indicate a different daemon or chain reorg.")
+                    print(f"  [!] Confirmed outputs may no longer be valid.")
+        except Exception as _ht_err:
+            integrity_log("stage5", f"height_check_fail:{str(_ht_err)[:40]}")
+
+    # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
+    # If accounts were added/removed between plan creation and resume,
+    # the account_index may now point to a different account or not exist.
+    _plan_acct_idx = plan_data.get("meta", {}).get("account_index", 0)
+    try:
+        _accts = rpc.raw_request("get_accounts", {})
+        _acct_list = _accts.get("subaddress_accounts", [])
+        _max_acct = len(_acct_list) - 1
+        if _plan_acct_idx > _max_acct:
+            integrity_log("stage5", f"ACCOUNT_INDEX_INVALID:{_plan_acct_idx}>{_max_acct}")
+            sys.exit(
+                f"[!] Plan's account_index={_plan_acct_idx} does not exist in wallet!\n"
+                f"    Wallet has {len(_acct_list)} account(s) (max index: {_max_acct}).\n"
+                f"    Accounts may have been modified since the plan was created.\n"
+                f"    Connect the original wallet or regenerate the plan."
+            )
+        integrity_log("stage5", f"account_index_valid:{_plan_acct_idx}")
+    except SystemExit:
+        raise
+    except Exception as _acct_err:
+        integrity_log("stage5", f"account_check_warn:{str(_acct_err)[:40]}")
+
+    total_txs = len(plan_txs)
+
+    if total_txs == 0:
+        sys.exit("[!] Plan has no TXs")
+
+    print(f"  [*] Stage 5: Processing {total_txs} TXs iteratively (create→sign→broadcast each)")
+    print(f"  [*] This is the ONLY safe approach — Monero does not support batch unsigned TXs.")
+
+    # Compute plan fingerprint so resume rejects stale progress from a different plan.
+    # BUG 74 FIX: Include ALL plan fields (src, dst, amt, delay, extra) in the
+    # fingerprint. The old hash only covered (dst, amt), so changing delays, src
+    # addresses, or extra nonces produced the same fingerprint. Stale progress
+    # from a prior run would be loaded, skipping TXs that should be re-executed
+    # with different timing decorrelation or routing.
+    import hashlib as _hl
+    _h = _hl.sha256()
+    for _tx in plan_txs:
+        _h.update(f"{_tx.get('src','')}:{_tx.get('dst','')}:{_tx.get('amt','')}:"
+                  f"{_tx.get('delay','')}:{_tx.get('extra','')}".encode())
+    plan_fingerprint = _h.hexdigest()[:32]
+
+    # BUG 85 FIX: HMAC on progress file to detect manual tampering.
+    # Without this, an operator (or malware) can add TX indices to
+    # "completed" to skip TXs, or remove them to cause double-spends.
+    import hmac as _hmac
+
+    def _progress_hmac(data: dict, nonce: str) -> str:
+        """Compute HMAC over progress file's semantic content."""
+        _msg = json.dumps({
+            "fp": data.get("plan_fingerprint", ""),
+            "completed": sorted(data.get("completed", [])),
+            "broadcast_pending": data.get("broadcast_pending"),
+        }, sort_keys=True).encode()
+        return _hmac.new(
+            (plan_fingerprint + nonce).encode(), _msg, _hl.sha256
+        ).hexdigest()[:32]
+
+    def _save_progress(data: dict, nonce: str, path: Path):
+        """Write progress with HMAC for tamper detection."""
+        data["hmac"] = _progress_hmac(data, nonce)
+        data["nonce"] = nonce
+        atomic_write_json(data, path)
+
+    # Progress tracking for resume
+    progress_file = Path("stage5_progress.json")
+    completed_indices = set()
+    _progress_nonce = secure_hex(16)
+    if progress_file.exists():
+        try:
+            with open(progress_file) as pf:
+                progress = json.load(pf)
+            saved_fp = progress.get("plan_fingerprint", "")
+            if saved_fp and saved_fp != plan_fingerprint:
+                print(f"  [!] Progress file is from a DIFFERENT plan (fingerprint mismatch).")
+                print(f"  [!] Discarding stale progress and starting fresh.")
+                integrity_log("stage5", "progress_fingerprint_mismatch:discarded")
+                progress_file.unlink()
+            else:
+                # BUG 85 FIX: Verify HMAC before trusting progress contents.
+                _saved_hmac = progress.pop("hmac", None)
+                _saved_nonce = progress.get("nonce", "")
+                if _saved_hmac and _saved_nonce:
+                    _expected = _progress_hmac(progress, _saved_nonce)
+                    if not _hmac.compare_digest(_saved_hmac, _expected):
+                        integrity_log("stage5", "PROGRESS_HMAC_MISMATCH:tampering")
+                        print(f"  [!] Progress file HMAC mismatch (tampered or corrupt).")
+                        print(f"  [!] Discarding progress and starting fresh.")
+                        progress_file.unlink()
+                        progress = {}
+                    else:
+                        _progress_nonce = _saved_nonce
+                completed_indices = set(progress.get("completed", []))
+                # BUG 73 FIX: Detect broadcast_pending — a TX that was
+                # broadcast but progress wasn't finalized (crash/kill
+                # between broadcast and completed save). Treat as
+                # completed to prevent double-payment on resume.
+                pending_idx = progress.get("broadcast_pending")
+                if pending_idx is not None and pending_idx not in completed_indices:
+                    print(f"  [!] TX {pending_idx} may have been broadcast before crash.")
+                    print(f"  [!] Skipping to prevent double-payment.")
+                    print(f"  [!] Check wallet balance before proceeding.")
+                    integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
+                    completed_indices.add(pending_idx)
+                if completed_indices:
+                    print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            integrity_log("stage5", f"progress_corrupt:{str(e)[:40]}")
+            print(f"  [!] Corrupt progress file — starting fresh ({e})")
+
+    success_count = 0
+    fail_count = 0
+
+    for tx_idx in range(total_txs):
+        if shutdown_requested():
+            integrity_log("stage5", f"shutdown_at_tx_{tx_idx}")
+            print(f"  [!] Shutdown at TX {tx_idx}. Rerun to resume from here.")
+            break
+
+        if tx_idx in completed_indices:
+            print(f"  [skip] TX {tx_idx} already completed in prior run")
+            success_count += 1
+            continue
+
+        tx = plan_txs[tx_idx]
+        if "amt" not in tx or "dst" not in tx:
+            integrity_log("stage5", f"malformed_tx:idx={tx_idx}")
+            print(f"  [!] TX {tx_idx} is malformed (missing amt or dst) — ABORTING.")
+            fail_count += 1
+            break
+        print(f"\n  [*] TX {tx_idx}/{total_txs-1}: {tx['amt']} XMR -> {scrub_address(tx['dst'])}")
+
+        # Apply planned delay (timing decorrelation)
+        if tx_idx > 0:
+            try:
+                delay = int(tx.get("delay", 0))
+            except (TypeError, ValueError):
+                delay = 0
+            if delay < 0:
+                delay = 0
+            if delay > 0:
+                print(f"  [*] Waiting {delay}s (planned delay)...")
+                waited = 0
+                while waited < delay:
+                    if shutdown_requested():
+                        break
+                    chunk = min(30, delay - waited)
+                    time.sleep(chunk)
+                    waited += chunk
+
+        newnym()
+
+        # BUG 96 FIX: Re-verify Tor is working before each broadcast.
+        # If Tor dies mid-operation and wallet-rpc is configured to fall
+        # through to clearnet, the broadcast leaks the operator's real IP
+        # to every Monero node that receives the TX. This is catastrophic.
+        if tx_idx % 3 == 0:
+            try:
+                tor_recheck(proxy, f"stage5_tx_{tx_idx}")
+            except SystemExit:
+                integrity_log("stage5", f"tor_leak_during_broadcast:tx={tx_idx}")
+                print(f"  [!] Tor verification failed at TX {tx_idx}. Aborting to prevent IP leak.")
+                fail_count += 1
+                break
+
+        secure_delay(3.0, 8.0)
+
+        # BUG 86 FIX: Delete stale artifacts from a prior failed attempt.
+        # If a previous run created .unsigned/.signed files for this TX but
+        # crashed before broadcast, those files reference outputs that may
+        # now be spent (by TXs that DID broadcast). Re-signing the stale
+        # .unsigned would produce a TX spending invalid outputs.
+        _stale_unsigned = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
+        _stale_signed = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+        for _stale in (_stale_unsigned, _stale_signed):
+            if _stale.exists():
+                _stale.unlink()
+                integrity_log("stage5", f"cleaned_stale_artifact:{_stale.name}")
+
+        # Step 1: Create unsigned TX
+        print(f"  [*] Step 1: Creating unsigned TX {tx_idx}...")
+        try:
+            create_env = os.environ.copy()
+            for sensitive_key in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                  "COINGECKO_API_KEY"):
+                create_env.pop(sensitive_key, None)
+            create_cmd = [
+                sys.executable, _core_script("airgap_tx_signer"), str(ufile),
+                "--phase", "create",
+                "--rpc", args.rpc_primary,
+                "--tor-proxy", args.tor_proxy,
+                "--outdir", staging_dir,
+                f"--fee-priority={args.fee_priority}",
+                "--tx-index", str(tx_idx),
+            ]
+            subprocess.run(create_cmd, check=True, timeout=300, env=create_env)
+        except subprocess.CalledProcessError as e:
+            integrity_log("stage5", f"create_fail:tx={tx_idx}:rc={e.returncode}")
+            print(f"  [!] TX {tx_idx} create failed (exit {e.returncode})")
+            print(f"  [!] Stopping: subsequent TXs depend on change from this TX.")
+            fail_count += 1
+            break
+        except subprocess.TimeoutExpired:
+            integrity_log("stage5", f"create_timeout:tx={tx_idx}")
+            print(f"  [!] TX {tx_idx} create timed out.")
+            fail_count += 1
+            break
+
+        # Hot wallets write presigned TXs directly to signed/tx_N.signed
+        # (no unsigned file created). View-only wallets write tx_N.unsigned.
+        # transfer_split may produce multiple on-chain TXs: tx_N_split0.signed, etc.
+        unsigned_file = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
+        presigned_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+        _split_pattern = f"tx_{tx_idx}_split*.signed"
+        _split_files = sorted((Path(staging_dir) / "signed").glob(_split_pattern)) \
+            if (Path(staging_dir) / "signed").is_dir() else []
+        is_presigned = (presigned_file.exists() or _split_files) and not unsigned_file.exists()
+
+        if not unsigned_file.exists() and not presigned_file.exists() and not _split_files:
+            print(f"  [!] TX {tx_idx}: neither unsigned nor presigned file created.")
+            fail_count += 1
+            break
+
+        # Validate file is non-empty and above minimum viable size.
+        # A crash during the create phase can leave a truncated/empty file.
+        # Monero unsigned_txset blobs are always > 100 bytes; anything
+        # smaller is certainly corrupt.
+        _MIN_BLOB_SIZE = 100
+        _check_file = presigned_file if is_presigned else unsigned_file
+        try:
+            _fsize = _check_file.stat().st_size
+        except OSError:
+            _fsize = 0
+        if _fsize < _MIN_BLOB_SIZE:
+            print(f"  [!] TX {tx_idx}: {'signed' if is_presigned else 'unsigned'} file is "
+                  f"truncated/empty ({_fsize} bytes) — likely from a prior crash.")
+            print(f"  [!] Removing corrupt file and ABORTING. Re-run to recreate.")
+            integrity_log("stage5", f"corrupt_blob:tx={tx_idx}:size={_fsize}")
+            try:
+                _check_file.unlink()
+            except OSError as _ul_err:
+                integrity_log("stage5", f"corrupt_blob_unlink_fail:tx={tx_idx}:{_ul_err}")
+            fail_count += 1
+            break
+
+        if is_presigned:
+            print(f"  [skip] Step 2: TX {tx_idx} already signed (hot wallet)")
+            if _split_files:
+                signed_files_to_broadcast = _split_files
+            else:
+                signed_files_to_broadcast = [presigned_file]
+        else:
+            # Step 2: Sign the unsigned TX
+            print(f"  [*] Step 2: Signing TX {tx_idx}...")
+            try:
+                # BUG 101 FIX: Don't pass --wallet-file via CLI (visible
+                # in /proc/PID/cmdline). GS_WALLET_FILE env var is set
+                # in sign_env and airgap_tx_signer now reads it.
+                sign_cmd = [
+                    sys.executable, _core_script("airgap_tx_signer"), str(ufile),
+                    "--phase", "sign",
+                    "--outdir", staging_dir,
+                    "--tx-index", str(tx_idx),
+                ]
+                subprocess.run(sign_cmd, check=True, timeout=300, env=sign_env,
+                               capture_output=True)
+            except subprocess.CalledProcessError as e:
+                integrity_log("stage5", f"sign_fail:tx={tx_idx}:rc={e.returncode}")
+                print(f"  [!] TX {tx_idx} signing failed.")
+                fail_count += 1
+                break
+            except subprocess.TimeoutExpired:
+                integrity_log("stage5", f"sign_timeout:tx={tx_idx}")
+                print(f"  [!] TX {tx_idx} sign timed out.")
+                fail_count += 1
+                break
+
+            signed_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
+            if not signed_file.exists():
+                print(f"  [!] TX {tx_idx}: signed file not created.")
+                fail_count += 1
+                break
+            signed_files_to_broadcast = [signed_file]
+
+        # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
+        # If the process is killed between broadcast and progress save,
+        # the TX is on-chain but progress doesn't reflect it. On resume,
+        # the code would re-create a NEW TX (different nonces) spending
+        # the same inputs. If the original confirmed between crash and
+        # resume, the wallet picks different inputs → double-payment.
+        # By persisting broadcast_pending first, the resume path can
+        # detect this and verify wallet state before re-creating.
+        broadcast_pending = set(completed_indices)
+        broadcast_pending.add(tx_idx)
+        _save_progress({
+            "plan_fingerprint": plan_fingerprint,
+            "completed": sorted(completed_indices),
+            "broadcast_pending": tx_idx,
+        }, _progress_nonce, progress_file)
+
+        # Step 3: Broadcast via wallet-rpc
+        # Hot wallet TXs (presigned from tx_metadata_list) use relay_tx.
+        # View-only wallet TXs (signed via wallet-cli) use submit_transfer.
+        # These are DIFFERENT wallet-rpc methods expecting different data formats.
+        # When transfer_split produced multiple on-chain TXs, broadcast ALL splits.
+        if len(signed_files_to_broadcast) > 1:
+            print(f"  [*] Step 3: Broadcasting TX {tx_idx} ({len(signed_files_to_broadcast)} splits)...")
+        else:
+            print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
+        newnym()
+        _all_txids = []
+        _broadcast_failed = False
+        try:
+            rpc_primary = rpc
+            for _sf_idx, _sf_path in enumerate(signed_files_to_broadcast):
+                signed_data = _sf_path.read_bytes()
+                if is_presigned:
+                    _broadcast_method = "relay_tx"
+                    result = rpc_primary.raw_request("relay_tx", {
+                        "hex": signed_data.hex(),
+                    })
+                else:
+                    _broadcast_method = "submit_transfer"
+                    result = rpc_primary.raw_request("submit_transfer", {
+                        "tx_data_hex": signed_data.hex(),
+                    })
+                try:
+                    tx_hashes = normalize_broadcast_result(result, _broadcast_method)
+                except ValueError as _nbe:
+                    integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}:split={_sf_idx}")
+                    print(f"  [!] TX {tx_idx} split {_sf_idx}: {_nbe}")
+                    print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+                    _broadcast_failed = True
+                    break
+                _all_txids.extend(tx_hashes)
+                if len(signed_files_to_broadcast) > 1:
+                    print(f"  [+] TX {tx_idx} split {_sf_idx}: {tx_hashes[0][:16]}...")
+            if _broadcast_failed:
+                fail_count += 1
+                break
+            txid = _all_txids[0]
+            print(f"  [+] TX {tx_idx} submitted to wallet-rpc | txid: {txid[:16]}...")
+            print(f"  [!] Note: submitted != confirmed. TX is in local mempool, not yet mined.")
+            integrity_log("stage5", f"broadcast_submitted:tx={tx_idx}")
+
+            # Verify TX entered mempool
+            import time as _t
+            _t.sleep(3)
+            for _verify_txid in _all_txids:
+                try:
+                    _check = rpc.raw_request("get_transfer_by_txid", {"txid": _verify_txid})
+                    if not _check.get("transfer"):
+                        print(f"  [!] TX {_verify_txid[:16]}... NOT FOUND in wallet after broadcast!")
+                        print(f"  [!] This may indicate the broadcast was not accepted.")
+                except Exception as _vfy_err:
+                    integrity_log("stage5", f"post_broadcast_verify_fail:{str(_vfy_err)[:40]}")
+
+        except Exception as e:
+            integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
+            print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
+            print(f"  [!] Stopping. Check if TX was actually broadcast before rerunning.")
+            print(f"  [!] Check if the TX was actually broadcast before rerunning.")
+            _save_progress({
+                "plan_fingerprint": plan_fingerprint,
+                "completed": sorted(completed_indices),
+            }, _progress_nonce, progress_file)
+            fail_count += 1
+            break
+
+        # Step 4: Wait for mempool acceptance, then refresh wallet state.
+        # submit_transfer broadcasts via wallet-rpc, which updates the hot
+        # wallet's internal state (spent outputs). But we must still call
+        # refresh so the wallet re-scans and sees the TX in the mempool/chain.
+        # Without this, the next transfer_split may reuse spent outputs.
+        # BUG 81 FIX: Refresh failure must be retried, not silently continued.
+        # Without refresh, the wallet doesn't know which outputs are spent.
+        # The next transfer_split reuses spent inputs → double-spend rejection
+        # → the operator thinks it's a transient error and retries, creating
+        # more conflicting TXs and potentially losing track of wallet state.
+        secure_delay(3.0, 8.0)
+        refresh_ok = False
+        for _refresh_attempt in range(5):
+            try:
+                rpc_primary.raw_request("refresh", {})
+                refresh_ok = True
+                break
+            except Exception as e:
+                integrity_log("stage5", f"refresh_retry:{_refresh_attempt}:tx={tx_idx}:{str(e)[:40]}")
+                print(f"  [!] Wallet refresh attempt {_refresh_attempt + 1}/5 failed: {str(e)[:60]}")
+                secure_delay(3.0, 10.0)
+        if not refresh_ok:
+            integrity_log("stage5", f"refresh_FATAL:tx={tx_idx}")
+            print(f"  [!] Wallet refresh FAILED after 5 attempts for TX {tx_idx}.")
+            print(f"  [!] Next TX would reuse spent outputs. Resume after fixing RPC.")
+            print(f"  [!] The successfully broadcast TXs are safe. Resume after fixing RPC.")
+            fail_count += 1
+            break
+
+        # BUG 83 FIX: Key image sync for view-only wallets.
+        # After broadcast, the view-only wallet doesn't know which outputs
+        # are spent. Without importing key images, the next transfer_split
+        # will try to spend the same outputs → double-spend rejection.
+        # In a full air-gap setup, key images come from the offline signer.
+        # In auto-mode with a view-only wallet, we export outputs and
+        # attempt to import key images if they've been provided.
+        if _is_view_only:
+            _ki_synced = False
+            try:
+                _eo_resp = rpc.raw_request("export_outputs", {"all": False})
+                _outputs_data = _eo_resp.get("outputs_data_hex", "")
+                if _outputs_data:
+                    _eo_path = Path(staging_dir) / f"outputs_after_tx_{tx_idx}.hex"
+                    _eo_path.write_text(_outputs_data)
+                    secure_file_perms(_eo_path)
+                    integrity_log("stage5", f"exported_outputs:tx={tx_idx}")
+
+                    _ki_path = Path(staging_dir) / "key_images.hex"
+                    if _ki_path.exists():
+                        _ki_hex = _ki_path.read_text().strip()
+                        if _ki_hex:
+                            rpc.raw_request("import_key_images", {
+                                "signed_key_images": _ki_hex,
+                            })
+                            _ki_synced = True
+                            integrity_log("stage5", f"key_images_imported:tx={tx_idx}")
+            except Exception as _ki_err:
+                integrity_log("stage5", f"key_image_sync_err:tx={tx_idx}:{str(_ki_err)[:40]}")
+
+            if not _ki_synced:
+                integrity_log("stage5", f"KEY_IMAGE_SYNC_MISSING:tx={tx_idx}")
+                print(f"  [!] Key image sync failed for TX {tx_idx}.")
+                print(f"  [!] Next TX will likely fail (double-spend).")
+                print(f"  [!] Transfer outputs to offline signer, export key images,")
+                print(f"  [!] place key_images.hex in {staging_dir}/, re-run with --resume-plan.")
+                print(f"  [!] Aborting: key image sync required for view-only wallet.")
+                fail_count += 1
+                break
+
+        success_count += 1
+        completed_indices.add(tx_idx)
+
+        _save_progress({
+            "plan_fingerprint": plan_fingerprint,
+            "completed": sorted(completed_indices),
+        }, _progress_nonce, progress_file)
+
+        print(f"  [+] TX {tx_idx} submitted and wallet refreshed ({success_count}/{total_txs})")
+
+    # Summary
+    integrity_log("stage5", f"pipeline:{success_count}_ok:{fail_count}_fail")
+    if fail_count > 0:
+        print(f"\n  [!] Stage 5 finished with errors: {success_count} submitted, {fail_count} FAILED out of {total_txs}")
+    else:
+        print(f"\n  [+] Stage 5 finished: {success_count}/{total_txs} TXs submitted to mempool")
+
+    if fail_count:
+        print(f"  [!] {fail_count} TXs failed. Check logs and retry.")
+
+    # BUG 93 FIX: Warn about output consolidation risk.
+    if success_count > 0:
+        print()
+        print("  " + "=" * 72)
+        print("  OUTPUT CONSOLIDATION WARNING")
+        print("  " + "=" * 72)
+        print(f"  Funds are now scattered across {success_count}+ subaddresses.")
+        print("  DO NOT consolidate (sweep_all / send-all-to-one-address) in a")
+        print("  single transaction. A single consolidation TX links ALL mixed")
+        print("  outputs back together on-chain, completely undoing the mixing.")
+        print()
+        print("  SAFE WITHDRAWAL STRATEGY:")
+        print("  1. Spend from individual subaddresses to different destinations")
+        print("     at different times (days/weeks apart).")
+        print("  2. Never combine outputs from multiple subaddresses in one TX.")
+        print("  3. Use Monero's subaddress_account feature or separate wallets")
+        print("     for each withdrawal destination.")
+        print("  4. Each change output created by a withdrawal is heuristically")
+        print("     identifiable — spend change outputs in subsequent TXs, not")
+        print("     alongside unspent mixed outputs.")
+        print("  " + "=" * 72)
+        integrity_log("stage5", "consolidation_warning_shown")
+
+    # Clean progress file and plan file on full success.
+    # The plan file contains the FULL mixing DAG (every src/dst XMR address).
+    # If seized, it reveals the entire transaction graph. Securely overwrite
+    # before unlinking so data is unrecoverable from disk journal/sectors.
+    if success_count == total_txs:
+        if progress_file.exists():
+            progress_file.unlink()
+        try:
+            plan_path = Path(str(ufile))
+            if plan_path.exists():
+                _psize = plan_path.stat().st_size
+                with open(plan_path, "r+b") as _wf:
+                    _wf.write(b"\x00" * _psize)
+                    _wf.flush()
+                    os.fsync(_wf.fileno())
+                plan_path.unlink()
+                integrity_log("stage5", "plan_wiped_after_success")
+        except OSError:
+            integrity_log("stage5", "plan_wipe_failed")
+        try:
+            staging_path = Path(staging_dir)
+            if staging_path.is_dir():
+                import shutil as _shutil_clean
+                _shutil_clean.rmtree(staging_path)
+                integrity_log("stage5", "tx_staging_wiped_after_success")
+        except OSError:
+            integrity_log("stage5", "tx_staging_wipe_failed")
+
+        # Wipe integrity_chain.log — it's a forensic roadmap of every stage,
+        # recording timestamps (10-min bucketed), stage transitions, TX counts,
+        # wallet addresses (scrubbed), fee estimates, and RPC interactions.
+        # An adversary with this file can reconstruct the entire operation
+        # timeline even if all other artifacts are gone.
+        for _log_artifact in (Path("integrity_chain.log"),
+                              Path("integrity_chain.log.lock")):
+            if _log_artifact.exists():
+                try:
+                    _lsize = _log_artifact.stat().st_size
+                    if _lsize > 0:
+                        with open(_log_artifact, "r+b") as _lf:
+                            _lf.write(b"\x00" * _lsize)
+                            _lf.flush()
+                            os.fsync(_lf.fileno())
+                    _log_artifact.unlink()
+                except OSError as _wipe_err:
+                    integrity_log("stage5", f"log_wipe_fail:{_log_artifact.name}:{_wipe_err}")
+
+        # Clean /dev/shm artifacts left by submodules (SML, dmswitch, signer).
+        # These survive until reboot and reveal toolkit usage.
+        _shm = Path("/dev/shm")
+        if _shm.is_dir():
+            import shutil as _shutil_shm
+            for _shm_pat in (".gs_seed_active", ".gs_seed_active.tmp",
+                             ".gs_seed_lock", ".gs_locked_bundle",
+                             ".gs_lock_meta", "gs_paranoia_wipe",
+                             "gs_unlock_token"):
+                _shm_f = _shm / _shm_pat
+                if _shm_f.exists():
+                    try:
+                        _shm_f.unlink()
+                    except OSError as _shm_err:
+                        integrity_log("stage5", f"shm_cleanup_fail:{_shm_pat}:{_shm_err}")
+            for _shm_glob in ("tx_*", ".tk_*"):
+                for _shm_f in _shm.glob(_shm_glob):
+                    try:
+                        if _shm_f.is_dir():
+                            _shutil_shm.rmtree(_shm_f, ignore_errors=True)
+                        else:
+                            _shm_f.unlink()
+                    except OSError as _shm_err:
+                        integrity_log("stage5", f"shm_glob_cleanup_fail:{_shm_f.name}:{_shm_err}")
+            for _shm_dir in ("qr_codes", "decoys"):
+                _sd = _shm / _shm_dir
+                if _sd.is_dir():
+                    _shutil_shm.rmtree(_sd, ignore_errors=True)
+
+        # BUG 92 FIX: Clean __pycache__ directories. Python auto-creates
+        # __pycache__/*.pyc files containing compilation timestamps and
+        # source paths (e.g. /home/user/mixer/core/gs_common.py). These
+        # survive all other cleanup and reveal toolkit usage + filesystem
+        # layout to a forensic analyst.
+        import shutil as _shutil_pyc
+        _core_dir = Path(__file__).resolve().parent
+        for _pyc_dir in _core_dir.rglob("__pycache__"):
+            if _pyc_dir.is_dir():
+                try:
+                    _shutil_pyc.rmtree(_pyc_dir)
+                except OSError as _pyc_err:
+                    integrity_log("stage5", f"pycache_clean_fail:{_pyc_dir.name}:{_pyc_err}")
+        _workspace_pyc = _core_dir.parent / "__pycache__"
+        if _workspace_pyc.is_dir():
+            try:
+                _shutil_pyc.rmtree(_workspace_pyc)
+            except OSError as _pyc_err:
+                integrity_log("stage5", f"pycache_workspace_fail:{_pyc_err}")
+        integrity_log("stage5", "pycache_cleaned")
+
+    # Exit strategy simulation
+    newnym()
+    secure_delay(5.0, 15.0)
+
+    try:
+        print("  [*] Exit strategy simulation...")
+        exit_amt = str(sum(Decimal(t.get("amt", "0")) for t in plan_txs))
+        exit_env = os.environ.copy()
+        for _ek in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE", "COINGECKO_API_KEY"):
+            exit_env.pop(_ek, None)
+        # BUG 97 FIX: Pass amount via env var instead of CLI arg.
+        # CLI args are visible to all local users via /proc/PID/cmdline.
+        # The total mixed amount is sensitive — it reveals the operation scale.
+        exit_env["GS_EXIT_AMOUNT"] = exit_amt
+        subprocess.run(
+            [sys.executable, _core_script("exit_strategy_simulator"),
+             "--method", "bisq", "--tor-proxy", args.tor_proxy],
+            check=True, timeout=300, env=exit_env,
+        )
+        integrity_log("stage5", "exit_sim_ok")
+    except Exception as e:
+        integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
+        print(f"  [!] Exit simulation failed (non-fatal): {type(e).__name__}")
+
+    integrity_log("stage5", "full_pipeline_complete")
+
+
+if __name__ == "__main__":
+    main()

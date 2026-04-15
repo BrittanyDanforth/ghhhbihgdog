@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ghost_mutator.py — GhostSpiral v16.9 Chaos Toolkit (Upgraded)
-=============================================================
-Self‑mutation engine that rewrites an existing Python script (e.g.
-`ghostspiral_v15.py`) into a **structurally‑identical but hash‑unique** copy
+ghost_mutator — Self-mutation engine for polymorphic script generation
+======================================================================
+Self‑mutation engine that rewrites an existing Python script into a
+**structurally‑identical but hash‑unique** copy
 for the current session.  By randomising identifiers, shuffling harmless code
 blocks, and injecting junk comments, this module ensures *no two runs ever
 produce the same file hash* — defeating YARA rules, signature matching, and
@@ -26,7 +26,7 @@ Key Features
 
 Usage
 ─────
-    python3 ghost_mutator.py --source ghostspiral_v15.py
+    python3 ghost_mutator.py --source script.py
     python3 ghost_mutator.py -s src.py -o runtime/mutated.py --seed entropy_seed.json
 
 Security Notes

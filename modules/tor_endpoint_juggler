@@ -37,6 +37,7 @@ import secrets
 import socket
 
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,18 +69,25 @@ TOR_CONTROL_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051
 TOR_CONTROL_SOCKET = "/var/run/tor/control"
 
-# Operational logging
+# Operational logging — file handler deferred to main() so importing
+# this module doesn't create tor_operations.log as a side effect.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler(OPERATIONAL_LOG, mode='a'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-if OPERATIONAL_LOG.exists():
-    os.chmod(OPERATIONAL_LOG, 0o600)
 logger = logging.getLogger("TorEndpointJuggler")
+
+
+def _attach_file_handler():
+    """Attach file handler to logger (called from main only)."""
+    fh = logging.FileHandler(OPERATIONAL_LOG, mode='a')
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+    logging.getLogger().addHandler(fh)
+    if OPERATIONAL_LOG.exists():
+        os.chmod(OPERATIONAL_LOG, 0o600)
 
 @dataclass
 class EndpointHealth:
@@ -106,7 +114,7 @@ class EndpointHealth:
         penalty = min(0.1 * self.consecutive_failures, 0.5)
         
         # Bonus for recent success
-        if self.last_success and datetime.now() - self.last_success < timedelta(hours=1):
+        if self.last_success and datetime.now(timezone.utc) - self.last_success < timedelta(hours=1):
             bonus = 0.1
         else:
             bonus = 0.0
@@ -206,7 +214,7 @@ class TorCircuitManager:
         try:
             with self._get_controller() as controller:
                 controller.signal(Signal.NEWNYM)
-                self.last_newnym = datetime.now()
+                self.last_newnym = datetime.now(timezone.utc)
                 logger.info("Forced new Tor circuit")
                 return True
         except Exception as e:
@@ -250,7 +258,7 @@ class TorCircuitManager:
         self.isolation_credentials[session_id] = {
             'username': username,
             'password': password,
-            'created': datetime.now()
+            'created': datetime.now(timezone.utc)
         }
         
         return {
@@ -264,29 +272,31 @@ class RealEndpointProber:
     def __init__(self, circuit_manager: TorCircuitManager):
         self.circuit_manager = circuit_manager
         self.session_cache = {}
+        self._cache_lock = threading.Lock()
         
     def _create_tor_session(self, session_id: str) -> requests.Session:
-        """Create real Tor-routed HTTP session"""
-        if session_id in self.session_cache:
-            return self.session_cache[session_id]
+        """Create real Tor-routed HTTP session (thread-safe)"""
+        with self._cache_lock:
+            if session_id in self.session_cache:
+                return self.session_cache[session_id]
         
-        session = requests.Session()
-        proxy_config = self.circuit_manager.create_isolation_session(session_id)
-        session.proxies.update(proxy_config)
-        
-        # Production headers
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        })
-        
-        self.session_cache[session_id] = session
-        return session
+            session = requests.Session()
+            proxy_config = self.circuit_manager.create_isolation_session(session_id)
+            session.proxies.update(proxy_config)
+            
+            # Production headers
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            })
+            
+            self.session_cache[session_id] = session
+            return session
     
     def validate_onion_endpoint(self, url: str, timeout: int = 20) -> Tuple[bool, float, Dict]:
         """Real .onion endpoint validation"""
@@ -408,7 +418,7 @@ class ProductionEndpointJuggler:
             if len(parsed.hostname.replace('.onion', '')) != 56:  # v3 only (v2 is dead)
                 return False
             return True
-        except:
+        except (ValueError, AttributeError):
             return False
     
     def validate_endpoint_pool(self, endpoints: Set[str], max_workers: int = 10) -> List[str]:
@@ -439,7 +449,7 @@ class ProductionEndpointJuggler:
                 health = self.endpoint_health[endpoint]
                 if is_valid:
                     health.success_count += 1
-                    health.last_success = datetime.now()
+                    health.last_success = datetime.now(timezone.utc)
                     health.consecutive_failures = 0
                     health.is_validated = True
                     health.response_times.append(response_time)
@@ -448,7 +458,7 @@ class ProductionEndpointJuggler:
                     logger.info(f"✓ {endpoint} - {response_time:.2f}s")
                 else:
                     health.failure_count += 1
-                    health.last_failure = datetime.now()
+                    health.last_failure = datetime.now(timezone.utc)
                     health.consecutive_failures += 1
                     logger.warning(f"✗ {endpoint} - {details.get('error', 'Unknown error')}")
                     
@@ -503,11 +513,16 @@ class ProductionEndpointJuggler:
         
         # Atomic write operation
         temp_path = output_path.with_suffix('.tmp')
-        with open(temp_path, 'w') as f:
-            os.chmod(temp_path, 0o600)
-            json.dump(operational_data, f, indent=2)
-        temp_path.replace(output_path)
-        os.chmod(output_path, 0o600)
+        try:
+            with open(temp_path, 'w') as f:
+                os.chmod(temp_path, 0o600)
+                json.dump(operational_data, f, indent=2)
+            temp_path.replace(output_path)
+            os.chmod(output_path, 0o600)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise
         
         logger.info(f"Exported operational data to {output_path}")
     
@@ -592,18 +607,19 @@ async def main():
     
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
+    _attach_file_handler()
     
     # Verify Tor is running (try system tor 9050, then Tor Browser 9150)
     global TOR_SOCKS_PORT
     tor_found = False
-    for _try_port in (TOR_SOCKS_PORT, 9150):
+    for _try_port in (9050, 9150):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
             result = sock.connect_ex((TOR_SOCKS_HOST, _try_port))
             sock.close()
             if result == 0:
-                if _try_port != TOR_SOCKS_PORT:
+                if _try_port != 9050:
                     logger.info(f"Tor SOCKS found on port {_try_port} (Tor Browser)")
                 TOR_SOCKS_PORT = _try_port
                 tor_found = True
