@@ -998,15 +998,46 @@ def main():
 
     rounds = args.wallets * 2 * args.deep
     priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))
-    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")  # base * priority * 50% safety margin
+    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
+
+    # ── Minimum balance model ──
+    # Compute hard/practical/recommended minimums so the operator knows
+    # BEFORE planning whether their config is realistic.
+    _fanout_w = min(args.wallets + 3, args.wallets)  # fanout_count
+    _min_fanout_amt = DUST_XMR + Decimal("0.0001")  # must be > DUST_XMR after quantize
+    _min_usable_fanout = (_min_fanout_amt * _fanout_w / Decimal("0.9")).quantize(Decimal("0.0001")) + Decimal("0.0001")
+    _hard_min = (total_fees + DUST_XMR + Decimal("0.0001"))
+    _practical_min = (total_fees + _min_usable_fanout)
+    _dag_rounds = max(rounds - _fanout_w, args.wallets)
+    _min_dag_budget = (_min_fanout_amt * _dag_rounds)
+    _recommended_min = (total_fees + _min_usable_fanout + _min_dag_budget + per_round_fee * _fanout_w)
+
+    print(f"  [*] Balance analysis for {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority}:")
+    print(f"      Estimated fees:  {total_fees:.6f} XMR ({rounds} rounds × {per_round_fee:.6f} each)")
+    print(f"      Your balance:    {bal:.6f} XMR")
+    print(f"      Usable after fees: {usable:.6f} XMR")
+    print(f"      Hard minimum:    {_hard_min:.4f} XMR (below = abort)")
+    print(f"      Practical min:   {_practical_min:.4f} XMR (below = fan-out only, no DAG mixing)")
+    print(f"      Recommended:     {_recommended_min:.4f} XMR (fan-out + DAG mixing)")
+
+    if bal < _hard_min:
+        sys.exit(
+            f"[!] Balance {bal:.6f} XMR is below hard minimum ({_hard_min:.4f} XMR).\n"
+            f"    Need at least {_hard_min:.4f} XMR for {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority}.\n"
+            f"    Options: add funds, reduce wallets/depth, or use lower fee priority."
+        )
 
     if args.fee_priority >= 3:
         print(f"  [!] WARNING: Fee priority {args.fee_priority} (multiplier {priority_mult}x) "
               f"dramatically increases TX costs.")
-        print(f"  [!] Estimated total fees: {total_fees:.6f} XMR for {rounds} rounds.")
         print(f"  [!] Use priority 1-2 unless the mempool is congested.")
+
+    if bal < _practical_min:
+        print(f"  [!] WARNING: Balance {bal:.6f} XMR is below practical minimum ({_practical_min:.4f} XMR).")
+        print(f"  [!] Fan-out will work but DAG mixing will be SKIPPED — weaker privacy.")
+        print(f"  [!] For full mixing, need at least {_recommended_min:.4f} XMR.")
 
     if usable <= DUST_XMR:
         sys.exit(
@@ -1375,9 +1406,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         rpc.raw_request("refresh", {})
         integrity_log("stage5", "wallet_refreshed_at_start")
     except Exception as _refresh_err:
-        integrity_log("stage5", f"refresh_at_start_warn:{str(_refresh_err)[:40]}")
-        print(f"  [!] WARNING: Wallet refresh at start failed: {str(_refresh_err)[:60]}")
-        print(f"  [!] If resuming after a crash, TXs may fail due to stale wallet state.")
+        integrity_log("stage5", f"refresh_at_start_FAIL:{str(_refresh_err)[:40]}")
+        sys.exit(
+            f"[!] Wallet refresh at start FAILED: {str(_refresh_err)[:60]}\n"
+            f"    Without a fresh wallet view, transfer_split may reuse spent outputs\n"
+            f"    or fail unpredictably. Fix wallet-rpc and retry."
+        )
 
     # Read the plan to get TX count
     try:
@@ -1402,9 +1436,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         if _remaining <= 0:
             _expired_ago = abs(_remaining)
             integrity_log("stage5", f"THORCHAIN_QUOTE_EXPIRED:{_expired_ago}s_ago")
-            print(f"  [!] Quote expired {_expired_ago // 60} minutes ago.")
-            print(f"  [!] If BTC already sent: check explorer for TX status.")
-            print(f"  [!] If NOT sent: regenerate the plan for fresh quote.")
+            sys.exit(
+                f"[!] ThorChain quote EXPIRED {_expired_ago // 60} minutes ago.\n"
+                f"    The deposit address and memo are no longer valid.\n"
+                f"    Sending BTC to an expired address = funds stuck in vault.\n"
+                f"    If BTC already sent: check explorer for TX status.\n"
+                f"    If NOT sent: regenerate the plan (option 1 or 7) for a fresh quote."
+            )
         elif _remaining < 600:
             print(f"  [!] WARNING: ThorChain quote expires in {_remaining // 60}m {_remaining % 60}s!")
             print(f"  [!] Send BTC to the deposit address IMMEDIATELY or regenerate the plan.")
@@ -1458,6 +1496,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     print(f"  [!] Confirmed outputs may no longer be valid.")
         except Exception as _ht_err:
             integrity_log("stage5", f"height_check_fail:{str(_ht_err)[:40]}")
+            print(f"  [!] WARNING: Cannot check daemon height: {str(_ht_err)[:60]}")
+            print(f"  [!] If the daemon is on a different chain or has reorged,")
+            print(f"  [!] TXs may fail or spend against reorganized outputs.")
 
     # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
     # If accounts were added/removed between plan creation and resume,
