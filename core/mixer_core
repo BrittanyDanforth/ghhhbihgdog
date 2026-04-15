@@ -738,9 +738,14 @@ def main():
         except SystemExit:
             raise
         except Exception as e:
-            integrity_log("stage3", f"entry_verify_warn:{str(e)[:40]}")
-            print(f"  [!] WARNING: Could not verify receive address in wallet: {e}")
-            print(f"  [!] Proceeding, but fan-out TXs may fail if address is wrong.")
+            integrity_log("stage3", f"entry_verify_FAIL:{str(e)[:40]}")
+            sys.exit(
+                f"[!] Cannot verify receive address in wallet: {e}\n"
+                f"    The wallet-rpc must be accessible to verify the receive address\n"
+                f"    exists in the connected wallet. Without this, fan-out TXs will\n"
+                f"    send to an address you may not control.\n"
+                f"    Fix the RPC connection and retry."
+            )
         if ENTRY in subs:
             subs.remove(ENTRY)
         subs.insert(0, ENTRY)
@@ -1110,6 +1115,9 @@ def main():
             integrity_log("stage4", f"dag_plan:{r+1}_rounds:total={dag_actual_total}")
     else:
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
+        print(f"  [!] WARNING: DAG mixing phase SKIPPED — insufficient remaining balance.")
+        print(f"  [!] Only fan-out TXs will run. This means LESS mixing privacy.")
+        print(f"  [!] To enable DAG mixing: increase balance, reduce wallets, or reduce depth.")
 
     # BUG 82 FIX: Bind plan to wallet identity. Without this, resuming
     # with a different wallet connected silently uses wrong subaddresses.

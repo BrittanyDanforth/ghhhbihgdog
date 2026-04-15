@@ -178,7 +178,8 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         json.dump(obj, f, indent=2, default=_json_safe_default)
         f.flush()
         os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
+    if not secure_file_perms(tmp, perms):
+        integrity_log("opsec", f"WARN:atomic_write_chmod_fail:{path.name}")
     os.replace(tmp, path)
     try:
         with open(path) as f:
@@ -598,11 +599,12 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
 # ---------------------------------------------------------------------------
 
 def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
-    """Run ALL OPSEC checks before any sensitive operation. Hard-fails on any issue.
+    """Run OPSEC checks before pipeline start. Hard-fails on any issue.
 
-    This is the single enforcement point. Every sensitive operation
-    (TX creation, signing, broadcasting, RPC calls to remote hosts)
-    must call this before proceeding. No fallbacks. No soft warnings.
+    Called by mixer_core at pipeline init (normal and resume paths).
+    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr, etc.)
+    use validate_proxy + verify_tor directly.
+    No fallbacks. No soft warnings.
     """
     # 1. Proxy must be valid and populated
     if not proxy or not proxy.get("https") or not proxy.get("http"):
