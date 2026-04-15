@@ -41,7 +41,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, normalize_broadcast_result,
     opsec_preflight, opsec_gate, validate_plan_schema,
-    validate_wallet_json, validate_rpc_response,
+    validate_wallet_json,
 )
 
 # Monero fee priority multipliers relative to the default (priority 1).
@@ -201,8 +201,15 @@ def main():
                 f"[!] Resume plan is a symlink: {resume_path}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
-        with open(resume_path) as f:
-            _rp = json.load(f)
+        try:
+            with open(resume_path) as f:
+                _rp = json.load(f)
+        except json.JSONDecodeError as e:
+            sys.exit(f"[!] Resume plan is not valid JSON: {e}\n"
+                     f"    File: {resume_path}\n"
+                     f"    The plan file may be corrupt. Re-generate it.")
+        except OSError as e:
+            sys.exit(f"[!] Cannot read resume plan: {e}")
         validate_plan_schema(_rp)
         if _rp.get("meta", {}).get("mock"):
             sys.exit("[!] Cannot resume a mock plan (no real funds)")
@@ -1010,6 +1017,12 @@ def main():
     # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
+    if fanout_count == 0:
+        sys.exit(
+            "[!] No mix target addresses available for fan-out.\n"
+            "    This means subaddress creation produced no usable addresses.\n"
+            "    Check wallet-rpc connection and retry."
+        )
 
     # Budget: 90% of usable goes to fan-out outputs, 10% reserved for fees+DAG.
     fanout_budget = (usable * Decimal("0.9")).quantize(Decimal("0.0001"))
@@ -1560,11 +1573,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
     for tx_idx in range(total_txs):
         # OPSEC gate: check proxy validity + shutdown state before EVERY TX.
-        try:
-            opsec_gate(proxy, f"stage5_pre_tx_{tx_idx}")
-        except SystemExit:
-            integrity_log("stage5", f"opsec_gate_fail:tx={tx_idx}")
-            break
+        opsec_gate(proxy, f"stage5_pre_tx_{tx_idx}")
 
         if tx_idx in completed_indices:
             print(f"  [skip] TX {tx_idx} already completed in prior run")

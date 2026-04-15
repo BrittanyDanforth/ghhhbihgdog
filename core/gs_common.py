@@ -549,19 +549,7 @@ class MoneroRPC:
         return self._wallet.new_account(**kwargs)
 
     def raw_request(self, method: str, params: dict) -> dict:
-        """Send a raw JSON-RPC request to monero-wallet-rpc.
-
-        Enforces a timeout on the underlying HTTP session to prevent
-        indefinite hangs if wallet-rpc becomes unresponsive. Without this,
-        a stuck wallet-rpc blocks the entire pipeline with no way to
-        recover except killing the process.
-        """
-        # Patch timeout into the session if not already set.
-        for attr in ('_session', 'session'):
-            sess = getattr(self._backend, attr, None)
-            if sess is not None and hasattr(sess, 'request'):
-                old_request = sess.request.__func__ if hasattr(sess.request, '__func__') else None
-                break
+        """Send a raw JSON-RPC request to monero-wallet-rpc."""
         result = self._backend.raw_request(method, params)
         if not isinstance(result, dict):
             raise ValueError(
@@ -701,16 +689,6 @@ def validate_wallet_json(data: dict) -> None:
     acct = data.get("account_index", 0)
     if not isinstance(acct, int) or acct < 0:
         sys.exit(f"[!] Invalid account_index in wallet JSON: {acct} (must be non-negative int)")
-
-
-def validate_rpc_response(result: dict, method: str, required_keys: list = None) -> None:
-    """Validate an RPC response has expected structure. Raises ValueError on issues."""
-    if not isinstance(result, dict):
-        raise ValueError(f"{method} returned {type(result).__name__}, expected dict")
-    if required_keys:
-        missing = [k for k in required_keys if k not in result]
-        if missing:
-            raise ValueError(f"{method} response missing keys: {missing}. Got: {sorted(result.keys())}")
 
 
 # ---------------------------------------------------------------------------

@@ -130,11 +130,8 @@ def main():
         if not isinstance(entries, list):
             sys.exit(f"[!] Manifest entries is not a list (got {type(entries).__name__})")
         for e in entries:
-            raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
-            # Containment check: only use the filename component, never absolute
-            # or relative paths from JSON (prevents path traversal attacks where
-            # a malicious manifest points to files outside the expected directory).
-            raw_path = manifest_dir / raw_path.name
+            raw_name = Path(e["file"]).name if isinstance(e, dict) else Path(e).name
+            blob_path = manifest_dir / raw_name
             _split_files_list = e.get("split_files", []) if isinstance(e, dict) else []
             if _split_files_list:
                 for _sf_name in _split_files_list:
@@ -142,22 +139,14 @@ def main():
                     if _sf_path.exists():
                         blobs.append(_sf_path)
                     else:
-                        _sf_local = manifest_dir / _sf_path.name
-                        if _sf_local.exists():
-                            blobs.append(_sf_local)
-                        else:
-                            print(f"  [!] Split blob not found: {_sf_name}")
-                            integrity_log("broadcast", f"missing_split_blob:{_sf_name}")
+                        print(f"  [!] Split blob not found: {_sf_path}")
+                        integrity_log("broadcast", f"missing_split_blob:{Path(_sf_name).name}")
             else:
-                if raw_path.exists():
-                    blobs.append(raw_path)
+                if blob_path.exists():
+                    blobs.append(blob_path)
                 else:
-                    local = manifest_dir / raw_path.name
-                    if local.exists():
-                        blobs.append(local)
-                    else:
-                        print(f"  [!] Blob not found: {raw_path} (also tried {local})")
-                        integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
+                    print(f"  [!] Blob not found: {blob_path}")
+                    integrity_log("broadcast", f"missing_manifest_blob:{raw_name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
@@ -530,16 +519,18 @@ def main():
                                 proxy,
                             )
                             txs = q.get("txs", [])
-                            all_confirmed = True
-                            for _txi, _txdata in enumerate(txs):
-                                in_pool = _txdata.get("in_pool", True)
-                                ht = _txdata.get("block_height", 0)
-                                if not in_pool and ht > 0:
-                                    if not confirmed:
-                                        block_height = ht
-                                else:
-                                    all_confirmed = False
-                            if txs and all_confirmed:
+                            all_confirmed = False
+                            if len(txs) >= len(all_txids_to_check):
+                                all_confirmed = True
+                                for _txi, _txdata in enumerate(txs):
+                                    in_pool = _txdata.get("in_pool", True)
+                                    ht = _txdata.get("block_height", 0)
+                                    if not in_pool and ht > 0:
+                                        if not confirmed:
+                                            block_height = ht
+                                    else:
+                                        all_confirmed = False
+                            if all_confirmed and len(txs) >= len(all_txids_to_check):
                                 print(f"  [+] TX {idx} confirmed at height {block_height}"
                                       f"{' (' + str(len(all_txids_to_check)) + ' parts)' if len(all_txids_to_check) > 1 else ''}")
                                 integrity_log("broadcast", f"mined:idx={idx}:ht={block_height}")

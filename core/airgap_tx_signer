@@ -311,8 +311,13 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         try:
             with open(manifest_path) as f:
                 existing = json.load(f)
-            existing_entries = existing.get("entries", [])
-        except (json.JSONDecodeError, OSError) as e:
+            if isinstance(existing, dict):
+                existing_entries = existing.get("entries", [])
+            elif isinstance(existing, list):
+                existing_entries = existing
+            else:
+                existing_entries = []
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
             print(f"  [!] Warning: corrupt existing manifest, starting fresh: {e}")
             existing_entries = []
 
@@ -468,12 +473,14 @@ def phase_sign(args, plan: List[dict]):
                 unsigned_file = local_file
             else:
                 print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
+                failed += 1
                 continue
 
         # Verify hash (BUG 71 FIX: file is now binary, not hex text)
         actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
         if actual_hash != entry["hash"]:
             print(f"  [!] TX {idx}: hash mismatch - file may be corrupted!")
+            failed += 1
             continue
 
         signed_file = signed_dir / f"tx_{idx}.signed"
@@ -537,6 +544,7 @@ def phase_sign(args, plan: List[dict]):
                 if stderr:
                     print(f"      stderr: {stderr[:200]}")
                 integrity_log("signer", f"sign_fail:idx={idx}:rc={result.returncode}")
+                failed += 1
                 continue
 
             # sign_transfer creates signed_monero_tx in the working directory
@@ -574,10 +582,13 @@ def phase_sign(args, plan: List[dict]):
                     print(f"      stderr: {stderr}")
                 if stdout:
                     print(f"      stdout: {stdout}")
+                failed += 1
         except subprocess.TimeoutExpired:
             print(f"  [!] TX {idx} signing timed out")
+            failed += 1
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
+            failed += 1
         finally:
             # Overwrite sensitive files before unlinking. shutil.rmtree only
             # unlinks — on disk-backed /tmp the data remains recoverable from
