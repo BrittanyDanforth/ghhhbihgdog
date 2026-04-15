@@ -131,11 +131,14 @@ def main():
             sys.exit(f"[!] Manifest entries is not a list (got {type(entries).__name__})")
         for e in entries:
             raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
-            # Handle split TX files: if the entry has split_files, use those instead
+            # Containment check: only use the filename component, never absolute
+            # or relative paths from JSON (prevents path traversal attacks where
+            # a malicious manifest points to files outside the expected directory).
+            raw_path = manifest_dir / raw_path.name
             _split_files_list = e.get("split_files", []) if isinstance(e, dict) else []
             if _split_files_list:
                 for _sf_name in _split_files_list:
-                    _sf_path = Path(_sf_name)
+                    _sf_path = manifest_dir / Path(_sf_name).name
                     if _sf_path.exists():
                         blobs.append(_sf_path)
                     else:

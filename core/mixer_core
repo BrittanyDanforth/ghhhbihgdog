@@ -1009,47 +1009,43 @@ def main():
             f"    Usable after fees: {usable} XMR"
         )
 
-    split_amt = usable / Decimal(rounds)
     integrity_log("stage4", "plan_calculated")
-
-    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
-    quantized_split = split_amt.quantize(Decimal("0.0001"))
-    total_planned = quantized_split * rounds
-    if total_planned > usable:
-        quantized_split -= Decimal("0.0001")
-        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
 
     plan = []
 
     # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
-    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
-    # deposits to ENTRY. Either way, we must spread funds outward before
-    # the random DAG mixing can function (otherwise src addresses have no
-    # balance and every TX fails).
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
-    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
-    # BUG 40 FIX: Verify fan-out total doesn't exceed usable balance.
-    # Quantization rounding can push total above usable for small balances.
-    fanout_total = fanout_amt * fanout_count
-    if fanout_total > usable:
-        fanout_amt -= DUST_XMR
+
+    # Budget: 90% of usable goes to fan-out outputs, 10% reserved for fees+DAG.
+    fanout_budget = (usable * Decimal("0.9")).quantize(Decimal("0.0001"))
+    fanout_amt = (fanout_budget / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+
     if fanout_amt <= DUST_XMR:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
             f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
         )
+
+    # Build fan-out TXs with jitter, tracking actual total for budget enforcement.
+    fanout_actual_total = Decimal("0")
     for fi in range(fanout_count):
         if shutdown_requested():
             integrity_log("stage4", f"shutdown_at_fanout_{fi}")
             break
-        # Per-TX jitter breaks identical-amount clustering on the blockchain.
-        # ±0.00005 XMR is small enough to be invisible to the operator but
-        # ensures no two fan-out TXs share the exact same amount on-chain.
         jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
         actual_fanout_amt = fanout_amt + jitter
         if actual_fanout_amt <= DUST_XMR:
             actual_fanout_amt = fanout_amt
+
+        # Budget guard: ensure cumulative fan-out never exceeds the budget.
+        if fanout_actual_total + actual_fanout_amt > fanout_budget:
+            actual_fanout_amt = fanout_budget - fanout_actual_total
+            if actual_fanout_amt <= DUST_XMR:
+                integrity_log("stage4", f"fanout_budget_exhausted_at_{fi}")
+                break
+
+        fanout_actual_total += actual_fanout_amt
         plan.append({
             "src": ENTRY,
             "dst": mix_targets[fi],
@@ -1057,39 +1053,54 @@ def main():
             "delay": _exponential_delay(args.delay_min, args.delay_max),
             "extra": secure_hex(16),
         })
-    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:base_amt={fanout_amt}:jittered")
+    integrity_log("stage4", f"fanout_plan:{len(plan)}_txs:total={fanout_actual_total}")
 
     # Phase B: DAG mixing — random hops between mix subaddresses.
-    # Recalculate per-round amount from the remaining balance after fan-out.
-    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    remaining_after_fanout = usable - fanout_actual_total - (per_round_fee * len(plan))
     dag_rounds = max(rounds - fanout_count, args.wallets)
+
     if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
-        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+        dag_budget = remaining_after_fanout
+        dag_split = (dag_budget / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+
+        # If per-hop amount is below dust even after budgeting, skip DAG mixing
+        # entirely rather than planning TXs that will fail at the wallet.
         if dag_split <= DUST_XMR:
-            dag_split = DUST_XMR
-        for r in range(dag_rounds):
-            if shutdown_requested():
-                integrity_log("stage4", f"shutdown_at_round_{r}")
-                break
-            src_idx = secrets.randbelow(len(mix_targets))
-            s = mix_targets[src_idx]
-            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
-            if not dst_candidates:
-                continue
-            dst_idx = secrets.randbelow(len(dst_candidates))
-            d = dst_candidates[dst_idx]
-            # Per-TX jitter breaks identical-amount clustering (same rationale as fan-out)
-            dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
-            actual_dag_amt = dag_split + dag_jitter
-            if actual_dag_amt <= DUST_XMR:
-                actual_dag_amt = dag_split
-            plan.append({
-                "src": s,
-                "dst": d,
-                "amt": str(actual_dag_amt),
-                "delay": _exponential_delay(args.delay_min, args.delay_max),
-                "extra": secure_hex(16),
-            })
+            integrity_log("stage4", "dag_mixing_skipped:per_hop_below_dust")
+        else:
+            dag_actual_total = Decimal("0")
+            for r in range(dag_rounds):
+                if shutdown_requested():
+                    integrity_log("stage4", f"shutdown_at_round_{r}")
+                    break
+                src_idx = secrets.randbelow(len(mix_targets))
+                s = mix_targets[src_idx]
+                dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+                if not dst_candidates:
+                    continue
+                dst_idx = secrets.randbelow(len(dst_candidates))
+                d = dst_candidates[dst_idx]
+                dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+                actual_dag_amt = dag_split + dag_jitter
+                if actual_dag_amt <= DUST_XMR:
+                    actual_dag_amt = dag_split
+
+                # Budget guard: cumulative DAG TXs must not exceed remaining funds.
+                if dag_actual_total + actual_dag_amt > dag_budget:
+                    actual_dag_amt = dag_budget - dag_actual_total
+                    if actual_dag_amt <= DUST_XMR:
+                        integrity_log("stage4", f"dag_budget_exhausted_at_{r}")
+                        break
+
+                dag_actual_total += actual_dag_amt
+                plan.append({
+                    "src": s,
+                    "dst": d,
+                    "amt": str(actual_dag_amt),
+                    "delay": _exponential_delay(args.delay_min, args.delay_max),
+                    "extra": secure_hex(16),
+                })
+            integrity_log("stage4", f"dag_plan:{r+1}_rounds:total={dag_actual_total}")
     else:
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
@@ -1512,7 +1523,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 integrity_log("stage5", "progress_fingerprint_mismatch:discarded")
                 progress_file.unlink()
             else:
-                # BUG 85 FIX: Verify HMAC before trusting progress contents.
+                # Verify HMAC before trusting progress contents.
                 _saved_hmac = progress.pop("hmac", None)
                 _saved_nonce = progress.get("nonce", "")
                 if _saved_hmac and _saved_nonce:
@@ -1525,6 +1536,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                         progress = {}
                     else:
                         _progress_nonce = _saved_nonce
+                elif progress.get("completed"):
+                    integrity_log("stage5", "PROGRESS_NO_HMAC:untrusted")
+                    print(f"  [!] Progress file has no HMAC (old format or tampered).")
+                    print(f"  [!] Cannot verify integrity. Discarding and starting fresh.")
+                    print(f"  [!] If TXs were already broadcast, check wallet balance first.")
+                    progress_file.unlink()
+                    progress = {}
                 completed_indices = set(progress.get("completed", []))
                 # BUG 73 FIX: Detect broadcast_pending — a TX that was
                 # broadcast but progress wasn't finalized (crash/kill
@@ -1582,6 +1600,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     chunk = min(30, delay - waited)
                     time.sleep(chunk)
                     waited += chunk
+                if shutdown_requested():
+                    integrity_log("stage5", f"shutdown_during_delay:tx={tx_idx}")
+                    print(f"  [!] Shutdown during delay before TX {tx_idx}. Rerun to resume.")
+                    break
 
         newnym()
 
@@ -1717,16 +1739,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 break
             signed_files_to_broadcast = [signed_file]
 
-        # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
-        # If the process is killed between broadcast and progress save,
-        # the TX is on-chain but progress doesn't reflect it. On resume,
-        # the code would re-create a NEW TX (different nonces) spending
-        # the same inputs. If the original confirmed between crash and
-        # resume, the wallet picks different inputs → double-payment.
-        # By persisting broadcast_pending first, the resume path can
-        # detect this and verify wallet state before re-creating.
-        broadcast_pending = set(completed_indices)
-        broadcast_pending.add(tx_idx)
+        # Save "broadcast_pending" state BEFORE broadcasting so resume can
+        # detect a TX that was broadcast but never finalized (crash/kill
+        # between broadcast and completion save). On resume, pending TXs
+        # are treated as completed to prevent double-payment.
         _save_progress({
             "plan_fingerprint": plan_fingerprint,
             "completed": sorted(completed_indices),
