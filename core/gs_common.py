@@ -272,12 +272,12 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
         sys.exit(
             f"[!] CRITICAL: socks5:// leaks DNS locally!\n"
             f"    Use socks5h:// so DNS resolves through the proxy.\n"
-            f"    Change: {proxy_url} -> {proxy_url.replace('socks5://', 'socks5h://')}"
+            f"    Replace socks5:// with socks5h:// in your proxy URL."
         )
     if not SOCKS_RE.match(proxy_lower):
         sys.exit(
-            f"[!] Invalid proxy format: {proxy_url}\n"
-            f"    Expected: socks5h://host:port  (NOT socks5://)"
+            f"[!] Invalid proxy format.\n"
+            f"    Expected: socks5h://host:port  (e.g. socks5h://127.0.0.1:9050)"
         )
     # Extract and validate port range
     port_str = proxy_lower.rsplit(":", 1)[-1]
@@ -641,7 +641,7 @@ def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
         if val and not val.lower().startswith("socks5h://"):
             integrity_log("opsec", f"HARD_FAIL:non_socks5h_proxy:{stage}")
             sys.exit(
-                f"[!] OPSEC VIOLATION: Proxy {key}={val[:20]}... is not socks5h://\n"
+                f"[!] OPSEC VIOLATION: Proxy is not socks5h://\n"
                 f"    DNS will leak to your ISP. Use socks5h:// (with the h)."
             )
 

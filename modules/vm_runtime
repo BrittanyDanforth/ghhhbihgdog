@@ -148,8 +148,11 @@ def probe_disk_io() -> float:
     try:
         test_data = b"timing_test_" + os.urandom(1024)  # 1KB test
         
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = tmp.name
+        _fd = tempfile.mkstemp(prefix="gs_io_")
+        tmp_path = _fd[1]
+        os.close(_fd[0])
+        os.chmod(tmp_path, 0o600)
+        with open(tmp_path, "r+b") as tmp:
             start = time.perf_counter()
             tmp.write(test_data)
             tmp.flush()

@@ -561,15 +561,12 @@ def flow_cold(detected_port=None):
     ]
     if run_script(CORE / "mixer_core", args, "Cold mode"):
         print()
-        _unsigned_dir = ROOT / "unsigned"
-        ok(f"Unsigned plan created in {_unsigned_dir}/")
+        ok("Unsigned plan created.")
         info("Next steps:")
-        info(f"  1. Copy {_unsigned_dir}/ to USB")
-        info("  2. On your offline machine, run:")
-        info(f"     python3 airgap_tx_signer <plan.json> \\")
-        info(f"       --phase sign --wallet-file /path/to/wallet --outdir tx_staging")
-        info("  3. Copy tx_staging/signed/ back to this machine")
-        info("  4. Choose option 4 (Broadcast) from the main menu")
+        info("  1. Copy the 'unsigned/' folder to USB")
+        info("  2. On your offline machine, sign the plan using the air-gap signer")
+        info("  3. Copy the 'signed/' folder back to this machine")
+        info("  4. Choose option 4 (Broadcast) from this menu")
 
 
 def flow_broadcast(detected_port=None):
@@ -580,10 +577,16 @@ def flow_broadcast(detected_port=None):
 
     signed_dir = ROOT / "tx_staging" / "signed"
     if signed_dir.is_dir():
+        _blob_count = len(list(signed_dir.glob("*.signed")))
+        if _blob_count > 0:
+            ok(f"Found {_blob_count} signed blob(s) in default location")
         path = prompt("Signed blobs directory", str(signed_dir))
     else:
+        print()
         info("No signed blobs found in the default location.")
-        info("If you used air-gap signing, point to the USB/directory with signed files.")
+        info("If you used air-gap signing, enter the path to your signed/ folder.")
+        info("If you ran the full pipeline (option 1), blobs are created automatically.")
+        print()
         path = prompt("Path to signed blobs (directory or manifest JSON)")
 
     rpc = prompt("Monero daemon RPC", "http://127.0.0.1:18081")
@@ -691,31 +694,49 @@ def flow_create_wallet(detected_port=None):
         return
     rpc = get_rpc()
     args = ["--rpc", rpc, "--tor-proxy", tor]
-    run_script(CORE / "create_receive_wallet", args, "Wallet creator")
+    if run_script(CORE / "create_receive_wallet", args, "Wallet creator"):
+        print()
+        ok("Wallet created. Next: use option 2 (Receive) for the full guided flow.")
 
 
 def flow_swap_preparer(detected_port=None):
-    heading("ThorChain Swap Preparer")
-    if not _opsec_preflight():
-        return
+    heading("ThorChain Swap Preparer (standalone)")
+    print(f"  This generates a BTC deposit address + memo for ThorChain swaps.")
+    print(f"  For the full guided receive flow, use option 2 instead.")
+    print()
     tor = get_tor_proxy(detected_port)
     if not tor:
         return
 
     wallet_files = _find_wallet_files()
+    dest = ""
     if wallet_files:
-        info(f"Found: {', '.join(f.name for f in wallet_files)}")
+        info(f"Found wallet(s): {', '.join(f.name for f in wallet_files[:3])}")
+        use_wf = prompt("Load XMR address from wallet JSON? (y/n)", "y").lower()
+        if use_wf in ("y", "yes", ""):
+            wf_path = prompt("Wallet JSON file", str(wallet_files[0]))
+            try:
+                with open(wf_path) as _f:
+                    dest = json.load(_f).get("address", "")
+                if dest:
+                    ok(f"Address loaded from {Path(wf_path).name}")
+            except (json.JSONDecodeError, KeyError, OSError) as e:
+                err(f"Cannot read wallet file: {e}")
+                return
 
-    amt = prompt("BTC amount to swap")
-    dest = prompt("XMR destination address (or wallet JSON path)")
-    if dest.endswith(".json") and Path(dest).exists():
-        try:
-            with open(dest) as _f:
-                dest = json.load(_f)["address"]
-            info(f"Loaded address from JSON: {dest[:8]}...{dest[-8:]}")
-        except (json.JSONDecodeError, KeyError, OSError) as e:
-            err(f"Failed to read address from {dest}: {e}")
-            return
+    if not dest:
+        dest = prompt("XMR destination address")
+    if not dest:
+        err("XMR address is required.")
+        return
+
+    amt = prompt("BTC amount to swap (e.g. 0.1)")
+    try:
+        if Decimal(amt) <= 0:
+            raise ValueError
+    except (ValueError, TypeError, InvalidOperation):
+        err(f"Invalid BTC amount: '{amt}'")
+        return
 
     _outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
     args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor,
@@ -723,9 +744,7 @@ def flow_swap_preparer(detected_port=None):
     if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer"):
         err("Swap preparation failed.")
     else:
-        ok(f"Deposit instructions written to: {Path(_outfile).name}")
-        info("This is a STANDALONE utility. Its output is for manual use.")
-        info("For the guided receive flow, use option 2 instead.")
+        ok("Deposit instructions generated — see output above.")
 
 
 def flow_exit_planner(detected_port=None):
@@ -815,22 +834,22 @@ def flow_testnet(detected_port=None):
         "--cold",
     ]
     if run_script(CORE / "mixer_core", args, "Testnet"):
-        ok("Dry-run plan created in ./unsigned/")
-        plans = sorted(Path("unsigned").glob("unsigned_*.json"))
+        ok("Dry-run plan created")
+        plans = _find_plan_files()
         if plans:
-            info(f"Plan: {plans[-1]}")
-            with open(plans[-1]) as f:
-                p = json.load(f)
-            txs = p.get("txs", [])
-            info(f"TXs in plan: {len(txs)}")
-            if txs:
-                total = sum(Decimal(t["amt"]) for t in txs)
-                info(f"Total amount: {total:.4f} XMR (mock)")
-            if p.get("meta", {}).get("mock"):
-                warn("This is a MOCK plan — cannot be signed/broadcast with real wallet")
+            try:
+                with open(plans[0]) as f:
+                    p = json.load(f)
+                txs = p.get("txs", [])
+                info(f"TXs in plan: {len(txs)}")
+                if p.get("meta", {}).get("mock"):
+                    warn("This is a MOCK plan — cannot be signed/broadcast with real wallet")
+            except (json.JSONDecodeError, OSError):
+                pass
 
         if confirm("Run paranoia cleanup (dry-run) to see what would be wiped?"):
-            run_script(OPSEC / "paranoia_mode", ["--dry-run"], "Paranoia dry-run")
+            run_script(OPSEC / "paranoia_mode", ["--dry-run", "--search-dir", str(ROOT)],
+                       "Paranoia dry-run")
 
 
 def flow_system_check():

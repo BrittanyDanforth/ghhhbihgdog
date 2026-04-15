@@ -306,15 +306,13 @@ def main():
                         continue
                     else:
                         sys.exit(
-                            f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
-                            "    Another instance may be running.\n"
-                            "    If not, delete the lock file manually."
+                            f"[!] Another instance may be running (PID {stale_pid}).\n"
+                        "    If not, delete .mixer.lock and retry."
                         )
                 except (OSError, ValueError):
                     sys.exit(
-                        "[!] Lock file exists: .mixer.lock\n"
-                        "    Another instance may be running.\n"
-                        "    If not, delete the lock file manually."
+                        "[!] Another instance may be running.\n"
+                        "    If not, delete .mixer.lock and retry."
                     )
         if not _lock_acquired:
             sys.exit("[!] Could not acquire lock after 3 attempts.")
@@ -895,12 +893,9 @@ def main():
         else:
             integrity_log("stage2", "manual_mode")
             print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
-            print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
-            print(f"        python3 thor_swap_preparer \\")
-            print(f"          --amounts <BTC_AMOUNT> \\")
-            print(f"          --dests {scrub_address(ENTRY)} \\")
-            print(f"          --tor-proxy {args.tor_proxy}")
-            print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
+            print(f"  [!] Use menu option 7 (Swap Preparer) to generate deposit addresses,")
+            print(f"  [!] or pass --btc-amount on the command line.")
+            print(f"  [!] Wait for XMR to arrive at the entry address before proceeding.")
 
     dag = {}
     for a in subs:
@@ -1353,15 +1348,13 @@ def main():
                     continue
                 else:
                     sys.exit(
-                        f"[!] Lock file exists: {lock_path} (PID {stale_pid})\n"
-                        "    Another instance may be running.\n"
-                        "    If not, delete the lock file manually."
+                        f"[!] Another instance may be running (PID {stale_pid}).\n"
+                        "    If not, delete .mixer.lock and retry."
                     )
             except (OSError, ValueError):
                 sys.exit(
-                    f"[!] Lock file exists: {lock_path}\n"
-                    "    Another instance may be running.\n"
-                    "    If not, delete the lock file manually."
+                    "[!] Another instance may be running.\n"
+                    "    If not, delete .mixer.lock and retry."
                 )
     if not _lock_acquired:
         sys.exit("[!] Could not acquire lock after 3 attempts.")

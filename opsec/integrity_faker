@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 # Configuration
-SEED_FILE = Path("entropy_seed.json")
-DEFAULT_OUT = Path("integrity_fake.log")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+DEFAULT_OUT = _TOOLKIT_ROOT / "integrity_fake.log"
 
 # Enhanced tag sets for realistic forensic evasion
 SYSTEM_TAGS = ["INIT", "BOOT", "LOAD", "START", "STOP", "SHUTDOWN", "RESTART"]
