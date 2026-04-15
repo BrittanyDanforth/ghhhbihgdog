@@ -63,6 +63,43 @@ MODS = ROOT / "modules"
 OPSEC = ROOT / "opsec"
 INTEL = ROOT / "intel"
 
+
+def _find_wallet_files() -> list:
+    """Search for wallet_*.json in toolkit root, CWD, and home directory.
+    Returns deduplicated list sorted by modification time (newest first)."""
+    search_dirs = []
+    seen = set()
+    for d in [Path("."), ROOT, Path.home(), Path.home() / "Downloads"]:
+        rd = d.resolve()
+        if rd not in seen and rd.is_dir():
+            seen.add(rd)
+            search_dirs.append(d)
+    found = {}
+    for d in search_dirs:
+        for f in d.glob("wallet_*.json"):
+            rp = f.resolve()
+            if rp not in found:
+                found[rp] = f
+    return sorted(found.values(), key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def _find_plan_files() -> list:
+    """Search for unsigned plan files in toolkit root and CWD."""
+    search_dirs = []
+    seen = set()
+    for d in [Path("unsigned"), ROOT / "unsigned", Path(".")]:
+        rd = d.resolve()
+        if rd not in seen and rd.is_dir():
+            seen.add(rd)
+            search_dirs.append(d)
+    found = {}
+    for d in search_dirs:
+        for f in d.glob("unsigned_*.json"):
+            rp = f.resolve()
+            if rp not in found:
+                found[rp] = f
+    return sorted(found.values(), key=lambda f: f.stat().st_mtime, reverse=True)
+
 # ── Colors ──────────────────────────────────────────────────────────────────
 R = "\033[0;31m"    # red
 G = "\033[0;32m"    # green
@@ -394,7 +431,7 @@ def flow_receive(detected_port=None):
         return
     rpc = get_rpc()
 
-    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wallet_files = _find_wallet_files()
     if wallet_files:
         info(f"Found wallet files: {', '.join(f.name for f in wallet_files)}")
         wf = prompt("Wallet JSON file", str(wallet_files[0]))
@@ -423,7 +460,7 @@ def flow_cold(detected_port=None):
         return
     rpc = get_rpc()
 
-    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wallet_files = _find_wallet_files()
     if wallet_files:
         wf = prompt("Wallet JSON file", str(wallet_files[0]))
     else:
@@ -481,10 +518,10 @@ def flow_resume(detected_port=None):
         return
     rpc = get_rpc()
 
-    plans = sorted(Path("unsigned").glob("unsigned_*.json")) if Path("unsigned").is_dir() else []
+    plans = _find_plan_files()
     if plans:
         info(f"Found plans: {', '.join(p.name for p in plans)}")
-        plan = prompt("Plan file to resume", str(plans[-1]))
+        plan = prompt("Plan file to resume", str(plans[0]))
     else:
         plan = prompt("Path to unsigned plan JSON")
 
@@ -496,7 +533,7 @@ def flow_resume(detected_port=None):
         info("Run option 1 or 3 first to generate a plan, then resume.")
         return
 
-    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wallet_files = _find_wallet_files()
     if wallet_files:
         wf = prompt("Wallet JSON file", str(wallet_files[0]))
     else:
@@ -578,7 +615,7 @@ def flow_swap_preparer(detected_port=None):
     if not tor:
         return
 
-    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wallet_files = _find_wallet_files()
     if wallet_files:
         info(f"Found: {', '.join(f.name for f in wallet_files)}")
 
@@ -648,13 +685,13 @@ def flow_testnet(detected_port=None):
         return
     rpc = get_rpc()
 
-    wallet_files = sorted(Path(".").glob("wallet_*.json"))
+    wallet_files = _find_wallet_files()
     if wallet_files:
         wf = prompt("Wallet JSON (or press Enter to create one)", str(wallet_files[0]))
     else:
         info("No wallet found — creating one first...")
         run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor], "Wallet creator")
-        wallet_files = sorted(Path(".").glob("wallet_*.json"))
+        wallet_files = _find_wallet_files()
         if not wallet_files:
             err("Failed to create wallet")
             return

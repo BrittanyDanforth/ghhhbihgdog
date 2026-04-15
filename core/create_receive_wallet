@@ -163,18 +163,20 @@ def main():
     # BUG 55 FIX: Don't print full XMR address in terminal output.
     # Terminal scrollback, screen recordings, and shoulder-surfing can
     # capture it. Instead, reference the JSON file which has 0600 perms.
-    print(f"  === RECEIVER FLOW: NEXT STEPS ===")
-    print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
-    print(f"       python3 thor_swap_preparer \\")
-    print(f"         --amounts <BTC_AMOUNT> \\")
-    print(f"         --dests $(jq -r .address {fname}) \\")
-    print(f"         --tor-proxy <SOCKS5H_PROXY>")
-    print(f"  2. Give the BTC deposit address + memo to the sender")
-    print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")
-    print(f"  4. Run the mixer pipeline in receive mode:")
-    print(f"       ./gs mixer \\")
-    print(f"         --receive-wallet {fname} \\")
-    print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print(f"  === NEXT STEPS ===")
+    print(f"  From the main menu:")
+    print(f"")
+    print(f"  Step 1: Choose option 7 (Swap Preparer)")
+    print(f"          Enter the BTC amount and paste this wallet's address")
+    print(f"          (or just type the path: {fname})")
+    print(f"          This generates a BTC deposit address + memo for the sender.")
+    print(f"")
+    print(f"  Step 2: Give the deposit address + memo to the BTC sender")
+    print(f"          Wait for the BTC → XMR swap to complete on ThorChain")
+    print(f"")
+    print(f"  Step 3: Choose option 2 (Receive Mode)")
+    print(f"          Select this wallet file: {fname}")
+    print(f"          The toolkit will mix the XMR that arrived.")
 
 
 if __name__ == "__main__":

@@ -82,6 +82,12 @@ monero-wallet-cli --generate-new-wallet ~/my_wallet
 - Write down the 25-word seed — **on paper, store safely**
 - That seed is the ONLY way to recover funds
 
+**If you get "file already exists":** You already have a wallet. Skip this step and use
+your existing wallet in the next step. If you want a fresh wallet, pick a different name:
+```
+monero-wallet-cli --generate-new-wallet ~/my_wallet2
+```
+
 ---
 
 ## Step 5: Start services (before each session)

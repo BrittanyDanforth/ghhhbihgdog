@@ -131,6 +131,19 @@ def fetch_fee_from_rpc(rpc, allow_fallback: bool = False) -> Decimal:
     except SystemExit:
         raise
     except Exception as e:
+        _err_str = str(e).lower()
+        if "method not found" in _err_str or "-32601" in _err_str:
+            integrity_log("fee", "rpc_fee_method_not_found")
+            if allow_fallback:
+                print(f"  [!] wallet-rpc does not support get_fee_estimate (older version or no daemon).")
+                print(f"  [!] Using fallback fee for planning only.")
+                return FALLBACK_FEE_XMR
+            sys.exit(
+                f"[!] wallet-rpc does not support get_fee_estimate.\n"
+                f"    This usually means monerod is not connected or not synced.\n"
+                f"    Make sure monero-wallet-rpc is connected to a running, synced monerod:\n"
+                f"      monero-wallet-rpc --daemon-address 127.0.0.1:18081 ..."
+            )
         integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
 
     if allow_fallback:
