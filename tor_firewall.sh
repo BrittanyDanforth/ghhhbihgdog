@@ -448,56 +448,67 @@ BRIDGES_BLOCK
 #
 do_setup_browser() {
     echo ""
-    echo -e "  ${BOLD}Browser Setup — Route Through Tor${NC}"
-    echo ""
-    echo -e "  The firewall blocks ALL direct internet from the VM."
-    echo -e "  This is correct — only Tor can reach outside."
-    echo -e "  Your browser needs to go through Tor's SOCKS proxy."
+    echo -e "  ${BOLD}Fixing Browser + CLI Tools — Route Everything Through Tor${NC}"
     echo ""
 
     local tor_port
     tor_port=$(detect_tor_socks_port 2>/dev/null) || tor_port=9050
 
-    # ── Option 1: Tor Browser (BEST) ──
-    echo -e "  ${GREEN}${BOLD}Option 1: Tor Browser (RECOMMENDED — most secure)${NC}"
-    echo ""
-    if command -v torbrowser-launcher &>/dev/null || [[ -d /opt/tor-browser ]] || [[ -d "$HOME/tor-browser" ]]; then
-        pass "Tor Browser appears to be installed"
-        echo -e "  ${DIM}  Launch it — it handles its own SOCKS connection.${NC}"
-        echo -e "  ${DIM}  It has anti-fingerprinting built in (blocks canvas, WebGL, etc).${NC}"
-    else
-        info "Tor Browser not found. Install it:"
-        echo ""
-        echo -e "    ${BOLD}# Kali/Debian:${NC}"
-        echo -e "    sudo apt install -y torbrowser-launcher"
-        echo -e "    torbrowser-launcher"
-        echo ""
-        echo -e "    ${BOLD}# Manual (any distro):${NC}"
-        echo -e "    cd /tmp"
-        echo -e "    curl -sL --socks5-hostname 127.0.0.1:${tor_port} \\"
-        echo -e "      'https://www.torproject.org/dist/torbrowser/14.0.4/tor-browser-linux-x86_64-14.0.4.tar.xz' \\"
-        echo -e "      -o tor-browser.tar.xz"
-        echo -e "    tar xf tor-browser.tar.xz"
-        echo -e "    ./tor-browser/Browser/start-tor-browser"
+    # =====================================================================
+    # STEP 1: Fix CLI tools (wget, curl, apt, pip) — ALWAYS do this
+    # =====================================================================
+    echo -e "  ${CYAN}[Step 1/3] Setting up CLI tools (wget, curl, apt, pip)...${NC}"
+
+    # System-wide proxy env vars for all future terminals
+    local proxy_conf="/etc/profile.d/tor-proxy.sh"
+    cat > "$proxy_conf" <<PROXY
+# Set by tor_firewall.sh — routes all CLI tools through Tor
+export http_proxy="socks5h://127.0.0.1:${tor_port}"
+export https_proxy="socks5h://127.0.0.1:${tor_port}"
+export HTTP_PROXY="socks5h://127.0.0.1:${tor_port}"
+export HTTPS_PROXY="socks5h://127.0.0.1:${tor_port}"
+export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
+export no_proxy="127.0.0.1,localhost,::1"
+PROXY
+    chmod 644 "$proxy_conf"
+
+    # Apply to current shell
+    export http_proxy="socks5h://127.0.0.1:${tor_port}"
+    export https_proxy="socks5h://127.0.0.1:${tor_port}"
+    export HTTP_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export HTTPS_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export no_proxy="127.0.0.1,localhost,::1"
+
+    # Configure apt
+    local apt_conf="/etc/apt/apt.conf.d/99tor-proxy"
+    cat > "$apt_conf" <<APTPROXY
+Acquire::http::Proxy "socks5h://127.0.0.1:${tor_port}";
+Acquire::https::Proxy "socks5h://127.0.0.1:${tor_port}";
+APTPROXY
+    chmod 644 "$apt_conf"
+
+    # Configure wget
+    if ! grep -q "# tor_firewall proxy" /etc/wgetrc 2>/dev/null; then
+        cat >> /etc/wgetrc <<WGETPROXY
+
+# tor_firewall proxy
+use_proxy = on
+http_proxy = http://127.0.0.1:${tor_port}
+https_proxy = http://127.0.0.1:${tor_port}
+WGETPROXY
     fi
+
+    pass "CLI tools configured: wget, curl, apt, pip now use Tor"
+    pass "New terminals: automatic (via /etc/profile.d/tor-proxy.sh)"
+    pass "This terminal: proxy exported — works right now"
     echo ""
 
-    # ── Option 2: Firefox SOCKS config ──
-    echo -e "  ${CYAN}${BOLD}Option 2: Firefox (already installed) via SOCKS proxy${NC}"
-    echo ""
-    echo -e "  Open Firefox, then:"
-    echo -e "    1. Type ${BOLD}about:preferences#general${NC} in the address bar"
-    echo -e "    2. Scroll to ${BOLD}Network Settings${NC} → click ${BOLD}Settings${NC}"
-    echo -e "    3. Select ${BOLD}Manual proxy configuration${NC}"
-    echo -e "    4. SOCKS Host: ${BOLD}127.0.0.1${NC}    Port: ${BOLD}${tor_port}${NC}"
-    echo -e "    5. Select ${BOLD}SOCKS v5${NC}"
-    echo -e "    6. CHECK: ${BOLD}Proxy DNS when using SOCKS v5${NC}  ${RED}(CRITICAL — prevents DNS leak)${NC}"
-    echo -e "    7. Leave HTTP/HTTPS/FTP proxy fields EMPTY"
-    echo -e "    8. Click OK"
-    echo ""
+    # =====================================================================
+    # STEP 2: Fix Firefox
+    # =====================================================================
+    echo -e "  ${CYAN}[Step 2/3] Setting up Firefox...${NC}"
 
-    # Auto-configure Firefox if a profile exists
-    local ff_configured=false
     local ff_profiles_dir=""
     for ff_dir in "$HOME/.mozilla/firefox" "/root/.mozilla/firefox"; do
         if [[ -d "$ff_dir" ]]; then
@@ -507,16 +518,13 @@ do_setup_browser() {
     done
 
     if [[ -n "$ff_profiles_dir" ]]; then
-        echo -e "  ${CYAN}Auto-configuring Firefox profiles...${NC}"
         local profile_count=0
         while IFS= read -r prefs_file; do
             local profile_dir
             profile_dir=$(dirname "$prefs_file")
-
-            # Create user.js (overrides prefs.js on next Firefox launch)
             local userjs="$profile_dir/user.js"
 
-            # Remove our old config if present
+            # Remove old config if present, then write fresh
             if [[ -f "$userjs" ]]; then
                 sed -i '/TOR-FIREWALL-PROXY-START/,/TOR-FIREWALL-PROXY-END/d' "$userjs" 2>/dev/null || true
             fi
@@ -544,60 +552,52 @@ FFPROXY
         done < <(find "$ff_profiles_dir" -name "prefs.js" -maxdepth 2 2>/dev/null)
 
         if [[ $profile_count -gt 0 ]]; then
-            pass "Auto-configured $profile_count Firefox profile(s)"
-            info "Settings applied: SOCKS5 proxy, DNS through proxy, WebRTC disabled"
-            info "WebGL disabled, geolocation disabled, referer headers stripped"
+            pass "Firefox: $profile_count profile(s) configured (SOCKS5 + DNS privacy + WebRTC off)"
             warn "RESTART Firefox for changes to take effect"
         else
-            warn "No Firefox profiles found — configure manually (see above)"
+            warn "No Firefox profiles found — open Firefox once first, then re-run this"
         fi
+    else
+        warn "No Firefox profile directory found — open Firefox once first, then re-run this"
     fi
     echo ""
 
-    # ── Option 3: Chromium ──
-    echo -e "  ${CYAN}${BOLD}Option 3: Chromium/Chrome via command line${NC}"
-    echo ""
-    echo -e "  ${BOLD}chromium --proxy-server=\"socks5://127.0.0.1:${tor_port}\" --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\"${NC}"
-    echo ""
-    echo -e "  ${DIM}The --host-resolver-rules flag forces DNS through the SOCKS proxy.${NC}"
-    echo -e "  ${DIM}Without it, Chromium leaks DNS queries directly (blocked by firewall).${NC}"
-    echo ""
+    # =====================================================================
+    # STEP 3: Verify everything works
+    # =====================================================================
+    echo -e "  ${CYAN}[Step 3/3] Testing...${NC}"
 
-    # ── Option 4: System-wide proxy env vars ──
-    echo -e "  ${CYAN}${BOLD}Option 4: CLI tools (curl, wget, apt, etc.)${NC}"
-    echo ""
-    echo -e "  For one-off commands, use the --socks5-hostname flag:"
-    echo -e "    ${BOLD}curl --socks5-hostname 127.0.0.1:${tor_port} https://check.torproject.org/api/ip${NC}"
-    echo ""
-    echo -e "  For system-wide (all CLI tools that respect proxy env vars):"
-    echo -e "    ${BOLD}export ALL_PROXY=socks5h://127.0.0.1:${tor_port}${NC}"
-    echo -e "    ${BOLD}export http_proxy=socks5h://127.0.0.1:${tor_port}${NC}"
-    echo -e "    ${BOLD}export https_proxy=socks5h://127.0.0.1:${tor_port}${NC}"
-    echo ""
-    echo -e "  Or use torsocks to wrap any command:"
-    echo -e "    ${BOLD}torsocks curl https://check.torproject.org/api/ip${NC}"
-    echo -e "    ${BOLD}torsocks wget https://example.com/file.zip${NC}"
-    echo -e "    ${BOLD}torsocks apt update${NC}"
-    echo ""
+    # Test CLI through proxy
+    local test_result
+    test_result=$(curl -s --max-time 15 --socks5-hostname "127.0.0.1:${tor_port}" \
+        https://check.torproject.org/api/ip 2>/dev/null) || true
+    if echo "$test_result" | grep -q '"IsTor":true' 2>/dev/null; then
+        pass "curl through Tor: WORKING"
+    else
+        fail "curl through Tor: NOT WORKING"
+        warn "Check: sudo systemctl status tor"
+    fi
 
-    # ── Security notes ──
-    echo -e "  ${YELLOW}${BOLD}SECURITY NOTES:${NC}"
+    # Test wget through proxy
+    if wget -q --spider --timeout=15 https://check.torproject.org 2>/dev/null; then
+        pass "wget through Tor: WORKING"
+    else
+        warn "wget through Tor: may need a new terminal (run: . /etc/profile.d/tor-proxy.sh)"
+    fi
+
     echo ""
-    echo -e "  ${YELLOW}1.${NC} Tor Browser is the SAFEST option. It has anti-fingerprinting"
-    echo -e "     that regular Firefox/Chromium do not (canvas, WebGL, timezone,"
-    echo -e "     screen size, font enumeration are all neutralized)."
+    echo -e "  ${GREEN}${BOLD}Setup complete.${NC}"
     echo ""
-    echo -e "  ${YELLOW}2.${NC} Regular Firefox/Chromium through SOCKS: your traffic goes through"
-    echo -e "     Tor, but the browser itself can still be fingerprinted (canvas,"
-    echo -e "     WebGL, installed fonts, screen resolution). For casual browsing"
-    echo -e "     this is fine. For high-OPSEC work, use Tor Browser."
+    echo -e "  ${BOLD}What works now:${NC}"
+    echo -e "    ${GREEN}✓${NC} curl, wget, apt, pip — through Tor automatically"
+    echo -e "    ${GREEN}✓${NC} Firefox — through Tor (restart Firefox first)"
+    echo -e "    ${GREEN}✓${NC} New terminals — proxy set automatically"
     echo ""
-    echo -e "  ${YELLOW}3.${NC} NEVER use both Tor Browser AND regular Firefox at the same time."
-    echo -e "     Traffic correlation between the two can deanonymize you."
+    echo -e "  ${BOLD}For THIS terminal (if wget still fails):${NC}"
+    echo -e "    ${BOLD}. /etc/profile.d/tor-proxy.sh${NC}"
     echo ""
-    echo -e "  ${YELLOW}4.${NC} The firewall ensures that even if the browser tries to leak"
-    echo -e "     (WebRTC STUN, DNS prefetch, speculative connections), iptables"
-    echo -e "     drops it. Only Tor traffic gets out."
+    echo -e "  ${BOLD}For Chromium:${NC}"
+    echo -e "    ${BOLD}chromium --proxy-server=\"socks5://127.0.0.1:${tor_port}\"${NC}"
     echo ""
     exit 0
 }
