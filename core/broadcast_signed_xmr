@@ -390,9 +390,9 @@ def main():
         # The daemon's /sendrawtransaction expects raw TX hex (a completely
         # different format) and would reject signed_txset data.
         #
-        # Hot wallet blobs (from tx_metadata_list) are also binary on disk
-        # (decoded from hex during phase_create). They go through the same
-        # submit_transfer path.
+        # Hot wallet blobs (presigned via tx_metadata_list) use relay_tx.
+        # Air-gap signed blobs (via wallet-cli sign_transfer) use submit_transfer.
+        # The method is determined by _presigned_blobs lookup from unsigned_manifest.
         use_wallet_rpc = True  # always for our pipeline's .signed files
 
         # NEWNYM + planned delay before each TX for circuit isolation and

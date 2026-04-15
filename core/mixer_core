@@ -1158,6 +1158,10 @@ def main():
         meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
 
+    # Validate the plan we just built before writing — catches any
+    # programming error in the amount engine or DAG construction.
+    validate_plan_schema(unsigned)
+
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
     ufile = outdir / f"unsigned_{secure_hex(8)}.json"
@@ -1285,9 +1289,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     Therefore, auto-mode MUST process TXs one at a time:
       For each TX in the plan:
         1. Create unsigned TX (wallet-rpc transfer_split with do_not_relay)
-        2. Sign the unsigned TX (wallet-cli sign_transfer)
-        3. Broadcast the signed TX (wallet-rpc submit_transfer)
-        4. Wait for confirmation (at least accepted into mempool)
+        2. Sign the unsigned TX (wallet-cli sign_transfer) — or skip if hot wallet (presigned)
+        3. Broadcast: relay_tx for hot wallet (presigned), submit_transfer for air-gap signed
+        4. Verify TX visible in wallet (hard gate — stops if not found)
         5. Key image sync (export_outputs → import_key_images) so the
            view-only wallet knows which outputs are now spent
 
@@ -1376,6 +1380,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                  f"    Re-generate the plan with option 1 or 3.")
     except OSError as e:
         sys.exit(f"[!] Cannot read plan file: {e}")
+    validate_plan_schema(plan_data)
     plan_txs = plan_data.get("txs", [])
 
     # Check ThorChain quote expiry. In air-gap workflows the operator may
@@ -1799,23 +1804,35 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             print(f"  [!] Note: submitted != confirmed. TX is in local mempool, not yet mined.")
             integrity_log("stage5", f"broadcast_submitted:tx={tx_idx}")
 
-            # Verify TX entered mempool
-            import time as _t
-            _t.sleep(3)
+            # Verify TX entered mempool — hard gate, not best-effort.
+            # If we cannot confirm the TX is in the wallet after broadcast,
+            # the state is ambiguous and continuing could double-spend.
+            time.sleep(3)
+            _verify_ok = True
             for _verify_txid in _all_txids:
                 try:
                     _check = rpc.raw_request("get_transfer_by_txid", {"txid": _verify_txid})
                     if not _check.get("transfer"):
+                        integrity_log("stage5", f"post_broadcast_NOT_FOUND:tx={tx_idx}:{_verify_txid[:16]}")
                         print(f"  [!] TX {_verify_txid[:16]}... NOT FOUND in wallet after broadcast!")
-                        print(f"  [!] This may indicate the broadcast was not accepted.")
+                        print(f"  [!] The broadcast may not have been accepted by wallet-rpc.")
+                        _verify_ok = False
                 except Exception as _vfy_err:
                     integrity_log("stage5", f"post_broadcast_verify_fail:{str(_vfy_err)[:40]}")
+                    print(f"  [!] Cannot verify TX {_verify_txid[:16]}...: {str(_vfy_err)[:60]}")
+                    _verify_ok = False
+            if not _verify_ok:
+                print(f"  [!] TX {tx_idx}: post-broadcast verification FAILED.")
+                print(f"  [!] Stopping pipeline. Check wallet state before rerunning.")
+                print(f"  [!] The TX may still confirm — do NOT re-broadcast without checking.")
+                integrity_log("stage5", f"post_verify_fail_abort:tx={tx_idx}")
+                fail_count += 1
+                break
 
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
-            print(f"  [!] Stopping. Check if TX was actually broadcast before rerunning.")
-            print(f"  [!] Check if the TX was actually broadcast before rerunning.")
+            print(f"  [!] Stopping. Check wallet state before rerunning.")
             _save_progress({
                 "plan_fingerprint": plan_fingerprint,
                 "completed": sorted(completed_indices),
