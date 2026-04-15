@@ -174,9 +174,19 @@ def show_status(st: dict):
     if missing:
         print(f"\n  {R}Missing deps:{N} python3 -m pip install {' '.join(missing)}")
     if not st.get("tor"):
-        print(
-            f"  {R}Tor not running:{N} sudo systemctl start tor (:9050) "
-            f"or start Tor Browser (:9150)"
+        print()
+        print(f"  {R}Tor is NOT running.{N} The toolkit cannot work without Tor.")
+        print()
+        print(f"  How to fix:")
+        print(f"    {B}sudo systemctl start tor{N}     <- start system Tor (port 9050)")
+        print(f"    {B}sudo systemctl status tor{N}    <- check if it's running")
+        print(f"    {B}sudo journalctl -u tor{N}       <- check for errors")
+        print()
+        print(f"  Or: open Tor Browser (uses port 9150 instead of 9050)")
+        print()
+        print(f"  If Tor keeps failing:")
+        print(f"    sudo apt purge tor && sudo apt install tor")
+        print(f"    sudo systemctl enable tor && sudo systemctl start tor"
         )
 
     return len(missing) == 0 and st.get("tor", False)
@@ -676,9 +686,17 @@ def main():
     _startup_status = check_prereqs()
     _detected_tor_port = _startup_status.get("tor_port")
     if _detected_tor_port:
-        ok(f"Tor detected on port {_detected_tor_port}")
+        ok(f"Tor working on port {_detected_tor_port}")
     else:
-        warn("Tor not detected on 9050 or 9150 — you'll need to enter the proxy manually")
+        print()
+        err("Tor is NOT running. Most features will not work.")
+        print()
+        info("How to fix:")
+        info(f"  {B}sudo systemctl start tor{N}     start system Tor (port 9050)")
+        info(f"  {B}sudo systemctl status tor{N}    check if it's running")
+        info(f"  Or open Tor Browser (uses port 9150)")
+        print()
+        info("After starting Tor, choose option 0 (System Check) to verify.")
 
     # Interactive mode
     while True:
