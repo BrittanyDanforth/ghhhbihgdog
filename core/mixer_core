@@ -581,7 +581,8 @@ def main():
                         "expiry": expiry,
                         "memo_bytes": memo_bytes,
                     }
-            except Exception:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                integrity_log("thornode", f"quote_fail:{node.split('/')[-1]}:{str(e)[:40]}")
                 continue
         return None
 
@@ -1088,7 +1089,7 @@ def main():
     # This means resuming with a different wallet is silently accepted.
     _wallet_primary = ""
     try:
-        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": 0})
+        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": bal_account})
         _wallet_primary = _addr_resp.get("address", "")
     except Exception as e:
         sys.exit(f"[!] Cannot determine wallet identity: {e}\n"
@@ -1363,10 +1364,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     #   - src subaddresses not found → silent fallback to wrong addresses
     #   - dst addresses valid but belong to wallet A → funds irrecoverable
     _plan_wallet = plan_data.get("meta", {}).get("wallet_primary", "")
+    _plan_acct = plan_data.get("meta", {}).get("account_index", 0)
     if _plan_wallet:
         try:
             _cur_wallet = rpc.raw_request(
-                "get_address", {"account_index": 0}
+                "get_address", {"account_index": _plan_acct}
             ).get("address", "")
             if _cur_wallet and _cur_wallet != _plan_wallet:
                 integrity_log("stage5", "WALLET_MISMATCH_DETECTED")

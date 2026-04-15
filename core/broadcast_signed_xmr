@@ -209,8 +209,9 @@ def main():
                     tx_delays[int(entry["idx"])] = int(entry["delay"])
             if tx_delays:
                 delay_source = "manifest"
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+            print(f"  [!] Warning: could not parse delays from manifest: {e}")
+            tx_delays = {}
 
     # Fallback: unsigned plan (only works if same machine/directory)
     if not tx_delays:
@@ -229,8 +230,9 @@ def main():
                             tx_delays[i] = int(tx["delay"])
                     if tx_delays:
                         delay_source = "unsigned_plan"
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+                print(f"  [!] Warning: could not parse delays from plan: {e}")
+                tx_delays = {}
 
     if tx_delays:
         integrity_log("broadcast", f"delays_loaded:{delay_source}")
@@ -452,6 +454,10 @@ def main():
                         status = "OK"
                         is_double = False
                         txid = tx_hashes[0]
+                        if len(tx_hashes) > 1:
+                            print(f"  [+] TX {idx}: split into {len(tx_hashes)} on-chain TXs")
+                            for _ti, _th in enumerate(tx_hashes):
+                                print(f"      part {_ti}: {_th[:16]}...")
                     except ValueError as _nbe:
                         status = "FAILED"
                         is_double = False
@@ -493,27 +499,34 @@ def main():
                     mine_start = time.time()
                     confirmed = False
                     block_height = 0
-                    while txid and (time.time() - mine_start) < args.mine_wait:
+                    all_txids_to_check = tx_hashes if status == "OK" else [txid]
+                    while all_txids_to_check and (time.time() - mine_start) < args.mine_wait:
                         if shutdown_requested():
                             break
                         try:
                             q = _single_post(
                                 check_url,
-                                {"txs_hashes": [txid],
+                                {"txs_hashes": all_txids_to_check,
                                  "decode_as_json": False,
                                  "prune": False},
                                 proxy,
                             )
                             txs = q.get("txs", [])
-                            if txs:
-                                in_pool = txs[0].get("in_pool", True)
-                                ht = txs[0].get("block_height", 0)
+                            all_confirmed = True
+                            for _txi, _txdata in enumerate(txs):
+                                in_pool = _txdata.get("in_pool", True)
+                                ht = _txdata.get("block_height", 0)
                                 if not in_pool and ht > 0:
-                                    print(f"  [+] TX {idx} confirmed at height {ht}")
-                                    integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
-                                    confirmed = True
-                                    block_height = ht
-                                    break
+                                    if not confirmed:
+                                        block_height = ht
+                                else:
+                                    all_confirmed = False
+                            if txs and all_confirmed:
+                                print(f"  [+] TX {idx} confirmed at height {block_height}"
+                                      f"{' (' + str(len(all_txids_to_check)) + ' parts)' if len(all_txids_to_check) > 1 else ''}")
+                                integrity_log("broadcast", f"mined:idx={idx}:ht={block_height}")
+                                confirmed = True
+                                break
                         except Exception as poll_err:
                             integrity_log("broadcast", f"poll_err:idx={idx}:{str(poll_err)[:30]}")
                         time.sleep(30 + secrets.randbelow(60))

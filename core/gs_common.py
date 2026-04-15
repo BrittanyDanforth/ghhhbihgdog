@@ -289,10 +289,11 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
                          headers=_BROWSER_HEADERS)
         r.raise_for_status()
-        if not r.json().get("IsTor"):
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
             sys.exit(f"[!] Tor leak detected during {stage} - aborting.")
-    except requests.RequestException:
+    except (requests.RequestException, ValueError, KeyError):
         integrity_log("tor", f"recheck_fail_{stage}")
         sys.exit(f"[!] Cannot verify Tor during {stage} - aborting for safety.")
 
@@ -498,16 +499,19 @@ class MoneroRPC:
         try:
             self._backend = JSONRPCWallet(**backend_kwargs)
         except TypeError:
-            if "proxy_url" in backend_kwargs and host.lower() not in _LOCALHOST_NAMES:
-                sys.exit(
-                    f"[!] monero-python does not support proxy_url for {host}:{port}.\n"
-                    f"    Cannot safely connect to a non-localhost RPC without proxy.\n"
-                    f"    Either: (a) use 127.0.0.1 with a local wallet-rpc, or\n"
-                    f"            (b) upgrade monero-python to a version that supports proxy_url."
-                )
-            fallback_kwargs = {k: v for k, v in backend_kwargs.items()
-                               if k != "proxy_url"}
-            self._backend = JSONRPCWallet(**fallback_kwargs)
+            if "proxy_url" in backend_kwargs:
+                if host.lower() not in _LOCALHOST_NAMES:
+                    sys.exit(
+                        f"[!] monero-python does not support proxy_url for {host}:{port}.\n"
+                        f"    Cannot safely connect to a non-localhost RPC without proxy.\n"
+                        f"    Either: (a) use 127.0.0.1 with a local wallet-rpc, or\n"
+                        f"            (b) upgrade monero-python to a version that supports proxy_url."
+                    )
+                fallback_kwargs = {k: v for k, v in backend_kwargs.items()
+                                   if k != "proxy_url"}
+                self._backend = JSONRPCWallet(**fallback_kwargs)
+            else:
+                raise
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
             proxy_dict = {"http": proxy_url, "https": proxy_url}
