@@ -135,6 +135,8 @@ history -c && history -w
 
 Blocks ALL internet except through Tor. Nothing leaks — not DNS, not IPv6, nothing.
 
+**CLI tools (wget, curl, apt, pip) are auto-configured to use Tor** — no manual proxy setup needed.
+
 | What | Command |
 |------|---------|
 | **Enable** | `sudo bash tor_firewall.sh` |
@@ -144,7 +146,11 @@ Blocks ALL internet except through Tor. Nothing leaks — not DNS, not IPv6, not
 | **Disable** | `sudo bash tor_firewall.sh --undo` |
 | **Check status** | `sudo bash tor_firewall.sh --status` |
 
-Your browser will stop working after enabling — that's correct. Run `--setup-browser` to fix it.
+After enabling:
+- **Terminal commands** (wget, curl, apt, pip) work through Tor automatically
+- **Browser** needs one extra step: run `--setup-browser`
+- **To source proxy in current terminal:** `. /etc/profile.d/tor-proxy.sh`
+- New terminal windows get it automatically
 
 ---
 

@@ -171,6 +171,12 @@ do_undo() {
     # Remove modprobe blocks
     rm -f /etc/modprobe.d/tor-firewall-block-tunnels.conf 2>/dev/null || true
 
+    # Remove CLI proxy configs added by apply_firewall
+    rm -f /etc/profile.d/tor-proxy.sh 2>/dev/null || true
+    rm -f /etc/apt/apt.conf.d/99tor-proxy 2>/dev/null || true
+    sed -i '/# tor_firewall proxy/,+3d' /etc/wgetrc 2>/dev/null || true
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy 2>/dev/null || true
+
     # Restart services that were stopped by apply_firewall
     for svc in systemd-resolved avahi-daemon cups-browsed; do
         if systemctl list-unit-files "$svc.service" &>/dev/null 2>&1; then
@@ -1084,6 +1090,56 @@ MODBLOCK
     pass "Raw table: Non-Tor packets dropped before conntrack"
     echo ""
 
+    # ── Auto-configure CLI proxy so wget/curl/apt/pip work through Tor ──
+    local tor_port
+    tor_port=$(detect_tor_socks_port 2>/dev/null) || tor_port=9050
+
+    local proxy_conf="/etc/profile.d/tor-proxy.sh"
+    cat > "$proxy_conf" <<PROXY
+# Set by tor_firewall.sh — routes all CLI tools through Tor
+export http_proxy="socks5h://127.0.0.1:${tor_port}"
+export https_proxy="socks5h://127.0.0.1:${tor_port}"
+export HTTP_PROXY="socks5h://127.0.0.1:${tor_port}"
+export HTTPS_PROXY="socks5h://127.0.0.1:${tor_port}"
+export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
+export no_proxy="127.0.0.1,localhost,::1"
+PROXY
+    chmod 644 "$proxy_conf"
+
+    # Apply to current shell immediately
+    export http_proxy="socks5h://127.0.0.1:${tor_port}"
+    export https_proxy="socks5h://127.0.0.1:${tor_port}"
+    export HTTP_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export HTTPS_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
+    export no_proxy="127.0.0.1,localhost,::1"
+
+    # Configure apt to use Tor SOCKS proxy
+    local apt_conf="/etc/apt/apt.conf.d/99tor-proxy"
+    cat > "$apt_conf" <<APTPROXY
+Acquire::http::Proxy "socks5h://127.0.0.1:${tor_port}";
+Acquire::https::Proxy "socks5h://127.0.0.1:${tor_port}";
+APTPROXY
+    chmod 644 "$apt_conf"
+
+    # Configure wget to use Tor
+    local wgetrc="/etc/wgetrc.d"
+    mkdir -p "$wgetrc" 2>/dev/null || true
+    local wget_proxy="/etc/wgetrc"
+    if ! grep -q "# tor_firewall proxy" "$wget_proxy" 2>/dev/null; then
+        cat >> "$wget_proxy" <<WGETPROXY
+
+# tor_firewall proxy
+use_proxy = on
+http_proxy = http://127.0.0.1:${tor_port}
+https_proxy = http://127.0.0.1:${tor_port}
+WGETPROXY
+    fi
+
+    pass "CLI proxy: wget, curl, apt, pip all route through Tor automatically"
+    pass "Proxy env vars set: http_proxy, https_proxy, ALL_PROXY"
+    echo ""
+
     # Bridge check
     if grep -q "^UseBridges 1" /etc/tor/torrc 2>/dev/null; then
         pass "Tor bridges: ACTIVE (entry guard IPs hidden from host)"
@@ -1108,6 +1164,10 @@ MODBLOCK
         echo -e "  ${DIM}  Destination IPs: Tor entry guards (may be on threat feeds).${NC}"
         echo -e "  ${DIM}  Malwarebytes may flag these. Run: sudo bash $0 --setup-bridges${NC}"
     fi
+    echo ""
+    echo -e "  ${GREEN}${BOLD}CLI tools (wget, curl, apt, pip) now work through Tor automatically.${NC}"
+    echo -e "  ${DIM}  New terminals pick this up automatically via /etc/profile.d/tor-proxy.sh${NC}"
+    echo -e "  ${DIM}  Current terminal: proxy vars already exported.${NC}"
     echo ""
     echo -e "  ${YELLOW}${BOLD}BROWSER NOT WORKING?${NC} That's correct — the firewall blocks direct internet."
     echo -e "  ${YELLOW}Run this to fix it:${NC}"
