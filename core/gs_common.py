@@ -388,16 +388,23 @@ def _newnym_between_retries(retry_state):
     newnym()
 
 
-_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+# BUG 99 FIX: Match Tor Browser's actual fingerprint. Tor Browser bundles
+# Firefox ESR — using a non-ESR UA or mismatched version makes requests
+# stand out to exit node observers and destination servers. The headers
+# below match Tor Browser 13.5+ (Firefox ESR 128).
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 _BROWSER_HEADERS = {
     "User-Agent": _BROWSER_UA,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "DNT": "1",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),

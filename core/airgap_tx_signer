@@ -352,9 +352,12 @@ def phase_sign(args, plan: List[dict]):
     if not entries:
         sys.exit("[!] No unsigned TX entries in manifest")
 
-    wallet_file = args.wallet_file
+    # BUG 101 FIX: Check GS_WALLET_FILE env var first. mixer_core sets
+    # this to avoid passing the wallet path via CLI (visible in
+    # /proc/PID/cmdline). But the old code never read it.
+    wallet_file = os.environ.get("GS_WALLET_FILE", "") or args.wallet_file
     if not wallet_file or not Path(wallet_file).exists():
-        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
+        sys.exit(f"[!] Wallet file required for signing (not found or not set)")
 
     # BUG 42 FIX: Prefer GS_WALLET_PASSWORD env var over --wallet-password
     # CLI arg. CLI args are visible in /proc/PID/cmdline to all local users.

@@ -74,7 +74,9 @@ def _exponential_delay(delay_min: int, delay_max: int) -> int:
     if span <= 0:
         return delay_min
     lam = 3.0 / span
-    while True:
+    # BUG 98 FIX: Add iteration cap to prevent theoretical infinite loop
+    # when samples consistently fall outside [delay_min, delay_max].
+    for _ in range(1000):
         u = secrets.randbelow(1_000_000) / 1_000_000.0
         if u == 0.0:
             continue
@@ -82,6 +84,7 @@ def _exponential_delay(delay_min: int, delay_max: int) -> int:
         delay = int(delay_min + sample)
         if delay_min <= delay <= delay_max:
             return delay
+    return delay_min + (span // 2)
 
 
 def _core_script(name: str) -> str:
@@ -103,13 +106,14 @@ def fetch_fee_from_rpc(rpc) -> Decimal:
     try:
         resp = rpc.raw_request("get_fee_estimate", {})
         fee_per_byte = resp.get("fee", 0)
-        if fee_per_byte > 0:
-            # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
+        if isinstance(fee_per_byte, (int, float)) and fee_per_byte > 0:
             fee_atomic = fee_per_byte * 2000
-            fee_xmr = Decimal(str(fee_atomic)) / Decimal(10 ** 12)
-            if fee_xmr > 0:
+            fee_xmr = Decimal(str(fee_atomic)) / Decimal("1000000000000")
+            if fee_xmr > 0 and fee_xmr < Decimal("1"):
                 integrity_log("fee", "rpc_fee_estimate_ok")
                 return fee_xmr
+            integrity_log("fee", f"rpc_fee_suspicious:{fee_xmr}")
+
     except Exception as e:
         integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
     integrity_log("fee", "using_fallback_fee")
@@ -233,19 +237,26 @@ def main():
 
         staging_dir = "tx_staging"
         lock_path = Path(".mixer.lock")
+    # BUG 100 FIX: Use atomic lock acquisition to close TOCTOU window.
+    # The old unlink+O_EXCL sequence has a race between the two calls.
+    _lock_acquired = False
+    for _lock_attempt in range(3):
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.write(fd, str(os.getpid()).encode())
             os.close(fd)
+            _lock_acquired = True
+            break
         except FileExistsError:
             try:
                 stale_pid = lock_path.read_text().strip()
                 if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
                     print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
-                    lock_path.unlink()
-                    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    os.write(fd, str(os.getpid()).encode())
-                    os.close(fd)
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
                 else:
                     sys.exit(
                         f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
@@ -258,12 +269,14 @@ def main():
                     "    Another instance may be running.\n"
                     "    If not, delete the lock file manually."
                 )
+    if not _lock_acquired:
+        sys.exit("[!] Could not acquire lock after 3 attempts.")
 
-        try:
-            _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
-        finally:
-            if lock_path.exists():
-                lock_path.unlink()
+    try:
+        _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
+    finally:
+        if lock_path.exists():
+            lock_path.unlink()
 
         print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
         print()
@@ -949,7 +962,7 @@ def main():
     bal = mix_bal
 
     if args.pre_mix_delay > 0:
-        hours = args.pre_mix_delay / 3600
+        hours = args.pre_mix_delay / 3600.0
         print(f"\n  [*] PRE-MIX DELAY: Waiting {args.pre_mix_delay}s ({hours:.1f} hours) before mixing.")
         print(f"  [*] This breaks the timing correlation between the ThorChain swap and mixing.")
         print(f"  [*] Press Ctrl+C to abort (progress is saved; rerun to resume).")
@@ -1177,33 +1190,39 @@ def main():
                 old_plan.unlink()
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
-    # Atomic lock file to prevent concurrent runs (O_EXCL = fail if exists)
     lock_path = Path(".mixer.lock")
-    try:
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-    except FileExistsError:
+    _lock_acquired = False
+    for _lock_attempt in range(3):
         try:
-            stale_pid = lock_path.read_text().strip()
-            if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
-                print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
-                lock_path.unlink()
-                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-            else:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            _lock_acquired = True
+            break
+        except FileExistsError:
+            try:
+                stale_pid = lock_path.read_text().strip()
+                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                    try:
+                        lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                else:
+                    sys.exit(
+                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "    Another instance may be running.\n"
+                        "    If not, delete the lock file manually."
+                    )
+            except (OSError, ValueError):
                 sys.exit(
-                    f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                    "[!] Lock file exists: .mixer.lock\n"
                     "    Another instance may be running.\n"
                     "    If not, delete the lock file manually."
                 )
-        except (OSError, ValueError):
-            sys.exit(
-                "[!] Lock file exists: .mixer.lock\n"
-                "    Another instance may be running.\n"
-                "    If not, delete the lock file manually."
-            )
+    if not _lock_acquired:
+        sys.exit("[!] Could not acquire lock after 3 attempts.")
 
     staging_dir = "tx_staging"
 
@@ -1248,7 +1267,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     chained Monero transactions.
     """
     sign_env = os.environ.copy()
-    sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
+    # Prefer env var over CLI arg; CLI args visible in /proc/PID/cmdline
+    _wallet_pw = os.environ.get("GS_WALLET_PASSWORD", args.wallet_password or "")
+    sign_env["GS_WALLET_PASSWORD"] = _wallet_pw
     # Pass wallet-file path via env var instead of CLI arg.
     # CLI args are visible to all local users via /proc/PID/cmdline and
     # `ps aux`. A wallet filename like "cold_storage_2024.wallet" reveals
@@ -1625,10 +1646,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             # Step 2: Sign the unsigned TX
             print(f"  [*] Step 2: Signing TX {tx_idx}...")
             try:
+                # BUG 101 FIX: Don't pass --wallet-file via CLI (visible
+                # in /proc/PID/cmdline). GS_WALLET_FILE env var is set
+                # in sign_env and airgap_tx_signer now reads it.
                 sign_cmd = [
                     sys.executable, _core_script("airgap_tx_signer"), str(ufile),
                     "--phase", "sign",
-                    "--wallet-file", args.wallet_file,
                     "--outdir", staging_dir,
                     "--tx-index", str(tx_idx),
                 ]
@@ -1933,15 +1956,19 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         exit_env = os.environ.copy()
         for _ek in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE", "COINGECKO_API_KEY"):
             exit_env.pop(_ek, None)
+        # BUG 97 FIX: Pass amount via env var instead of CLI arg.
+        # CLI args are visible to all local users via /proc/PID/cmdline.
+        # The total mixed amount is sensitive — it reveals the operation scale.
+        exit_env["GS_EXIT_AMOUNT"] = exit_amt
         subprocess.run(
-            [sys.executable, _core_script("exit_strategy_simulator"), exit_amt,
+            [sys.executable, _core_script("exit_strategy_simulator"),
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300, env=exit_env,
         )
         integrity_log("stage5", "exit_sim_ok")
     except Exception as e:
         integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
-        print(f"  [!] Exit simulation failed (non-fatal): {e}")
+        print(f"  [!] Exit simulation failed (non-fatal): {type(e).__name__}")
 
     integrity_log("stage5", "full_pipeline_complete")
 
