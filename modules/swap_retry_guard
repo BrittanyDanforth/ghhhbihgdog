@@ -465,8 +465,10 @@ class AdvancedSwapOrchestrator:
                     additional = yaml.safe_load(pool_file.read_text())
                     if isinstance(additional, list):
                         pool.extend(additional)
-                except Exception:
-                    pass
+                    else:
+                        print(f"[!] WARNING: {pool_file} is not a YAML list — ignoring", file=sys.stderr)
+                except Exception as e:
+                    print(f"[!] WARNING: Failed to parse aggregator pool {pool_file}: {e}", file=sys.stderr)
                     
         # Shuffle for unpredictability
         self.rng.shuffle(pool)
