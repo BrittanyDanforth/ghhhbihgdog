@@ -13,7 +13,7 @@ OPSEC hardening:
   - Liquidity depth validation (warns if thin)
 """
 from __future__ import annotations
-import argparse, sys, time
+import argparse, os, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict
@@ -124,13 +124,24 @@ def main():
     ap = argparse.ArgumentParser(
         description="Plan XMR off-ramp with liquidity analysis",
     )
-    ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
+    ap.add_argument("amount", type=Decimal, nargs="?", default=None,
+                    help="XMR amount to off-ramp (also reads GS_EXIT_AMOUNT env var)")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
     ap.add_argument("--outfile", default="plan_output.json")
     args = ap.parse_args()
+
+    if args.amount is None:
+        _env_amt = os.environ.get("GS_EXIT_AMOUNT", "")
+        if _env_amt:
+            try:
+                args.amount = Decimal(_env_amt)
+            except Exception:
+                sys.exit(f"[!] GS_EXIT_AMOUNT env var is not a valid number: '{_env_amt}'")
+        else:
+            sys.exit("[!] Amount is required (positional arg or GS_EXIT_AMOUNT env var)")
 
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")

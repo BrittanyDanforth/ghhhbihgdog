@@ -24,7 +24,7 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
-    require_resources, atomic_write_json,
+    require_resources, atomic_write_json, validate_wallet_json,
     install_signal_handlers, newnym, scrub_address, secure_hex,
 )
 
@@ -135,6 +135,8 @@ def main():
         "label": args.label,
         "network": network,
     }
+
+    validate_wallet_json(out)
 
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)

@@ -34,7 +34,7 @@ from gs_common import (
 )
 
 try:
-    from monero.address import Address as XMRAddress
+    from monero.address import address as _parse_xmr_address
 except ImportError:
     sys.exit("[!] python-monero missing - pip install monero")
 
@@ -81,13 +81,20 @@ def _btc_per_xmr(proxy: Optional[Dict[str, str]]) -> Decimal:
 
 
 def _validate_xmr_addr(addr: str) -> None:
-    """Validate XMR address format and checksum."""
+    """Validate XMR address format and checksum.
+
+    Uses monero.address.address() (lowercase) which auto-detects address
+    type: standard (4...), subaddress (8...), and integrated (4...106chars).
+    The old XMRAddress() (capital A) only handled standard addresses —
+    subaddresses from create_receive_wallet would fail validation here,
+    causing the operator to think a valid address was corrupt.
+    """
     if not _XMR_RE.match(addr):
         sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
     try:
-        XMRAddress(addr)
-    except Exception:
-        sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
+        _parse_xmr_address(addr)
+    except Exception as e:
+        sys.exit(f"[!] XMR address validation failed: {scrub_address(addr)}: {e}")
 
 
 def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> Optional[dict]:

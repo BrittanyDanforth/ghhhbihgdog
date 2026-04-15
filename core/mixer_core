@@ -331,12 +331,19 @@ def main():
             from monero.address import address as _parse_xmr_addr
             _parse_xmr_addr(receive_entry_addr)
         except ImportError:
-            pass
+            integrity_log("stage0", "address_checksum_skip:monero_lib_missing")
+            print(f"  [!] WARNING: monero-python not installed — cannot validate address checksum.")
+            print(f"  [!] Continuing because format regex passed. Install monero-python for full validation.")
         except Exception as _addr_err:
-            integrity_log("stage0", f"address_checksum_warn:{str(_addr_err)[:40]}")
-            print(f"  [!] WARNING: Address checksum validation failed: {str(_addr_err)[:60]}")
-            print(f"  [!] If this address was just created by wallet-rpc, it is likely valid.")
-            print(f"  [!] The monero-python library may not support this address type/network.")
+            integrity_log("stage0", f"address_checksum_FAIL:{str(_addr_err)[:40]}")
+            sys.exit(
+                f"[!] Address checksum validation FAILED: {str(_addr_err)[:60]}\n"
+                f"    Address: {scrub_address(receive_entry_addr)}\n"
+                f"    If this address was created by wallet-rpc, this likely indicates a\n"
+                f"    network mismatch (e.g., testnet address used with mainnet library).\n"
+                f"    Sending funds to an invalid address = permanent loss.\n"
+                f"    Verify the address is correct and retry."
+            )
         wallet_network = rw_data.get("network")
         if wallet_network and wallet_network != "mainnet":
             sys.exit(
@@ -1003,22 +1010,62 @@ def main():
     # ── Minimum balance model ──
     # Compute hard/practical/recommended minimums so the operator knows
     # BEFORE planning whether their config is realistic.
-    _fanout_w = min(args.wallets + 3, args.wallets)  # fanout_count
-    _min_fanout_amt = DUST_XMR + Decimal("0.0001")  # must be > DUST_XMR after quantize
-    _min_usable_fanout = (_min_fanout_amt * _fanout_w / Decimal("0.9")).quantize(Decimal("0.0001")) + Decimal("0.0001")
+    #
+    # Formula breakdown:
+    #   fanout_count     = wallets (number of mix target subaddresses)
+    #   min_fanout_amt   = smallest viable per-target amount (> DUST after quantize)
+    #   min_usable_fanout= total needed for fan-out phase (divided by 0.9 because
+    #                      fan-out uses 90% of usable balance)
+    #   hard_min         = total_fees + minimum to produce at least one TX
+    #   practical_min    = total_fees + enough for full fan-out (but no DAG)
+    #   recommended_min  = total_fees + fan-out + DAG mixing + DAG fee reserve
+    #   buffer           = 5% safety margin for refresh/retry/split variance
+    _fanout_count = args.wallets
+    _min_fanout_amt = DUST_XMR + Decimal("0.0001")
+    _min_usable_fanout = (_min_fanout_amt * _fanout_count / Decimal("0.9")).quantize(Decimal("0.0001")) + Decimal("0.0001")
     _hard_min = (total_fees + DUST_XMR + Decimal("0.0001"))
     _practical_min = (total_fees + _min_usable_fanout)
-    _dag_rounds = max(rounds - _fanout_w, args.wallets)
+    _dag_rounds = max(rounds - _fanout_count, args.wallets)
     _min_dag_budget = (_min_fanout_amt * _dag_rounds)
-    _recommended_min = (total_fees + _min_usable_fanout + _min_dag_budget + per_round_fee * _fanout_w)
+    _dag_fee_reserve = per_round_fee * _dag_rounds
+    _buffer = (_practical_min + _min_dag_budget + _dag_fee_reserve) * Decimal("0.05")
+    _recommended_min = (total_fees + _min_usable_fanout + _min_dag_budget + _dag_fee_reserve + _buffer).quantize(Decimal("0.0001"))
 
-    print(f"  [*] Balance analysis for {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority}:")
-    print(f"      Estimated fees:  {total_fees:.6f} XMR ({rounds} rounds × {per_round_fee:.6f} each)")
-    print(f"      Your balance:    {bal:.6f} XMR")
-    print(f"      Usable after fees: {usable:.6f} XMR")
-    print(f"      Hard minimum:    {_hard_min:.4f} XMR (below = abort)")
-    print(f"      Practical min:   {_practical_min:.4f} XMR (below = fan-out only, no DAG mixing)")
-    print(f"      Recommended:     {_recommended_min:.4f} XMR (fan-out + DAG mixing)")
+    _fee_pct = (total_fees / bal * 100) if bal > 0 else Decimal("0")
+
+    print()
+    print(f"  {'=' * 68}")
+    print(f"  BALANCE ANALYSIS")
+    print(f"  {'=' * 68}")
+    print(f"  Config:  {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority} ({priority_mult}x)")
+    print(f"  Balance: {bal:.6f} XMR (after mix_fraction {args.mix_fraction})")
+    print(f"  Fees:    {total_fees:.6f} XMR ({rounds} rounds × {per_round_fee:.6f} each) = {_fee_pct:.1f}% of balance")
+    print(f"  Usable:  {usable:.6f} XMR (balance minus fee reserve)")
+    print()
+    print(f"  MINIMUM THRESHOLDS:")
+    print(f"  ├─ Hard minimum:    {_hard_min:.4f} XMR — below this: ABORT (cannot create even one TX)")
+    print(f"  ├─ Practical min:   {_practical_min:.4f} XMR — below this: fan-out ONLY, no DAG mixing")
+    print(f"  └─ Recommended:     {_recommended_min:.4f} XMR — fan-out + full DAG mixing + 5% buffer")
+
+    if _fee_pct > Decimal("50"):
+        print(f"  [!] WARNING: Fees consume {_fee_pct:.0f}% of your balance!")
+        print(f"  [!] Most of your funds go to miner fees, not mixing.")
+        print(f"  [!] Options: lower --fee-priority, reduce wallets/depth, or add more funds.")
+        integrity_log("stage4", f"fee_dominated_run:fee_pct={_fee_pct:.0f}")
+    elif _fee_pct > Decimal("30"):
+        print(f"  [!] NOTE: Fees consume {_fee_pct:.0f}% of balance — this is high but workable.")
+
+    if bal >= _recommended_min:
+        print(f"  [+] STATUS: GOOD — balance supports full fan-out + DAG mixing")
+    elif bal >= _practical_min:
+        print(f"  [!] STATUS: DEGRADED — balance supports fan-out only (NO DAG mixing)")
+        print(f"  [!] Privacy will be weaker: simple one-to-many pattern instead of full DAG.")
+    elif bal >= _hard_min:
+        print(f"  [!] STATUS: FRAGILE — barely above minimum, most TXs near dust threshold")
+        print(f"  [!] High risk of TX failures during execution.")
+
+    print(f"  {'=' * 68}")
+    print()
 
     if bal < _hard_min:
         sys.exit(
@@ -1108,6 +1155,12 @@ def main():
         # entirely rather than planning TXs that will fail at the wallet.
         if dag_split <= DUST_XMR:
             integrity_log("stage4", "dag_mixing_skipped:per_hop_below_dust")
+            print(f"  [!] WARNING: DAG mixing phase SKIPPED — per-hop amount ({dag_split:.6f} XMR)")
+            print(f"  [!] is below dust threshold ({DUST_XMR} XMR) after fee reservation.")
+            print(f"  [!] PRIVACY IMPACT: Only fan-out TXs will run. The mixing graph")
+            print(f"  [!] will be a simple one-to-many pattern, which is easier to analyze")
+            print(f"  [!] than a full DAG with random inter-wallet hops.")
+            print(f"  [!] To enable DAG mixing: increase balance or reduce wallets/depth/fee-priority.")
         else:
             dag_actual_total = Decimal("0")
             for r in range(dag_rounds):
@@ -1195,6 +1248,23 @@ def main():
     if shutdown_requested():
         meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
+
+    # User-visible plan quality summary
+    _total_plan_txs = len(plan)
+    _fanout_txs = len([t for t in plan if t.get("src") == ENTRY])
+    _dag_txs = _total_plan_txs - _fanout_txs
+    if _dag_txs == 0 and _total_plan_txs > 0:
+        print()
+        print(f"  {'!' * 68}")
+        print(f"  PRIVACY NOTICE: Plan contains ONLY fan-out TXs ({_fanout_txs} TXs)")
+        print(f"  No DAG mixing hops were generated. The on-chain pattern is a simple")
+        print(f"  one-to-many distribution from a single source, which is the weakest")
+        print(f"  form of mixing and can be trivially identified by chain analysts.")
+        print(f"  For stronger privacy, increase balance or reduce wallets/depth/fee-priority.")
+        print(f"  {'!' * 68}")
+        integrity_log("stage4", f"plan_fanout_only:{_fanout_txs}_txs")
+    elif _dag_txs > 0:
+        print(f"  [+] Plan quality: {_fanout_txs} fan-out TXs + {_dag_txs} DAG mixing hops")
 
     # Validate the plan we just built before writing — catches any
     # programming error in the amount engine or DAG construction.
@@ -1489,14 +1559,23 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 _height_diff = _cur_height - _plan_height
                 if _height_diff < -10:
                     integrity_log("stage5", f"DAEMON_HEIGHT_REGRESSED:{_plan_height}->{_cur_height}")
-                    print(f"  [!] Daemon height regressed: {_plan_height} -> {_cur_height} (diff: {_height_diff})")
-                    print(f"  [!] This may indicate a different daemon or chain reorg.")
-                    print(f"  [!] Confirmed outputs may no longer be valid.")
+                    sys.exit(
+                        f"[!] Daemon height REGRESSED: {_plan_height} -> {_cur_height} (diff: {_height_diff})\n"
+                        f"    This indicates a different daemon, chain reorg, or fork.\n"
+                        f"    Outputs confirmed at height {_plan_height} may not exist at {_cur_height}.\n"
+                        f"    Broadcasting TXs against reorganized outputs = funds lost.\n"
+                        f"    Verify you are connected to the correct daemon and retry."
+                    )
+        except SystemExit:
+            raise
         except Exception as _ht_err:
             integrity_log("stage5", f"height_check_fail:{str(_ht_err)[:40]}")
-            print(f"  [!] WARNING: Cannot check daemon height: {str(_ht_err)[:60]}")
-            print(f"  [!] If the daemon is on a different chain or has reorged,")
-            print(f"  [!] TXs may fail or spend against reorganized outputs.")
+            sys.exit(
+                f"[!] Cannot check daemon height: {str(_ht_err)[:60]}\n"
+                f"    If the daemon is on a different chain or has reorged,\n"
+                f"    TXs may spend against reorganized outputs = funds lost.\n"
+                f"    Fix the RPC connection and retry."
+            )
 
     # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
     # If accounts were added/removed between plan creation and resume,
@@ -1611,36 +1690,64 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 pending_idx = progress.get("broadcast_pending")
                 if pending_idx is not None and pending_idx not in completed_indices:
                     print(f"  [!] TX {pending_idx} was checkpointed before broadcast in prior run.")
-                    print(f"  [!] Checking wallet to determine if it was actually sent...")
+                    print(f"  [!] Checking wallet transfer history to determine if it was actually sent...")
                     _pending_confirmed = False
                     try:
-                        # Check if the wallet has any transfer for this index's
-                        # destination. We can't check by txid (we don't have one),
-                        # but we can check recent transfers for the amount.
                         _pending_tx = plan_txs[pending_idx] if pending_idx < len(plan_txs) else None
                         if _pending_tx:
-                            _check_bal = rpc.raw_request("get_balance", {
+                            _pending_dst = _pending_tx.get("dst", "")
+                            _pending_amt = Decimal(str(_pending_tx.get("amt", "0")))
+
+                            _transfers = rpc.raw_request("get_transfers", {
+                                "out": True, "pending": True, "pool": True,
                                 "account_index": _plan_acct_idx,
                             })
-                            # If unlocked_balance changed significantly since the plan
-                            # was created, the TX likely went through.
-                            _unlocked = Decimal(str(_check_bal.get("unlocked_balance", 0))) / Decimal("1e12")
-                            _plan_bal = Decimal(str(plan_data.get("meta", {}).get("balance_at_plan", "0") or "0"))
-                            if _plan_bal > 0 and _unlocked < _plan_bal:
-                                print(f"  [+] Balance decreased since plan creation ({_plan_bal} -> {_unlocked})")
-                                print(f"  [+] TX {pending_idx} was likely broadcast. Marking as completed.")
-                                integrity_log("stage5", f"broadcast_pending_verified:tx={pending_idx}")
+                            _found_matching = False
+                            for _ttype in ("out", "pending", "pool"):
+                                for _tr in _transfers.get(_ttype, []):
+                                    _tr_dst = ""
+                                    _tr_dests = _tr.get("destinations", [])
+                                    if _tr_dests:
+                                        _tr_dst = _tr_dests[0].get("address", "")
+                                    _tr_amt = Decimal(str(_tr.get("amount", 0))) / Decimal("1e12")
+                                    if _tr_dst == _pending_dst:
+                                        _found_matching = True
+                                        break
+                                    if _pending_amt > 0 and abs(_tr_amt - _pending_amt) < _pending_amt * Decimal("0.01"):
+                                        _found_matching = True
+                                        break
+                                if _found_matching:
+                                    break
+
+                            if _found_matching:
+                                print(f"  [+] Found matching transfer for TX {pending_idx} in wallet history.")
+                                print(f"  [+] TX was broadcast. Marking as completed.")
+                                integrity_log("stage5", f"broadcast_pending_verified_via_transfers:tx={pending_idx}")
                                 _pending_confirmed = True
                             else:
-                                print(f"  [!] Balance unchanged — TX {pending_idx} likely NOT broadcast.")
-                                print(f"  [!] Will re-create and broadcast this TX.")
-                                integrity_log("stage5", f"broadcast_pending_NOT_broadcast:tx={pending_idx}")
+                                _check_bal = rpc.raw_request("get_balance", {
+                                    "account_index": _plan_acct_idx,
+                                })
+                                _unlocked = Decimal(str(_check_bal.get("unlocked_balance", 0))) / Decimal("1e12")
+                                _plan_bal = Decimal(str(plan_data.get("meta", {}).get("balance_at_plan", "0") or "0"))
+                                if _plan_bal > 0 and _unlocked < _plan_bal:
+                                    print(f"  [+] Balance decreased since plan creation ({_plan_bal} -> {_unlocked})")
+                                    print(f"  [+] TX {pending_idx} was likely broadcast. Marking as completed.")
+                                    integrity_log("stage5", f"broadcast_pending_verified_via_balance:tx={pending_idx}")
+                                    _pending_confirmed = True
+                                else:
+                                    print(f"  [!] No matching transfer found and balance unchanged.")
+                                    print(f"  [!] TX {pending_idx} was likely NOT broadcast.")
+                                    print(f"  [!] Will re-create and broadcast this TX.")
+                                    integrity_log("stage5", f"broadcast_pending_NOT_broadcast:tx={pending_idx}")
                     except Exception as _pv_err:
                         integrity_log("stage5", f"broadcast_pending_check_fail:{str(_pv_err)[:40]}")
                         print(f"  [!] Cannot verify TX {pending_idx} status: {str(_pv_err)[:60]}")
-                        print(f"  [!] Treating as completed to prevent potential double-payment.")
-                        print(f"  [!] CHECK WALLET BALANCE before continuing.")
-                        _pending_confirmed = True
+                        print(f"  [!] ABORTING: Cannot determine if TX was broadcast.")
+                        print(f"  [!] Check wallet balance and transfer history manually.")
+                        print(f"  [!] If the TX was broadcast, add {pending_idx} to completed in progress file.")
+                        print(f"  [!] If NOT broadcast, delete the progress file and re-run.")
+                        sys.exit("[!] Ambiguous broadcast state. Manual verification required.")
                     if _pending_confirmed:
                         completed_indices.add(pending_idx)
                 if completed_indices:
@@ -2033,8 +2140,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     # If seized, it reveals the entire transaction graph. Securely overwrite
     # before unlinking so data is unrecoverable from disk journal/sectors.
     if success_count == total_txs:
-        if progress_file.exists():
-            progress_file.unlink()
+        for _prog_f in (progress_file, progress_file.with_suffix(".json.tmp")):
+            if _prog_f.exists():
+                try:
+                    _prog_f.unlink()
+                except OSError:
+                    pass
         try:
             plan_path = Path(str(ufile))
             if plan_path.exists():
@@ -2104,7 +2215,27 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 if _sd.is_dir():
                     _shutil_shm.rmtree(_sd, ignore_errors=True)
 
-        # BUG 92 FIX: Clean __pycache__ directories. Python auto-creates
+        # Clean Monero RPC/CLI logs if present — these record every RPC call
+        # including the distinctive API sequence of this toolkit.
+        for _monero_log in [
+            Path("monero-wallet-rpc.log"),
+            Path("monero-wallet-cli.log"),
+            Path.home() / "monero-wallet-rpc.log",
+            Path.home() / "monero-wallet-cli.log",
+        ]:
+            if _monero_log.exists():
+                try:
+                    _ml_size = _monero_log.stat().st_size
+                    if _ml_size > 0:
+                        with open(_monero_log, "r+b") as _mlf:
+                            _mlf.write(b"\x00" * _ml_size)
+                            _mlf.flush()
+                            os.fsync(_mlf.fileno())
+                    _monero_log.unlink()
+                except OSError as _ml_err:
+                    integrity_log("stage5", f"monero_log_wipe_fail:{_monero_log.name}:{_ml_err}")
+
+        # Clean __pycache__ directories. Python auto-creates
         # __pycache__/*.pyc files containing compilation timestamps and
         # source paths (e.g. /home/user/mixer/core/gs_common.py). These
         # survive all other cleanup and reveal toolkit usage + filesystem

@@ -205,7 +205,8 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
+    if not secure_file_perms(tmp, perms):
+        integrity_log("opsec", f"WARN:atomic_write_text_chmod_fail:{path.name}")
     os.replace(tmp, path)
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -602,8 +603,11 @@ def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
     """Run OPSEC checks before pipeline start. Hard-fails on any issue.
 
     Called by mixer_core at pipeline init (normal and resume paths).
-    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr, etc.)
-    use validate_proxy + verify_tor directly.
+    Also called by run's _opsec_preflight for the UI checklist.
+    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr,
+    create_receive_wallet, thor_swap_preparer, exit_strategy_simulator)
+    use validate_proxy + verify_tor directly — they do NOT call this
+    function and are responsible for their own proxy/Tor validation.
     No fallbacks. No soft warnings.
     """
     # 1. Proxy must be valid and populated
