@@ -407,6 +407,14 @@ def flow_resume(detected_port=None):
     else:
         plan = prompt("Path to unsigned plan JSON")
 
+    if not plan:
+        err("Plan file path is required.")
+        return
+    if not Path(plan).exists():
+        err(f"Plan file does not exist: {plan}")
+        info("Run option 1 or 3 first to generate a plan, then resume.")
+        return
+
     wallet_files = sorted(Path(".").glob("wallet_*.json"))
     if wallet_files:
         wf = prompt("Wallet JSON file", str(wallet_files[0]))
@@ -455,7 +463,10 @@ def flow_resume(detected_port=None):
     except json.JSONDecodeError as e:
         err(f"Plan file is not valid JSON (corrupt or truncated): {e}")
         return
-    except (OSError, KeyError) as e:
+    except OSError as e:
+        err(f"Cannot read plan file: {e}")
+        return
+    except KeyError as e:
         warn(f"Could not read plan metadata ({e}), defaulting to receive-wallet mode")
         wf_arg = wf
 

@@ -169,6 +169,11 @@ def write_bundle(bundle: dict, out_path: Path):
         
     except Exception as e:
         print(f"[-] Error writing bundle: {e}")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
         raise
 
 

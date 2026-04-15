@@ -210,7 +210,7 @@ class AntiForensics:
         for i in range(count):
             decoy_path = DECOY_DIR / f"backup_{secrets.token_hex(4)}.json"
             decoy_data = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": secrets.token_hex(64),
                 "checksum": secrets.token_hex(32)
             }
@@ -356,7 +356,7 @@ class QRManager:
         # Add fake document header
         if font:
             draw.text((20, 20), "System Configuration Backup", fill='black', font=font)
-            draw.text((20, 40), f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", fill='gray', font=font)
+            draw.text((20, 40), f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}", fill='gray', font=font)
             draw.text((20, 60), "Checksum verification required", fill='gray', font=font)
         
         # Embed QR code
@@ -528,9 +528,15 @@ class DeadManSwitch:
                 _tk_name = f".tk_{secrets.token_hex(4)}"
                 print(f"    Full token written to: /dev/shm/{_tk_name}")
                 print(f"\n[!] Token will be needed within {ttl} seconds")
+                print(f"[!] WARNING: Token file is PLAINTEXT in /dev/shm. Any process running")
+                print(f"[!] as the same UID can read it. Delete immediately after copying.")
                 _tk_path = Path(f"/dev/shm/{_tk_name}")
-                _tk_path.write_text(token)
-                os.chmod(_tk_path, 0o600)
+                _tk_fd = os.open(str(_tk_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(_tk_fd, token.encode())
+                    os.fsync(_tk_fd)
+                finally:
+                    os.close(_tk_fd)
             
             # Start TTL countdown in background
             self._start_ttl_countdown(ttl)
@@ -548,7 +554,16 @@ class DeadManSwitch:
             return False
     
     def _start_ttl_countdown(self, ttl: int):
-        """Start TTL countdown as a separate process (survives parent exit)."""
+        """Start TTL countdown as a separate process (survives parent exit).
+
+        LIMITATION: If the child is SIGKILL'd before TTL expires, no
+        automatic destruction occurs. The lock metadata records expires_at
+        so unlock will refuse after expiry, but the encrypted bundle
+        persists on /dev/shm until reboot (tmpfs) or manual cleanup.
+        There is no reliable fix for SIGKILL — it cannot be caught.
+        Mitigation: lock metadata stores the expiry timestamp, and the
+        unlock path checks it.  paranoia_mode also wipes /dev/shm/.gs_*.
+        """
         import signal as _sig
         _sig.signal(_sig.SIGCHLD, _sig.SIG_IGN)  # Auto-reap
         pid = os.fork()
@@ -561,6 +576,12 @@ class DeadManSwitch:
                 AntiForensics.secure_delete_file(LOCKED_BUNDLE)
                 AntiForensics.secure_delete_file(LOCK_METADATA)
                 AntiForensics.cleanup_decoys()
+            # Also wipe any lingering token files
+            for tk_file in Path("/dev/shm").glob(".tk_*"):
+                try:
+                    AntiForensics.secure_delete_file(tk_file)
+                except Exception:
+                    pass
             sys.exit(0)
         else:
             print(f"  [*] TTL wiper started (PID {pid})")

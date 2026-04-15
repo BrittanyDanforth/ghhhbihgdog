@@ -134,12 +134,21 @@ def lock_memory() -> bool:
         return False
 
 
-def secure_file_perms(path: Path, mode: int = 0o600) -> None:
-    """Set file to owner-read/write only."""
+def secure_file_perms(path: Path, mode: int = 0o600) -> bool:
+    """Set file to owner-read/write only. Returns True on success.
+
+    BUG 94 FIX: The old except-pass silently ate chmod failures. If this
+    fails on a password file or unsigned TX blob, those files remain
+    world-readable (default umask-based permissions). Callers that handle
+    sensitive data (password files, TX blobs) should check the return value
+    and abort if permissions cannot be set.
+    """
     try:
         os.chmod(path, mode)
-    except OSError:
-        pass
+        return True
+    except OSError as e:
+        integrity_log("opsec", f"chmod_fail:{path.name}:{e}")
+        return False
 
 
 def _json_safe_default(o):
@@ -175,7 +184,8 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         with open(path) as f:
             json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        sys.exit(f"[!] CRITICAL: Atomic write to {path} produced corrupt JSON: {e}")
+        # BUG 95 FIX: Don't print full path in error — reveals filesystem layout.
+        sys.exit(f"[!] CRITICAL: Atomic write to {path.name} produced corrupt JSON: {e}")
     # fsync parent dir to make the rename durable across power loss
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)

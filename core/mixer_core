@@ -222,8 +222,10 @@ def main():
             bal = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
         except Exception as _bal_err:
             integrity_log("stage5", f"resume_rpc_unreachable:{str(_bal_err)[:40]}")
+            # BUG 95 FIX: Don't print full RPC URL in error — may contain
+            # auth credentials (http://user:pass@host:port) or reveal infra.
             sys.exit(
-                f"[!] Cannot reach wallet-rpc at {args.rpc_primary}\n"
+                f"[!] Cannot reach wallet-rpc endpoint.\n"
                 f"    Error: {str(_bal_err)[:80]}\n"
                 f"    Resume requires a working RPC to create/broadcast TXs.\n"
                 f"    Start monero-wallet-rpc and retry."
@@ -665,6 +667,24 @@ def main():
     if len(subs) < MIN_WALLETS + 1:
         sys.exit("[!] Failed to create enough subaddresses")
 
+    # BUG 91 FIX: Warn about permanent subaddress creation.
+    # Monero subaddresses CANNOT be deleted from a wallet. They are
+    # persisted in the wallet file forever. An adversary who seizes the
+    # wallet (via law enforcement, device theft, or backup compromise) sees
+    # N+ subaddresses created at the same time with random hex labels —
+    # a distinctive fingerprint of automated mixing. paranoia_mode cannot
+    # remove them because Monero's wallet format has no subaddress deletion.
+    _total_subs_created = args.wallets + NUM_DECOYS
+    print(f"  [!] OPSEC WARNING: {_total_subs_created} subaddresses were just PERMANENTLY")
+    print(f"  [!] added to the wallet file (account {sub_account}).")
+    print(f"  [!] Monero subaddresses CANNOT be deleted. If this wallet is ever")
+    print(f"  [!] seized or backed up, the subaddress pattern reveals mixing activity.")
+    print(f"  [!] MITIGATION: After mixing is complete, destroy this wallet entirely")
+    print(f"  [!] and recreate from seed. Subaddresses are deterministic from the seed")
+    print(f"  [!] and only appear if explicitly recreated (which an adversary cannot do")
+    print(f"  [!] without running this toolkit against the same seed).")
+    integrity_log("stage3", f"permanent_subaddrs_created:{_total_subs_created}")
+
     if receive_mode:
         ENTRY = receive_entry_addr
         # Verify the receive address actually exists in the connected wallet.
@@ -1050,12 +1070,21 @@ def main():
 
     # BUG 82 FIX: Bind plan to wallet identity. Without this, resuming
     # with a different wallet connected silently uses wrong subaddresses.
+    # BUG 90 FIX: If this fails, the plan's wallet_primary is empty, and the
+    # Stage 5 resume wallet-mismatch check becomes a no-op (empty string
+    # doesn't match, but empty plan_wallet skips the check entirely).
+    # This means resuming with a different wallet is silently accepted.
     _wallet_primary = ""
     try:
         _wa = rpc_primary.raw_request("get_address", {"account_index": 0})
         _wallet_primary = _wa.get("address", "")
-    except Exception:
-        pass
+    except Exception as _wa_err:
+        integrity_log("stage4", f"wallet_identity_fetch_fail:{str(_wa_err)[:40]}")
+        print(f"  [!] WARNING: Could not fetch wallet primary address for plan binding.")
+        print(f"  [!] Resume-with-wrong-wallet detection will be DISABLED.")
+    if not _wallet_primary:
+        integrity_log("stage4", "wallet_identity_empty:resume_guard_disabled")
+        print(f"  [!] WARNING: Wallet primary address is empty. Resume safety check disabled.")
 
     # Collect ThorChain quote expiry for plan metadata. Air-gap operators
     # need this to know whether quotes are still valid when they return.
@@ -1233,6 +1262,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     # Without it, the wallet's balance is WRONG after the first broadcast:
     # spent outputs still appear available, so the next transfer_split
     # reuses them → double-spend rejection → stuck pipeline.
+    # BUG 89 FIX: query_key fails on view-only wallets with an RPC error
+    # ("query_key requires spend key; this is a view-only wallet"). The old
+    # except-pass swallowed this, leaving _is_view_only=False. This means
+    # the key-image sync path was NEVER triggered for view-only wallets —
+    # the exact case it was designed for — causing double-spend failures.
     _is_view_only = False
     try:
         _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
@@ -1240,8 +1274,15 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         _is_view_only = (not _spend_key or
                          _spend_key == "0" * 64 or
                          _spend_key == "0000000000000000000000000000000000000000000000000000000000000000")
-    except Exception:
-        pass
+    except Exception as _qk_err:
+        _err_str = str(_qk_err).lower()
+        if "view" in _err_str or "watch" in _err_str or "spend" in _err_str:
+            _is_view_only = True
+            integrity_log("stage5", "view_only_detected_via_exception")
+        else:
+            integrity_log("stage5", f"query_key_err:{str(_qk_err)[:40]}")
+            print(f"  [!] WARNING: Cannot determine wallet type: {str(_qk_err)[:60]}")
+            print(f"  [!] Assuming hot wallet. If this is view-only, use --airgap mode.")
 
     if _is_view_only:
         integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
@@ -1332,8 +1373,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     print(f"  [!] Daemon height regressed: {_plan_height} -> {_cur_height} (diff: {_height_diff})")
                     print(f"  [!] This may indicate a different daemon or chain reorg.")
                     print(f"  [!] Confirmed outputs may no longer be valid.")
-        except Exception:
-            pass
+        except Exception as _ht_err:
+            integrity_log("stage5", f"height_check_fail:{str(_ht_err)[:40]}")
 
     # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
     # If accounts were added/removed between plan creation and resume,
@@ -1487,6 +1528,20 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     waited += chunk
 
         newnym()
+
+        # BUG 96 FIX: Re-verify Tor is working before each broadcast.
+        # If Tor dies mid-operation and wallet-rpc is configured to fall
+        # through to clearnet, the broadcast leaks the operator's real IP
+        # to every Monero node that receives the TX. This is catastrophic.
+        if tx_idx % 3 == 0:
+            try:
+                tor_recheck(proxy, f"stage5_tx_{tx_idx}")
+            except SystemExit:
+                integrity_log("stage5", f"tor_leak_during_broadcast:tx={tx_idx}")
+                print(f"  [!] Tor verification failed at TX {tx_idx}. Aborting to prevent IP leak.")
+                fail_count += 1
+                break
+
         secure_delay(3.0, 8.0)
 
         # BUG 86 FIX: Delete stale artifacts from a prior failed attempt.
@@ -1625,7 +1680,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 result = rpc_primary.raw_request("relay_tx", {
                     "hex": signed_data.hex(),
                 })
-                tx_hashes = result.get("tx_hash_list", [])
+                # BUG 87 FIX: relay_tx returns {"tx_hash": "..."} (a single
+                # string), NOT {"tx_hash_list": [...]}. The old code always
+                # got an empty list, triggering the "no txid returned" abort
+                # for EVERY hot wallet broadcast — making auto-mode completely
+                # broken for hot wallets.
+                _single_hash = result.get("tx_hash", "")
+                tx_hashes = [_single_hash] if _single_hash else result.get("tx_hash_list", [])
             else:
                 result = rpc_primary.raw_request("submit_transfer", {
                     "tx_data_hex": signed_data.hex(),
@@ -1742,6 +1803,29 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     if fail_count:
         print(f"  [!] {fail_count} TXs failed. Check logs and retry.")
 
+    # BUG 93 FIX: Warn about output consolidation risk.
+    if success_count > 0:
+        print()
+        print("  " + "=" * 72)
+        print("  OUTPUT CONSOLIDATION WARNING")
+        print("  " + "=" * 72)
+        print(f"  Funds are now scattered across {success_count}+ subaddresses.")
+        print("  DO NOT consolidate (sweep_all / send-all-to-one-address) in a")
+        print("  single transaction. A single consolidation TX links ALL mixed")
+        print("  outputs back together on-chain, completely undoing the mixing.")
+        print()
+        print("  SAFE WITHDRAWAL STRATEGY:")
+        print("  1. Spend from individual subaddresses to different destinations")
+        print("     at different times (days/weeks apart).")
+        print("  2. Never combine outputs from multiple subaddresses in one TX.")
+        print("  3. Use Monero's subaddress_account feature or separate wallets")
+        print("     for each withdrawal destination.")
+        print("  4. Each change output created by a withdrawal is heuristically")
+        print("     identifiable — spend change outputs in subsequent TXs, not")
+        print("     alongside unspent mixed outputs.")
+        print("  " + "=" * 72)
+        integrity_log("stage5", "consolidation_warning_shown")
+
     # Clean progress file and plan file on full success.
     # The plan file contains the FULL mixing DAG (every src/dst XMR address).
     # If seized, it reveals the entire transaction graph. Securely overwrite
@@ -1817,6 +1901,27 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 _sd = _shm / _shm_dir
                 if _sd.is_dir():
                     _shutil_shm.rmtree(_sd, ignore_errors=True)
+
+        # BUG 92 FIX: Clean __pycache__ directories. Python auto-creates
+        # __pycache__/*.pyc files containing compilation timestamps and
+        # source paths (e.g. /home/user/mixer/core/gs_common.py). These
+        # survive all other cleanup and reveal toolkit usage + filesystem
+        # layout to a forensic analyst.
+        import shutil as _shutil_pyc
+        _core_dir = Path(__file__).resolve().parent
+        for _pyc_dir in _core_dir.rglob("__pycache__"):
+            if _pyc_dir.is_dir():
+                try:
+                    _shutil_pyc.rmtree(_pyc_dir)
+                except OSError:
+                    pass
+        _workspace_pyc = _core_dir.parent / "__pycache__"
+        if _workspace_pyc.is_dir():
+            try:
+                _shutil_pyc.rmtree(_workspace_pyc)
+            except OSError:
+                pass
+        integrity_log("stage5", "pycache_cleaned")
 
     # Exit strategy simulation
     newnym()

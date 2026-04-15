@@ -264,9 +264,16 @@ def main():
     # Build presigned lookup: hot wallet blobs need relay_tx, not submit_transfer.
     # The unsigned_manifest (from airgap_tx_signer create phase) marks presigned entries.
     _presigned_blobs: dict = {}
-    _unsigned_manifest = input_path / "unsigned_manifest.json" if input_path.is_dir() else None
-    if _unsigned_manifest is None and input_path.is_dir():
+    if input_path.is_dir():
+        _unsigned_manifest = input_path / "unsigned_manifest.json"
+        if not _unsigned_manifest.exists():
+            _unsigned_manifest = input_path.parent / "unsigned_manifest.json"
+    elif input_path.is_file():
+        # Single-file or manifest JSON: look for unsigned_manifest.json
+        # in the same directory as the blob/manifest file.
         _unsigned_manifest = input_path.parent / "unsigned_manifest.json"
+    else:
+        _unsigned_manifest = None
     if _unsigned_manifest and _unsigned_manifest.exists():
         try:
             with open(_unsigned_manifest) as _umf:
@@ -483,7 +490,7 @@ def main():
                                     break
                         except Exception as poll_err:
                             integrity_log("broadcast", f"poll_err:idx={idx}:{str(poll_err)[:30]}")
-                        time.sleep(45 + secrets.randbelow(30))
+                        time.sleep(30 + secrets.randbelow(60))
 
                     if confirmed:
                         prog_entry["confirmed"] = True
@@ -525,6 +532,10 @@ def main():
                         atomic_write_json(prog, progF)
                         fail_count += 1
                         break
+            except requests.exceptions.ConnectionError as e:
+                integrity_log("broadcast", f"rpc_down:idx={idx}:{str(e)[:40]}")
+                print(f"  [!] Cannot reach wallet-rpc at {args.wallet_rpc} — is it running?")
+                print(f"  [!] Error: {str(e)[:80]}")
             except Exception as e:
                 integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")
                 print(f"  [!] Error: {str(e)[:80]}")

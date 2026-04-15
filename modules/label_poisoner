@@ -331,12 +331,18 @@ Examples:
         print(f"[+] File size: {args.out.stat().st_size} bytes")
         
     except PermissionError:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] Permission denied writing to {args.out}")
         sys.exit(1)
     except OSError as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] OS error writing output file: {e}")
         sys.exit(1)
     except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         print(f"[!] Unexpected error writing output file: {e}")
         sys.exit(1)
 

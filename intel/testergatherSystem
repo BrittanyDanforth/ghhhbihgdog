@@ -281,8 +281,9 @@ class SecureRAMLogger:
         return msg
     
     def log(self, level, msg):
-        """Add log entry to RAM buffer"""
-        timestamp = datetime.now().isoformat()
+        """Add log entry to RAM buffer (timestamp coarsened to 10-min bucket)"""
+        coarsened = int(time.time()) // 600 * 600
+        timestamp = datetime.fromtimestamp(coarsened).isoformat()
         entry = f"[{timestamp}] [{level}] {msg}"
         entry = self._add_canary(entry)
         encrypted = self._encrypt_log(entry)
@@ -439,19 +440,20 @@ class ProxyChainManager:
         chain = []
         
         # Always start with Tor
-        chain.append(random.choice(self.chains['tor']))
+        chain.append(secrets.choice(self.chains['tor']))
         
-        # Mix in other types
+        # Mix in other types (use SystemRandom for CSPRNG shuffle)
         proxy_types = ['socks5', 'mobile', 'residential']
-        random.shuffle(proxy_types)
+        _sysrand = random.SystemRandom()
+        _sysrand.shuffle(proxy_types)
         
         for ptype in proxy_types[:length-1]:
             if ptype == 'mobile' and self.mobile_proxies:
-                chain.append(random.choice(self.mobile_proxies))
+                chain.append(secrets.choice(self.mobile_proxies))
             elif ptype == 'residential' and self.residential_proxies:
-                chain.append(random.choice(self.residential_proxies))
+                chain.append(secrets.choice(self.residential_proxies))
             elif ptype == 'socks5' and self.chains['socks5']:
-                chain.append(random.choice(self.chains['socks5']))
+                chain.append(secrets.choice(self.chains['socks5']))
                 
         self.current_chain = chain
         return chain
@@ -499,44 +501,40 @@ class BreachDatabaseManager:
             logger.error(f"Local DB init failed: {e}")
             
     async def check_hibp(self, email):
-        """Check Have I Been Pwned"""
+        """Check Have I Been Pwned breachedaccount API for email breaches.
+
+        The pwnedpasswords API is for *passwords*, not emails. The correct
+        endpoint for email breach lookup is /breachedaccount/{account}.
+        """
         if not self.hibp_key:
             return None
-            
+
         headers = {
             'hibp-api-key': self.hibp_key,
             'user-agent': 'SecurityResearch/1.0'
         }
-        
-        # Hash for k-anonymity
-        sha1 = hashlib.sha1(email.encode()).hexdigest().upper()
-        prefix = sha1[:5]
-        
+
         try:
             from aiohttp_socks import ProxyConnector
             connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
-            # Use k-anonymity API
+            encoded_email = email.replace('@', '%40')
+            url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{encoded_email}?truncateResponse=true"
             async with aiohttp.ClientSession(connector=connector) as session:
-                url = f"https://api.pwnedpasswords.com/range/{prefix}"
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
-                        text = await resp.text()
-                        
-                        # Check if hash suffix exists
-                        suffix = sha1[5:]
-                        for line in text.split('\n'):
-                            if line.startswith(suffix):
-                                count = int(line.split(':')[1])
-                                return {
-                                    'email': email,
-                                    'breached': True,
-                                    'breach_count': count,
-                                    'source': 'HIBP'
-                                }
-                                
+                        breaches = await resp.json()
+                        return {
+                            'email': email,
+                            'breached': True,
+                            'breach_count': len(breaches) if isinstance(breaches, list) else 1,
+                            'source': 'HIBP'
+                        }
+                    elif resp.status == 404:
+                        return {'email': email, 'breached': False, 'source': 'HIBP'}
+
         except Exception as e:
             logger.error(f"HIBP check failed: {e}")
-            
+
         return {'email': email, 'breached': False}
         
     async def check_dehashed(self, email):
@@ -582,10 +580,11 @@ class BreachDatabaseManager:
             email = breach_data.get('email', '')
             source = breach_data.get('source', 'unknown')
             
+            _coarsened = int(time.time()) // 600 * 600
             cursor.execute('''
                 INSERT OR REPLACE INTO breaches (email, source, date)
                 VALUES (?, ?, ?)
-            ''', (email, source, datetime.now().isoformat()))
+            ''', (email, source, datetime.fromtimestamp(_coarsened).isoformat()))
             
             self.local_db.commit()
             
@@ -612,8 +611,9 @@ class TelegramIntelligence:
             return
             
         try:
+            session_path = os.path.join('/dev/shm', 'intel_session')
             self.client = TelegramClient(
-                'intel_session',
+                session_path,
                 CONFIG['TELEGRAM']['API_ID'],
                 CONFIG['TELEGRAM']['API_HASH']
             )
@@ -886,30 +886,30 @@ class UltraStealthBrowser:
         return {
             'canvas': hashlib.sha256(os.urandom(32)).hexdigest(),
             'webgl': {
-                'vendor': random.choice(['Intel Inc.', 'NVIDIA Corporation', 'AMD']),
-                'renderer': random.choice([
+                'vendor': secrets.choice(['Intel Inc.', 'NVIDIA Corporation', 'AMD']),
+                'renderer': secrets.choice([
                     'Intel Iris OpenGL Engine',
                     'NVIDIA GeForce GTX 1080',
                     'AMD Radeon Pro 5500M'
                 ])
             },
-            'audio': round(random.uniform(35.7, 35.8), 6),
+            'audio': round(35.7 + secrets.randbelow(1000) / 10000.0, 6),
             'fonts': random.sample([
                 'Arial', 'Helvetica', 'Times New Roman', 'Georgia',
                 'Verdana', 'Comic Sans MS', 'Trebuchet MS'
             ], 5),
-            'screen': random.choice([
+            'screen': secrets.choice([
                 (1920, 1080), (1366, 768), (1440, 900),
                 (2560, 1440), (1280, 720)
             ]),
-            'timezone': random.choice([
+            'timezone': secrets.choice([
                 'America/New_York', 'Europe/London', 'Asia/Tokyo',
                 'Australia/Sydney', 'America/Chicago'
             ]),
-            'language': random.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
-            'platform': random.choice(['Win32', 'MacIntel', 'Linux x86_64']),
-            'tls_version': random.choice(['TLS 1.2', 'TLS 1.3']),
-            'http_version': random.choice(['HTTP/1.1', 'HTTP/2', 'HTTP/3'])
+            'language': secrets.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
+            'platform': secrets.choice(['Win32', 'MacIntel', 'Linux x86_64']),
+            'tls_version': secrets.choice(['TLS 1.2', 'TLS 1.3']),
+            'http_version': secrets.choice(['HTTP/1.1', 'HTTP/2', 'HTTP/3'])
         }
         
     def _setup_browser(self):
@@ -983,12 +983,13 @@ class UltraStealthBrowser:
         """Generate realistic user agent"""
         platform = self.fingerprints['platform']
         
+        chrome_ver = 90 + secrets.randbelow(31)
         if platform == 'Win32':
-            return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90, 120)}.0.0.0 Safari/537.36"
+            return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
         elif platform == 'MacIntel':
-            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90, 120)}.0.0.0 Safari/537.36"
+            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
         else:
-            return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(90, 120)}.0.0.0 Safari/537.36"
+            return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
             
     def _inject_maximum_stealth(self):
         """Inject all stealth scripts"""
@@ -1165,7 +1166,7 @@ class DistributedScraperEngine:
                     auto_remove=True,
                     mem_limit='512m',
                     network_mode='bridge',
-                    volumes={'/dev/shm': {'bind': '/data', 'mode': 'rw'}}
+                    tmpfs={'/data': 'size=256m,mode=0700'},
                 )
                 self.container_pool.append(container)
                 
@@ -1176,9 +1177,10 @@ class DistributedScraperEngine:
             
     async def scrape_with_validation(self, url):
         """Scrape with full validation pipeline"""
+        _coarsened = int(time.time()) // 600 * 600
         result = {
             'url': url,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.fromtimestamp(_coarsened).isoformat(),
             'data': {},
             'validation': {},
             'risk_score': 0
@@ -1192,7 +1194,7 @@ class DistributedScraperEngine:
                     return None
                     
             # Select browser
-            browser = random.choice(self.browser_pool) if self.browser_pool else None
+            browser = secrets.choice(self.browser_pool) if self.browser_pool else None
             
             if not browser or not browser.driver:
                 return None
@@ -1200,8 +1202,9 @@ class DistributedScraperEngine:
             # Rotate identity
             self._rotate_identity(browser)
             
-            # Add jitter delay
-            delay = random.uniform(*CONFIG['STEALTH']['JITTER_DELAYS'])
+            # Add jitter delay (CSPRNG)
+            _jlo, _jhi = CONFIG['STEALTH']['JITTER_DELAYS']
+            delay = _jlo + secrets.randbelow(int((_jhi - _jlo) * 1000)) / 1000.0
             await asyncio.sleep(delay)
             
             # Navigate
@@ -1303,18 +1306,18 @@ class DistributedScraperEngine:
         # Random scroll
         scroll_height = driver.execute_script("return document.body.scrollHeight")
         
-        for _ in range(random.randint(1, 3)):
-            scroll_to = random.randint(100, scroll_height)
+        for _ in range(1 + secrets.randbelow(3)):
+            scroll_to = 100 + secrets.randbelow(max(scroll_height - 100, 1))
             driver.execute_script(f"window.scrollTo(0, {scroll_to})")
-            await asyncio.sleep(random.uniform(0.5, 2))
+            await asyncio.sleep(0.5 + secrets.randbelow(1500) / 1000.0)
             
         # Random mouse movements
         try:
             action = ActionChains(driver)
             
-            for _ in range(random.randint(2, 5)):
-                x = random.randint(100, 800)
-                y = random.randint(100, 600)
+            for _ in range(2 + secrets.randbelow(4)):
+                x = 100 + secrets.randbelow(701)
+                y = 100 + secrets.randbelow(501)
                 action.move_by_offset(x, y)
                 
             action.perform()
@@ -1434,10 +1437,11 @@ class SecureDataProcessor:
         
         # Derive key
         combined = b''.join(sources)
+        _dynamic_salt = os.urandom(16)
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
-            salt=b'intel_system_v20',
+            salt=_dynamic_salt,
             iterations=100000
         )
         
@@ -1445,9 +1449,10 @@ class SecureDataProcessor:
         
     def process_results(self, raw_results):
         """Process results with categorization"""
+        _coarsened = int(time.time()) // 600 * 600
         processed = {
             'metadata': {
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.fromtimestamp(_coarsened).isoformat(),
                 'total_results': len(raw_results),
                 'processing_id': secrets.token_hex(8)
             },
@@ -1531,8 +1536,9 @@ class SecureDataProcessor:
             cipher = Fernet(self.encryption_key)
             encrypted = cipher.encrypt(serialized)
             
-            # Save to RAM disk
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            # Save to RAM disk with coarsened timestamp
+            _coarsened = int(time.time()) // 600 * 600
+            timestamp = datetime.fromtimestamp(_coarsened).strftime('%Y%m%d_%H%M')
             output_file = self.ram_path / f'intel_{timestamp}.enc'
             
             with open(output_file, 'wb') as f:
@@ -1566,10 +1572,13 @@ class SecureDataProcessor:
             return
 
         try:
+            # PyCryptodome Shamir expects exactly 16 bytes; derive a 16-byte
+            # share-key from the full encryption key via truncated SHA-256.
+            share_key = hashlib.sha256(self.encryption_key).digest()[:16]
             shares = Shamir.split(
                 CONFIG['DATA_HANDLING']['SHAMIR_THRESHOLD'],
                 CONFIG['DATA_HANDLING']['SHAMIR_SHARES'],
-                self.encryption_key
+                share_key,
             )
             
             # Save shares to separate locations
@@ -1744,8 +1753,8 @@ class UltimateIntelOrchestrator:
     def _morph_query(self, query):
         """Morph query with typos and synonyms"""
         # Add typos
-        if random.random() < 0.3:
-            pos = random.randint(0, len(query) - 1)
+        if secrets.randbelow(10) < 3:
+            pos = secrets.randbelow(len(query))
             query = query[:pos] + query[pos+1:]
             
         # Add synonyms
@@ -1757,7 +1766,7 @@ class UltimateIntelOrchestrator:
         
         for word, syns in synonyms.items():
             if word in query.lower():
-                query = query.replace(word, random.choice(syns))
+                query = query.replace(word, secrets.choice(syns))
                 
         return query
         
@@ -1797,8 +1806,8 @@ class UltimateIntelOrchestrator:
 
         while True:
             try:
-                await asyncio.sleep(random.randint(30, 300))
-                site = random.choice(decoy_sites)
+                await asyncio.sleep(30 + secrets.randbelow(271))
+                site = secrets.choice(decoy_sites)
                 connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
                 async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.get(site) as resp:
@@ -1808,10 +1817,11 @@ class UltimateIntelOrchestrator:
                 
     def _generate_report(self, processed, raw_results):
         """Generate comprehensive report"""
+        _coarsened_ts = int(time.time()) // 600 * 600
         report = {
             'metadata': {
                 'campaign_id': secrets.token_hex(16),
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.fromtimestamp(_coarsened_ts).isoformat(),
                 'version': 'v20+ASF',
                 'opsec_level': 'maximum',
                 'total_results': len(raw_results)

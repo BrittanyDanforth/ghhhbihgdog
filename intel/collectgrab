@@ -286,8 +286,9 @@ def _run_pipeline():
     targets = load_targets()
 
     meta_entries = []
+    _coarsened_ts = int(time.time()) // 600 * 600
     audit_info = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_coarsened_ts)),
         "targets_processed": 0,
         "errors": [],
         "tor_available": TOR_AVAILABLE,
@@ -319,7 +320,8 @@ def _run_pipeline():
             query = f"site:linkedin.com \"{target}\""
 
         url = f"https://www.google.com/search?q={quote_plus(query)}"
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        import secrets as _secrets
+        headers = {'User-Agent': _secrets.choice(USER_AGENTS)}
 
         try:
             random_sleep(5, 10)
@@ -385,7 +387,7 @@ def _run_pipeline():
             twitter_url = f"{base}/search?f=tweets&q={encoded_query}"
             try:
                 random_sleep(1, 3)
-                r = session.get(twitter_url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+                r = session.get(twitter_url, headers={'User-Agent': _secrets.choice(USER_AGENTS)}, timeout=15)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.text, 'html.parser')
                     # Try multiple selectors for different Nitter versions
@@ -431,7 +433,7 @@ def _run_pipeline():
                 f"?q={quote_plus(target)}&size=50"
             )
             response = session.get(push_url, timeout=30,
-                                   headers={'User-Agent': random.choice(USER_AGENTS)})
+                                   headers={'User-Agent': _secrets.choice(USER_AGENTS)})
 
             if response.status_code == 200:
                 data = response.json().get("data", [])
@@ -508,6 +510,7 @@ def _run_pipeline():
             sha_file = filepath + ".sha256"
             with open(sha_file, 'w') as sf:
                 sf.write(f"{sha_digest}  {os.path.basename(filepath)}\n")
+            _secure_perms(sha_file)
 
             logger.info("SHA256 for %s: %s", os.path.basename(filepath), sha_digest)
 

@@ -38,7 +38,12 @@ class MemoryScrambler:
         self._lock_memory()
     
     def _lock_memory(self):
-        """Lock memory pages to prevent swapping."""
+        """Lock memory pages to prevent swapping and disable core dumps."""
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except (ImportError, ValueError, OSError):
+            pass
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_MEMLOCK, 
@@ -481,7 +486,7 @@ def generate_dag(args):
     # Build output structure
     output = {
         "version": "3.0-poly",
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "timestamp": "redacted",
         "seed_ref": {
             "sha256": seed_hash
         },

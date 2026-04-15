@@ -69,18 +69,25 @@ TOR_CONTROL_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051
 TOR_CONTROL_SOCKET = "/var/run/tor/control"
 
-# Operational logging
+# Operational logging — file handler deferred to main() so importing
+# this module doesn't create tor_operations.log as a side effect.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler(OPERATIONAL_LOG, mode='a'),
         logging.StreamHandler(sys.stdout)
     ]
 )
-if OPERATIONAL_LOG.exists():
-    os.chmod(OPERATIONAL_LOG, 0o600)
 logger = logging.getLogger("TorEndpointJuggler")
+
+
+def _attach_file_handler():
+    """Attach file handler to logger (called from main only)."""
+    fh = logging.FileHandler(OPERATIONAL_LOG, mode='a')
+    fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+    logging.getLogger().addHandler(fh)
+    if OPERATIONAL_LOG.exists():
+        os.chmod(OPERATIONAL_LOG, 0o600)
 
 @dataclass
 class EndpointHealth:
@@ -107,7 +114,7 @@ class EndpointHealth:
         penalty = min(0.1 * self.consecutive_failures, 0.5)
         
         # Bonus for recent success
-        if self.last_success and datetime.now() - self.last_success < timedelta(hours=1):
+        if self.last_success and datetime.now(timezone.utc) - self.last_success < timedelta(hours=1):
             bonus = 0.1
         else:
             bonus = 0.0
@@ -207,7 +214,7 @@ class TorCircuitManager:
         try:
             with self._get_controller() as controller:
                 controller.signal(Signal.NEWNYM)
-                self.last_newnym = datetime.now()
+                self.last_newnym = datetime.now(timezone.utc)
                 logger.info("Forced new Tor circuit")
                 return True
         except Exception as e:
@@ -251,7 +258,7 @@ class TorCircuitManager:
         self.isolation_credentials[session_id] = {
             'username': username,
             'password': password,
-            'created': datetime.now()
+            'created': datetime.now(timezone.utc)
         }
         
         return {
@@ -442,7 +449,7 @@ class ProductionEndpointJuggler:
                 health = self.endpoint_health[endpoint]
                 if is_valid:
                     health.success_count += 1
-                    health.last_success = datetime.now()
+                    health.last_success = datetime.now(timezone.utc)
                     health.consecutive_failures = 0
                     health.is_validated = True
                     health.response_times.append(response_time)
@@ -451,7 +458,7 @@ class ProductionEndpointJuggler:
                     logger.info(f"✓ {endpoint} - {response_time:.2f}s")
                 else:
                     health.failure_count += 1
-                    health.last_failure = datetime.now()
+                    health.last_failure = datetime.now(timezone.utc)
                     health.consecutive_failures += 1
                     logger.warning(f"✗ {endpoint} - {details.get('error', 'Unknown error')}")
                     
@@ -595,6 +602,7 @@ async def main():
     
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
+    _attach_file_handler()
     
     # Verify Tor is running (try system tor 9050, then Tor Browser 9150)
     global TOR_SOCKS_PORT

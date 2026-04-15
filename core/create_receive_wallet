@@ -103,9 +103,20 @@ def main():
             f"(wallet has {len(accounts)} account(s), indices 0-{len(accounts)-1}).\n"
             f"    Create the account first via monero-wallet-rpc's create_account."
         )
-    addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
-        account_index=acct_idx, label=args.label,
-    )
+    try:
+        addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
+            account_index=acct_idx, label=args.label,
+        )
+    except Exception as e:
+        integrity_log("wallet", f"subaddress_create_fail:{str(e)[:60]}")
+        sys.exit(
+            f"[!] Failed to create subaddress: {e}\n"
+            f"    Verify monero-wallet-rpc is running and the wallet is open."
+        )
+
+    if not addr_str:
+        integrity_log("wallet", "subaddress_empty")
+        sys.exit("[!] wallet-rpc returned empty address — wallet may not be open.")
 
     network = _detect_network(addr_str)
     if network != "mainnet":

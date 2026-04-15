@@ -49,7 +49,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 import threading
@@ -222,7 +222,7 @@ class CryptoSecureRNG:
             secure_seed = secrets.token_bytes(64)
             seed_data = {
                 "primary_seed": secure_seed.hex(),
-                "created": datetime.now().isoformat(),
+                "created": datetime.now(timezone.utc).isoformat(),
                 "hardware_id": SystemFingerprint.get_hardware_id(),
                 "runtime_entropy": SystemFingerprint.get_runtime_entropy()
             }

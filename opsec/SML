@@ -25,6 +25,19 @@ SEED_SHM = SHM_DIR / ".gs_seed_active"
 LOCK_SHM = SHM_DIR / ".gs_seed_lock"
 
 
+def _disable_core_dumps() -> bool:
+    """Disable core dumps to prevent seed leakage via /proc/sys/kernel/core_pattern.
+    Without this, mlockall only prevents swap — a core dump still captures all
+    process memory (including the seed) to disk.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return True
+    except (ImportError, ValueError, OSError):
+        return False
+
+
 def _mlock_available() -> bool:
     """Check if mlockall is available and working."""
     try:
@@ -108,6 +121,14 @@ def cmd_load(args):
         print("  [!] /dev/shm not available — cannot use RAM-only storage")
         print("  [!] On this system, seed would touch disk. Aborting.")
         sys.exit(1)
+
+    # Disable core dumps BEFORE loading seed into memory — a core dump
+    # captures all process memory and writes it to disk, bypassing mlockall.
+    if _disable_core_dumps():
+        print("  [+] Core dumps disabled (RLIMIT_CORE=0)")
+    else:
+        print("  [!] WARNING: Could not disable core dumps — seed may leak via core dump")
+        print("  [!] Check /proc/sys/kernel/core_pattern and disable if possible")
 
     # Lock memory — intentionally kept locked while seed is loaded;
     # unlocked in cmd_wipe when the seed is erased.

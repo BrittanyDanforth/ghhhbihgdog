@@ -203,9 +203,18 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             elif tx_metadata_list:
                 is_presigned = True
                 if len(tx_metadata_list) > 1:
+                    # BUG 88 FIX: transfer_split may split a single logical
+                    # TX into multiple on-chain TXs (e.g. when input count
+                    # requires it). Each entry in tx_metadata_list is a
+                    # separate signed TX that MUST be broadcast independently.
+                    # The old code silently dropped all but the first —
+                    # meaning partial funds never moved.
+                    # Concatenate all metadata items with a separator so the
+                    # broadcast phase can split and relay each one. We use a
+                    # manifest field to record the count.
                     integrity_log("signer", f"multi_metadata:idx={idx}:count={len(tx_metadata_list)}")
                     print(f"  [!] TX {idx}: transfer_split returned {len(tx_metadata_list)} "
-                          f"metadata items (split TX). Using first item only.")
+                          f"metadata items (split TX). Saving ALL items.")
                 blob_hex = tx_metadata_list[0]
                 integrity_log("signer", f"hot_wallet_presigned:idx={idx}")
             else:
@@ -226,6 +235,18 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 failed += 1
                 continue
 
+            # BUG 88 FIX: Save ALL split TX parts, not just the first.
+            all_blobs = []
+            if is_presigned and len(tx_metadata_list) > 1:
+                for part_hex in tx_metadata_list:
+                    try:
+                        all_blobs.append(bytes.fromhex(part_hex))
+                    except ValueError:
+                        integrity_log("signer", f"bad_hex_part:idx={idx}")
+                        print(f"  [!] TX {idx}: split part has invalid hex, skipping")
+            else:
+                all_blobs = [blob_bytes]
+
             if is_presigned:
                 signed_dir = outdir / "signed"
                 signed_dir.mkdir(parents=True, exist_ok=True)
@@ -233,20 +254,28 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             else:
                 tx_file = outdir / f"tx_{idx}.unsigned"
 
-            _tmp_blob = tx_file.with_suffix(tx_file.suffix + ".tmp")
-            _fd = os.open(str(_tmp_blob), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                os.write(_fd, blob_bytes)
-                os.fsync(_fd)
-            finally:
-                os.close(_fd)
-            os.replace(str(_tmp_blob), str(tx_file))
-            secure_file_perms(tx_file)
+            for part_num, part_bytes in enumerate(all_blobs):
+                if len(all_blobs) > 1:
+                    suffix = tx_file.suffix
+                    part_file = tx_file.with_name(f"tx_{idx}_part{part_num}{suffix}")
+                else:
+                    part_file = tx_file
+
+                _tmp_blob = part_file.with_suffix(part_file.suffix + ".tmp")
+                _fd = os.open(str(_tmp_blob), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(_fd, part_bytes)
+                    os.fsync(_fd)
+                finally:
+                    os.close(_fd)
+                os.replace(str(_tmp_blob), str(part_file))
+                secure_file_perms(part_file)
 
             if is_presigned:
-                print(f"  [+] TX {idx} -> {tx_file.name} (hot wallet, already signed, fsync'd)")
+                part_info = f" ({len(all_blobs)} parts)" if len(all_blobs) > 1 else ""
+                print(f"  [+] TX {idx} -> {tx_file.name}{part_info} (hot wallet, already signed, fsync'd)")
 
-            sha = hashlib.sha256(blob_bytes).hexdigest()
+            sha = hashlib.sha256(all_blobs[0]).hexdigest()
             manifest.append({
                 "idx": idx,
                 "file": tx_file.name,
@@ -255,6 +284,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "amt": tx["amt"],
                 "delay": tx.get("delay", 0),
                 "presigned": is_presigned,
+                "split_parts": len(all_blobs),
             })
             created += 1
             print(f"  [+] TX {idx} -> {tx_file.name}")
@@ -347,11 +377,12 @@ def phase_sign(args, plan: List[dict]):
         actual_hash = hashlib.sha256(Path(cli_path).read_bytes()).hexdigest()
         if actual_hash.lower() != expected_hash.lower():
             integrity_log("signer", f"wallet_cli_hash_MISMATCH:{actual_hash[:16]}")
+            # BUG 95 FIX: Don't print full path — reveals filesystem layout.
             sys.exit(
                 f"[!] wallet-cli hash MISMATCH!\n"
                 f"    Expected: {expected_hash}\n"
                 f"    Actual:   {actual_hash}\n"
-                f"    The binary at {cli_path} may be trojaned."
+                f"    The wallet-cli binary may be trojaned."
             )
         integrity_log("signer", "wallet_cli_hash_verified")
         print(f"  [+] wallet-cli binary verified: {actual_hash[:16]}...")
@@ -455,8 +486,16 @@ def phase_sign(args, plan: List[dict]):
             # Write password to a temp file so it's not visible in /proc/PID/cmdline.
             # monero-wallet-cli --password-file reads from file instead of CLI arg.
             pw_file = Path(work_dir) / ".wallet_pw"
-            pw_file.write_text(wallet_password)
-            secure_file_perms(pw_file)
+            _pw_fd = os.open(str(pw_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(_pw_fd, wallet_password.encode())
+                os.fsync(_pw_fd)
+            finally:
+                os.close(_pw_fd)
+            if not secure_file_perms(pw_file):
+                print(f"  [!] CRITICAL: Cannot set 0600 on password file — aborting TX {idx}")
+                failed += 1
+                continue
 
             cmd = [
                 args.wallet_cli,
