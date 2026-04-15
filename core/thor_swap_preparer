@@ -30,7 +30,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
-    secure_hex,
+    secure_hex, data_path, TOOLKIT_ROOT,
 )
 
 try:
@@ -178,7 +178,7 @@ def main():
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
                     help="GPG recipient for encrypted output")
-    ap.add_argument("--outfile", default="thor_pairs_batch.json")
+    ap.add_argument("--outfile", default=str(data_path("thor_pairs_batch.json")))
     ap.add_argument("--force", action="store_true",
                     help="Overwrite existing output file (DANGER: old deposit "
                          "addresses are invalidated when new ones are generated)")
@@ -291,7 +291,7 @@ def main():
         )
     atomic_write_json(pairs, _out)
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
-    print(f"\n  [+] {len(pairs)} pair(s) written to {_out} (fsync'd, 0600 permissions)")
+    print(f"\n  [+] {len(pairs)} pair(s) written to {_out.name} (fsync'd, 0600 permissions)")
 
     print()
     print(f"  {'=' * 68}")

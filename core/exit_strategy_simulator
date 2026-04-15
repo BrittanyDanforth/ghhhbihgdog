@@ -24,7 +24,7 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
-    atomic_write_json, install_signal_handlers,
+    atomic_write_json, install_signal_handlers, data_path,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -130,7 +130,7 @@ def main():
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
-    ap.add_argument("--outfile", default="plan_output.json")
+    ap.add_argument("--outfile", default=str(data_path("plan_output.json")))
     args = ap.parse_args()
 
     if args.amount is None:
@@ -224,7 +224,7 @@ def main():
     print(f"  Liquidity   : {liq_guidance}")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan written -> {args.outfile} (fsync'd)")
+    print(f"  [+] Plan written -> {Path(args.outfile).name} (fsync'd, 0600)")
 
 
 if __name__ == "__main__":

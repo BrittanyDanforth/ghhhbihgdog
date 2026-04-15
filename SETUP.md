@@ -98,13 +98,19 @@ monero-wallet-cli --generate-new-wallet ~/my_wallet2
 monerod --detach --data-dir ~/.bitmonero
 ```
 
-**Start wallet server** — replace `YOUR_PASSWORD` with your wallet password:
+**Start wallet server** — create a password file first (avoids password in shell history):
+
+```
+echo -n "YOUR_PASSWORD" > /dev/shm/.wallet_pw && chmod 600 /dev/shm/.wallet_pw
+```
+
+Then start the wallet server:
 
 ```
 monero-wallet-rpc \
   --rpc-bind-port 18083 \
   --wallet-file ~/my_wallet \
-  --password "YOUR_PASSWORD" \
+  --password-file /dev/shm/.wallet_pw \
   --daemon-address 127.0.0.1:18081 \
   --disable-rpc-login \
   --log-level 0 \
@@ -116,7 +122,7 @@ What the flags mean:
 |------|-----|
 | `--rpc-bind-port 18083` | Port the toolkit connects to |
 | `--wallet-file` | Your wallet from Step 4 |
-| `--password` | Same password from Step 4 |
+| `--password-file` | Reads password from file (not visible in `ps aux`) |
 | `--daemon-address` | Your local node from above |
 | `--disable-rpc-login` | Safe — only listens on localhost |
 | `--log-level 0` | **OPSEC:** prevents logging your operations |

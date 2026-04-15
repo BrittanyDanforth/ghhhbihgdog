@@ -26,6 +26,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json, validate_wallet_json,
     install_signal_handlers, newnym, scrub_address, secure_hex,
+    data_path, TOOLKIT_ROOT,
 )
 
 
@@ -72,8 +73,8 @@ def main():
                     help="label for the new subaddress (default: random hex)")
     ap.add_argument("--account-index", type=int, default=0,
                     help="wallet account index to create subaddress on (default: 0)")
-    ap.add_argument("--output-dir", default=".",
-                    help="directory for wallet JSON output")
+    ap.add_argument("--output-dir", default=str(TOOLKIT_ROOT),
+                    help="directory for wallet JSON output (default: toolkit root)")
     args = ap.parse_args()
 
     require_resources(min_disk_gb=2.0)
@@ -147,9 +148,8 @@ def main():
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 
-    print(f"  [+] Wallet written -> {fname} (fsync'd, 0600 permissions)")
+    print(f"  [+] Wallet written -> {fname.name} (fsync'd, 0600 permissions)")
     print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
-    print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
     print(f"  [+] Network: {network}")
     print(f"  [+] Full address is in the JSON file — do NOT display it in terminal.")
 
@@ -166,17 +166,11 @@ def main():
     print(f"  === NEXT STEPS ===")
     print(f"  From the main menu:")
     print(f"")
-    print(f"  Step 1: Choose option 7 (Swap Preparer)")
-    print(f"          Enter the BTC amount and paste this wallet's address")
-    print(f"          (or just type the path: {fname})")
-    print(f"          This generates a BTC deposit address + memo for the sender.")
-    print(f"")
-    print(f"  Step 2: Give the deposit address + memo to the BTC sender")
-    print(f"          Wait for the BTC → XMR swap to complete on ThorChain")
-    print(f"")
-    print(f"  Step 3: Choose option 2 (Receive Mode)")
-    print(f"          Select this wallet file: {fname}")
-    print(f"          The toolkit will mix the XMR that arrived.")
+    print(f"  Option 2 (Receive - guided) walks you through everything:")
+    print(f"    → Select this wallet (it will auto-detect {fname.name})")
+    print(f"    → Generate a BTC deposit address for the sender")
+    print(f"    → Wait for BTC → XMR conversion")
+    print(f"    → Mix the received XMR")
 
 
 if __name__ == "__main__":

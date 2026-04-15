@@ -717,8 +717,15 @@ def flow_swap_preparer(detected_port=None):
             err(f"Failed to read address from {dest}: {e}")
             return
 
-    args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor]
-    run_script(CORE / "thor_swap_preparer", args, "Swap preparer")
+    _outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
+    args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor,
+            "--outfile", _outfile, "--force"]
+    if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer"):
+        err("Swap preparation failed.")
+    else:
+        ok(f"Deposit instructions written to: {Path(_outfile).name}")
+        info("This is a STANDALONE utility. Its output is for manual use.")
+        info("For the guided receive flow, use option 2 instead.")
 
 
 def flow_exit_planner(detected_port=None):

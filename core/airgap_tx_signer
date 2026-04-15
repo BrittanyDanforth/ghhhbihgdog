@@ -42,7 +42,7 @@ if _CORE_DIR not in sys.path:
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms, lock_memory,
     install_signal_handlers, shutdown_requested, scrub_address,
-    connect_rpc, validate_proxy, verify_tor,
+    connect_rpc, validate_proxy, verify_tor, data_path,
 )
 
 REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
@@ -664,8 +664,8 @@ def main():
     cli.add_argument("--wallet-password", default=None,
                      help="Wallet password (phase=sign only). "
                           "Prefer GS_WALLET_PASSWORD env var to avoid /proc leak")
-    cli.add_argument("--outdir", default="tx_staging",
-                     help="Directory for TX files")
+    cli.add_argument("--outdir", default=str(data_path("tx_staging")),
+                     help="Directory for TX files (default: toolkit root / tx_staging)")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--dry-run", action="store_true",

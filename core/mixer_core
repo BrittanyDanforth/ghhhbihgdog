@@ -1316,7 +1316,7 @@ def main():
 
     # Clean old signed blobs directory
     for old_dir in ["signed_blobs", "tx_staging"]:
-        old_path = Path(old_dir)
+        old_path = data_path(old_dir)
         if old_path.is_dir():
             _shutil.rmtree(old_path)
             integrity_log("stage5", f"cleaned_old_dir:{old_dir}")

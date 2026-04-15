@@ -609,7 +609,7 @@ def main():
         print(f"\n  [+] Broadcast finished: {success_count} submitted to mempool, {skip_count} skipped (prior run).")
     if skip_count > 0:
         print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
-    print(f"  [+] Progress: {progF}")
+    print(f"  [+] Progress saved ({progF.name})")
 
 
 if __name__ == "__main__":
