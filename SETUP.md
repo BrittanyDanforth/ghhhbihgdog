@@ -1,113 +1,67 @@
 # GhostSpiral — Setup Guide
 
-Know nothing? Start here. Every command is copy-paste ready.
-All commands run in a terminal. You need a Debian/Kali box with `sudo`.
+Everything is copy-paste. You need a Debian/Kali VM with `sudo`.
 
 ---
 
-## 1. System packages
+## Step 1: Install
 
 ```
-sudo apt update
-sudo apt install -y tor torsocks jq gnupg python3-pip curl wget bzip2
-```
-
----
-
-## 2. Python libraries
-
-The installer creates a **virtual environment** (`.venv/`) so nothing
-conflicts with your system packages. No red errors, no warnings.
-
-Easiest way — just run the installer (it does everything):
-
-```
+sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip python3-venv curl wget bzip2
 bash install.sh
+sudo systemctl start tor && sudo systemctl enable tor
 ```
-
-Or manually:
-
-```
-python3 -m venv .venv
-source .venv/bin/activate
-pip install requests PySocks tenacity stem monero psutil
-pip install python-gnupg pycryptodomex cryptography qrcode pyyaml
-pip install beautifulsoup4 aiohttp aiohttp-socks
-```
-
-Quick check — should print `ALL OK`:
-
-```
-python3 -c "import requests, socks, stem, monero, psutil, tenacity, cryptography; print('ALL OK')"
-```
-
-If it says `ModuleNotFoundError`, install whichever one it names.
 
 ---
 
-## 3. Tor
-
-Tor is your proxy. It routes all traffic through 3 encrypted hops — nobody
-(ISP, law enforcement, data brokers) can see what you're doing. You don't
-need any other proxy. Tor is free and runs on your machine.
-
-**Start it:**
+## Step 2: Lock down the VM (do this FIRST, before anything else)
 
 ```
-sudo systemctl start tor
-sudo systemctl enable tor
+sudo bash tor_firewall.sh
 ```
 
-**Check it works:**
+This blocks ALL direct internet. Only Tor traffic gets out.
+
+Then fix your browser and CLI tools:
 
 ```
-curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
+sudo bash tor_firewall.sh --setup-browser
 ```
 
-You should see `"IsTor":true`. If you get an error, Tor isn't running.
+This automatically configures:
+- **wget, curl, apt, pip** — work through Tor immediately
+- **Firefox** — SOCKS5 proxy + DNS privacy + WebRTC disabled
 
-**Enable circuit rotation** (required — GhostSpiral changes your identity
-between operations):
+**For your current terminal** (if wget still fails after the above):
 
 ```
-sudo bash -c 'echo "" >> /etc/tor/torrc'
-sudo bash -c 'echo "ControlPort 9051" >> /etc/tor/torrc'
-sudo bash -c 'echo "CookieAuthentication 1" >> /etc/tor/torrc'
-sudo systemctl restart tor
+. /etc/profile.d/tor-proxy.sh
 ```
 
-**Your proxy address:** `socks5h://127.0.0.1:9050`
+New terminals get it automatically.
 
-This is what you enter whenever GhostSpiral asks for a proxy.
-The `h` means DNS goes through Tor too (critical).
+**Make firewall survive reboots:**
 
-> **Port cheat-sheet:**
->
-> | Port | What it is | When to use |
-> |------|-----------|-------------|
-> | 9050 | SOCKS (system `tor`) | Default — use this |
-> | 9150 | SOCKS (Tor Browser) | Only if you run Tor Browser instead of system tor |
-> | 9051 | Control (system `tor`) | GhostSpiral uses this automatically for circuit rotation |
-> | 9151 | Control (Tor Browser) | GhostSpiral falls back to this if 9051 isn't there |
->
-> **Never** pass 9051 or 9151 as `--tor-proxy`. Those are control ports, not SOCKS.
+```
+sudo bash tor_firewall.sh --persist
+```
 
-**Never use:**
-- Free proxy lists (they log everything)
-- Cheap VPN SOCKS proxies (they see your traffic)
-- Any proxy you don't control (they can steal funds)
-- `socks5://` without the `h` (leaks DNS to your ISP)
+**If Malwarebytes on your host PC flags Tor traffic:**
+
+```
+sudo bash tor_firewall.sh --setup-bridges
+```
 
 ---
 
-## 4. Monero CLI tools
+## Step 3: Install Monero tools
 
-GhostSpiral needs `monerod` (blockchain node), `monero-wallet-rpc` (wallet
-server), and `monero-wallet-cli` (signing tool).
+After `--setup-browser`, wget works through Tor automatically. If it still fails, prefix with `torsocks`:
 
 ```
 cd /tmp
 wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
+# If wget fails: torsocks wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
 tar xf monero.tar.bz2
 sudo cp monero-x86_64-linux-gnu-*/monerod /usr/local/bin/
 sudo cp monero-x86_64-linux-gnu-*/monero-wallet-cli /usr/local/bin/
@@ -116,178 +70,112 @@ rm -rf monero-x86_64-linux-gnu-* monero.tar.bz2
 cd -
 ```
 
-Check all three print a version:
-
-```
-monerod --version
-monero-wallet-cli --version
-monero-wallet-rpc --version
-```
-
 ---
 
-## 5. Start Monero (before each session)
-
-**5a. Blockchain node:**
-
-```
-monerod --detach --data-dir ~/.bitmonero
-```
-
-First run downloads the full chain (~170 GB, takes hours). After that it
-starts in seconds. Check progress with `monerod status`.
-
-**5b. Create a wallet** (first time only):
+## Step 4: Create a wallet (first time only)
 
 ```
 monero-wallet-cli --generate-new-wallet ~/my_wallet
 ```
 
-It asks for a password — remember it. It shows a 25-word seed phrase —
-**write it on paper and store it safely**. That phrase is the only way to
-recover funds.
+- Pick a password — **remember it**
+- Write down the 25-word seed — **on paper, store safely**
+- That seed is the ONLY way to recover funds
 
-**5c. Start wallet RPC:**
+---
+
+## Step 5: Start services (before each session)
+
+**Start blockchain node** (first time downloads ~170 GB):
 
 ```
-monero-wallet-rpc --rpc-bind-port 18083 \
+monerod --detach --data-dir ~/.bitmonero
+```
+
+**Start wallet server** — replace `YOUR_PASSWORD` with your wallet password:
+
+```
+monero-wallet-rpc \
+  --rpc-bind-port 18083 \
   --wallet-file ~/my_wallet \
-  --password "YOUR_WALLET_PASSWORD" \
+  --password "YOUR_PASSWORD" \
   --daemon-address 127.0.0.1:18081 \
-  --disable-rpc-login
+  --disable-rpc-login \
+  --log-level 0 \
+  --detach
 ```
 
-Keep that terminal open (or add `--detach`).
+What the flags mean:
+| Flag | Why |
+|------|-----|
+| `--rpc-bind-port 18083` | Port the toolkit connects to |
+| `--wallet-file` | Your wallet from Step 4 |
+| `--password` | Same password from Step 4 |
+| `--daemon-address` | Your local node from above |
+| `--disable-rpc-login` | Safe — only listens on localhost |
+| `--log-level 0` | **OPSEC:** prevents logging your operations |
+| `--detach` | Runs in background |
 
-**5d. Verify it's running:**
+**Set password as env var** (hides it from `ps aux`):
 
 ```
-curl -s http://127.0.0.1:18083/json_rpc \
-  -d '{"jsonrpc":"2.0","id":"0","method":"get_height"}' \
-  -H 'Content-Type: application/json'
+export GS_WALLET_PASSWORD="YOUR_PASSWORD"
 ```
-
-Should return something with `"height":` and a number.
 
 ---
 
-## 6. Environment variables
+## Step 6: Run the toolkit
 
 ```
-export GS_WALLET_PASSWORD="YOUR_WALLET_PASSWORD"
-```
-
-Same password from step 5c. Setting it as an env var keeps it out of
-`ps aux` where anyone on the machine could see it.
-
----
-
-## 7. Run GhostSpiral
-
-```
-cd /path/to/ghostspiral
 ./gs
 ```
 
-That `./gs` shortcut was created by the installer — it uses the venv
-automatically so you don't have to activate it every time.
-
-Or if you prefer to activate manually:
-
-```
-source .venv/bin/activate
-python3 run
-```
-
-Interactive menu:
-
-```
-1  Full Pipeline          BTC -> mixed XMR
-2  Receive Mode           Mix XMR that already arrived
-3  Cold / Air-Gap         Offline signing
-4  Broadcast              Send signed TXs
-5  Resume                 Continue after crash
-6  Create Wallet          New receive address
-7  Swap Preparer          ThorChain deposit address
-8  Exit Planner           Plan XMR off-ramp
-9  Paranoia Cleanup       Wipe all traces
-0  System Check           Verify everything works
-t  Testnet / Dry Run      Test without real funds
-```
-
-**First time?** Start with `0` — it checks everything is wired up.
-
-**Want a safe test?** Use `t` — runs the whole pipeline with fake funds.
+Choose `0` to verify everything is connected.
 
 ---
 
-## 8. Stopping (when you're done)
-
-Go in reverse order: clean artifacts first, then stop services.
-
-**8a. Wipe GhostSpiral artifacts** (do this while Tor is still running):
+## When you're done
 
 ```
-./gs paranoia --dry-run   # preview what gets deleted
-./gs paranoia             # actually delete (sudo recommended)
+./gs
 ```
 
-**8b. Stop wallet RPC:**
+Choose `9` (Paranoia Cleanup). Then:
 
 ```
-kill $(pgrep monero-wallet-rpc)
-```
-
-(Or Ctrl+C if it's running in a terminal.)
-
-**8c. Stop monerod:**
-
-```
+pkill monero-wallet-rpc
 monerod exit
-```
-
-Don't `kill -9` it — that can corrupt the blockchain database.
-
-**8d. Stop Tor** (optional — you probably want to keep it):
-
-```
-sudo systemctl stop tor
-```
-
-**8e. Clean up your shell:**
-
-```
-unset GS_WALLET_PASSWORD TOR_CONTROL_PASSWORD
+unset GS_WALLET_PASSWORD
 history -c && history -w
 ```
 
-**Verify nothing's left running:**
-
-```
-pgrep -a monero || echo "No Monero processes"
-ss -tlnp | grep -E '18081|18083|9050' || echo "No GhostSpiral ports open"
-```
+| Command | What it does |
+|---------|-------------|
+| `./gs` → `9` | Wipes all toolkit artifacts and logs |
+| `pkill monero-wallet-rpc` | Stops the wallet server |
+| `monerod exit` | Stops the blockchain node cleanly |
+| `unset GS_WALLET_PASSWORD` | Removes password from shell memory |
+| `history -c && history -w` | Clears command history |
 
 ---
 
-## Common workflows
+## Quick reference
 
-**Receive XMR (someone sends you BTC):**
-
-1. `6` Create Wallet — get a fresh XMR address
-2. `7` Swap Preparer — get a BTC deposit address via ThorChain
-3. Give the BTC address + memo to the sender
-4. Wait for XMR to arrive
-5. `2` Receive Mode — mix the XMR
-6. `9` Paranoia Cleanup — wipe traces
-
-**Cold signing (maximum security):**
-
-1. Online machine: `3` Cold — creates unsigned plan
-2. Copy `unsigned/` to USB
-3. Offline machine: run the signer on the USB files
-4. Copy `tx_staging/signed/` back to USB
-5. Online machine: `4` Broadcast — sends the signed TXs
+| What | Command |
+|------|---------|
+| Run toolkit | `./gs` |
+| System check | `./gs` → `0` |
+| Enable firewall | `sudo bash tor_firewall.sh` |
+| Fix browser + CLI | `sudo bash tor_firewall.sh --setup-browser` |
+| Fix Malwarebytes | `sudo bash tor_firewall.sh --setup-bridges` |
+| Keep after reboot | `sudo bash tor_firewall.sh --persist` |
+| Disable firewall | `sudo bash tor_firewall.sh --undo` |
+| Check firewall | `sudo bash tor_firewall.sh --status` |
+| Start node | `monerod --detach --data-dir ~/.bitmonero` |
+| Stop node | `monerod exit` |
+| Start wallet-rpc | See Step 5 |
+| Stop wallet-rpc | `pkill monero-wallet-rpc` |
+| Cleanup | `./gs` → `9` |
 
 ---
 
@@ -295,68 +183,10 @@ ss -tlnp | grep -E '18081|18083|9050' || echo "No GhostSpiral ports open"
 
 | Problem | Fix |
 |---------|-----|
-| Red errors / version conflicts during pip install | Use `bash install.sh` — it creates a venv so nothing clashes with system packages |
-| "Running pip as root" warning | Use `bash install.sh` — it installs into `.venv/` not system Python |
-| `ModuleNotFoundError` | Make sure you're using `./gs` (uses the venv) or activate it first: `source .venv/bin/activate` |
-| `curl: (7) ... port 9050` | Tor isn't running. `sudo systemctl start tor`. Using Tor Browser? Try port 9150 |
-| `Tor leak detected` | `sudo systemctl start tor` |
-| `NEWNYM failed` | Re-run the ControlPort lines from step 3 |
-| `socks5:// leaks DNS` | Use `socks5h://` (with the h) |
-| `No wallet file` | Start wallet RPC (step 5c) |
-| `Method not found` | You're hitting port 18081 instead of 18083 |
-| `No swap routes` | THORNode endpoints are down. Check Tor, try again later |
-| `Invalid BTC address` | Must start with `bc1`, `1`, or `3` |
-| System Check shows `[!]` for Monero | Run step 4 |
-| System Check shows `[!]` for wallet-rpc | Run step 5c |
-
----
-
-## Proxy safety
-
-```
-NEVER use free/cheap/public SOCKS proxies with GhostSpiral.
-
-A malicious proxy can:
-  - See ALL your traffic (destinations, amounts, addresses)
-  - Modify RPC responses (swap destination = steal funds)
-  - Log your IP and correlate with blockchain activity
-
-ONLY use:
-  OK  Your local Tor (socks5h://127.0.0.1:9050 or :9150 for Tor Browser)
-  OK  A Tor instance on a VPS you control
-  NO  Public proxy lists
-  NO  "Free VPN" SOCKS
-  NO  Shared proxies from unknown providers
-```
-
----
-
-## Quick install (all-in-one)
-
-The installer handles everything — system packages, venv, Python deps, Tor config, Monero:
-
-```
-sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip python3-venv curl wget bzip2
-bash install.sh
-```
-
-That's it. Then run `./gs` to start.
-
----
-
-## File layout
-
-```
-ghostspiral/
-  gs                     <- shortcut (uses venv automatically)
-  run                    <- interactive launcher
-  install.sh             <- auto-installer (creates .venv/)
-  .venv/                 <- virtual environment (created by install.sh)
-  requirements.txt       <- Python dependencies
-  core/                  <- main pipeline
-  modules/               <- mixing & chaos
-  opsec/                 <- cleanup & anti-forensics
-  intel/                 <- OSINT collection
-```
-
-`./gs list` shows all available tools.
+| `wget: unable to resolve` | `sudo bash tor_firewall.sh --setup-browser` then `. /etc/profile.d/tor-proxy.sh` |
+| Browser can't connect | `sudo bash tor_firewall.sh --setup-browser` then restart Firefox |
+| Malwarebytes flags on host | `sudo bash tor_firewall.sh --setup-bridges` |
+| `ModuleNotFoundError` | `bash install.sh` |
+| `Cannot reach wallet-rpc` | Start wallet-rpc (Step 5) |
+| `Tor is NOT running` | `sudo systemctl start tor` |
+| Firewall locked me out | `sudo bash tor_firewall.sh --undo` |

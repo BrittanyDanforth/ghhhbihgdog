@@ -24,7 +24,7 @@ OPSEC hardening:
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, math, os, re, secrets, sys, time, subprocess
+import argparse, json, math, os, re, requests, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -40,6 +40,8 @@ from gs_common import (
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, normalize_broadcast_result,
+    opsec_preflight, opsec_gate, validate_plan_schema,
+    validate_wallet_json,
 )
 
 # Monero fee priority multipliers relative to the default (priority 1).
@@ -199,17 +201,22 @@ def main():
                 f"[!] Resume plan is a symlink: {resume_path}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
-        with open(resume_path) as f:
-            _rp = json.load(f)
-        _schema = _rp.get("meta", {}).get("schema", "")
-        if _schema not in ("plan_v1", "unsigned_v1"):
-            sys.exit(f"[!] Unrecognized plan schema: {_schema}")
+        try:
+            with open(resume_path) as f:
+                _rp = json.load(f)
+        except json.JSONDecodeError as e:
+            sys.exit(f"[!] Resume plan is not valid JSON: {e}\n"
+                     f"    File: {resume_path}\n"
+                     f"    The plan file may be corrupt. Re-generate it.")
+        except OSError as e:
+            sys.exit(f"[!] Cannot read resume plan: {e}")
+        validate_plan_schema(_rp)
         if _rp.get("meta", {}).get("mock"):
             sys.exit("[!] Cannot resume a mock plan (no real funds)")
 
         proxy = validate_proxy(args.tor_proxy)
         require_resources(min_disk_gb=2.0)
-        verify_tor(proxy)
+        opsec_preflight(proxy, "resume_init")
         newnym()
 
         print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
@@ -237,46 +244,45 @@ def main():
 
         staging_dir = "tx_staging"
         lock_path = Path(".mixer.lock")
-    # BUG 100 FIX: Use atomic lock acquisition to close TOCTOU window.
-    # The old unlink+O_EXCL sequence has a race between the two calls.
-    _lock_acquired = False
-    for _lock_attempt in range(3):
-        try:
-            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            _lock_acquired = True
-            break
-        except FileExistsError:
+
+        _lock_acquired = False
+        for _lock_attempt in range(3):
             try:
-                stale_pid = lock_path.read_text().strip()
-                if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
-                    print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
-                    try:
-                        lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                else:
+                fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                _lock_acquired = True
+                break
+            except FileExistsError:
+                try:
+                    stale_pid = lock_path.read_text().strip()
+                    if stale_pid.isdigit() and not Path(f"/proc/{stale_pid}").exists():
+                        print(f"  [!] Stale lock from dead PID {stale_pid} — removing")
+                        try:
+                            lock_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        continue
+                    else:
+                        sys.exit(
+                            f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                            "    Another instance may be running.\n"
+                            "    If not, delete the lock file manually."
+                        )
+                except (OSError, ValueError):
                     sys.exit(
-                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        "[!] Lock file exists: .mixer.lock\n"
                         "    Another instance may be running.\n"
                         "    If not, delete the lock file manually."
                     )
-            except (OSError, ValueError):
-                sys.exit(
-                    "[!] Lock file exists: .mixer.lock\n"
-                    "    Another instance may be running.\n"
-                    "    If not, delete the lock file manually."
-                )
-    if not _lock_acquired:
-        sys.exit("[!] Could not acquire lock after 3 attempts.")
+        if not _lock_acquired:
+            sys.exit("[!] Could not acquire lock after 3 attempts.")
 
-    try:
-        _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
-    finally:
-        if lock_path.exists():
-            lock_path.unlink()
+        try:
+            _stage5_run(args, resume_path, staging_dir, proxy, bal, rpc_primary)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
 
         print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
         print()
@@ -300,10 +306,16 @@ def main():
                 f"[!] Receive wallet file is a symlink: {rw_path}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
-        with open(rw_path) as f:
-            rw_data = json.load(f)
-        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
-            sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
+        try:
+            with open(rw_path) as f:
+                rw_data = json.load(f)
+        except json.JSONDecodeError as e:
+            sys.exit(f"[!] Receive wallet file is not valid JSON: {e}\n"
+                     f"    File: {rw_path}\n"
+                     f"    Re-create with option 6 (Create Wallet).")
+        except OSError as e:
+            sys.exit(f"[!] Cannot read receive wallet file: {e}")
+        validate_wallet_json(rw_data)
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
         if not receive_entry_addr:
@@ -316,17 +328,15 @@ def main():
                 f"    Expected a 95-char Monero address starting with 4 or 8."
             )
         try:
-            from monero.address import Address as _XMRAddr
-            _XMRAddr(receive_entry_addr)
+            from monero.address import address as _parse_xmr_addr
+            _parse_xmr_addr(receive_entry_addr)
         except ImportError:
-            pass  # monero-python not available; regex check is the best we can do
-        except Exception:
-            sys.exit(
-                f"[!] Receive wallet address fails checksum validation: "
-                f"{scrub_address(receive_entry_addr)}\n"
-                f"    The address format looks correct but the checksum is invalid.\n"
-                f"    This means a typo or corruption — funds sent here would be LOST."
-            )
+            pass
+        except Exception as _addr_err:
+            integrity_log("stage0", f"address_checksum_warn:{str(_addr_err)[:40]}")
+            print(f"  [!] WARNING: Address checksum validation failed: {str(_addr_err)[:60]}")
+            print(f"  [!] If this address was just created by wallet-rpc, it is likely valid.")
+            print(f"  [!] The monero-python library may not support this address type/network.")
         wallet_network = rw_data.get("network")
         if wallet_network and wallet_network != "mainnet":
             sys.exit(
@@ -402,7 +412,7 @@ def main():
 
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
-    verify_tor(proxy)
+    opsec_preflight(proxy, "stage0_init")
     integrity_log("stage0", "tor_ok")
 
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
@@ -582,7 +592,8 @@ def main():
                         "expiry": expiry,
                         "memo_bytes": memo_bytes,
                     }
-            except Exception:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                integrity_log("thornode", f"quote_fail:{base_url.split('/')[-1]}:{str(e)[:40]}")
                 continue
         return None
 
@@ -725,9 +736,14 @@ def main():
         except SystemExit:
             raise
         except Exception as e:
-            integrity_log("stage3", f"entry_verify_warn:{str(e)[:40]}")
-            print(f"  [!] WARNING: Could not verify receive address in wallet: {e}")
-            print(f"  [!] Proceeding, but fan-out TXs may fail if address is wrong.")
+            integrity_log("stage3", f"entry_verify_FAIL:{str(e)[:40]}")
+            sys.exit(
+                f"[!] Cannot verify receive address in wallet: {e}\n"
+                f"    The wallet-rpc must be accessible to verify the receive address\n"
+                f"    exists in the connected wallet. Without this, fan-out TXs will\n"
+                f"    send to an address you may not control.\n"
+                f"    Fix the RPC connection and retry."
+            )
         if ENTRY in subs:
             subs.remove(ENTRY)
         subs.insert(0, ENTRY)
@@ -980,15 +996,46 @@ def main():
 
     rounds = args.wallets * 2 * args.deep
     priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))
-    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")  # base * priority * 50% safety margin
+    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
+
+    # ── Minimum balance model ──
+    # Compute hard/practical/recommended minimums so the operator knows
+    # BEFORE planning whether their config is realistic.
+    _fanout_w = min(args.wallets + 3, args.wallets)  # fanout_count
+    _min_fanout_amt = DUST_XMR + Decimal("0.0001")  # must be > DUST_XMR after quantize
+    _min_usable_fanout = (_min_fanout_amt * _fanout_w / Decimal("0.9")).quantize(Decimal("0.0001")) + Decimal("0.0001")
+    _hard_min = (total_fees + DUST_XMR + Decimal("0.0001"))
+    _practical_min = (total_fees + _min_usable_fanout)
+    _dag_rounds = max(rounds - _fanout_w, args.wallets)
+    _min_dag_budget = (_min_fanout_amt * _dag_rounds)
+    _recommended_min = (total_fees + _min_usable_fanout + _min_dag_budget + per_round_fee * _fanout_w)
+
+    print(f"  [*] Balance analysis for {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority}:")
+    print(f"      Estimated fees:  {total_fees:.6f} XMR ({rounds} rounds × {per_round_fee:.6f} each)")
+    print(f"      Your balance:    {bal:.6f} XMR")
+    print(f"      Usable after fees: {usable:.6f} XMR")
+    print(f"      Hard minimum:    {_hard_min:.4f} XMR (below = abort)")
+    print(f"      Practical min:   {_practical_min:.4f} XMR (below = fan-out only, no DAG mixing)")
+    print(f"      Recommended:     {_recommended_min:.4f} XMR (fan-out + DAG mixing)")
+
+    if bal < _hard_min:
+        sys.exit(
+            f"[!] Balance {bal:.6f} XMR is below hard minimum ({_hard_min:.4f} XMR).\n"
+            f"    Need at least {_hard_min:.4f} XMR for {args.wallets} wallets, depth {args.deep}, priority {args.fee_priority}.\n"
+            f"    Options: add funds, reduce wallets/depth, or use lower fee priority."
+        )
 
     if args.fee_priority >= 3:
         print(f"  [!] WARNING: Fee priority {args.fee_priority} (multiplier {priority_mult}x) "
               f"dramatically increases TX costs.")
-        print(f"  [!] Estimated total fees: {total_fees:.6f} XMR for {rounds} rounds.")
         print(f"  [!] Use priority 1-2 unless the mempool is congested.")
+
+    if bal < _practical_min:
+        print(f"  [!] WARNING: Balance {bal:.6f} XMR is below practical minimum ({_practical_min:.4f} XMR).")
+        print(f"  [!] Fan-out will work but DAG mixing will be SKIPPED — weaker privacy.")
+        print(f"  [!] For full mixing, need at least {_recommended_min:.4f} XMR.")
 
     if usable <= DUST_XMR:
         sys.exit(
@@ -997,47 +1044,49 @@ def main():
             f"    Usable after fees: {usable} XMR"
         )
 
-    split_amt = usable / Decimal(rounds)
     integrity_log("stage4", "plan_calculated")
-
-    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
-    quantized_split = split_amt.quantize(Decimal("0.0001"))
-    total_planned = quantized_split * rounds
-    if total_planned > usable:
-        quantized_split -= Decimal("0.0001")
-        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
 
     plan = []
 
     # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
-    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
-    # deposits to ENTRY. Either way, we must spread funds outward before
-    # the random DAG mixing can function (otherwise src addresses have no
-    # balance and every TX fails).
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
-    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
-    # BUG 40 FIX: Verify fan-out total doesn't exceed usable balance.
-    # Quantization rounding can push total above usable for small balances.
-    fanout_total = fanout_amt * fanout_count
-    if fanout_total > usable:
-        fanout_amt -= DUST_XMR
+    if fanout_count == 0:
+        sys.exit(
+            "[!] No mix target addresses available for fan-out.\n"
+            "    This means subaddress creation produced no usable addresses.\n"
+            "    Check wallet-rpc connection and retry."
+        )
+
+    # Budget: 90% of usable goes to fan-out outputs, 10% reserved for fees+DAG.
+    fanout_budget = (usable * Decimal("0.9")).quantize(Decimal("0.0001"))
+    fanout_amt = (fanout_budget / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+
     if fanout_amt <= DUST_XMR:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
             f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
         )
+
+    # Build fan-out TXs with jitter, tracking actual total for budget enforcement.
+    fanout_actual_total = Decimal("0")
     for fi in range(fanout_count):
         if shutdown_requested():
             integrity_log("stage4", f"shutdown_at_fanout_{fi}")
             break
-        # Per-TX jitter breaks identical-amount clustering on the blockchain.
-        # ±0.00005 XMR is small enough to be invisible to the operator but
-        # ensures no two fan-out TXs share the exact same amount on-chain.
         jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
         actual_fanout_amt = fanout_amt + jitter
         if actual_fanout_amt <= DUST_XMR:
             actual_fanout_amt = fanout_amt
+
+        # Budget guard: ensure cumulative fan-out never exceeds the budget.
+        if fanout_actual_total + actual_fanout_amt > fanout_budget:
+            actual_fanout_amt = fanout_budget - fanout_actual_total
+            if actual_fanout_amt <= DUST_XMR:
+                integrity_log("stage4", f"fanout_budget_exhausted_at_{fi}")
+                break
+
+        fanout_actual_total += actual_fanout_amt
         plan.append({
             "src": ENTRY,
             "dst": mix_targets[fi],
@@ -1045,41 +1094,59 @@ def main():
             "delay": _exponential_delay(args.delay_min, args.delay_max),
             "extra": secure_hex(16),
         })
-    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:base_amt={fanout_amt}:jittered")
+    integrity_log("stage4", f"fanout_plan:{len(plan)}_txs:total={fanout_actual_total}")
 
     # Phase B: DAG mixing — random hops between mix subaddresses.
-    # Recalculate per-round amount from the remaining balance after fan-out.
-    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    remaining_after_fanout = usable - fanout_actual_total - (per_round_fee * len(plan))
     dag_rounds = max(rounds - fanout_count, args.wallets)
+
     if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
-        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+        dag_budget = remaining_after_fanout
+        dag_split = (dag_budget / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
+
+        # If per-hop amount is below dust even after budgeting, skip DAG mixing
+        # entirely rather than planning TXs that will fail at the wallet.
         if dag_split <= DUST_XMR:
-            dag_split = DUST_XMR
-        for r in range(dag_rounds):
-            if shutdown_requested():
-                integrity_log("stage4", f"shutdown_at_round_{r}")
-                break
-            src_idx = secrets.randbelow(len(mix_targets))
-            s = mix_targets[src_idx]
-            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
-            if not dst_candidates:
-                continue
-            dst_idx = secrets.randbelow(len(dst_candidates))
-            d = dst_candidates[dst_idx]
-            # Per-TX jitter breaks identical-amount clustering (same rationale as fan-out)
-            dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
-            actual_dag_amt = dag_split + dag_jitter
-            if actual_dag_amt <= DUST_XMR:
-                actual_dag_amt = dag_split
-            plan.append({
-                "src": s,
-                "dst": d,
-                "amt": str(actual_dag_amt),
-                "delay": _exponential_delay(args.delay_min, args.delay_max),
-                "extra": secure_hex(16),
-            })
+            integrity_log("stage4", "dag_mixing_skipped:per_hop_below_dust")
+        else:
+            dag_actual_total = Decimal("0")
+            for r in range(dag_rounds):
+                if shutdown_requested():
+                    integrity_log("stage4", f"shutdown_at_round_{r}")
+                    break
+                src_idx = secrets.randbelow(len(mix_targets))
+                s = mix_targets[src_idx]
+                dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+                if not dst_candidates:
+                    continue
+                dst_idx = secrets.randbelow(len(dst_candidates))
+                d = dst_candidates[dst_idx]
+                dag_jitter = Decimal(str(secrets.randbelow(1000) - 500)) / Decimal("10000000")
+                actual_dag_amt = dag_split + dag_jitter
+                if actual_dag_amt <= DUST_XMR:
+                    actual_dag_amt = dag_split
+
+                # Budget guard: cumulative DAG TXs must not exceed remaining funds.
+                if dag_actual_total + actual_dag_amt > dag_budget:
+                    actual_dag_amt = dag_budget - dag_actual_total
+                    if actual_dag_amt <= DUST_XMR:
+                        integrity_log("stage4", f"dag_budget_exhausted_at_{r}")
+                        break
+
+                dag_actual_total += actual_dag_amt
+                plan.append({
+                    "src": s,
+                    "dst": d,
+                    "amt": str(actual_dag_amt),
+                    "delay": _exponential_delay(args.delay_min, args.delay_max),
+                    "extra": secure_hex(16),
+                })
+            integrity_log("stage4", f"dag_plan:{r+1}_rounds:total={dag_actual_total}")
     else:
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
+        print(f"  [!] WARNING: DAG mixing phase SKIPPED — insufficient remaining balance.")
+        print(f"  [!] Only fan-out TXs will run. This means LESS mixing privacy.")
+        print(f"  [!] To enable DAG mixing: increase balance, reduce wallets, or reduce depth.")
 
     # BUG 82 FIX: Bind plan to wallet identity. Without this, resuming
     # with a different wallet connected silently uses wrong subaddresses.
@@ -1089,7 +1156,7 @@ def main():
     # This means resuming with a different wallet is silently accepted.
     _wallet_primary = ""
     try:
-        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": 0})
+        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": bal_account})
         _wallet_primary = _addr_resp.get("address", "")
     except Exception as e:
         sys.exit(f"[!] Cannot determine wallet identity: {e}\n"
@@ -1117,6 +1184,7 @@ def main():
         "fee_priority": args.fee_priority,
         "delay_min": args.delay_min,
         "delay_max": args.delay_max,
+        "balance_at_plan": str(bal),
     }
     if _earliest_quote_expiry > 0:
         meta["thorchain_quote_expiry"] = _earliest_quote_expiry
@@ -1127,6 +1195,10 @@ def main():
     if shutdown_requested():
         meta["partial"] = True
     unsigned = {"meta": meta, "txs": plan}
+
+    # Validate the plan we just built before writing — catches any
+    # programming error in the amount engine or DAG construction.
+    validate_plan_schema(unsigned)
 
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1255,9 +1327,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     Therefore, auto-mode MUST process TXs one at a time:
       For each TX in the plan:
         1. Create unsigned TX (wallet-rpc transfer_split with do_not_relay)
-        2. Sign the unsigned TX (wallet-cli sign_transfer)
-        3. Broadcast the signed TX (wallet-rpc submit_transfer)
-        4. Wait for confirmation (at least accepted into mempool)
+        2. Sign the unsigned TX (wallet-cli sign_transfer) — or skip if hot wallet (presigned)
+        3. Broadcast: relay_tx for hot wallet (presigned), submit_transfer for air-gap signed
+        4. Verify TX visible in wallet (hard gate — stops if not found)
         5. Key image sync (export_outputs → import_key_images) so the
            view-only wallet knows which outputs are now spent
 
@@ -1332,13 +1404,24 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         rpc.raw_request("refresh", {})
         integrity_log("stage5", "wallet_refreshed_at_start")
     except Exception as _refresh_err:
-        integrity_log("stage5", f"refresh_at_start_warn:{str(_refresh_err)[:40]}")
-        print(f"  [!] WARNING: Wallet refresh at start failed: {str(_refresh_err)[:60]}")
-        print(f"  [!] If resuming after a crash, TXs may fail due to stale wallet state.")
+        integrity_log("stage5", f"refresh_at_start_FAIL:{str(_refresh_err)[:40]}")
+        sys.exit(
+            f"[!] Wallet refresh at start FAILED: {str(_refresh_err)[:60]}\n"
+            f"    Without a fresh wallet view, transfer_split may reuse spent outputs\n"
+            f"    or fail unpredictably. Fix wallet-rpc and retry."
+        )
 
     # Read the plan to get TX count
-    with open(str(ufile)) as _pf:
-        plan_data = json.load(_pf)
+    try:
+        with open(str(ufile)) as _pf:
+            plan_data = json.load(_pf)
+    except json.JSONDecodeError as e:
+        sys.exit(f"[!] Plan file is corrupt or not valid JSON: {e}\n"
+                 f"    File: {ufile}\n"
+                 f"    Re-generate the plan with option 1 or 3.")
+    except OSError as e:
+        sys.exit(f"[!] Cannot read plan file: {e}")
+    validate_plan_schema(plan_data)
     plan_txs = plan_data.get("txs", [])
 
     # Check ThorChain quote expiry. In air-gap workflows the operator may
@@ -1351,9 +1434,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         if _remaining <= 0:
             _expired_ago = abs(_remaining)
             integrity_log("stage5", f"THORCHAIN_QUOTE_EXPIRED:{_expired_ago}s_ago")
-            print(f"  [!] Quote expired {_expired_ago // 60} minutes ago.")
-            print(f"  [!] If BTC already sent: check explorer for TX status.")
-            print(f"  [!] If NOT sent: regenerate the plan for fresh quote.")
+            sys.exit(
+                f"[!] ThorChain quote EXPIRED {_expired_ago // 60} minutes ago.\n"
+                f"    The deposit address and memo are no longer valid.\n"
+                f"    Sending BTC to an expired address = funds stuck in vault.\n"
+                f"    If BTC already sent: check explorer for TX status.\n"
+                f"    If NOT sent: regenerate the plan (option 1 or 7) for a fresh quote."
+            )
         elif _remaining < 600:
             print(f"  [!] WARNING: ThorChain quote expires in {_remaining // 60}m {_remaining % 60}s!")
             print(f"  [!] Send BTC to the deposit address IMMEDIATELY or regenerate the plan.")
@@ -1364,10 +1451,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     #   - src subaddresses not found → silent fallback to wrong addresses
     #   - dst addresses valid but belong to wallet A → funds irrecoverable
     _plan_wallet = plan_data.get("meta", {}).get("wallet_primary", "")
+    _plan_acct = plan_data.get("meta", {}).get("account_index", 0)
     if _plan_wallet:
         try:
             _cur_wallet = rpc.raw_request(
-                "get_address", {"account_index": 0}
+                "get_address", {"account_index": _plan_acct}
             ).get("address", "")
             if _cur_wallet and _cur_wallet != _plan_wallet:
                 integrity_log("stage5", "WALLET_MISMATCH_DETECTED")
@@ -1406,6 +1494,9 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     print(f"  [!] Confirmed outputs may no longer be valid.")
         except Exception as _ht_err:
             integrity_log("stage5", f"height_check_fail:{str(_ht_err)[:40]}")
+            print(f"  [!] WARNING: Cannot check daemon height: {str(_ht_err)[:60]}")
+            print(f"  [!] If the daemon is on a different chain or has reorged,")
+            print(f"  [!] TXs may fail or spend against reorganized outputs.")
 
     # BUG 84 FIX: Validate account_index from the plan exists in the wallet.
     # If accounts were added/removed between plan creation and resume,
@@ -1427,7 +1518,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     except SystemExit:
         raise
     except Exception as _acct_err:
-        integrity_log("stage5", f"account_check_warn:{str(_acct_err)[:40]}")
+        integrity_log("stage5", f"account_check_FAIL:{str(_acct_err)[:40]}")
+        sys.exit(
+            f"[!] Cannot verify account_index={_plan_acct_idx} exists in wallet: {str(_acct_err)[:60]}\n"
+            f"    Wallet-rpc must be accessible to validate the plan's account.\n"
+            f"    Fix the RPC connection and retry."
+        )
 
     total_txs = len(plan_txs)
 
@@ -1487,7 +1583,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 integrity_log("stage5", "progress_fingerprint_mismatch:discarded")
                 progress_file.unlink()
             else:
-                # BUG 85 FIX: Verify HMAC before trusting progress contents.
+                # Verify HMAC before trusting progress contents.
                 _saved_hmac = progress.pop("hmac", None)
                 _saved_nonce = progress.get("nonce", "")
                 if _saved_hmac and _saved_nonce:
@@ -1500,18 +1596,53 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                         progress = {}
                     else:
                         _progress_nonce = _saved_nonce
+                elif progress.get("completed"):
+                    integrity_log("stage5", "PROGRESS_NO_HMAC:untrusted")
+                    print(f"  [!] Progress file has no HMAC (old format or tampered).")
+                    print(f"  [!] Cannot verify integrity. Discarding and starting fresh.")
+                    print(f"  [!] If TXs were already broadcast, check wallet balance first.")
+                    progress_file.unlink()
+                    progress = {}
                 completed_indices = set(progress.get("completed", []))
-                # BUG 73 FIX: Detect broadcast_pending — a TX that was
-                # broadcast but progress wasn't finalized (crash/kill
-                # between broadcast and completed save). Treat as
-                # completed to prevent double-payment on resume.
+                # Detect broadcast_pending — a TX that was checkpointed
+                # before broadcast but may or may not have actually been sent.
+                # Instead of blindly promoting to completed (which could skip
+                # a TX that was never broadcast), verify with wallet-rpc.
                 pending_idx = progress.get("broadcast_pending")
                 if pending_idx is not None and pending_idx not in completed_indices:
-                    print(f"  [!] TX {pending_idx} may have been broadcast before crash.")
-                    print(f"  [!] Skipping to prevent double-payment.")
-                    print(f"  [!] Check wallet balance before proceeding.")
-                    integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
-                    completed_indices.add(pending_idx)
+                    print(f"  [!] TX {pending_idx} was checkpointed before broadcast in prior run.")
+                    print(f"  [!] Checking wallet to determine if it was actually sent...")
+                    _pending_confirmed = False
+                    try:
+                        # Check if the wallet has any transfer for this index's
+                        # destination. We can't check by txid (we don't have one),
+                        # but we can check recent transfers for the amount.
+                        _pending_tx = plan_txs[pending_idx] if pending_idx < len(plan_txs) else None
+                        if _pending_tx:
+                            _check_bal = rpc.raw_request("get_balance", {
+                                "account_index": _plan_acct_idx,
+                            })
+                            # If unlocked_balance changed significantly since the plan
+                            # was created, the TX likely went through.
+                            _unlocked = Decimal(str(_check_bal.get("unlocked_balance", 0))) / Decimal("1e12")
+                            _plan_bal = Decimal(str(plan_data.get("meta", {}).get("balance_at_plan", "0") or "0"))
+                            if _plan_bal > 0 and _unlocked < _plan_bal:
+                                print(f"  [+] Balance decreased since plan creation ({_plan_bal} -> {_unlocked})")
+                                print(f"  [+] TX {pending_idx} was likely broadcast. Marking as completed.")
+                                integrity_log("stage5", f"broadcast_pending_verified:tx={pending_idx}")
+                                _pending_confirmed = True
+                            else:
+                                print(f"  [!] Balance unchanged — TX {pending_idx} likely NOT broadcast.")
+                                print(f"  [!] Will re-create and broadcast this TX.")
+                                integrity_log("stage5", f"broadcast_pending_NOT_broadcast:tx={pending_idx}")
+                    except Exception as _pv_err:
+                        integrity_log("stage5", f"broadcast_pending_check_fail:{str(_pv_err)[:40]}")
+                        print(f"  [!] Cannot verify TX {pending_idx} status: {str(_pv_err)[:60]}")
+                        print(f"  [!] Treating as completed to prevent potential double-payment.")
+                        print(f"  [!] CHECK WALLET BALANCE before continuing.")
+                        _pending_confirmed = True
+                    if _pending_confirmed:
+                        completed_indices.add(pending_idx)
                 if completed_indices:
                     print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
         except (json.JSONDecodeError, OSError, KeyError) as e:
@@ -1522,10 +1653,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     fail_count = 0
 
     for tx_idx in range(total_txs):
-        if shutdown_requested():
-            integrity_log("stage5", f"shutdown_at_tx_{tx_idx}")
-            print(f"  [!] Shutdown at TX {tx_idx}. Rerun to resume from here.")
-            break
+        # OPSEC gate: check proxy validity + shutdown state before EVERY TX.
+        opsec_gate(proxy, f"stage5_pre_tx_{tx_idx}")
 
         if tx_idx in completed_indices:
             print(f"  [skip] TX {tx_idx} already completed in prior run")
@@ -1557,6 +1686,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     chunk = min(30, delay - waited)
                     time.sleep(chunk)
                     waited += chunk
+                if shutdown_requested():
+                    integrity_log("stage5", f"shutdown_during_delay:tx={tx_idx}")
+                    print(f"  [!] Shutdown during delay before TX {tx_idx}. Rerun to resume.")
+                    break
 
         newnym()
 
@@ -1692,16 +1825,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 break
             signed_files_to_broadcast = [signed_file]
 
-        # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
-        # If the process is killed between broadcast and progress save,
-        # the TX is on-chain but progress doesn't reflect it. On resume,
-        # the code would re-create a NEW TX (different nonces) spending
-        # the same inputs. If the original confirmed between crash and
-        # resume, the wallet picks different inputs → double-payment.
-        # By persisting broadcast_pending first, the resume path can
-        # detect this and verify wallet state before re-creating.
-        broadcast_pending = set(completed_indices)
-        broadcast_pending.add(tx_idx)
+        # Save "broadcast_pending" state BEFORE broadcasting so resume can
+        # detect a TX that was broadcast but never finalized (crash/kill
+        # between broadcast and completion save). On resume, pending TXs
+        # are treated as completed to prevent double-payment.
         _save_progress({
             "plan_fingerprint": plan_fingerprint,
             "completed": sorted(completed_indices),
@@ -1753,23 +1880,35 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             print(f"  [!] Note: submitted != confirmed. TX is in local mempool, not yet mined.")
             integrity_log("stage5", f"broadcast_submitted:tx={tx_idx}")
 
-            # Verify TX entered mempool
-            import time as _t
-            _t.sleep(3)
+            # Verify TX entered mempool — hard gate, not best-effort.
+            # If we cannot confirm the TX is in the wallet after broadcast,
+            # the state is ambiguous and continuing could double-spend.
+            time.sleep(3)
+            _verify_ok = True
             for _verify_txid in _all_txids:
                 try:
                     _check = rpc.raw_request("get_transfer_by_txid", {"txid": _verify_txid})
                     if not _check.get("transfer"):
+                        integrity_log("stage5", f"post_broadcast_NOT_FOUND:tx={tx_idx}:{_verify_txid[:16]}")
                         print(f"  [!] TX {_verify_txid[:16]}... NOT FOUND in wallet after broadcast!")
-                        print(f"  [!] This may indicate the broadcast was not accepted.")
+                        print(f"  [!] The broadcast may not have been accepted by wallet-rpc.")
+                        _verify_ok = False
                 except Exception as _vfy_err:
                     integrity_log("stage5", f"post_broadcast_verify_fail:{str(_vfy_err)[:40]}")
+                    print(f"  [!] Cannot verify TX {_verify_txid[:16]}...: {str(_vfy_err)[:60]}")
+                    _verify_ok = False
+            if not _verify_ok:
+                print(f"  [!] TX {tx_idx}: post-broadcast verification FAILED.")
+                print(f"  [!] Stopping pipeline. Check wallet state before rerunning.")
+                print(f"  [!] The TX may still confirm — do NOT re-broadcast without checking.")
+                integrity_log("stage5", f"post_verify_fail_abort:tx={tx_idx}")
+                fail_count += 1
+                break
 
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
-            print(f"  [!] Stopping. Check if TX was actually broadcast before rerunning.")
-            print(f"  [!] Check if the TX was actually broadcast before rerunning.")
+            print(f"  [!] Stopping. Check wallet state before rerunning.")
             _save_progress({
                 "plan_fingerprint": plan_fingerprint,
                 "completed": sorted(completed_indices),

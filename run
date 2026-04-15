@@ -114,20 +114,23 @@ def check_prereqs() -> dict:
     # Tor (system tor SOCKS 9050; Tor Browser embedded tor 9150)
     status["tor"] = False
     status["tor_port"] = None
-    import requests as _r
-    for _tor_port in (9050, 9150):
-        try:
-            _px = {
-                "http": f"socks5h://127.0.0.1:{_tor_port}",
-                "https": f"socks5h://127.0.0.1:{_tor_port}",
-            }
-            resp = _r.get("https://check.torproject.org/api/ip", proxies=_px, timeout=10)
-            if resp.json().get("IsTor"):
-                status["tor"] = True
-                status["tor_port"] = _tor_port
-                break
-        except Exception:
-            continue
+    try:
+        import requests as _r
+        for _tor_port in (9050, 9150):
+            try:
+                _px = {
+                    "http": f"socks5h://127.0.0.1:{_tor_port}",
+                    "https": f"socks5h://127.0.0.1:{_tor_port}",
+                }
+                resp = _r.get("https://check.torproject.org/api/ip", proxies=_px, timeout=10)
+                if resp.json().get("IsTor"):
+                    status["tor"] = True
+                    status["tor_port"] = _tor_port
+                    break
+            except Exception:
+                continue
+    except ImportError:
+        pass
 
     # Monero
     for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
@@ -135,8 +138,8 @@ def check_prereqs() -> dict:
 
     # Wallet RPC running?
     try:
-        import requests as _r
-        resp = _r.post("http://127.0.0.1:18083/json_rpc",
+        import requests as _r2
+        resp = _r2.post("http://127.0.0.1:18083/json_rpc",
                         json={"jsonrpc":"2.0","id":"0","method":"get_height"},
                         timeout=3)
         status["wallet_rpc"] = resp.status_code == 200
@@ -197,20 +200,22 @@ def show_status(st: dict):
 def menu_main():
     clear()
     banner()
-    print(f"  {B}1{N}  {G}Full Pipeline{N}          BTC → mixed XMR (guided setup)")
-    print(f"  {B}2{N}  {G}Receive Mode{N}           Mix XMR that already arrived")
-    print(f"  {B}3{N}  {G}Cold / Air-Gap{N}          Create unsigned plan for offline signing")
-    print(f"  {B}4{N}  {G}Broadcast{N}              Send signed TXs to network")
-    print(f"  {B}5{N}  {G}Resume{N}                 Continue from a crash")
+    print(f"  {G}── Send / Receive ─────────────────────────────────{N}")
+    print(f"  {B}1{N}  Full Pipeline          BTC → mixed XMR (guided)")
+    print(f"  {B}2{N}  Receive Mode           Mix XMR that already arrived")
+    print(f"  {B}6{N}  Create Wallet          Generate new XMR receive address")
+    print(f"  {B}7{N}  Swap Preparer          Get ThorChain BTC deposit address")
     print()
-    print(f"  {B}6{N}  {C}Create Wallet{N}          Generate new receive address")
-    print(f"  {B}7{N}  {C}Swap Preparer{N}          Get ThorChain deposit address")
-    print(f"  {B}8{N}  {C}Exit Planner{N}           Plan XMR off-ramp")
+    print(f"  {C}── Advanced ───────────────────────────────────────{N}")
+    print(f"  {B}3{N}  Cold / Air-Gap         Unsigned plan for offline signing")
+    print(f"  {B}4{N}  Broadcast              Send signed TXs to the network")
+    print(f"  {B}5{N}  Resume                 Continue after a crash")
+    print(f"  {B}8{N}  Exit Planner           Plan XMR off-ramp")
     print()
-    print(f"  {B}9{N}  {M}Paranoia Cleanup{N}       Wipe all traces from this machine")
-    print(f"  {B}0{N}  {M}System Check{N}           Verify deps, Tor, Monero")
-    print()
-    print(f"  {B}t{N}  {Y}Testnet / Dry Run{N}      Simulate full pipeline (no real funds)")
+    print(f"  {M}── System ─────────────────────────────────────────{N}")
+    print(f"  {B}0{N}  System Check           Verify Tor, Monero, deps")
+    print(f"  {B}9{N}  Paranoia Cleanup       Wipe ALL traces from this machine")
+    print(f"  {B}t{N}  Dry Run                Test the full pipeline (no real funds)")
     print()
     print(f"  {D}q  quit{N}")
     print()
@@ -299,6 +304,16 @@ def flow_full_pipeline(detected_port=None):
     splits = prompt("Split into how many chunks?", "2")
     wallets = prompt("Number of mix wallets", "10")
     depth = prompt("Mix depth", "2")
+
+    for label, val, min_val in [("Split", splits, 1), ("Wallets", wallets, 3), ("Depth", depth, 1)]:
+        try:
+            v = int(val)
+            if v < min_val:
+                err(f"{label} must be at least {min_val} (got {val})")
+                return
+        except ValueError:
+            err(f"{label} must be a number (got '{val}')")
+            return
 
     print()
     info("Starting full pipeline...")
@@ -737,6 +752,14 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print()
             continue
+        except SystemExit as _se:
+            if _se.code and str(_se.code).startswith("[!]"):
+                print(f"\n  {R}{_se.code}{N}")
+            pass
+        except Exception as _menu_err:
+            print()
+            err(f"Operation failed: {_menu_err}")
+            info("Returning to menu. Check the error above.")
 
         if choice not in ("q", "quit", "exit"):
             print()

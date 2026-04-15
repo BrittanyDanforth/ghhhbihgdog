@@ -121,32 +121,32 @@ def main():
                 entries = entries["manifest"]
             elif "entries" in entries:
                 entries = entries["entries"]
+            else:
+                sys.exit(
+                    f"[!] Manifest JSON has no 'manifest' or 'entries' key.\n"
+                    f"    Keys found: {list(entries.keys())[:10]}\n"
+                    f"    Expected format: {{\"entries\": [...]}}"
+                )
+        if not isinstance(entries, list):
+            sys.exit(f"[!] Manifest entries is not a list (got {type(entries).__name__})")
         for e in entries:
-            raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
-            # Handle split TX files: if the entry has split_files, use those instead
+            raw_name = Path(e["file"]).name if isinstance(e, dict) else Path(e).name
+            blob_path = manifest_dir / raw_name
             _split_files_list = e.get("split_files", []) if isinstance(e, dict) else []
             if _split_files_list:
                 for _sf_name in _split_files_list:
-                    _sf_path = Path(_sf_name)
+                    _sf_path = manifest_dir / Path(_sf_name).name
                     if _sf_path.exists():
                         blobs.append(_sf_path)
                     else:
-                        _sf_local = manifest_dir / _sf_path.name
-                        if _sf_local.exists():
-                            blobs.append(_sf_local)
-                        else:
-                            print(f"  [!] Split blob not found: {_sf_name}")
-                            integrity_log("broadcast", f"missing_split_blob:{_sf_name}")
+                        print(f"  [!] Split blob not found: {_sf_path}")
+                        integrity_log("broadcast", f"missing_split_blob:{Path(_sf_name).name}")
             else:
-                if raw_path.exists():
-                    blobs.append(raw_path)
+                if blob_path.exists():
+                    blobs.append(blob_path)
                 else:
-                    local = manifest_dir / raw_path.name
-                    if local.exists():
-                        blobs.append(local)
-                    else:
-                        print(f"  [!] Blob not found: {raw_path} (also tried {local})")
-                        integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
+                    print(f"  [!] Blob not found: {blob_path}")
+                    integrity_log("broadcast", f"missing_manifest_blob:{raw_name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
@@ -209,8 +209,9 @@ def main():
                     tx_delays[int(entry["idx"])] = int(entry["delay"])
             if tx_delays:
                 delay_source = "manifest"
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+            print(f"  [!] Warning: could not parse delays from manifest: {e}")
+            tx_delays = {}
 
     # Fallback: unsigned plan (only works if same machine/directory)
     if not tx_delays:
@@ -229,8 +230,9 @@ def main():
                             tx_delays[i] = int(tx["delay"])
                     if tx_delays:
                         delay_source = "unsigned_plan"
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+                print(f"  [!] Warning: could not parse delays from plan: {e}")
+                tx_delays = {}
 
     if tx_delays:
         integrity_log("broadcast", f"delays_loaded:{delay_source}")
@@ -302,8 +304,8 @@ def main():
                 if isinstance(_ue, dict) and _ue.get("presigned"):
                     _fname = Path(_ue.get("file", "")).name
                     _presigned_blobs[_fname] = True
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+            print(f"  [!] Warning: could not load unsigned manifest for presigned detection: {e}")
 
     # Compute blob fingerprint to bind progress to this specific set of blobs.
     # MUST include file content hashes, not just names. Otherwise, re-signed
@@ -325,14 +327,21 @@ def main():
         with open(progF) as f:
             prog = json.load(f)
         saved_fp = prog.get("blob_fingerprint", "")
-        if saved_fp and saved_fp != blob_fp:
+        if not saved_fp:
+            integrity_log("broadcast", "STALE_PROGRESS:no_fingerprint")
+            print("  [!] WARNING: Progress file has no blob fingerprint (old format).")
+            print("  [!] Cannot verify it matches this blob set. Resetting progress.")
+            prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
+            last_idx = -1
+        elif saved_fp != blob_fp:
             integrity_log("broadcast", "STALE_PROGRESS:blob_set_changed")
             sys.exit(
                 "[!] Broadcast progress is from a DIFFERENT set of blobs!\n"
                 "    Delete the progress file or use the matching blob set.\n"
                 "    Stale progress would silently skip TXs."
             )
-        last_idx = prog.get("last", -1)
+        else:
+            last_idx = prog.get("last", -1)
     else:
         prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
         last_idx = -1
@@ -381,9 +390,9 @@ def main():
         # The daemon's /sendrawtransaction expects raw TX hex (a completely
         # different format) and would reject signed_txset data.
         #
-        # Hot wallet blobs (from tx_metadata_list) are also binary on disk
-        # (decoded from hex during phase_create). They go through the same
-        # submit_transfer path.
+        # Hot wallet blobs (presigned via tx_metadata_list) use relay_tx.
+        # Air-gap signed blobs (via wallet-cli sign_transfer) use submit_transfer.
+        # The method is determined by _presigned_blobs lookup from unsigned_manifest.
         use_wallet_rpc = True  # always for our pipeline's .signed files
 
         # NEWNYM + planned delay before each TX for circuit isolation and
@@ -452,6 +461,10 @@ def main():
                         status = "OK"
                         is_double = False
                         txid = tx_hashes[0]
+                        if len(tx_hashes) > 1:
+                            print(f"  [+] TX {idx}: split into {len(tx_hashes)} on-chain TXs")
+                            for _ti, _th in enumerate(tx_hashes):
+                                print(f"      part {_ti}: {_th[:16]}...")
                     except ValueError as _nbe:
                         status = "FAILED"
                         is_double = False
@@ -493,27 +506,36 @@ def main():
                     mine_start = time.time()
                     confirmed = False
                     block_height = 0
-                    while txid and (time.time() - mine_start) < args.mine_wait:
+                    all_txids_to_check = tx_hashes if status == "OK" else [txid]
+                    while all_txids_to_check and (time.time() - mine_start) < args.mine_wait:
                         if shutdown_requested():
                             break
                         try:
                             q = _single_post(
                                 check_url,
-                                {"txs_hashes": [txid],
+                                {"txs_hashes": all_txids_to_check,
                                  "decode_as_json": False,
                                  "prune": False},
                                 proxy,
                             )
                             txs = q.get("txs", [])
-                            if txs:
-                                in_pool = txs[0].get("in_pool", True)
-                                ht = txs[0].get("block_height", 0)
-                                if not in_pool and ht > 0:
-                                    print(f"  [+] TX {idx} confirmed at height {ht}")
-                                    integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
-                                    confirmed = True
-                                    block_height = ht
-                                    break
+                            all_confirmed = False
+                            if len(txs) >= len(all_txids_to_check):
+                                all_confirmed = True
+                                for _txi, _txdata in enumerate(txs):
+                                    in_pool = _txdata.get("in_pool", True)
+                                    ht = _txdata.get("block_height", 0)
+                                    if not in_pool and ht > 0:
+                                        if not confirmed:
+                                            block_height = ht
+                                    else:
+                                        all_confirmed = False
+                            if all_confirmed and len(txs) >= len(all_txids_to_check):
+                                print(f"  [+] TX {idx} confirmed at height {block_height}"
+                                      f"{' (' + str(len(all_txids_to_check)) + ' parts)' if len(all_txids_to_check) > 1 else ''}")
+                                integrity_log("broadcast", f"mined:idx={idx}:ht={block_height}")
+                                confirmed = True
+                                break
                         except Exception as poll_err:
                             integrity_log("broadcast", f"poll_err:idx={idx}:{str(poll_err)[:30]}")
                         time.sleep(30 + secrets.randbelow(60))
@@ -560,7 +582,8 @@ def main():
                         break
             except requests.exceptions.ConnectionError as e:
                 integrity_log("broadcast", f"rpc_down:idx={idx}:{str(e)[:40]}")
-                print(f"  [!] Cannot reach wallet-rpc at {args.wallet_rpc} — is it running?")
+                _wrpc_safe = f"{urlparse(args.wallet_rpc).hostname}:{urlparse(args.wallet_rpc).port}"
+                print(f"  [!] Cannot reach wallet-rpc at {_wrpc_safe} — is it running?")
                 print(f"  [!] Error: {str(e)[:80]}")
             except Exception as e:
                 integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")

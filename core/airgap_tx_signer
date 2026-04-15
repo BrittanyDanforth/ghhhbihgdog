@@ -296,7 +296,8 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "split_files": split_files if len(all_blobs) > 1 else [],
             })
             created += 1
-            print(f"  [+] TX {idx} -> {tx_file.name}")
+            if not is_presigned:
+                print(f"  [+] TX {idx} -> {tx_file.name} (unsigned, needs signing)")
 
         except Exception as e:
             integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")
@@ -310,9 +311,15 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         try:
             with open(manifest_path) as f:
                 existing = json.load(f)
-            existing_entries = existing.get("entries", [])
-        except Exception:
-            pass
+            if isinstance(existing, dict):
+                existing_entries = existing.get("entries", [])
+            elif isinstance(existing, list):
+                existing_entries = existing
+            else:
+                existing_entries = []
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            print(f"  [!] Warning: corrupt existing manifest, starting fresh: {e}")
+            existing_entries = []
 
     # Merge new entries with existing (for iterative create)
     existing_by_idx = {e["idx"]: e for e in existing_entries}
@@ -434,14 +441,29 @@ def phase_sign(args, plan: List[dict]):
         return
 
     signed_dir = outdir / "signed"
-    # Only wipe the signed dir in batch mode (no --tx-index).
     # In iterative mode, prior signed files belong to already-broadcast TXs.
+    # In batch mode, only remove unsigned-origin files (NOT presigned blobs
+    # from phase_create which are already valid signed blobs).
     if tx_index is None and signed_dir.is_dir():
-        shutil.rmtree(signed_dir)
+        for old_file in signed_dir.iterdir():
+            if old_file.suffix == ".signed":
+                # Check if this blob is from a presigned entry — keep those
+                _is_presigned_blob = False
+                for _e in entries:
+                    if _e.get("presigned") and old_file.name == _e.get("file"):
+                        _is_presigned_blob = True
+                        break
+                    if _e.get("presigned") and _e.get("split_files"):
+                        if old_file.name in _e["split_files"]:
+                            _is_presigned_blob = True
+                            break
+                if not _is_presigned_blob:
+                    old_file.unlink(missing_ok=True)
     signed_dir.mkdir(parents=True, exist_ok=True)
 
     signed_manifest = []
     signed_count = 0
+    failed = 0
 
     for entry in entries:
         if shutdown_requested():
@@ -454,6 +476,12 @@ def phase_sign(args, plan: List[dict]):
         # Skip signing for entries marked presigned.
         if entry.get("presigned"):
             print(f"  [skip] TX {idx}: already signed (hot wallet)")
+            signed_manifest.append({
+                "idx": idx,
+                "file": entry.get("file", f"tx_{idx}.signed"),
+                "hash": entry.get("hash", ""),
+                "delay": entry.get("delay", 0),
+            })
             signed_count += 1
             continue
         unsigned_file = Path(entry["file"])
@@ -465,12 +493,14 @@ def phase_sign(args, plan: List[dict]):
                 unsigned_file = local_file
             else:
                 print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
+                failed += 1
                 continue
 
         # Verify hash (BUG 71 FIX: file is now binary, not hex text)
         actual_hash = hashlib.sha256(unsigned_file.read_bytes()).hexdigest()
         if actual_hash != entry["hash"]:
             print(f"  [!] TX {idx}: hash mismatch - file may be corrupted!")
+            failed += 1
             continue
 
         signed_file = signed_dir / f"tx_{idx}.signed"
@@ -534,6 +564,7 @@ def phase_sign(args, plan: List[dict]):
                 if stderr:
                     print(f"      stderr: {stderr[:200]}")
                 integrity_log("signer", f"sign_fail:idx={idx}:rc={result.returncode}")
+                failed += 1
                 continue
 
             # sign_transfer creates signed_monero_tx in the working directory
@@ -571,10 +602,13 @@ def phase_sign(args, plan: List[dict]):
                     print(f"      stderr: {stderr}")
                 if stdout:
                     print(f"      stdout: {stdout}")
+                failed += 1
         except subprocess.TimeoutExpired:
             print(f"  [!] TX {idx} signing timed out")
+            failed += 1
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
+            failed += 1
         finally:
             # Overwrite sensitive files before unlinking. shutil.rmtree only
             # unlinks — on disk-backed /tmp the data remains recoverable from
@@ -596,8 +630,10 @@ def phase_sign(args, plan: List[dict]):
     final_manifest = signed_dir / "signed_manifest_v1.json"
     atomic_write_json(signed_manifest, final_manifest)
 
-    integrity_log("signer", f"sign_done:{signed_count}_signed")
+    integrity_log("signer", f"sign_done:{signed_count}_signed:{failed}_failed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
+    if failed:
+        print(f"  [!] {failed} TX(s) failed during signing. Check wallet password and file integrity.")
     print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
 
 

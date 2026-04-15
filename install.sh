@@ -100,9 +100,9 @@ if [ "$FIRST_RUN" = true ]; then
         done
     }
 else
-    # Re-run: just check what's missing
+    # Re-run: check ALL packages (same set as first-run)
     MISSING=""
-    for mod_pkg in "requests:requests" "socks:PySocks" "tenacity:tenacity" "stem:stem" "monero:monero" "psutil:psutil" "Cryptodome:pycryptodomex"; do
+    for mod_pkg in "requests:requests" "socks:PySocks" "tenacity:tenacity" "stem:stem" "monero:monero" "psutil:psutil" "Cryptodome:pycryptodomex" "cryptography:cryptography" "gnupg:python-gnupg" "qrcode:qrcode" "yaml:pyyaml" "bs4:beautifulsoup4" "aiohttp:aiohttp" "aiohttp_socks:aiohttp-socks"; do
         mod="${mod_pkg%%:*}"
         pkg="${mod_pkg##*:}"
         $PY -c "import $mod" 2>/dev/null || MISSING="$MISSING $pkg"
@@ -121,8 +121,14 @@ echo ""
 echo "  [3/5] Tor..."
 
 # Make sure Tor config has ControlPort
+if [ ! -f /etc/tor/torrc ]; then
+    if [ -d /etc/tor ]; then
+        sudo touch /etc/tor/torrc 2>/dev/null && \
+            warn "Created empty /etc/tor/torrc (Tor package may not be installed yet)" || true
+    fi
+fi
 if [ -f /etc/tor/torrc ]; then
-    if ! grep -q "^ControlPort 9051" /etc/tor/torrc 2>/dev/null; then
+    if ! grep -qE "^\s*ControlPort\s+9051" /etc/tor/torrc 2>/dev/null; then
         echo "" | sudo tee -a /etc/tor/torrc >/dev/null
         echo "ControlPort 9051" | sudo tee -a /etc/tor/torrc >/dev/null
         echo "CookieAuthentication 1" | sudo tee -a /etc/tor/torrc >/dev/null
@@ -130,6 +136,8 @@ if [ -f /etc/tor/torrc ]; then
     else
         ok "Tor control port configured"
     fi
+else
+    warn "No /etc/tor/torrc found — Tor may not be installed. Install with: sudo apt install tor"
 fi
 
 # Start Tor if not running

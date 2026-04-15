@@ -178,7 +178,8 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         json.dump(obj, f, indent=2, default=_json_safe_default)
         f.flush()
         os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
+    if not secure_file_perms(tmp, perms):
+        integrity_log("opsec", f"WARN:atomic_write_chmod_fail:{path.name}")
     os.replace(tmp, path)
     try:
         with open(path) as f:
@@ -252,13 +253,27 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 #  Tor verification
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
 def verify_tor(proxy: Dict[str, str]) -> None:
     """Verify we are exiting through Tor. Aborts on failure.
 
     Validates both the IsTor flag AND the response structure to detect
     compromised/cached/spoofed responses from check.torproject.org.
+    Retries up to 4 times with exponential backoff before aborting.
     """
+    try:
+        _verify_tor_inner(proxy)
+    except Exception:
+        integrity_log("tor", "VERIFY_EXHAUSTED")
+        sys.exit(
+            "[!] Cannot verify Tor after 4 attempts.\n"
+            "    check.torproject.org may be down, or Tor is not working.\n"
+            "    Check: sudo systemctl status tor\n"
+            "    Check: curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip"
+        )
+
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
+def _verify_tor_inner(proxy: Dict[str, str]) -> None:
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy,
                      headers=_BROWSER_HEADERS)
     r.raise_for_status()
@@ -289,10 +304,11 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy,
                          headers=_BROWSER_HEADERS)
         r.raise_for_status()
-        if not r.json().get("IsTor"):
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
             sys.exit(f"[!] Tor leak detected during {stage} - aborting.")
-    except requests.RequestException:
+    except (requests.RequestException, ValueError, KeyError):
         integrity_log("tor", f"recheck_fail_{stage}")
         sys.exit(f"[!] Cannot verify Tor during {stage} - aborting for safety.")
 
@@ -377,8 +393,8 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     the abort would be retried 4 times before propagating. Check first, then
     call the retry-wrapped inner function.
     """
-    if proxies is None:
-        sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
+    if not proxies or not proxies.get("https"):
+        sys.exit("[!] safe_get called without valid proxies — clearnet leak. Aborting.")
     return _safe_get_inner(url, proxies)
 
 
@@ -418,9 +434,9 @@ def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
 
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
               headers: Dict[str, str] = None) -> dict:
-    """POST with retry. Aborts if proxies is None (clearnet leak prevention)."""
-    if proxies is None:
-        sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
+    """POST with retry. Aborts if proxies is None or empty (clearnet leak prevention)."""
+    if not proxies or not proxies.get("https"):
+        sys.exit("[!] safe_post called without valid proxies — clearnet leak. Aborting.")
     return _safe_post_inner(url, payload, proxies, headers or {})
 
 
@@ -459,8 +475,9 @@ class MoneroRPC:
         host = parsed.hostname
         port = parsed.port
         if not host or not port:
+            safe_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}" if parsed.hostname else "(unparseable)"
             sys.exit(
-                f"[!] Invalid RPC URL: {url}\n"
+                f"[!] Invalid RPC URL: {safe_url}\n"
                 f"    Expected format: http://host:port (e.g., http://127.0.0.1:18083)"
             )
 
@@ -498,16 +515,19 @@ class MoneroRPC:
         try:
             self._backend = JSONRPCWallet(**backend_kwargs)
         except TypeError:
-            if "proxy_url" in backend_kwargs and host.lower() not in _LOCALHOST_NAMES:
-                sys.exit(
-                    f"[!] monero-python does not support proxy_url for {host}:{port}.\n"
-                    f"    Cannot safely connect to a non-localhost RPC without proxy.\n"
-                    f"    Either: (a) use 127.0.0.1 with a local wallet-rpc, or\n"
-                    f"            (b) upgrade monero-python to a version that supports proxy_url."
-                )
-            fallback_kwargs = {k: v for k, v in backend_kwargs.items()
-                               if k != "proxy_url"}
-            self._backend = JSONRPCWallet(**fallback_kwargs)
+            if "proxy_url" in backend_kwargs:
+                if host.lower() not in _LOCALHOST_NAMES:
+                    sys.exit(
+                        f"[!] monero-python does not support proxy_url for {host}:{port}.\n"
+                        f"    Cannot safely connect to a non-localhost RPC without proxy.\n"
+                        f"    Either: (a) use 127.0.0.1 with a local wallet-rpc, or\n"
+                        f"            (b) upgrade monero-python to a version that supports proxy_url."
+                    )
+                fallback_kwargs = {k: v for k, v in backend_kwargs.items()
+                                   if k != "proxy_url"}
+                self._backend = JSONRPCWallet(**fallback_kwargs)
+            else:
+                raise
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
             proxy_dict = {"http": proxy_url, "https": proxy_url}
@@ -531,7 +551,13 @@ class MoneroRPC:
 
     def raw_request(self, method: str, params: dict) -> dict:
         """Send a raw JSON-RPC request to monero-wallet-rpc."""
-        return self._backend.raw_request(method, params)
+        result = self._backend.raw_request(method, params)
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"wallet-rpc {method} returned {type(result).__name__}, expected dict. "
+                f"The RPC may be returning HTML (wrong endpoint?) or malformed JSON."
+            )
+        return result
 
     def new_subaddress(self, account_index: int = 0, label: str = "") -> str:
         """Create a new subaddress and return its string address.
@@ -567,6 +593,105 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     connection is rejected to prevent clearnet IP leaks.
     """
     return MoneroRPC(url, proxy_url=proxy_url)
+
+# ---------------------------------------------------------------------------
+#  OPSEC enforcement layer — hard gates, no fallbacks
+# ---------------------------------------------------------------------------
+
+def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
+    """Run OPSEC checks before pipeline start. Hard-fails on any issue.
+
+    Called by mixer_core at pipeline init (normal and resume paths).
+    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr, etc.)
+    use validate_proxy + verify_tor directly.
+    No fallbacks. No soft warnings.
+    """
+    # 1. Proxy must be valid and populated
+    if not proxy or not proxy.get("https") or not proxy.get("http"):
+        integrity_log("opsec", f"HARD_FAIL:invalid_proxy:{stage}")
+        sys.exit(f"[!] OPSEC VIOLATION: No valid proxy at {stage}. Aborting.")
+
+    # 2. Proxy must be socks5h (DNS through proxy)
+    for key in ("http", "https"):
+        val = proxy.get(key, "")
+        if val and not val.lower().startswith("socks5h://"):
+            integrity_log("opsec", f"HARD_FAIL:non_socks5h_proxy:{stage}")
+            sys.exit(
+                f"[!] OPSEC VIOLATION: Proxy {key}={val[:20]}... is not socks5h://\n"
+                f"    DNS will leak to your ISP. Use socks5h:// (with the h)."
+            )
+
+    # 3. Tor must be working RIGHT NOW
+    verify_tor(proxy)
+
+    # 4. Shutdown not requested
+    if shutdown_requested():
+        integrity_log("opsec", f"HARD_FAIL:shutdown_requested:{stage}")
+        sys.exit(f"[!] Shutdown requested before {stage}. Aborting safely.")
+
+    integrity_log("opsec", f"preflight_pass:{stage}")
+
+
+def opsec_gate(proxy: Dict[str, str], stage: str = "gate") -> None:
+    """Lightweight OPSEC check for use between TX iterations.
+    Checks proxy validity and shutdown state without full Tor verification
+    (tor_recheck handles periodic Tor checks separately).
+    """
+    if not proxy or not proxy.get("https"):
+        integrity_log("opsec", f"HARD_FAIL:proxy_invalid:{stage}")
+        sys.exit(f"[!] OPSEC VIOLATION: Proxy became invalid at {stage}. Aborting.")
+    if shutdown_requested():
+        integrity_log("opsec", f"shutdown_at:{stage}")
+        sys.exit(f"[!] Shutdown requested at {stage}. Aborting safely.")
+
+
+# ---------------------------------------------------------------------------
+#  Schema validation for external inputs
+# ---------------------------------------------------------------------------
+
+def validate_plan_schema(plan_data: dict) -> None:
+    """Validate a plan file's structure. Hard-fails on any issue."""
+    if not isinstance(plan_data, dict):
+        sys.exit(f"[!] Plan file is not a JSON object (got {type(plan_data).__name__})")
+    meta = plan_data.get("meta")
+    if not isinstance(meta, dict):
+        sys.exit("[!] Plan file missing 'meta' key or meta is not an object")
+    txs = plan_data.get("txs")
+    if not isinstance(txs, list):
+        sys.exit("[!] Plan file missing 'txs' key or txs is not a list")
+    if len(txs) == 0:
+        sys.exit("[!] Plan file has empty 'txs' list — nothing to execute")
+    schema = meta.get("schema", "")
+    if schema not in ("plan_v1", "unsigned_v1"):
+        sys.exit(f"[!] Unrecognized plan schema: '{schema}'. Expected 'plan_v1' or 'unsigned_v1'.")
+    for i, tx in enumerate(txs):
+        if not isinstance(tx, dict):
+            sys.exit(f"[!] TX {i} is not a dict")
+        if "dst" not in tx:
+            sys.exit(f"[!] TX {i} missing 'dst' (destination address)")
+        if "amt" not in tx:
+            sys.exit(f"[!] TX {i} missing 'amt' (amount)")
+        try:
+            amt = Decimal(tx["amt"])
+            if amt <= 0:
+                sys.exit(f"[!] TX {i} has non-positive amount: {tx['amt']}")
+        except Exception:
+            sys.exit(f"[!] TX {i} has unparseable amount: {tx['amt']}")
+
+
+def validate_wallet_json(data: dict) -> None:
+    """Validate a receive wallet JSON's structure. Hard-fails on any issue."""
+    if not isinstance(data, dict):
+        sys.exit(f"[!] Wallet file is not a JSON object (got {type(data).__name__})")
+    if data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
+        sys.exit(f"[!] Unrecognized wallet schema: {data.get('schema')}")
+    addr = data.get("address")
+    if not addr or not isinstance(addr, str):
+        sys.exit("[!] Wallet JSON missing 'address' field")
+    acct = data.get("account_index", 0)
+    if not isinstance(acct, int) or acct < 0:
+        sys.exit(f"[!] Invalid account_index in wallet JSON: {acct} (must be non-negative int)")
+
 
 # ---------------------------------------------------------------------------
 #  Resource sentinel
