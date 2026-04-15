@@ -78,30 +78,32 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     tag = hashlib.sha256(f"{stage}:{msg}".encode()).hexdigest()[:12]
 
     lock_path = log_path.with_suffix(log_path.suffix + ".lock")
-    with open(lock_path, "w") as lf:
+    _lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    lf = os.fdopen(_lock_fd, "w")
+    try:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            prev = "0" * 64
-            if log_path.exists():
-                try:
-                    text = log_path.read_text()
-                    lines = [l for l in text.splitlines() if l.strip()]
-                    if lines:
-                        parts = lines[-1].split(" | ", 1)
-                        candidate = parts[0].strip()
-                        if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
-                            prev = candidate
-                except (OSError, UnicodeDecodeError):
-                    pass
-            ts = int(time.time()) // 600 * 600
-            line = f"{ts}|{tag}"
-            h = hashlib.sha256((prev + line).encode()).hexdigest()
-            with log_path.open("a") as f:
-                f.write(f"{h} | {line}\n")
-                f.flush()
-                os.fsync(f.fileno())
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+        prev = "0" * 64
+        if log_path.exists():
+            try:
+                text = log_path.read_text()
+                lines = [l for l in text.splitlines() if l.strip()]
+                if lines:
+                    parts = lines[-1].split(" | ", 1)
+                    candidate = parts[0].strip()
+                    if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                        prev = candidate
+            except (OSError, UnicodeDecodeError):
+                pass
+        ts = int(time.time()) // 600 * 600
+        line = f"{ts}|{tag}"
+        h = hashlib.sha256((prev + line).encode()).hexdigest()
+        with log_path.open("a") as f:
+            f.write(f"{h} | {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
     secure_file_perms(log_path)
     return h
 
@@ -458,11 +460,6 @@ def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     r.raise_for_status()
     return r.json()
 
-
-    # safe_post and _safe_post_inner were removed: defined but never called
-    # anywhere in the codebase. Dead code in a security library creates
-    # false confidence that POST operations use hardened retry/proxy logic
-    # when they actually don't. Re-add only when a real caller exists.
 
 # ---------------------------------------------------------------------------
 #  RPC connection (monero-wallet-rpc)

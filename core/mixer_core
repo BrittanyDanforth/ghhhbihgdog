@@ -2173,8 +2173,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                             _lf.flush()
                             os.fsync(_lf.fileno())
                     _log_artifact.unlink()
-                except OSError as _wipe_err:
-                    integrity_log("stage5", f"log_wipe_fail:{_log_artifact.name}:{_wipe_err}")
+                except OSError:
+                    # DO NOT call integrity_log() here — that would RECREATE
+                    # the file we just tried to destroy.
+                    print(f"  [!] Failed to wipe {_log_artifact.name} — delete manually")
 
         # Clean /dev/shm artifacts left by submodules (SML, dmswitch, signer).
         # These survive until reboot and reveal toolkit usage.
@@ -2189,8 +2191,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 if _shm_f.exists():
                     try:
                         _shm_f.unlink()
-                    except OSError as _shm_err:
-                        integrity_log("stage5", f"shm_cleanup_fail:{_shm_pat}:{_shm_err}")
+                    except OSError:
+                        pass
             for _shm_glob in ("tx_*", ".tk_*"):
                 for _shm_f in _shm.glob(_shm_glob):
                     try:
@@ -2198,8 +2200,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                             _shutil_shm.rmtree(_shm_f, ignore_errors=True)
                         else:
                             _shm_f.unlink()
-                    except OSError as _shm_err:
-                        integrity_log("stage5", f"shm_glob_cleanup_fail:{_shm_f.name}:{_shm_err}")
+                    except OSError:
+                        pass
             for _shm_dir in ("qr_codes", "decoys"):
                 _sd = _shm / _shm_dir
                 if _sd.is_dir():
@@ -2222,8 +2224,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                             _mlf.flush()
                             os.fsync(_mlf.fileno())
                     _monero_log.unlink()
-                except OSError as _ml_err:
-                    integrity_log("stage5", f"monero_log_wipe_fail:{_monero_log.name}:{_ml_err}")
+                except OSError:
+                    print(f"  [!] Failed to wipe {_monero_log.name} — delete manually")
 
         # Clean __pycache__ directories. Python auto-creates
         # __pycache__/*.pyc files containing compilation timestamps and
@@ -2236,24 +2238,18 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             if _pyc_dir.is_dir():
                 try:
                     _shutil_pyc.rmtree(_pyc_dir)
-                except OSError as _pyc_err:
-                    integrity_log("stage5", f"pycache_clean_fail:{_pyc_dir.name}:{_pyc_err}")
+                except OSError:
+                    pass
         _workspace_pyc = _core_dir.parent / "__pycache__"
         if _workspace_pyc.is_dir():
             try:
                 _shutil_pyc.rmtree(_workspace_pyc)
-            except OSError as _pyc_err:
-                integrity_log("stage5", f"pycache_workspace_fail:{_pyc_err}")
-        integrity_log("stage5", "pycache_cleaned")
+            except OSError:
+                pass
 
-    # Exit strategy simulation was removed from the automatic pipeline.
-    # It was non-fatal (failure swallowed), used a hardcoded method (bisq),
-    # and its output was never consumed by any subsequent step. Running an
-    # informational-only subprocess inside a money-critical pipeline creates
-    # false confidence that the exit plan is validated or integrated.
-    # Use option 8 (Exit Planner) from the menu for exit planning.
-
-    integrity_log("stage5", "full_pipeline_complete")
+    # DO NOT call integrity_log() after this point. The integrity_chain.log
+    # was wiped above on success. Any call recreates it, leaving the exact
+    # forensic artifact the cleanup was supposed to destroy.
 
 
 if __name__ == "__main__":
