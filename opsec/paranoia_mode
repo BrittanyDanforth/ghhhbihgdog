@@ -12,7 +12,10 @@ OPSEC hardening:
   - Spoofs MAC with locally-administered unicast address
   - Clears systemd journal (if present)
   - Overwrites swap + shared memory
-  - DNS leak check post-spoof
+  - Wipes Monero daemon/wallet logs (monero-wallet-rpc.log etc.)
+  - Post-spoof connectivity check (interface UP + has IP — no DNS
+    resolution is performed to avoid creating a timing correlation
+    between the new MAC and network activity)
   - Integrity log for every action (even in dry-run)
   - Resource sentinel
   - All actions idempotent and safe to re-run

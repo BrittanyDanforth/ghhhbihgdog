@@ -702,14 +702,25 @@ def validate_wallet_json(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
-    """Return True if resources are OK. False if system is stressed."""
+    """Return True if resources are OK. False if system is stressed.
+
+    Falls back to basic os.statvfs disk check if psutil is unavailable,
+    rather than blindly returning True.
+    """
     try:
         import psutil
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage(".")
+        return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
     except ImportError:
-        return True  # Can't check — assume OK rather than crashing mid-operation
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(".")
-    return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
+        try:
+            st = os.statvfs(".")
+            free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+            if free_gb < min_disk_gb:
+                return False
+        except (OSError, AttributeError):
+            pass
+        return True
 
 
 def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> None:

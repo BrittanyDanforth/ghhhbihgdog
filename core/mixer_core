@@ -119,6 +119,10 @@ def fetch_fee_from_rpc(rpc) -> Decimal:
     except Exception as e:
         integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
     integrity_log("fee", "using_fallback_fee")
+    print(f"  [!] WARNING: Using fallback fee estimate ({FALLBACK_FEE_XMR} XMR/TX).")
+    print(f"  [!] The RPC fee estimate failed or returned suspicious values.")
+    print(f"  [!] If the actual network fee is higher, TXs may be rejected.")
+    print(f"  [!] If lower, you'll overpay. Check monerod status.")
     return FALLBACK_FEE_XMR
 
 
@@ -476,10 +480,15 @@ def main():
             return []
         if not args.joinmarket_wallet:
             sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
+
+        print(f"  [!] IMPORTANT: JoinMarket integration is EXPERIMENTAL.")
+        print(f"  [!] The tumble will run but its UTXO outputs are NOT automatically")
+        print(f"  [!] fed into the ThorChain split amounts. After JoinMarket completes,")
+        print(f"  [!] the pipeline uses --btc-amount and --split for ThorChain sizing.")
+        print(f"  [!] Verify JoinMarket output manually before proceeding.")
+        integrity_log("stage1", "JM_experimental_warning_shown")
+
         try:
-            # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
-            # --socks5-host/port to be explicit (JM >= 0.9 supports this).
-            # Without this, JM may resolve maker addresses over clearnet.
             from urllib.parse import urlparse as _urlparse
             _parsed_proxy = _urlparse(args.tor_proxy)
             jm_path = Path(args.joinmarket_wallet).parent / "tumble.py"
@@ -493,8 +502,8 @@ def main():
                 check=True, capture_output=True, text=True, timeout=3600,
             )
             integrity_log("stage1", "JM_tumble_OK")
-            # TODO: parse actual UTXO amounts from result.stdout
-            # For now return empty - operator must check JM output manually
+            print(f"  [+] JoinMarket tumble completed successfully.")
+            print(f"  [!] UTXO parsing not implemented — pipeline will use --btc-amount for sizing.")
             return []
         except subprocess.TimeoutExpired:
             integrity_log("stage1", "JM_timeout")
@@ -2067,7 +2076,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 if _outputs_data:
                     _eo_path = Path(staging_dir) / f"outputs_after_tx_{tx_idx}.hex"
                     _eo_path.write_text(_outputs_data)
-                    secure_file_perms(_eo_path)
+                    if not secure_file_perms(_eo_path):
+                        print(f"  [!] WARNING: Cannot set 0600 on {_eo_path.name} — may be world-readable")
                     integrity_log("stage5", f"exported_outputs:tx={tx_idx}")
 
                     _ki_path = Path(staging_dir) / "key_images.hex"
