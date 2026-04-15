@@ -513,11 +513,16 @@ class ProductionEndpointJuggler:
         
         # Atomic write operation
         temp_path = output_path.with_suffix('.tmp')
-        with open(temp_path, 'w') as f:
-            os.chmod(temp_path, 0o600)
-            json.dump(operational_data, f, indent=2)
-        temp_path.replace(output_path)
-        os.chmod(output_path, 0o600)
+        try:
+            with open(temp_path, 'w') as f:
+                os.chmod(temp_path, 0o600)
+                json.dump(operational_data, f, indent=2)
+            temp_path.replace(output_path)
+            os.chmod(output_path, 0o600)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise
         
         logger.info(f"Exported operational data to {output_path}")
     
