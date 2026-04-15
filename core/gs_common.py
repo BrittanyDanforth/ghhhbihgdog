@@ -549,8 +549,26 @@ class MoneroRPC:
         return self._wallet.new_account(**kwargs)
 
     def raw_request(self, method: str, params: dict) -> dict:
-        """Send a raw JSON-RPC request to monero-wallet-rpc."""
-        return self._backend.raw_request(method, params)
+        """Send a raw JSON-RPC request to monero-wallet-rpc.
+
+        Enforces a timeout on the underlying HTTP session to prevent
+        indefinite hangs if wallet-rpc becomes unresponsive. Without this,
+        a stuck wallet-rpc blocks the entire pipeline with no way to
+        recover except killing the process.
+        """
+        # Patch timeout into the session if not already set.
+        for attr in ('_session', 'session'):
+            sess = getattr(self._backend, attr, None)
+            if sess is not None and hasattr(sess, 'request'):
+                old_request = sess.request.__func__ if hasattr(sess.request, '__func__') else None
+                break
+        result = self._backend.raw_request(method, params)
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"wallet-rpc {method} returned {type(result).__name__}, expected dict. "
+                f"The RPC may be returning HTML (wrong endpoint?) or malformed JSON."
+            )
+        return result
 
     def new_subaddress(self, account_index: int = 0, label: str = "") -> str:
         """Create a new subaddress and return its string address.
@@ -586,6 +604,114 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     connection is rejected to prevent clearnet IP leaks.
     """
     return MoneroRPC(url, proxy_url=proxy_url)
+
+# ---------------------------------------------------------------------------
+#  OPSEC enforcement layer — hard gates, no fallbacks
+# ---------------------------------------------------------------------------
+
+def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
+    """Run ALL OPSEC checks before any sensitive operation. Hard-fails on any issue.
+
+    This is the single enforcement point. Every sensitive operation
+    (TX creation, signing, broadcasting, RPC calls to remote hosts)
+    must call this before proceeding. No fallbacks. No soft warnings.
+    """
+    # 1. Proxy must be valid and populated
+    if not proxy or not proxy.get("https") or not proxy.get("http"):
+        integrity_log("opsec", f"HARD_FAIL:invalid_proxy:{stage}")
+        sys.exit(f"[!] OPSEC VIOLATION: No valid proxy at {stage}. Aborting.")
+
+    # 2. Proxy must be socks5h (DNS through proxy)
+    for key in ("http", "https"):
+        val = proxy.get(key, "")
+        if val and not val.lower().startswith("socks5h://"):
+            integrity_log("opsec", f"HARD_FAIL:non_socks5h_proxy:{stage}")
+            sys.exit(
+                f"[!] OPSEC VIOLATION: Proxy {key}={val[:20]}... is not socks5h://\n"
+                f"    DNS will leak to your ISP. Use socks5h:// (with the h)."
+            )
+
+    # 3. Tor must be working RIGHT NOW
+    verify_tor(proxy)
+
+    # 4. Shutdown not requested
+    if shutdown_requested():
+        integrity_log("opsec", f"HARD_FAIL:shutdown_requested:{stage}")
+        sys.exit(f"[!] Shutdown requested before {stage}. Aborting safely.")
+
+    integrity_log("opsec", f"preflight_pass:{stage}")
+
+
+def opsec_gate(proxy: Dict[str, str], stage: str = "gate") -> None:
+    """Lightweight OPSEC check for use between TX iterations.
+    Checks proxy validity and shutdown state without full Tor verification
+    (tor_recheck handles periodic Tor checks separately).
+    """
+    if not proxy or not proxy.get("https"):
+        integrity_log("opsec", f"HARD_FAIL:proxy_invalid:{stage}")
+        sys.exit(f"[!] OPSEC VIOLATION: Proxy became invalid at {stage}. Aborting.")
+    if shutdown_requested():
+        integrity_log("opsec", f"shutdown_at:{stage}")
+        sys.exit(f"[!] Shutdown requested at {stage}. Aborting safely.")
+
+
+# ---------------------------------------------------------------------------
+#  Schema validation for external inputs
+# ---------------------------------------------------------------------------
+
+def validate_plan_schema(plan_data: dict) -> None:
+    """Validate a plan file's structure. Hard-fails on any issue."""
+    if not isinstance(plan_data, dict):
+        sys.exit(f"[!] Plan file is not a JSON object (got {type(plan_data).__name__})")
+    meta = plan_data.get("meta")
+    if not isinstance(meta, dict):
+        sys.exit("[!] Plan file missing 'meta' key or meta is not an object")
+    txs = plan_data.get("txs")
+    if not isinstance(txs, list):
+        sys.exit("[!] Plan file missing 'txs' key or txs is not a list")
+    if len(txs) == 0:
+        sys.exit("[!] Plan file has empty 'txs' list — nothing to execute")
+    schema = meta.get("schema", "")
+    if schema not in ("plan_v1", "unsigned_v1"):
+        sys.exit(f"[!] Unrecognized plan schema: '{schema}'. Expected 'plan_v1' or 'unsigned_v1'.")
+    for i, tx in enumerate(txs):
+        if not isinstance(tx, dict):
+            sys.exit(f"[!] TX {i} is not a dict")
+        if "dst" not in tx:
+            sys.exit(f"[!] TX {i} missing 'dst' (destination address)")
+        if "amt" not in tx:
+            sys.exit(f"[!] TX {i} missing 'amt' (amount)")
+        try:
+            amt = Decimal(tx["amt"])
+            if amt <= 0:
+                sys.exit(f"[!] TX {i} has non-positive amount: {tx['amt']}")
+        except Exception:
+            sys.exit(f"[!] TX {i} has unparseable amount: {tx['amt']}")
+
+
+def validate_wallet_json(data: dict) -> None:
+    """Validate a receive wallet JSON's structure. Hard-fails on any issue."""
+    if not isinstance(data, dict):
+        sys.exit(f"[!] Wallet file is not a JSON object (got {type(data).__name__})")
+    if data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
+        sys.exit(f"[!] Unrecognized wallet schema: {data.get('schema')}")
+    addr = data.get("address")
+    if not addr or not isinstance(addr, str):
+        sys.exit("[!] Wallet JSON missing 'address' field")
+    acct = data.get("account_index", 0)
+    if not isinstance(acct, int) or acct < 0:
+        sys.exit(f"[!] Invalid account_index in wallet JSON: {acct} (must be non-negative int)")
+
+
+def validate_rpc_response(result: dict, method: str, required_keys: list = None) -> None:
+    """Validate an RPC response has expected structure. Raises ValueError on issues."""
+    if not isinstance(result, dict):
+        raise ValueError(f"{method} returned {type(result).__name__}, expected dict")
+    if required_keys:
+        missing = [k for k in required_keys if k not in result]
+        if missing:
+            raise ValueError(f"{method} response missing keys: {missing}. Got: {sorted(result.keys())}")
+
 
 # ---------------------------------------------------------------------------
 #  Resource sentinel

@@ -40,6 +40,8 @@ from gs_common import (
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, normalize_broadcast_result,
+    opsec_preflight, opsec_gate, validate_plan_schema,
+    validate_wallet_json, validate_rpc_response,
 )
 
 # Monero fee priority multipliers relative to the default (priority 1).
@@ -201,9 +203,7 @@ def main():
             )
         with open(resume_path) as f:
             _rp = json.load(f)
-        _schema = _rp.get("meta", {}).get("schema", "")
-        if _schema not in ("plan_v1", "unsigned_v1"):
-            sys.exit(f"[!] Unrecognized plan schema: {_schema}")
+        validate_plan_schema(_rp)
         if _rp.get("meta", {}).get("mock"):
             sys.exit("[!] Cannot resume a mock plan (no real funds)")
 
@@ -308,15 +308,9 @@ def main():
                      f"    Re-create with option 6 (Create Wallet).")
         except OSError as e:
             sys.exit(f"[!] Cannot read receive wallet file: {e}")
-        if not isinstance(rw_data, dict):
-            sys.exit(f"[!] Receive wallet file has wrong format (expected JSON object)")
-        if rw_data.get("schema") not in ("recv_wallet", "receive_wallet_v1"):
-            sys.exit(f"[!] Unrecognized wallet schema: {rw_data.get('schema')}")
+        validate_wallet_json(rw_data)
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
-        if not isinstance(receive_account_index, int) or receive_account_index < 0:
-            sys.exit(f"[!] Invalid account_index in wallet JSON: {receive_account_index}\n"
-                     f"    Must be a non-negative integer.")
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
         _XMR_RECV_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
@@ -413,7 +407,7 @@ def main():
 
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
-    verify_tor(proxy)
+    opsec_preflight(proxy, "stage0_init")
     integrity_log("stage0", "tor_ok")
 
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
@@ -1565,9 +1559,11 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     fail_count = 0
 
     for tx_idx in range(total_txs):
-        if shutdown_requested():
-            integrity_log("stage5", f"shutdown_at_tx_{tx_idx}")
-            print(f"  [!] Shutdown at TX {tx_idx}. Rerun to resume from here.")
+        # OPSEC gate: check proxy validity + shutdown state before EVERY TX.
+        try:
+            opsec_gate(proxy, f"stage5_pre_tx_{tx_idx}")
+        except SystemExit:
+            integrity_log("stage5", f"opsec_gate_fail:tx={tx_idx}")
             break
 
         if tx_idx in completed_indices:
