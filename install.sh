@@ -161,9 +161,9 @@ if [ "$TOR_RUNNING" = false ]; then
         fail "Tor is NOT working. Fix this before using the toolkit."
         echo ""
         echo "  Common fixes:"
-        echo "    ${BOLD}sudo systemctl start tor${NC}     <- start system Tor"
-        echo "    ${BOLD}sudo systemctl status tor${NC}    <- check if Tor is running"
-        echo "    ${BOLD}sudo journalctl -u tor${NC}       <- check Tor logs for errors"
+        echo -e "    ${BOLD}sudo systemctl start tor${NC}     <- start system Tor"
+        echo -e "    ${BOLD}sudo systemctl status tor${NC}    <- check if Tor is running"
+        echo -e "    ${BOLD}sudo journalctl -u tor${NC}       <- check Tor logs for errors"
         echo ""
         echo "  Or open Tor Browser (uses port 9150 instead of 9050)."
         echo ""
@@ -211,21 +211,23 @@ fi
 # ---------- Step 5: Quick import check ----------
 echo ""
 echo "  [5/5] Final check..."
-$PY -c "
+$PY << 'PYCHECK'
 fails = []
 for mod, name in [
     ('requests', 'requests'), ('socks', 'PySocks'), ('tenacity', 'tenacity'),
     ('stem', 'stem'), ('monero', 'monero'), ('psutil', 'psutil'),
     ('Cryptodome', 'pycryptodomex'),
 ]:
-    try: __import__(mod)
-    except ImportError: fails.append(name)
+    try:
+        __import__(mod)
+    except ImportError:
+        fails.append(name)
 if fails:
-    print(f'  Missing: {", ".join(fails)}')
-    print(f'  Fix: .venv/bin/pip install {" ".join(fails)}')
+    print('  Missing: ' + ', '.join(fails))
+    print('  Fix: .venv/bin/pip install ' + ' '.join(fails))
 else:
     print('  All imports working.')
-"
+PYCHECK
 
 # ---------- Create/update launcher ----------
 WRAPPER="$SCRIPT_DIR/gs"
@@ -246,12 +248,12 @@ echo ""
 echo "  ----- Setup complete -----"
 echo ""
 echo "  Run the toolkit:"
-echo "    ${GREEN}./gs${NC}                    opens the menu"
-echo "    ${GREEN}./gs list${NC}               shows all tools"
-echo "    ${GREEN}./gs paranoia --dry-run${NC}  tests cleanup"
+echo -e "    ${GREEN}./gs${NC}                    opens the menu"
+echo -e "    ${GREEN}./gs list${NC}               shows all tools"
+echo -e "    ${GREEN}./gs paranoia --dry-run${NC}  tests cleanup"
 echo ""
 if [ "$TOR_RUNNING" = false ]; then
-    echo "  ${RED}WARNING: Tor is not running. Start it before using the toolkit.${NC}"
+    echo -e "  ${RED}WARNING: Tor is not running. Start it before using the toolkit.${NC}"
     echo ""
 fi
 echo "  Before mixing, you need monero-wallet-rpc running:"
