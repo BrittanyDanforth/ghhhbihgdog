@@ -397,7 +397,9 @@ def wipe_artifacts(dry: bool, extra_dirs: list = None):
         # any toolkit-created staging directories.
     ]
 
+    _toolkit_root = Path(__file__).resolve().parent.parent
     search_roots = list(set([
+        _toolkit_root,
         Path("."),
         Path.home(),
         Path.home() / "ghostspiral",

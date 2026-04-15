@@ -41,7 +41,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, normalize_broadcast_result,
     opsec_preflight, opsec_gate, validate_plan_schema,
-    validate_wallet_json,
+    validate_wallet_json, data_path, TOOLKIT_ROOT,
 )
 
 # Monero fee priority multipliers relative to the default (priority 1).
@@ -199,7 +199,7 @@ def main():
                      help="Secondary monero-wallet-rpc endpoint for height sync check "
                           "only. NOT used as a fallback for TX creation or broadcast — "
                           "all TX operations use --rpc-primary exclusively.")
-    cli.add_argument("--output", default="./unsigned",
+    cli.add_argument("--output", default=str(data_path("unsigned")),
                      help="Output directory for unsigned TX plans")
     # --joinmarket-wallet removed with --joinmarket (see above)
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
@@ -283,8 +283,8 @@ def main():
                 f"    Start monero-wallet-rpc and retry."
             )
 
-        staging_dir = "tx_staging"
-        lock_path = Path(".mixer.lock")
+        staging_dir = str(data_path("tx_staging"))
+        lock_path = data_path(".mixer.lock")
 
         _lock_acquired = False
         for _lock_attempt in range(3):
@@ -1283,7 +1283,7 @@ def main():
         mode = "cold" if args.cold else "airgap"
         for stale in ["signer_progress.json", "broadcast_progress.json",
                        "stage5_progress.json"]:
-            stale_path = Path(stale)
+            stale_path = data_path(stale)
             if stale_path.exists():
                 stale_path.unlink()
                 integrity_log("stage4", f"cleaned_stale:{stale}")
@@ -1309,7 +1309,7 @@ def main():
 
     # Clean ALL stale artifacts from prior runs to prevent poisoning
     for stale in ["signer_progress.json", "broadcast_progress.json"]:
-        stale_path = Path(stale)
+        stale_path = data_path(stale)
         if stale_path.exists():
             stale_path.unlink()
             integrity_log("stage5", f"cleaned_stale:{stale}")
@@ -1332,7 +1332,7 @@ def main():
                 old_plan.unlink()
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
-    lock_path = Path(".mixer.lock")
+    lock_path = data_path(".mixer.lock")
     _lock_acquired = False
     for _lock_attempt in range(3):
         try:
@@ -1353,20 +1353,20 @@ def main():
                     continue
                 else:
                     sys.exit(
-                        f"[!] Lock file exists: .mixer.lock (PID {stale_pid})\n"
+                        f"[!] Lock file exists: {lock_path} (PID {stale_pid})\n"
                         "    Another instance may be running.\n"
                         "    If not, delete the lock file manually."
                     )
             except (OSError, ValueError):
                 sys.exit(
-                    "[!] Lock file exists: .mixer.lock\n"
+                    f"[!] Lock file exists: {lock_path}\n"
                     "    Another instance may be running.\n"
                     "    If not, delete the lock file manually."
                 )
     if not _lock_acquired:
         sys.exit("[!] Could not acquire lock after 3 attempts.")
 
-    staging_dir = "tx_staging"
+    staging_dir = str(data_path("tx_staging"))
 
     try:  # ensures lock file is cleaned even on error
         _stage5_run(args, ufile, staging_dir, proxy, bal, rpc_primary)
@@ -1650,7 +1650,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         atomic_write_json(data, path)
 
     # Progress tracking for resume
-    progress_file = Path("stage5_progress.json")
+    progress_file = data_path("stage5_progress.json")
     completed_indices = set()
     _progress_nonce = secure_hex(16)
     if progress_file.exists():
@@ -2175,8 +2175,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         # wallet addresses (scrubbed), fee estimates, and RPC interactions.
         # An adversary with this file can reconstruct the entire operation
         # timeline even if all other artifacts are gone.
-        for _log_artifact in (Path("integrity_chain.log"),
-                              Path("integrity_chain.log.lock")):
+        for _log_artifact in (data_path("integrity_chain.log"),
+                              data_path("integrity_chain.log.lock")):
             if _log_artifact.exists():
                 try:
                     _lsize = _log_artifact.stat().st_size

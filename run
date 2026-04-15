@@ -65,18 +65,19 @@ INTEL = ROOT / "intel"
 
 
 def _find_wallet_files() -> list:
-    """Search for wallet_*.json in toolkit root, CWD, and home directory.
+    """Search for wallet_*.json under toolkit root, CWD, and home.
     Returns deduplicated list sorted by modification time (newest first)."""
-    search_dirs = []
     seen = set()
-    for d in [Path("."), ROOT, Path.home(), Path.home() / "Downloads"]:
-        rd = d.resolve()
-        if rd not in seen and rd.is_dir():
-            seen.add(rd)
-            search_dirs.append(d)
     found = {}
-    for d in search_dirs:
-        for f in d.glob("wallet_*.json"):
+    for d in [ROOT, Path(".").resolve(), Path.home(), Path.home() / "Downloads"]:
+        try:
+            rd = d.resolve()
+        except OSError:
+            continue
+        if rd in seen or not rd.is_dir():
+            continue
+        seen.add(rd)
+        for f in rd.glob("wallet_*.json"):
             rp = f.resolve()
             if rp not in found:
                 found[rp] = f
@@ -84,17 +85,19 @@ def _find_wallet_files() -> list:
 
 
 def _find_plan_files() -> list:
-    """Search for unsigned plan files in toolkit root and CWD."""
-    search_dirs = []
+    """Search for unsigned plan files under toolkit root and CWD."""
     seen = set()
-    for d in [Path("unsigned"), ROOT / "unsigned", Path(".")]:
-        rd = d.resolve()
-        if rd not in seen and rd.is_dir():
-            seen.add(rd)
-            search_dirs.append(d)
     found = {}
-    for d in search_dirs:
-        for f in d.glob("unsigned_*.json"):
+    for d in [ROOT / "unsigned", Path(".").resolve() / "unsigned",
+              ROOT, Path(".").resolve()]:
+        try:
+            rd = d.resolve()
+        except OSError:
+            continue
+        if rd in seen or not rd.is_dir():
+            continue
+        seen.add(rd)
+        for f in rd.glob("unsigned_*.json"):
             rp = f.resolve()
             if rp not in found:
                 found[rp] = f
@@ -286,27 +289,31 @@ def show_status(st: dict):
 
 # ── Main Menu ──────────────────────────────────────────────────────────────
 
-def menu_main():
+def menu_main(tor_ok: bool = False):
     clear()
     banner()
+    _net = "" if tor_ok else f" {R}(Tor required){N}"
     print(f"  {G}── Send / Receive ─────────────────────────────────{N}")
-    print(f"  {B}1{N}  Full Pipeline          BTC → mixed XMR (guided)")
-    print(f"  {B}2{N}  Receive Mode           Mix XMR that already arrived")
-    print(f"  {B}6{N}  Create Wallet          Generate new XMR receive address")
-    print(f"  {B}7{N}  Swap Preparer          Get ThorChain BTC deposit address")
+    print(f"  {B}1{N}  Full Pipeline          BTC → mixed XMR (guided){_net}")
+    print(f"  {B}2{N}  Receive (guided)       Create wallet → swap → mix{_net}")
+    print(f"  {B}6{N}  Create Wallet          Generate new XMR receive address{_net}")
     print()
     print(f"  {C}── Advanced ───────────────────────────────────────{N}")
-    print(f"  {B}3{N}  Cold / Air-Gap         Unsigned plan for offline signing")
-    print(f"  {B}4{N}  Broadcast              Send signed TXs to the network")
-    print(f"  {B}5{N}  Resume                 Continue after a crash")
-    print(f"  {B}8{N}  Exit Planner           Plan XMR off-ramp")
+    print(f"  {B}3{N}  Cold / Air-Gap         Unsigned plan for offline signing{_net}")
+    print(f"  {B}4{N}  Broadcast              Send signed TXs to the network{_net}")
+    print(f"  {B}5{N}  Resume                 Continue after a crash{_net}")
+    print(f"  {B}7{N}  Swap Preparer          ThorChain quote (standalone){_net}")
+    print(f"  {B}8{N}  Exit Planner           Plan XMR off-ramp{_net}")
     print()
     print(f"  {M}── System ─────────────────────────────────────────{N}")
     print(f"  {B}0{N}  System Check           Verify Tor, Monero, deps")
     print(f"  {B}9{N}  Paranoia Cleanup       Wipe ALL traces from this machine")
-    print(f"  {B}t{N}  Dry Run                Test the full pipeline (no real funds)")
+    print(f"  {B}t{N}  Dry Run                Test the full pipeline (no real funds){_net}")
     print()
     print(f"  {D}q  quit{N}")
+    if not tor_ok:
+        print(f"\n  {R}Tor is not running. Network options are disabled.{N}")
+        print(f"  {D}Start Tor, then choose 0 (System Check) to re-check.{N}")
     print()
     return prompt("Choose").strip().lower()
 
@@ -425,19 +432,96 @@ def flow_full_pipeline(detected_port=None):
 
 
 def flow_receive(detected_port=None):
-    heading("Receive Mode: Mix XMR Already On Your Address")
+    heading("Receive Funds (Guided)")
+    print(f"  This guides you through the full receive flow:")
+    print(f"  1. Create or select a receive wallet")
+    print(f"  2. Get a ThorChain BTC deposit address for the sender")
+    print(f"  3. Wait for BTC → XMR conversion")
+    print(f"  4. Mix the received XMR")
+    print()
+
     tor = get_tor_proxy(detected_port)
     if not tor:
         return
     rpc = get_rpc()
 
+    # Step 1: Wallet
     wallet_files = _find_wallet_files()
     if wallet_files:
-        info(f"Found wallet files: {', '.join(f.name for f in wallet_files)}")
-        wf = prompt("Wallet JSON file", str(wallet_files[0]))
+        info(f"Found wallet(s): {', '.join(f.name for f in wallet_files[:5])}")
+        choice = prompt("Use existing wallet? (y) or create new? (n)", "y").lower()
+        if choice in ("y", "yes", ""):
+            wf = prompt("Wallet JSON file", str(wallet_files[0]))
+        else:
+            info("Creating new receive wallet...")
+            run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor],
+                       "Wallet creator")
+            wallet_files = _find_wallet_files()
+            if not wallet_files:
+                err("Wallet creation failed.")
+                return
+            wf = str(wallet_files[0])
+            ok(f"Using: {wallet_files[0].name}")
     else:
-        wf = prompt("Path to wallet JSON file (from 'Create Wallet')")
+        info("No wallet found — creating one...")
+        run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor],
+                   "Wallet creator")
+        wallet_files = _find_wallet_files()
+        if not wallet_files:
+            err("Wallet creation failed.")
+            return
+        wf = str(wallet_files[0])
+        ok(f"Using: {wallet_files[0].name}")
 
+    # Load address from wallet JSON
+    try:
+        with open(wf) as _wf:
+            _wdata = json.load(_wf)
+        _addr = _wdata.get("address", "")
+    except (json.JSONDecodeError, OSError, KeyError):
+        err(f"Cannot read wallet file: {wf}")
+        return
+
+    # Step 2: ThorChain swap preparation
+    print()
+    heading("Step 2: Generate BTC Deposit Address")
+    print(f"  The sender needs a BTC deposit address + memo to send BTC.")
+    print(f"  ThorChain will convert BTC → XMR to your wallet address.")
+    print()
+    if confirm("Generate a ThorChain deposit address now?"):
+        btc_amt = prompt("How much BTC will the sender send? (e.g. 0.1)")
+        try:
+            if Decimal(btc_amt) <= 0:
+                raise ValueError
+        except (ValueError, TypeError, InvalidOperation):
+            err(f"Invalid BTC amount: '{btc_amt}'")
+            return
+
+        swap_args = ["--amounts", btc_amt, "--dests", _addr, "--tor-proxy", tor,
+                     "--outfile", str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json"),
+                     "--force"]
+        if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer"):
+            err("Swap preparation failed.")
+            return
+    else:
+        info("Skipping swap prep. When the sender has already sent BTC,")
+        info("or you already have XMR on the wallet address, continue below.")
+
+    # Step 3: Wait
+    print()
+    heading("Step 3: Wait for XMR")
+    print(f"  Give the BTC deposit address + memo to the sender.")
+    print(f"  Wait for the BTC → XMR conversion to complete on ThorChain.")
+    print(f"  You can check your balance with monero-wallet-rpc or the wallet CLI.")
+    print()
+    if not confirm("XMR has arrived and is ready to mix?"):
+        info("Come back when XMR has arrived. Choose option 2 again and select")
+        info(f"the same wallet: {wf}")
+        return
+
+    # Step 4: Mix
+    print()
+    heading("Step 4: Mix XMR")
     wallets = prompt("Number of mix wallets", "10")
     depth = prompt("Mix depth", "2")
 
@@ -448,8 +532,8 @@ def flow_receive(detected_port=None):
         "--wallets", wallets,
         "--deep", depth,
     ]
-    if not run_script(CORE / "mixer_core", args, "Receive mode"):
-        err("Receive mode failed. Check the output above for details.")
+    if not run_script(CORE / "mixer_core", args, "Mixing"):
+        err("Mixing failed. Check the output above for details.")
         info("If the pipeline crashed mid-run, use option 5 (Resume) to continue.")
 
 
@@ -477,11 +561,12 @@ def flow_cold(detected_port=None):
     ]
     if run_script(CORE / "mixer_core", args, "Cold mode"):
         print()
-        ok("Unsigned plan created in ./unsigned/")
+        _unsigned_dir = ROOT / "unsigned"
+        ok(f"Unsigned plan created in {_unsigned_dir}/")
         info("Next steps:")
-        info("  1. Copy the unsigned/ folder to USB")
+        info(f"  1. Copy {_unsigned_dir}/ to USB")
         info("  2. On your offline machine, run:")
-        info(f"     python3 {CORE / 'airgap_tx_signer'} unsigned/unsigned_*.json \\")
+        info(f"     python3 airgap_tx_signer <plan.json> \\")
         info(f"       --phase sign --wallet-file /path/to/wallet --outdir tx_staging")
         info("  3. Copy tx_staging/signed/ back to this machine")
         info("  4. Choose option 4 (Broadcast) from the main menu")
@@ -493,10 +578,12 @@ def flow_broadcast(detected_port=None):
     if not tor:
         return
 
-    signed_dir = Path("tx_staging/signed")
+    signed_dir = ROOT / "tx_staging" / "signed"
     if signed_dir.is_dir():
         path = prompt("Signed blobs directory", str(signed_dir))
     else:
+        info("No signed blobs found in the default location.")
+        info("If you used air-gap signing, point to the USB/directory with signed files.")
         path = prompt("Path to signed blobs (directory or manifest JSON)")
 
     rpc = prompt("Monero daemon RPC", "http://127.0.0.1:18081")
@@ -665,13 +752,29 @@ def flow_paranoia():
     detected = _detect_iface()
     iface = prompt(f"Network interface", detected)
 
+    extra_dirs = [str(ROOT)]
+    extra = prompt("Additional directories to search (comma-separated, or Enter to skip)", "")
+    if extra.strip():
+        extra_dirs.extend([d.strip() for d in extra.split(",") if d.strip()])
+
+    search_args = []
+    for d in extra_dirs:
+        search_args.extend(["--search-dir", d])
+
+    print()
+    warn("Cleanup searches: toolkit root, home directory, common system paths,")
+    warn("and any extra directories you specified. Files in other locations")
+    warn("(external drives, unusual paths) may NOT be found.")
+    print()
+
     if confirm("Dry run first? (shows what WOULD be deleted without deleting)"):
-        run_script(OPSEC / "paranoia_mode", ["--iface", iface, "--dry-run"], "Paranoia dry-run")
+        run_script(OPSEC / "paranoia_mode", ["--iface", iface, "--dry-run"] + search_args,
+                   "Paranoia dry-run")
         print()
         if not confirm("Proceed with REAL wipe? THIS IS DESTRUCTIVE"):
             return
 
-    run_script(OPSEC / "paranoia_mode", ["--iface", iface], "Paranoia mode")
+    run_script(OPSEC / "paranoia_mode", ["--iface", iface] + search_args, "Paranoia mode")
 
 
 def flow_testnet(detected_port=None):
@@ -734,6 +837,7 @@ def flow_system_check():
         warn("Some components are missing — see above")
         if confirm("Run installer to fix missing deps?"):
             subprocess.run(["bash", str(ROOT / "install.sh")])
+    return st
 
 
 # ── CLI passthrough ────────────────────────────────────────────────────────
@@ -806,13 +910,22 @@ def main():
         print()
         info("After starting Tor, choose option 0 (System Check) to verify.")
 
+    _tor_ok = bool(_detected_tor_port)
+
     # Interactive mode
     while True:
         try:
-            choice = menu_main()
+            choice = menu_main(tor_ok=_tor_ok)
         except (EOFError, KeyboardInterrupt):
             print()
             break
+
+        _network_ops = {"1", "2", "3", "4", "5", "6", "7", "8", "t"}
+        if choice in _network_ops and not _tor_ok:
+            err("This operation requires Tor. Start Tor first, then choose 0 to re-check.")
+            info("  sudo systemctl start tor")
+            info("  Or open Tor Browser (port 9150)")
+            choice = "_blocked"
 
         try:
             if choice == "1":
@@ -834,11 +947,18 @@ def main():
             elif choice == "9":
                 flow_paranoia()
             elif choice == "0":
-                flow_system_check()
+                _startup_status = check_prereqs()
+                _detected_tor_port = _startup_status.get("tor_port")
+                _tor_ok = bool(_detected_tor_port)
+                show_status(_startup_status)
+                if _tor_ok:
+                    ok("Tor is working — all options are now available.")
             elif choice == "t":
                 flow_testnet(_detected_tor_port)
             elif choice in ("q", "quit", "exit"):
                 break
+            elif choice == "_blocked":
+                pass
             else:
                 warn(f"Unknown option: {choice}")
                 continue

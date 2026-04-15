@@ -30,7 +30,7 @@ from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested,
-    _BROWSER_HEADERS, normalize_broadcast_result,
+    _BROWSER_HEADERS, normalize_broadcast_result, data_path, TOOLKIT_ROOT,
 )
 
 _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -215,7 +215,7 @@ def main():
 
     # Fallback: unsigned plan (only works if same machine/directory)
     if not tx_delays:
-        plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+        plan_files = sorted(data_path("unsigned").glob("unsigned_*.json"), reverse=True)
         if len(plan_files) > 1:
             print(f"  [!] WARNING: {len(plan_files)} unsigned plans found in ./unsigned/")
             print(f"  [!] Using newest: {plan_files[0].name}")
@@ -322,7 +322,7 @@ def main():
     blob_fp = _fp_hasher.hexdigest()[:32]
 
     # Progress state
-    progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
+    progF = Path(args.resume) if args.resume else data_path("broadcast_progress.json")
     if progF.exists():
         with open(progF) as f:
             prog = json.load(f)

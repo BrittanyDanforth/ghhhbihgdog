@@ -35,10 +35,21 @@ from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 #  Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "10.5"
+VERSION = "10.6"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
-INTEGRITY_LOG = Path("integrity_chain.log")
 SOCKS_RE = re.compile(r"^socks5h://[^\s:]+:\d{1,5}$")
+
+# Central toolkit root: all persistent artifacts live here regardless of CWD.
+# Resolved once from gs_common.py's own location (core/ is always inside root).
+TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+def data_path(name: str) -> Path:
+    """Resolve an artifact path under the toolkit root.
+    Every progress file, lock, log, staging dir, and output dir MUST use
+    this instead of raw Path('.') / Path(name) to eliminate CWD coupling."""
+    return TOOLKIT_ROOT / name
+
+INTEGRITY_LOG = data_path("integrity_chain.log")
 # CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
 # because the requests library resolves hostnames BEFORE sending through
 # the SOCKS proxy. With socks5h://, DNS resolution happens at the proxy.
