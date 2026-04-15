@@ -174,6 +174,7 @@ do_undo() {
     # Remove CLI proxy configs added by apply_firewall
     rm -f /etc/profile.d/tor-proxy.sh 2>/dev/null || true
     rm -f /etc/apt/apt.conf.d/99tor-proxy 2>/dev/null || true
+    rm -f /usr/local/bin/wget 2>/dev/null || true
     sed -i '/# tor_firewall proxy/,+3d' /etc/wgetrc 2>/dev/null || true
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy 2>/dev/null || true
 
@@ -480,26 +481,33 @@ PROXY
     export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
     export no_proxy="127.0.0.1,localhost,::1"
 
-    # Configure apt
+    # Configure apt to use Tor
     local apt_conf="/etc/apt/apt.conf.d/99tor-proxy"
     cat > "$apt_conf" <<APTPROXY
 Acquire::http::Proxy "socks5h://127.0.0.1:${tor_port}";
 Acquire::https::Proxy "socks5h://127.0.0.1:${tor_port}";
+Acquire::socks::Proxy "socks5h://127.0.0.1:${tor_port}";
 APTPROXY
     chmod 644 "$apt_conf"
 
-    # Configure wget
-    if ! grep -q "# tor_firewall proxy" /etc/wgetrc 2>/dev/null; then
-        cat >> /etc/wgetrc <<WGETPROXY
-
-# tor_firewall proxy
-use_proxy = on
-http_proxy = http://127.0.0.1:${tor_port}
-https_proxy = http://127.0.0.1:${tor_port}
-WGETPROXY
+    # wget wrapper via torsocks (wget doesn't support SOCKS natively)
+    if command -v torsocks &>/dev/null; then
+        local wget_real
+        wget_real=$(which wget 2>/dev/null)
+        if [[ -n "$wget_real" ]] && [[ "$wget_real" != "/usr/local/bin/wget" ]]; then
+            cat > /usr/local/bin/wget <<WGETWRAP
+#!/bin/bash
+exec torsocks $wget_real "\$@"
+WGETWRAP
+            chmod 755 /usr/local/bin/wget
+        fi
     fi
 
-    pass "CLI tools configured: wget, curl, apt, pip now use Tor"
+    # Clean up broken HTTP proxy from prior versions
+    sed -i '/# tor_firewall proxy/,+3d' /etc/wgetrc 2>/dev/null || true
+
+    pass "CLI tools configured: curl, apt, pip use Tor via env vars"
+    pass "wget: wrapped with torsocks (transparent SOCKS support)"
     pass "New terminals: automatic (via /etc/profile.d/tor-proxy.sh)"
     pass "This terminal: proxy exported — works right now"
     echo ""
@@ -578,11 +586,16 @@ FFPROXY
         warn "Check: sudo systemctl status tor"
     fi
 
-    # Test wget through proxy
+    # Test wget (uses torsocks wrapper)
     if wget -q --spider --timeout=15 https://check.torproject.org 2>/dev/null; then
         pass "wget through Tor: WORKING"
+    elif torsocks wget -q --spider --timeout=15 https://check.torproject.org 2>/dev/null; then
+        pass "wget through Tor: WORKING (via torsocks)"
+        warn "The wget wrapper may not be active yet. Open a new terminal or run:"
+        echo -e "      ${BOLD}hash -r${NC}  (refreshes command cache)"
     else
-        warn "wget through Tor: may need a new terminal (run: . /etc/profile.d/tor-proxy.sh)"
+        fail "wget through Tor: NOT WORKING"
+        warn "Try: torsocks wget <url>"
     fi
 
     echo ""
@@ -1115,29 +1128,36 @@ PROXY
     export ALL_PROXY="socks5h://127.0.0.1:${tor_port}"
     export no_proxy="127.0.0.1,localhost,::1"
 
-    # Configure apt to use Tor SOCKS proxy
+    # Configure apt to use Tor
+    # Modern apt (Debian 11+ / Kali) supports socks5h:// natively.
+    # Older apt needs torsocks wrapper. Try native first.
     local apt_conf="/etc/apt/apt.conf.d/99tor-proxy"
     cat > "$apt_conf" <<APTPROXY
 Acquire::http::Proxy "socks5h://127.0.0.1:${tor_port}";
 Acquire::https::Proxy "socks5h://127.0.0.1:${tor_port}";
+Acquire::socks::Proxy "socks5h://127.0.0.1:${tor_port}";
 APTPROXY
     chmod 644 "$apt_conf"
 
-    # Configure wget to use Tor
-    local wgetrc="/etc/wgetrc.d"
-    mkdir -p "$wgetrc" 2>/dev/null || true
-    local wget_proxy="/etc/wgetrc"
-    if ! grep -q "# tor_firewall proxy" "$wget_proxy" 2>/dev/null; then
-        cat >> "$wget_proxy" <<WGETPROXY
-
-# tor_firewall proxy
-use_proxy = on
-http_proxy = http://127.0.0.1:${tor_port}
-https_proxy = http://127.0.0.1:${tor_port}
-WGETPROXY
+    # Create wrapper so 'wget' transparently uses torsocks
+    # (wget does NOT support SOCKS proxies natively — it only speaks HTTP proxy)
+    if command -v torsocks &>/dev/null; then
+        local wget_real
+        wget_real=$(which wget 2>/dev/null)
+        if [[ -n "$wget_real" ]] && [[ ! -f /usr/local/bin/wget ]]; then
+            cat > /usr/local/bin/wget <<WGETWRAP
+#!/bin/bash
+exec torsocks $wget_real "\$@"
+WGETWRAP
+            chmod 755 /usr/local/bin/wget
+        fi
     fi
 
-    pass "CLI proxy: wget, curl, apt, pip all route through Tor automatically"
+    # Remove any broken HTTP proxy config from wgetrc (prior versions set this wrong)
+    sed -i '/# tor_firewall proxy/,+3d' /etc/wgetrc 2>/dev/null || true
+
+    pass "CLI proxy: curl, apt, pip route through Tor via env vars"
+    pass "wget: wrapped with torsocks (SOCKS-transparent)"
     pass "Proxy env vars set: http_proxy, https_proxy, ALL_PROXY"
     echo ""
 

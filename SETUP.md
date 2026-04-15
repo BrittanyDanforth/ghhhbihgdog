@@ -56,9 +56,12 @@ sudo bash tor_firewall.sh --setup-bridges
 
 ## Step 3: Install Monero tools
 
+After `--setup-browser`, wget works through Tor automatically. If it still fails, prefix with `torsocks`:
+
 ```
 cd /tmp
 wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
+# If wget fails: torsocks wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
 tar xf monero.tar.bz2
 sudo cp monero-x86_64-linux-gnu-*/monerod /usr/local/bin/
 sudo cp monero-x86_64-linux-gnu-*/monero-wallet-cli /usr/local/bin/
