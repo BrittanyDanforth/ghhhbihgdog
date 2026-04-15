@@ -30,7 +30,7 @@ from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested,
-    _BROWSER_HEADERS,
+    _BROWSER_HEADERS, normalize_broadcast_result,
 )
 
 _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -123,29 +123,48 @@ def main():
                 entries = entries["entries"]
         for e in entries:
             raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
-            if raw_path.exists():
-                blobs.append(raw_path)
+            # Handle split TX files: if the entry has split_files, use those instead
+            _split_files_list = e.get("split_files", []) if isinstance(e, dict) else []
+            if _split_files_list:
+                for _sf_name in _split_files_list:
+                    _sf_path = Path(_sf_name)
+                    if _sf_path.exists():
+                        blobs.append(_sf_path)
+                    else:
+                        _sf_local = manifest_dir / _sf_path.name
+                        if _sf_local.exists():
+                            blobs.append(_sf_local)
+                        else:
+                            print(f"  [!] Split blob not found: {_sf_name}")
+                            integrity_log("broadcast", f"missing_split_blob:{_sf_name}")
             else:
-                # Try resolving by filename in the manifest's directory
-                local = manifest_dir / raw_path.name
-                if local.exists():
-                    blobs.append(local)
+                if raw_path.exists():
+                    blobs.append(raw_path)
                 else:
-                    print(f"  [!] Blob not found: {raw_path} (also tried {local})")
-                    integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
+                    local = manifest_dir / raw_path.name
+                    if local.exists():
+                        blobs.append(local)
+                    else:
+                        print(f"  [!] Blob not found: {raw_path} (also tried {local})")
+                        integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
         def _blob_sort_key(p: Path) -> tuple:
-            """Extract numeric index from tx_N.signed for correct numeric sort.
+            """Extract numeric index from tx_N.signed or tx_N_splitM.signed.
             Secondary key is the filename itself to guarantee stable ordering
             when multiple blobs share the same numeric index (or lack one)."""
-            stem = p.stem  # e.g. "tx_15"
-            parts = stem.split("_")
+            import re as _sort_re
+            m = _sort_re.match(r"tx_(\d+)(?:_split(\d+))?", p.stem)
+            if m:
+                tx_num = int(m.group(1))
+                split_num = int(m.group(2)) if m.group(2) else 0
+                return (tx_num, split_num, p.name)
+            parts = p.stem.split("_")
             try:
-                return (int(parts[-1]), p.name)
+                return (int(parts[-1]), 0, p.name)
             except (ValueError, IndexError):
-                return (999999, p.name)
+                return (999999, 0, p.name)
         blobs = sorted(raw_blobs, key=_blob_sort_key)
         # Warn loudly if no manifest — stale blobs from prior runs could be
         # broadcast to wrong addresses/amounts without manifest filtering.
@@ -420,17 +439,24 @@ def main():
                 res = _single_post(wallet_rpc_url, rpc_payload, wallet_proxy)
                 rpc_result = res.get("result", {})
                 rpc_error = res.get("error", {})
+                _rpc_method = "relay_tx" if _is_presigned else "submit_transfer"
                 if rpc_error:
                     status = "FAILED"
                     is_double = "double" in str(rpc_error).lower()
                     txid = ""
                     err_msg = rpc_error.get("message", str(rpc_error))
-                    print(f"  [!] submit_transfer error: {str(err_msg)[:80]}")
+                    print(f"  [!] {_rpc_method} error: {str(err_msg)[:80]}")
                 else:
-                    tx_hashes = rpc_result.get("tx_hash_list", [])
-                    status = "OK" if tx_hashes else "FAILED"
-                    is_double = False
-                    txid = tx_hashes[0] if tx_hashes else ""
+                    try:
+                        tx_hashes = normalize_broadcast_result(rpc_result, _rpc_method)
+                        status = "OK"
+                        is_double = False
+                        txid = tx_hashes[0]
+                    except ValueError as _nbe:
+                        status = "FAILED"
+                        is_double = False
+                        txid = ""
+                        print(f"  [!] {_nbe}")
 
                 if status == "OK" and not is_double:
                     if not txid:

@@ -39,7 +39,7 @@ from gs_common import (
     safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
-    scrub_address,
+    scrub_address, normalize_broadcast_result,
 )
 
 # Monero fee priority multipliers relative to the default (priority 1).
@@ -552,7 +552,7 @@ def main():
                                 print(f"  [!] Swap will likely fail or be refunded minus fees.")
                                 continue
                         except (ValueError, TypeError):
-                            pass
+                            integrity_log("stage2", f"min_amount_parse_fail:{rec_min}")
 
                     # THORNode returns expected_amount_out in target asset's
                     # native precision. For XMR that's piconero (1e12).
@@ -1089,15 +1089,13 @@ def main():
     # This means resuming with a different wallet is silently accepted.
     _wallet_primary = ""
     try:
-        _wa = rpc_primary.raw_request("get_address", {"account_index": 0})
-        _wallet_primary = _wa.get("address", "")
-    except Exception as _wa_err:
-        integrity_log("stage4", f"wallet_identity_fetch_fail:{str(_wa_err)[:40]}")
-        print(f"  [!] WARNING: Could not fetch wallet primary address for plan binding.")
-        print(f"  [!] Resume-with-wrong-wallet detection will be DISABLED.")
+        _addr_resp = rpc_primary.raw_request("get_address", {"account_index": 0})
+        _wallet_primary = _addr_resp.get("address", "")
+    except Exception as e:
+        sys.exit(f"[!] Cannot determine wallet identity: {e}\n"
+                 f"    Wallet-rpc must be accessible for safe execution.")
     if not _wallet_primary:
-        integrity_log("stage4", "wallet_identity_empty:resume_guard_disabled")
-        print(f"  [!] WARNING: Wallet primary address is empty. Resume safety check disabled.")
+        sys.exit("[!] Wallet returned empty primary address. Cannot verify identity.")
 
     # Collect ThorChain quote expiry for plan metadata. Air-gap operators
     # need this to know whether quotes are still valid when they return.
@@ -1292,18 +1290,10 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     try:
         _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
         _spend_key = _qk.get("key", "")
-        _is_view_only = (not _spend_key or
-                         _spend_key == "0" * 64 or
-                         _spend_key == "0000000000000000000000000000000000000000000000000000000000000000")
-    except Exception as _qk_err:
-        _err_str = str(_qk_err).lower()
-        if "view" in _err_str or "watch" in _err_str or "spend" in _err_str:
-            _is_view_only = True
-            integrity_log("stage5", "view_only_detected_via_exception")
-        else:
-            integrity_log("stage5", f"query_key_err:{str(_qk_err)[:40]}")
-            print(f"  [!] WARNING: Cannot determine wallet type: {str(_qk_err)[:60]}")
-            print(f"  [!] Assuming hot wallet. If this is view-only, use --airgap mode.")
+        _is_view_only = (not _spend_key or _spend_key == "0" * 64)
+    except Exception:
+        _is_view_only = True  # RPC error on spend_key query = view-only
+        integrity_log("stage5", "view_only_detected_via_rpc_error")
 
     if _is_view_only:
         integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
@@ -1608,11 +1598,15 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
         # Hot wallets write presigned TXs directly to signed/tx_N.signed
         # (no unsigned file created). View-only wallets write tx_N.unsigned.
+        # transfer_split may produce multiple on-chain TXs: tx_N_split0.signed, etc.
         unsigned_file = Path(staging_dir) / f"tx_{tx_idx}.unsigned"
         presigned_file = Path(staging_dir) / "signed" / f"tx_{tx_idx}.signed"
-        is_presigned = presigned_file.exists() and not unsigned_file.exists()
+        _split_pattern = f"tx_{tx_idx}_split*.signed"
+        _split_files = sorted((Path(staging_dir) / "signed").glob(_split_pattern)) \
+            if (Path(staging_dir) / "signed").is_dir() else []
+        is_presigned = (presigned_file.exists() or _split_files) and not unsigned_file.exists()
 
-        if not unsigned_file.exists() and not presigned_file.exists():
+        if not unsigned_file.exists() and not presigned_file.exists() and not _split_files:
             print(f"  [!] TX {tx_idx}: neither unsigned nor presigned file created.")
             fail_count += 1
             break
@@ -1634,14 +1628,17 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             integrity_log("stage5", f"corrupt_blob:tx={tx_idx}:size={_fsize}")
             try:
                 _check_file.unlink()
-            except OSError:
-                pass
+            except OSError as _ul_err:
+                integrity_log("stage5", f"corrupt_blob_unlink_fail:tx={tx_idx}:{_ul_err}")
             fail_count += 1
             break
 
         if is_presigned:
             print(f"  [skip] Step 2: TX {tx_idx} already signed (hot wallet)")
-            signed_file = presigned_file
+            if _split_files:
+                signed_files_to_broadcast = _split_files
+            else:
+                signed_files_to_broadcast = [presigned_file]
         else:
             # Step 2: Sign the unsigned TX
             print(f"  [*] Step 2: Signing TX {tx_idx}...")
@@ -1673,6 +1670,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 print(f"  [!] TX {tx_idx}: signed file not created.")
                 fail_count += 1
                 break
+            signed_files_to_broadcast = [signed_file]
 
         # BUG 73 FIX: Save "broadcast_pending" state BEFORE broadcasting.
         # If the process is killed between broadcast and progress save,
@@ -1694,37 +1692,59 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         # Hot wallet TXs (presigned from tx_metadata_list) use relay_tx.
         # View-only wallet TXs (signed via wallet-cli) use submit_transfer.
         # These are DIFFERENT wallet-rpc methods expecting different data formats.
-        print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
+        # When transfer_split produced multiple on-chain TXs, broadcast ALL splits.
+        if len(signed_files_to_broadcast) > 1:
+            print(f"  [*] Step 3: Broadcasting TX {tx_idx} ({len(signed_files_to_broadcast)} splits)...")
+        else:
+            print(f"  [*] Step 3: Broadcasting TX {tx_idx}...")
         newnym()
+        _all_txids = []
+        _broadcast_failed = False
         try:
-            signed_data = signed_file.read_bytes()
             rpc_primary = rpc
-            if is_presigned:
-                result = rpc_primary.raw_request("relay_tx", {
-                    "hex": signed_data.hex(),
-                })
-                # BUG 87 FIX: relay_tx returns {"tx_hash": "..."} (a single
-                # string), NOT {"tx_hash_list": [...]}. The old code always
-                # got an empty list, triggering the "no txid returned" abort
-                # for EVERY hot wallet broadcast — making auto-mode completely
-                # broken for hot wallets.
-                _single_hash = result.get("tx_hash", "")
-                tx_hashes = [_single_hash] if _single_hash else result.get("tx_hash_list", [])
-            else:
-                result = rpc_primary.raw_request("submit_transfer", {
-                    "tx_data_hex": signed_data.hex(),
-                })
-                tx_hashes = result.get("tx_hash_list", [])
-            if not tx_hashes:
-                integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}")
-                print(f"  [!] TX {tx_idx} submitted but no txid returned.")
-                print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+            for _sf_idx, _sf_path in enumerate(signed_files_to_broadcast):
+                signed_data = _sf_path.read_bytes()
+                if is_presigned:
+                    _broadcast_method = "relay_tx"
+                    result = rpc_primary.raw_request("relay_tx", {
+                        "hex": signed_data.hex(),
+                    })
+                else:
+                    _broadcast_method = "submit_transfer"
+                    result = rpc_primary.raw_request("submit_transfer", {
+                        "tx_data_hex": signed_data.hex(),
+                    })
+                try:
+                    tx_hashes = normalize_broadcast_result(result, _broadcast_method)
+                except ValueError as _nbe:
+                    integrity_log("stage5", f"broadcast_no_txid:tx={tx_idx}:split={_sf_idx}")
+                    print(f"  [!] TX {tx_idx} split {_sf_idx}: {_nbe}")
+                    print(f"  [!] Wallet state is ambiguous. Investigate before rerunning.")
+                    _broadcast_failed = True
+                    break
+                _all_txids.extend(tx_hashes)
+                if len(signed_files_to_broadcast) > 1:
+                    print(f"  [+] TX {tx_idx} split {_sf_idx}: {tx_hashes[0][:16]}...")
+            if _broadcast_failed:
                 fail_count += 1
                 break
-            txid = tx_hashes[0]
+            txid = _all_txids[0]
             print(f"  [+] TX {tx_idx} submitted to wallet-rpc | txid: {txid[:16]}...")
             print(f"  [!] Note: submitted != confirmed. TX is in local mempool, not yet mined.")
             integrity_log("stage5", f"broadcast_submitted:tx={tx_idx}")
+
+            # Verify TX entered mempool
+            import time as _t
+            _t.sleep(3)
+            for _verify_txid in _all_txids:
+                try:
+                    _check = rpc.raw_request("get_transfer_by_txid", {"txid": _verify_txid})
+                    if not _check.get("transfer"):
+                        print(f"  [!] TX {_verify_txid[:16]}... NOT FOUND in wallet after broadcast!")
+                        print(f"  [!] This may indicate the broadcast was not accepted.")
+                except Exception:
+                    pass  # get_transfer_by_txid may not be available; non-fatal
+
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")
             print(f"  [!] TX {tx_idx} broadcast failed: {str(e)[:80]}")
@@ -1893,8 +1913,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                             _lf.flush()
                             os.fsync(_lf.fileno())
                     _log_artifact.unlink()
-                except OSError:
-                    pass
+                except OSError as _wipe_err:
+                    integrity_log("stage5", f"log_wipe_fail:{_log_artifact.name}:{_wipe_err}")
 
         # Clean /dev/shm artifacts left by submodules (SML, dmswitch, signer).
         # These survive until reboot and reveal toolkit usage.
@@ -1909,8 +1929,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 if _shm_f.exists():
                     try:
                         _shm_f.unlink()
-                    except OSError:
-                        pass
+                    except OSError as _shm_err:
+                        integrity_log("stage5", f"shm_cleanup_fail:{_shm_pat}:{_shm_err}")
             for _shm_glob in ("tx_*", ".tk_*"):
                 for _shm_f in _shm.glob(_shm_glob):
                     try:
@@ -1918,8 +1938,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                             _shutil_shm.rmtree(_shm_f, ignore_errors=True)
                         else:
                             _shm_f.unlink()
-                    except OSError:
-                        pass
+                    except OSError as _shm_err:
+                        integrity_log("stage5", f"shm_glob_cleanup_fail:{_shm_f.name}:{_shm_err}")
             for _shm_dir in ("qr_codes", "decoys"):
                 _sd = _shm / _shm_dir
                 if _sd.is_dir():
@@ -1936,14 +1956,14 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             if _pyc_dir.is_dir():
                 try:
                     _shutil_pyc.rmtree(_pyc_dir)
-                except OSError:
-                    pass
+                except OSError as _pyc_err:
+                    integrity_log("stage5", f"pycache_clean_fail:{_pyc_dir.name}:{_pyc_err}")
         _workspace_pyc = _core_dir.parent / "__pycache__"
         if _workspace_pyc.is_dir():
             try:
                 _shutil_pyc.rmtree(_workspace_pyc)
-            except OSError:
-                pass
+            except OSError as _pyc_err:
+                integrity_log("stage5", f"pycache_workspace_fail:{_pyc_err}")
         integrity_log("stage5", "pycache_cleaned")
 
     # Exit strategy simulation

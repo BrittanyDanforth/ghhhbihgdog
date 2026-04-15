@@ -238,12 +238,18 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             # BUG 88 FIX: Save ALL split TX parts, not just the first.
             all_blobs = []
             if is_presigned and len(tx_metadata_list) > 1:
-                for part_hex in tx_metadata_list:
+                for split_idx, split_hex in enumerate(tx_metadata_list):
                     try:
-                        all_blobs.append(bytes.fromhex(part_hex))
+                        all_blobs.append(bytes.fromhex(split_hex))
                     except ValueError:
-                        integrity_log("signer", f"bad_hex_part:idx={idx}")
-                        print(f"  [!] TX {idx}: split part has invalid hex, skipping")
+                        integrity_log("signer", f"bad_hex_split:idx={idx}:split={split_idx}")
+                        print(f"  [!] TX {idx} split {split_idx}: invalid hex — ABORTING TX.")
+                        print(f"  [!] ALL splits must be saved or funds are lost.")
+                        all_blobs = []
+                        break
+                if not all_blobs:
+                    failed += 1
+                    continue
             else:
                 all_blobs = [blob_bytes]
 
@@ -254,25 +260,27 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             else:
                 tx_file = outdir / f"tx_{idx}.unsigned"
 
-            for part_num, part_bytes in enumerate(all_blobs):
+            split_files = []
+            for split_idx, split_bytes in enumerate(all_blobs):
                 if len(all_blobs) > 1:
                     suffix = tx_file.suffix
-                    part_file = tx_file.with_name(f"tx_{idx}_part{part_num}{suffix}")
+                    split_file = tx_file.with_name(f"tx_{idx}_split{split_idx}{suffix}")
                 else:
-                    part_file = tx_file
+                    split_file = tx_file
 
-                _tmp_blob = part_file.with_suffix(part_file.suffix + ".tmp")
+                _tmp_blob = split_file.with_suffix(split_file.suffix + ".tmp")
                 _fd = os.open(str(_tmp_blob), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 try:
-                    os.write(_fd, part_bytes)
+                    os.write(_fd, split_bytes)
                     os.fsync(_fd)
                 finally:
                     os.close(_fd)
-                os.replace(str(_tmp_blob), str(part_file))
-                secure_file_perms(part_file)
+                os.replace(str(_tmp_blob), str(split_file))
+                secure_file_perms(split_file)
+                split_files.append(split_file.name)
 
             if is_presigned:
-                part_info = f" ({len(all_blobs)} parts)" if len(all_blobs) > 1 else ""
+                part_info = f" ({len(all_blobs)} splits)" if len(all_blobs) > 1 else ""
                 print(f"  [+] TX {idx} -> {tx_file.name}{part_info} (hot wallet, already signed, fsync'd)")
 
             sha = hashlib.sha256(all_blobs[0]).hexdigest()
@@ -285,6 +293,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "delay": tx.get("delay", 0),
                 "presigned": is_presigned,
                 "split_parts": len(all_blobs),
+                "split_files": split_files if len(all_blobs) > 1 else [],
             })
             created += 1
             print(f"  [+] TX {idx} -> {tx_file.name}")

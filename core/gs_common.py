@@ -614,6 +614,34 @@ def shutdown_requested() -> bool:
 #  Sensitive data scrubbing
 # ---------------------------------------------------------------------------
 
+def normalize_broadcast_result(result: dict, method: str) -> list:
+    """Extract transaction IDs from wallet-rpc broadcast response.
+
+    Different methods return txids in different fields:
+      - submit_transfer → result["tx_hash_list"] (list)
+      - relay_tx → result["tx_hash"] (string)
+      - transfer_split (do_not_relay=False) → result["tx_hash_list"] (list)
+
+    Returns a list of txid strings. Raises ValueError if no txids found.
+    """
+    txids = []
+    if "tx_hash_list" in result:
+        txids = result["tx_hash_list"]
+    elif "tx_hash" in result:
+        val = result["tx_hash"]
+        if isinstance(val, list):
+            txids = val
+        elif isinstance(val, str) and val:
+            txids = [val]
+
+    if not txids:
+        raise ValueError(
+            f"No transaction IDs in {method} response. "
+            f"Keys present: {list(result.keys())}"
+        )
+    return txids
+
+
 def scrub_address(addr: str, visible: int = 8) -> str:
     """Truncate an address for safe terminal display.
 
