@@ -1287,13 +1287,29 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
     # the key-image sync path was NEVER triggered for view-only wallets —
     # the exact case it was designed for — causing double-spend failures.
     _is_view_only = False
-    try:
-        _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
-        _spend_key = _qk.get("key", "")
-        _is_view_only = (not _spend_key or _spend_key == "0" * 64)
-    except Exception:
-        _is_view_only = True  # RPC error on spend_key query = view-only
-        integrity_log("stage5", "view_only_detected_via_rpc_error")
+    _vo_determined = False
+    for _vo_attempt in range(3):
+        try:
+            _qk = rpc.raw_request("query_key", {"key_type": "spend_key"})
+            _spend_key = _qk.get("key", "")
+            _is_view_only = (not _spend_key or _spend_key == "0" * 64)
+            _vo_determined = True
+            break
+        except Exception as _vo_err:
+            _vo_msg = str(_vo_err).lower()
+            if "watch" in _vo_msg or "view" in _vo_msg or "spend" in _vo_msg:
+                _is_view_only = True
+                _vo_determined = True
+                integrity_log("stage5", "view_only_confirmed_via_rpc_error")
+                break
+            if _vo_attempt < 2:
+                time.sleep(2)
+    if not _vo_determined:
+        _is_view_only = True
+        integrity_log("stage5", "view_only_assumed_after_retries")
+        print("  [!] Could not determine wallet type after 3 attempts.")
+        print("  [!] Assuming view-only (safer). If this is a hot wallet,")
+        print("  [!] check your wallet-rpc connection.")
 
     if _is_view_only:
         integrity_log("stage5", "VIEW_ONLY_WALLET_DETECTED")
@@ -1367,8 +1383,12 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
         except SystemExit:
             raise
         except Exception as _wid_err:
-            integrity_log("stage5", f"wallet_identity_check_warn:{str(_wid_err)[:40]}")
-            print(f"  [!] WARNING: Could not verify wallet identity: {_wid_err}")
+            integrity_log("stage5", f"wallet_identity_check_FAIL:{str(_wid_err)[:40]}")
+            sys.exit(
+                f"[!] Cannot verify wallet identity: {str(_wid_err)[:60]}\n"
+                f"    Wallet-rpc must be accessible to prevent wrong-wallet fund loss.\n"
+                f"    Fix the RPC connection and retry."
+            )
 
     # BUG 82 FIX: Daemon height drift check — warn if daemon height has
     # diverged significantly from plan creation time. Large backward drift
@@ -1742,8 +1762,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     if not _check.get("transfer"):
                         print(f"  [!] TX {_verify_txid[:16]}... NOT FOUND in wallet after broadcast!")
                         print(f"  [!] This may indicate the broadcast was not accepted.")
-                except Exception:
-                    pass  # get_transfer_by_txid may not be available; non-fatal
+                except Exception as _vfy_err:
+                    integrity_log("stage5", f"post_broadcast_verify_fail:{str(_vfy_err)[:40]}")
 
         except Exception as e:
             integrity_log("stage5", f"broadcast_fail:tx={tx_idx}:{str(e)[:40]}")

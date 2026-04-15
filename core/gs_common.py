@@ -618,27 +618,47 @@ def normalize_broadcast_result(result: dict, method: str) -> list:
     """Extract transaction IDs from wallet-rpc broadcast response.
 
     Different methods return txids in different fields:
-      - submit_transfer → result["tx_hash_list"] (list)
-      - relay_tx → result["tx_hash"] (string)
-      - transfer_split (do_not_relay=False) → result["tx_hash_list"] (list)
+      - submit_transfer -> result["tx_hash_list"] (list of hex strings)
+      - relay_tx        -> result["tx_hash"] (single hex string)
+      - transfer_split  -> result["tx_hash_list"] (list of hex strings)
 
-    Returns a list of txid strings. Raises ValueError if no txids found.
+    Returns a non-empty list of txid strings.
+    Raises ValueError with full diagnostic info if extraction fails.
     """
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"{method} returned non-dict: {type(result).__name__}. "
+            f"Raw value (truncated): {str(result)[:200]}"
+        )
+
     txids = []
     if "tx_hash_list" in result:
-        txids = result["tx_hash_list"]
-    elif "tx_hash" in result:
+        raw = result["tx_hash_list"]
+        if isinstance(raw, list):
+            txids = [h for h in raw if isinstance(h, str) and len(h) >= 16]
+    if not txids and "tx_hash" in result:
         val = result["tx_hash"]
         if isinstance(val, list):
-            txids = val
-        elif isinstance(val, str) and val:
+            txids = [h for h in val if isinstance(h, str) and len(h) >= 16]
+        elif isinstance(val, str) and len(val) >= 16:
             txids = [val]
 
     if not txids:
         raise ValueError(
-            f"No transaction IDs in {method} response. "
-            f"Keys present: {list(result.keys())}"
+            f"No valid transaction IDs in {method} response. "
+            f"Keys: {sorted(result.keys())}. "
+            f"tx_hash_list={result.get('tx_hash_list', '<missing>')}. "
+            f"tx_hash={result.get('tx_hash', '<missing>')}"
         )
+
+    for txid in txids:
+        if not isinstance(txid, str) or len(txid) != 64:
+            raise ValueError(
+                f"Invalid txid format from {method}: "
+                f"'{txid[:20]}...' (len={len(txid) if isinstance(txid, str) else 'N/A'}). "
+                f"Expected 64-char hex string."
+            )
+
     return txids
 
 
