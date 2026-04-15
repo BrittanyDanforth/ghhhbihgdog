@@ -1147,6 +1147,7 @@ def main():
         "fee_priority": args.fee_priority,
         "delay_min": args.delay_min,
         "delay_max": args.delay_max,
+        "balance_at_plan": str(bal),
     }
     if _earliest_quote_expiry > 0:
         meta["thorchain_quote_expiry"] = _earliest_quote_expiry
@@ -1556,17 +1557,45 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                     progress_file.unlink()
                     progress = {}
                 completed_indices = set(progress.get("completed", []))
-                # BUG 73 FIX: Detect broadcast_pending — a TX that was
-                # broadcast but progress wasn't finalized (crash/kill
-                # between broadcast and completed save). Treat as
-                # completed to prevent double-payment on resume.
+                # Detect broadcast_pending — a TX that was checkpointed
+                # before broadcast but may or may not have actually been sent.
+                # Instead of blindly promoting to completed (which could skip
+                # a TX that was never broadcast), verify with wallet-rpc.
                 pending_idx = progress.get("broadcast_pending")
                 if pending_idx is not None and pending_idx not in completed_indices:
-                    print(f"  [!] TX {pending_idx} may have been broadcast before crash.")
-                    print(f"  [!] Skipping to prevent double-payment.")
-                    print(f"  [!] Check wallet balance before proceeding.")
-                    integrity_log("stage5", f"broadcast_pending_recovered:tx={pending_idx}")
-                    completed_indices.add(pending_idx)
+                    print(f"  [!] TX {pending_idx} was checkpointed before broadcast in prior run.")
+                    print(f"  [!] Checking wallet to determine if it was actually sent...")
+                    _pending_confirmed = False
+                    try:
+                        # Check if the wallet has any transfer for this index's
+                        # destination. We can't check by txid (we don't have one),
+                        # but we can check recent transfers for the amount.
+                        _pending_tx = plan_txs[pending_idx] if pending_idx < len(plan_txs) else None
+                        if _pending_tx:
+                            _check_bal = rpc.raw_request("get_balance", {
+                                "account_index": _plan_acct_idx,
+                            })
+                            # If unlocked_balance changed significantly since the plan
+                            # was created, the TX likely went through.
+                            _unlocked = Decimal(str(_check_bal.get("unlocked_balance", 0))) / Decimal("1e12")
+                            _plan_bal = Decimal(str(plan_data.get("meta", {}).get("balance_at_plan", "0") or "0"))
+                            if _plan_bal > 0 and _unlocked < _plan_bal:
+                                print(f"  [+] Balance decreased since plan creation ({_plan_bal} -> {_unlocked})")
+                                print(f"  [+] TX {pending_idx} was likely broadcast. Marking as completed.")
+                                integrity_log("stage5", f"broadcast_pending_verified:tx={pending_idx}")
+                                _pending_confirmed = True
+                            else:
+                                print(f"  [!] Balance unchanged — TX {pending_idx} likely NOT broadcast.")
+                                print(f"  [!] Will re-create and broadcast this TX.")
+                                integrity_log("stage5", f"broadcast_pending_NOT_broadcast:tx={pending_idx}")
+                    except Exception as _pv_err:
+                        integrity_log("stage5", f"broadcast_pending_check_fail:{str(_pv_err)[:40]}")
+                        print(f"  [!] Cannot verify TX {pending_idx} status: {str(_pv_err)[:60]}")
+                        print(f"  [!] Treating as completed to prevent potential double-payment.")
+                        print(f"  [!] CHECK WALLET BALANCE before continuing.")
+                        _pending_confirmed = True
+                    if _pending_confirmed:
+                        completed_indices.add(pending_idx)
                 if completed_indices:
                     print(f"  [+] Resuming: {len(completed_indices)} TXs already completed")
         except (json.JSONDecodeError, OSError, KeyError) as e:
