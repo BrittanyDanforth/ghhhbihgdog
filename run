@@ -1533,19 +1533,55 @@ class ReportGenerator:
     @staticmethod
     def generate(audit: AuditTrail, file_mgr: ExploitFileManager,
                  fmt: str = "text",
-                 findings_summary: list = None) -> str:
-        """Generate a full session report."""
+                 findings_summary: list = None,
+                 server: "ExploitServer" = None) -> str:
+        """Generate a full session report.
+
+        When `server` is provided, the captured callback data (credentials,
+        exfil, keylog, session dumps, beacons) is included in the report.
+        The raw capture bodies are truncated per-entry to keep the report
+        readable; full bodies still live in server memory until stop().
+        """
         stats = audit.get_stats()
         report_lines = []
+
+        captures = []
+        attacker_base = ""
+        if server is not None:
+            try:
+                if server.is_running:
+                    attacker_base = server.get_attacker_url(prefer_onion=True)
+                captures = server.get_captures(last_n=9999)
+            except Exception:
+                captures = []
 
         if fmt == "json":
             report_data = {
                 "report_type": "exploit_walkthrough_session",
                 "session": stats,
+                "attacker_infra": {
+                    "base_url": attacker_base,
+                    "onion": bool(getattr(server, "onion_host", None))
+                             if server else False,
+                },
                 "findings_tested": findings_summary or [],
                 "files_generated": file_mgr.list_files(),
                 "audit_entries": audit.get_live_feed(last_n=9999),
                 "alerts": audit.get_alerts(),
+                "captures": [
+                    {
+                        "time": c.get("time"),
+                        "kind": c.get("kind"),
+                        "endpoint": c.get("endpoint"),
+                        "method": c.get("method"),
+                        "remote": c.get("remote"),
+                        "ua": c.get("ua"),
+                        "referer": c.get("referer"),
+                        "query": c.get("query", "")[:2000],
+                        "data": c.get("data", "")[:8000],
+                    }
+                    for c in captures
+                ],
             }
             return json.dumps(report_data, indent=2)
 
@@ -1597,6 +1633,36 @@ class ReportGenerator:
             report_lines.append("  " + "-" * 40)
             for a in alerts:
                 report_lines.append(f"  [{a['ts_iso']}] {a['action']}: {a.get('detail', '')}")
+            report_lines.append("")
+
+        if captures:
+            report_lines.append(f"  CAPTURED CALLBACKS ({len(captures)})")
+            if attacker_base:
+                report_lines.append(f"  Attacker base: {attacker_base}")
+            report_lines.append("  " + "-" * 40)
+            for i, c in enumerate(captures, 1):
+                report_lines.append(
+                    f"  {i:>3}. [{c.get('time','')}] "
+                    f"{c.get('kind','?'):11s} "
+                    f"{c.get('method','?'):4s} {c.get('endpoint','?')} "
+                    f"from={c.get('remote','')}"
+                )
+                ua = c.get("ua", "")
+                if ua:
+                    report_lines.append(f"        UA: {ua[:120]}")
+                ref = c.get("referer", "")
+                if ref:
+                    report_lines.append(f"        Ref: {ref[:120]}")
+                q = c.get("query", "")
+                if q:
+                    report_lines.append(f"        Query: {q[:200]}")
+                d = c.get("data", "")
+                if d:
+                    preview = d[:400].replace("\n", "\\n")
+                    report_lines.append(f"        Data: {preview}")
+                    if len(d) > 400:
+                        report_lines.append(
+                            f"        ... ({len(d)} bytes total)")
             report_lines.append("")
 
         report_lines.append("  DETAILED ACTION LOG")
@@ -3182,6 +3248,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
         report_content = ReportGenerator.generate(
             audit, file_mgr, fmt=fmt,
             findings_summary=findings_summary,
+            server=server,
         )
         report_path = ReportGenerator.save_report(
             report_content, file_mgr, fmt=fmt,
