@@ -49,6 +49,9 @@ from datetime import datetime, timezone
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import install_signal_handlers
+
 ROOT      = _TOOLKIT_ROOT
 _MOD_DIR  = Path(__file__).resolve().parent
 RUNTIME   = ROOT / "runtime"
@@ -158,6 +161,8 @@ def ensure_shm_writable():
 
 
 def main():
+    install_signal_handlers()
+
     p = argparse.ArgumentParser(
         description="Unified driver for session preparation pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter

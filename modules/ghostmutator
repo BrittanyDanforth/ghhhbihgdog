@@ -46,6 +46,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_text, atomic_write_json
+
 VERSION = "2.0"
 BASE58 = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 ZERO_WIDTH = "\u200b"  # Zero-width space for string obfuscation
@@ -342,10 +345,9 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path,
 
         mutated_src = banner + "\n\n" + mutated_src
         
-        # Write output
+        # Write output atomically with secure permissions
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(mutated_src, encoding="utf-8")
-        os.chmod(out_path, 0o600)
+        atomic_write_text(mutated_src, out_path, perms=0o600)
         
         print(f"[+] Mutated script → {out_path}")
         print(f"[+] Rename count: {len(rename_map)}")
@@ -367,8 +369,7 @@ def mutate(source_path: Path, out_path: Path, seed_path: Path,
                 ]
             }
             man_path = out_path.with_suffix(".manifest.json")
-            man_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-            os.chmod(man_path, 0o600)
+            atomic_write_json(manifest, man_path, perms=0o600)
             print(f"[!] Manifest saved → {man_path}")
             print(f"[!] WARNING: Manifest is a de-obfuscation key. Delete after use.")
         else:

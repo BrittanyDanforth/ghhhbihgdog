@@ -28,6 +28,9 @@ import ctypes
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
+
 # Stealth configuration
 STEALTH_MODE = os.environ.get('DEBUG', '0') != '1'
 PARANOID_MODE = True
@@ -499,11 +502,9 @@ def generate_dag(args):
     temp_data = json.dumps(output, sort_keys=True).encode()
     output["integrity"] = hashlib.sha3_256(temp_data).hexdigest()
     
-    # Final JSON
-    final_data = json.dumps(output, indent=2, sort_keys=True).encode()
-    
-    # Secure write
-    StealthWriter.write_atomic(args.out, final_data)
+    # Secure atomic write
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output, args.out, perms=0o600)
     
     # Cleanup sensitive data
     mem_guard.scramble()

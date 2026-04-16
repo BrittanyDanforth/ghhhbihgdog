@@ -58,6 +58,9 @@ import tempfile
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_text
+
 # Enhanced configuration
 SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 DEFAULT_OUTPUT = _TOOLKIT_ROOT / "mirror_exec.log"
@@ -571,35 +574,13 @@ class EnhancedForensicMirrormask:
         return int(match.group(1)) if match else None
     
     def write_output(self, mirror_lines: List[str], output_path: Path, overwrite_source: bool = False):
-        """Write output with secure file operations"""
+        """Write output with secure atomic file operations"""
         if not mirror_lines:
             raise ValueError("No mirror lines to write")
         
-        # Use temporary file for atomic operation
-        temp_file = output_path.with_suffix('.tmp')
-        
-        try:
-            # Write to temporary file
-            with temp_file.open('w', encoding='utf-8') as f:
-                f.write('\n'.join(mirror_lines))
-                f.flush()
-                os.fsync(f.fileno())  # Ensure data is written to disk
-            
-            # Atomic move + restrict permissions
-            temp_file.replace(output_path)
-            os.chmod(output_path, 0o600)
-
-            print(f"[+] Mirror log written: {output_path} ({len(mirror_lines)} lines)")
-            
-            # Secure cleanup
-            if temp_file.exists():
-                temp_file.unlink()
-            
-        except Exception as e:
-            # Cleanup on error
-            if temp_file.exists():
-                temp_file.unlink()
-            raise e
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text('\n'.join(mirror_lines), output_path, perms=0o600)
+        print(f"[+] Mirror log written: {output_path} ({len(mirror_lines)} lines)")
 
 def setup_argument_parser() -> argparse.ArgumentParser:
     """Setup comprehensive argument parser"""

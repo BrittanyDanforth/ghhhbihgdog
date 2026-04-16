@@ -49,8 +49,12 @@ import secrets
 import socket
 import time
 import random
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from gs_common import atomic_write_json
 
 try:
     import psutil  # Optional but recommended
@@ -153,30 +157,9 @@ def build_seed_bundle(entropy: dict, num_bytes: int) -> dict:
 
 
 def write_bundle(bundle: dict, out_path: Path):
-    """Write bundle to file atomically."""
-    try:
-        # Ensure parent directory exists
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            os.chmod(tmp_path, 0o600)
-            json.dump(bundle, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        
-        # Atomic move
-        tmp_path.replace(out_path)
-        os.chmod(out_path, 0o600)
-        
-    except Exception as e:
-        print(f"[-] Error writing bundle: {e}")
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-        raise
+    """Write bundle to file atomically with secure permissions."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(bundle, out_path, perms=0o600)
 
 
 def main():
