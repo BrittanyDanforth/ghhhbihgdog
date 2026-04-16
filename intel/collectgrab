@@ -52,11 +52,23 @@ targ_script = "targ_graber_v14.py"
 if not (os.path.isfile(targ_script) and os.access(targ_script, os.X_OK)):
     logger.warning("Script '%s' is missing or not executable. Using default targets.", targ_script)
 
-# Setup proxy configuration — ABORT if Tor is not available
-# Running clearnet exposes the operator's real IP to every target
+# Proxy setup is deferred to _init_tor_proxy() — called at runtime, not import time.
+# This allows --help and other non-network operations to work without Tor.
 proxies = {}
 _tor_socks_port = None
-if TOR_AVAILABLE:
+
+
+def _init_tor_proxy():
+    """Initialize Tor proxy. Called at runtime, not import time.
+
+    Module-level proxy setup prevented --help from working without Tor
+    (the verify_tor call would hang on network timeout). Deferring to
+    runtime means the module can be imported and inspected freely.
+    """
+    global proxies, _tor_socks_port
+    if not TOR_AVAILABLE:
+        logger.critical("Tor (stem) not available — refusing to run over clearnet.")
+        sys.exit(1)
     for _candidate_port in (9050, 9150):
         _proxy_url = f'socks5h://127.0.0.1:{_candidate_port}'
         try:
@@ -71,15 +83,9 @@ if TOR_AVAILABLE:
             'http': f'socks5h://127.0.0.1:{_tor_socks_port}',
             'https': f'socks5h://127.0.0.1:{_tor_socks_port}',
         }
-        logger.info("Tor SOCKS active on port %d", _tor_socks_port)
     else:
-        logger.critical("Tor SOCKS not responding on 9050 or 9150 — refusing to run over clearnet.")
-        logger.critical("Start Tor: sudo systemctl start tor  or open Tor Browser.")
+        logger.critical("Tor not responding on 9050 or 9150. Start Tor first.")
         sys.exit(1)
-else:
-    logger.critical("Tor (stem) not available — refusing to run over clearnet.")
-    logger.critical("Install stem: pip install stem  and ensure Tor is running.")
-    sys.exit(1)
 
 def _secure_perms(path):
     """Set file to owner-only (0600) to protect collected data."""
@@ -88,9 +94,8 @@ def _secure_perms(path):
     except OSError:
         pass
 
-# Create a requests session for persistent settings
+# Session created lazily after Tor is initialized
 session = requests.Session()
-session.proxies.update(proxies)
 
 # Randomized user agents list
 USER_AGENTS = [
@@ -283,6 +288,8 @@ def load_targets():
     return cleaned_targets
 
 def _run_pipeline():
+    _init_tor_proxy()
+    session.proxies.update(proxies)
     targets = load_targets()
 
     meta_entries = []
