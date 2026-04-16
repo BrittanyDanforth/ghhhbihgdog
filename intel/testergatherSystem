@@ -214,6 +214,8 @@ class TorSession:
         self._proxy = proxy_dict
         self._session = requests.Session()
         self._session.proxies.update(proxy_dict)
+        # Verify DNS goes through proxy (socks5h handles this, but verify)
+        self._verify_dns_safety()
         retry = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 504])
         adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
         self._session.mount("http://", adapter)
@@ -221,6 +223,33 @@ class TorSession:
         self._domain_last: Dict[str, float] = {}
         self._domain_blocks: Dict[str, int] = defaultdict(int)
         self._request_count = 0
+
+    def _verify_dns_safety(self):
+        """Verify DNS queries go through Tor, not local resolver.
+
+        socks5h:// should handle this, but if the system has a DNS leak
+        (e.g., /etc/resolv.conf points to a real DNS server and some
+        library bypasses the SOCKS proxy), this catches it.
+        """
+        try:
+            # Check that our exit IP is a Tor exit (already done by require_tor_proxy,
+            # but verify the session itself routes correctly)
+            resp = self._session.get(
+                "https://check.torproject.org/api/ip",
+                timeout=15, headers=_pick_profile(),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("IsTor"):
+                    integrity_log("intel", "DNS_LEAK:session_not_through_tor")
+                    print("  [!] CRITICAL: Session traffic is NOT going through Tor!")
+                    print("  [!] DNS or connection leak detected. Aborting.")
+                    sys.exit(1)
+                integrity_log("intel", "dns_safety_verified")
+        except requests.exceptions.Timeout:
+            integrity_log("intel", "dns_verify_timeout:proceeding_cautiously")
+        except Exception as e:
+            integrity_log("intel", f"dns_verify_error:{type(e).__name__}")
 
     def _delay_for_domain(self, domain: str):
         """Adaptive delay — increases if domain has blocked us before."""
@@ -256,15 +285,18 @@ class TorSession:
             # Add referer for non-first requests to look like navigation
             if self._request_count > 1:
                 headers["Referer"] = f"https://duckduckgo.com/?q={quote(domain)}"
-            if "headers" in kwargs:
-                headers.update(kwargs.pop("headers"))
+            # Merge caller headers without mutating kwargs (pop breaks retries)
+            extra_headers = kwargs.get("headers", {})
+            if extra_headers:
+                headers.update(extra_headers)
+            req_kwargs = {k: v for k, v in kwargs.items() if k != "headers"}
 
             try:
                 self._domain_last[domain] = time.time()
                 if method.upper() == "HEAD":
-                    resp = self._session.head(url, headers=headers, allow_redirects=True, **kwargs)
+                    resp = self._session.head(url, headers=headers, allow_redirects=True, **req_kwargs)
                 else:
-                    resp = self._session.get(url, headers=headers, **kwargs)
+                    resp = self._session.get(url, headers=headers, **req_kwargs)
 
                 if resp.status_code in (200, 301, 302, 304):
                     self._domain_blocks[domain] = max(0, self._domain_blocks[domain] - 1)
@@ -305,8 +337,13 @@ class TorSession:
             if resp.status_code == 200:
                 integrity_log("intel", f"wayback_ok:{urlparse(url).netloc}")
                 return resp
-        except Exception:
-            pass
+            integrity_log("intel", f"wayback_fail:{urlparse(url).netloc}:status={resp.status_code}")
+        except requests.exceptions.Timeout:
+            integrity_log("intel", f"wayback_timeout:{urlparse(url).netloc}")
+        except requests.exceptions.ConnectionError:
+            integrity_log("intel", f"wayback_conn_error:{urlparse(url).netloc}")
+        except Exception as e:
+            integrity_log("intel", f"wayback_error:{urlparse(url).netloc}:{type(e).__name__}")
         return None
 
     def post_json(self, url: str, json_data: dict, **kwargs) -> Optional[requests.Response]:
@@ -393,8 +430,8 @@ class DataExtractor:
                     if val and not val.startswith(("#", "javascript:", "data:", "mailto:")):
                         full = urljoin(base_url, val)
                         urls.add(full)
-        except Exception:
-            pass
+        except Exception as e:
+            integrity_log("intel", f"url_extract_error:{type(e).__name__}")
         return list(urls)[:200]
 
     @classmethod
@@ -406,7 +443,8 @@ class DataExtractor:
             soup = BeautifulSoup(html, "html.parser")
             comments = soup.find_all(string=lambda t: isinstance(t, Comment))
             return [c.strip() for c in comments if len(c.strip()) > 10][:50]
-        except Exception:
+        except Exception as e:
+            integrity_log("intel", f"comment_extract_error:{type(e).__name__}")
             return []
 
     @classmethod
@@ -545,8 +583,8 @@ class TechFingerprinter:
                 gen = soup.find("meta", attrs={"name": "generator"})
                 if gen and gen.get("content"):
                     tech["meta_generator"] = gen["content"][:100]
-            except Exception:
-                pass
+            except Exception as e:
+                integrity_log("intel", f"tech_meta_error:{type(e).__name__}")
 
         return tech
 
@@ -643,36 +681,80 @@ class VulnScanner:
     def __init__(self, session: TorSession):
         self._session = session
 
+    @staticmethod
+    def _add_confidence(findings: List[dict], base_confidence: float) -> List[dict]:
+        """Add confidence score to findings.
+
+        Confidence represents how reliably the finding is a real issue:
+          1.0 = confirmed (e.g., we got /etc/passwd content back)
+          0.9 = very likely (e.g., error-based SQLi, canary reflected as HTML)
+          0.7 = likely (e.g., header missing, sensitive path accessible)
+          0.5 = possible (e.g., pattern match that could be false positive)
+          0.3 = informational (e.g., robots.txt exists)
+
+        Exploitable findings get +0.1 confidence (we verified the exploit works).
+        """
+        for f in findings:
+            if "confidence" not in f:
+                conf = base_confidence
+                if f.get("exploitable"):
+                    conf = min(conf + 0.1, 1.0)
+                if f.get("severity") == SEV_CRITICAL:
+                    conf = max(conf, 0.8)
+                f["confidence"] = round(conf, 2)
+        return findings
+
     def scan_full(self, base_url: str, html: str = "", headers: dict = None,
                   depth: str = "full") -> List[dict]:
         """Run all applicable vulnerability checks.
 
         depth: 'quick' = headers only, 'full' = + paths, 'deep' = + exploits
+
+        Each finding gets a confidence score (0.0–1.0) indicating reliability.
         """
         if headers is None:
             headers = {}
         findings = []
 
-        findings.extend(self._check_security_headers(headers))
-        findings.extend(self._check_cookies(headers))
-        findings.extend(self._check_cors(base_url, headers))
-        findings.extend(self._check_info_disclosure(headers, html))
-        findings.extend(self._check_clickjacking(headers))
+        # Header checks — high confidence (deterministic, no false positives)
+        findings.extend(self._add_confidence(
+            self._check_security_headers(headers), 0.95))
+        findings.extend(self._add_confidence(
+            self._check_cookies(headers), 0.9))
+        findings.extend(self._add_confidence(
+            self._check_cors(base_url, headers), 0.85))
+        findings.extend(self._add_confidence(
+            self._check_info_disclosure(headers, html), 0.8))
+        findings.extend(self._add_confidence(
+            self._check_clickjacking(headers), 0.9))
 
         if depth in ("full", "deep"):
-            findings.extend(self._check_sensitive_paths(base_url))
-            findings.extend(self._check_http_methods(base_url))
-            findings.extend(self._check_open_redirect(base_url))
+            # Path probing — moderate confidence (could be custom 404)
+            findings.extend(self._add_confidence(
+                self._check_sensitive_paths(base_url), 0.75))
+            findings.extend(self._add_confidence(
+                self._check_http_methods(base_url), 0.7))
+            findings.extend(self._add_confidence(
+                self._check_open_redirect(base_url), 0.85))
 
         if depth == "deep":
-            findings.extend(self._check_sqli_indicators(base_url))
-            findings.extend(self._check_xss_reflection(base_url))
-            findings.extend(self._check_directory_traversal(base_url))
-            findings.extend(self._check_ssl_cert(base_url))
-            findings.extend(self._check_graphql_introspection(base_url))
-            findings.extend(self._check_ssrf_indicators(base_url))
-            findings.extend(self._check_lfi(base_url))
-            findings.extend(self._check_command_injection(base_url))
+            # Active exploit detection — confidence varies by check type
+            findings.extend(self._add_confidence(
+                self._check_sqli_indicators(base_url), 0.9))
+            findings.extend(self._add_confidence(
+                self._check_xss_reflection(base_url), 0.9))
+            findings.extend(self._add_confidence(
+                self._check_directory_traversal(base_url), 0.95))
+            findings.extend(self._add_confidence(
+                self._check_ssl_cert(base_url), 0.85))
+            findings.extend(self._add_confidence(
+                self._check_graphql_introspection(base_url), 0.95))
+            findings.extend(self._add_confidence(
+                self._check_ssrf_indicators(base_url), 0.9))
+            findings.extend(self._add_confidence(
+                self._check_lfi(base_url), 0.95))
+            findings.extend(self._add_confidence(
+                self._check_command_injection(base_url), 0.95))
 
         return findings
 
@@ -902,8 +984,8 @@ class VulnScanner:
                                       else "PUT/DELETE methods may allow unauthorized file modification.",
                             "evidence": f"Allow: {allow}"
                         })
-        except Exception:
-            pass
+        except Exception as e:
+            integrity_log("intel", f"http_methods_error:{type(e).__name__}")
         return findings
 
     def _check_open_redirect(self, base_url: str) -> List[dict]:
@@ -931,8 +1013,8 @@ class VulnScanner:
                             "evidence": f"?{param}={evil_target} → Location: {location[:100]}"
                         })
                         break  # One is enough to confirm
-            except Exception:
-                pass
+            except Exception as e:
+                integrity_log("intel", f"_check_open_redirect_error:{type(e).__name__}")
         return findings
 
     def _check_sqli_indicators(self, base_url: str) -> List[dict]:
@@ -1061,8 +1143,8 @@ class VulnScanner:
                             return findings
                     except (ValueError, KeyError):
                         pass
-            except Exception:
-                pass
+            except Exception as e:
+                integrity_log("intel", f"unknown_error:{type(e).__name__}")
         return findings
 
     def _check_ssrf_indicators(self, base_url: str) -> List[dict]:
@@ -1240,8 +1322,8 @@ class VulnScanner:
                                     },
                                 })
                                 return findings
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            integrity_log("intel", f"unknown_error:{type(e).__name__}")
         return findings
 
     def _check_ssl_cert(self, base_url: str) -> List[dict]:
@@ -1463,6 +1545,13 @@ class BreachChecker:
 # ══════════════════════════════════════════════════════════════════════════
 
 class SecureStorage:
+    """RAM-only encrypted storage with proper key management.
+
+    Key is printed to terminal once at save time (for the operator to note)
+    and held in memory only — NOT written to disk alongside the encrypted
+    file, which would make encryption meaningless.
+    """
+
     def __init__(self):
         self._dir = RAM_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -1470,38 +1559,57 @@ class SecureStorage:
         self._key = Fernet.generate_key() if HAS_FERNET else None
         self._cipher = Fernet(self._key) if self._key else None
 
-    def save(self, data: dict, label: str = "intel") -> Path:
+    def save(self, data: dict, label: str = "intel") -> Tuple[Path, Optional[str]]:
+        """Save data to RAM disk. Returns (path, key_hex_or_None).
+
+        The key is returned so the caller can display it once. It is NOT
+        written to disk — the operator must note it to decrypt later.
+        """
         _ts = int(time.time()) // 600 * 600
         ts_str = datetime.fromtimestamp(_ts, tz=timezone.utc).strftime("%Y%m%d_%H%M")
         filename = f"{label}_{ts_str}_{secure_hex(4)}"
         serialized = json.dumps(data, indent=2, default=str).encode()
+
         if self._cipher:
             encrypted = self._cipher.encrypt(serialized)
             outpath = self._dir / f"{filename}.enc"
             outpath.write_bytes(encrypted)
             secure_file_perms(outpath, 0o600)
-            keypath = self._dir / f"{filename}.key"
-            keypath.write_bytes(self._key)
-            secure_file_perms(keypath, 0o600)
+            # Key stays in memory — returned to caller for display, NOT written to disk
+            key_hex = self._key.decode() if isinstance(self._key, bytes) else str(self._key)
+            return outpath, key_hex
         else:
             outpath = self._dir / f"{filename}.json"
             outpath.write_text(serialized.decode())
             secure_file_perms(outpath, 0o600)
-        return outpath
+            return outpath, None
 
     def wipe_all(self):
+        """Securely wipe all intel data — files AND subdirectories."""
         if not self._dir.exists():
             return
-        for f in self._dir.iterdir():
-            try:
-                size = f.stat().st_size
-                with open(f, "r+b") as fh:
-                    fh.write(os.urandom(size))
-                    fh.flush()
-                f.unlink()
-            except (OSError, PermissionError):
+        import shutil
+        # Walk bottom-up to handle subdirectories
+        for root, dirs, files in os.walk(str(self._dir), topdown=False):
+            root_path = Path(root)
+            for fname in files:
+                fpath = root_path / fname
                 try:
-                    f.unlink()
+                    size = fpath.stat().st_size
+                    if size > 0:
+                        with open(fpath, "r+b") as fh:
+                            fh.write(os.urandom(size))
+                            fh.flush()
+                    fpath.unlink()
+                except (OSError, PermissionError):
+                    try:
+                        fpath.unlink()
+                    except OSError:
+                        pass
+            for dname in dirs:
+                dpath = root_path / dname
+                try:
+                    dpath.rmdir()
                 except OSError:
                     pass
         try:
@@ -1546,8 +1654,8 @@ class IntelScraper:
                 mt = soup.find("meta", attrs={"name": "description"})
                 if mt:
                     meta_desc = mt.get("content", "")
-            except Exception:
-                pass
+            except Exception as e:
+                integrity_log("intel", f"scrape_url_error:{type(e).__name__}")
 
         extracted = self._extractor.extract_all(text)
         urls = self._extractor.extract_urls(content, url)
@@ -1807,7 +1915,9 @@ class IntelOrchestrator:
                      "INFO": "\033[0;90m"}.get(sev, "")
             reset = "\033[0m"
             exploit_tag = " [EXPLOITABLE]" if v.get("exploitable") else ""
-            print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}")
+            conf = v.get("confidence", 0)
+            conf_tag = f" ({conf*100:.0f}%)" if conf else ""
+            print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}{conf_tag}")
             if sev in (SEV_CRITICAL, SEV_HIGH):
                 print(f"         {v['detail'][:120]}")
             if v.get("exploit_info"):
@@ -1873,7 +1983,7 @@ class IntelOrchestrator:
             ],
         }
 
-        outpath = self._storage.save(report)
+        outpath, enc_key = self._storage.save(report)
 
         # Summary
         print(f"\n  {'═' * 55}")
@@ -1892,9 +2002,13 @@ class IntelOrchestrator:
             for k, v in sorted(all_data.items()):
                 if v:
                     print(f"    {k}: {len(v)}")
-        enc = "encrypted" if HAS_FERNET else "plaintext"
         print(f"  {'═' * 55}")
-        print(f"  [+] Report saved ({enc}): {scrub_path(outpath)}")
+        if enc_key:
+            print(f"  [+] Report saved (encrypted): {scrub_path(outpath)}")
+            print(f"  [+] Decryption key (note this — NOT saved to disk):")
+            print(f"      {enc_key}")
+        else:
+            print(f"  [+] Report saved (plaintext): {scrub_path(outpath)}")
         return outpath
 
     def cleanup(self):
@@ -1939,6 +2053,29 @@ def main():
 
     if not args.domain and not args.email and not args.query and not args.file:
         ap.error("At least one of --domain, --email, --query, or --file is required")
+
+    # ── Input validation ──
+    if args.domain:
+        # Normalize domain: strip protocol, trailing path, whitespace
+        d = args.domain.strip().lower()
+        if d.startswith("http://") or d.startswith("https://"):
+            d = urlparse(d).netloc or d
+        d = d.split("/")[0].split("?")[0].split("#")[0]
+        if not re.match(r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$", d):
+            print(f"  [!] Invalid domain: {d[:40]}")
+            sys.exit(1)
+        args.domain = d
+
+    if args.email:
+        e = args.email.strip()
+        if "@" not in e or "." not in e.split("@")[-1]:
+            print(f"  [!] Invalid email format")
+            sys.exit(1)
+        args.email = e
+
+    if args.file and not args.file.exists():
+        print(f"  [!] File not found: {scrub_path(args.file)}")
+        sys.exit(1)
 
     proxy = require_tor_proxy(args.tor_proxy)
     integrity_log("intel", "session_start")

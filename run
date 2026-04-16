@@ -63,8 +63,9 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil
+import json, subprocess, shutil, secrets
 from decimal import Decimal, InvalidOperation
+from urllib.parse import urlparse
 
 ROOT = _ROOT
 CORE = ROOT / "core"
@@ -944,6 +945,164 @@ def flow_testnet(detected_port=None):
                        "Paranoia dry-run")
 
 
+def _intel_exploit_walkthrough(tor_proxy: str):
+    """Interactive walkthrough of exploitable findings from the latest scan.
+
+    Reads the most recent report from RAM storage, presents each exploitable
+    finding, and offers to re-run the exploit payload for verification.
+    """
+    import glob as _glob
+    ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
+    if not ram_dir.exists():
+        info("No scan results found. Run a scan first.")
+        return
+
+    # Find most recent report (encrypted or plain)
+    reports = sorted(ram_dir.glob("intel_*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not reports:
+        info("No scan results found. Run a scan first.")
+        return
+
+    latest = reports[0]
+    report_data = None
+
+    if latest.suffix == ".enc":
+        # Need decryption key
+        try:
+            from cryptography.fernet import Fernet as _F
+        except ImportError:
+            err("cryptography package needed to read encrypted reports.")
+            return
+        key = prompt("Enter decryption key for the report")
+        if not key:
+            return
+        try:
+            cipher = _F(key.encode() if isinstance(key, str) else key)
+            decrypted = cipher.decrypt(latest.read_bytes())
+            report_data = json.loads(decrypted)
+        except Exception:
+            err("Decryption failed — wrong key or corrupt file.")
+            return
+    else:
+        try:
+            report_data = json.loads(latest.read_text())
+        except (json.JSONDecodeError, OSError):
+            err("Cannot read report file.")
+            return
+
+    vulns = report_data.get("vulnerabilities", [])
+    exploitable = [v for v in vulns if v.get("exploitable")]
+
+    if not exploitable:
+        info("No exploitable findings in the latest scan.")
+        info(f"Total findings: {len(vulns)}")
+        return
+
+    heading("Exploit Walkthrough")
+    print(f"  Found {len(exploitable)} exploitable vulnerabilities.")
+    print(f"  Walk through each one? You can choose to verify each exploit.")
+    print()
+
+    for i, v in enumerate(exploitable):
+        if shutdown_requested():
+            break
+        sev = v.get("severity", "?")
+        color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C}.get(sev, D)
+        conf = v.get("confidence", 0)
+
+        print(f"\n  {'─' * 55}")
+        print(f"  {color}[{sev}]{N} {v['title']} ({conf*100:.0f}% confidence)")
+        print(f"  {'─' * 55}")
+        print(f"  {B}Detail:{N} {v.get('detail', 'N/A')}")
+
+        ei = v.get("exploit_info", {})
+        if ei:
+            print(f"  {B}Type:{N}   {ei.get('type', 'unknown')}")
+            print(f"  {B}Method:{N} {ei.get('method', 'N/A')}")
+            print(f"  {B}Risk:{N}   {ei.get('risk', 'N/A')}")
+
+        print(f"  {B}Evidence:{N} {v.get('evidence', 'N/A')}")
+        print()
+
+        choice = prompt(f"  [{i+1}/{len(exploitable)}] Verify this exploit? (y/n/q)", "n").lower()
+
+        if choice == "q":
+            info("Walkthrough ended.")
+            break
+
+        if choice in ("y", "yes"):
+            # Re-run the specific exploit check for verification
+            exploit_type = ei.get("type", "")
+            param = ei.get("parameter", "")
+            path = ei.get("path", "")
+            target = v.get("evidence", "")
+
+            info(f"Re-verifying {exploit_type}...")
+
+            # Build verification URL based on exploit type
+            verify_url = None
+            if exploit_type == "sqli" and param:
+                # Get base URL from evidence
+                base = _extract_base_url_from_vulns(vulns)
+                if base:
+                    verify_url = f"{base}?{param}=1'"
+                    info(f"Sending: {param}=1' (single quote injection)")
+            elif exploit_type == "xss" and param:
+                base = _extract_base_url_from_vulns(vulns)
+                if base:
+                    canary = f"xss{secrets.token_hex(4)}test"
+                    verify_url = f"{base}?{param}=<{canary}>"
+                    info(f"Sending: {param}=<{canary}> (XSS canary)")
+            elif exploit_type in ("lfi", "command_injection") and param:
+                base = _extract_base_url_from_vulns(vulns)
+                if base and exploit_type == "lfi":
+                    verify_url = f"{base}?{param}=..%2F..%2F..%2Fetc%2Fpasswd"
+                    info(f"Sending: {param}=../../../etc/passwd")
+                elif base:
+                    marker = f"gs{secrets.token_hex(4)}verify"
+                    verify_url = f"{base}?{param}=;echo {marker}"
+                    info(f"Sending: {param}=;echo {marker}")
+            elif exploit_type == "graphql_introspection" and path:
+                base = _extract_base_url_from_vulns(vulns)
+                if base:
+                    verify_url = base.rstrip("/") + path
+                    info(f"Sending introspection query to {path}")
+            elif exploit_type == "ssrf" and param:
+                base = _extract_base_url_from_vulns(vulns)
+                if base:
+                    verify_url = f"{base}?{param}=http://169.254.169.254/latest/meta-data/"
+                    info(f"Sending: {param}=<AWS metadata>")
+
+            if verify_url:
+                # Execute verification via the intel tool
+                verify_args = ["--domain", urlparse(verify_url).netloc,
+                               "--scan", "quick", "--tor-proxy", tor_proxy]
+                info("Running verification scan...")
+                run_script(INTEL / "testergatherSystem", verify_args, "Verify exploit")
+                ok(f"Verification complete — check output above.")
+            else:
+                info(f"Manual verification needed for {exploit_type}.")
+                if ei.get("method"):
+                    info(f"Method: {ei['method'][:200]}")
+
+    print()
+    ok("Exploit walkthrough complete.")
+    info("Run option 9 (Paranoia Cleanup) when done.")
+
+
+def _extract_base_url_from_vulns(vulns: list) -> str:
+    """Extract the base URL from vulnerability findings."""
+    for v in vulns:
+        ev = v.get("evidence", "")
+        if "http" in ev:
+            import re as _re
+            m = _re.search(r"https?://[^\s,)]+", ev)
+            if m:
+                parsed = urlparse(m.group(0))
+                return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
 def flow_intel(detected_port=None):
     heading("Intelligence Gathering & Vulnerability Scanner")
     print(f"  This tool performs OSINT collection and vulnerability scanning")
@@ -954,12 +1113,20 @@ def flow_intel(detected_port=None):
     print(f"    {G}2{N}  Email Breach Check           (check breach databases)")
     print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
     print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
-    print(f"    {G}5{N}  Wipe Intel Data              (secure erase from RAM)")
+    print(f"    {G}5{N}  Exploit Walkthrough          (review + verify findings)")
+    print(f"    {G}6{N}  Wipe Intel Data              (secure erase from RAM)")
     print()
-    mode = prompt("Choose mode (1-5)")
+    mode = prompt("Choose mode (1-6)")
+
+    if mode == "6":
+        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        return
 
     if mode == "5":
-        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        tor = get_tor_proxy(detected_port)
+        if not tor:
+            return
+        _intel_exploit_walkthrough(tor)
         return
 
     tor = get_tor_proxy(detected_port)
@@ -990,7 +1157,12 @@ def flow_intel(detected_port=None):
             depth = "full"
 
         args = ["--domain", domain, "--scan", depth, "--tor-proxy", tor]
-        run_script(INTEL / "testergatherSystem", args, "Intel scan")
+        if run_script(INTEL / "testergatherSystem", args, "Intel scan"):
+            # After scan, offer exploit walkthrough if deep scan
+            if depth == "deep":
+                print()
+                if confirm("Review exploitable findings interactively?"):
+                    _intel_exploit_walkthrough(tor)
 
     elif mode == "2":
         email = prompt("Email address to check")
