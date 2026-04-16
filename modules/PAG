@@ -43,18 +43,15 @@ class MemoryScrambler:
         self._lock_memory()
     
     def _lock_memory(self):
-        """Lock memory pages to prevent swapping and disable core dumps."""
+        """Lock memory pages to prevent swapping and disable core dumps.
+        All operations are best-effort — failure is not fatal."""
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         except (ImportError, ValueError, OSError):
             pass
         try:
-            import resource
-            resource.setrlimit(resource.RLIMIT_MEMLOCK, 
-                             (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            
-            libc = ctypes.CDLL("libc.so.6")
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
             MCL_CURRENT = 1
             MCL_FUTURE = 2
             libc.mlockall(MCL_CURRENT | MCL_FUTURE)
