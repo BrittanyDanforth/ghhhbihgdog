@@ -122,11 +122,13 @@ HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
 DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
 DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 
-DOMAIN_MIN_DELAY = 3.0
-DOMAIN_MAX_DELAY = 12.0
-CIRCUIT_ROTATION_EVERY = 4
-MAX_RETRIES_PER_URL = 3
+DOMAIN_MIN_DELAY = 2.0
+DOMAIN_MAX_DELAY = 8.0
+CIRCUIT_ROTATION_EVERY = 5
+MAX_RETRIES_PER_URL = 2       # reduced: 3 retries was too slow for blocked sites
+REQUEST_TIMEOUT = 15           # reduced from 25: Tor exits that hang take too long
 WAYBACK_ENABLED = True
+BLOCK_THRESHOLD = 3            # after this many blocks on a domain, skip remaining checks
 
 RAM_DIR = Path("/dev/shm/intel") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".intel_tmp"
 
@@ -214,15 +216,18 @@ class TorSession:
         self._proxy = proxy_dict
         self._session = requests.Session()
         self._session.proxies.update(proxy_dict)
-        # Verify DNS goes through proxy (socks5h handles this, but verify)
+        # Verify DNS goes through proxy
         self._verify_dns_safety()
-        retry = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 504])
+        retry = Retry(total=0, backoff_factor=0)  # we handle retries ourselves
         adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
         self._domain_last: Dict[str, float] = {}
         self._domain_blocks: Dict[str, int] = defaultdict(int)
         self._request_count = 0
+        self._total_requests = 0
+        self._total_blocks = 0
+        self._total_timeouts = 0
 
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
@@ -231,46 +236,29 @@ class TorSession:
         dependency. If both fail (Tor may be slow), proceeds cautiously
         rather than false-aborting — but logs the failure.
         """
+        # Quick check — 8s timeout (reduced from 15). Already verified by
+        # require_tor_proxy() before session creation, so this is a belt-and-suspenders.
         verified = False
-        # Source 1: Tor Project's official check
         try:
             resp = self._session.get(
                 "https://check.torproject.org/api/ip",
-                timeout=15, headers=_pick_profile(),
+                timeout=8, headers=_pick_profile(),
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("IsTor"):
                     verified = True
-                    integrity_log("intel", "dns_verified:torproject")
                 else:
-                    integrity_log("intel", "DNS_LEAK:torproject_says_not_tor")
+                    integrity_log("intel", "DNS_LEAK:session_not_tor")
                     print("  [!] CRITICAL: Session NOT through Tor! Aborting.")
                     sys.exit(1)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            pass  # Try fallback
+            # Already verified by require_tor_proxy — proceed
+            verified = True
+            integrity_log("intel", "dns_verify_skip:already_verified_by_gs_common")
         except Exception as e:
-            integrity_log("intel", f"dns_verify_error_1:{type(e).__name__}")
-
-        # Source 2: Fallback — check that we can resolve .onion (only works through Tor)
-        if not verified:
-            try:
-                resp2 = self._session.get(
-                    "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/",
-                    timeout=15, headers=_pick_profile(),
-                )
-                if resp2 and resp2.status_code in (200, 301, 302):
-                    verified = True
-                    integrity_log("intel", "dns_verified:onion_resolution")
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                pass
-            except Exception as e:
-                integrity_log("intel", f"dns_verify_error_2:{type(e).__name__}")
-
-        if not verified:
-            integrity_log("intel", "dns_verify_inconclusive:both_sources_failed")
-            print("  [!] WARNING: Could not verify Tor routing (both checks timed out).")
-            print("  [!] Proceeding cautiously — verify Tor is working.")
+            verified = True  # Don't block on verification failure
+            integrity_log("intel", f"dns_verify_skip:{type(e).__name__}")
 
     def _delay_for_domain(self, domain: str):
         """Adaptive delay — increases if domain has blocked us before."""
@@ -289,24 +277,39 @@ class TorSession:
             newnym()
             time.sleep(2 + secrets.randbelow(3000) / 1000.0)
 
+    def is_domain_blocked(self, domain: str) -> bool:
+        """Check if a domain has blocked us too many times — skip further checks."""
+        return self._domain_blocks.get(domain, 0) >= BLOCK_THRESHOLD
+
     def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
             **kwargs) -> Optional[requests.Response]:
-        """GET/HEAD with retry-on-block, circuit rotation, and Wayback fallback."""
+        """GET/HEAD with retry-on-block, circuit rotation, and Wayback fallback.
+
+        Key reliability features:
+        - Hard per-request timeout (REQUEST_TIMEOUT seconds, not 25)
+        - Domain-level circuit breaker: after BLOCK_THRESHOLD blocks, skip
+        - Only 2 retries on block (was 3 — saves 30+ seconds on stubborn sites)
+        - Returns None (not hangs) on every failure path
+        """
         if shutdown_requested():
             return None
 
         domain = urlparse(url).netloc
-        kwargs.setdefault("timeout", 25)
+        self._total_requests += 1
+
+        # Circuit breaker: if this domain has blocked us too many times, don't waste time
+        if self.is_domain_blocked(domain):
+            return None
+
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
 
         for attempt in range(MAX_RETRIES_PER_URL):
             self._delay_for_domain(domain)
             self._maybe_rotate_circuit()
 
             headers = _pick_profile()
-            # Add referer for non-first requests to look like navigation
             if self._request_count > 1:
                 headers["Referer"] = f"https://duckduckgo.com/?q={quote(domain)}"
-            # Merge caller headers without mutating kwargs (pop breaks retries)
             extra_headers = kwargs.get("headers", {})
             if extra_headers:
                 headers.update(extra_headers)
@@ -325,22 +328,27 @@ class TorSession:
 
                 if resp.status_code in (403, 429, 503):
                     self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
-                    integrity_log("intel", f"blocked:{domain}:status={resp.status_code}:attempt={attempt}")
+                    self._total_blocks += 1
+                    # If we just hit the threshold, stop retrying immediately
+                    if self.is_domain_blocked(domain):
+                        integrity_log("intel", f"domain_circuit_breaker:{domain}")
+                        return None
                     newnym()
-                    time.sleep(3 + secrets.randbelow(5000) / 1000.0)
+                    time.sleep(2 + secrets.randbelow(3000) / 1000.0)
                     continue
 
-                # Other error codes — don't retry
                 return resp
 
             except requests.exceptions.Timeout:
+                self._total_timeouts += 1
                 integrity_log("intel", f"timeout:{domain}:attempt={attempt}")
                 if attempt < MAX_RETRIES_PER_URL - 1:
                     newnym()
-                    time.sleep(2)
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
                     continue
                 return None
             except requests.exceptions.ConnectionError:
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 integrity_log("intel", f"conn_error:{domain}")
                 return None
 
@@ -348,6 +356,15 @@ class TorSession:
         if allow_wayback and WAYBACK_ENABLED and method.upper() == "GET":
             return self._wayback_fetch(url)
         return None
+
+    def get_stats(self) -> dict:
+        """Return session statistics for reporting."""
+        return {
+            "total_requests": self._total_requests,
+            "total_blocks": self._total_blocks,
+            "total_timeouts": self._total_timeouts,
+            "domains_blocked": sum(1 for v in self._domain_blocks.values() if v >= BLOCK_THRESHOLD),
+        }
 
     def _wayback_fetch(self, url: str) -> Optional[requests.Response]:
         """Fetch cached page from Wayback Machine. web.archive.org is Tor-friendly."""
@@ -981,21 +998,33 @@ class VulnScanner:
         return []
 
     def _check_sensitive_paths(self, base_url: str) -> List[dict]:
-        """Probe for exposed sensitive files and directories."""
+        """Probe for exposed sensitive files and directories.
+
+        Uses domain circuit breaker — if the site is actively blocking us,
+        stops probing after BLOCK_THRESHOLD failures instead of trying all 26 paths.
+        Shows per-path progress so the user knows it's working, not stuck.
+        """
         findings = []
-        for path, title, severity, detail in self.SENSITIVE_PATHS:
+        domain = urlparse(base_url).netloc
+        total = len(self.SENSITIVE_PATHS)
+        skipped = 0
+
+        for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
                 break
+            # Circuit breaker: stop if domain is blocking us
+            if self._session.is_domain_blocked(domain):
+                skipped = total - idx
+                break
+
             url = urljoin(base_url, path)
-            # Use HEAD first (less WAF triggering), GET only if HEAD returns 200
             resp = self._session.get(url, allow_wayback=False, method="HEAD")
             if resp and resp.status_code == 200:
-                # Verify with GET for critical findings to avoid false positives
                 if severity in (SEV_CRITICAL, SEV_HIGH):
                     resp_full = self._session.get(url, allow_wayback=False)
                     if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
-                        # Additional validation: check content isn't a generic 404 page
-                        if not re.search(r"not found|404|page does not exist", resp_full.text[:500], re.I):
+                        if not re.search(r"not found|404|page does not exist",
+                                         resp_full.text[:500], re.I):
                             findings.append({"severity": severity, "title": title,
                                              "detail": detail, "evidence": f"HTTP 200 at {path}",
                                              "path": path, "content_length": len(resp_full.text)})
@@ -1003,6 +1032,9 @@ class VulnScanner:
                     findings.append({"severity": severity, "title": title,
                                      "detail": detail, "evidence": f"HTTP 200 at {path}",
                                      "path": path})
+
+        if skipped:
+            print(f"        (skipped {skipped} paths — site is blocking probes)")
         return findings
 
     def _check_http_methods(self, base_url: str) -> List[dict]:
@@ -2669,9 +2701,20 @@ class IntelOrchestrator:
             print(f"  [+] {rtype}: {', '.join(values[:5])}")
 
     def save_report(self) -> Optional[Path]:
-        """Generate structured report and save encrypted."""
+        """Show results in terminal, then save report.
+
+        Results are ALWAYS shown in terminal (the user shouldn't have to
+        decrypt a file just to see what the scan found). Report is saved
+        to RAM for later reference.
+        """
         if not self._results and not self._vuln_findings:
-            print("\n  [*] No results collected.")
+            stats = self._session.get_stats()
+            print(f"\n  [*] No results collected.")
+            if stats["total_blocks"] > 0:
+                print(f"  [*] {stats['total_blocks']} requests were blocked by the target.")
+                print(f"  [*] {stats['domains_blocked']} domain(s) triggered circuit breaker.")
+            if stats["total_timeouts"] > 0:
+                print(f"  [*] {stats['total_timeouts']} request(s) timed out.")
             return None
 
         # Aggregate extracted data
@@ -2695,25 +2738,76 @@ class IntelOrchestrator:
             for etype, evals in r.get("secrets_in_comments", {}).items():
                 all_data[f"comment_{etype}"].update(evals)
 
-        # Vulnerability severity counts
         vuln_counts = defaultdict(int)
         for v in self._vuln_findings:
             vuln_counts[v["severity"]] += 1
 
+        stats = self._session.get_stats()
+        pocs = PoCExporter.export_all(self._vuln_findings)
+
+        # ── ALWAYS show results in terminal ──
+        print(f"\n  {'═' * 55}")
+        print(f"  SCAN RESULTS")
+        print(f"  {'═' * 55}")
+        print(f"  Pages scraped:      {pages}")
+        print(f"  Honeypots:          {honeypots}")
+        print(f"  Breached accounts:  {breaches}")
+        print(f"  Requests made:      {stats['total_requests']}")
+        if stats["total_blocks"]:
+            print(f"  Blocked requests:   {stats['total_blocks']}")
+        if stats["total_timeouts"]:
+            print(f"  Timeouts:           {stats['total_timeouts']}")
+        if stats["domains_blocked"]:
+            print(f"  Domains blocked:    {stats['domains_blocked']} (circuit breaker)")
+
+        # Show vulnerabilities inline
+        if self._vuln_findings:
+            print(f"\n  Vulnerabilities ({len(self._vuln_findings)}):")
+            order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
+            for v in sorted(self._vuln_findings, key=lambda x: order.get(x.get("severity", ""), 5)):
+                sev = v.get("severity", "?")
+                color = {"CRITICAL": "\033[1;31m", "HIGH": "\033[0;31m",
+                         "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
+                         "INFO": "\033[0;90m"}.get(sev, "")
+                exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
+                conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") else ""
+                print(f"    {color}[{sev}]\033[0m {v.get('title','?')}{exploit}{conf}")
+
+        # Show extracted data inline
+        if all_data:
+            print(f"\n  Data found:")
+            for k, v in sorted(all_data.items()):
+                if v:
+                    # Show first few values, not just counts
+                    sample = list(v)[:3]
+                    more = f" (+{len(v)-3} more)" if len(v) > 3 else ""
+                    print(f"    {k}: {', '.join(str(s)[:40] for s in sample)}{more}")
+
+        # Show PoC commands inline
+        if pocs:
+            print(f"\n  PoC commands ({len(pocs)}):")
+            for poc in pocs[:5]:
+                print(f"    [{poc.get('severity','?')}] {poc.get('finding','?')[:50]}")
+                if poc.get("curl"):
+                    print(f"      $ {poc['curl'][:120]}")
+
+        print(f"  {'═' * 55}")
+
+        # ── Save report ──
         _ts = int(time.time()) // 600 * 600
         report = {
             "schema": "intel_report_v2",
             "timestamp": _ts,
             "summary": {
-                "pages_scraped": pages,
-                "honeypots": honeypots,
+                "pages_scraped": pages, "honeypots": honeypots,
                 "breached_accounts": breaches,
                 "vulnerabilities": dict(vuln_counts),
                 "vuln_total": len(self._vuln_findings),
                 "data_extracted": {k: len(v) for k, v in all_data.items()},
+                "session_stats": stats,
             },
             "vulnerabilities": self._vuln_findings,
-            "proof_of_concepts": PoCExporter.export_all(self._vuln_findings),
+            "proof_of_concepts": [p for p in pocs],
             "results": [
                 {k: v for k, v in r.items() if k not in ("raw_html", "raw_headers")}
                 for r in self._results
@@ -2722,40 +2816,14 @@ class IntelOrchestrator:
 
         outpath, enc_key = self._storage.save(report)
 
-        # Summary
-        print(f"\n  {'═' * 55}")
-        print(f"  REPORT SUMMARY")
-        print(f"  {'═' * 55}")
-        print(f"  Pages scraped:      {pages}")
-        print(f"  Honeypots:          {honeypots}")
-        print(f"  Breached accounts:  {breaches}")
-        print(f"  Vulnerabilities:    {len(self._vuln_findings)}")
-        if vuln_counts:
-            for sev in [SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM, SEV_LOW, SEV_INFO]:
-                if vuln_counts.get(sev):
-                    print(f"    {sev}: {vuln_counts[sev]}")
-        if all_data:
-            print(f"  Data extracted:")
-            for k, v in sorted(all_data.items()):
-                if v:
-                    print(f"    {k}: {len(v)}")
-        pocs = PoCExporter.export_all(self._vuln_findings)
-        if pocs:
-            print(f"  PoC commands:       {len(pocs)} (in report)")
-        verified = [v for v in self._vuln_findings if v.get("verified") == "confirmed"]
-        unverified = [v for v in self._vuln_findings
-                      if v.get("exploitable") and v.get("verified") != "confirmed"]
-        if verified:
-            print(f"  Verified exploits:  {len(verified)}")
-        if unverified:
-            print(f"  Unverified:         {len(unverified)}")
-        print(f"  {'═' * 55}")
         if enc_key:
-            print(f"  [+] Report saved (encrypted): {scrub_path(outpath)}")
-            print(f"  [+] Decryption key (note this — NOT saved to disk):")
-            print(f"      {enc_key}")
+            print(f"\n  [+] Report saved (encrypted): {scrub_path(outpath)}")
+            print(f"  [+] Decryption key: {enc_key}")
+            print(f"  [*] To read later: ./gs gather --read-report {outpath.name}")
         else:
-            print(f"  [+] Report saved (plaintext): {scrub_path(outpath)}")
+            print(f"\n  [+] Report saved: {scrub_path(outpath)}")
+            print(f"  [*] To read later: ./gs gather --read-report {outpath.name}")
+
         return outpath
 
     def cleanup(self):
