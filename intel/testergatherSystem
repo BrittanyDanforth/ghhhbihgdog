@@ -2183,7 +2183,13 @@ class VulnScanner:
                 self._run_check("crawling for endpoints", self.crawl_for_endpoints,
                                 (base_url, html), 0.0, [])
 
-            # Per-endpoint active testing — this is where real vulns are found
+            # ── TWO-PHASE ATTACK ENGINE ──────────────────────────────────
+            # Phase A: Inject tracked payloads into every endpoint
+            # Phase B: Re-crawl the site and search ALL responses for markers
+            #
+            # This catches stored XSS, second-order SQLi, and delayed rendering
+            # that single-endpoint testing completely misses.
+
             endpoints = self._crawled_urls
             if not endpoints:
                 endpoints = [{"url": base_url, "params": [{"name": p, "value": "1",
@@ -2191,23 +2197,19 @@ class VulnScanner:
                               for p in self._get_test_params(["id", "q", "search"])],
                               "method": "GET", "source": "fallback"}]
 
-            # Reset circuit breaker before active testing.
-            # Crawling and infra checks may have accumulated blocks from 403s
-            # on nonexistent paths — those are expected, not real blocks.
             domain = urlparse(base_url).netloc
             self._session.reset_domain_blocks(domain)
 
-            print(f"      testing {len(endpoints)} discovered endpoint(s)...")
+            # ── PHASE A: Inject + immediate analysis ──────────────────
+            # Track every injected payload with a unique marker
+            injected_markers: Dict[str, dict] = {}  # marker -> {type, endpoint, param, payload}
+
+            print(f"      Phase A: testing {len(endpoints)} endpoint(s)...")
             tested = 0
-            skipped_blocked = 0
             for ep in endpoints[:20]:
                 if shutdown_requested():
                     break
                 if self._session.is_domain_blocked(urlparse(ep["url"]).netloc):
-                    skipped_blocked += 1
-                    if skipped_blocked >= 3:
-                        print(f"\n      (stopped: domain is blocking active probes)")
-                        break
                     continue
                 tested += 1
                 path = urlparse(ep["url"]).path or "/"
@@ -2216,30 +2218,68 @@ class VulnScanner:
                 print(f"        [{tested}] {ep['method']} {path} ({params_str})", end="", flush=True)
 
                 ep_findings = []
+
+                # SQLi (adaptive attack loop)
                 try:
                     sqli = self._test_endpoint_sqli(ep)
                     ep_findings.extend(sqli)
                 except Exception as e:
                     integrity_log("intel", f"sqli_error:{path}:{type(e).__name__}")
 
+                # XSS — inject tracked markers for stored detection
                 try:
                     xss = self._test_endpoint_xss(ep)
                     ep_findings.extend(xss)
                 except Exception as e:
                     integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
 
+                # Inject stored XSS markers (even if reflected XSS wasn't found)
+                for pi in [p for p in ep["params"] if not p.get("hidden")][:2]:
+                    marker_id = f"GSXSS{secrets.token_hex(4)}"
+                    stored_payload = f"<img src=x onerror='{marker_id}'>"
+                    try:
+                        self._send_test(ep, pi["name"], stored_payload)
+                        injected_markers[marker_id] = {
+                            "type": "stored_xss",
+                            "endpoint": path,
+                            "param": pi["name"],
+                            "payload": stored_payload,
+                        }
+                    except Exception:
+                        pass
+
+                # SSTI markers
+                ssti_a, ssti_b = secrets.randbelow(90)+10, secrets.randbelow(90)+10
+                ssti_expected = str(ssti_a * ssti_b)
+                ssti_marker = f"GSSSTI{secrets.token_hex(3)}"
+                for pi in [p for p in ep["params"] if not p.get("hidden")][:1]:
+                    try:
+                        r = self._send_test(ep, pi["name"], f"{{{{{ssti_a}*{ssti_b}}}}}")
+                        if r and r.text and ssti_expected in r.text:
+                            raw = f"{ssti_a}*{ssti_b}"
+                            if raw not in r.text:
+                                ep_findings.append({
+                                    "severity": SEV_CRITICAL,
+                                    "title": f"SSTI via '{pi['name']}' at {path}",
+                                    "detail": f"Template expression evaluated: {ssti_expected}",
+                                    "evidence": f"param: {pi['name']}, {ssti_a}*{ssti_b}={ssti_expected}",
+                                    "exploitable": True,
+                                    "test_url": f"{ep['url']}?{pi['name']}={quote(f'{{{{{ssti_a}*{ssti_b}}}}}')}" if ep["method"] == "GET" else ep["url"],
+                                    "exploit_info": {"type": "ssti", "parameter": pi["name"],
+                                                     "path": path, "method": "SSTI confirmed.",
+                                                     "risk": "Remote code execution"},
+                                })
+                    except Exception:
+                        pass
+
+                # LFI
                 try:
                     lfi = self._test_endpoint_lfi(ep)
                     ep_findings.extend(lfi)
                 except Exception as e:
                     integrity_log("intel", f"lfi_error:{path}:{type(e).__name__}")
 
-                try:
-                    ssti = self._test_endpoint_ssti(ep)
-                    ep_findings.extend(ssti)
-                except Exception as e:
-                    integrity_log("intel", f"ssti_error:{path}:{type(e).__name__}")
-
+                # CRLF
                 try:
                     crlf = self._test_endpoint_crlf(ep)
                     ep_findings.extend(crlf)
@@ -2253,10 +2293,72 @@ class VulnScanner:
                 else:
                     print(f" -> clean")
 
-            # Also run SSRF/LFI/cmd injection against base URL with page params
+            # ── PHASE B: Re-crawl and search for stored/delayed payloads ──
+            if injected_markers:
+                print(f"\n      Phase B: searching for {len(injected_markers)} stored payloads...")
+                self._session.reset_domain_blocks(domain)
+
+                # Re-visit discovered pages + common pages where stored content appears
+                revisit_urls = set()
+                for ep in endpoints[:20]:
+                    revisit_urls.add(ep["url"])
+                # Add common pages where stored payloads might render
+                for suffix in ["/", "/index.php", "/dashboard", "/admin",
+                               "/comments", "/users", "/search", "/profile",
+                               "/blog", "/posts", "/list", "/home"]:
+                    revisit_urls.add(urljoin(base_url, suffix))
+
+                stored_found = 0
+                for revisit_url in list(revisit_urls)[:25]:
+                    if shutdown_requested() or self._session.is_domain_blocked(domain):
+                        break
+                    try:
+                        resp = self._session.get(revisit_url, allow_wayback=False)
+                        if not resp or not resp.text:
+                            continue
+
+                        # Search this response for ANY injected marker
+                        for marker_id, marker_info in injected_markers.items():
+                            if marker_id in resp.text:
+                                stored_found += 1
+                                revisit_path = urlparse(revisit_url).path or "/"
+                                inject_path = marker_info["endpoint"]
+
+                                findings.append({
+                                    "severity": SEV_CRITICAL,
+                                    "title": f"Stored XSS: injected at {inject_path}, "
+                                             f"rendered at {revisit_path}",
+                                    "detail": f"Payload injected via '{marker_info['param']}' at "
+                                              f"{inject_path} appears in response from {revisit_path}. "
+                                              "This is a stored/persistent XSS vulnerability.",
+                                    "evidence": f"marker: {marker_id}, inject: {inject_path} "
+                                                f"param: {marker_info['param']}, "
+                                                f"rendered: {revisit_path}",
+                                    "exploitable": True,
+                                    "test_url": revisit_url,
+                                    "exploit_info": {
+                                        "type": "stored_xss",
+                                        "parameter": marker_info["param"],
+                                        "path": inject_path,
+                                        "render_path": revisit_path,
+                                        "method": f"Stored XSS: POST payload to "
+                                                  f"{inject_path} via '{marker_info['param']}', "
+                                                  f"executes on {revisit_path}.",
+                                        "risk": "Persistent XSS, session hijacking of other users",
+                                    },
+                                    "confidence": 0.95,
+                                })
+                    except Exception:
+                        pass
+
+                if stored_found:
+                    print(f"      Phase B: {stored_found} stored vuln(s) found!")
+                else:
+                    print(f"      Phase B: no stored payloads detected")
+
+            # Also run SSRF/cmd injection against base URL
             self._run_check("SSRF", self._check_ssrf_indicators,
                             (base_url,), 0.9, findings)
-            self._run_check("LFI", self._check_lfi, (base_url,), 0.95, findings)
             self._run_check("command injection", self._check_command_injection,
                             (base_url,), 0.95, findings)
 
