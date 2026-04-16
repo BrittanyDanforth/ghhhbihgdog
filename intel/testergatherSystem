@@ -4036,6 +4036,65 @@ class PoCExporter:
             poc["description"] = "GraphQL schema exposes sensitive types/fields."
             poc["remediation"] = "Disable introspection. Implement field-level authorization."
 
+        elif exploit_type == "stored_xss":
+            render_path = ei.get("render_path", "/")
+            poc["curl"] = (
+                f'# Step 1: Inject payload\n'
+                f'curl {sp} -X POST -d "{param}=<script>alert(document.cookie)</script>" '
+                f'"[TARGET_URL]{path}"\n'
+                f'# Step 2: Visit render page to trigger\n'
+                f'curl {sp} "[TARGET_URL]{render_path}"'
+            )
+            poc["description"] = (
+                f"Stored XSS: inject via '{param}' at {path}, "
+                f"payload renders at {render_path}."
+            )
+            poc["remediation"] = "Sanitize all stored user input. Use Content-Security-Policy."
+
+        elif exploit_type == "csp_bypass":
+            poc["curl"] = f'# CSP allows execution — inject via any XSS vector\n# Test: curl {sp} "[TARGET_URL]"'
+            poc["description"] = ei.get("method", "CSP misconfiguration allows script execution.")
+            poc["remediation"] = "Remove unsafe-inline and unsafe-eval from CSP. Use nonce-based CSP."
+
+        elif exploit_type == "cors_misconfiguration":
+            poc["curl"] = (
+                f'curl -v {sp} -H "Origin: https://evil.com" "[TARGET_URL]"\n'
+                f'# Check response for: Access-Control-Allow-Origin: https://evil.com'
+            )
+            poc["description"] = "CORS allows cross-origin data theft from any domain."
+            poc["remediation"] = "Whitelist specific origins. Never reflect arbitrary Origin headers."
+
+        elif exploit_type == "clickjacking":
+            poc["curl"] = (
+                f'# Create HTML file:\n'
+                f'# <iframe src="[TARGET_URL]" style="opacity:0;position:absolute;top:0;left:0;'
+                f'width:100%;height:100%"></iframe>\n'
+                f'# Overlay fake UI to trick clicks on the real page'
+            )
+            poc["description"] = "No X-Frame-Options or frame-ancestors CSP. Page can be framed."
+            poc["remediation"] = "Add X-Frame-Options: DENY or CSP frame-ancestors 'self'."
+
+        elif exploit_type == "csrf":
+            poc["curl"] = (
+                f'# Create auto-submitting form:\n'
+                f'# <form method="POST" action="[TARGET_URL]">\n'
+                f'#   <input type="hidden" name="{param}" value="attacker_value">\n'
+                f'# </form>\n'
+                f'# <script>document.forms[0].submit()</script>'
+            )
+            poc["description"] = f"POST form at '{path}' has no CSRF token."
+            poc["remediation"] = "Add anti-CSRF token to all state-changing forms."
+
+        elif exploit_type == "idor":
+            poc["curl"] = (
+                f'# Enumerate IDs:\n'
+                f'for i in $(seq 1 100); do\n'
+                f'  curl -s {sp} "[TARGET_URL]?{param}=$i" | head -1\n'
+                f'done'
+            )
+            poc["description"] = f"Sequential IDs via '{param}' return different data without auth check."
+            poc["remediation"] = "Implement proper access control. Use UUIDs instead of sequential IDs."
+
         else:
             poc["curl"] = "# Manual verification required"
             poc["description"] = finding.get("detail", "")
@@ -4646,7 +4705,7 @@ class IntelOrchestrator:
             conf = v.get("confidence", 0)
             conf_tag = f" ({conf*100:.0f}%)" if conf is not None else ""
             print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}{conf_tag}")
-            if sev in (SEV_CRITICAL, SEV_HIGH):
+            if sev in (SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM):
                 print(f"         {v['detail'][:120]}")
             if v.get("exploit_info"):
                 ei = v["exploit_info"]
@@ -4746,10 +4805,13 @@ class IntelOrchestrator:
         # Show PoC commands inline
         if pocs:
             print(f"\n  PoC commands ({len(pocs)}):")
-            for poc in pocs[:5]:
-                print(f"    [{poc.get('severity','?')}] {poc.get('finding','?')[:50]}")
+            for poc in pocs[:15]:
+                print(f"    [{poc.get('severity','?')}] {poc.get('finding','?')[:60]}")
                 if poc.get("curl"):
-                    print(f"      $ {poc['curl'][:120]}")
+                    for curl_line in poc["curl"].split("\n"):
+                        print(f"      {curl_line}")
+                if poc.get("remediation"):
+                    print(f"      Fix: {poc['remediation'][:100]}")
 
         print(f"  {'═' * 55}")
 
