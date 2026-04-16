@@ -211,8 +211,15 @@ _pip_cmd() {
     fi
 }
 
-# Upgrade pip quietly
-_pip_cmd install --upgrade pip 2>/dev/null || true
+# Upgrade pip quietly — must clear proxy vars since PySocks may not be installed yet
+_SAVED_PROXY="${ALL_PROXY:-}"
+unset ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null
+if [ "$USE_TORSOCKS" = true ]; then
+    torsocks $VENV_PIP install --upgrade pip 2>/dev/null || true
+else
+    $VENV_PIP install --upgrade pip 2>/dev/null || true
+fi
+[ -n "$_SAVED_PROXY" ] && export ALL_PROXY="$_SAVED_PROXY"
 
 # ── Install packages ──────────────────────────────────────────────────────
 # Core deps are required. Extra deps enable optional features.
@@ -225,16 +232,40 @@ EXTRA_DEPS="cryptography pycryptodomex qrcode pyyaml beautifulsoup4 aiohttp aioh
 
 dim "Installing Python packages..."
 
-# Step 1: Bootstrap PySocks first (via torsocks if available)
+# Step 1: Bootstrap PySocks first.
+# CRITICAL: pip itself needs PySocks to use socks5h:// proxy. But PySocks
+# isn't installed yet. If ANY proxy env var is set (ALL_PROXY, http_proxy,
+# https_proxy) — even from a prior run or system config — pip will try to
+# use SOCKS and fail with "Missing dependencies for SOCKS support".
+#
+# Solution: UNSET all proxy env vars for this one install, then use torsocks
+# (which works at the OS/libc level, not Python level) to route through Tor.
 if ! "$VENV_PY" -c "import socks" 2>/dev/null; then
     dim "Bootstrapping PySocks (needed for SOCKS proxy support)..."
-    _pip_cmd install PySocks 2>&1 | tail -3
+    # Save and clear proxy vars — pip can't use them without PySocks
+    _SAVED_ALL_PROXY="${ALL_PROXY:-}"
+    _SAVED_HTTP_PROXY="${http_proxy:-}"
+    _SAVED_HTTPS_PROXY="${https_proxy:-}"
+    unset ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+    PYSOCKS_OK=false
+    if [ "$USE_TORSOCKS" = true ]; then
+        torsocks $VENV_PIP install PySocks 2>&1 | tail -3 && PYSOCKS_OK=true
+    else
+        $VENV_PIP install PySocks 2>&1 | tail -3 && PYSOCKS_OK=true
+    fi
+
+    # Restore proxy vars
+    [ -n "$_SAVED_ALL_PROXY" ] && export ALL_PROXY="$_SAVED_ALL_PROXY"
+    [ -n "$_SAVED_HTTP_PROXY" ] && export http_proxy="$_SAVED_HTTP_PROXY"
+    [ -n "$_SAVED_HTTPS_PROXY" ] && export https_proxy="$_SAVED_HTTPS_PROXY"
+
     if "$VENV_PY" -c "import socks" 2>/dev/null; then
         ok "PySocks bootstrapped"
     else
         fail "PySocks bootstrap FAILED"
         fail "Without PySocks, pip cannot download through Tor's SOCKS proxy."
-        fail "Try: sudo apt install python3-socks  OR  torsocks pip install PySocks"
+        fail "Try manually: torsocks .venv/bin/pip install PySocks"
         exit 1
     fi
 fi
