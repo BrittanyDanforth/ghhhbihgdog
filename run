@@ -475,6 +475,9 @@ def flow_receive(detected_port=None):
     print(f"  4. Mix the received XMR")
     print()
 
+    if not _opsec_preflight():
+        return
+
     tor = get_tor_proxy(detected_port)
     if not tor:
         return

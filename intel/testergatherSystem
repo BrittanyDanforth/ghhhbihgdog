@@ -31,7 +31,7 @@ Capabilities (all functional — no placeholders):
     - HTTP method enumeration (PUT, DELETE, TRACE, OPTIONS)
 
   Anti-Blocking (Tor-optimized):
-    - Retry with new Tor circuit on every block (up to 3 retries)
+    - Retry with new Tor circuit on every block (up to 2 retries)
     - Wayback Machine fallback for blocked/unavailable pages
     - Adaptive per-domain delay scaling based on block history
     - Realistic browser profiles (Chrome/Firefox with correct Sec-* headers)
@@ -354,7 +354,12 @@ class TorSession:
             except requests.exceptions.ConnectionError:
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 integrity_log("intel", f"conn_error:{domain}")
-                return None
+                # Don't return immediately — fall through to Wayback on last attempt
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                break
 
         # All retries exhausted — try Wayback Machine
         if allow_wayback and WAYBACK_ENABLED and method.upper() == "GET":
@@ -1054,11 +1059,15 @@ class VulnScanner:
                                          "detail": detail, "evidence": f"HTTP 200 at {path}",
                                          "path": path, "content_length": len(body)})
                 else:
-                    # INFO/LOW/MEDIUM: still check for soft-404
-                    if severity in (SEV_INFO,) and _soft404_length > 0:
+                    # For INFO/LOW/MEDIUM: check for soft-404 to avoid false positives
+                    # on sites that return 200 with generic pages for every path
+                    if severity in (SEV_INFO, SEV_LOW, SEV_MEDIUM) and _soft404_length > 0:
                         resp_check = self._session.get(url, allow_wayback=False)
-                        if resp_check and abs(len(resp_check.text) - _soft404_length) < 100:
-                            continue
+                        if resp_check:
+                            if abs(len(resp_check.text) - _soft404_length) < 100:
+                                continue
+                            if _soft404_patterns.search(resp_check.text[:1000]):
+                                continue
                     findings.append({"severity": severity, "title": title,
                                      "detail": detail, "evidence": f"HTTP 200 at {path}",
                                      "path": path})
@@ -1114,7 +1123,10 @@ class VulnScanner:
                 )
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location", "")
-                    if "evil-attacker.com" in location:
+                    # Must check that the redirect HOST is the attacker, not just
+                    # that the attacker URL appears somewhere in query params
+                    loc_parsed = urlparse(location)
+                    if loc_parsed.netloc and "evil-attacker.com" in loc_parsed.netloc:
                         findings.append({
                             "severity": SEV_MEDIUM,
                             "title": f"Open redirect via '{param}' parameter",
@@ -1340,18 +1352,25 @@ class VulnScanner:
         for param in ssrf_params[:5]:
             if shutdown_requested():
                 break
+            # Baseline: check what the page returns without SSRF payload
+            baseline_url = f"{base_url}?{param}=https://example.com/"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_text = baseline_resp.text.lower() if baseline_resp else ""
+
             test_url = f"{base_url}?{param}={quote(canary_url)}"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
-                # Check if AWS metadata content appears in response
+                # Use specific AWS metadata indicators that rarely appear in
+                # documentation or normal pages. Require 3+ to avoid FP from
+                # pages that mention "meta-data" or "iam" in their own content.
                 aws_indicators = [
                     "ami-id", "instance-id", "instance-type",
                     "local-hostname", "public-hostname", "security-credentials",
-                    "iam", "meta-data",
                 ]
                 text_lower = resp.text.lower()
-                matched = [ind for ind in aws_indicators if ind in text_lower]
-                if len(matched) >= 2:
+                matched = [ind for ind in aws_indicators
+                           if ind in text_lower and ind not in baseline_text]
+                if len(matched) >= 3:
                     findings.append({
                         "severity": SEV_CRITICAL,
                         "title": f"SSRF via '{param}' parameter — AWS metadata accessible",
@@ -1429,13 +1448,20 @@ class VulnScanner:
         for param in cmd_params[:3]:
             if shutdown_requested():
                 return findings
-            # Test 1: try to echo a unique marker
             marker = f"gs{secrets.token_hex(4)}rce"
-            # URL-encode the payload: ;echo <marker>
             payload = f";echo {marker}"
+
+            # Baseline: check if the param value is simply echoed back (search page etc.)
+            baseline_marker = f"gs{secrets.token_hex(4)}base"
+            baseline_url = f"{base_url}?{param}={quote(baseline_marker)}"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_echoes = baseline_resp and baseline_marker in baseline_resp.text
+
             test_url = f"{base_url}?{param}={quote(payload)}"
             resp = self._session.get(test_url, allow_wayback=False)
-            if resp and marker in resp.text:
+            # Only flag if marker appears AND it's not just the page echoing
+            # back whatever we send (which search pages and error pages do)
+            if resp and marker in resp.text and not baseline_echoes:
                 findings.append({
                     "severity": SEV_CRITICAL,
                     "title": f"OS Command Injection via '{param}' parameter",
@@ -1574,7 +1600,7 @@ class SubdomainEnumerator:
                 name = entry.get("name_value", "")
                 for line in name.split("\n"):
                     line = line.strip().lower()
-                    if line and line.endswith(f".{domain}") or line == domain:
+                    if line and (line.endswith(f".{domain}") or line == domain):
                         # Remove wildcard prefix
                         line = line.lstrip("*.")
                         if line and re.match(r"^[a-z0-9.\-]+$", line):
@@ -2067,16 +2093,31 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "subdomain_takeover":
-            fingerprint = finding.get("exploit_info", {}).get("cname", "")
-            return resp.status_code in (404, 200) and len(text) < 5000
+            # Use the service fingerprint from the original finding for verification
+            ei = finding.get("exploit_info", {})
+            service = ei.get("service", "")
+            takeover_fingerprints = {
+                "GitHub Pages": "there isn't a github pages site here",
+                "Heroku": "no-such-app",
+                "AWS S3": "nosuchbucket",
+                "Shopify": "sorry, this shop is currently unavailable",
+                "Fastly": "fastly error: unknown domain",
+            }
+            fp = takeover_fingerprints.get(service, "")
+            if fp and fp in text.lower():
+                return True
+            return False
 
         elif exploit_type == "directory_traversal":
             if re.search(r"root:.*:0:0:", text):
                 return True
 
         elif exploit_type == "open_redirect":
-            # Check if server still redirects
-            return resp.status_code in (301, 302, 303, 307, 308)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                loc_host = urlparse(location).netloc
+                return loc_host != "" and loc_host != urlparse(resp.url).netloc
+            return False
 
         return False
 
@@ -2235,11 +2276,6 @@ class FindingChain:
     # Chain rules: if finding A exists, check for finding B
     CHAIN_RULES = [
         {
-            "trigger": lambda f: f.get("title", "").startswith("Server version"),
-            "action": "version_cve_lookup",
-            "description": "Server version disclosed → check known CVEs",
-        },
-        {
             "trigger": lambda f: "WordPress" in str(f.get("evidence", "")),
             "action": "wordpress_deep_scan",
             "description": "WordPress detected → check WP-specific endpoints",
@@ -2253,11 +2289,6 @@ class FindingChain:
             "trigger": lambda f: "GraphQL" in f.get("title", ""),
             "action": "graphql_enum",
             "description": "GraphQL found → enumerate sensitive queries",
-        },
-        {
-            "trigger": lambda f: f.get("severity") == SEV_CRITICAL and f.get("exploitable"),
-            "action": "critical_exploit_verify",
-            "description": "Critical exploitable finding → auto-verify",
         },
     ]
 
@@ -2800,7 +2831,7 @@ class IntelOrchestrator:
             reset = "\033[0m"
             exploit_tag = " [EXPLOITABLE]" if v.get("exploitable") else ""
             conf = v.get("confidence", 0)
-            conf_tag = f" ({conf*100:.0f}%)" if conf else ""
+            conf_tag = f" ({conf*100:.0f}%)" if conf is not None else ""
             print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}{conf_tag}")
             if sev in (SEV_CRITICAL, SEV_HIGH):
                 print(f"         {v['detail'][:120]}")
@@ -2886,7 +2917,7 @@ class IntelOrchestrator:
                          "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
                          "INFO": "\033[0;90m"}.get(sev, "")
                 exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
-                conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") else ""
+                conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") is not None else ""
                 print(f"    {color}[{sev}]\033[0m {v.get('title','?')}{exploit}{conf}")
 
         # Show extracted data inline
@@ -2974,7 +3005,7 @@ def _list_reports():
     for r in reports:
         size = r.stat().st_size
         age = (time.time() - r.stat().st_mtime) / 60
-        enc = "🔒" if r.suffix == ".enc" else "📄"
+        enc = "[enc]" if r.suffix == ".enc" else "[txt]"
         print(f"  {enc} {r.name}  ({size} bytes, {age:.0f}m ago)")
     print(f"  {'═' * 50}")
     print(f"  Read with: --read-report <filename>")
@@ -3064,7 +3095,7 @@ def _display_report(report: dict):
                      "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
                      "INFO": "\033[0;90m"}.get(sev, "")
             exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
-            conf = f" ({v.get('confidence', 0)*100:.0f}%)" if v.get("confidence") else ""
+            conf = f" ({v.get('confidence', 0)*100:.0f}%)" if v.get("confidence") is not None else ""
             verified = ""
             if v.get("verified") == "confirmed":
                 verified = " ✓verified"
@@ -3159,7 +3190,6 @@ def main():
 
     proxy = require_tor_proxy(args.tor_proxy)
 
-    # Extract port from proxy URL so PoC commands use the operator's actual port
     global _ACTIVE_TOR_PORT
     _proxy_parsed = urlparse(args.tor_proxy)
     _ACTIVE_TOR_PORT = str(_proxy_parsed.port or 9050)
@@ -3180,11 +3210,21 @@ def main():
         orch.save_report()
     except KeyboardInterrupt:
         print("\n  [!] Interrupted — saving partial results...")
-        orch.save_report()
+        try:
+            orch.save_report()
+        except Exception:
+            pass
     except Exception as e:
         print(f"\n  [!] Error: {str(e)[:80]}")
         integrity_log("intel", f"error:{str(e)[:40]}")
+        try:
+            orch.save_report()
+        except Exception:
+            pass
     finally:
+        if shutdown_requested():
+            print("  [*] Signal received — wiping in-memory data...")
+            orch.emergency_wipe()
         orch.cleanup()
         integrity_log("intel", "session_end")
 

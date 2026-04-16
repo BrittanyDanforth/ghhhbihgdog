@@ -610,6 +610,13 @@ def main():
                     except (ValueError, TypeError):
                         expiry = 0
 
+                    # Reject already-expired quotes — sending BTC to an expired
+                    # vault address can result in permanently stuck funds
+                    if expiry > 0 and expiry < int(time.time()):
+                        integrity_log("stage2", f"quote_already_expired:{expiry}")
+                        print(f"  [!] Quote from this endpoint already expired — trying next...")
+                        continue
+
                     return {
                         "deposit_address": inbound,
                         "memo": memo,
@@ -749,9 +756,11 @@ def main():
                 for e in _all_addrs.get("addresses", [])
             )
             if not _found:
+                # Scrub RPC URL from error output — it may contain credentials
+                _rpc_display = urlparse(args.rpc_primary).hostname or "localhost"
                 sys.exit(
                     f"[!] Receive-wallet address {scrub_address(ENTRY)} NOT FOUND\n"
-                    f"    in the wallet connected at {args.rpc_primary} "
+                    f"    in the wallet connected at {_rpc_display} "
                     f"(account {sub_account}).\n"
                     f"    The RPC wallet must be the SAME wallet that generated\n"
                     f"    the receive address. All fan-out TXs would fail.\n"
