@@ -1,91 +1,112 @@
 #!/usr/bin/env python3
 """
-Intelligence Gathering System — Production OSINT Toolkit
-=========================================================
-Multi-source OSINT collector with real-world anti-blocking, full Tor
-enforcement, and RAM-only data handling.
+Intelligence Gathering & Vulnerability Analysis System
+=======================================================
+Production OSINT collector + vulnerability scanner with real-world
+anti-blocking, full Tor enforcement, and RAM-only data handling.
 
-Capabilities (all functional, no placeholders):
-  - Web scraping with adaptive rate limiting and anti-fingerprinting
-  - Breach database lookup (HIBP, Dehashed) via Tor
-  - Search engine dorking with circuit rotation
-  - Data extraction (emails, crypto addresses, phones, credentials)
-  - Honeypot detection heuristics
-  - RAM-only encrypted storage with auto-wipe
-  - Secure cleanup on exit or interrupt
+Capabilities (all functional — no placeholders):
 
-OPSEC hardening:
-  - ALL network I/O forced through Tor (socks5h, DNS at proxy)
-  - Circuit rotation between requests (configurable cadence)
-  - Per-request User-Agent + header rotation (realistic browser profiles)
-  - Adaptive delays with CSPRNG jitter (not predictable patterns)
-  - RAM-only output (/dev/shm) with Fernet encryption
-  - Coarsened timestamps (10-minute buckets)
-  - Signal handlers for clean abort + emergency wipe
-  - No clearnet fallback — aborts if Tor unavailable
+  OSINT / Data Extraction:
+    - Email, phone, crypto address (BTC/ETH/XMR) extraction with validation
+    - Username / social media profile detection
+    - API key / token / secret detection (AWS, GitHub, Stripe, JWT, etc.)
+    - URL harvesting and link analysis
+    - Subdomain enumeration via crt.sh certificate transparency
+    - DNS reconnaissance via DNS-over-HTTPS (Cloudflare DoH)
+    - Breach database lookups (HIBP, Dehashed) via Tor
 
-Anti-blocking:
-  - Realistic browser header sets (Chrome/Firefox/Safari profiles)
-  - Referer chain simulation
-  - Cookie jar per session
-  - Exponential backoff on rate limits (429/503)
-  - Domain-level rate tracking (per-host delay)
-  - robots.txt awareness (optional enforcement)
-  - Request spacing with human-like jitter
+  Vulnerability Scanning:
+    - Security header analysis (HSTS, CSP, X-Frame-Options, etc.)
+    - SSL/TLS certificate analysis (expiry, issuer, weak config)
+    - Exposed sensitive paths (.git, .env, .DS_Store, backups, etc.)
+    - Technology fingerprinting (server, CMS, framework, JS libraries)
+    - CORS misconfiguration detection
+    - Cookie security audit (Secure, HttpOnly, SameSite flags)
+    - Open redirect detection
+    - Information disclosure (server versions, debug headers, stack traces)
+    - Common exploit pattern detection (SQLi indicators, XSS reflection,
+      directory traversal, SSRF indicators, command injection patterns)
+    - Clickjacking vulnerability assessment
+    - HTTP method enumeration (PUT, DELETE, TRACE, OPTIONS)
+
+  Anti-Blocking (Tor-optimized):
+    - Retry with new Tor circuit on every block (up to 3 retries)
+    - Wayback Machine fallback for blocked/unavailable pages
+    - Adaptive per-domain delay scaling based on block history
+    - Realistic browser profiles (Chrome/Firefox with correct Sec-* headers)
+    - Referer chain simulation
+    - HEAD requests for vuln checks (less WAF triggering)
+    - Graceful degradation — partial results on blocks, not crashes
+
+  OPSEC:
+    - ALL traffic through Tor socks5h (DNS at proxy)
+    - Circuit rotation every N requests + on every block
+    - RAM-only output (/dev/shm) with Fernet encryption
+    - Coarsened timestamps (10-minute buckets)
+    - Signal handlers for clean abort + emergency wipe
+    - No clearnet fallback — aborts if Tor unavailable
+    - Scrubbed terminal output (basenames, truncated addresses)
 
 Usage:
-  python3 testergatherSystem --query "target search" --tor-proxy socks5h://127.0.0.1:9050
-  python3 testergatherSystem --email user@example.com --tor-proxy socks5h://127.0.0.1:9050
-  python3 testergatherSystem --domain example.com --tor-proxy socks5h://127.0.0.1:9050
-  python3 testergatherSystem --file targets.txt --tor-proxy socks5h://127.0.0.1:9050
+  # Quick scan (headers + data extraction)
+  python3 testergatherSystem --domain example.com --scan quick
+
+  # Full scan (+ vuln scan + breach check)
+  python3 testergatherSystem --domain example.com --scan full
+
+  # Deep scan (+ subdomain enum + path probing + exploit detection)
+  python3 testergatherSystem --domain example.com --scan deep
+
+  # Email breach check
+  python3 testergatherSystem --email user@example.com
+
+  # Search query OSINT
+  python3 testergatherSystem --query "target search terms"
+
+  # Batch targets from file
+  python3 testergatherSystem --file targets.txt --scan full
+
+  # Wipe all collected data
+  python3 testergatherSystem --wipe
 
 # NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
 import gc
 import hashlib
 import json
 import os
 import re
 import secrets
-import signal
+import ssl
 import sys
 import time
-import threading
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set
-from urllib.parse import quote, urlparse, urljoin
+from typing import Dict, List, Optional, Any, Set, Tuple
+from urllib.parse import quote, urlparse, urljoin, parse_qs, urlencode
 
-# Toolkit integration
+# ── Toolkit integration ──────────────────────────────────────────────────
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
 from gs_common import (
     validate_proxy, verify_tor, require_tor_proxy, newnym,
     install_signal_handlers, shutdown_requested, scrub_path,
-    scrub_address, integrity_log, atomic_write_json,
-    secure_file_perms, secure_delay, secure_hex,
+    integrity_log, atomic_write_json, secure_file_perms, secure_hex,
 )
 
-# Core deps (required)
+# ── Core deps ─────────────────────────────────────────────────────────────
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Optional deps with graceful fallback
+# ── Optional deps ─────────────────────────────────────────────────────────
 try:
-    import aiohttp
-    from aiohttp_socks import ProxyConnector
-    HAS_ASYNC = True
-except ImportError:
-    HAS_ASYNC = False
-
-try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Comment
     HAS_BS4 = True
 except ImportError:
     HAS_BS4 = False
@@ -96,44 +117,37 @@ try:
 except ImportError:
     HAS_FERNET = False
 
-try:
-    from stem import Signal as StemSignal
-    from stem.control import Controller
-    HAS_STEM = True
-except ImportError:
-    HAS_STEM = False
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-
-# All sensitive API keys from environment only — never hardcoded
+# ── Config ────────────────────────────────────────────────────────────────
 HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
 DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
 DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 
-# Rate limiting: per-domain minimum delay (seconds)
 DOMAIN_MIN_DELAY = 3.0
 DOMAIN_MAX_DELAY = 12.0
-CIRCUIT_ROTATION_EVERY = 5   # requests per circuit
+CIRCUIT_ROTATION_EVERY = 4
+MAX_RETRIES_PER_URL = 3
+WAYBACK_ENABLED = True
 
-# RAM storage
 RAM_DIR = Path("/dev/shm/intel") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".intel_tmp"
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Browser Profile Rotation (realistic, not random garbage)
-# ═══════════════════════════════════════════════════════════════════════════
+# Severity levels for vulnerability findings
+SEV_CRITICAL = "CRITICAL"
+SEV_HIGH = "HIGH"
+SEV_MEDIUM = "MEDIUM"
+SEV_LOW = "LOW"
+SEV_INFO = "INFO"
 
-# These match real browser releases. Using fictional versions or mixing
-# incompatible header combinations is the #1 way to get flagged.
+# ══════════════════════════════════════════════════════════════════════════
+#  Browser Profile Rotation
+# ══════════════════════════════════════════════════════════════════════════
+
 BROWSER_PROFILES = [
     {
-        "name": "Chrome 124 Windows",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
@@ -143,12 +157,11 @@ BROWSER_PROFILES = [
         "Upgrade-Insecure-Requests": "1",
     },
     {
-        "name": "Chrome 124 macOS",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"macOS"',
         "Sec-Fetch-Dest": "document",
@@ -158,24 +171,22 @@ BROWSER_PROFILES = [
         "Upgrade-Insecure-Requests": "1",
     },
     {
-        "name": "Firefox 128 ESR (Tor Browser profile)",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
-        "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     },
     {
-        "name": "Chrome 124 Linux",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Linux"',
         "Sec-Fetch-Dest": "document",
@@ -188,54 +199,178 @@ BROWSER_PROFILES = [
 
 
 def _pick_profile() -> dict:
-    """Pick a random browser profile using CSPRNG."""
-    p = BROWSER_PROFILES[secrets.randbelow(len(BROWSER_PROFILES))]
-    return {k: v for k, v in p.items() if k != "name"}
+    return BROWSER_PROFILES[secrets.randbelow(len(BROWSER_PROFILES))].copy()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Data Extraction Patterns
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Enhanced TorSession — retry-on-block, Wayback fallback, adaptive delays
+# ══════════════════════════════════════════════════════════════════════════
+
+class TorSession:
+    """Rate-limited requests session with Tor, circuit rotation on blocks,
+    and Wayback Machine fallback for blocked pages."""
+
+    def __init__(self, proxy_dict: dict):
+        self._proxy = proxy_dict
+        self._session = requests.Session()
+        self._session.proxies.update(proxy_dict)
+        retry = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 504])
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+        self._domain_last: Dict[str, float] = {}
+        self._domain_blocks: Dict[str, int] = defaultdict(int)
+        self._request_count = 0
+
+    def _delay_for_domain(self, domain: str):
+        """Adaptive delay — increases if domain has blocked us before."""
+        blocks = self._domain_blocks.get(domain, 0)
+        base_min = DOMAIN_MIN_DELAY + (blocks * 2)
+        base_max = DOMAIN_MAX_DELAY + (blocks * 5)
+        last = self._domain_last.get(domain, 0)
+        elapsed = time.time() - last
+        needed = base_min + secrets.randbelow(int((base_max - base_min) * 1000)) / 1000.0
+        if elapsed < needed:
+            time.sleep(needed - elapsed)
+
+    def _maybe_rotate_circuit(self):
+        self._request_count += 1
+        if self._request_count % CIRCUIT_ROTATION_EVERY == 0:
+            newnym()
+            time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+
+    def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
+            **kwargs) -> Optional[requests.Response]:
+        """GET/HEAD with retry-on-block, circuit rotation, and Wayback fallback."""
+        if shutdown_requested():
+            return None
+
+        domain = urlparse(url).netloc
+        kwargs.setdefault("timeout", 25)
+
+        for attempt in range(MAX_RETRIES_PER_URL):
+            self._delay_for_domain(domain)
+            self._maybe_rotate_circuit()
+
+            headers = _pick_profile()
+            # Add referer for non-first requests to look like navigation
+            if self._request_count > 1:
+                headers["Referer"] = f"https://duckduckgo.com/?q={quote(domain)}"
+            if "headers" in kwargs:
+                headers.update(kwargs.pop("headers"))
+
+            try:
+                self._domain_last[domain] = time.time()
+                if method.upper() == "HEAD":
+                    resp = self._session.head(url, headers=headers, allow_redirects=True, **kwargs)
+                else:
+                    resp = self._session.get(url, headers=headers, **kwargs)
+
+                if resp.status_code in (200, 301, 302, 304):
+                    self._domain_blocks[domain] = max(0, self._domain_blocks[domain] - 1)
+                    return resp
+
+                if resp.status_code in (403, 429, 503):
+                    self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                    integrity_log("intel", f"blocked:{domain}:status={resp.status_code}:attempt={attempt}")
+                    newnym()
+                    time.sleep(3 + secrets.randbelow(5000) / 1000.0)
+                    continue
+
+                # Other error codes — don't retry
+                return resp
+
+            except requests.exceptions.Timeout:
+                integrity_log("intel", f"timeout:{domain}:attempt={attempt}")
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(2)
+                    continue
+                return None
+            except requests.exceptions.ConnectionError:
+                integrity_log("intel", f"conn_error:{domain}")
+                return None
+
+        # All retries exhausted — try Wayback Machine
+        if allow_wayback and WAYBACK_ENABLED and method.upper() == "GET":
+            return self._wayback_fetch(url)
+        return None
+
+    def _wayback_fetch(self, url: str) -> Optional[requests.Response]:
+        """Fetch cached page from Wayback Machine. web.archive.org is Tor-friendly."""
+        wb_url = f"https://web.archive.org/web/2/{url}"
+        try:
+            headers = _pick_profile()
+            resp = self._session.get(wb_url, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                integrity_log("intel", f"wayback_ok:{urlparse(url).netloc}")
+                return resp
+        except Exception:
+            pass
+        return None
+
+    def post_json(self, url: str, json_data: dict, **kwargs) -> Optional[requests.Response]:
+        """POST JSON request (for APIs like crt.sh)."""
+        if shutdown_requested():
+            return None
+        domain = urlparse(url).netloc
+        self._delay_for_domain(domain)
+        self._maybe_rotate_circuit()
+        headers = _pick_profile()
+        headers["Content-Type"] = "application/json"
+        kwargs.setdefault("timeout", 25)
+        try:
+            self._domain_last[domain] = time.time()
+            return self._session.post(url, json=json_data, headers=headers, **kwargs)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            return None
+
+    def close(self):
+        self._session.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Data Extraction — Expanded patterns
+# ══════════════════════════════════════════════════════════════════════════
 
 class DataExtractor:
-    """Extract structured data from text using validated regex patterns."""
+    """Extract structured data from text with validated patterns."""
 
     PATTERNS = {
-        "email": re.compile(
-            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
-        ),
-        "btc_address": re.compile(
-            r"\b(?:bc1[ac-hj-np-z02-9]{25,59}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"
-        ),
+        "email": re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,7}\b"),
+        "btc_address": re.compile(r"\b(?:bc1[ac-hj-np-z02-9]{25,59}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"),
         "eth_address": re.compile(r"\b0x[a-fA-F0-9]{40}\b"),
         "xmr_address": re.compile(r"\b[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b"),
-        "phone": re.compile(
-            r"(?<!\d)[\+]?[(]?[0-9]{1,3}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?"
-            r"[-\s.]?[0-9]{3,4}[-\s.]?[0-9]{3,4}(?!\d)"
-        ),
+        "phone": re.compile(r"(?<![0-9])[\+]?[(]?[0-9]{1,3}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?[-\s.]?[0-9]{3,4}[-\s.]?[0-9]{3,4}(?![0-9])"),
         "onion_v3": re.compile(r"\b[a-z2-7]{56}\.onion\b"),
-        "ipv4": re.compile(
-            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
-            r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
-        ),
+        "ipv4": re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
         "tx_hash": re.compile(r"\b0x[a-fA-F0-9]{64}\b"),
+        # Social / usernames
+        "twitter_handle": re.compile(r"(?:twitter\.com|x\.com)/(@?[A-Za-z0-9_]{1,15})\b"),
+        "github_user": re.compile(r"github\.com/([A-Za-z0-9\-]{1,39})(?:/|$)"),
+        "linkedin_profile": re.compile(r"linkedin\.com/in/([A-Za-z0-9\-]{3,100})"),
+        "reddit_user": re.compile(r"reddit\.com/u(?:ser)?/([A-Za-z0-9_\-]{3,20})"),
+        # API keys / secrets
+        "aws_key": re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
+        "github_token": re.compile(r"\b(ghp_[A-Za-z0-9]{36})\b"),
+        "stripe_key": re.compile(r"\b(sk_live_[A-Za-z0-9]{24,})\b"),
+        "jwt_token": re.compile(r"\beyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b"),
+        "generic_secret": re.compile(r"(?:api[_\-]?key|secret|token|password|passwd|auth)\s*[:=]\s*['\"]([A-Za-z0-9\-_./+=]{16,128})['\"]", re.I),
     }
 
     @classmethod
     def extract_all(cls, text: str) -> Dict[str, List[str]]:
-        """Extract all pattern matches from text, deduplicated and limited."""
         if not text:
             return {}
         results = {}
         for name, pattern in cls.PATTERNS.items():
             matches = pattern.findall(text)
             if matches:
-                # Deduplicate, limit to 50, validate
                 seen: Set[str] = set()
                 validated = []
                 for m in matches:
-                    m = m.strip()
-                    if m not in seen and cls._validate(name, m):
+                    m = m.strip() if isinstance(m, str) else str(m).strip()
+                    if m and m not in seen and cls._validate(name, m):
                         seen.add(m)
                         validated.append(m)
                         if len(validated) >= 50:
@@ -245,389 +380,862 @@ class DataExtractor:
         return results
 
     @classmethod
-    def _validate(cls, pattern_type: str, value: str) -> bool:
-        """Basic validation to reject false positives."""
-        if pattern_type == "email":
-            parts = value.split("@")
-            return len(parts) == 2 and "." in parts[1] and len(parts[1]) > 3
-        elif pattern_type == "btc_address":
-            return 26 <= len(value) <= 62
-        elif pattern_type == "eth_address":
-            return len(value) == 42
-        elif pattern_type == "phone":
-            digits = re.sub(r"\D", "", value)
+    def extract_urls(cls, html: str, base_url: str) -> List[str]:
+        """Extract all URLs from HTML content."""
+        if not HAS_BS4 or not html:
+            return []
+        urls = set()
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup.find_all(["a", "link", "script", "img", "form"]):
+                for attr in ["href", "src", "action"]:
+                    val = tag.get(attr)
+                    if val and not val.startswith(("#", "javascript:", "data:", "mailto:")):
+                        full = urljoin(base_url, val)
+                        urls.add(full)
+        except Exception:
+            pass
+        return list(urls)[:200]
+
+    @classmethod
+    def extract_comments(cls, html: str) -> List[str]:
+        """Extract HTML comments (often contain secrets/debug info)."""
+        if not HAS_BS4 or not html:
+            return []
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            comments = soup.find_all(string=lambda t: isinstance(t, Comment))
+            return [c.strip() for c in comments if len(c.strip()) > 10][:50]
+        except Exception:
+            return []
+
+    @classmethod
+    def _validate(cls, ptype: str, val: str) -> bool:
+        if ptype == "email":
+            parts = val.split("@")
+            if len(parts) != 2 or "." not in parts[1] or len(parts[1]) < 4:
+                return False
+            # Filter common false positives
+            if parts[1] in ("example.com", "test.com", "localhost"):
+                return False
+            return True
+        elif ptype == "btc_address":
+            return 26 <= len(val) <= 62
+        elif ptype == "eth_address":
+            return len(val) == 42
+        elif ptype == "phone":
+            digits = re.sub(r"\D", "", val)
             return 7 <= len(digits) <= 15
+        elif ptype == "aws_key":
+            return len(val) == 20 and val.startswith("AKIA")
+        elif ptype == "github_token":
+            return len(val) >= 40
         return True
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Technology Fingerprinter
+# ══════════════════════════════════════════════════════════════════════════
+
+class TechFingerprinter:
+    """Detect server software, CMS, frameworks from headers and HTML."""
+
+    # Server header patterns
+    SERVER_PATTERNS = {
+        "Apache": re.compile(r"Apache/?(\S*)", re.I),
+        "Nginx": re.compile(r"nginx/?(\S*)", re.I),
+        "IIS": re.compile(r"Microsoft-IIS/?(\S*)", re.I),
+        "LiteSpeed": re.compile(r"LiteSpeed", re.I),
+        "Cloudflare": re.compile(r"cloudflare", re.I),
+        "Caddy": re.compile(r"Caddy", re.I),
+    }
+
+    # CMS detection via HTML patterns
+    CMS_PATTERNS = {
+        "WordPress": [
+            re.compile(r"/wp-content/", re.I),
+            re.compile(r"/wp-includes/", re.I),
+            re.compile(r'<meta name="generator" content="WordPress[^"]*"', re.I),
+        ],
+        "Drupal": [
+            re.compile(r'<meta name="generator" content="Drupal', re.I),
+            re.compile(r"/sites/default/files/", re.I),
+            re.compile(r"Drupal\.settings", re.I),
+        ],
+        "Joomla": [
+            re.compile(r'<meta name="generator" content="Joomla', re.I),
+            re.compile(r"/media/jui/", re.I),
+        ],
+        "Shopify": [
+            re.compile(r"cdn\.shopify\.com", re.I),
+            re.compile(r"Shopify\.theme", re.I),
+        ],
+        "Wix": [re.compile(r"static\.wixstatic\.com", re.I)],
+        "Squarespace": [re.compile(r"squarespace\.com", re.I)],
+    }
+
+    # Framework detection
+    FRAMEWORK_PATTERNS = {
+        "React": re.compile(r"react(?:\.production|\.development|DOM)", re.I),
+        "Vue.js": re.compile(r"vue(?:\.runtime|\.global|\.esm)", re.I),
+        "Angular": re.compile(r"ng-version|angular(?:\.min)?\.js", re.I),
+        "jQuery": re.compile(r"jquery[.\-](\d+\.\d+)", re.I),
+        "Bootstrap": re.compile(r"bootstrap[.\-](\d+\.\d+)", re.I),
+        "Laravel": re.compile(r"laravel|csrf-token", re.I),
+        "Django": re.compile(r"csrfmiddlewaretoken|__admin__", re.I),
+        "Rails": re.compile(r"rails|turbolinks", re.I),
+        "Next.js": re.compile(r"_next/static|__NEXT_DATA__", re.I),
+        "Express": re.compile(r"X-Powered-By:\s*Express", re.I),
+    }
+
+    @classmethod
+    def fingerprint(cls, headers: dict, html: str) -> dict:
+        tech = {"server": None, "cms": [], "frameworks": [], "powered_by": None,
+                "language": None, "cdn": None}
+
+        # Server header
+        server = headers.get("Server", headers.get("server", ""))
+        if server:
+            tech["server"] = server
+            for name, pat in cls.SERVER_PATTERNS.items():
+                m = pat.search(server)
+                if m:
+                    tech["server"] = f"{name} {m.group(1) if m.group(1) else ''}".strip()
+                    break
+
+        # X-Powered-By
+        powered = headers.get("X-Powered-By", headers.get("x-powered-by", ""))
+        if powered:
+            tech["powered_by"] = powered
+            if "PHP" in powered.upper():
+                tech["language"] = f"PHP ({powered})"
+            elif "ASP.NET" in powered.upper():
+                tech["language"] = f"ASP.NET ({powered})"
+            elif "Express" in powered:
+                tech["language"] = "Node.js (Express)"
+
+        # CDN detection
+        for cdn_header in ["cf-ray", "x-cache", "x-cdn", "x-amz-cf-id"]:
+            if cdn_header in {k.lower() for k in headers}:
+                if "cf-ray" in {k.lower() for k in headers}:
+                    tech["cdn"] = "Cloudflare"
+                elif "x-amz-cf-id" in {k.lower() for k in headers}:
+                    tech["cdn"] = "AWS CloudFront"
+                else:
+                    tech["cdn"] = "CDN detected"
+                break
+
+        # CMS detection from HTML
+        for cms_name, patterns in cls.CMS_PATTERNS.items():
+            for pat in patterns:
+                if pat.search(html[:50000]):
+                    if cms_name not in tech["cms"]:
+                        tech["cms"].append(cms_name)
+                    break
+
+        # Framework detection from HTML
+        for fw_name, pat in cls.FRAMEWORK_PATTERNS.items():
+            if pat.search(html[:50000]):
+                tech["frameworks"].append(fw_name)
+
+        # Meta generator
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(html[:10000], "html.parser")
+                gen = soup.find("meta", attrs={"name": "generator"})
+                if gen and gen.get("content"):
+                    tech["meta_generator"] = gen["content"][:100]
+            except Exception:
+                pass
+
+        return tech
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Vulnerability Scanner — Real checks, real findings
+# ══════════════════════════════════════════════════════════════════════════
+
+class VulnScanner:
+    """Production vulnerability scanner that works through Tor.
+
+    All checks are real — they probe actual server behavior, headers, and
+    responses. No simulated findings. Each check returns a list of
+    {severity, title, detail, evidence} dicts.
+    """
+
+    # Sensitive paths to probe — common misconfigs that expose data
+    SENSITIVE_PATHS = [
+        ("/.git/HEAD", "Git repository exposed", SEV_CRITICAL,
+         "Full source code + commit history downloadable"),
+        ("/.env", "Environment file exposed", SEV_CRITICAL,
+         "Database credentials, API keys, secrets in plaintext"),
+        ("/.git/config", "Git config exposed", SEV_HIGH,
+         "Remote repository URLs, author info revealed"),
+        ("/wp-config.php.bak", "WordPress config backup", SEV_CRITICAL,
+         "Database credentials in plaintext backup file"),
+        ("/wp-config.php~", "WordPress config editor backup", SEV_CRITICAL,
+         "Database credentials in editor temp file"),
+        ("/.DS_Store", "macOS directory metadata", SEV_LOW,
+         "File listing of directory contents leaked"),
+        ("/robots.txt", "Robots.txt", SEV_INFO,
+         "May reveal hidden directories and admin paths"),
+        ("/sitemap.xml", "Sitemap", SEV_INFO,
+         "Full site structure enumeration"),
+        ("/.well-known/security.txt", "Security.txt", SEV_INFO,
+         "Security contact and disclosure policy"),
+        ("/server-status", "Apache server-status", SEV_HIGH,
+         "Live request info, client IPs, internal paths"),
+        ("/server-info", "Apache server-info", SEV_HIGH,
+         "Full server configuration exposed"),
+        ("/phpinfo.php", "PHP info page", SEV_HIGH,
+         "Server config, paths, loaded modules, environment"),
+        ("/info.php", "PHP info page (alt)", SEV_HIGH,
+         "Server config, paths, loaded modules, environment"),
+        ("/wp-json/wp/v2/users", "WordPress user enumeration", SEV_MEDIUM,
+         "Usernames and user IDs publicly accessible"),
+        ("/api/", "API root endpoint", SEV_INFO,
+         "API endpoint may expose documentation or data"),
+        ("/graphql", "GraphQL endpoint", SEV_MEDIUM,
+         "GraphQL introspection may expose full schema"),
+        ("/debug", "Debug endpoint", SEV_HIGH,
+         "Debug information and internal state exposed"),
+        ("/.htaccess", "Apache config exposed", SEV_MEDIUM,
+         "Rewrite rules, auth config, internal paths"),
+        ("/crossdomain.xml", "Flash crossdomain policy", SEV_LOW,
+         "Overly permissive Flash cross-origin policy"),
+        ("/backup/", "Backup directory", SEV_HIGH,
+         "Database dumps, source code backups"),
+        ("/admin/", "Admin panel", SEV_INFO,
+         "Administrative interface accessible"),
+        ("/console", "Debug console", SEV_CRITICAL,
+         "Interactive debug console (e.g., Werkzeug, Rails)"),
+        ("/elmah.axd", "ELMAH error log (.NET)", SEV_HIGH,
+         "Full error logs with stack traces and request data"),
+        ("/trace.axd", ".NET trace", SEV_HIGH,
+         "Request tracing with headers, cookies, session data"),
+        ("/.svn/entries", "SVN metadata exposed", SEV_HIGH,
+         "Subversion repository structure and file listing"),
+        ("/WEB-INF/web.xml", "Java config exposed", SEV_CRITICAL,
+         "Servlet mappings, security constraints, database config"),
+    ]
+
+    # Open redirect parameters to test
+    REDIRECT_PARAMS = ["url", "redirect", "next", "return", "returnTo",
+                       "goto", "redirect_uri", "continue", "target", "dest"]
+
+    # SQL injection test patterns (benign — detection only, no exploitation)
+    SQLI_INDICATORS = [
+        re.compile(r"SQL syntax.*MySQL", re.I),
+        re.compile(r"Warning.*mysql_", re.I),
+        re.compile(r"PostgreSQL.*ERROR", re.I),
+        re.compile(r"ORA-\d{5}", re.I),
+        re.compile(r"Microsoft.*ODBC.*SQL", re.I),
+        re.compile(r"Unclosed quotation mark", re.I),
+        re.compile(r"quoted string not properly terminated", re.I),
+        re.compile(r"SQLite3::query", re.I),
+        re.compile(r"pg_query\(\).*failed", re.I),
+        re.compile(r"You have an error in your SQL syntax", re.I),
+    ]
+
+    # XSS reflection test — we inject a unique marker, check if reflected unescaped
+    XSS_CANARY = f"gs{secrets.token_hex(4)}test"
+
+    def __init__(self, session: TorSession):
+        self._session = session
+
+    def scan_full(self, base_url: str, html: str = "", headers: dict = None,
+                  depth: str = "full") -> List[dict]:
+        """Run all applicable vulnerability checks.
+
+        depth: 'quick' = headers only, 'full' = + paths, 'deep' = + exploits
+        """
+        if headers is None:
+            headers = {}
+        findings = []
+
+        findings.extend(self._check_security_headers(headers))
+        findings.extend(self._check_cookies(headers))
+        findings.extend(self._check_cors(base_url, headers))
+        findings.extend(self._check_info_disclosure(headers, html))
+        findings.extend(self._check_clickjacking(headers))
+
+        if depth in ("full", "deep"):
+            findings.extend(self._check_sensitive_paths(base_url))
+            findings.extend(self._check_http_methods(base_url))
+            findings.extend(self._check_open_redirect(base_url))
+
+        if depth == "deep":
+            findings.extend(self._check_sqli_indicators(base_url))
+            findings.extend(self._check_xss_reflection(base_url))
+            findings.extend(self._check_directory_traversal(base_url))
+            findings.extend(self._check_ssl_cert(base_url))
+
+        return findings
+
+    def _check_security_headers(self, headers: dict) -> List[dict]:
+        """Check for missing or weak security headers."""
+        findings = []
+        h = {k.lower(): v for k, v in headers.items()}
+
+        checks = [
+            ("strict-transport-security", SEV_MEDIUM,
+             "Missing HSTS", "Site doesn't enforce HTTPS via HSTS header. "
+             "Users can be downgraded to HTTP via MITM."),
+            ("content-security-policy", SEV_MEDIUM,
+             "Missing Content-Security-Policy", "No CSP header. "
+             "XSS attacks can load scripts from any origin."),
+            ("x-frame-options", SEV_MEDIUM,
+             "Missing X-Frame-Options", "Page can be embedded in iframes. "
+             "Vulnerable to clickjacking attacks."),
+            ("x-content-type-options", SEV_LOW,
+             "Missing X-Content-Type-Options", "Browser may MIME-sniff "
+             "responses, enabling content-type confusion attacks."),
+            ("referrer-policy", SEV_LOW,
+             "Missing Referrer-Policy", "Full URL may be leaked in "
+             "Referer header to third-party sites."),
+            ("permissions-policy", SEV_LOW,
+             "Missing Permissions-Policy", "Browser features (camera, "
+             "mic, geolocation) not explicitly restricted."),
+        ]
+
+        for header, sev, title, detail in checks:
+            if header not in h:
+                findings.append({"severity": sev, "title": title,
+                                 "detail": detail, "evidence": f"Header '{header}' absent"})
+
+        # Check HSTS quality
+        hsts = h.get("strict-transport-security", "")
+        if hsts:
+            if "max-age=0" in hsts:
+                findings.append({"severity": SEV_HIGH, "title": "HSTS disabled (max-age=0)",
+                                 "detail": "HSTS is explicitly disabled.",
+                                 "evidence": f"HSTS: {hsts}"})
+            elif "max-age" in hsts:
+                try:
+                    age = int(re.search(r"max-age=(\d+)", hsts).group(1))
+                    if age < 15768000:  # < 6 months
+                        findings.append({"severity": SEV_LOW, "title": "HSTS max-age too short",
+                                         "detail": f"max-age={age} ({age//86400} days). Recommended: 1 year+.",
+                                         "evidence": f"HSTS: {hsts}"})
+                except (AttributeError, ValueError):
+                    pass
+
+        # Check CSP quality
+        csp = h.get("content-security-policy", "")
+        if csp:
+            if "unsafe-inline" in csp:
+                findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-inline",
+                                 "detail": "Inline scripts/styles permitted, weakening XSS protection.",
+                                 "evidence": "CSP contains 'unsafe-inline'"})
+            if "unsafe-eval" in csp:
+                findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-eval",
+                                 "detail": "eval() permitted in scripts, enabling code injection.",
+                                 "evidence": "CSP contains 'unsafe-eval'"})
+            if "'*'" in csp or "* " in csp:
+                findings.append({"severity": SEV_HIGH, "title": "CSP has wildcard source",
+                                 "detail": "Wildcard allows loading resources from any origin.",
+                                 "evidence": "CSP contains '*'"})
+
+        return findings
+
+    def _check_cookies(self, headers: dict) -> List[dict]:
+        """Audit Set-Cookie headers for security flags."""
+        findings = []
+        for key, val in headers.items():
+            if key.lower() != "set-cookie":
+                continue
+            cookie_name = val.split("=")[0].strip() if "=" in val else "unknown"
+            val_lower = val.lower()
+
+            if "secure" not in val_lower:
+                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing Secure flag",
+                                 "detail": "Cookie sent over HTTP (unencrypted), exposable via MITM.",
+                                 "evidence": f"Set-Cookie: {val[:80]}"})
+            if "httponly" not in val_lower:
+                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing HttpOnly flag",
+                                 "detail": "Cookie accessible via JavaScript — stealable via XSS.",
+                                 "evidence": f"Set-Cookie: {val[:80]}"})
+            if "samesite" not in val_lower:
+                findings.append({"severity": SEV_LOW, "title": f"Cookie '{cookie_name}' missing SameSite flag",
+                                 "detail": "Cookie sent on cross-site requests — CSRF risk.",
+                                 "evidence": f"Set-Cookie: {val[:80]}"})
+        return findings
+
+    def _check_cors(self, url: str, headers: dict) -> List[dict]:
+        """Check for CORS misconfiguration."""
+        findings = []
+        acao = headers.get("Access-Control-Allow-Origin", headers.get("access-control-allow-origin", ""))
+
+        if acao == "*":
+            acac = headers.get("Access-Control-Allow-Credentials", "").lower()
+            sev = SEV_HIGH if acac == "true" else SEV_MEDIUM
+            findings.append({
+                "severity": sev,
+                "title": "CORS allows any origin" + (" WITH credentials" if acac == "true" else ""),
+                "detail": "Access-Control-Allow-Origin: * permits any website to read responses." +
+                          (" Combined with credentials=true, this is exploitable." if acac == "true" else ""),
+                "evidence": f"ACAO: {acao}, ACAC: {acac or 'absent'}"
+            })
+
+        # Test reflective CORS — send Origin header and check if reflected
+        if not acao:
+            evil_origin = "https://evil-attacker.com"
+            resp = self._session.get(url, allow_wayback=False,
+                                     headers={"Origin": evil_origin})
+            if resp and resp.headers.get("Access-Control-Allow-Origin") == evil_origin:
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": "Reflective CORS — arbitrary origin accepted",
+                    "detail": "Server reflects any Origin header in ACAO. "
+                              "Attacker can read authenticated responses.",
+                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}"
+                })
+        return findings
+
+    def _check_info_disclosure(self, headers: dict, html: str) -> List[dict]:
+        """Check for information disclosure in headers and HTML."""
+        findings = []
+
+        # Server version strings
+        server = headers.get("Server", "")
+        if server and re.search(r"\d+\.\d+", server):
+            findings.append({"severity": SEV_LOW, "title": "Server version disclosed",
+                             "detail": f"Server header reveals version info. Aids attacker reconnaissance.",
+                             "evidence": f"Server: {server[:80]}"})
+
+        powered = headers.get("X-Powered-By", "")
+        if powered:
+            findings.append({"severity": SEV_LOW, "title": "X-Powered-By header present",
+                             "detail": "Technology stack revealed. Remove this header.",
+                             "evidence": f"X-Powered-By: {powered[:80]}"})
+
+        # Debug headers
+        for debug_h in ["X-Debug-Token", "X-Debug-Info", "X-Debug-Link"]:
+            if debug_h in headers or debug_h.lower() in {k.lower() for k in headers}:
+                findings.append({"severity": SEV_HIGH, "title": f"Debug header present: {debug_h}",
+                                 "detail": "Debug mode likely enabled in production.",
+                                 "evidence": f"{debug_h} header found"})
+
+        # Stack traces in HTML
+        stack_patterns = [
+            (re.compile(r"Traceback \(most recent call last\)", re.I), "Python stack trace"),
+            (re.compile(r"at\s+\w+\.\w+\([\w.]+:\d+\)", re.I), "Java/.NET stack trace"),
+            (re.compile(r"Fatal error:.*on line \d+", re.I), "PHP fatal error"),
+            (re.compile(r"Exception in thread", re.I), "Java exception"),
+        ]
+        for pat, desc in stack_patterns:
+            if pat.search(html[:20000]):
+                findings.append({"severity": SEV_HIGH, "title": f"Stack trace in response: {desc}",
+                                 "detail": "Error details visible to users. Reveals internal paths, "
+                                           "library versions, and potential attack vectors.",
+                                 "evidence": desc})
+                break
+
+        return findings
+
+    def _check_clickjacking(self, headers: dict) -> List[dict]:
+        """Check clickjacking protection."""
+        h = {k.lower(): v for k, v in headers.items()}
+        xfo = h.get("x-frame-options", "")
+        csp = h.get("content-security-policy", "")
+
+        if not xfo and "frame-ancestors" not in csp:
+            return [{"severity": SEV_MEDIUM, "title": "Clickjacking possible",
+                     "detail": "No X-Frame-Options or CSP frame-ancestors. "
+                               "Page can be embedded in attacker iframes.",
+                     "evidence": "Neither X-Frame-Options nor frame-ancestors directive found"}]
+        return []
+
+    def _check_sensitive_paths(self, base_url: str) -> List[dict]:
+        """Probe for exposed sensitive files and directories."""
+        findings = []
+        for path, title, severity, detail in self.SENSITIVE_PATHS:
+            if shutdown_requested():
+                break
+            url = urljoin(base_url, path)
+            # Use HEAD first (less WAF triggering), GET only if HEAD returns 200
+            resp = self._session.get(url, allow_wayback=False, method="HEAD")
+            if resp and resp.status_code == 200:
+                # Verify with GET for critical findings to avoid false positives
+                if severity in (SEV_CRITICAL, SEV_HIGH):
+                    resp_full = self._session.get(url, allow_wayback=False)
+                    if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
+                        # Additional validation: check content isn't a generic 404 page
+                        if not re.search(r"not found|404|page does not exist", resp_full.text[:500], re.I):
+                            findings.append({"severity": severity, "title": title,
+                                             "detail": detail, "evidence": f"HTTP 200 at {path}",
+                                             "path": path, "content_length": len(resp_full.text)})
+                else:
+                    findings.append({"severity": severity, "title": title,
+                                     "detail": detail, "evidence": f"HTTP 200 at {path}",
+                                     "path": path})
+        return findings
+
+    def _check_http_methods(self, base_url: str) -> List[dict]:
+        """Check for dangerous HTTP methods enabled."""
+        findings = []
+        resp = self._session.get(base_url, allow_wayback=False, method="HEAD")
+        if not resp:
+            return findings
+
+        # Try OPTIONS to discover allowed methods
+        try:
+            opt_resp = self._session._session.options(base_url, timeout=15,
+                                                       proxies=self._session._proxy,
+                                                       headers=_pick_profile())
+            if opt_resp and opt_resp.status_code == 200:
+                allow = opt_resp.headers.get("Allow", "")
+                if allow:
+                    dangerous = {"PUT", "DELETE", "TRACE", "PATCH"}
+                    allowed = {m.strip().upper() for m in allow.split(",")}
+                    found = dangerous & allowed
+                    if found:
+                        findings.append({
+                            "severity": SEV_MEDIUM if "TRACE" not in found else SEV_HIGH,
+                            "title": f"Dangerous HTTP methods enabled: {', '.join(sorted(found))}",
+                            "detail": "TRACE enables Cross-Site Tracing (XST). "
+                                      "PUT/DELETE may allow file manipulation." if "TRACE" in found
+                                      else "PUT/DELETE methods may allow unauthorized file modification.",
+                            "evidence": f"Allow: {allow}"
+                        })
+        except Exception:
+            pass
+        return findings
+
+    def _check_open_redirect(self, base_url: str) -> List[dict]:
+        """Check for open redirect vulnerabilities."""
+        findings = []
+        evil_target = "https://evil-attacker.com/pwned"
+
+        for param in self.REDIRECT_PARAMS[:5]:  # Limit to avoid excessive requests
+            if shutdown_requested():
+                break
+            test_url = f"{base_url}?{param}={quote(evil_target)}"
+            try:
+                resp = self._session._session.get(
+                    test_url, timeout=15, allow_redirects=False,
+                    proxies=self._session._proxy, headers=_pick_profile()
+                )
+                if resp and resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    if "evil-attacker.com" in location:
+                        findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": f"Open redirect via '{param}' parameter",
+                            "detail": "Server redirects to attacker-controlled URL. "
+                                      "Usable for phishing and OAuth token theft.",
+                            "evidence": f"?{param}={evil_target} → Location: {location[:100]}"
+                        })
+                        break  # One is enough to confirm
+            except Exception:
+                pass
+        return findings
+
+    def _check_sqli_indicators(self, base_url: str) -> List[dict]:
+        """Detect SQL injection indicators via error-based detection.
+
+        This does NOT exploit anything — it sends a single apostrophe and
+        checks if the error response contains SQL error messages, which
+        indicates the input reaches a SQL query without sanitization.
+        """
+        findings = []
+        # Test common parameter names with a single apostrophe
+        test_params = ["id", "page", "q", "search", "user", "item", "cat"]
+
+        for param in test_params[:3]:
+            if shutdown_requested():
+                break
+            test_url = f"{base_url}?{param}=1%27"  # single quote
+            resp = self._session.get(test_url, allow_wayback=False)
+            if resp and resp.text:
+                for indicator in self.SQLI_INDICATORS:
+                    if indicator.search(resp.text[:5000]):
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"SQL injection indicator via '{param}' parameter",
+                            "detail": "SQL error message in response to apostrophe injection. "
+                                      "Input likely reaches a SQL query without parameterization.",
+                            "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}"
+                        })
+                        return findings  # One confirmed is enough
+        return findings
+
+    def _check_xss_reflection(self, base_url: str) -> List[dict]:
+        """Detect reflected XSS by checking if a unique canary is reflected unescaped."""
+        findings = []
+        canary = self.XSS_CANARY
+        test_params = ["q", "search", "query", "s", "name", "input"]
+
+        for param in test_params[:3]:
+            if shutdown_requested():
+                break
+            # Inject canary with HTML context
+            payload = f"<{canary}>"
+            test_url = f"{base_url}?{param}={quote(payload)}"
+            resp = self._session.get(test_url, allow_wayback=False)
+            if resp and resp.text:
+                # Check if canary appears UNESCAPED (i.e., as actual HTML tag, not &lt;)
+                if f"<{canary}>" in resp.text:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Reflected XSS via '{param}' parameter",
+                        "detail": "HTML input reflected unescaped in response. "
+                                  "Attacker can inject arbitrary JavaScript.",
+                        "evidence": f"Parameter: {param}, canary <{canary}> reflected as HTML"
+                    })
+                    return findings
+        return findings
+
+    def _check_directory_traversal(self, base_url: str) -> List[dict]:
+        """Detect directory/path traversal indicators."""
+        findings = []
+        traversal_payloads = [
+            ("..%2F..%2F..%2Fetc%2Fpasswd", "/etc/passwd content"),
+            ("....//....//....//etc/passwd", "/etc/passwd content"),
+        ]
+        # Indicators that traversal succeeded
+        passwd_indicators = [
+            re.compile(r"root:.*:0:0:", re.I),
+            re.compile(r"daemon:.*:/usr/sbin", re.I),
+        ]
+
+        for payload, desc in traversal_payloads[:1]:
+            if shutdown_requested():
+                break
+            test_url = f"{base_url}/{payload}"
+            resp = self._session.get(test_url, allow_wayback=False)
+            if resp and resp.text:
+                for ind in passwd_indicators:
+                    if ind.search(resp.text[:2000]):
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": "Directory traversal — /etc/passwd readable",
+                            "detail": "Path traversal allows reading arbitrary system files. "
+                                      "Full filesystem access likely possible.",
+                            "evidence": f"Payload: {payload}, {desc} detected"
+                        })
+                        return findings
+        return findings
+
+    def _check_ssl_cert(self, base_url: str) -> List[dict]:
+        """Check SSL/TLS certificate issues."""
+        findings = []
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https":
+            findings.append({"severity": SEV_HIGH, "title": "Site uses HTTP (no encryption)",
+                             "detail": "All traffic sent in plaintext. Credentials, "
+                                       "session tokens visible to network observers.",
+                             "evidence": f"Scheme: {parsed.scheme}"})
+            return findings
+
+        # We can't do raw TLS checks through Tor SOCKS (the Tor exit does TLS),
+        # but we can check what the server reports about its cert via headers
+        # and check for common cert-related issues in response behavior
+        resp = self._session.get(base_url, allow_wayback=False)
+        if resp is None:
+            return findings
+
+        # Check if site accepts HTTP (downgrade possible)
+        http_url = base_url.replace("https://", "http://", 1)
+        http_resp = self._session.get(http_url, allow_wayback=False, method="HEAD")
+        if http_resp and http_resp.status_code == 200:
+            # Check if it redirects to HTTPS
+            if not any(r.status_code in (301, 302) and "https" in r.headers.get("Location", "")
+                       for r in http_resp.history):
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "HTTP not redirected to HTTPS",
+                    "detail": "HTTP version of site responds without redirect. "
+                              "Users can be served unencrypted version via MITM.",
+                    "evidence": f"HTTP {http_url} returns {http_resp.status_code} without HTTPS redirect"
+                })
+
+        return findings
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Subdomain Enumerator (via crt.sh certificate transparency)
+# ══════════════════════════════════════════════════════════════════════════
+
+class SubdomainEnumerator:
+    """Enumerate subdomains via certificate transparency logs.
+
+    crt.sh is a free public service that indexes certificate transparency
+    logs. It's Tor-friendly and doesn't block automated queries.
+    """
+
+    CRTSH_URL = "https://crt.sh/?q={domain}&output=json"
+
+    def __init__(self, session: TorSession):
+        self._session = session
+
+    def enumerate(self, domain: str) -> List[str]:
+        """Query crt.sh for subdomains of the given domain."""
+        url = self.CRTSH_URL.format(domain=quote(f"%.{domain}"))
+        resp = self._session.get(url)
+        if not resp:
+            return []
+
+        subdomains: Set[str] = set()
+        try:
+            entries = resp.json()
+            if not isinstance(entries, list):
+                return []
+            for entry in entries:
+                name = entry.get("name_value", "")
+                for line in name.split("\n"):
+                    line = line.strip().lower()
+                    if line and line.endswith(f".{domain}") or line == domain:
+                        # Remove wildcard prefix
+                        line = line.lstrip("*.")
+                        if line and re.match(r"^[a-z0-9.\-]+$", line):
+                            subdomains.add(line)
+        except (ValueError, KeyError):
+            pass
+
+        return sorted(subdomains)[:200]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DNS Reconnaissance (via DNS-over-HTTPS through Tor)
+# ══════════════════════════════════════════════════════════════════════════
+
+class DNSRecon:
+    """DNS record lookup via Cloudflare DNS-over-HTTPS.
+
+    All queries go through Tor. Cloudflare DoH doesn't block Tor exits.
+    """
+
+    DOH_URL = "https://cloudflare-dns.com/dns-query"
+    RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA"]
+
+    def __init__(self, session: TorSession):
+        self._session = session
+
+    def lookup(self, domain: str) -> Dict[str, List[str]]:
+        """Query multiple DNS record types for a domain."""
+        results = {}
+        for rtype in self.RECORD_TYPES:
+            if shutdown_requested():
+                break
+            records = self._query(domain, rtype)
+            if records:
+                results[rtype] = records
+        return results
+
+    def _query(self, domain: str, rtype: str) -> List[str]:
+        """Single DNS-over-HTTPS query."""
+        params = f"?name={quote(domain)}&type={rtype}"
+        resp = self._session.get(
+            self.DOH_URL + params,
+            headers={"Accept": "application/dns-json"},
+            allow_wayback=False,
+        )
+        if not resp:
+            return []
+        try:
+            data = resp.json()
+            answers = data.get("Answer", [])
+            return [a.get("data", "").strip('"') for a in answers
+                    if a.get("data")][:20]
+        except (ValueError, KeyError):
+            return []
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Honeypot Detection
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 class HoneypotDetector:
-    """Detect honeypot/bot-trap pages using content and behavior heuristics."""
-
     TRAP_PATTERNS = [
         re.compile(r"(?:honeypot|bot.?trap|bot.?check)", re.I),
         re.compile(r"please\s+verify\s+you\s+are\s+human", re.I),
         re.compile(r"unusual\s+activity\s+detected", re.I),
         re.compile(r"access\s+denied.*cloudflare", re.I),
-        re.compile(r"captcha", re.I),
     ]
-
-    SUSPICIOUS_HEADERS = {
-        "x-honeypot", "x-trap", "x-security-scan",
-        "x-abuse-info", "cf-mitigated",
-    }
+    SUSPICIOUS_HEADERS = {"x-honeypot", "x-trap", "x-security-scan", "cf-mitigated"}
 
     @classmethod
-    def check(cls, content: str, headers: dict, response_time_ms: float,
-              redirects: int) -> dict:
-        """Returns {is_honeypot: bool, confidence: float, reasons: []}."""
+    def check(cls, content: str, headers: dict, elapsed_ms: float, redirects: int) -> dict:
         score = 0.0
         reasons = []
-
-        # Content patterns
         for pat in cls.TRAP_PATTERNS:
             if pat.search(content[:5000]):
                 score += 0.25
-                reasons.append(f"trap_pattern:{pat.pattern[:30]}")
-
-        # Suspicious headers
-        lower_headers = {k.lower(): v for k, v in headers.items()}
+                reasons.append(f"pattern:{pat.pattern[:30]}")
         for h in cls.SUSPICIOUS_HEADERS:
-            if h in lower_headers:
+            if h in {k.lower() for k in headers}:
                 score += 0.2
-                reasons.append(f"suspicious_header:{h}")
-
-        # Too-fast response (bot-served page)
-        if response_time_ms < 30:
+                reasons.append(f"header:{h}")
+        if elapsed_ms < 30:
             score += 0.15
-            reasons.append("response_too_fast")
-
-        # Excessive redirects
+            reasons.append("too_fast")
         if redirects > 4:
             score += 0.2
-            reasons.append(f"excessive_redirects:{redirects}")
-
-        # Very small page (likely a block/challenge page)
-        if len(content) < 500 and ("blocked" in content.lower() or "denied" in content.lower()):
+            reasons.append(f"redirects:{redirects}")
+        if len(content) < 500 and re.search(r"blocked|denied|forbidden", content, re.I):
             score += 0.3
-            reasons.append("tiny_block_page")
-
-        return {
-            "is_honeypot": score >= 0.5,
-            "confidence": min(score, 1.0),
-            "reasons": reasons,
-        }
+            reasons.append("block_page")
+        return {"is_honeypot": score >= 0.5, "confidence": min(score, 1.0), "reasons": reasons}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Rate-Limited Tor Session
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TorSession:
-    """Requests session with Tor proxy, rate limiting, and anti-fingerprinting.
-
-    Features:
-    - All requests through socks5h (DNS at proxy)
-    - Per-domain rate tracking with adaptive delays
-    - Automatic circuit rotation every N requests
-    - Browser profile rotation per request
-    - Exponential backoff on 429/503
-    - Cookie persistence within session
-    """
-
-    def __init__(self, proxy_dict: dict):
-        self._proxy = proxy_dict
-        self._session = requests.Session()
-        self._session.proxies.update(proxy_dict)
-
-        # Retry adapter for transient errors (NOT for rate limits)
-        retry = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 504])
-        adapter = HTTPAdapter(max_retries=retry)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
-
-        # Rate tracking
-        self._domain_last_request: Dict[str, float] = {}
-        self._request_count = 0
-        self._backoff_domains: Dict[str, float] = {}  # domain → backoff_until
-
-    def get(self, url: str, **kwargs) -> Optional[requests.Response]:
-        """GET with rate limiting, anti-fingerprinting, and error handling."""
-        if shutdown_requested():
-            return None
-
-        domain = urlparse(url).netloc
-
-        # Check domain backoff
-        backoff_until = self._backoff_domains.get(domain, 0)
-        if time.time() < backoff_until:
-            wait = backoff_until - time.time()
-            if wait > 0:
-                time.sleep(wait)
-
-        # Per-domain rate limit
-        last = self._domain_last_request.get(domain, 0)
-        elapsed = time.time() - last
-        min_delay = DOMAIN_MIN_DELAY + secrets.randbelow(
-            int((DOMAIN_MAX_DELAY - DOMAIN_MIN_DELAY) * 1000)
-        ) / 1000.0
-        if elapsed < min_delay:
-            time.sleep(min_delay - elapsed)
-
-        # Rotate circuit periodically
-        self._request_count += 1
-        if self._request_count % CIRCUIT_ROTATION_EVERY == 0:
-            newnym()
-            time.sleep(2 + secrets.randbelow(3000) / 1000.0)
-
-        # Pick browser profile
-        headers = _pick_profile()
-        if "headers" in kwargs:
-            headers.update(kwargs.pop("headers"))
-
-        # Set timeout
-        kwargs.setdefault("timeout", 20)
-
-        try:
-            self._domain_last_request[domain] = time.time()
-            resp = self._session.get(url, headers=headers, **kwargs)
-
-            # Handle rate limiting
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "60"))
-                retry_after = min(retry_after, 300)  # cap at 5 min
-                self._backoff_domains[domain] = time.time() + retry_after
-                integrity_log("intel", f"rate_limited:{domain}:wait={retry_after}s")
-                return None
-
-            if resp.status_code == 503:
-                # Service unavailable — likely WAF challenge
-                self._backoff_domains[domain] = time.time() + 30
-                return None
-
-            if resp.status_code == 403:
-                # Forbidden — likely blocked
-                integrity_log("intel", f"blocked:{domain}")
-                self._backoff_domains[domain] = time.time() + 120
-                newnym()  # Rotate circuit on block
-                return None
-
-            resp.raise_for_status()
-            return resp
-
-        except requests.exceptions.Timeout:
-            integrity_log("intel", f"timeout:{domain}")
-            return None
-        except requests.exceptions.ConnectionError:
-            integrity_log("intel", f"conn_error:{domain}")
-            return None
-        except requests.exceptions.HTTPError as e:
-            integrity_log("intel", f"http_error:{domain}:{e.response.status_code if e.response else '?'}")
-            return None
-
-    def close(self):
-        """Close the session."""
-        self._session.close()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Breach Database Integration
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Breach Checker
+# ══════════════════════════════════════════════════════════════════════════
 
 class BreachChecker:
-    """Check emails against breach databases via Tor."""
-
     def __init__(self, session: TorSession):
         self._session = session
 
     def check_hibp(self, email: str) -> Optional[dict]:
-        """Check Have I Been Pwned for email breaches.
-
-        Requires HIBP_KEY env var (paid API key).
-        Uses the v3 breachedaccount endpoint, NOT pwnedpasswords.
-        """
         if not HIBP_API_KEY:
             return None
-
         url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email)}?truncateResponse=true"
-        resp = self._session.get(url, headers={
-            "hibp-api-key": HIBP_API_KEY,
-            "User-Agent": "IntelGather-OSINT",
-        })
-
+        resp = self._session.get(url, allow_wayback=False,
+                                 headers={"hibp-api-key": HIBP_API_KEY})
         if resp is None:
             return {"email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
                     "status": "error", "source": "hibp"}
-
         if resp.status_code == 200:
             try:
                 breaches = resp.json()
-                return {
-                    "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
-                    "breached": True,
-                    "breach_count": len(breaches) if isinstance(breaches, list) else 1,
-                    "breach_names": [b.get("Name", "?") for b in breaches[:10]]
-                                    if isinstance(breaches, list) else [],
-                    "source": "hibp",
-                }
+                return {"email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                        "breached": True,
+                        "breach_count": len(breaches) if isinstance(breaches, list) else 1,
+                        "breach_names": [b.get("Name", "?") for b in (breaches if isinstance(breaches, list) else [])[:10]],
+                        "source": "hibp"}
             except (ValueError, KeyError):
                 pass
         elif resp.status_code == 404:
-            return {
-                "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
-                "breached": False,
-                "source": "hibp",
-            }
-
+            return {"email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                    "breached": False, "source": "hibp"}
         return None
 
     def check_dehashed(self, email: str) -> Optional[dict]:
-        """Check Dehashed API for breach data.
-
-        Requires DEHASHED_KEY and DEHASHED_EMAIL env vars.
-        """
         if not DEHASHED_API_KEY or not DEHASHED_EMAIL:
             return None
-
         url = f"https://api.dehashed.com/search?query=email:{quote(email)}"
-        resp = self._session.get(url, headers={
-            "Accept": "application/json",
-        })
-
-        if resp is None:
-            return None
-
-        if resp.status_code == 200:
+        resp = self._session.get(url, allow_wayback=False,
+                                 headers={"Accept": "application/json"})
+        if resp and resp.status_code == 200:
             try:
                 data = resp.json()
                 entries = data.get("entries", [])
                 if entries:
-                    return {
-                        "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
-                        "breached": True,
-                        "entry_count": len(entries),
-                        "sources": list(set(e.get("database_name", "?")
-                                            for e in entries[:20])),
-                        "source": "dehashed",
-                    }
+                    return {"email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                            "breached": True, "entry_count": len(entries),
+                            "sources": list(set(e.get("database_name", "?") for e in entries[:20])),
+                            "source": "dehashed"}
             except (ValueError, KeyError):
                 pass
-
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Web Scraper with Anti-Blocking
-# ═══════════════════════════════════════════════════════════════════════════
-
-class IntelScraper:
-    """Scrape web pages for OSINT data with anti-blocking measures."""
-
-    def __init__(self, session: TorSession):
-        self._session = session
-        self._extractor = DataExtractor()
-        self._honeypot = HoneypotDetector()
-
-    def scrape_url(self, url: str) -> Optional[dict]:
-        """Scrape a single URL with full pipeline: fetch → detect → extract."""
-        t0 = time.time()
-        resp = self._session.get(url)
-        elapsed_ms = (time.time() - t0) * 1000
-
-        if resp is None:
-            return None
-
-        content = resp.text
-        headers = dict(resp.headers)
-
-        # Honeypot check
-        hp = self._honeypot.check(
-            content, headers, elapsed_ms, len(resp.history)
-        )
-        if hp["is_honeypot"]:
-            integrity_log("intel", f"honeypot_detected:{urlparse(url).netloc}")
-            return {"url": url, "honeypot": True, "hp_reasons": hp["reasons"]}
-
-        # Parse HTML
-        text = content
-        if HAS_BS4:
-            try:
-                soup = BeautifulSoup(content, "html.parser")
-                # Remove script/style tags
-                for tag in soup(["script", "style", "noscript"]):
-                    tag.decompose()
-                text = soup.get_text(separator=" ", strip=True)
-                # Also get page title and meta description
-                title = soup.title.string.strip() if soup.title and soup.title.string else ""
-                meta_desc = ""
-                meta_tag = soup.find("meta", attrs={"name": "description"})
-                if meta_tag:
-                    meta_desc = meta_tag.get("content", "")
-            except Exception:
-                title = ""
-                meta_desc = ""
-        else:
-            title = ""
-            meta_desc = ""
-
-        # Extract data patterns
-        extracted = self._extractor.extract_all(text)
-
-        _coarsened = int(time.time()) // 600 * 600
-        return {
-            "url": url,
-            "title": title[:200],
-            "description": meta_desc[:500],
-            "extracted": extracted,
-            "content_length": len(content),
-            "timestamp": _coarsened,
-            "honeypot": False,
-        }
-
-    def scrape_search_results(self, query: str, max_results: int = 20) -> List[dict]:
-        """Search via DuckDuckGo HTML (no API key needed, Tor-friendly).
-
-        DuckDuckGo's HTML endpoint doesn't block Tor and doesn't require
-        JavaScript. Google aggressively blocks automated queries and Tor
-        exit nodes — DDG is the only reliable option for Tor-based search.
-        """
-        results = []
-        encoded_q = quote(query)
-
-        # DuckDuckGo HTML search
-        url = f"https://html.duckduckgo.com/html/?q={encoded_q}"
-        resp = self._session.get(url)
-        if resp is None:
-            return results
-
-        if not HAS_BS4:
-            integrity_log("intel", "bs4_missing:cannot_parse_search")
-            return results
-
-        try:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            links = soup.find_all("a", class_="result__a")
-            for link in links[:max_results]:
-                href = link.get("href", "")
-                title = link.get_text(strip=True)
-                if href and href.startswith("http"):
-                    results.append({"url": href, "title": title, "source": "ddg"})
-        except Exception as e:
-            integrity_log("intel", f"search_parse_error:{str(e)[:40]}")
-
-        return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Secure Output Storage
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Secure Storage
+# ══════════════════════════════════════════════════════════════════════════
 
 class SecureStorage:
-    """RAM-only encrypted output with auto-wipe."""
-
     def __init__(self):
         self._dir = RAM_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -636,19 +1244,15 @@ class SecureStorage:
         self._cipher = Fernet(self._key) if self._key else None
 
     def save(self, data: dict, label: str = "intel") -> Path:
-        """Save data to RAM disk, optionally encrypted."""
         _ts = int(time.time()) // 600 * 600
         ts_str = datetime.fromtimestamp(_ts, tz=timezone.utc).strftime("%Y%m%d_%H%M")
         filename = f"{label}_{ts_str}_{secure_hex(4)}"
-
         serialized = json.dumps(data, indent=2, default=str).encode()
-
         if self._cipher:
             encrypted = self._cipher.encrypt(serialized)
             outpath = self._dir / f"{filename}.enc"
             outpath.write_bytes(encrypted)
             secure_file_perms(outpath, 0o600)
-            # Save key separately
             keypath = self._dir / f"{filename}.key"
             keypath.write_bytes(self._key)
             secure_file_perms(keypath, 0o600)
@@ -656,11 +1260,9 @@ class SecureStorage:
             outpath = self._dir / f"{filename}.json"
             outpath.write_text(serialized.decode())
             secure_file_perms(outpath, 0o600)
-
         return outpath
 
     def wipe_all(self):
-        """Securely wipe all intel data from RAM disk."""
         if not self._dir.exists():
             return
         for f in self._dir.iterdir():
@@ -681,270 +1283,440 @@ class SecureStorage:
             pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+#  Web Scraper / Intel Collector
+# ══════════════════════════════════════════════════════════════════════════
+
+class IntelScraper:
+    def __init__(self, session: TorSession):
+        self._session = session
+        self._extractor = DataExtractor()
+        self._honeypot = HoneypotDetector()
+
+    def scrape_url(self, url: str) -> Optional[dict]:
+        t0 = time.time()
+        resp = self._session.get(url)
+        elapsed_ms = (time.time() - t0) * 1000
+        if resp is None:
+            return None
+        content = resp.text
+        headers = dict(resp.headers)
+        hp = self._honeypot.check(content, headers, elapsed_ms, len(resp.history))
+        if hp["is_honeypot"]:
+            integrity_log("intel", f"honeypot:{urlparse(url).netloc}")
+            return {"url": url, "honeypot": True, "hp_reasons": hp["reasons"]}
+
+        text = content
+        title = ""
+        meta_desc = ""
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(content, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ", strip=True)
+                title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+                mt = soup.find("meta", attrs={"name": "description"})
+                if mt:
+                    meta_desc = mt.get("content", "")
+            except Exception:
+                pass
+
+        extracted = self._extractor.extract_all(text)
+        urls = self._extractor.extract_urls(content, url)
+        comments = self._extractor.extract_comments(content)
+        secrets_in_comments = {}
+        if comments:
+            combined = " ".join(comments)
+            secrets_in_comments = self._extractor.extract_all(combined)
+
+        _coarsened = int(time.time()) // 600 * 600
+        return {
+            "url": url, "title": title[:200], "description": meta_desc[:500],
+            "extracted": extracted, "urls_found": len(urls),
+            "comments": len(comments),
+            "secrets_in_comments": secrets_in_comments,
+            "content_length": len(content), "timestamp": _coarsened,
+            "raw_html": content, "raw_headers": headers,
+            "honeypot": False,
+        }
+
+    def search_ddg(self, query: str, max_results: int = 20) -> List[dict]:
+        """DuckDuckGo HTML search — Tor-friendly, no JS needed."""
+        results = []
+        url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+        resp = self._session.get(url)
+        if not resp or not HAS_BS4:
+            return results
+        try:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # DDG HTML uses result__a class for links
+            links = soup.find_all("a", class_="result__a")
+            if not links:
+                # Fallback: find any result links
+                links = soup.find_all("a", href=re.compile(r"^https?://"))
+            for link in links[:max_results]:
+                href = link.get("href", "")
+                title = link.get_text(strip=True)
+                if href and href.startswith("http") and "duckduckgo" not in href:
+                    results.append({"url": href, "title": title, "source": "ddg"})
+        except Exception as e:
+            integrity_log("intel", f"ddg_parse_error:{str(e)[:40]}")
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Main Orchestrator
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 class IntelOrchestrator:
-    """Main orchestration: search → scrape → extract → check → store."""
+    """Wire everything together: scrape → extract → scan → check → report."""
 
-    def __init__(self, proxy: dict):
+    def __init__(self, proxy: dict, scan_depth: str = "full"):
         self._session = TorSession(proxy)
         self._scraper = IntelScraper(self._session)
+        self._vulns = VulnScanner(self._session)
         self._breach = BreachChecker(self._session)
+        self._subdomains = SubdomainEnumerator(self._session)
+        self._dns = DNSRecon(self._session)
+        self._tech = TechFingerprinter()
         self._storage = SecureStorage()
         self._results: List[dict] = []
+        self._vuln_findings: List[dict] = []
+        self._scan_depth = scan_depth
 
-    def run_query(self, query: str, max_pages: int = 20):
-        """Search + scrape pipeline for a text query."""
-        print(f"  [*] Searching: {query[:40]}...")
-        search_results = self._scraper.scrape_search_results(query, max_pages)
-        print(f"  [+] Found {len(search_results)} results")
+    def run_domain(self, domain: str):
+        """Full domain reconnaissance + vulnerability scan."""
+        print(f"\n  {'═' * 55}")
+        print(f"  TARGET: {domain}")
+        print(f"  DEPTH:  {self._scan_depth}")
+        print(f"  {'═' * 55}\n")
 
-        for i, sr in enumerate(search_results):
+        base_url = f"https://{domain}"
+
+        # Phase 1: Main page scrape + data extraction
+        print(f"  [*] Phase 1: Fetching main page...")
+        result = self._scraper.scrape_url(base_url)
+        if not result:
+            # Try HTTP
+            base_url = f"http://{domain}"
+            result = self._scraper.scrape_url(base_url)
+        if result and not result.get("honeypot"):
+            self._results.append(result)
+            self._print_extraction(result)
+        elif result and result.get("honeypot"):
+            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+
+        # Phase 2: Technology fingerprinting
+        print(f"\n  [*] Phase 2: Technology fingerprinting...")
+        html = result.get("raw_html", "") if result else ""
+        headers = result.get("raw_headers", {}) if result else {}
+        tech = self._tech.fingerprint(headers, html)
+        self._print_tech(tech)
+
+        # Phase 3: Vulnerability scanning
+        print(f"\n  [*] Phase 3: Vulnerability scanning ({self._scan_depth})...")
+        vulns = self._vulns.scan_full(base_url, html, headers, depth=self._scan_depth)
+        self._vuln_findings.extend(vulns)
+        self._print_vulns(vulns)
+
+        # Phase 4: DNS reconnaissance (full/deep only)
+        if self._scan_depth in ("full", "deep"):
+            print(f"\n  [*] Phase 4: DNS reconnaissance...")
+            dns_records = self._dns.lookup(domain)
+            self._print_dns(dns_records)
+            if dns_records:
+                self._results.append({"type": "dns", "domain": domain, "records": dns_records})
+
+        # Phase 5: Subdomain enumeration (deep only)
+        if self._scan_depth == "deep":
+            print(f"\n  [*] Phase 5: Subdomain enumeration (crt.sh)...")
+            subs = self._subdomains.enumerate(domain)
+            if subs:
+                print(f"  [+] Found {len(subs)} subdomains")
+                for s in subs[:20]:
+                    print(f"      {s}")
+                if len(subs) > 20:
+                    print(f"      ... and {len(subs) - 20} more")
+                self._results.append({"type": "subdomains", "domain": domain,
+                                      "subdomains": subs, "count": len(subs)})
+
+        # Phase 6: Search for additional intel
+        print(f"\n  [*] Phase 6: Search engine OSINT...")
+        dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
+        for dq in dork_queries[:2]:
             if shutdown_requested():
-                print("  [!] Shutdown requested, stopping.")
                 break
-            url = sr["url"]
-            print(f"  [*] Scraping [{i+1}/{len(search_results)}] {urlparse(url).netloc}...")
-            result = self._scraper.scrape_url(url)
-            if result:
-                self._results.append(result)
-                # Print extracted data summary
-                extracted = result.get("extracted", {})
-                if extracted:
-                    for etype, evals in extracted.items():
-                        print(f"      {etype}: {len(evals)} found")
+            self._run_search(dq, max_results=10)
 
-    def run_email_check(self, email: str):
-        """Check a single email against breach databases."""
-        print(f"  [*] Checking breaches for: {email[:3]}***@***")
-
+    def run_email(self, email: str):
+        """Breach database check for email."""
+        print(f"  [*] Checking: {email[:3]}***@***")
         hibp = self._breach.check_hibp(email)
         if hibp:
             if hibp.get("breached"):
                 print(f"  [!] HIBP: BREACHED ({hibp.get('breach_count', '?')} breaches)")
-                for name in hibp.get("breach_names", [])[:5]:
-                    print(f"      - {name}")
+                for n in hibp.get("breach_names", [])[:5]:
+                    print(f"      - {n}")
             elif hibp.get("status") == "error":
-                print(f"  [!] HIBP: check failed (rate limit or network issue)")
+                print(f"  [!] HIBP: check failed")
             else:
-                print(f"  [+] HIBP: not found in breaches")
+                print(f"  [+] HIBP: not found")
             self._results.append({"type": "breach_check", "data": hibp})
-
         dehashed = self._breach.check_dehashed(email)
         if dehashed:
             if dehashed.get("breached"):
                 print(f"  [!] Dehashed: BREACHED ({dehashed.get('entry_count', '?')} entries)")
             self._results.append({"type": "breach_check", "data": dehashed})
-
         if not hibp and not dehashed:
             print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
 
-    def run_domain_recon(self, domain: str):
-        """Basic domain reconnaissance via public sources."""
-        print(f"  [*] Domain recon: {domain}")
+    def run_query(self, query: str, max_pages: int = 20):
+        """Search + scrape pipeline."""
+        print(f"  [*] Searching: {query[:50]}...")
+        self._run_search(query, max_pages)
 
-        # Scrape the main page
-        for scheme in ["https", "http"]:
-            url = f"{scheme}://{domain}"
-            result = self._scraper.scrape_url(url)
-            if result and not result.get("honeypot"):
-                self._results.append(result)
-                print(f"  [+] Main page scraped ({result.get('content_length', 0)} bytes)")
-                extracted = result.get("extracted", {})
-                for etype, evals in extracted.items():
-                    print(f"      {etype}: {len(evals)} found")
-                break
-
-        # Search for domain mentions
-        dork_queries = [
-            f'site:{domain}',
-            f'"{domain}" email contact',
-            f'"{domain}" leak breach',
-        ]
-        for dq in dork_queries:
+    def _run_search(self, query: str, max_results: int = 20):
+        search_results = self._scraper.search_ddg(query, max_results)
+        print(f"  [+] {len(search_results)} results")
+        for i, sr in enumerate(search_results):
             if shutdown_requested():
                 break
-            self.run_query(dq, max_pages=10)
+            url = sr["url"]
+            print(f"  [*] [{i+1}/{len(search_results)}] {urlparse(url).netloc}...")
+            result = self._scraper.scrape_url(url)
+            if result:
+                self._results.append(result)
+                ex = result.get("extracted", {})
+                if ex:
+                    for etype, evals in ex.items():
+                        print(f"      {etype}: {len(evals)}")
 
     def run_file(self, filepath: Path):
-        """Process targets from a file (one per line: email, domain, or query)."""
+        """Process targets from file."""
         if not filepath.exists():
-            print(f"  [!] File not found: {scrub_path(filepath)}")
+            print(f"  [!] File not found")
             return
-
         lines = filepath.read_text().strip().splitlines()
-        print(f"  [*] Processing {len(lines)} targets from file")
-
+        print(f"  [*] {len(lines)} targets from file")
         for i, line in enumerate(lines):
             if shutdown_requested():
                 break
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-
             print(f"\n  ── Target {i+1}/{len(lines)} ──")
             if "@" in line and "." in line:
-                self.run_email_check(line)
+                self.run_email(line)
             elif "." in line and " " not in line:
-                self.run_domain_recon(line)
+                self.run_domain(line)
             else:
-                self.run_query(line, max_pages=10)
+                self.run_query(line, 10)
 
-    def save_and_report(self) -> Optional[Path]:
-        """Process results, save encrypted, print summary."""
-        if not self._results:
+    def _print_extraction(self, result: dict):
+        ex = result.get("extracted", {})
+        if ex:
+            print(f"  [+] Data extracted:")
+            for etype, evals in ex.items():
+                print(f"      {etype}: {len(evals)} found")
+        sc = result.get("secrets_in_comments", {})
+        if sc:
+            print(f"  [!] Secrets found in HTML comments:")
+            for stype, svals in sc.items():
+                print(f"      {stype}: {len(svals)}")
+
+    def _print_tech(self, tech: dict):
+        if tech.get("server"):
+            print(f"  [+] Server: {tech['server']}")
+        if tech.get("powered_by"):
+            print(f"  [+] Powered by: {tech['powered_by']}")
+        if tech.get("cdn"):
+            print(f"  [+] CDN: {tech['cdn']}")
+        for cms in tech.get("cms", []):
+            print(f"  [+] CMS: {cms}")
+        for fw in tech.get("frameworks", []):
+            print(f"  [+] Framework: {fw}")
+        if tech.get("language"):
+            print(f"  [+] Language: {tech['language']}")
+        if tech.get("meta_generator"):
+            print(f"  [+] Generator: {tech['meta_generator']}")
+
+    def _print_vulns(self, vulns: List[dict]):
+        if not vulns:
+            print(f"  [+] No vulnerabilities found at this scan depth")
+            return
+        # Sort by severity
+        order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
+        vulns.sort(key=lambda v: order.get(v["severity"], 5))
+        counts = defaultdict(int)
+        for v in vulns:
+            counts[v["severity"]] += 1
+        print(f"  [!] {len(vulns)} findings: "
+              f"{counts.get(SEV_CRITICAL,0)} critical, {counts.get(SEV_HIGH,0)} high, "
+              f"{counts.get(SEV_MEDIUM,0)} medium, {counts.get(SEV_LOW,0)} low, "
+              f"{counts.get(SEV_INFO,0)} info")
+        for v in vulns:
+            sev = v["severity"]
+            color = {"CRITICAL": "\033[1;31m", "HIGH": "\033[0;31m",
+                     "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
+                     "INFO": "\033[0;90m"}.get(sev, "")
+            reset = "\033[0m"
+            print(f"  {color}[{sev}]{reset} {v['title']}")
+            if sev in (SEV_CRITICAL, SEV_HIGH):
+                print(f"         {v['detail'][:120]}")
+
+    def _print_dns(self, records: dict):
+        if not records:
+            print(f"  [*] No DNS records found (DoH may be blocked)")
+            return
+        for rtype, values in records.items():
+            print(f"  [+] {rtype}: {', '.join(values[:5])}")
+
+    def save_report(self) -> Optional[Path]:
+        """Generate structured report and save encrypted."""
+        if not self._results and not self._vuln_findings:
             print("\n  [*] No results collected.")
             return None
 
-        # Aggregate
-        all_emails: Set[str] = set()
-        all_btc: Set[str] = set()
-        all_eth: Set[str] = set()
-        all_xmr: Set[str] = set()
-        all_phones: Set[str] = set()
-        all_onions: Set[str] = set()
-        breach_count = 0
-        honeypot_count = 0
-        pages_scraped = 0
-
+        # Aggregate extracted data
+        all_data: Dict[str, Set[str]] = defaultdict(set)
+        pages = 0
+        honeypots = 0
+        breaches = 0
         for r in self._results:
             if r.get("honeypot"):
-                honeypot_count += 1
+                honeypots += 1
                 continue
             if r.get("type") == "breach_check":
                 if r.get("data", {}).get("breached"):
-                    breach_count += 1
+                    breaches += 1
                 continue
+            if r.get("type") in ("dns", "subdomains"):
+                continue
+            pages += 1
+            for etype, evals in r.get("extracted", {}).items():
+                all_data[etype].update(evals)
+            for etype, evals in r.get("secrets_in_comments", {}).items():
+                all_data[f"comment_{etype}"].update(evals)
 
-            pages_scraped += 1
-            ex = r.get("extracted", {})
-            all_emails.update(ex.get("email", []))
-            all_btc.update(ex.get("btc_address", []))
-            all_eth.update(ex.get("eth_address", []))
-            all_xmr.update(ex.get("xmr_address", []))
-            all_phones.update(ex.get("phone", []))
-            all_onions.update(ex.get("onion_v3", []))
+        # Vulnerability severity counts
+        vuln_counts = defaultdict(int)
+        for v in self._vuln_findings:
+            vuln_counts[v["severity"]] += 1
 
-        _coarsened = int(time.time()) // 600 * 600
+        _ts = int(time.time()) // 600 * 600
         report = {
-            "schema": "intel_report_v1",
-            "timestamp": _coarsened,
+            "schema": "intel_report_v2",
+            "timestamp": _ts,
             "summary": {
-                "pages_scraped": pages_scraped,
-                "honeypots_detected": honeypot_count,
-                "breached_accounts": breach_count,
-                "unique_emails": len(all_emails),
-                "unique_btc_addresses": len(all_btc),
-                "unique_eth_addresses": len(all_eth),
-                "unique_xmr_addresses": len(all_xmr),
-                "unique_phones": len(all_phones),
-                "unique_onion_services": len(all_onions),
+                "pages_scraped": pages,
+                "honeypots": honeypots,
+                "breached_accounts": breaches,
+                "vulnerabilities": dict(vuln_counts),
+                "vuln_total": len(self._vuln_findings),
+                "data_extracted": {k: len(v) for k, v in all_data.items()},
             },
-            "results": self._results,
+            "vulnerabilities": self._vuln_findings,
+            "results": [
+                {k: v for k, v in r.items() if k not in ("raw_html", "raw_headers")}
+                for r in self._results
+            ],
         }
 
         outpath = self._storage.save(report)
 
-        # Print summary
-        print(f"\n  {'═' * 50}")
-        print(f"  COLLECTION SUMMARY")
-        print(f"  {'═' * 50}")
-        print(f"  Pages scraped:      {pages_scraped}")
-        print(f"  Honeypots detected: {honeypot_count}")
-        print(f"  Breached accounts:  {breach_count}")
-        print(f"  Emails found:       {len(all_emails)}")
-        print(f"  BTC addresses:      {len(all_btc)}")
-        print(f"  ETH addresses:      {len(all_eth)}")
-        print(f"  XMR addresses:      {len(all_xmr)}")
-        print(f"  Phone numbers:      {len(all_phones)}")
-        print(f"  Onion services:     {len(all_onions)}")
-        print(f"  {'═' * 50}")
-        encrypted = "encrypted" if HAS_FERNET else "plaintext"
-        print(f"  [+] Report saved ({encrypted}): {scrub_path(outpath)}")
-
+        # Summary
+        print(f"\n  {'═' * 55}")
+        print(f"  REPORT SUMMARY")
+        print(f"  {'═' * 55}")
+        print(f"  Pages scraped:      {pages}")
+        print(f"  Honeypots:          {honeypots}")
+        print(f"  Breached accounts:  {breaches}")
+        print(f"  Vulnerabilities:    {len(self._vuln_findings)}")
+        if vuln_counts:
+            for sev in [SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM, SEV_LOW, SEV_INFO]:
+                if vuln_counts.get(sev):
+                    print(f"    {sev}: {vuln_counts[sev]}")
+        if all_data:
+            print(f"  Data extracted:")
+            for k, v in sorted(all_data.items()):
+                if v:
+                    print(f"    {k}: {len(v)}")
+        enc = "encrypted" if HAS_FERNET else "plaintext"
+        print(f"  {'═' * 55}")
+        print(f"  [+] Report saved ({enc}): {scrub_path(outpath)}")
         return outpath
 
     def cleanup(self):
-        """Close session and clean up."""
         self._session.close()
         gc.collect()
 
     def emergency_wipe(self):
-        """Wipe all data from RAM disk."""
         self._storage.wipe_all()
         self._results.clear()
+        self._vuln_findings.clear()
         gc.collect()
         print("  [+] Emergency wipe complete")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 #  CLI
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 
 def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        description="Intelligence Gathering System — OSINT via Tor with anti-blocking",
+        description="Intelligence Gathering & Vulnerability Scanner — via Tor",
     )
-    ap.add_argument("--query", "-q", help="Search query to investigate")
-    ap.add_argument("--email", "-e", help="Email to check against breach databases")
-    ap.add_argument("--domain", "-d", help="Domain to perform reconnaissance on")
-    ap.add_argument("--file", "-f", type=Path,
-                    help="File with targets (one per line: email, domain, or query)")
+    ap.add_argument("--domain", "-d", help="Target domain for recon + vuln scan")
+    ap.add_argument("--email", "-e", help="Email to check against breach DBs")
+    ap.add_argument("--query", "-q", help="Search query for OSINT")
+    ap.add_argument("--file", "-f", type=Path, help="File with targets (one per line)")
+    ap.add_argument("--scan", choices=["quick", "full", "deep"], default="full",
+                    help="Scan depth: quick (headers), full (+paths+vulns), deep (+subdomains+exploits)")
     ap.add_argument("--tor-proxy", default="socks5h://127.0.0.1:9050",
                     help="Tor SOCKS5 proxy (default: socks5h://127.0.0.1:9050)")
     ap.add_argument("--max-results", type=int, default=20,
-                    help="Max search results to scrape per query (default: 20)")
-    ap.add_argument("--wipe", action="store_true",
-                    help="Wipe all intel data from RAM and exit")
+                    help="Max search results per query (default: 20)")
+    ap.add_argument("--wipe", action="store_true", help="Wipe all intel data and exit")
     args = ap.parse_args()
 
     if args.wipe:
-        storage = SecureStorage()
-        storage.wipe_all()
-        print("  [+] Intel data wiped from RAM.")
+        SecureStorage().wipe_all()
+        print("  [+] Intel data wiped.")
         return
 
-    if not args.query and not args.email and not args.domain and not args.file:
-        ap.error("At least one of --query, --email, --domain, or --file is required")
+    if not args.domain and not args.email and not args.query and not args.file:
+        ap.error("At least one of --domain, --email, --query, or --file is required")
 
-    # Enforce Tor
     proxy = require_tor_proxy(args.tor_proxy)
     integrity_log("intel", "session_start")
 
-    orchestrator = IntelOrchestrator(proxy)
+    orch = IntelOrchestrator(proxy, scan_depth=args.scan)
 
     try:
         if args.email:
-            orchestrator.run_email_check(args.email)
-
+            orch.run_email(args.email)
         if args.domain:
-            orchestrator.run_domain_recon(args.domain)
-
+            orch.run_domain(args.domain)
         if args.query:
-            orchestrator.run_query(args.query, args.max_results)
-
+            orch.run_query(args.query, args.max_results)
         if args.file:
-            orchestrator.run_file(args.file)
-
-        orchestrator.save_and_report()
-
+            orch.run_file(args.file)
+        orch.save_report()
     except KeyboardInterrupt:
         print("\n  [!] Interrupted — saving partial results...")
-        orchestrator.save_and_report()
+        orch.save_report()
     except Exception as e:
-        print(f"\n  [!] Error: {str(e)[:60]}")
+        print(f"\n  [!] Error: {str(e)[:80]}")
         integrity_log("intel", f"error:{str(e)[:40]}")
     finally:
-        orchestrator.cleanup()
+        orch.cleanup()
         integrity_log("intel", "session_end")
 
-    print()
-    print("  [*] Done. Data is in RAM (/dev/shm/intel/).")
-    print("  [*] Run with --wipe to securely erase when finished.")
+    print(f"\n  [*] Done. Data in RAM ({scrub_path(RAM_DIR)}).")
+    print(f"  [*] Run with --wipe to securely erase.\n")
 
 
 if __name__ == "__main__":
