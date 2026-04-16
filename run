@@ -497,6 +497,16 @@ def flow_receive(detected_port=None):
         with open(wf) as _wf:
             _wdata = json.load(_wf)
         _addr = _wdata.get("address", "")
+
+        # Warn if wallet is old (subaddresses don't expire, but stale wallets
+        # from prior sessions may indicate the user forgot to clean up)
+        import time as _time
+        _wallet_created = _wdata.get("created", 0)
+        if _wallet_created > 0:
+            _wallet_age_hours = (_time.time() - _wallet_created) / 3600
+            if _wallet_age_hours > 72:
+                warn(f"This wallet is {_wallet_age_hours:.0f} hours old.")
+                info("If this is from a prior session, consider creating a fresh wallet.")
     except (json.JSONDecodeError, OSError, KeyError):
         err(f"Cannot read wallet file: {Path(wf).name}")
         return
