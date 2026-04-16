@@ -51,7 +51,7 @@ from typing import Dict, List, Tuple
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
-from gs_common import atomic_write_json
+from gs_common import atomic_write_json, integrity_log
 
 VERSION = "3.0"
 
@@ -97,8 +97,8 @@ def secure_wipe(path: Path) -> None:
             # Fallback to simple deletion
             try:
                 path.unlink()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("labelmask", f"secure_wipe_unlink_fail:{type(e).__name__}")
 
 
 # ---------------------------------------------------------------------------

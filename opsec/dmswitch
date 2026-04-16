@@ -82,6 +82,9 @@ except ImportError:
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import integrity_log
+
 # Enhanced file paths with OPSEC considerations
 SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".tmp_secure"
@@ -134,8 +137,8 @@ class SecureMemory:
                     mm.write(secrets.token_bytes(size))
                     mm.flush()
                 mm.close()
-            except Exception:
-                pass
+            except (OSError, ValueError, BufferError) as e:
+                integrity_log("dmswitch", f"secure_mem_cleanup_fail:{type(e).__name__}")
         self._allocations.clear()
 
 class AntiForensics:
@@ -226,8 +229,8 @@ class AntiForensics:
                 AntiForensics.secure_delete_file(decoy_file)
             try:
                 DECOY_DIR.rmdir()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("dmswitch", f"decoy_rmdir_fail:{type(e).__name__}")
 
 class CryptoEngine:
     """Military-grade cryptographic operations"""
@@ -450,8 +453,8 @@ class DeadManSwitch:
             try:
                 if SECURE_DIR.exists() and not any(SECURE_DIR.iterdir()):
                     SECURE_DIR.rmdir()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("dmswitch", f"secure_dir_rmdir_fail:{type(e).__name__}")
                 
             print("[+] Secure cleanup completed")
             
@@ -582,8 +585,8 @@ class DeadManSwitch:
             for tk_file in Path("/dev/shm").glob(".tk_*"):
                 try:
                     AntiForensics.secure_delete_file(tk_file)
-                except Exception:
-                    pass
+                except (OSError, ValueError) as e:
+                    integrity_log("dmswitch", f"ttl_token_wipe_fail:{type(e).__name__}")
             sys.exit(0)
         else:
             print(f"  [*] TTL wiper started (PID {pid})")

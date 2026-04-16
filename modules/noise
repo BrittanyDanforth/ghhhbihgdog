@@ -64,7 +64,11 @@ _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
 # NETWORK: Uses canonical Tor enforcement from gs_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
-from gs_common import validate_proxy as _gs_validate_proxy, verify_tor as _gs_verify_tor
+from gs_common import (
+    validate_proxy as _gs_validate_proxy,
+    verify_tor as _gs_verify_tor,
+    integrity_log,
+)
 
 VERSION = "3.0"
 
@@ -219,8 +223,8 @@ def new_tor_circuit():
                 controller.authenticate()
                 controller.signal(stem.Signal.NEWNYM)
                 return True
-    except Exception:
-        pass
+    except (stem.SocketError, stem.ProtocolError, stem.ControllerError, OSError) as e:
+        integrity_log("noise", f"newnym_socket_fail:{type(e).__name__}")
 
     for port in (9051, 9151):
         try:

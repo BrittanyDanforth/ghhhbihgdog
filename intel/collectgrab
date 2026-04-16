@@ -528,7 +528,8 @@ def _run_pipeline():
                         ["gpg", "--batch", "--yes", "--detach-sign", "--armor", "-o", sigfile, filepath],
                         check=True,
                         capture_output=True,
-                        text=True
+                        text=True,
+                        timeout=30,
                     )
                     logger.info("GPG signature created for %s", os.path.basename(filepath))
                 except subprocess.CalledProcessError as e:

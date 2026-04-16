@@ -78,7 +78,11 @@ except ImportError as e:
 
 # NETWORK: Uses canonical Tor enforcement from gs_common
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
-from gs_common import validate_proxy as _gs_validate_proxy, verify_tor as _gs_verify_tor
+from gs_common import (
+    validate_proxy as _gs_validate_proxy,
+    verify_tor as _gs_verify_tor,
+    integrity_log,
+)
 
 # -------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
@@ -184,8 +188,8 @@ class QuantumEntropyFusion:
             try:
                 sources.append(os.urandom(8))
                 sources.append(struct.pack('d', time.monotonic()))
-            except Exception:
-                pass
+            except (OSError, NotImplementedError, struct.error) as e:
+                integrity_log("swap_retry", f"net_entropy_skip:{type(e).__name__}")
                 
             # Filesystem entropy
             if self.seed_file.exists():

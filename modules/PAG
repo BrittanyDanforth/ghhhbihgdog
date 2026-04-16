@@ -416,7 +416,7 @@ class StealthWriter:
                 
                 # Clear filesystem caches
                 try:
-                    subprocess.run(['sync'], capture_output=True)
+                    subprocess.run(['sync'], capture_output=True, timeout=10)
                     with open('/proc/sys/vm/drop_caches', 'w') as f:
                         f.write('3')
                 except (OSError, PermissionError, FileNotFoundError):
