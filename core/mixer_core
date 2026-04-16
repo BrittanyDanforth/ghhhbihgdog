@@ -1017,7 +1017,11 @@ def main():
 
     rounds = args.wallets * 2 * args.deep
     priority_mult = FEE_PRIORITY_MULTIPLIER.get(args.fee_priority, Decimal("1"))
-    per_round_fee = fee_xmr * priority_mult * Decimal("1.5")
+    # Fee estimate: base fee × priority multiplier × 1.2 safety margin.
+    # The old 1.5x multiplier was too aggressive — it reserved 50% more
+    # fees than needed, eating into the mixable balance and causing "fund loss"
+    # where XMR was reserved for fees that were never actually spent.
+    per_round_fee = fee_xmr * priority_mult * Decimal("1.2")
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
 
@@ -1119,8 +1123,13 @@ def main():
             "    Check wallet-rpc connection and retry."
         )
 
-    # Budget: 90% of usable goes to fan-out outputs, 10% reserved for fees+DAG.
-    fanout_budget = (usable * Decimal("0.9")).quantize(Decimal("0.0001"))
+    # Budget: usable balance split between fan-out phase and DAG phase.
+    # Fan-out gets the bulk (proportional to fan-out rounds vs total rounds).
+    # The fee reserve (total_fees) is already subtracted from usable.
+    # Old logic used 90/10 split which left 10% permanently unspent ("lost" funds).
+    fanout_fraction = Decimal(fanout_count) / Decimal(max(rounds, 1))
+    fanout_fraction = max(min(fanout_fraction, Decimal("0.85")), Decimal("0.5"))
+    fanout_budget = (usable * fanout_fraction).quantize(Decimal("0.0001"))
     fanout_amt = (fanout_budget / Decimal(fanout_count)).quantize(Decimal("0.0001"))
 
     if fanout_amt <= DUST_XMR:
@@ -1158,7 +1167,10 @@ def main():
     integrity_log("stage4", f"fanout_plan:{len(plan)}_txs:total={fanout_actual_total}")
 
     # Phase B: DAG mixing — random hops between mix subaddresses.
-    remaining_after_fanout = usable - fanout_actual_total - (per_round_fee * len(plan))
+    # remaining = usable minus what fan-out claimed.
+    # Fees are already reserved in total_fees (subtracted from bal to get usable),
+    # so DON'T subtract per_round_fee again — that was double-counting.
+    remaining_after_fanout = usable - fanout_actual_total
     dag_rounds = max(rounds - fanout_count, args.wallets)
 
     if remaining_after_fanout > DUST_XMR and dag_rounds > 0:

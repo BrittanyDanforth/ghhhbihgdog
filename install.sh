@@ -108,6 +108,19 @@ if [ "$TOR_RUNNING" = false ]; then
     fi
 fi
 
+# ── Configure pip to use Tor if firewall is active ─────────────────────────
+# The tor_firewall blocks ALL direct internet from non-Tor users. pip runs as
+# the current user (not the Tor user), so its connections get DROP'd unless we
+# route pip through Tor's SOCKS proxy.
+if [ "$TOR_RUNNING" = true ]; then
+    _TOR_PORT="${TOR_PORT:-9050}"
+    # pip uses these env vars for proxy
+    export ALL_PROXY="socks5h://127.0.0.1:${_TOR_PORT}"
+    export http_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+    export https_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+    ok "pip will download through Tor (port ${_TOR_PORT})"
+fi
+
 # ── Step 3: Python environment + packages ──────────────────────────────────
 echo ""
 echo "  [3/6] Python setup..."
