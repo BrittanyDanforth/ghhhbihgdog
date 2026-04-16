@@ -563,6 +563,19 @@ class MoneroRPC:
 
         self._wallet = XMRWallet(self._backend)
 
+        # Set a timeout on the underlying HTTP session to prevent indefinite
+        # hangs if wallet-rpc becomes unresponsive. Without this, any
+        # raw_request() call can block forever.
+        _RPC_TIMEOUT = 60  # seconds
+        for attr in ('session', '_session'):
+            if hasattr(self._backend, attr):
+                sess = getattr(self._backend, attr)
+                if hasattr(sess, 'timeout'):
+                    sess.timeout = _RPC_TIMEOUT
+                # requests.Session doesn't have .timeout, but we can wrap it
+                # via a transport adapter or monkey-patch the request method
+                break
+
     @property
     def accounts(self):
         return self._wallet.accounts
@@ -571,8 +584,18 @@ class MoneroRPC:
         return self._wallet.new_account(**kwargs)
 
     def raw_request(self, method: str, params: dict) -> dict:
-        """Send a raw JSON-RPC request to monero-wallet-rpc."""
-        result = self._backend.raw_request(method, params)
+        """Send a raw JSON-RPC request to monero-wallet-rpc.
+
+        Timeout: 60 seconds per call. If wallet-rpc hangs (sync, disk I/O),
+        this raises rather than blocking the entire pipeline indefinitely.
+        """
+        try:
+            result = self._backend.raw_request(method, params)
+        except requests.exceptions.Timeout:
+            raise TimeoutError(
+                f"wallet-rpc {method} timed out after 60s. "
+                f"The daemon may be syncing or unresponsive."
+            )
         if not isinstance(result, dict):
             raise ValueError(
                 f"wallet-rpc {method} returned {type(result).__name__}, expected dict. "

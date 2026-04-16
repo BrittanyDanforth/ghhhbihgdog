@@ -697,6 +697,25 @@ def main():
     elif args.phase == "sign":
         phase_sign(args, plan)
 
+    # If sign phase had failures, exit non-zero so mixer_core detects it
+    # via subprocess return code. Without this, mixer_core assumes success
+    # when it checks `result.returncode == 0`.
+    if args.phase == "sign":
+        plan_data, _ = _load_unsigned(plan_path)
+        signed_dir = Path(args.outdir) / "signed"
+        manifest_path = signed_dir / "signed_manifest_v1.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                entries = manifest.get("entries", [])
+                if len(entries) < len(plan_data):
+                    sys.exit(
+                        f"[!] Only {len(entries)}/{len(plan_data)} TXs signed. "
+                        f"Check wallet password and file integrity."
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+
 
 if __name__ == "__main__":
     main()

