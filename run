@@ -844,7 +844,7 @@ def flow_exit_planner(detected_port=None):
         err(f"Unknown method: {method}")
         return
     args = [amt, "--method", method, "--tor-proxy", tor]
-    run_script(CORE / "exit_strategy_simulator", args, "Exit planner")
+    run_script(CORE / "exit_strategy_planner", args, "Exit planner")
 
 
 def _detect_iface() -> str:
@@ -961,7 +961,7 @@ TOOLS = {
     "mixer": CORE/"mixer_core", "gs": CORE/"mixer_core",
     "signer": CORE/"airgap_tx_signer", "broadcast": CORE/"broadcast_signed_xmr",
     "wallet": CORE/"create_receive_wallet", "swap": CORE/"thor_swap_preparer",
-    "exit": CORE/"exit_strategy_simulator", "exitplan": CORE/"exit_strategy_simulator",
+    "exit": CORE/"exit_strategy_planner", "exitplan": CORE/"exit_strategy_planner",
     "dag": MODS/"PAG", "labels": MODS/"labelmask", "poison": MODS/"label_poisoner",
     "leaves": MODS/"fake_leaf_inserter", "noise": MODS/"noise",
     "mutate": MODS/"ghostmutator", "wdna": MODS/"wdna", "seed": MODS/"en_seeder",

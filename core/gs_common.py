@@ -625,7 +625,7 @@ def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
     Called by mixer_core at pipeline init (normal and resume paths).
     Also called by run's _opsec_preflight for the UI checklist.
     Standalone scripts (airgap_tx_signer, broadcast_signed_xmr,
-    create_receive_wallet, thor_swap_preparer, exit_strategy_simulator)
+    create_receive_wallet, thor_swap_preparer, exit_strategy_planner)
     use validate_proxy + verify_tor directly — they do NOT call this
     function and are responsible for their own proxy/Tor validation.
     No fallbacks. No soft warnings.
