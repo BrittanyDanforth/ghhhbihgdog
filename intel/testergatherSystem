@@ -122,6 +122,10 @@ HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
 DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
 DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 
+# Global proxy port — set at startup from --tor-proxy, used by PoC export
+# to generate curl commands that match the operator's actual Tor port.
+_ACTIVE_TOR_PORT = "9050"
+
 DOMAIN_MIN_DELAY = 2.0
 DOMAIN_MAX_DELAY = 8.0
 CIRCUIT_ROTATION_EVERY = 5
@@ -1002,17 +1006,29 @@ class VulnScanner:
 
         Uses domain circuit breaker — if the site is actively blocking us,
         stops probing after BLOCK_THRESHOLD failures instead of trying all 26 paths.
-        Shows per-path progress so the user knows it's working, not stuck.
+
+        Soft-404 detection: many sites return HTTP 200 for nonexistent paths
+        with a generic "not found" page. We first fetch a known-nonexistent path
+        to get the baseline 404 page length, then compare against it.
         """
         findings = []
         domain = urlparse(base_url).netloc
         total = len(self.SENSITIVE_PATHS)
         skipped = 0
 
+        # Soft-404 baseline: fetch a random path that definitely doesn't exist
+        _baseline_url = urljoin(base_url, f"/gs_nonexistent_{secrets.token_hex(4)}")
+        _baseline_resp = self._session.get(_baseline_url, allow_wayback=False, method="GET")
+        _soft404_length = len(_baseline_resp.text) if _baseline_resp and _baseline_resp.status_code == 200 else -1
+        _soft404_patterns = re.compile(
+            r"not\s*found|404|page\s*(does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
+            r"this\s*page\s*could\s*not|we\s*couldn.t\s*find|error\s*404",
+            re.I
+        )
+
         for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
                 break
-            # Circuit breaker: stop if domain is blocking us
             if self._session.is_domain_blocked(domain):
                 skipped = total - idx
                 break
@@ -1023,12 +1039,26 @@ class VulnScanner:
                 if severity in (SEV_CRITICAL, SEV_HIGH):
                     resp_full = self._session.get(url, allow_wayback=False)
                     if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
-                        if not re.search(r"not found|404|page does not exist",
-                                         resp_full.text[:500], re.I):
-                            findings.append({"severity": severity, "title": title,
-                                             "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                             "path": path, "content_length": len(resp_full.text)})
+                        body = resp_full.text
+                        # Soft-404 check: skip if body matches baseline or has 404 patterns
+                        if _soft404_length > 0 and abs(len(body) - _soft404_length) < 100:
+                            continue
+                        if _soft404_patterns.search(body[:1000]):
+                            continue
+                        # For git/env, verify content looks real
+                        if path == "/.git/HEAD" and "ref:" not in body[:100]:
+                            continue
+                        if path == "/.env" and "=" not in body[:500]:
+                            continue
+                        findings.append({"severity": severity, "title": title,
+                                         "detail": detail, "evidence": f"HTTP 200 at {path}",
+                                         "path": path, "content_length": len(body)})
                 else:
+                    # INFO/LOW/MEDIUM: still check for soft-404
+                    if severity in (SEV_INFO,) and _soft404_length > 0:
+                        resp_check = self._session.get(url, allow_wayback=False)
+                        if resp_check and abs(len(resp_check.text) - _soft404_length) < 100:
+                            continue
                     findings.append({"severity": severity, "title": title,
                                      "detail": detail, "evidence": f"HTTP 200 at {path}",
                                      "path": path})
@@ -1107,29 +1137,38 @@ class VulnScanner:
         return findings
 
     def _check_sqli_indicators(self, base_url: str) -> List[dict]:
-        """Detect SQL injection indicators via error-based detection.
+        """Detect SQL injection indicators via error-based detection with baseline comparison.
 
-        This does NOT exploit anything — it sends a single apostrophe and
-        checks if the error response contains SQL error messages, which
-        indicates the input reaches a SQL query without sanitization.
+        Sends a clean request first, then an apostrophe-injected request. Only flags as SQLi
+        if the SQL error pattern appears ONLY in the injected response (not the baseline),
+        which eliminates false positives from generic error pages or debug-mode sites that
+        always show SQL traces.
         """
         findings = []
-        # Test common parameter names with a single apostrophe
         test_params = ["id", "page", "q", "search", "user", "item", "cat"]
 
         for param in test_params[:3]:
             if shutdown_requested():
                 break
-            test_url = f"{base_url}?{param}=1%27"  # single quote
+            # Baseline: clean request with a safe value
+            baseline_url = f"{base_url}?{param}=1"
+            baseline_resp = self._session.get(baseline_url, allow_wayback=False)
+            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+
+            # Payload: single apostrophe injection
+            test_url = f"{base_url}?{param}=1%27"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
                 for indicator in self.SQLI_INDICATORS:
-                    if indicator.search(resp.text[:5000]):
+                    # Only count if the pattern is NEW in the injected response
+                    in_payload = indicator.search(resp.text[:5000])
+                    in_baseline = indicator.search(baseline_text) if baseline_text else False
+                    if in_payload and not in_baseline:
                         findings.append({
                             "severity": SEV_CRITICAL,
                             "title": f"SQL injection indicator via '{param}' parameter",
-                            "detail": "SQL error message in response to apostrophe injection. "
-                                      "Input likely reaches a SQL query without parameterization.",
+                            "detail": "SQL error message appears ONLY in response to apostrophe injection "
+                                      "(not in baseline). Input likely reaches SQL query without parameterization.",
                             "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}",
                             "exploitable": True,
                             "test_url": test_url,
@@ -1141,11 +1180,16 @@ class VulnScanner:
                                 "risk": "Database access, data exfiltration, potential RCE via INTO OUTFILE",
                             },
                         })
-                        return findings  # One confirmed is enough
+                        return findings
         return findings
 
     def _check_xss_reflection(self, base_url: str) -> List[dict]:
-        """Detect reflected XSS by checking if a unique canary is reflected unescaped."""
+        """Detect reflected XSS by checking if a unique canary is reflected unescaped.
+
+        Uses a fresh canary per scan (generated at class init) to avoid
+        cached responses matching. Also checks that the reflection isn't
+        inside a WAF/block page (which would be a false positive).
+        """
         findings = []
         canary = self.XSS_CANARY
         test_params = ["q", "search", "query", "s", "name", "input"]
@@ -1153,13 +1197,30 @@ class VulnScanner:
         for param in test_params[:3]:
             if shutdown_requested():
                 break
-            # Inject canary with HTML context
             payload = f"<{canary}>"
             test_url = f"{base_url}?{param}={quote(payload)}"
             resp = self._session.get(test_url, allow_wayback=False)
             if resp and resp.text:
-                # Check if canary appears UNESCAPED (i.e., as actual HTML tag, not &lt;)
+                # Reject WAF/block pages — canary might appear in error text
+                if resp.status_code in (403, 429, 503):
+                    continue
+                text_lower = resp.text[:5000].lower()
+                if any(kw in text_lower for kw in ("blocked", "forbidden", "access denied", "waf")):
+                    if len(resp.text) < 2000:
+                        continue
+
                 if f"<{canary}>" in resp.text:
+                    # Verify it's reflected in a context that would execute JS
+                    # (not inside a <pre>, <textarea>, or HTML comment)
+                    reflected_idx = resp.text.index(f"<{canary}>")
+                    context = resp.text[max(0, reflected_idx - 100):reflected_idx + 100]
+                    in_safe_context = any(tag in context.lower() for tag in
+                                         ["<pre>", "<textarea", "<code>", "<!--"])
+                    if in_safe_context:
+                        confidence_penalty = 0.2
+                    else:
+                        confidence_penalty = 0
+
                     findings.append({
                         "severity": SEV_HIGH,
                         "title": f"Reflected XSS via '{param}' parameter",
@@ -1177,6 +1238,8 @@ class VulnScanner:
                             "risk": "Session theft, credential capture, client-side attacks",
                         },
                     })
+                    if confidence_penalty:
+                        findings[-1]["confidence"] = 0.7
                     return findings
         return findings
 
@@ -1780,11 +1843,12 @@ class CapturedRequest:
         """Generate a curl command that reproduces this request.
 
         OPSEC: redacts cookies, auth headers, and API keys by default.
+        Uses the operator's actual Tor port (not hardcoded 9050).
         """
         parts = ["curl"]
         if self.method != "GET":
             parts.append(f"-X {self.method}")
-        parts.append("--socks5-hostname 127.0.0.1:9050")
+        parts.append(f"--socks5-hostname 127.0.0.1:{_ACTIVE_TOR_PORT}")
         for k, v in self.headers.items():
             if redact and k.lower() in ("cookie", "authorization", "hibp-api-key"):
                 v = "[REDACTED]"
@@ -2032,11 +2096,15 @@ class PoCExporter:
 
     @staticmethod
     def export_finding(finding: dict, redact: bool = True) -> dict:
-        """Export a single finding as multiple PoC formats."""
+        """Export a single finding as multiple PoC formats.
+
+        Uses _ACTIVE_TOR_PORT so curl commands match the operator's proxy.
+        """
         ei = finding.get("exploit_info", {})
         exploit_type = ei.get("type", "unknown")
         param = ei.get("parameter", "")
         path = ei.get("path", "")
+        sp = f"--socks5-hostname 127.0.0.1:{_ACTIVE_TOR_PORT}"
 
         poc = {
             "finding": finding.get("title", ""),
@@ -2048,12 +2116,8 @@ class PoCExporter:
             "remediation": "",
         }
 
-        # Generate PoC based on exploit type
         if exploit_type == "sqli" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=1\'"'
-            )
+            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=1\'"'
             poc["description"] = (
                 f"SQL injection via '{param}' parameter. "
                 f"Send a single quote to trigger SQL error messages."
@@ -2061,10 +2125,7 @@ class PoCExporter:
             poc["remediation"] = "Use parameterized queries / prepared statements."
 
         elif exploit_type == "xss" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=<script>alert(1)</script>"'
-            )
+            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=<script>alert(1)</script>"'
             poc["description"] = (
                 f"Reflected XSS via '{param}' parameter. "
                 f"HTML tags reflected unescaped in response."
@@ -2072,10 +2133,7 @@ class PoCExporter:
             poc["remediation"] = "HTML-encode all user input in output context."
 
         elif exploit_type == "lfi" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
-            )
+            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
             poc["description"] = (
                 f"Local file inclusion via '{param}'. "
                 f"Arbitrary server files readable."
@@ -2083,10 +2141,7 @@ class PoCExporter:
             poc["remediation"] = "Whitelist allowed file paths. Never pass user input to file operations."
 
         elif exploit_type == "command_injection" and param:
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=;id"'
-            )
+            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}=;id"'
             poc["description"] = (
                 f"OS command injection via '{param}'. "
                 f"Arbitrary commands execute on the server."
@@ -2095,7 +2150,7 @@ class PoCExporter:
 
         elif exploit_type == "ssrf" and param:
             poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'curl {sp} '
                 f'"[TARGET_URL]?{param}=http://169.254.169.254/latest/meta-data/"'
             )
             poc["description"] = (
@@ -2105,7 +2160,7 @@ class PoCExporter:
 
         elif exploit_type == "graphql_introspection" and path:
             poc["curl"] = (
-                f'curl --socks5-hostname 127.0.0.1:9050 '
+                f'curl {sp} '
                 f'-X POST -H "Content-Type: application/json" '
                 f'-d \'{{"query": "{{ __schema {{ types {{ name }} }} }}"}}\' '
                 f'"[TARGET_URL]{path}"'
@@ -2124,18 +2179,12 @@ class PoCExporter:
             poc["remediation"] = "Remove dangling CNAME record or claim the resource."
 
         elif exploit_type == "directory_traversal":
-            poc["curl"] = (
-                f"curl --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]/..%2F..%2F..%2F..%2Fetc%2Fpasswd"'
-            )
+            poc["curl"] = f'curl {sp} "[TARGET_URL]/..%2F..%2F..%2F..%2Fetc%2Fpasswd"'
             poc["description"] = "Path traversal to read arbitrary server files."
             poc["remediation"] = "Validate file paths. Use chroot or whitelist allowed directories."
 
         elif exploit_type == "open_redirect" and param:
-            poc["curl"] = (
-                f"curl -v --socks5-hostname 127.0.0.1:9050 "
-                f'"[TARGET_URL]?{param}=https://evil.com/"'
-            )
+            poc["curl"] = f'curl -v {sp} "[TARGET_URL]?{param}=https://evil.com/"'
             poc["description"] = (
                 f"Open redirect via '{param}'. Chain with OAuth for token theft."
             )
@@ -2143,7 +2192,7 @@ class PoCExporter:
 
         elif exploit_type == "xmlrpc_abuse":
             poc["curl"] = (
-                f'curl --socks5-hostname 127.0.0.1:9050 -X POST '
+                f'curl {sp} -X POST '
                 f'-H "Content-Type: text/xml" '
                 f'-d \'<?xml version="1.0"?><methodCall><methodName>system.listMethods'
                 f'</methodName></methodCall>\' "[TARGET_URL]/xmlrpc.php"'
@@ -2461,53 +2510,90 @@ class IntelOrchestrator:
         self._vuln_findings: List[dict] = []
         self._scan_depth = scan_depth
 
+    def _run_phase(self, phase_num: int, name: str, func, *args, **kwargs):
+        """Run a scan phase with timing, error isolation, and progress display.
+
+        If a phase crashes or hangs, it's logged and skipped — never blocks
+        the rest of the scan. Shows elapsed time so the operator knows
+        what's happening.
+        """
+        if shutdown_requested():
+            return None
+        t0 = time.time()
+        print(f"\n  [*] Phase {phase_num}: {name}...")
+        try:
+            result = func(*args, **kwargs)
+            elapsed = time.time() - t0
+            if elapsed > 30:
+                print(f"      ({elapsed:.0f}s elapsed)")
+            return result
+        except KeyboardInterrupt:
+            print(f"  [!] Phase {phase_num} interrupted by user")
+            return None
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"  [!] Phase {phase_num} error: {type(e).__name__}: {str(e)[:60]} ({elapsed:.0f}s)")
+            integrity_log("intel", f"phase_{phase_num}_error:{type(e).__name__}")
+            return None
+
     def run_domain(self, domain: str):
-        """Full domain reconnaissance + vulnerability scan."""
+        """Full domain reconnaissance + vulnerability scan.
+
+        Each phase is isolated — one failure or hang does not block others.
+        Progress is shown inline with timing.
+        """
         print(f"\n  {'═' * 55}")
         print(f"  TARGET: {domain}")
         print(f"  DEPTH:  {self._scan_depth}")
-        print(f"  {'═' * 55}\n")
+        print(f"  {'═' * 55}")
 
+        t_start = time.time()
         base_url = f"https://{domain}"
 
         # Phase 1: Main page scrape + data extraction
-        print(f"  [*] Phase 1: Fetching main page...")
-        result = self._scraper.scrape_url(base_url)
-        if not result:
-            # Try HTTP
-            base_url = f"http://{domain}"
-            result = self._scraper.scrape_url(base_url)
+        def _phase1():
+            r = self._scraper.scrape_url(base_url)
+            if not r:
+                r = self._scraper.scrape_url(f"http://{domain}")
+            return r
+
+        result = self._run_phase(1, "Fetching main page", _phase1)
         if result and not result.get("honeypot"):
             self._results.append(result)
             self._print_extraction(result)
         elif result and result.get("honeypot"):
             print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+        if result and not result.get("honeypot"):
+            if result.get("url", "").startswith("http://"):
+                base_url = f"http://{domain}"
 
         # Phase 2: Technology fingerprinting
-        print(f"\n  [*] Phase 2: Technology fingerprinting...")
         html = result.get("raw_html", "") if result else ""
         headers = result.get("raw_headers", {}) if result else {}
-        tech = self._tech.fingerprint(headers, html)
-        self._print_tech(tech)
+        tech = self._run_phase(2, "Technology fingerprinting",
+                               self._tech.fingerprint, headers, html) or {}
+        if tech:
+            self._print_tech(tech)
 
         # Phase 3: Vulnerability scanning
-        print(f"\n  [*] Phase 3: Vulnerability scanning ({self._scan_depth})...")
-        vulns = self._vulns.scan_full(base_url, html, headers, depth=self._scan_depth)
+        vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
+                                self._vulns.scan_full, base_url, html, headers,
+                                self._scan_depth) or []
         self._vuln_findings.extend(vulns)
         self._print_vulns(vulns)
 
         # Phase 4: DNS reconnaissance (full/deep only)
         if self._scan_depth in ("full", "deep"):
-            print(f"\n  [*] Phase 4: DNS reconnaissance...")
-            dns_records = self._dns.lookup(domain)
+            dns_records = self._run_phase(4, "DNS reconnaissance",
+                                          self._dns.lookup, domain) or {}
             self._print_dns(dns_records)
             if dns_records:
                 self._results.append({"type": "dns", "domain": domain, "records": dns_records})
 
         # Phase 5: Subdomain enumeration (deep only)
         if self._scan_depth == "deep":
-            print(f"\n  [*] Phase 5: Subdomain enumeration (crt.sh)...")
-            subs = self._subdomains.enumerate(domain)
+            subs = self._run_phase(5, "Subdomain enumeration (crt.sh)",
+                                   self._subdomains.enumerate, domain) or []
             if subs:
                 print(f"  [+] Found {len(subs)} subdomains")
                 for s in subs[:20]:
@@ -2517,54 +2603,76 @@ class IntelOrchestrator:
                 self._results.append({"type": "subdomains", "domain": domain,
                                       "subdomains": subs, "count": len(subs)})
 
-                # Check for subdomain takeover on subdomains that have CNAME records
+                # Phase 5b: subdomain takeover check (limit to 10, with progress)
                 print(f"\n  [*] Phase 5b: Checking subdomains for takeover...")
+                checked = 0
                 for sub in subs[:10]:
                     if shutdown_requested():
                         break
-                    sub_dns = self._dns.lookup(sub)
-                    cnames = sub_dns.get("CNAME", [])
-                    if cnames:
-                        takeover = self._vulns._check_subdomain_takeover(sub, cnames)
-                        if takeover:
-                            # Add confidence (bypasses scan_full)
-                            self._vulns._add_confidence(takeover, 0.85)
-                            self._vuln_findings.extend(takeover)
-                            for t in takeover:
-                                print(f"  [!] TAKEOVER: {t['title']}")
+                    checked += 1
+                    try:
+                        sub_dns = self._dns.lookup(sub)
+                        cnames = sub_dns.get("CNAME", [])
+                        if cnames:
+                            takeover = self._vulns._check_subdomain_takeover(sub, cnames)
+                            if takeover:
+                                self._vulns._add_confidence(takeover, 0.85)
+                                self._vuln_findings.extend(takeover)
+                                for t in takeover:
+                                    print(f"  [!] TAKEOVER: {t['title']}")
+                    except Exception as e:
+                        integrity_log("intel", f"takeover_check_error:{sub}:{type(e).__name__}")
+                print(f"      checked {checked}/{min(len(subs), 10)} subdomains")
 
-        # Phase 6: Search for additional intel
-        print(f"\n  [*] Phase 6: Search engine OSINT...")
-        dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
-        for dq in dork_queries[:2]:
-            if shutdown_requested():
-                break
-            self._run_search(dq, max_results=10)
+        # Phase 6: Search engine OSINT (limit scraping to avoid hanging)
+        def _phase6():
+            dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
+            for dq in dork_queries[:2]:
+                if shutdown_requested():
+                    break
+                self._run_search(dq, max_results=5)
+
+        self._run_phase(6, "Search engine OSINT", _phase6)
 
         # Phase 7: Finding chaining (use discoveries to find more)
         if self._scan_depth in ("full", "deep") and self._vuln_findings:
-            print(f"\n  [*] Phase 7: Finding chain analysis...")
-            chain_findings = self._chain.process_chains(
-                self._vuln_findings, base_url, tech)
+            chain_findings = self._run_phase(
+                7, "Finding chain analysis",
+                self._chain.process_chains, self._vuln_findings, base_url, tech) or []
             if chain_findings:
                 self._vulns._add_confidence(chain_findings, 0.8)
                 self._vuln_findings.extend(chain_findings)
                 print(f"  [+] Chain analysis found {len(chain_findings)} additional findings")
                 self._print_vulns(chain_findings)
 
-        # Phase 8: Verify exploitable findings (deep only)
+        # Phase 8: Verify exploitable findings (deep only, max 5 to avoid hanging)
         if self._scan_depth == "deep":
             exploitable = [f for f in self._vuln_findings if f.get("exploitable")]
             if exploitable:
-                print(f"\n  [*] Phase 8: Verifying {len(exploitable)} exploitable findings...")
-                for ef in exploitable:
+                verify_limit = min(len(exploitable), 5)
+                print(f"\n  [*] Phase 8: Verifying {verify_limit}/{len(exploitable)} exploitable findings...")
+                for idx, ef in enumerate(exploitable[:verify_limit]):
                     if shutdown_requested():
                         break
-                    self._verifier.verify_finding(ef)
-                    status = ef.get("verified", "?")
-                    conf = ef.get("confidence", 0)
-                    tag = "✓" if status == "confirmed" else "✗" if "not_reproduced" in status else "?"
-                    print(f"      {tag} {ef['title'][:50]} → {status} ({conf*100:.0f}%)")
+                    try:
+                        self._verifier.verify_finding(ef)
+                        status = ef.get("verified", "?")
+                        conf = ef.get("confidence", 0)
+                        tag = "+" if status == "confirmed" else "-" if "not_reproduced" in status else "?"
+                        print(f"      [{tag}] {ef['title'][:50]} -> {status} ({conf*100:.0f}%)")
+                    except Exception as e:
+                        print(f"      [?] {ef['title'][:50]} -> error ({type(e).__name__})")
+                        integrity_log("intel", f"verify_error:{type(e).__name__}")
+
+        # Final stats
+        elapsed_total = time.time() - t_start
+        print(f"\n  [*] Scan complete ({elapsed_total:.0f}s total)")
+        stats = self._session.get_stats()
+        if stats["total_blocks"] or stats["total_timeouts"]:
+            blocked = f"{stats['total_blocks']} blocked" if stats["total_blocks"] else ""
+            timeouts = f"{stats['total_timeouts']} timeouts" if stats["total_timeouts"] else ""
+            sep = ", " if blocked and timeouts else ""
+            print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
 
     def run_email(self, email: str):
         """Breach database check for email."""
@@ -2596,11 +2704,17 @@ class IntelOrchestrator:
     def _run_search(self, query: str, max_results: int = 20):
         search_results = self._scraper.search_ddg(query, max_results)
         print(f"  [+] {len(search_results)} results")
-        for i, sr in enumerate(search_results):
+        # Only scrape first few results to avoid getting stuck on slow sites
+        scrape_limit = min(len(search_results), 5)
+        for i, sr in enumerate(search_results[:scrape_limit]):
             if shutdown_requested():
                 break
             url = sr["url"]
-            print(f"  [*] [{i+1}/{len(search_results)}] {urlparse(url).netloc}...")
+            domain = urlparse(url).netloc
+            if self._session.is_domain_blocked(domain):
+                print(f"  [*] [{i+1}/{scrape_limit}] {domain} (blocked, skipped)")
+                continue
+            print(f"  [*] [{i+1}/{scrape_limit}] {domain}...")
             result = self._scraper.scrape_url(url)
             if result:
                 self._results.append(result)
@@ -2608,6 +2722,8 @@ class IntelOrchestrator:
                 if ex:
                     for etype, evals in ex.items():
                         print(f"      {etype}: {len(evals)}")
+        if len(search_results) > scrape_limit:
+            print(f"      ({len(search_results) - scrape_limit} additional results not scraped)")
 
     def run_file(self, filepath: Path):
         """Process targets from file."""
@@ -3042,6 +3158,12 @@ def main():
         sys.exit(1)
 
     proxy = require_tor_proxy(args.tor_proxy)
+
+    # Extract port from proxy URL so PoC commands use the operator's actual port
+    global _ACTIVE_TOR_PORT
+    _proxy_parsed = urlparse(args.tor_proxy)
+    _ACTIVE_TOR_PORT = str(_proxy_parsed.port or 9050)
+
     integrity_log("intel", "session_start")
 
     orch = IntelOrchestrator(proxy, scan_depth=args.scan)

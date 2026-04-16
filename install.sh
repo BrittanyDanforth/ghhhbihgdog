@@ -40,7 +40,7 @@ echo "  Setup"
 echo "  -----"
 
 # ── Step 1: System packages ────────────────────────────────────────────────
-echo "  [1/5] System packages..."
+echo "  [1/6] System packages..."
 if command -v apt-get &>/dev/null; then
     NEED_PKGS=""
     for pkg in tor torsocks jq gnupg python3-pip python3-venv python3-dev curl wget build-essential; do
@@ -109,16 +109,27 @@ if [ "$TOR_RUNNING" = false ]; then
 fi
 
 # ── Configure pip to use Tor if firewall is active ─────────────────────────
-# The tor_firewall blocks ALL direct internet from non-Tor users. pip runs as
-# the current user (not the Tor user), so its connections get DROP'd unless we
-# route pip through Tor's SOCKS proxy.
+# CHICKEN-AND-EGG PROBLEM:
+# pip needs PySocks to use socks5h:// proxy, but PySocks isn't installed yet.
+# Setting ALL_PROXY=socks5h:// before PySocks exists = pip can't connect at all.
+#
+# SOLUTION: Use torsocks as a transparent wrapper to bootstrap PySocks first.
+# torsocks intercepts libc connect() calls and routes them through Tor — it
+# doesn't need Python SOCKS support. Once PySocks is installed, pip can use
+# the socks5h:// env vars natively for all subsequent installs.
 if [ "$TOR_RUNNING" = true ]; then
     _TOR_PORT="${TOR_PORT:-9050}"
-    # pip uses these env vars for proxy
-    export ALL_PROXY="socks5h://127.0.0.1:${_TOR_PORT}"
-    export http_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
-    export https_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
-    ok "pip will download through Tor (port ${_TOR_PORT})"
+    USE_TORSOCKS=false
+    if command -v torsocks &>/dev/null; then
+        USE_TORSOCKS=true
+        ok "pip will download through Tor via torsocks (port ${_TOR_PORT})"
+    else
+        warn "torsocks not found — setting SOCKS proxy env vars for pip"
+        warn "If PySocks is not yet installed, first pip install may fail"
+        export ALL_PROXY="socks5h://127.0.0.1:${_TOR_PORT}"
+        export http_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+        export https_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+    fi
 fi
 
 # ── Step 3: Python environment + packages ──────────────────────────────────
@@ -168,9 +179,15 @@ if ! "$VENV_PY" -c "import pip" 2>/dev/null; then
     dim "Installing pip into environment..."
     # Method 1: ensurepip
     "$VENV_PY" -m ensurepip --upgrade 2>/dev/null || {
-        # Method 2: get-pip.py
+        # Method 2: get-pip.py (route through Tor if available)
         dim "Trying get-pip.py..."
-        curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null && \
+        if [ "$TOR_RUNNING" = true ] && command -v torsocks &>/dev/null; then
+            torsocks curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
+        elif [ "$TOR_RUNNING" = true ]; then
+            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
+        else
+            curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
+        fi && \
         "$VENV_PY" /tmp/_get_pip.py 2>/dev/null && \
         rm -f /tmp/_get_pip.py || {
             # Method 3: copy system pip
@@ -185,20 +202,55 @@ if ! "$VENV_PY" -c "import pip" 2>/dev/null; then
     }
 fi
 
+# Helper: run pip, optionally through torsocks
+_pip_cmd() {
+    if [ "$USE_TORSOCKS" = true ]; then
+        torsocks $VENV_PIP "$@"
+    else
+        $VENV_PIP "$@"
+    fi
+}
+
 # Upgrade pip quietly
-$VENV_PIP install --upgrade pip 2>/dev/null || true
+_pip_cmd install --upgrade pip 2>/dev/null || true
 
 # ── Install packages ──────────────────────────────────────────────────────
 # Core deps are required. Extra deps enable optional features.
-CORE_DEPS="requests PySocks tenacity stem monero psutil"
+# PySocks MUST be installed FIRST — it enables pip's own socks5h:// support.
+# Without PySocks, pip cannot use ALL_PROXY=socks5h://... and will fail
+# with "Missing dependencies for SOCKS support".
+BOOTSTRAP_DEP="PySocks"
+CORE_DEPS="requests tenacity stem monero psutil"
 EXTRA_DEPS="cryptography pycryptodomex qrcode pyyaml beautifulsoup4 aiohttp aiohttp-socks"
 
 dim "Installing Python packages..."
 
-# Try batch install first (fastest). Capture pip's actual exit code instead
-# of piping through tail (which swallows the real return code).
+# Step 1: Bootstrap PySocks first (via torsocks if available)
+if ! "$VENV_PY" -c "import socks" 2>/dev/null; then
+    dim "Bootstrapping PySocks (needed for SOCKS proxy support)..."
+    _pip_cmd install PySocks 2>&1 | tail -3
+    if "$VENV_PY" -c "import socks" 2>/dev/null; then
+        ok "PySocks bootstrapped"
+    else
+        fail "PySocks bootstrap FAILED"
+        fail "Without PySocks, pip cannot download through Tor's SOCKS proxy."
+        fail "Try: sudo apt install python3-socks  OR  torsocks pip install PySocks"
+        exit 1
+    fi
+fi
+
+# Step 2: Now that PySocks is installed, pip can use socks5h:// natively.
+# Switch from torsocks to env vars (more reliable for pip's internal urllib3).
+if [ "$TOR_RUNNING" = true ]; then
+    export ALL_PROXY="socks5h://127.0.0.1:${_TOR_PORT}"
+    export http_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+    export https_proxy="socks5h://127.0.0.1:${_TOR_PORT}"
+    USE_TORSOCKS=false
+fi
+
+# Step 3: Install remaining core + extra deps
 INSTALL_OK=true
-INSTALL_OUTPUT=$($VENV_PIP install $CORE_DEPS $EXTRA_DEPS 2>&1) || INSTALL_OK=false
+INSTALL_OUTPUT=$(_pip_cmd install $CORE_DEPS $EXTRA_DEPS 2>&1) || INSTALL_OK=false
 
 if [ "$INSTALL_OK" = true ]; then
     ok "Python packages installed"
@@ -209,7 +261,7 @@ else
         if "$VENV_PY" -c "import $MOD" 2>/dev/null; then
             ok "$dep (present)"
         else
-            $VENV_PIP install "$dep" 2>&1 | tail -5
+            _pip_cmd install "$dep" 2>&1 | tail -5
             if "$VENV_PY" -c "import $MOD" 2>/dev/null; then
                 ok "$dep"
             else
@@ -223,12 +275,12 @@ else
         if "$VENV_PY" -c "import $MOD" 2>/dev/null; then
             ok "$dep (present)"
         else
-            $VENV_PIP install "$dep" 2>/dev/null && ok "$dep" || warn "$dep (optional, skipped)"
+            _pip_cmd install "$dep" 2>/dev/null && ok "$dep" || warn "$dep (optional, skipped)"
         fi
     done
 fi
 
-# ── Step 3: Verify ALL imports ─────────────────────────────────────────────
+# ── Step 4: Verify ALL imports ─────────────────────────────────────────────
 # This is the hard gate. Every core dependency must be importable in the
 # EXACT Python interpreter that will run the toolkit. If any core dep fails,
 # setup fails — no silent "it'll probably work" acceptance.
@@ -292,12 +344,27 @@ if [ "$MONERO_OK" = false ]; then
     echo ""
     if confirm "Download Monero CLI tools?"; then
         cd /tmp
-        wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2 && \
-        tar xf monero-cli.tar.bz2 && \
-        sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/ && \
-        rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2 && \
-        ok "Monero CLI installed" || \
-        fail "Download failed — see https://www.getmonero.org/downloads/"
+        # OPSEC: download through Tor — never hit getmonero.org on clearnet
+        if command -v torsocks &>/dev/null; then
+            dim "Downloading via torsocks..."
+            torsocks wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+        elif [ "$TOR_RUNNING" = true ]; then
+            dim "Downloading via curl + SOCKS proxy..."
+            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -L -o monero-cli.tar.bz2 \
+                https://downloads.getmonero.org/cli/linux64
+        else
+            warn "Tor not available — downloading over clearnet (NOT OPSEC-SAFE)"
+            wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+        fi
+        if [ -f monero-cli.tar.bz2 ]; then
+            tar xf monero-cli.tar.bz2 && \
+            sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/ && \
+            rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2 && \
+            ok "Monero CLI installed" || \
+            fail "Extract/install failed"
+        else
+            fail "Download failed — see https://www.getmonero.org/downloads/"
+        fi
         cd - >/dev/null
     fi
 fi

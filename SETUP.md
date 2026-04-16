@@ -1,7 +1,7 @@
 # Setup Guide
 
 Two paths: **Automatic** (recommended) or **Manual** (if you need control).
-Both follow the same OPSEC-safe order: Tor first, then downloads.
+Both follow the same OPSEC-safe order: Tor first, then all downloads through Tor.
 
 ---
 
@@ -12,13 +12,14 @@ bash install.sh
 ```
 
 This does everything in the correct OPSEC order:
-1. System packages (apt)
+1. System packages (apt) — includes `torsocks` for bootstrapping
 2. **Start Tor** (before any downloads)
-3. **Route pip through Tor** (so package downloads don't leak)
-4. Python virtual environment + packages
-5. Verify all imports
-6. Monero tools (optional download)
-7. Create `./gs` launcher
+3. **Bootstrap PySocks via torsocks** — pip needs PySocks to use SOCKS proxy, but PySocks isn't installed yet. `torsocks` wraps pip at the OS level to solve this chicken-and-egg problem
+4. **Route pip through Tor natively** — once PySocks is installed, pip can use `socks5h://` env vars directly
+5. Install remaining Python packages through Tor
+6. Verify all imports
+7. Monero tools (optional download via `torsocks wget`)
+8. Create `./gs` launcher
 
 Run it again any time — it skips what's already working.
 
@@ -78,16 +79,31 @@ All subsequent downloads (pip, wget, curl) will go through Tor.
 ```
 python3 -m venv .venv
 . .venv/bin/activate
-pip install requests PySocks tenacity stem monero psutil \
+```
+
+**Important:** pip needs PySocks to use `socks5h://` proxy, but PySocks isn't installed yet.
+Bootstrap PySocks first using `torsocks` (which works at the OS level):
+
+```
+torsocks pip install PySocks
+```
+
+Now pip can use SOCKS natively:
+
+```
+export ALL_PROXY=socks5h://127.0.0.1:9050
+export http_proxy=socks5h://127.0.0.1:9050
+export https_proxy=socks5h://127.0.0.1:9050
+
+pip install requests tenacity stem monero psutil \
     cryptography pycryptodomex qrcode pyyaml beautifulsoup4 \
     aiohttp aiohttp-socks
 ```
 
-If pip fails with connection errors, set the proxy manually:
+If pip still fails with "Missing dependencies for SOCKS support":
 
 ```
-export ALL_PROXY=socks5h://127.0.0.1:9050
-pip install requests PySocks tenacity stem monero psutil
+torsocks pip install requests tenacity stem monero psutil
 ```
 
 ### Step 5: Install Monero tools
@@ -194,7 +210,8 @@ monerod exit
 
 | Problem | Fix |
 |---------|-----|
-| pip fails with connection error | `export ALL_PROXY=socks5h://127.0.0.1:9050` then retry |
+| `Missing dependencies for SOCKS support` | PySocks not installed yet. Run: `torsocks pip install PySocks` then retry |
+| pip fails with connection error | `torsocks pip install <package>` OR `export ALL_PROXY=socks5h://127.0.0.1:9050` (requires PySocks) |
 | `wget: unable to resolve` | `. /etc/profile.d/tor-proxy.sh` or use `torsocks wget` |
 | Browser can't connect | `sudo bash tor_firewall.sh --setup-browser` then restart browser |
 | Malwarebytes flags on host | `sudo bash tor_firewall.sh --setup-bridges` |
@@ -202,3 +219,4 @@ monerod exit
 | `Cannot reach wallet-rpc` | Start wallet-rpc (Step 7) |
 | `Tor is NOT running` | `sudo systemctl start tor` |
 | Firewall locked me out | `sudo bash tor_firewall.sh --undo` |
+| Scan getting stuck | Check `./gs` → `i` → mode 6 for partial results. The scanner auto-skips blocked domains after 3 failures |

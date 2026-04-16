@@ -63,9 +63,21 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets
+import json, subprocess, shutil, secrets, signal, threading
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
+
+# ── Shutdown signal handling ───────────────────────────────────────────────
+_shutdown_event = threading.Event()
+
+def _handle_signal(signum, frame):
+    _shutdown_event.set()
+
+def shutdown_requested() -> bool:
+    return _shutdown_event.is_set()
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
 ROOT = _ROOT
 CORE = ROOT / "core"
@@ -1024,24 +1036,25 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         print(f"  {B}Evidence:{N} {v.get('evidence', 'N/A')}")
         print()
 
-        # Show PoC command
+        # Show PoC command — use operator's proxy port, not hardcoded 9050
+        _proxy_port = urlparse(tor_proxy).port or 9050
+        _sp = f"--socks5-hostname 127.0.0.1:{_proxy_port}"
         poc = v.get("poc_curl", "")
         if not poc and ei:
-            # Generate PoC on the fly
             from urllib.parse import quote as _q
             etype = ei.get("type", "")
             param = ei.get("parameter", "")
             path_info = ei.get("path", "")
             if etype == "sqli" and param:
-                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=1\'"'
+                poc = f'curl {_sp} "[TARGET]?{param}=1\'"'
             elif etype == "xss" and param:
-                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=<script>alert(1)</script>"'
+                poc = f'curl {_sp} "[TARGET]?{param}=<script>alert(1)</script>"'
             elif etype == "lfi" and param:
-                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
+                poc = f'curl {_sp} "[TARGET]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
             elif etype == "command_injection" and param:
-                poc = f'curl --socks5-hostname 127.0.0.1:9050 "[TARGET]?{param}=;id"'
+                poc = f'curl {_sp} "[TARGET]?{param}=;id"'
             elif etype == "graphql_introspection" and path_info:
-                poc = (f'curl --socks5-hostname 127.0.0.1:9050 -X POST '
+                poc = (f'curl {_sp} -X POST '
                        f'-H "Content-Type: application/json" '
                        f'-d \'{{ "query": "{{ __schema {{ types {{ name }} }} }}" }}\' '
                        f'"[TARGET]{path_info}"')
@@ -1155,15 +1168,59 @@ def flow_intel(detected_port=None):
     mode = prompt("Choose mode (1-7)")
 
     if mode == "7":
-        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
+        if not ram_dir.exists():
+            info("No intel data to wipe.")
+            return
+        files = list(ram_dir.glob("*"))
+        if not files:
+            info("Intel directory is empty.")
+            return
+        total_kb = sum(f.stat().st_size for f in files if f.is_file()) / 1024
+        warn(f"Will securely erase {len(files)} file(s) ({total_kb:.1f}KB) from {ram_dir.name}/")
+        for f in files[:10]:
+            print(f"    {D}{f.name}{N}")
+        if len(files) > 10:
+            print(f"    {D}... and {len(files) - 10} more{N}")
+        print()
+        if confirm("Proceed with secure wipe? (files overwritten with random data)"):
+            run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+            ok("Intel data wiped.")
+        else:
+            info("Wipe cancelled.")
         return
 
     if mode == "6":
-        # List and optionally read reports
-        run_script(INTEL / "testergatherSystem", ["--list-reports"], "List reports")
-        report_name = prompt("Enter report filename to view (or Enter to skip)")
-        if report_name:
-            run_script(INTEL / "testergatherSystem", ["--read-report", report_name], "View report")
+        # Interactive report browser — list, select by number, view inline
+        ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
+        if not ram_dir.exists() or not any(ram_dir.glob("intel_*")):
+            info("No reports found. Run a scan first (mode 1).")
+            return
+        reports = sorted(ram_dir.glob("intel_*"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not reports:
+            info("No reports found.")
+            return
+        heading("Saved Reports")
+        import time as _t
+        for idx, rp in enumerate(reports):
+            age_min = (_t.time() - rp.stat().st_mtime) / 60
+            size_kb = rp.stat().st_size / 1024
+            enc_icon = "encrypted" if rp.suffix == ".enc" else "plain"
+            if age_min < 60:
+                age_str = f"{age_min:.0f}m ago"
+            elif age_min < 1440:
+                age_str = f"{age_min/60:.1f}h ago"
+            else:
+                age_str = f"{age_min/1440:.0f}d ago"
+            print(f"    {G}{idx+1}{N}  {rp.name}  ({size_kb:.1f}KB, {age_str}, {enc_icon})")
+        print()
+        choice_str = prompt("Enter number to view (or Enter to skip)")
+        if choice_str and choice_str.isdigit():
+            idx = int(choice_str) - 1
+            if 0 <= idx < len(reports):
+                run_script(INTEL / "testergatherSystem", ["--read-report", str(reports[idx])], "View report")
+            else:
+                err(f"Invalid choice: {choice_str}")
         return
 
     if mode == "5":
