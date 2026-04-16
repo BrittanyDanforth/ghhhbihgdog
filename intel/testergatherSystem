@@ -725,57 +725,84 @@ class VulnScanner:
                 f["confidence"] = round(conf, 2)
         return findings
 
+    def _run_check(self, name: str, check_fn, args: tuple, confidence: float,
+                   findings: list):
+        """Run a single vuln check with timeout protection and progress display.
+
+        If a check hangs (network timeout, slow response), it's skipped
+        after 60 seconds instead of blocking the entire scan.
+        """
+        if shutdown_requested():
+            return
+        print(f"      checking {name}...", end="", flush=True)
+        try:
+            result = check_fn(*args)
+            if result:
+                result = self._add_confidence(result, confidence)
+                findings.extend(result)
+                print(f" {len(result)} finding(s)")
+            else:
+                print(" clean")
+        except requests.exceptions.Timeout:
+            print(" timeout (skipped)")
+            integrity_log("intel", f"check_timeout:{name}")
+        except requests.exceptions.ConnectionError:
+            print(" connection failed (skipped)")
+            integrity_log("intel", f"check_conn_fail:{name}")
+        except re.error as e:
+            print(f" regex error (skipped)")
+            integrity_log("intel", f"check_regex_error:{name}:{e}")
+        except Exception as e:
+            print(f" error: {type(e).__name__} (skipped)")
+            integrity_log("intel", f"check_error:{name}:{type(e).__name__}")
+
     def scan_full(self, base_url: str, html: str = "", headers: dict = None,
                   depth: str = "full") -> List[dict]:
-        """Run all applicable vulnerability checks.
+        """Run all applicable vulnerability checks with progress display.
 
-        depth: 'quick' = headers only, 'full' = + paths, 'deep' = + exploits
-
-        Each finding gets a confidence score (0.0–1.0) indicating reliability.
+        Each check runs independently — one failure doesn't block others.
+        Progress shown inline so the user knows it's not stuck.
         """
         if headers is None:
             headers = {}
         findings = []
 
-        # Header checks — high confidence (deterministic, no false positives)
-        findings.extend(self._add_confidence(
-            self._check_security_headers(headers), 0.95))
-        findings.extend(self._add_confidence(
-            self._check_cookies(headers), 0.9))
-        findings.extend(self._add_confidence(
-            self._check_cors(base_url, headers), 0.85))
-        findings.extend(self._add_confidence(
-            self._check_info_disclosure(headers, html), 0.8))
-        findings.extend(self._add_confidence(
-            self._check_clickjacking(headers), 0.9))
+        # Header checks (instant, no network)
+        self._run_check("security headers", self._check_security_headers,
+                        (headers,), 0.95, findings)
+        self._run_check("cookies", self._check_cookies, (headers,), 0.9, findings)
+        self._run_check("CORS", self._check_cors, (base_url, headers), 0.85, findings)
+        self._run_check("info disclosure", self._check_info_disclosure,
+                        (headers, html), 0.8, findings)
+        self._run_check("clickjacking", self._check_clickjacking,
+                        (headers,), 0.9, findings)
 
         if depth in ("full", "deep"):
-            # Path probing — moderate confidence (could be custom 404)
-            findings.extend(self._add_confidence(
-                self._check_sensitive_paths(base_url), 0.75))
-            findings.extend(self._add_confidence(
-                self._check_http_methods(base_url), 0.7))
-            findings.extend(self._add_confidence(
-                self._check_open_redirect(base_url), 0.85))
+            # Network checks (can be slow)
+            self._run_check("sensitive paths", self._check_sensitive_paths,
+                            (base_url,), 0.75, findings)
+            self._run_check("HTTP methods", self._check_http_methods,
+                            (base_url,), 0.7, findings)
+            self._run_check("open redirect", self._check_open_redirect,
+                            (base_url,), 0.85, findings)
 
         if depth == "deep":
-            # Active exploit detection — confidence varies by check type
-            findings.extend(self._add_confidence(
-                self._check_sqli_indicators(base_url), 0.9))
-            findings.extend(self._add_confidence(
-                self._check_xss_reflection(base_url), 0.9))
-            findings.extend(self._add_confidence(
-                self._check_directory_traversal(base_url), 0.95))
-            findings.extend(self._add_confidence(
-                self._check_ssl_cert(base_url), 0.85))
-            findings.extend(self._add_confidence(
-                self._check_graphql_introspection(base_url), 0.95))
-            findings.extend(self._add_confidence(
-                self._check_ssrf_indicators(base_url), 0.9))
-            findings.extend(self._add_confidence(
-                self._check_lfi(base_url), 0.95))
-            findings.extend(self._add_confidence(
-                self._check_command_injection(base_url), 0.95))
+            # Active exploit checks (network-heavy)
+            self._run_check("SQL injection", self._check_sqli_indicators,
+                            (base_url,), 0.9, findings)
+            self._run_check("XSS reflection", self._check_xss_reflection,
+                            (base_url,), 0.9, findings)
+            self._run_check("directory traversal", self._check_directory_traversal,
+                            (base_url,), 0.95, findings)
+            self._run_check("SSL/TLS", self._check_ssl_cert,
+                            (base_url,), 0.85, findings)
+            self._run_check("GraphQL introspection", self._check_graphql_introspection,
+                            (base_url,), 0.95, findings)
+            self._run_check("SSRF", self._check_ssrf_indicators,
+                            (base_url,), 0.9, findings)
+            self._run_check("LFI", self._check_lfi, (base_url,), 0.95, findings)
+            self._run_check("command injection", self._check_command_injection,
+                            (base_url,), 0.95, findings)
 
         return findings
 
@@ -2747,6 +2774,143 @@ class IntelOrchestrator:
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════
 
+def _list_reports():
+    """List available reports in RAM storage."""
+    ram_dir = RAM_DIR
+    if not ram_dir.exists():
+        print("  [*] No reports found (no intel directory).")
+        return
+    reports = sorted(ram_dir.glob("intel_*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not reports:
+        print("  [*] No reports found.")
+        return
+    print(f"\n  {'═' * 50}")
+    print(f"  Available reports ({len(reports)}):")
+    print(f"  {'═' * 50}")
+    for r in reports:
+        size = r.stat().st_size
+        age = (time.time() - r.stat().st_mtime) / 60
+        enc = "🔒" if r.suffix == ".enc" else "📄"
+        print(f"  {enc} {r.name}  ({size} bytes, {age:.0f}m ago)")
+    print(f"  {'═' * 50}")
+    print(f"  Read with: --read-report <filename>")
+    print()
+
+
+def _read_report(path: Path):
+    """Read and display a report — handles both encrypted and plaintext."""
+    if not path.exists():
+        # Try looking in RAM_DIR
+        alt = RAM_DIR / path.name
+        if alt.exists():
+            path = alt
+        else:
+            print(f"  [!] Report not found: {scrub_path(path)}")
+            # Show available reports
+            _list_reports()
+            return
+
+    report_data = None
+
+    if path.suffix == ".enc":
+        if not HAS_FERNET:
+            print("  [!] cryptography package needed for encrypted reports.")
+            return
+        key_input = input("  Enter decryption key: ").strip()
+        if not key_input:
+            print("  [!] No key provided.")
+            return
+        try:
+            cipher = Fernet(key_input.encode() if isinstance(key_input, str) else key_input)
+            decrypted = cipher.decrypt(path.read_bytes())
+            report_data = json.loads(decrypted)
+        except Exception as e:
+            print(f"  [!] Decryption failed: {type(e).__name__}")
+            return
+    else:
+        try:
+            report_data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  [!] Cannot read report: {type(e).__name__}")
+            return
+
+    # Display report
+    _display_report(report_data)
+
+
+def _display_report(report: dict):
+    """Pretty-print a report to terminal."""
+    print(f"\n  {'═' * 60}")
+    print(f"  INTELLIGENCE REPORT")
+    print(f"  {'═' * 60}")
+
+    summary = report.get("summary", {})
+    print(f"\n  Pages scraped:      {summary.get('pages_scraped', 0)}")
+    print(f"  Honeypots:          {summary.get('honeypots', 0)}")
+    print(f"  Breached accounts:  {summary.get('breached_accounts', 0)}")
+    print(f"  Vulnerabilities:    {summary.get('vuln_total', 0)}")
+
+    # Vuln breakdown
+    vuln_counts = summary.get("vulnerabilities", {})
+    for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+        if vuln_counts.get(sev):
+            color = {"CRITICAL": "\033[1;31m", "HIGH": "\033[0;31m",
+                     "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
+                     "INFO": "\033[0;90m"}.get(sev, "")
+            print(f"    {color}{sev}\033[0m: {vuln_counts[sev]}")
+
+    # Data extracted
+    data = summary.get("data_extracted", {})
+    if data:
+        print(f"\n  Data extracted:")
+        for k, v in sorted(data.items()):
+            if v:
+                print(f"    {k}: {v}")
+
+    # Vulnerabilities detail
+    vulns = report.get("vulnerabilities", [])
+    if vulns:
+        print(f"\n  {'─' * 60}")
+        print(f"  VULNERABILITY DETAILS ({len(vulns)})")
+        print(f"  {'─' * 60}")
+        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        for v in sorted(vulns, key=lambda x: order.get(x.get("severity", ""), 5)):
+            sev = v.get("severity", "?")
+            color = {"CRITICAL": "\033[1;31m", "HIGH": "\033[0;31m",
+                     "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
+                     "INFO": "\033[0;90m"}.get(sev, "")
+            exploit = " [EXPLOITABLE]" if v.get("exploitable") else ""
+            conf = f" ({v.get('confidence', 0)*100:.0f}%)" if v.get("confidence") else ""
+            verified = ""
+            if v.get("verified") == "confirmed":
+                verified = " ✓verified"
+            elif v.get("verified") == "not_reproduced":
+                verified = " ✗unverified"
+            print(f"\n  {color}[{sev}]\033[0m {v.get('title', '?')}{exploit}{conf}{verified}")
+            print(f"    {v.get('detail', '')[:200]}")
+            if v.get("evidence"):
+                print(f"    Evidence: {v['evidence'][:150]}")
+            ei = v.get("exploit_info", {})
+            if ei:
+                print(f"    Method: {ei.get('method', '')[:150]}")
+                print(f"    Risk: {ei.get('risk', '')[:100]}")
+
+    # PoC commands
+    pocs = report.get("proof_of_concepts", [])
+    if pocs:
+        print(f"\n  {'─' * 60}")
+        print(f"  PROOF OF CONCEPT COMMANDS ({len(pocs)})")
+        print(f"  {'─' * 60}")
+        for poc in pocs:
+            if poc.get("curl"):
+                print(f"\n  [{poc.get('severity', '?')}] {poc.get('finding', '?')}")
+                print(f"    $ {poc['curl']}")
+                if poc.get("remediation"):
+                    print(f"    Fix: {poc['remediation']}")
+
+    print(f"\n  {'═' * 60}\n")
+
+
 def main():
     install_signal_handlers()
 
@@ -2764,11 +2928,23 @@ def main():
     ap.add_argument("--max-results", type=int, default=20,
                     help="Max search results per query (default: 20)")
     ap.add_argument("--wipe", action="store_true", help="Wipe all intel data and exit")
+    ap.add_argument("--read-report", type=Path, metavar="FILE",
+                    help="Read and display an existing report (encrypted or plain)")
+    ap.add_argument("--list-reports", action="store_true",
+                    help="List available reports in RAM storage")
     args = ap.parse_args()
 
     if args.wipe:
         SecureStorage().wipe_all()
         print("  [+] Intel data wiped.")
+        return
+
+    if args.list_reports:
+        _list_reports()
+        return
+
+    if args.read_report:
+        _read_report(args.read_report)
         return
 
     if not args.domain and not args.email and not args.query and not args.file:

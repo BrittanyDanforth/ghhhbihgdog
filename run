@@ -1149,12 +1149,21 @@ def flow_intel(detected_port=None):
     print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
     print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
     print(f"    {G}5{N}  Exploit Walkthrough          (review + verify findings)")
-    print(f"    {G}6{N}  Wipe Intel Data              (secure erase from RAM)")
+    print(f"    {G}6{N}  View Reports                 (read saved scan results)")
+    print(f"    {G}7{N}  Wipe Intel Data              (secure erase from RAM)")
     print()
-    mode = prompt("Choose mode (1-6)")
+    mode = prompt("Choose mode (1-7)")
+
+    if mode == "7":
+        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        return
 
     if mode == "6":
-        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        # List and optionally read reports
+        run_script(INTEL / "testergatherSystem", ["--list-reports"], "List reports")
+        report_name = prompt("Enter report filename to view (or Enter to skip)")
+        if report_name:
+            run_script(INTEL / "testergatherSystem", ["--read-report", report_name], "View report")
         return
 
     if mode == "5":
