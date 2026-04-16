@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator - Off-Ramp Planner w/ Liquidity Probe
-==============================================================
-Generates a schema-tagged exit plan JSON bundle.
+exit_strategy_planner - XMR Off-Ramp Planner with Live Market Data
+===================================================================
+Generates a schema-tagged exit plan JSON bundle using LIVE price data
+from CoinGecko and Bisq price oracles.
+
+This is NOT a simulator — all prices are fetched in real-time via Tor.
+The output plan contains:
+  - Live market rates (clearly labeled as "live" with fetch timestamp)
+  - Fee and slippage estimates (labeled as "estimated" — actual varies)
+  - Liquidity guidance (heuristic — no queryable P2P order books exist)
+  - KYC requirement flags (factual per method)
+  - Next-step guidance for the chosen off-ramp method
 
 OPSEC hardening:
   - Tor verified before any API access
-  - No sensitive amounts or addresses leaked to terminal (redacted)
+  - Amounts scrubbed in terminal (full detail in output file)
   - Atomic fsync-rename output with 0600 perms
   - Integrity hash-chain logging
   - KYC risk flagging
-  - Liquidity depth validation (warns if thin)
+  - Price staleness warning
 """
 from __future__ import annotations
 import argparse, os, sys, time
@@ -25,16 +34,13 @@ if _CORE_DIR not in sys.path:
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, data_path,
+    scrub_path, scrub_amount, require_tor_proxy,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
-# Bisq and Haveno are P2P DEXs without centralized market APIs.
-# The Bisq price oracle is the closest to an official data source.
-# NOTE: The wiz-operated pricenode (price.bisq.wiz.biz) was removed from
-# the Bisq network in Oct 2023 (PR #6938). Bisq pricenodes now run as
-# Tor hidden services only. This URL will likely time out or 404.
-# Kept as best-effort fallback; the code already aborts gracefully if
-# both CoinGecko and Bisq fail (no silent wrong prices).
+# Bisq pricenodes now run as Tor hidden services only (Oct 2023+).
+# This URL may time out — kept as best-effort fallback. The code aborts
+# gracefully if both CoinGecko and Bisq fail (no silent wrong prices).
 BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
 
 METHODS: Dict[str, Dict] = {
@@ -44,9 +50,22 @@ METHODS: Dict[str, Dict] = {
     "p2p":    {"fee_pct": Decimal("0.00"),  "slippage": Decimal("0.03"),  "kyc": False},
 }
 
+# Off-ramp guidance per method — what the operator should actually do next
+NEXT_STEPS: Dict[str, str] = {
+    "bisq":   "Install Bisq desktop app (via Tor). Create offer or take existing XMR sell offer.",
+    "haveno": "Install Haveno (via Tor). Create or take an XMR sell offer on the P2P network.",
+    "azteco": "Purchase Azteco voucher codes. Redeem for BTC/fiat. Note: KYC may apply.",
+    "p2p":    "Find a trusted counterparty. Use escrow if available. Verify identity carefully.",
+}
+
 
 def fetch_prices(proxy):
-    """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails."""
+    """Fetch LIVE XMR and BTC prices via Tor.
+
+    Returns dict with prices clearly tagged as live data.
+    Falls back to Bisq price oracle if CoinGecko fails.
+    Aborts if ALL oracles fail — never uses stale/cached prices.
+    """
     try:
         j = safe_get(CG_URL, proxy)
         return {
@@ -55,14 +74,12 @@ def fetch_prices(proxy):
             "btc_usd": Decimal(str(j["bitcoin"]["usd"])),
             "btc_eur": Decimal(str(j["bitcoin"]["eur"])),
             "source": "coingecko",
+            "data_type": "live",
         }
     except Exception as e:
         integrity_log("exit", f"coingecko_fail:{str(e)[:40]}")
 
-    # Fallback: Bisq price oracle (returns all market prices)
-    # The Bisq pricenode returns "price" as:
-    #   - For fiat (USD, EUR): BTC price in that fiat (e.g., 60000 = $60k per BTC)
-    #   - For altcoins (XMR): altcoin price in BTC (e.g., 0.00413 BTC per XMR)
+    # Fallback: Bisq price oracle
     try:
         j = safe_get(BISQ_PRICE_URL, proxy)
         prices = {}
@@ -72,9 +89,6 @@ def fetch_prices(proxy):
             if code == "XMR" and price > 0:
                 prices["xmr_btc"] = Decimal(str(price))
             elif code == "USD" and price > 0:
-                # BUG 64 FIX: The old code inverted the price (1/60000 = 0.00001666),
-                # producing XMR/USD values off by a factor of ~3.6 billion.
-                # Bisq pricenode returns BTC price IN USD directly (e.g., 60000).
                 prices["btc_usd"] = Decimal(str(price))
             elif code == "EUR" and price > 0:
                 prices["btc_eur"] = Decimal(str(price))
@@ -89,32 +103,35 @@ def fetch_prices(proxy):
                 "btc_usd": prices["btc_usd"].quantize(Decimal("0.01")),
                 "btc_eur": prices.get("btc_eur", prices["btc_usd"]).quantize(Decimal("0.01")),
                 "source": "bisq_oracle",
+                "data_type": "live",
             }
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{str(e)[:40]}")
 
     sys.exit(
         "[!] All price oracles failed (CoinGecko + Bisq).\n"
-        "    Cannot generate exit plan without prices.\n"
+        "    Cannot generate exit plan without live prices.\n"
         "    Check Tor connectivity and retry."
     )
 
 
 def liquidity_estimate(method: str, amount_xmr: Decimal) -> str:
-    """Provide liquidity guidance based on method and amount.
-    P2P DEXs like Bisq/Haveno don't have queryable order books,
-    so we give heuristic guidance instead of fake API calls."""
+    """Heuristic liquidity guidance — no queryable P2P order books exist.
+
+    Returns a human-readable guidance string. This is an ESTIMATE based
+    on typical P2P market volumes, not a live query.
+    """
     if method in ("bisq", "haveno"):
         if amount_xmr > Decimal("50"):
-            return "LOW — consider splitting across multiple trades over days"
+            return "LOW (estimated) — consider splitting across multiple trades over days"
         elif amount_xmr > Decimal("10"):
-            return "MEDIUM — may take multiple trades to fill"
+            return "MEDIUM (estimated) — may take multiple trades to fill"
         else:
-            return "OK — typical volume for P2P markets"
+            return "OK (estimated) — typical volume for P2P markets"
     elif method == "p2p":
-        return "UNKNOWN — depends on your counterparty"
+        return "UNKNOWN — depends on your counterparty and market"
     elif method == "azteco":
-        return "HIGH — voucher-based, no order book"
+        return "HIGH (voucher-based) — no order book dependency"
     return "UNKNOWN"
 
 
@@ -122,15 +139,16 @@ def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        description="Plan XMR off-ramp with liquidity analysis",
+        description="Plan XMR off-ramp with live market data and liquidity analysis",
     )
     ap.add_argument("amount", type=Decimal, nargs="?", default=None,
                     help="XMR amount to off-ramp (also reads GS_EXIT_AMOUNT env var)")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
-    ap.add_argument("--suppress-kyc", action="store_true")
-    ap.add_argument("--outfile", default=str(data_path("plan_output.json")))
+    ap.add_argument("--suppress-kyc", action="store_true",
+                    help="Suppress KYC warning in terminal (does NOT remove actual KYC requirement)")
+    ap.add_argument("--outfile", default=str(data_path("exit_plan.json")))
     args = ap.parse_args()
 
     if args.amount is None:
@@ -139,22 +157,18 @@ def main():
             try:
                 args.amount = Decimal(_env_amt)
             except Exception:
-                sys.exit(f"[!] GS_EXIT_AMOUNT env var is not a valid number: '{_env_amt}'")
+                sys.exit("[!] GS_EXIT_AMOUNT env var is not a valid number.")
         else:
             sys.exit("[!] Amount is required (positional arg or GS_EXIT_AMOUNT env var)")
 
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")
 
-    if not args.tor_proxy:
-        sys.exit(
-            "[!] --tor-proxy is REQUIRED. Clearnet queries to CoinGecko/Bisq/Haveno\n"
-            "    leak your IP and reveal interest in XMR off-ramp methods. Aborting."
-        )
-    proxy = validate_proxy(args.tor_proxy)
-    verify_tor(proxy)
+    proxy = require_tor_proxy(args.tor_proxy)
 
     prices = fetch_prices(proxy)
+    import datetime as _dt
+    fetch_time = _dt.datetime.now(_dt.timezone.utc)
 
     cfg = METHODS[args.method]
     gross = args.amount
@@ -163,18 +177,14 @@ def main():
     net = gross - fee - slip
 
     if net <= 0:
-        sys.exit(f"[!] Net amount after fees+slippage is non-positive: {net}")
+        sys.exit("[!] Net amount after fees+slippage is non-positive.")
 
     fiat_rate = prices[f"xmr_{args.currency}"]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
     liq_guidance = liquidity_estimate(args.method, gross)
+    next_step = NEXT_STEPS.get(args.method, "")
 
-    # BUG 72 FIX: --suppress-kyc should ONLY suppress the terminal warning,
-    # NOT change the factual kyc_required field. Azteco genuinely requires
-    # KYC — suppressing the warning doesn't remove the requirement. Setting
-    # kyc_required=false would mislead the operator into thinking they can
-    # use a KYC method without KYC.
     plan = {
         "schema": "exit_plan",
         "timestamp": int(time.time()) // 600 * 600,
@@ -187,9 +197,14 @@ def main():
         "currency": args.currency,
         "amount_out_fiat": str(fiat_val),
         "oracle_prices": {k: str(v) for k, v in prices.items()
-                          if k != "source"},
+                          if k not in ("source", "data_type")},
         "price_source": prices.get("source", "unknown"),
+        "price_data_type": "live",
+        "fetched_utc": fetch_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "liquidity_guidance": liq_guidance,
+        "fee_type": "estimated",
+        "slippage_type": "estimated",
+        "next_steps": next_step,
     }
 
     atomic_write_json(plan, Path(args.outfile))
@@ -197,34 +212,35 @@ def main():
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
+    # Terminal output — summary only, full detail in the JSON file
     print()
-    print(f"  {'=' * 68}")
-    print("  OPSEC: Do NOT send mixed XMR to a KYC exchange under your real identity.")
-    print("  Use P2P methods (Bisq, Haveno) or atomic swaps for off-ramp.")
-    print(f"  {'=' * 68}")
+    print(f"  {'=' * 60}")
+    print("  OPSEC: Do NOT send mixed XMR to a KYC exchange")
+    print("  under your real identity. Use P2P methods.")
+    print(f"  {'=' * 60}")
     print()
 
     kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
-    print(f"  Method      : {args.method} ({kyc_label})")
-    print(f"  Gross       : {gross} XMR")
-    print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
-    print(f"  Slippage    : {slip:.4f} XMR")
-    print(f"  ---")
-    print(f"  Net         : {net:.4f} XMR")
-    print(f"  Value       : {fiat_val} {args.currency.upper()}")
-    print(f"  Prices from : {prices.get('source', 'unknown')}")
-    # BUG 82 FIX: Show when prices were fetched so the operator can judge
-    # staleness. The plan JSON has a coarsened timestamp, but the terminal
-    # output had no time indicator — an operator reading the plan hours
-    # later would act on stale prices without realizing it.
-    import datetime as _dt
-    print(f"  Fetched at  : {_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  [!] PRICES ARE VOLATILE — this plan is only valid near the fetch time.")
-    print(f"  [!] If more than 15 minutes have passed, re-run to get fresh prices.")
-    print(f"  Liquidity   : {liq_guidance}")
+    print(f"  Method       : {args.method} ({kyc_label})")
+    print(f"  Gross        : {scrub_amount(gross)} XMR")
+    print(f"  Fees         : ~{scrub_amount(fee)} XMR (estimated {cfg['fee_pct'] * 100:.1f}%)")
+    print(f"  Slippage     : ~{scrub_amount(slip)} XMR (estimated)")
+    print(f"  Net          : ~{scrub_amount(net)} XMR")
+    print(f"  Value        : ~{fiat_val} {args.currency.upper()} (live rate)")
+    print(f"  Price source : {prices.get('source', 'unknown')} (live)")
+    print(f"  Fetched at   : {fetch_time.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  Liquidity    : {liq_guidance}")
+    print()
+    print(f"  [!] Prices are LIVE but VOLATILE — re-run for fresh data before acting.")
+    print(f"  [!] Fee and slippage are ESTIMATES — actual values depend on market.")
     if cfg["kyc"] and not args.suppress_kyc:
-        print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan written -> {Path(args.outfile).name} (fsync'd, 0600)")
+        print(f"  [!] WARNING: {args.method} requires KYC verification.")
+    print()
+    print(f"  [+] Full plan saved to {scrub_path(args.outfile)} (0600 perms)")
+    print()
+    if next_step:
+        print(f"  Next step: {next_step}")
+    print()
 
 
 if __name__ == "__main__":
