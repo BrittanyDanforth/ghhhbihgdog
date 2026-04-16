@@ -34,7 +34,7 @@ if _CORE_DIR not in sys.path:
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, data_path,
-    scrub_path, scrub_amount, require_tor_proxy,
+    scrub_path, scrub_amount, require_tor_proxy, connect_rpc,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -142,10 +142,15 @@ def main():
         description="Plan XMR off-ramp with live market data and liquidity analysis",
     )
     ap.add_argument("amount", type=Decimal, nargs="?", default=None,
-                    help="XMR amount to off-ramp (also reads GS_EXIT_AMOUNT env var)")
+                    help="XMR amount to off-ramp (also reads GS_EXIT_AMOUNT env var, "
+                         "or use --rpc to query wallet balance)")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
+    ap.add_argument("--rpc", default=None,
+                    help="monero-wallet-rpc endpoint to query unlocked balance directly "
+                         "(e.g. http://127.0.0.1:18083). If set and no amount argument "
+                         "is provided, uses the wallet's unlocked XMR balance.")
     ap.add_argument("--suppress-kyc", action="store_true",
                     help="Suppress KYC warning in terminal (does NOT remove actual KYC requirement)")
     ap.add_argument("--outfile", default=str(data_path("exit_plan.json")))
@@ -158,8 +163,22 @@ def main():
                 args.amount = Decimal(_env_amt)
             except Exception:
                 sys.exit("[!] GS_EXIT_AMOUNT env var is not a valid number.")
+        elif args.rpc:
+            # Query wallet-rpc for unlocked balance
+            try:
+                _rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
+                _bal_resp = _rpc.raw_request("get_balance", {"account_index": 0})
+                _unlocked = _bal_resp.get("unlocked_balance", 0)
+                if _unlocked <= 0:
+                    sys.exit("[!] Wallet has no unlocked balance to plan an exit for.")
+                args.amount = Decimal(str(_unlocked)) / Decimal("1000000000000")
+                print(f"  [+] Queried wallet balance: {scrub_amount(args.amount)} XMR (live)")
+            except SystemExit:
+                raise
+            except Exception as e:
+                sys.exit(f"[!] Cannot query wallet-rpc: {str(e)[:60]}")
         else:
-            sys.exit("[!] Amount is required (positional arg or GS_EXIT_AMOUNT env var)")
+            sys.exit("[!] Amount is required (positional arg, GS_EXIT_AMOUNT env var, or --rpc)")
 
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")

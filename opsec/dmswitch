@@ -669,7 +669,8 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     """Setup comprehensive CLI argument parser"""
     parser = argparse.ArgumentParser(
         prog="deadman_entropy_qr",
-        description="Enhanced Dead Man's Switch for Entropy Seed Protection"
+        description="Dead Man's Switch — standalone OPSEC tool for entropy seed protection. "
+                    "Not part of the main mixing pipeline.",
     )
     
     # Operation modes
@@ -679,6 +680,10 @@ def setup_argument_parser() -> argparse.ArgumentParser:
                        help="Token to unlock the entropy seed")
     parser.add_argument("--emergency-destruct", action="store_true",
                        help="Emergency destruction of all sensitive data")
+    
+    # Seed file
+    parser.add_argument("--seed-file", type=Path, default=SEED_FILE,
+                       help="Path to entropy_seed.json (default: toolkit root)")
     
     # Lock options
     parser.add_argument("--ttl", type=int, default=300,
@@ -700,6 +705,11 @@ def main():
     """Enhanced main function with comprehensive error handling"""
     parser = setup_argument_parser()
     args = parser.parse_args()
+    
+    # Override global SEED_FILE if --seed-file was provided
+    global SEED_FILE
+    if args.seed_file != SEED_FILE:
+        SEED_FILE = args.seed_file
     
     # Initialize dead man's switch
     switch = DeadManSwitch()
