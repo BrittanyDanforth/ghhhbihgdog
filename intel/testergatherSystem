@@ -227,29 +227,50 @@ class TorSession:
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
 
-        socks5h:// should handle this, but if the system has a DNS leak
-        (e.g., /etc/resolv.conf points to a real DNS server and some
-        library bypasses the SOCKS proxy), this catches it.
+        Uses two independent verification sources to avoid single-point
+        dependency. If both fail (Tor may be slow), proceeds cautiously
+        rather than false-aborting — but logs the failure.
         """
+        verified = False
+        # Source 1: Tor Project's official check
         try:
-            # Check that our exit IP is a Tor exit (already done by require_tor_proxy,
-            # but verify the session itself routes correctly)
             resp = self._session.get(
                 "https://check.torproject.org/api/ip",
                 timeout=15, headers=_pick_profile(),
             )
             if resp.status_code == 200:
                 data = resp.json()
-                if not data.get("IsTor"):
-                    integrity_log("intel", "DNS_LEAK:session_not_through_tor")
-                    print("  [!] CRITICAL: Session traffic is NOT going through Tor!")
-                    print("  [!] DNS or connection leak detected. Aborting.")
+                if data.get("IsTor"):
+                    verified = True
+                    integrity_log("intel", "dns_verified:torproject")
+                else:
+                    integrity_log("intel", "DNS_LEAK:torproject_says_not_tor")
+                    print("  [!] CRITICAL: Session NOT through Tor! Aborting.")
                     sys.exit(1)
-                integrity_log("intel", "dns_safety_verified")
-        except requests.exceptions.Timeout:
-            integrity_log("intel", "dns_verify_timeout:proceeding_cautiously")
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            pass  # Try fallback
         except Exception as e:
-            integrity_log("intel", f"dns_verify_error:{type(e).__name__}")
+            integrity_log("intel", f"dns_verify_error_1:{type(e).__name__}")
+
+        # Source 2: Fallback — check that we can resolve .onion (only works through Tor)
+        if not verified:
+            try:
+                resp2 = self._session.get(
+                    "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/",
+                    timeout=15, headers=_pick_profile(),
+                )
+                if resp2 and resp2.status_code in (200, 301, 302):
+                    verified = True
+                    integrity_log("intel", "dns_verified:onion_resolution")
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                pass
+            except Exception as e:
+                integrity_log("intel", f"dns_verify_error_2:{type(e).__name__}")
+
+        if not verified:
+            integrity_log("intel", "dns_verify_inconclusive:both_sources_failed")
+            print("  [!] WARNING: Could not verify Tor routing (both checks timed out).")
+            print("  [!] Proceeding cautiously — verify Tor is working.")
 
     def _delay_for_domain(self, domain: str):
         """Adaptive delay — increases if domain has blocked us before."""
@@ -1585,16 +1606,31 @@ class SecureStorage:
             return outpath, None
 
     def wipe_all(self):
-        """Securely wipe all intel data — files AND subdirectories."""
+        """Securely wipe all intel data — files, subdirectories, symlinks.
+
+        SECURITY: Refuses to follow symlinks out of the RAM directory.
+        A symlink pointing to /etc/passwd would be deleted (the link),
+        NOT overwritten (the target file). os.walk followlinks=False
+        prevents directory symlink traversal.
+        """
         if not self._dir.exists():
             return
-        import shutil
-        # Walk bottom-up to handle subdirectories
-        for root, dirs, files in os.walk(str(self._dir), topdown=False):
+        # Resolve the real dir to detect if _dir itself is a symlink
+        real_dir = self._dir.resolve()
+        if self._dir.is_symlink():
+            integrity_log("intel", "WIPE_ABORT:intel_dir_is_symlink")
+            print("  [!] Intel directory is a symlink — refusing to wipe (safety).")
+            return
+        # Walk bottom-up, never follow symlinks
+        for root, dirs, files in os.walk(str(real_dir), topdown=False, followlinks=False):
             root_path = Path(root)
             for fname in files:
                 fpath = root_path / fname
                 try:
+                    if fpath.is_symlink():
+                        # Remove symlink itself, don't overwrite target
+                        fpath.unlink()
+                        continue
                     size = fpath.stat().st_size
                     if size > 0:
                         with open(fpath, "r+b") as fh:
@@ -1608,6 +1644,9 @@ class SecureStorage:
                         pass
             for dname in dirs:
                 dpath = root_path / dname
+                if dpath.is_symlink():
+                    dpath.unlink()
+                    continue
                 try:
                     dpath.rmdir()
                 except OSError:
@@ -1786,6 +1825,8 @@ class IntelOrchestrator:
                     if cnames:
                         takeover = self._vulns._check_subdomain_takeover(sub, cnames)
                         if takeover:
+                            # Add confidence (bypasses scan_full)
+                            self._vulns._add_confidence(takeover, 0.85)
                             self._vuln_findings.extend(takeover)
                             for t in takeover:
                                 print(f"  [!] TAKEOVER: {t['title']}")
