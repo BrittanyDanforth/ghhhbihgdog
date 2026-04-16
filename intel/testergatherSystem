@@ -26,6 +26,7 @@ import tempfile
 import shutil
 import mmap
 import gc
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Set
@@ -34,6 +35,10 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from collections import defaultdict, deque
 import base64
 import pickle
+
+# NETWORK: Uses canonical Tor enforcement from gs_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from gs_common import validate_proxy as _gs_validate_proxy, verify_tor as _gs_verify_tor
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -398,11 +403,20 @@ class ProxyChainManager:
         self.residential_proxies = self._get_residential_proxies()
         
     def _get_tor_proxies(self):
-        """Get Tor SOCKS proxies (socks5h to resolve DNS at proxy)."""
-        return [
+        """Get Tor SOCKS proxies (socks5h to resolve DNS at proxy).
+        Validates format via canonical gs_common."""
+        candidates = [
             "socks5h://127.0.0.1:9050",
             "socks5h://127.0.0.1:9150"
         ]
+        validated = []
+        for proxy_url in candidates:
+            try:
+                _gs_validate_proxy(proxy_url)
+                validated.append(proxy_url)
+            except SystemExit:
+                pass
+        return validated if validated else candidates
         
     def _fetch_socks5_proxies(self):
         """Fetch public SOCKS5 proxies through Tor to avoid clearnet leak."""
@@ -418,7 +432,12 @@ class ProxyChainManager:
                 resp = requests.get(source, timeout=10, proxies=tor_proxy)
                 for line in resp.text.strip().split('\n'):
                     if ':' in line:
-                        proxies.append(f"socks5h://{line.strip()}")
+                        proxy_url = f"socks5h://{line.strip()}"
+                        try:
+                            _gs_validate_proxy(proxy_url)
+                            proxies.append(proxy_url)
+                        except SystemExit:
+                            pass
             except Exception:
                 pass
                 

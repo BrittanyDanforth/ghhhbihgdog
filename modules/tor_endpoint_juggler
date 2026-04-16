@@ -61,6 +61,10 @@ except ImportError as e:
 
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 
+# NETWORK: Uses canonical Tor enforcement from gs_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from gs_common import validate_proxy as _gs_validate_proxy, verify_tor as _gs_verify_tor, newnym as _gs_newnym
+
 # Operational configuration
 OPERATIONAL_LOG = _TOOLKIT_ROOT / "tor_operations.log"
 
@@ -611,22 +615,20 @@ async def main():
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     _attach_file_handler()
     
-    # Verify Tor is running (try system tor 9050, then Tor Browser 9150)
+    # Verify Tor is running using canonical validation (try 9050 then 9150)
     global TOR_SOCKS_PORT
     tor_found = False
     for _try_port in (9050, 9150):
+        _proxy_url = f"socks5h://{TOR_SOCKS_HOST}:{_try_port}"
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex((TOR_SOCKS_HOST, _try_port))
-            sock.close()
-            if result == 0:
-                if _try_port != 9050:
-                    logger.info(f"Tor SOCKS found on port {_try_port} (Tor Browser)")
-                TOR_SOCKS_PORT = _try_port
-                tor_found = True
-                break
-        except Exception:
+            _proxy_dict = _gs_validate_proxy(_proxy_url)
+            _gs_verify_tor(_proxy_dict)
+            if _try_port != 9050:
+                logger.info(f"Tor SOCKS found on port {_try_port} (Tor Browser)")
+            TOR_SOCKS_PORT = _try_port
+            tor_found = True
+            break
+        except SystemExit:
             continue
     if not tor_found:
         logger.error(f"Tor SOCKS proxy not accessible on {TOR_SOCKS_HOST}:9050 or :9150")
