@@ -274,9 +274,7 @@ def show_status(st: dict):
 
     missing = [n for n in ["requests","PySocks","stem","monero","psutil","tenacity"] if not st.get(n)]
     if missing:
-        _pip_cmd = ".venv/bin/pip" if (ROOT / ".venv" / "bin" / "pip").exists() else "python3 -m pip"
-        print(f"\n  {R}Missing deps:{N} {_pip_cmd} install {' '.join(missing)}")
-        print(f"  Or run: bash install.sh")
+        print(f"\n  {R}Missing packages detected.{N} Run: bash install.sh")
     if not st.get("tor"):
         print()
         print(f"  {R}Tor is NOT running.{N} The toolkit cannot work without Tor.")
@@ -457,7 +455,7 @@ def flow_receive(detected_port=None):
     # Step 1: Wallet
     wallet_files = _find_wallet_files()
     if wallet_files:
-        info(f"Found wallet(s): {', '.join(f.name for f in wallet_files[:5])}")
+        info(f"Found {len(wallet_files)} wallet(s)")
         choice = prompt("Use existing wallet? (y) or create new? (n)", "y").lower()
         if choice in ("y", "yes", ""):
             wf = prompt("Wallet JSON file", str(wallet_files[0]))
@@ -470,7 +468,7 @@ def flow_receive(detected_port=None):
                 err("Wallet creation failed.")
                 return
             wf = str(wallet_files[0])
-            ok(f"Using: {wallet_files[0].name}")
+            ok("New wallet ready")
     else:
         info("No wallet found — creating one...")
         run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor],
@@ -480,7 +478,7 @@ def flow_receive(detected_port=None):
             err("Wallet creation failed.")
             return
         wf = str(wallet_files[0])
-        ok(f"Using: {wallet_files[0].name}")
+        ok("Wallet ready")
 
     # Load address from wallet JSON
     try:
@@ -488,7 +486,7 @@ def flow_receive(detected_port=None):
             _wdata = json.load(_wf)
         _addr = _wdata.get("address", "")
     except (json.JSONDecodeError, OSError, KeyError):
-        err(f"Cannot read wallet file: {wf}")
+        err(f"Cannot read wallet file: {Path(wf).name}")
         return
 
     # Step 2: ThorChain swap preparation
@@ -506,9 +504,9 @@ def flow_receive(detected_port=None):
             err(f"Invalid BTC amount: '{btc_amt}'")
             return
 
+        _swap_outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
         swap_args = ["--amounts", btc_amt, "--dests", _addr, "--tor-proxy", tor,
-                     "--outfile", str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json"),
-                     "--force"]
+                     "--outfile", _swap_outfile, "--force"]
         if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer"):
             err("Swap preparation failed.")
             return
@@ -525,7 +523,7 @@ def flow_receive(detected_port=None):
     print()
     if not confirm("XMR has arrived and is ready to mix?"):
         info("Come back when XMR has arrived. Choose option 2 again and select")
-        info(f"the same wallet: {wf}")
+        info(f"the same wallet ({Path(wf).name}).")
         return
 
     # Step 4: Mix
@@ -619,7 +617,7 @@ def flow_resume(detected_port=None):
 
     plans = _find_plan_files()
     if plans:
-        info(f"Found plans: {', '.join(p.name for p in plans)}")
+        info(f"Found {len(plans)} plan(s)")
         plan = prompt("Plan file to resume", str(plans[0]))
     else:
         plan = prompt("Path to unsigned plan JSON")
@@ -628,7 +626,7 @@ def flow_resume(detected_port=None):
         err("Plan file path is required.")
         return
     if not Path(plan).exists():
-        err(f"Plan file does not exist: {plan}")
+        err(f"Plan file not found: {Path(plan).name}")
         info("Run option 1 or 3 first to generate a plan, then resume.")
         return
 
@@ -720,7 +718,7 @@ def flow_swap_preparer(detected_port=None):
     wallet_files = _find_wallet_files()
     dest = ""
     if wallet_files:
-        info(f"Found wallet(s): {', '.join(f.name for f in wallet_files[:3])}")
+        info(f"Found {len(wallet_files)} wallet(s)")
         use_wf = prompt("Load XMR address from wallet JSON? (y/n)", "y").lower()
         if use_wf in ("y", "yes", ""):
             wf_path = prompt("Wallet JSON file", str(wallet_files[0]))
@@ -730,7 +728,7 @@ def flow_swap_preparer(detected_port=None):
                 if dest:
                     ok(f"Address loaded from {Path(wf_path).name}")
             except (json.JSONDecodeError, KeyError, OSError) as e:
-                err(f"Cannot read wallet file: {e}")
+                err(f"Cannot read wallet file: {Path(wf_path).name}")
                 return
 
     if not dest:

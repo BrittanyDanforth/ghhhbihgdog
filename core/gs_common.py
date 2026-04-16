@@ -837,3 +837,52 @@ def scrub_address(addr: str, visible: int = 8) -> str:
     if len(addr) <= visible * 2 + 3:
         return f"{addr[:4]}...{addr[-4:]}" if len(addr) > 11 else "****"
     return f"{addr[:visible]}...{addr[-visible:]}"
+
+
+def scrub_path(p) -> str:
+    """Show only the filename component, never the full filesystem path.
+
+    Full paths leak username, OS layout, toolkit location, and operational
+    directory structure. Basenames are enough for user orientation.
+    """
+    if not p:
+        return "<none>"
+    return Path(p).name
+
+
+def scrub_amount(amt, precision: int = 4) -> str:
+    """Round an amount for terminal display.
+
+    Exact amounts in terminal output enable correlation with on-chain
+    values. Rounding to `precision` decimal places reduces this while
+    still being operationally useful. Use precision=2 for fiat,
+    precision=4 for XMR, precision=8 for BTC.
+    """
+    try:
+        d = Decimal(str(amt))
+        return str(d.quantize(Decimal(10) ** -precision))
+    except Exception:
+        return "***"
+
+
+def is_verbose() -> bool:
+    """Return True if the operator explicitly requested verbose output.
+
+    Set GS_VERBOSE=1 in the environment for full detail (paths, addresses,
+    exact amounts) in terminal output. Default is scrubbed output.
+    """
+    return os.environ.get("GS_VERBOSE", "0") == "1"
+
+
+def require_tor_proxy(proxy_url: str = None) -> Dict[str, str]:
+    """One-call Tor enforcement: validate proxy format, verify Tor exit.
+
+    Every script that performs real network access should call this once
+    at startup instead of separate validate_proxy + verify_tor calls.
+    Returns the proxy dict or aborts.
+    """
+    if not proxy_url:
+        sys.exit("[!] --tor-proxy is REQUIRED for network operations. Aborting.")
+    proxy = validate_proxy(proxy_url)
+    verify_tor(proxy)
+    return proxy
