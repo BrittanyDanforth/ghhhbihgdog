@@ -63,9 +63,54 @@ else
     warn "Not Debian/Ubuntu — install manually: tor, python3-pip, python3-venv, python3-dev, curl, build-essential"
 fi
 
-# ── Step 2: Python environment + packages ──────────────────────────────────
+# ── Step 2: Start Tor BEFORE downloading anything ─────────────────────────
+# OPSEC: pip install downloads from PyPI. If the tor_firewall is active,
+# traffic goes through Tor automatically. But Tor must be RUNNING first.
 echo ""
-echo "  [2/5] Python setup..."
+echo "  [2/6] Tor (starting before downloads)..."
+
+if [ -f /etc/tor/torrc ]; then
+    if ! grep -qE "^\s*ControlPort\s+9051" /etc/tor/torrc 2>/dev/null; then
+        echo "" | sudo tee -a /etc/tor/torrc >/dev/null
+        echo "ControlPort 9051" | sudo tee -a /etc/tor/torrc >/dev/null
+        echo "CookieAuthentication 1" | sudo tee -a /etc/tor/torrc >/dev/null
+        ok "Tor control port configured"
+    else
+        ok "Tor control port configured"
+    fi
+fi
+
+TOR_RUNNING=false
+for TOR_PORT in 9050 9150; do
+    if curl -s --max-time 5 --connect-timeout 3 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
+       https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        ok "Tor verified (port ${TOR_PORT})"
+        TOR_RUNNING=true
+        break
+    fi
+done
+
+if [ "$TOR_RUNNING" = false ]; then
+    warn "Tor not responding. Trying to start..."
+    sudo systemctl start tor 2>/dev/null || sudo service tor start 2>/dev/null || true
+    sleep 3
+    for TOR_PORT in 9050 9150; do
+        if curl -s --max-time 10 --connect-timeout 5 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
+           https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+            ok "Tor started (port ${TOR_PORT})"
+            TOR_RUNNING=true
+            break
+        fi
+    done
+    if [ "$TOR_RUNNING" = false ]; then
+        warn "Tor is NOT running. Downloads will use clearnet."
+        warn "For OPSEC: start Tor first, then re-run install.sh"
+    fi
+fi
+
+# ── Step 3: Python environment + packages ──────────────────────────────────
+echo ""
+echo "  [3/6] Python setup..."
 
 PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 if [ -z "$PY" ]; then
@@ -175,7 +220,7 @@ fi
 # EXACT Python interpreter that will run the toolkit. If any core dep fails,
 # setup fails — no silent "it'll probably work" acceptance.
 echo ""
-echo "  [3/5] Verifying imports..."
+echo "  [4/6] Verifying imports..."
 IMPORT_FAILS=""
 
 # Core deps: MUST all pass
@@ -217,56 +262,9 @@ if [ -n "$IMPORT_FAILS" ]; then
     exit 1
 fi
 
-# ── Step 4: Tor ────────────────────────────────────────────────────────────
-echo ""
-echo "  [4/5] Tor..."
-
-if [ -f /etc/tor/torrc ]; then
-    if ! grep -qE "^\s*ControlPort\s+9051" /etc/tor/torrc 2>/dev/null; then
-        echo "" | sudo tee -a /etc/tor/torrc >/dev/null
-        echo "ControlPort 9051" | sudo tee -a /etc/tor/torrc >/dev/null
-        echo "CookieAuthentication 1" | sudo tee -a /etc/tor/torrc >/dev/null
-        ok "Tor control port configured"
-    else
-        ok "Tor control port configured"
-    fi
-fi
-
-TOR_RUNNING=false
-for TOR_PORT in 9050 9150; do
-    if curl -s --max-time 5 --connect-timeout 3 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
-       https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
-        ok "Tor verified (port ${TOR_PORT})"
-        TOR_RUNNING=true
-        break
-    fi
-done
-
-if [ "$TOR_RUNNING" = false ]; then
-    warn "Tor not responding. Trying to start..."
-    sudo systemctl start tor 2>/dev/null || sudo service tor start 2>/dev/null || true
-    sleep 3
-    for TOR_PORT in 9050 9150; do
-        if curl -s --max-time 10 --connect-timeout 5 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
-           https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
-            ok "Tor started (port ${TOR_PORT})"
-            TOR_RUNNING=true
-            break
-        fi
-    done
-    if [ "$TOR_RUNNING" = false ]; then
-        echo ""
-        fail "Tor is NOT working."
-        echo "  Start Tor before using the toolkit:"
-        echo "    sudo systemctl start tor"
-        echo "    (or open Tor Browser for port 9150)"
-        echo ""
-    fi
-fi
-
 # ── Step 5: Monero tools ──────────────────────────────────────────────────
 echo ""
-echo "  [5/5] Monero tools..."
+echo "  [5/6] Monero tools..."
 MONERO_OK=true
 for tool in monerod monero-wallet-cli monero-wallet-rpc; do
     if command -v $tool &>/dev/null; then
@@ -291,7 +289,7 @@ if [ "$MONERO_OK" = false ]; then
     fi
 fi
 
-# ── Create launcher ───────────────────────────────────────────────────────
+# ── Step 6: Create launcher ────────────────────────────────────────────────
 # The gs wrapper ensures the toolkit always runs under the venv interpreter.
 # It checks ALL critical imports (not just requests) to catch partial installs.
 WRAPPER="$SCRIPT_DIR/gs"
