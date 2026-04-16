@@ -30,6 +30,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
+    scrub_path, scrub_amount,
     secure_hex, data_path, TOOLKIT_ROOT,
 )
 
@@ -284,7 +285,7 @@ def main():
     _out = Path(args.outfile)
     if _out.exists() and not args.force:
         sys.exit(
-            f"[!] Output file {_out} already exists!\n"
+            f"[!] Output file {scrub_path(_out)} already exists!\n"
             f"    Re-running creates NEW deposit addresses — old ones may expire.\n"
             f"    If a sender already sent BTC to the old addresses, DO NOT overwrite.\n"
             f"    Use --force to overwrite, or --outfile <different_name>."
@@ -308,7 +309,7 @@ def main():
         print(f"  Send exactly: {pair['btc_in']} BTC")
         print(f"  To address:   {pair['deposit']}")
         if pair.get("memo"):
-            print(f"  With memo:    {pair['memo']}")
+            print(f"  With memo:    {pair['memo'][:30]}... (full memo in output file)")
         else:
             print(f"  Memo:         (none required)")
         print(f"  Expected XMR: ~{pair['expected_xmr']}")
@@ -341,7 +342,7 @@ def main():
                 gpg_path.write_bytes(enc.data if isinstance(enc.data, bytes) else str(enc).encode())
                 os.chmod(gpg_path, 0o600)
                 integrity_log("thor", f"gpg_ok:{gpg_path.name}")
-                print(f"  [+] GPG bundle -> {gpg_path}")
+                print(f"  [+] GPG bundle -> {scrub_path(gpg_path)}")
             else:
                 integrity_log("thor", f"gpg_fail:{enc.status}")
                 print(f"  [!] GPG encryption failed: {enc.status}")

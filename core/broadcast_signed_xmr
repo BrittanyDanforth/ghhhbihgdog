@@ -29,7 +29,7 @@ if _CORE_DIR not in sys.path:
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json,
-    install_signal_handlers, shutdown_requested,
+    install_signal_handlers, shutdown_requested, scrub_path,
     _BROWSER_HEADERS, normalize_broadcast_result, data_path, TOOLKIT_ROOT,
 )
 
@@ -139,13 +139,13 @@ def main():
                     if _sf_path.exists():
                         blobs.append(_sf_path)
                     else:
-                        print(f"  [!] Split blob not found: {_sf_path}")
+                        print(f"  [!] Split blob not found: {scrub_path(_sf_path)}")
                         integrity_log("broadcast", f"missing_split_blob:{Path(_sf_name).name}")
             else:
                 if blob_path.exists():
                     blobs.append(blob_path)
                 else:
-                    print(f"  [!] Blob not found: {blob_path}")
+                    print(f"  [!] Blob not found: {scrub_path(blob_path)}")
                     integrity_log("broadcast", f"missing_manifest_blob:{raw_name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
@@ -354,7 +354,7 @@ def main():
     for idx, blob in enumerate(blobs):
         if shutdown_requested():
             integrity_log("broadcast", f"shutdown_at_blob_{idx}")
-            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progF}")
+            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {scrub_path(progF)}")
             break
 
         if idx <= last_idx:
