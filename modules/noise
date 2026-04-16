@@ -29,6 +29,7 @@ Usage
                               --tor-proxy socks5h://127.0.0.1:9050 \
                               --duration 300 --intensity high
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 from __future__ import annotations
 import argparse
 import hashlib

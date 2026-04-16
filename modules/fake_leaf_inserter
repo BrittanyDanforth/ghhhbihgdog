@@ -11,6 +11,7 @@ Fixed Issues:
 - Removed potentially problematic comments
 - Added proper type checking
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib

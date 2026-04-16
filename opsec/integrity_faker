@@ -13,6 +13,7 @@ thereby masking or replacing the real hash‑chain logs. Works by:
    for manual substitution.
 Fully functional — no mocks, production-ready OPSEC tool.
 """
+# NETWORK: This module operates locally only. No network access.
 
 from __future__ import annotations
 import argparse

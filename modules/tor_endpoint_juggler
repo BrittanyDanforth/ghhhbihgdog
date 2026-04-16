@@ -26,6 +26,7 @@ python3 tor_endpoint_juggler.py --endpoints live_endpoints.yaml --probe --newnym
 # High-security mode with aggressive rotation
 python3 tor_endpoint_juggler.py --endpoints endpoints.yaml --aggressive --isolation-level high
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 
 import argparse
 import asyncio

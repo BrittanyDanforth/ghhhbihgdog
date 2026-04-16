@@ -54,6 +54,7 @@ Manifest Schema (wallet_mutation_manifest_v1.json)
 }
 ```
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib

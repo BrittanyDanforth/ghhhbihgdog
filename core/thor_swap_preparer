@@ -16,6 +16,9 @@ OPSEC hardening:
   - GPG encryption support with import guard
   - Integrity hash-chain per pair
 """
+# NOTE: This is the standalone ThorChain quote fetcher, used by menu options 2 and 7.
+# mixer_core has its own internal _thornode_quote() for the automated pipeline.
+# Both use the same THORNODE_APIS endpoints and quote format.
 from __future__ import annotations
 import argparse, json, os, sys, time, re
 from decimal import Decimal

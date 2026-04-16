@@ -34,6 +34,7 @@ Usage
     python3 label_masker_v3.py --dag my_dag.json    # custom DAG
     python3 label_masker_v3.py -o /tmp/map.json     # custom output
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib

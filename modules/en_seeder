@@ -40,6 +40,7 @@ The resulting JSON schema:
     }
 }
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib

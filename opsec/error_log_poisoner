@@ -25,6 +25,7 @@ Usage
     # Disk output with custom path
     python3 error_log_poisoner.py --source exec.log --out decoy_exec.log
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import datetime as dt

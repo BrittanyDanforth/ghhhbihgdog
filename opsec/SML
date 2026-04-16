@@ -17,6 +17,7 @@ Usage:
     python3 SML verify                              # check if seed is loaded
     python3 SML wipe                                # securely erase from RAM
 """
+# NETWORK: This module operates locally only. No network access.
 import argparse, ctypes, hashlib, json, os, secrets, signal, sys, time, threading
 from pathlib import Path
 

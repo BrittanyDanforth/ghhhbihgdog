@@ -36,6 +36,7 @@ Usage Examples:
     python3 forensic_mirrormask.py --sources *.log --paranoid --multiplier 2.5 \
         --anti-forensics --decoy-injection --statistical-masking
 """
+# NETWORK: This module operates locally only. No network access.
 
 import argparse
 import hashlib

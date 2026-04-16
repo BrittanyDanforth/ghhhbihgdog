@@ -54,6 +54,7 @@ Security / OPSEC Notes
 * Network probes are minimal ICMP pings to avoid fingerprinting.
 * Disk I/O tests use temporary files in /tmp with immediate cleanup.
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 from __future__ import annotations
 import argparse, json, math, os, random, sys, time, hashlib, statistics
 import socket, subprocess, tempfile

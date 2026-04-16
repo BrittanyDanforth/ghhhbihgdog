@@ -517,6 +517,24 @@ def main():
     # Stage 2 - ThorChain swap definition
     ###########################################################################
 
+    # ── ThorChain Quote Generation ──────────────────────────────────────
+    # There are three paths that generate ThorChain quotes in the toolkit:
+    #
+    # 1. mixer_core (this file): _thornode_quote() + stage2_get_swap_quotes()
+    #    Used by the full pipeline (option 1) and cold/airgap (option 3).
+    #    Generates deposit instructions as part of the automated flow.
+    #
+    # 2. core/thor_swap_preparer: standalone script
+    #    Used by menu option 7 (Swap Preparer) and option 2 (Receive guided).
+    #    Generates deposit instructions for the operator to give to a sender.
+    #
+    # 3. Menu option 2 calls thor_swap_preparer as a subprocess.
+    #
+    # All three use the same THORNODE_APIS list and the same quote format.
+    # They serve different use cases and are intentionally separate:
+    # - Path 1: automated pipeline, deposit info goes to plan file
+    # - Path 2/3: interactive/guided, deposit info shown to operator
+    # ────────────────────────────────────────────────────────────────────
     def _thornode_quote(amt: Decimal, xmr_dest: str) -> Optional[dict]:
         """Try THORNode native API for a swap quote (no API key needed)."""
         from urllib.parse import quote as _url_quote
