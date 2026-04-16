@@ -861,8 +861,8 @@ def _detect_iface() -> str:
             m = re.search(r"dev\s+(\S+)", r.stdout)
             if m:
                 return m.group(1)
-    except Exception:
-        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass  # ip command not available — use fallback
     return "eth0"
 
 
@@ -1244,7 +1244,7 @@ def flow_system_check():
     else:
         warn("Some components are missing — see above")
         if confirm("Run installer to fix missing deps?"):
-            subprocess.run(["bash", str(ROOT / "install.sh")])
+            subprocess.run(["bash", str(ROOT / "install.sh")], timeout=600)
     return st
 
 

@@ -689,9 +689,8 @@ def main():
     print("  [*] Phase 12: Environment variables")
     scrub_env_vars(args.dry_run)
     print("  [!] NOTE: env var scrubbing only affects THIS process. Your parent")
-    print("  [!] shell still has the original variables. Close the terminal or run:")
-    print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
-    print("  [!]   history -c && history -w  # clear shell history of unset commands")
+    print("  [!] shell still has the original variables. Close the terminal or")
+    print("  [!] unset any sensitive env vars manually, then clear shell history.")
 
     print("  [*] Phase 13: Monero daemon/wallet logs")
     _monero_log_paths = [

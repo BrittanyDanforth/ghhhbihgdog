@@ -48,8 +48,8 @@ def _detect_network(addr_str: str) -> str:
             return "testnet"
         elif net == "stage":
             return "stagenet"
-    except Exception:
-        pass
+    except Exception as e:
+        integrity_log("wallet", f"network_detect_fallback:{type(e).__name__}")
     if addr_str and addr_str[0] in ("4", "8"):
         return "mainnet"
     elif addr_str and addr_str[0] in ("9", "B"):
