@@ -1261,6 +1261,14 @@ def flow_intel(detected_port=None):
             depth = "full"
 
         args = ["--domain", domain, "--scan", depth, "--tor-proxy", tor]
+
+        # Cookie support for authenticated scanning
+        cookie_input = prompt("Session cookies (name=value, comma-separated, or Enter to skip)", "")
+        if cookie_input.strip():
+            for ck in cookie_input.split(","):
+                ck = ck.strip()
+                if "=" in ck:
+                    args.extend(["--cookie", ck])
         if run_script(INTEL / "testergatherSystem", args, "Intel scan"):
             # After scan, offer exploit walkthrough if deep scan
             if depth == "deep":

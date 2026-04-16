@@ -126,13 +126,13 @@ DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 # to generate curl commands that match the operator's actual Tor port.
 _ACTIVE_TOR_PORT = "9050"
 
-DOMAIN_MIN_DELAY = 2.0
-DOMAIN_MAX_DELAY = 8.0
-CIRCUIT_ROTATION_EVERY = 5
-MAX_RETRIES_PER_URL = 2       # reduced: 3 retries was too slow for blocked sites
-REQUEST_TIMEOUT = 15           # reduced from 25: Tor exits that hang take too long
+DOMAIN_MIN_DELAY = 1.0
+DOMAIN_MAX_DELAY = 4.0
+CIRCUIT_ROTATION_EVERY = 8
+MAX_RETRIES_PER_URL = 2
+REQUEST_TIMEOUT = 15
 WAYBACK_ENABLED = True
-BLOCK_THRESHOLD = 3            # after this many blocks on a domain, skip remaining checks
+BLOCK_THRESHOLD = 8            # raised from 3: old value killed scans after a few 403s from path probes
 
 RAM_DIR = Path("/dev/shm/intel") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".intel_tmp"
 
@@ -265,13 +265,16 @@ class TorSession:
             integrity_log("intel", f"dns_verify_skip:{type(e).__name__}")
 
     def _delay_for_domain(self, domain: str):
-        """Adaptive delay — increases if domain has blocked us before."""
+        """Adaptive delay — scales up only under sustained blocking."""
         blocks = self._domain_blocks.get(domain, 0)
-        base_min = DOMAIN_MIN_DELAY + (blocks * 2)
-        base_max = DOMAIN_MAX_DELAY + (blocks * 5)
+        if blocks < 3:
+            base_min, base_max = DOMAIN_MIN_DELAY, DOMAIN_MAX_DELAY
+        else:
+            base_min = DOMAIN_MIN_DELAY + min(blocks, 6)
+            base_max = DOMAIN_MAX_DELAY + min(blocks * 2, 12)
         last = self._domain_last.get(domain, 0)
         elapsed = time.time() - last
-        needed = base_min + secrets.randbelow(int((base_max - base_min) * 1000)) / 1000.0
+        needed = base_min + secrets.randbelow(int((base_max - base_min) * 1000 + 1)) / 1000.0
         if elapsed < needed:
             time.sleep(needed - elapsed)
 
@@ -282,8 +285,22 @@ class TorSession:
             time.sleep(2 + secrets.randbelow(3000) / 1000.0)
 
     def is_domain_blocked(self, domain: str) -> bool:
-        """Check if a domain has blocked us too many times — skip further checks."""
+        """Check if a domain has blocked us too many times."""
         return self._domain_blocks.get(domain, 0) >= BLOCK_THRESHOLD
+
+    def reset_domain_blocks(self, domain: str):
+        """Reset block counter for a domain between scan phases.
+
+        Path probing (/.git, /.env, etc.) triggers 403s that are NOT real blocks —
+        they're expected responses. Without resetting, the circuit breaker trips
+        before deep testing even starts, making the entire deep scan useless.
+        """
+        old = self._domain_blocks.get(domain, 0)
+        self._domain_blocks[domain] = max(0, old // 2)
+
+    def set_cookies(self, cookies: dict):
+        """Set session cookies for authenticated scanning."""
+        self._session.cookies.update(cookies)
 
     def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
             **kwargs) -> Optional[requests.Response]:
@@ -1816,18 +1833,29 @@ class VulnScanner:
             # Per-endpoint active testing — this is where real vulns are found
             endpoints = self._crawled_urls
             if not endpoints:
-                # Fallback: test base URL with discovered/guessed params
-                endpoints = [{"url": base_url, "params": [{"name": p, "value": "1"}
+                endpoints = [{"url": base_url, "params": [{"name": p, "value": "1",
+                              "hidden": False, "type": "text"}
                               for p in self._get_test_params(["id", "q", "search"])],
                               "method": "GET", "source": "fallback"}]
 
+            # Reset circuit breaker before active testing.
+            # Crawling and infra checks may have accumulated blocks from 403s
+            # on nonexistent paths — those are expected, not real blocks.
+            domain = urlparse(base_url).netloc
+            self._session.reset_domain_blocks(domain)
+
             print(f"      testing {len(endpoints)} discovered endpoint(s)...")
             tested = 0
+            skipped_blocked = 0
             for ep in endpoints[:20]:
                 if shutdown_requested():
                     break
                 if self._session.is_domain_blocked(urlparse(ep["url"]).netloc):
-                    break
+                    skipped_blocked += 1
+                    if skipped_blocked >= 3:
+                        print(f"\n      (stopped: domain is blocking active probes)")
+                        break
+                    continue
                 tested += 1
                 path = urlparse(ep["url"]).path or "/"
                 params_str = ",".join(p["name"] for p in ep["params"][:3])
@@ -3697,12 +3725,19 @@ class IntelOrchestrator:
         if tech:
             self._print_tech(tech)
 
-        # Phase 3: Vulnerability scanning
+        # Phase 3: Vulnerability scanning (headers + path probes)
         vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
                                 self._vulns.scan_full, base_url, html, headers,
                                 self._scan_depth) or []
         self._vuln_findings.extend(vulns)
         self._print_vulns(vulns)
+
+        # Reset circuit breaker between phases.
+        # Path probing (/.git, /.env, etc.) in phase 3 generates expected 403s
+        # that fill the block counter. Without reset, deep scan crawling and
+        # endpoint testing in later phases get killed by is_domain_blocked()
+        # before they can even start — making the entire deep scan useless.
+        self._session.reset_domain_blocks(domain)
 
         # Phase 4: DNS reconnaissance (full/deep only)
         if self._scan_depth in ("full", "deep"):
@@ -4233,6 +4268,10 @@ def main():
                     help="Tor SOCKS5 proxy (default: socks5h://127.0.0.1:9050)")
     ap.add_argument("--max-results", type=int, default=20,
                     help="Max search results per query (default: 20)")
+    ap.add_argument("--cookie", action="append", default=[],
+                    help="Session cookie (name=value). Repeat for multiple. "
+                         "Enables scanning authenticated pages. "
+                         "Example: --cookie PHPSESSID=abc123 --cookie security=low")
     ap.add_argument("--wipe", action="store_true", help="Wipe all intel data and exit")
     ap.add_argument("--read-report", type=Path, metavar="FILE",
                     help="Read and display an existing report (encrypted or plain)")
@@ -4288,6 +4327,17 @@ def main():
     integrity_log("intel", "session_start")
 
     orch = IntelOrchestrator(proxy, scan_depth=args.scan)
+
+    # Set session cookies for authenticated scanning
+    if args.cookie:
+        cookies = {}
+        for c in args.cookie:
+            if "=" in c:
+                k, v = c.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        if cookies:
+            orch._session.set_cookies(cookies)
+            print(f"  [+] {len(cookies)} session cookie(s) set for authenticated scanning")
 
     try:
         if args.email:
