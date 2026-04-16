@@ -312,6 +312,9 @@ def menu_main(tor_ok: bool = False):
     print(f"  {B}7{N}  Swap Preparer          ThorChain quote (standalone){_net}")
     print(f"  {B}8{N}  Exit Planner           Plan XMR off-ramp (live prices){_net}")
     print()
+    print(f"  {Y}── Intel / Recon ──────────────────────────────────{N}")
+    print(f"  {B}i{N}  Intel Gather           OSINT + vulnerability scan{_net}")
+    print()
     print(f"  {M}── System ─────────────────────────────────────────{N}")
     print(f"  {B}0{N}  System Check           Verify Tor, Monero, deps")
     print(f"  {B}9{N}  Paranoia Cleanup       Wipe ALL traces from this machine")
@@ -941,6 +944,89 @@ def flow_testnet(detected_port=None):
                        "Paranoia dry-run")
 
 
+def flow_intel(detected_port=None):
+    heading("Intelligence Gathering & Vulnerability Scanner")
+    print(f"  This tool performs OSINT collection and vulnerability scanning")
+    print(f"  through Tor. All data is stored in RAM only.")
+    print()
+    print(f"  {B}Modes:{N}")
+    print(f"    {G}1{N}  Domain Recon + Vuln Scan    (enter a domain)")
+    print(f"    {G}2{N}  Email Breach Check           (check breach databases)")
+    print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
+    print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
+    print(f"    {G}5{N}  Wipe Intel Data              (secure erase from RAM)")
+    print()
+    mode = prompt("Choose mode (1-5)")
+
+    if mode == "5":
+        run_script(INTEL / "testergatherSystem", ["--wipe"], "Intel wipe")
+        return
+
+    tor = get_tor_proxy(detected_port)
+    if not tor:
+        return
+
+    if mode == "1":
+        domain = prompt("Target domain (e.g. example.com)")
+        if not domain:
+            err("Domain is required.")
+            return
+        # Clean domain input
+        domain = domain.strip().lower()
+        if domain.startswith("http://") or domain.startswith("https://"):
+            from urllib.parse import urlparse as _up
+            domain = _up(domain).netloc or domain
+        if "/" in domain:
+            domain = domain.split("/")[0]
+
+        print()
+        print(f"  {B}Scan depth:{N}")
+        print(f"    {G}quick{N}  — headers + data extraction + tech fingerprint")
+        print(f"    {G}full{N}   — + sensitive paths + vuln checks + DNS recon")
+        print(f"    {G}deep{N}   — + subdomain enum + exploit detection (SQLi/XSS/traversal)")
+        print()
+        depth = prompt("Scan depth", "full").lower()
+        if depth not in ("quick", "full", "deep"):
+            depth = "full"
+
+        args = ["--domain", domain, "--scan", depth, "--tor-proxy", tor]
+        run_script(INTEL / "testergatherSystem", args, "Intel scan")
+
+    elif mode == "2":
+        email = prompt("Email address to check")
+        if not email or "@" not in email:
+            err("Valid email address required.")
+            return
+        args = ["--email", email, "--tor-proxy", tor]
+        run_script(INTEL / "testergatherSystem", args, "Breach check")
+
+    elif mode == "3":
+        query = prompt("Search query")
+        if not query:
+            err("Query is required.")
+            return
+        max_r = prompt("Max results to scrape", "20")
+        args = ["--query", query, "--max-results", max_r, "--tor-proxy", tor]
+        run_script(INTEL / "testergatherSystem", args, "OSINT search")
+
+    elif mode == "4":
+        filepath = prompt("Path to targets file")
+        if not filepath:
+            err("File path is required.")
+            return
+        if not Path(filepath).exists():
+            err(f"File not found: {Path(filepath).name}")
+            return
+        depth = prompt("Scan depth (quick/full/deep)", "full").lower()
+        if depth not in ("quick", "full", "deep"):
+            depth = "full"
+        args = ["--file", filepath, "--scan", depth, "--tor-proxy", tor]
+        run_script(INTEL / "testergatherSystem", args, "Batch intel")
+
+    else:
+        warn(f"Unknown mode: {mode}")
+
+
 def flow_system_check():
     heading("System Check")
     st = check_prereqs()
@@ -971,6 +1057,7 @@ TOOLS = {
     "mirror": OPSEC/"mirrormask", "deadman": OPSEC/"dmswitch",
     "memseed": OPSEC/"SML", "intfake": OPSEC/"integrity_faker", "verify": OPSEC/"entropy_verifier",
     "collect": INTEL/"collectgrab", "gather": INTEL/"testergatherSystem",
+    "intel": INTEL/"testergatherSystem", "vulnscan": INTEL/"testergatherSystem",
 }
 
 
@@ -1052,7 +1139,7 @@ def main():
             print()
             break
 
-        _network_ops = {"1", "2", "3", "4", "5", "6", "7", "8", "t"}
+        _network_ops = {"1", "2", "3", "4", "5", "6", "7", "8", "t", "i"}
         if choice in _network_ops and not _tor_ok:
             err("This operation requires Tor. Start Tor first, then choose 0 to re-check.")
             info("  sudo systemctl start tor")
@@ -1087,6 +1174,8 @@ def main():
                     ok("Tor is working — all options are now available.")
             elif choice == "t":
                 flow_testnet(_detected_tor_port)
+            elif choice == "i":
+                flow_intel(_detected_tor_port)
             elif choice in ("q", "quit", "exit"):
                 break
             elif choice == "_blocked":
