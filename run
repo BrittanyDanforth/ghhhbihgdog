@@ -18,21 +18,32 @@ _ROOT = Path(__file__).resolve().parent
 _VENV_PY = _ROOT / ".venv" / "bin" / "python3"
 
 def _venv_works() -> bool:
-    """Check if the venv Python can import the critical dep (requests)."""
+    """Check if the venv Python can import ALL critical deps.
+    
+    A partial venv (e.g. only requests installed) would pass a single-import
+    check but crash later when stem/monero/socks are needed. Check everything.
+    """
     if not _VENV_PY.exists():
         return False
     try:
         import subprocess as _sp
-        r = _sp.run([str(_VENV_PY), "-c", "import requests"], 
-                    capture_output=True, timeout=5)
+        r = _sp.run(
+            [str(_VENV_PY), "-c",
+             "import requests, socks, tenacity, stem, monero, psutil"],
+            capture_output=True, timeout=10,
+        )
         return r.returncode == 0
     except Exception:
         return False
 
 def _system_has_deps() -> bool:
-    """Check if current Python has the critical deps."""
+    """Check if current Python has ALL critical deps.
+    
+    Must match the same set checked by _venv_works() and the gs launcher.
+    If any is missing, the toolkit will crash at runtime.
+    """
     try:
-        import requests, tenacity
+        import requests, socks, tenacity, stem, monero, psutil
         return True
     except ImportError:
         return False
@@ -42,16 +53,14 @@ if _VENV_PY.exists() and str(_VENV_PY) != sys.executable:
     if _venv_works():
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__] + sys.argv[1:])
     elif not _system_has_deps():
-        print("\n  [!] Python packages are missing and the virtual environment is broken.")
-        print(f"  [!] Fix: run 'bash install.sh' to rebuild everything cleanly.")
-        print(f"  [!] Or manually: python3 -m pip install requests PySocks tenacity stem monero psutil")
+        print("\n  [!] Required packages are missing or incomplete.")
+        print(f"  [!] Run: bash install.sh")
         sys.exit(1)
 
 # If venv doesn't exist at all and system has no deps, guide the user
 if not _VENV_PY.exists() and not _system_has_deps():
-    print("\n  [!] Required Python packages are not installed.")
-    print(f"  [!] Run 'bash install.sh' first, or:")
-    print(f"  [!]   python3 -m pip install requests PySocks tenacity stem monero psutil")
+    print("\n  [!] Required packages are not installed.")
+    print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
 import json, subprocess, shutil
