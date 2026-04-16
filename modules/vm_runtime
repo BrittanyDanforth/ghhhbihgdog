@@ -71,6 +71,8 @@ try:
 except ImportError:
     requests = None
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 VERSION = "2.0"
 DEFAULT_EVENTS = 50
 
@@ -356,7 +358,7 @@ Examples:
   %(prog)s --seed custom_seed.json --out /tmp/timing.json
         """
     )
-    p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
+    p.add_argument("--seed", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json", 
                    help="entropy_seed.json path")
     p.add_argument("--events", type=int, default=DEFAULT_EVENTS, 
                    help="How many delay values to generate")

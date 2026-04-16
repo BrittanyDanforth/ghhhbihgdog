@@ -59,6 +59,8 @@ except ImportError:
     print("[!] Missing TOR control: pip install stem (optional but recommended)", file=sys.stderr)
     stem = None
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 VERSION = "3.0"
 
 # ┌─────────────────────────────────────────────────────────────────────┐
@@ -456,11 +458,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Advanced decoy noise generator for network traffic obfuscation"
     )
-    parser.add_argument("--dag", type=Path, default=Path("dag_structure.json"),
+    parser.add_argument("--dag", type=Path, default=_TOOLKIT_ROOT / "dag_structure.json",
                        help="DAG structure file")
-    parser.add_argument("--labels", type=Path, default=Path("label_map.json"),
+    parser.add_argument("--labels", type=Path, default=_TOOLKIT_ROOT / "label_map.json",
                        help="Label mapping file")
-    parser.add_argument("--seed", type=Path, default=Path("entropy_seed.json"),
+    parser.add_argument("--seed", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json",
                        help="Entropy seed file")
     parser.add_argument("--tor-proxy", required=True,
                        help="TOR proxy URL (socks5h://127.0.0.1:9050)")

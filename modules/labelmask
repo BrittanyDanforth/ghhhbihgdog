@@ -47,6 +47,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 VERSION = "3.0"
 
 # ---------------------------------------------------------------------------
@@ -286,11 +288,11 @@ def validate_dag_structure(dag: dict) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate randomized label_map.json for a DAG structure.")
-    parser.add_argument("--dag", "-d", type=Path, default=Path("dag_structure.json"), 
+    parser.add_argument("--dag", "-d", type=Path, default=_TOOLKIT_ROOT / "dag_structure.json", 
                        help="Path to DAG JSON from dag_generator_v2.py")
-    parser.add_argument("--seed", "-s", type=Path, default=Path("entropy_seed.json"), 
+    parser.add_argument("--seed", "-s", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json", 
                        help="Path to entropy_seed.json")
-    parser.add_argument("--out", "-o", type=Path, default=Path("label_map.json"), 
+    parser.add_argument("--out", "-o", type=Path, default=_TOOLKIT_ROOT / "label_map.json", 
                        help="Where to write map (default: ./label_map.json)")
     parser.add_argument("--verify", action="store_true", 
                        help="Verify DAG structure before processing")

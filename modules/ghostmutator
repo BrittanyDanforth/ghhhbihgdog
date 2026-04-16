@@ -44,6 +44,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 VERSION = "2.0"
 BASE58 = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 ZERO_WIDTH = "\u200b"  # Zero-width space for string obfuscation
@@ -397,7 +399,7 @@ def main():
                    help="Path to original .py file to mutate")
     p.add_argument("--out", "-o", type=Path, 
                    help="Output path (default: runtime/<name>_<random>.py)")
-    p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
+    p.add_argument("--seed", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json", 
                    help="Entropy seed file (default: entropy_seed.json)")
     p.add_argument("--manifest", action="store_true",
                    help="Write rename map manifest (WARNING: de-obfuscation key)")
@@ -414,7 +416,7 @@ def main():
     # Default output path
     if not args.out:
         rnd = rand_name(random.Random(), 6)
-        args.out = Path("runtime") / f"{args.source.stem}_{rnd}.py"
+        args.out = _TOOLKIT_ROOT / "runtime" / f"{args.source.stem}_{rnd}.py"
     
     mutate(args.source, args.out, args.seed, write_manifest=args.manifest)
 

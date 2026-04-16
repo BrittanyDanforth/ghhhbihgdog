@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Optional, Any
 import ctypes
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # Stealth configuration
 STEALTH_MODE = os.environ.get('DEBUG', '0') != '1'
 PARANOID_MODE = True
@@ -511,9 +513,9 @@ def generate_dag(args):
 def main():
     parser = argparse.ArgumentParser(description="Generate polymorphic DAG structure")
     parser.add_argument("--seed", "-s", type=Path, 
-                       default=Path("entropy_seed.json"))
+                       default=_TOOLKIT_ROOT / "entropy_seed.json")
     parser.add_argument("--out", "-o", type=Path, 
-                       default=Path("dag_structure.json"))
+                       default=_TOOLKIT_ROOT / "dag_structure.json")
     parser.add_argument("--amount", "-a", type=float, 
                        default=1.0)
     

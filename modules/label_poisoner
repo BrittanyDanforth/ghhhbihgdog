@@ -38,6 +38,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 VERSION = "1.0"
 ZERO_WIDTH = "\u200b"  # zero‑width space — confuses grep/ML
 HAIR_SPACE = "\u200a"  # hair space - another invisible character
@@ -209,25 +211,25 @@ Examples:
     parser.add_argument(
         "--labels", 
         type=Path, 
-        default=Path("label_map.json"), 
+        default=_TOOLKIT_ROOT / "label_map.json", 
         help="Input label_map.json from label_masker_v3.py (default: label_map.json)"
     )
     parser.add_argument(
         "--dag", 
         type=Path, 
-        default=Path("dag_structure.json"), 
+        default=_TOOLKIT_ROOT / "dag_structure.json", 
         help="DAG JSON for hash seed (default: dag_structure.json)"
     )
     parser.add_argument(
         "--seed", 
         type=Path, 
-        default=Path("entropy_seed.json"), 
+        default=_TOOLKIT_ROOT / "entropy_seed.json", 
         help="entropy_seed.json for deterministic RNG (default: entropy_seed.json)"
     )
     parser.add_argument(
         "--out", "-o", 
         type=Path, 
-        default=Path("label_map_poisoned.json"), 
+        default=_TOOLKIT_ROOT / "label_map_poisoned.json", 
         help="Output path (default: label_map_poisoned.json)"
     )
     parser.add_argument(

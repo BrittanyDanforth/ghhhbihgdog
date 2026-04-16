@@ -47,7 +47,9 @@ from datetime import datetime, timezone
 # Config defaults
 # ---------------------------------------------------------------------------
 
-ROOT      = Path.cwd()
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+ROOT      = _TOOLKIT_ROOT
 _MOD_DIR  = Path(__file__).resolve().parent
 RUNTIME   = ROOT / "runtime"
 SEED      = ROOT / "entropy_seed.json"

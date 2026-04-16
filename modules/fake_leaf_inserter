@@ -21,7 +21,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 MANIFEST_NAME = "fake_leaf_manifest_v1.json"
 
 
@@ -223,13 +225,13 @@ def main():
     parser.add_argument(
         "--input", "-i", 
         type=Path, 
-        default=Path("dag_structure.json"),
+        default=_TOOLKIT_ROOT / "dag_structure.json",
         help="Input DAG JSON file"
     )
     parser.add_argument(
         "--output", "-o",
         type=Path,
-        default=Path("dag_augmented.json"),
+        default=_TOOLKIT_ROOT / "dag_augmented.json",
         help="Output augmented DAG JSON file"
     )
     parser.add_argument(

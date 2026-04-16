@@ -67,7 +67,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 MANIFEST_NAME = "wallet_mutation_manifest_v1.json"
 BASE58 = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 
@@ -343,7 +345,7 @@ def main():
     ap.add_argument(
         "--out", 
         type=Path, 
-        default=Path("mutated_wallet.json"), 
+        default=_TOOLKIT_ROOT / "mutated_wallet.json", 
         help="Output mutated wallet JSON (default: mutated_wallet.json)"
     )
     ap.add_argument("--dry-run", action="store_true", help="Preview mapping only, no file writes")

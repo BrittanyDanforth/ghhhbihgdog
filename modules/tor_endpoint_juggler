@@ -59,8 +59,10 @@ except ImportError as e:
     print(f"Missing dependency: {e}")
     sys.exit(1)
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # Operational configuration
-OPERATIONAL_LOG = Path("tor_operations.log")
+OPERATIONAL_LOG = _TOOLKIT_ROOT / "tor_operations.log"
 
 # Real Tor configuration
 TOR_SOCKS_HOST = "127.0.0.1"
@@ -581,7 +583,7 @@ def setup_args() -> argparse.ArgumentParser:
     
     parser.add_argument('--endpoints', type=Path, action='append', required=True,
                        help='YAML files containing real .onion endpoints')
-    parser.add_argument('--output', type=Path, default=Path('operational_endpoints.json'),
+    parser.add_argument('--output', type=Path, default=_TOOLKIT_ROOT / 'operational_endpoints.json',
                        help='Output file for rotated endpoints')
     parser.add_argument('--probe', action='store_true',
                        help='Validate endpoints via real Tor connections')

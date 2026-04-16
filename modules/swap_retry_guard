@@ -79,9 +79,11 @@ except ImportError as e:
 # CONFIGURATION & CONSTANTS
 # -------------------------------------------------------------------
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # File paths
-SEED_FILE = Path("entropy_seed.json")
-INTEGRITY_LOG = Path("swap_integrity_v2.log")
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+INTEGRITY_LOG = _TOOLKIT_ROOT / "swap_integrity_v2.log"
 CIRCUIT_LOG = Path("/dev/shm/circuit_burn.log") if Path("/dev/shm").exists() else Path("/tmp/circuit_burn.log")
 RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").exists() else Path("/tmp/swap_progress_secure.json")
 
