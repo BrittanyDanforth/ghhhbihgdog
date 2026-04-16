@@ -1,54 +1,89 @@
 #!/usr/bin/env python3
 """
-Ultimate Intelligence Gathering System v20+ ASF (As-Fuck Edition)
-================================================================
-Maximum OPSEC with all advanced features combined
-RAM-only operations, distributed execution, breach DB integration
-"""
+Intelligence Gathering System — Production OSINT Toolkit
+=========================================================
+Multi-source OSINT collector with real-world anti-blocking, full Tor
+enforcement, and RAM-only data handling.
 
+Capabilities (all functional, no placeholders):
+  - Web scraping with adaptive rate limiting and anti-fingerprinting
+  - Breach database lookup (HIBP, Dehashed) via Tor
+  - Search engine dorking with circuit rotation
+  - Data extraction (emails, crypto addresses, phones, credentials)
+  - Honeypot detection heuristics
+  - RAM-only encrypted storage with auto-wipe
+  - Secure cleanup on exit or interrupt
+
+OPSEC hardening:
+  - ALL network I/O forced through Tor (socks5h, DNS at proxy)
+  - Circuit rotation between requests (configurable cadence)
+  - Per-request User-Agent + header rotation (realistic browser profiles)
+  - Adaptive delays with CSPRNG jitter (not predictable patterns)
+  - RAM-only output (/dev/shm) with Fernet encryption
+  - Coarsened timestamps (10-minute buckets)
+  - Signal handlers for clean abort + emergency wipe
+  - No clearnet fallback — aborts if Tor unavailable
+
+Anti-blocking:
+  - Realistic browser header sets (Chrome/Firefox/Safari profiles)
+  - Referer chain simulation
+  - Cookie jar per session
+  - Exponential backoff on rate limits (429/503)
+  - Domain-level rate tracking (per-host delay)
+  - robots.txt awareness (optional enforcement)
+  - Request spacing with human-like jitter
+
+Usage:
+  python3 testergatherSystem --query "target search" --tor-proxy socks5h://127.0.0.1:9050
+  python3 testergatherSystem --email user@example.com --tor-proxy socks5h://127.0.0.1:9050
+  python3 testergatherSystem --domain example.com --tor-proxy socks5h://127.0.0.1:9050
+  python3 testergatherSystem --file targets.txt --tor-proxy socks5h://127.0.0.1:9050
+
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import gc
+import hashlib
+import json
 import os
 import re
-import json
-import time
-import random
-import requests
-import string
-import logging
-import hashlib
 import secrets
-import threading
-import subprocess
-import socket
-import struct
-import asyncio
-import aiohttp
-import tempfile
-import shutil
-import mmap
-import gc
+import signal
 import sys
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Set
-from urllib.parse import quote, urlparse, urljoin
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import time
+import threading
 from collections import defaultdict, deque
-import base64
-import pickle
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Set
+from urllib.parse import quote, urlparse, urljoin
 
-# NETWORK: Uses canonical Tor enforcement from gs_common
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
-from gs_common import validate_proxy as _gs_validate_proxy, verify_tor as _gs_verify_tor
+# Toolkit integration
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import (
+    validate_proxy, verify_tor, require_tor_proxy, newnym,
+    install_signal_handlers, shutdown_requested, scrub_path,
+    scrub_address, integrity_log, atomic_write_json,
+    secure_file_perms, secure_delay, secure_hex,
+)
+
+# Core deps (required)
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Optional deps with graceful fallback
 try:
-    import numpy as np
-    HAS_NUMPY = True
+    import aiohttp
+    from aiohttp_socks import ProxyConnector
+    HAS_ASYNC = True
 except ImportError:
-    HAS_NUMPY = False
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    HAS_ASYNC = False
 
-# Advanced imports with fallback
 try:
     from bs4 import BeautifulSoup
     HAS_BS4 = True
@@ -56,1918 +91,861 @@ except ImportError:
     HAS_BS4 = False
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.firefox.options import Options as FirefoxOptions
-    from selenium.common.exceptions import TimeoutException, WebDriverException
-    from selenium.webdriver.common.action_chains import ActionChains
-    import undetected_chromedriver as uc
-    HAS_SELENIUM = True
+    from cryptography.fernet import Fernet
+    HAS_FERNET = True
 except ImportError:
-    HAS_SELENIUM = False
+    HAS_FERNET = False
 
 try:
-    from fake_useragent import UserAgent
-    HAS_FAKE_UA = True
-except ImportError:
-    HAS_FAKE_UA = False
-
-try:
-    import captcha_solver
-    from twocaptcha import TwoCaptcha
-    HAS_CAPTCHA = True
-except ImportError:
-    HAS_CAPTCHA = False
-
-try:
-    from telethon.sync import TelegramClient
-    from telethon import events
-    from telethon.tl.functions.messages import SearchGlobalRequest
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    HAS_TELEGRAM = True
-except ImportError:
-    HAS_TELEGRAM = False
-
-try:
-    from web3 import Web3
-    from eth_account import Account
-    import bitcoin
-    HAS_BLOCKCHAIN = True
-except ImportError:
-    HAS_BLOCKCHAIN = False
-
-try:
-    import spacy
-    from transformers import pipeline
-    import torch
-    HAS_NLP = True
-except ImportError:
-    HAS_NLP = False
-
-try:
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    import joblib
-    HAS_ML = True
-except ImportError:
-    HAS_ML = False
-
-try:
-    import pymongo
-    from motor.motor_asyncio import AsyncIOMotorClient
-    HAS_MONGO = True
-except ImportError:
-    HAS_MONGO = False
-
-try:
-    from stem import Signal
+    from stem import Signal as StemSignal
     from stem.control import Controller
-    HAS_TOR = True
+    HAS_STEM = True
 except ImportError:
-    HAS_TOR = False
+    HAS_STEM = False
 
-try:
-    import tweepy
-    import praw
-    HAS_SOCIAL = True
-except ImportError:
-    HAS_SOCIAL = False
+# ═══════════════════════════════════════════════════════════════════════════
+#  Configuration
+# ═══════════════════════════════════════════════════════════════════════════
 
-try:
-    import docker
-    HAS_DOCKER = True
-except ImportError:
-    HAS_DOCKER = False
+# All sensitive API keys from environment only — never hardcoded
+HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
+DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
+DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 
-# ========== ULTRA CONFIG ==========
-CONFIG = {
-    "OPSEC": {
-        "RAM_ONLY": True,  # Use /dev/shm for all I/O
-        "RANDOM_HOSTNAME": True,
-        "RANDOM_MAC": True,
-        "AIR_GAP_MODE": False,  # Split scrape/decrypt machines
-        "DISABLE_GPU": True,
-        "MEMORY_ENCRYPTION": True,
-        "EPHEMERAL_CONTAINERS": True,
-        "TAILS_MODE": False,  # LiveCD boot
-        "FHE_LOGS": True,  # Fully homomorphic encryption
-        "CANARY_TOKENS": True,
-        "INTEGRITY_CHECK": True,
-        "AUTO_SHRED": True,
-        "DNS_OVER_HTTPS": True,
-        "DOMAIN_FRONTING": True
+# Rate limiting: per-domain minimum delay (seconds)
+DOMAIN_MIN_DELAY = 3.0
+DOMAIN_MAX_DELAY = 12.0
+CIRCUIT_ROTATION_EVERY = 5   # requests per circuit
+
+# RAM storage
+RAM_DIR = Path("/dev/shm/intel") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".intel_tmp"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Browser Profile Rotation (realistic, not random garbage)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# These match real browser releases. Using fictional versions or mixing
+# incompatible header combinations is the #1 way to get flagged.
+BROWSER_PROFILES = [
+    {
+        "name": "Chrome 124 Windows",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     },
-    
-    "TARGETING": {
-        "ADAPTIVE_MORPHING": True,  # Query mutation
-        "WAYBACK_PREFETCH": True,
-        "PRE_FILTER": True,  # Regex pre-flight
-        "LOCAL_AI_CLASSIFY": True,  # Offline LLaMA
-        "TRIPLE_PII_THRESHOLD": 0.8,
-        "HONEYPOT_ML_DETECT": True,
-        "DISTRIBUTED_FANOUT": True,
-        "MOBILE_PROXY_MIX": True
+    {
+        "name": "Chrome 124 macOS",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     },
-    
-    "STEALTH": {
-        "DECOY_TRAFFIC": True,
-        "CANVAS_SPOOF": True,
-        "WEBRTC_DISABLE": True,
-        "AUDIO_FINGERPRINT_RANDOM": True,
-        "TLS_FINGERPRINT_RANDOM": True,
-        "HTTP3_QUIC_RANDOM": True,
-        "SCREEN_RESOLUTION_ROTATE": True,
-        "FONT_FINGERPRINT_SPOOF": True,
-        "JITTER_DELAYS": (1, 20),  # seconds
-        "CIRCUIT_ROTATION": 5,  # pages per circuit
-        "USER_AGENT_ROTATION": "per_request"
+    {
+        "name": "Firefox 128 ESR (Tor Browser profile)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     },
-    
-    "VALIDATION": {
-        "BREACH_DB_CHECK": True,
-        "DEHASHED_LOCAL": "/dev/shm/leak.db",
-        "PEOPLE_FINDER_THRESHOLD": 0.8,
-        "MATCH_SCORE_TIERS": {
-            "low": 0.3,
-            "medium": 0.6,
-            "high": 0.8,
-            "critical": 0.95
-        },
-        "HASH_ONLY_PII": True,
-        "API_RATE_LIMIT": 300  # 5 minutes
+    {
+        "name": "Chrome 124 Linux",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Linux"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     },
-    
-    "PROXIES": {
-        "CHAIN_TYPES": ["tor", "socks5", "vpn", "mobile", "residential"],
-        "ROTATION_STRATEGY": "adaptive",
-        "FAILOVER_POOLS": 10,
-        "DNS_LEAK_PREVENT": True,
-        "MOBILE_NETWORKS": ["4g", "5g"],
-        "GEO_DIVERSITY": True
-    },
-    
-    "BREACH_DATABASES": {
-        "HIBP_API_KEY": os.environ.get("HIBP_KEY", ""),
-        "DEHASHED_API": os.environ.get("DEHASHED_KEY", ""),
-        "LEAK_LOOKUP_API": os.environ.get("LEAK_API", ""),
-        "LOCAL_BREACH_DB": "/dev/shm/breaches.db",
-        "TELEGRAM_BREACH_CHANNELS": [
-            "combolists", "leaked_databases", "databreach"
-        ]
-    },
-    
-    "TELEGRAM": {
-        "API_ID": os.environ.get("TG_API_ID", ""),
-        "API_HASH": os.environ.get("TG_API_HASH", ""),
-        "PHONE": os.environ.get("TG_PHONE", ""),
-        "CHANNELS": [
-            "coinbase_support", "binance_english", "crypto_victims",
-            "scam_reports", "wallet_recovery"
-        ],
-        "KEYWORDS": [
-            "locked account", "lost funds", "withdrawal stuck",
-            "2fa problem", "verification failed", "help urgent"
-        ]
-    },
-    
-    "AI_ML": {
-        "VICTIM_CLASSIFIER": "llama-7b",
-        "HONEYPOT_DETECTOR": "custom_cnn",
-        "SENTIMENT_MODEL": "finbert",
-        "ANOMALY_DETECTION": True,
-        "PATTERN_LEARNING": True
-    },
-    
-    "CRYPTO_SPECIFIC": {
-        "EXCHANGES": ["coinbase", "binance", "kraken", "ftx", "crypto.com"],
-        "WALLET_TYPES": ["metamask", "trust", "exodus", "ledger", "trezor"],
-        "COMPLAINT_KEYWORDS": [
-            "account locked", "funds missing", "withdrawal pending",
-            "verification failed", "2fa lost", "seed phrase",
-            "support ticket", "hacked wallet", "frozen account"
-        ]
-    },
-    
-    "DATA_HANDLING": {
-        "STORAGE": "/dev/shm/intel",  # RAM disk
-        "ENCRYPTION": "AES-256-GCM + GPG",
-        "SHAMIR_SHARES": 5,
-        "SHAMIR_THRESHOLD": 3,
-        "AUTO_WIPE_INTERVAL": 3600,  # 1 hour
-        "INTEGRITY_CHAIN": True
-    }
-}
+]
 
-# ========== RAM-ONLY LOGGING ==========
-class SecureRAMLogger:
-    """Logging to RAM only with encryption"""
-    
-    def __init__(self, name):
-        self.name = name
-        self.logs = deque(maxlen=10000)  # Circular buffer
-        self.key = Fernet.generate_key()
-        self.cipher = Fernet(self.key)
-        self.canary = secrets.token_hex(16)
-        
-    def _encrypt_log(self, msg):
-        """Encrypt log entry"""
-        if CONFIG['OPSEC']['FHE_LOGS']:
-            # Placeholder for FHE - use Fernet for now
-            return self.cipher.encrypt(msg.encode())
-        return msg.encode()
-    
-    def _add_canary(self, msg):
-        """Add canary token to detect tampering"""
-        if CONFIG['OPSEC']['CANARY_TOKENS']:
-            return f"{msg}|CANARY:{self.canary}"
-        return msg
-    
-    def log(self, level, msg):
-        """Add log entry to RAM buffer (timestamp coarsened to 10-min bucket)"""
-        coarsened = int(time.time()) // 600 * 600
-        timestamp = datetime.fromtimestamp(coarsened).isoformat()
-        entry = f"[{timestamp}] [{level}] {msg}"
-        entry = self._add_canary(entry)
-        encrypted = self._encrypt_log(entry)
-        self.logs.append(encrypted)
-        
-    def info(self, msg):
-        self.log("INFO", msg)
-        
-    def error(self, msg):
-        self.log("ERROR", msg)
-        
-    def warning(self, msg):
-        self.log("WARNING", msg)
-        
-    def critical(self, msg):
-        self.log("CRITICAL", msg)
-        
-    def dump_secure(self):
-        """Dump logs with integrity verification"""
-        return list(self.logs)
-        
-    def wipe(self):
-        """Secure wipe of logs"""
-        self.logs.clear()
-        gc.collect()
 
-# Global logger
-logger = SecureRAMLogger(__name__)
+def _pick_profile() -> dict:
+    """Pick a random browser profile using CSPRNG."""
+    p = BROWSER_PROFILES[secrets.randbelow(len(BROWSER_PROFILES))]
+    return {k: v for k, v in p.items() if k != "name"}
 
-# ========== HARDWARE OPSEC ==========
-class HardwareOPSEC:
-    """Hardware-level OPSEC features"""
-    
-    @staticmethod
-    def randomize_hostname():
-        """Set random hostname per session"""
-        if CONFIG['OPSEC']['RANDOM_HOSTNAME']:
-            hostname = f"host-{secrets.token_hex(4)}"
-            try:
-                subprocess.run(['hostname', hostname], check=True,
-                               capture_output=True, timeout=10)
-                logger.info(f"Hostname randomized: {hostname}")
-            except Exception:
-                pass
-    
-    @staticmethod
-    def randomize_mac():
-        """Randomize MAC address"""
-        if CONFIG['OPSEC']['RANDOM_MAC']:
-            try:
-                # Get interfaces
-                result = subprocess.run(['ip', 'link'], capture_output=True, text=True,
-                                       timeout=10)
-                interfaces = re.findall(r'^\d+: (\w+):', result.stdout, re.MULTILINE)
-                
-                for iface in interfaces:
-                    if iface not in ['lo', 'docker0']:
-                        octets = [secrets.randbelow(256) for _ in range(6)]
-                        octets[0] = (octets[0] | 0x02) & 0xFE  # locally administered, unicast
-                        mac = ":".join(f"{b:02x}" for b in octets)
-                        
-                        subprocess.run(['ip', 'link', 'set', iface, 'down'],
-                                       check=True, capture_output=True, timeout=10)
-                        subprocess.run(['ip', 'link', 'set', iface, 'address', mac],
-                                       check=True, capture_output=True, timeout=10)
-                        subprocess.run(['ip', 'link', 'set', iface, 'up'],
-                                       check=True, capture_output=True, timeout=10)
-                        
-                        logger.info(f"MAC randomized for {iface}: {mac}")
-            except Exception:
-                pass
-    
-    @staticmethod
-    def setup_ram_disk():
-        """Ensure RAM disk is available"""
-        ram_path = Path("/dev/shm/intel")
-        if not ram_path.exists():
-            ram_path.mkdir(parents=True, mode=0o700)
-        return ram_path
-    
-    @staticmethod
-    def disable_gpu():
-        """Disable GPU features"""
-        if CONFIG['OPSEC']['DISABLE_GPU']:
-            os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'
-            os.environ['GALLIUM_DRIVER'] = 'softpipe'
 
-# ========== ADVANCED PROXY CHAIN ==========
-class ProxyChainManager:
-    """Multi-tier proxy management with diversity"""
-    
-    def __init__(self):
-        self.chains = defaultdict(list)
-        self.current_chain = []
-        self.mobile_proxies = []
-        self.residential_proxies = []
-        self._initialize_pools()
-        
-    def _initialize_pools(self):
-        """Initialize diverse proxy pools"""
-        # Tor nodes
-        self.chains['tor'] = self._get_tor_proxies()
-        
-        # Public SOCKS5
-        self.chains['socks5'] = self._fetch_socks5_proxies()
-        
-        # Mobile networks
-        if CONFIG['PROXIES']['MOBILE_NETWORKS']:
-            self.mobile_proxies = self._get_mobile_proxies()
-            
-        # Residential
-        self.residential_proxies = self._get_residential_proxies()
-        
-    def _get_tor_proxies(self):
-        """Get Tor SOCKS proxies (socks5h to resolve DNS at proxy).
-        Validates format via canonical gs_common."""
-        candidates = [
-            "socks5h://127.0.0.1:9050",
-            "socks5h://127.0.0.1:9150"
-        ]
-        validated = []
-        for proxy_url in candidates:
-            try:
-                _gs_validate_proxy(proxy_url)
-                validated.append(proxy_url)
-            except SystemExit:
-                pass
-        return validated if validated else candidates
-        
-    def _fetch_socks5_proxies(self):
-        """Fetch public SOCKS5 proxies through Tor to avoid clearnet leak."""
-        sources = [
-            "https://api.proxyscrape.com/v2/?request=get&protocol=socks5",
-            "https://www.proxy-list.download/api/v1/get?type=socks5"
-        ]
-        tor_proxy = {"http": "socks5h://127.0.0.1:9050",
-                      "https": "socks5h://127.0.0.1:9050"}
-        proxies = []
-        for source in sources:
-            try:
-                resp = requests.get(source, timeout=10, proxies=tor_proxy)
-                for line in resp.text.strip().split('\n'):
-                    if ':' in line:
-                        proxy_url = f"socks5h://{line.strip()}"
-                        try:
-                            _gs_validate_proxy(proxy_url)
-                            proxies.append(proxy_url)
-                        except SystemExit:
-                            pass
-            except Exception:
-                pass
-                
-        return proxies[:20]  # Limit
-        
-    def _get_mobile_proxies(self):
-        """Get mobile network proxies"""
-        # This would connect to mobile proxy providers
-        # Placeholder for actual implementation
-        return []
-        
-    def _get_residential_proxies(self):
-        """Get residential proxies"""
-        # Connect to residential proxy services
-        return []
-        
-    def build_chain(self, length=3):
-        """Build multi-hop proxy chain"""
-        chain = []
-        
-        # Always start with Tor
-        chain.append(secrets.choice(self.chains['tor']))
-        
-        # Mix in other types (use SystemRandom for CSPRNG shuffle)
-        proxy_types = ['socks5', 'mobile', 'residential']
-        _sysrand = random.SystemRandom()
-        _sysrand.shuffle(proxy_types)
-        
-        for ptype in proxy_types[:length-1]:
-            if ptype == 'mobile' and self.mobile_proxies:
-                chain.append(secrets.choice(self.mobile_proxies))
-            elif ptype == 'residential' and self.residential_proxies:
-                chain.append(secrets.choice(self.residential_proxies))
-            elif ptype == 'socks5' and self.chains['socks5']:
-                chain.append(secrets.choice(self.chains['socks5']))
-                
-        self.current_chain = chain
-        return chain
+# ═══════════════════════════════════════════════════════════════════════════
+#  Data Extraction Patterns
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ========== BREACH DATABASE INTEGRATION ==========
-class BreachDatabaseManager:
-    """Integration with multiple breach databases"""
-    
-    def __init__(self):
-        self.hibp_key = CONFIG['BREACH_DATABASES']['HIBP_API_KEY']
-        self.dehashed_key = CONFIG['BREACH_DATABASES']['DEHASHED_API']
-        self.local_db = None
-        self._init_local_db()
-        
-    def _init_local_db(self):
-        """Initialize local breach database in RAM"""
-        try:
-            import sqlite3
-            self.local_db = sqlite3.connect(':memory:')
-            cursor = self.local_db.cursor()
-            
-            # Create tables
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS breaches (
-                    email TEXT,
-                    password_hash TEXT,
-                    source TEXT,
-                    date TEXT,
-                    PRIMARY KEY (email, source)
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS validations (
-                    email_hash TEXT PRIMARY KEY,
-                    valid INTEGER,
-                    last_checked TEXT
-                )
-            ''')
-            
-            self.local_db.commit()
-            logger.info("Local breach DB initialized in RAM")
-            
-        except Exception as e:
-            logger.error(f"Local DB init failed: {e}")
-            
-    async def check_hibp(self, email):
-        """Check Have I Been Pwned breachedaccount API for email breaches.
-
-        The pwnedpasswords API is for *passwords*, not emails. The correct
-        endpoint for email breach lookup is /breachedaccount/{account}.
-        """
-        if not self.hibp_key:
-            return None
-
-        headers = {
-            'hibp-api-key': self.hibp_key,
-            'user-agent': 'SecurityResearch/1.0'
-        }
-
-        try:
-            from aiohttp_socks import ProxyConnector
-            connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
-            encoded_email = email.replace('@', '%40')
-            url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{encoded_email}?truncateResponse=true"
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        breaches = await resp.json()
-                        return {
-                            'email': email,
-                            'breached': True,
-                            'breach_count': len(breaches) if isinstance(breaches, list) else 1,
-                            'source': 'HIBP'
-                        }
-                    elif resp.status == 404:
-                        return {'email': email, 'breached': False, 'source': 'HIBP'}
-
-        except Exception as e:
-            logger.error(f"HIBP check failed: {e}")
-
-        return {'email': email, 'breached': False}
-        
-    async def check_dehashed(self, email):
-        """Check Dehashed database"""
-        if not self.dehashed_key:
-            return None
-            
-        headers = {
-            'Accept': 'application/json',
-            'Authorization': f'Bearer {self.dehashed_key}'
-        }
-        
-        try:
-            from aiohttp_socks import ProxyConnector
-            connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
-            async with aiohttp.ClientSession(connector=connector) as session:
-                url = f"https://api.dehashed.com/search?query=email:{email}"
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        
-                        if data.get('entries'):
-                            return {
-                                'email': email,
-                                'breached': True,
-                                'entries': data['entries'][:5],  # Limit
-                                'source': 'Dehashed'
-                            }
-                            
-        except Exception as e:
-            logger.error(f"Dehashed check failed: {e}")
-            
-        return None
-        
-    def save_to_local(self, breach_data):
-        """Save breach data to local RAM DB"""
-        if not self.local_db:
-            return
-            
-        try:
-            cursor = self.local_db.cursor()
-            
-            email = breach_data.get('email', '')
-            source = breach_data.get('source', 'unknown')
-            
-            _coarsened = int(time.time()) // 600 * 600
-            cursor.execute('''
-                INSERT OR REPLACE INTO breaches (email, source, date)
-                VALUES (?, ?, ?)
-            ''', (email, source, datetime.fromtimestamp(_coarsened).isoformat()))
-            
-            self.local_db.commit()
-            
-        except Exception as e:
-            logger.error(f"Local save failed: {e}")
-
-# ========== TELEGRAM INTEGRATION ==========
-class TelegramIntelligence:
-    """Telegram channel monitoring and search"""
-    
-    def __init__(self):
-        self.client = None
-        self.channels = CONFIG['TELEGRAM']['CHANNELS']
-        self.keywords = CONFIG['TELEGRAM']['KEYWORDS']
-        self._init_client()
-        
-    def _init_client(self):
-        """Initialize Telegram client"""
-        if not HAS_TELEGRAM:
-            logger.warning("Telegram support not available")
-            return
-            
-        if not CONFIG['TELEGRAM']['API_ID']:
-            return
-            
-        try:
-            session_path = os.path.join('/dev/shm', 'intel_session')
-            self.client = TelegramClient(
-                session_path,
-                CONFIG['TELEGRAM']['API_ID'],
-                CONFIG['TELEGRAM']['API_HASH']
-            )
-            logger.info("Telegram client initialized")
-            
-        except Exception as e:
-            logger.error(f"Telegram init failed: {e}")
-            
-    async def search_channels(self, query):
-        """Search Telegram channels"""
-        if not self.client:
-            return []
-            
-        results = []
-        
-        try:
-            await self.client.start()
-            
-            # Search in specific channels
-            for channel_name in self.channels:
-                try:
-                    channel = await self.client.get_entity(channel_name)
-                    
-                    # Search messages
-                    async for message in self.client.iter_messages(
-                        channel, 
-                        search=query,
-                        limit=50
-                    ):
-                        result = {
-                            'channel': channel_name,
-                            'text': message.text,
-                            'date': message.date.isoformat(),
-                            'sender_id': message.sender_id,
-                            'id': message.id
-                        }
-                        
-                        # Extract data
-                        if message.text:
-                            extractor = DataExtractor()
-                            result['extracted'] = extractor.extract_all(message.text)
-                            
-                        results.append(result)
-                        
-                except Exception as e:
-                    logger.error(f"Channel search error {channel_name}: {e}")
-                    
-            # Global search
-            try:
-                global_results = await self.client(SearchGlobalRequest(
-                    q=query,
-                    limit=20
-                ))
-                
-                for msg in global_results.messages:
-                    if hasattr(msg, 'message'):
-                        results.append({
-                            'channel': 'global',
-                            'text': msg.message,
-                            'date': datetime.now().isoformat()
-                        })
-                        
-            except Exception:
-                pass
-                
-        except Exception as e:
-            logger.error(f"Telegram search failed: {e}")
-            
-        return results
-        
-    async def monitor_realtime(self, callback):
-        """Real-time monitoring of channels"""
-        if not self.client:
-            return
-            
-        @self.client.on(events.NewMessage(chats=self.channels))
-        async def handler(event):
-            # Check keywords
-            text = event.message.text.lower() if event.message.text else ""
-            
-            for keyword in self.keywords:
-                if keyword.lower() in text:
-                    await callback(event)
-                    break
-
-# ========== AI/ML ENHANCED DETECTION ==========
-class AIEnhancedDetector:
-    """AI/ML for victim classification and honeypot detection"""
-    
-    def __init__(self):
-        self.victim_classifier = None
-        self.honeypot_detector = None
-        self.sentiment_analyzer = None
-        self._init_models()
-        
-    def _init_models(self):
-        """Initialize AI models"""
-        if not HAS_ML:
-            return
-            
-        # Load or create models
-        try:
-            # Victim classifier
-            self.victim_classifier = self._load_victim_classifier()
-            
-            # Honeypot detector
-            self.honeypot_detector = self._load_honeypot_detector()
-            
-            # Sentiment analyzer
-            if HAS_NLP:
-                self.sentiment_analyzer = pipeline(
-                    "sentiment-analysis",
-                    model="ProsusAI/finbert"
-                )
-                
-            logger.info("AI models loaded")
-            
-        except Exception as e:
-            logger.error(f"AI model loading failed: {e}")
-            
-    def _load_victim_classifier(self):
-        """Load/create victim classification model"""
-        # This would be a pre-trained model
-        # Placeholder for actual implementation
-        return RandomForestClassifier(n_estimators=100)
-        
-    def _load_honeypot_detector(self):
-        """Load honeypot detection model"""
-        # CNN-based honeypot detector
-        # Placeholder
-        return None
-        
-    def classify_victim(self, text, metadata=None):
-        """Classify if text indicates potential victim"""
-        features = self._extract_features(text, metadata)
-        
-        # Keyword scoring
-        score = 0.0
-        complaint_keywords = [
-            'locked', 'frozen', 'stuck', 'lost', 'stolen',
-            'hacked', 'scammed', 'help', 'urgent', 'support'
-        ]
-        
-        text_lower = text.lower()
-        
-        for keyword in complaint_keywords:
-            if keyword in text_lower:
-                score += 0.1
-                
-        # Exchange mentions
-        for exchange in CONFIG['CRYPTO_SPECIFIC']['EXCHANGES']:
-            if exchange in text_lower:
-                score += 0.15
-                
-        # Sentiment
-        if self.sentiment_analyzer:
-            try:
-                sentiment = self.sentiment_analyzer(text[:512])[0]
-                if sentiment['label'] == 'negative':
-                    score += sentiment['score'] * 0.3
-            except Exception:
-                pass
-                
-        # ML classification if available
-        if self.victim_classifier and features:
-            try:
-                proba = self.victim_classifier.predict_proba([features])[0][1]
-                score = (score + proba) / 2
-            except Exception:
-                pass
-                
-        return {
-            'is_victim': score > CONFIG['TARGETING']['TRIPLE_PII_THRESHOLD'],
-            'confidence': score,
-            'classification': self._get_tier(score)
-        }
-        
-    def _get_tier(self, score):
-        """Get risk tier from score"""
-        tiers = CONFIG['VALIDATION']['MATCH_SCORE_TIERS']
-        
-        if score >= tiers['critical']:
-            return 'critical'
-        elif score >= tiers['high']:
-            return 'high'
-        elif score >= tiers['medium']:
-            return 'medium'
-        elif score >= tiers['low']:
-            return 'low'
-        else:
-            return 'none'
-            
-    def _extract_features(self, text, metadata):
-        """Extract features for ML models"""
-        features = []
-        
-        # Text features
-        features.append(len(text))
-        features.append(text.count('!'))
-        features.append(text.count('?'))
-        features.append(text.count('@'))
-        
-        # Add more features based on metadata
-        if metadata:
-            features.append(metadata.get('likes', 0))
-            features.append(metadata.get('shares', 0))
-            
-        return features
-        
-    def detect_honeypot(self, response_data):
-        """Detect if response is honeypot"""
-        indicators = {
-            'headers': 0,
-            'content': 0,
-            'behavior': 0
-        }
-        
-        # Check headers
-        headers = response_data.get('headers', {})
-        suspicious_headers = [
-            'x-honeypot', 'x-trap', 'x-security-scan',
-            'cf-bot-score', 'x-abuse-info'
-        ]
-        
-        for header in suspicious_headers:
-            if header in headers:
-                indicators['headers'] += 1
-                
-        # Check content patterns
-        content = response_data.get('content', '')
-        honeypot_patterns = [
-            r'var _0x[a-f0-9]{4}',  # Obfuscated JS
-            r'honeypot|trap|bot-check',
-            r'please verify you are human',
-            r'unusual activity detected'
-        ]
-        
-        for pattern in honeypot_patterns:
-            if re.search(pattern, content, re.I):
-                indicators['content'] += 1
-                
-        # Check behavior
-        if response_data.get('redirects', 0) > 3:
-            indicators['behavior'] += 1
-            
-        if response_data.get('response_time', 0) < 50:  # Too fast
-            indicators['behavior'] += 1
-            
-        # Calculate score
-        total_score = sum(indicators.values())
-        
-        return {
-            'is_honeypot': total_score > 2,
-            'confidence': min(total_score / 10, 1.0),
-            'indicators': indicators
-        }
-
-# ========== ULTRA-STEALTH BROWSER ==========
-class UltraStealthBrowser:
-    """Maximum stealth browser with all evasions"""
-    
-    def __init__(self):
-        self.driver = None
-        self.fingerprints = self._generate_fingerprints()
-        self.current_profile = None
-        self._setup_browser()
-        
-    def _generate_fingerprints(self):
-        """Generate random browser fingerprints"""
-        return {
-            'canvas': hashlib.sha256(os.urandom(32)).hexdigest(),
-            'webgl': {
-                'vendor': secrets.choice(['Intel Inc.', 'NVIDIA Corporation', 'AMD']),
-                'renderer': secrets.choice([
-                    'Intel Iris OpenGL Engine',
-                    'NVIDIA GeForce GTX 1080',
-                    'AMD Radeon Pro 5500M'
-                ])
-            },
-            'audio': round(35.7 + secrets.randbelow(1000) / 10000.0, 6),
-            'fonts': random.sample([
-                'Arial', 'Helvetica', 'Times New Roman', 'Georgia',
-                'Verdana', 'Comic Sans MS', 'Trebuchet MS'
-            ], 5),
-            'screen': secrets.choice([
-                (1920, 1080), (1366, 768), (1440, 900),
-                (2560, 1440), (1280, 720)
-            ]),
-            'timezone': secrets.choice([
-                'America/New_York', 'Europe/London', 'Asia/Tokyo',
-                'Australia/Sydney', 'America/Chicago'
-            ]),
-            'language': secrets.choice(['en-US', 'en-GB', 'en-CA', 'en-AU']),
-            'platform': secrets.choice(['Win32', 'MacIntel', 'Linux x86_64']),
-            'tls_version': secrets.choice(['TLS 1.2', 'TLS 1.3']),
-            'http_version': secrets.choice(['HTTP/1.1', 'HTTP/2', 'HTTP/3'])
-        }
-        
-    def _setup_browser(self):
-        """Setup browser with maximum stealth"""
-        if not HAS_SELENIUM:
-            return
-            
-        try:
-            # Use undetected-chromedriver
-            options = uc.ChromeOptions()
-            
-            # Basic stealth
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            
-            # Screen resolution
-            width, height = self.fingerprints['screen']
-            options.add_argument(f'--window-size={width},{height}')
-            
-            # Language
-            options.add_argument(f'--lang={self.fingerprints["language"]}')
-            
-            # Platform spoofing
-            options.add_argument(f'--user-agent={self._generate_user_agent()}')
-            
-            # Disable WebRTC
-            prefs = {
-                'webrtc.ip_handling_policy': 'disable_non_proxied_udp',
-                'webrtc.multiple_routes_enabled': False,
-                'webrtc.nonproxied_udp_enabled': False
-            }
-            
-            # GPU
-            if CONFIG['OPSEC']['DISABLE_GPU']:
-                options.add_argument('--disable-gpu')
-                options.add_argument('--disable-software-rasterizer')
-                
-            # Proxy
-            proxy_manager = ProxyChainManager()
-            chain = proxy_manager.build_chain()
-            
-            if chain:
-                chrome_proxy = chain[0]
-                # Chrome uses socks5:// but always does remote DNS for SOCKS5;
-                # rewrite socks5h:// to socks5:// for Chrome syntax compatibility.
-                chrome_proxy = chrome_proxy.replace('socks5h://', 'socks5://')
-                options.add_argument(f'--proxy-server={chrome_proxy}')
-                # Force remote DNS resolution through the proxy
-                options.add_argument('--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1')
-
-            # Additional privacy
-            options.add_argument('--no-first-run')
-            options.add_argument('--no-default-browser-check')
-            options.add_argument('--disable-background-timer-throttling')
-            
-            # Headless if configured
-            if CONFIG.get('HEADLESS', True):
-                options.add_argument('--headless=new')
-                
-            # Create driver
-            self.driver = uc.Chrome(options=options, version_main=None)
-            
-            # Inject stealth scripts
-            self._inject_maximum_stealth()
-            
-            logger.info("Ultra-stealth browser initialized")
-            
-        except Exception as e:
-            logger.error(f"Browser setup failed: {e}")
-            
-    def _generate_user_agent(self):
-        """Generate realistic user agent"""
-        platform = self.fingerprints['platform']
-        
-        chrome_ver = 90 + secrets.randbelow(31)
-        if platform == 'Win32':
-            return f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
-        elif platform == 'MacIntel':
-            return f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
-        else:
-            return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{chrome_ver}.0.0.0 Safari/537.36"
-            
-    def _inject_maximum_stealth(self):
-        """Inject all stealth scripts"""
-        stealth_js = f"""
-        // Maximum stealth overrides
-        
-        // Navigator overrides
-        Object.defineProperty(navigator, 'webdriver', {{
-            get: () => undefined
-        }});
-        
-        Object.defineProperty(navigator, 'platform', {{
-            get: () => '{self.fingerprints['platform']}'
-        }});
-        
-        Object.defineProperty(navigator, 'languages', {{
-            get: () => ['{self.fingerprints['language']}']
-        }});
-        
-        // Screen overrides
-        Object.defineProperty(screen, 'width', {{
-            get: () => {self.fingerprints['screen'][0]}
-        }});
-        
-        Object.defineProperty(screen, 'height', {{
-            get: () => {self.fingerprints['screen'][1]}
-        }});
-        
-        // WebGL spoofing
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-            if (parameter === 37445) {{
-                return '{self.fingerprints['webgl']['vendor']}';
-            }}
-            if (parameter === 37446) {{
-                return '{self.fingerprints['webgl']['renderer']}';
-            }}
-            return getParameter.apply(this, arguments);
-        }};
-        
-        // Canvas fingerprinting
-        const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-        HTMLCanvasElement.prototype.toDataURL = function() {{
-            const context = this.getContext('2d');
-            const imageData = context.getImageData(0, 0, this.width, this.height);
-            
-            // Add noise
-            for (let i = 0; i < imageData.data.length; i += 4) {{
-                imageData.data[i] = imageData.data[i] ^ (Math.random() * 2);
-                imageData.data[i + 1] = imageData.data[i + 1] ^ (Math.random() * 2);
-                imageData.data[i + 2] = imageData.data[i + 2] ^ (Math.random() * 2);
-            }}
-            
-            context.putImageData(imageData, 0, 0);
-            return toDataURL.apply(this, arguments);
-        }};
-        
-        // Audio fingerprinting
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
-        const audioContext = new AudioContext();
-        const oscillator = audioContext.createOscillator();
-        const analyser = audioContext.createAnalyser();
-        const gain = audioContext.createGain();
-        const scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-        
-        // Font fingerprinting
-        Object.defineProperty(document, 'fonts', {{
-            get: () => {{
-                return {{
-                    check: () => true,
-                    ready: Promise.resolve(),
-                    entries: () => {self.fingerprints['fonts']}
-                }};
-            }}
-        }});
-        
-        // Chrome object
-        window.chrome = {{
-            runtime: {{}},
-            loadTimes: function() {{}},
-            csi: function() {{}},
-            app: {{}}
-        }};
-        
-        // Permission overrides
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({{ state: Notification.permission }}) :
-                originalQuery(parameters)
-        );
-        
-        // Battery API
-        navigator.getBattery = () => Promise.resolve({{
-            charging: true,
-            chargingTime: 0,
-            dischargingTime: Infinity,
-            level: 0.99
-        }});
-        
-        // Plugin spoofing
-        Object.defineProperty(navigator, 'plugins', {{
-            get: () => {{
-                return {{
-                    length: 3,
-                    item: (i) => ({{
-                        name: ['Chrome PDF Plugin', 'Chrome PDF Viewer', 'Native Client'][i],
-                        filename: ['internal-pdf-viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', 'internal-nacl-plugin'][i],
-                        description: ['Portable Document Format', 'Portable Document Format', 'Native Client Executable'][i]
-                    }}),
-                    namedItem: () => null,
-                    refresh: () => {{}}
-                }};
-            }}
-        }});
-        
-        // Timezone spoofing
-        Date.prototype.getTimezoneOffset = function() {{
-            const offset = {{
-                'America/New_York': 300,
-                'Europe/London': 0,
-                'Asia/Tokyo': -540,
-                'Australia/Sydney': -660,
-                'America/Chicago': 360
-            }};
-            return offset['{self.fingerprints['timezone']}'] || 0;
-        }};
-        """
-        
-        try:
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': stealth_js
-            })
-        except Exception:
-            self.driver.execute_script(stealth_js)
-
-# ========== DISTRIBUTED SCRAPER ENGINE ==========
-class DistributedScraperEngine:
-    """Distributed scraping with container isolation"""
-    
-    def __init__(self):
-        self.browser_pool = []
-        self.container_pool = []
-        self.extractor = DataExtractor()
-        self.ai_detector = AIEnhancedDetector()
-        self.breach_db = BreachDatabaseManager()
-        self.telegram = TelegramIntelligence()
-        self._init_pools()
-        
-    def _init_pools(self):
-        """Initialize browser and container pools"""
-        # Create browser pool
-        for i in range(3):
-            browser = UltraStealthBrowser()
-            if browser.driver:
-                self.browser_pool.append(browser)
-                
-        # Create container pool if Docker available
-        if HAS_DOCKER and CONFIG['OPSEC']['EPHEMERAL_CONTAINERS']:
-            self._init_containers()
-            
-    def _init_containers(self):
-        """Initialize ephemeral containers"""
-        try:
-            client = docker.from_env()
-            
-            # Pull scraper image
-            image = "alpine:latest"  # Use custom image
-            
-            for i in range(5):
-                container = client.containers.create(
-                    image,
-                    detach=True,
-                    auto_remove=True,
-                    mem_limit='512m',
-                    network_mode='bridge',
-                    tmpfs={'/data': 'size=256m,mode=0700'},
-                )
-                self.container_pool.append(container)
-                
-            logger.info(f"Created {len(self.container_pool)} ephemeral containers")
-            
-        except Exception as e:
-            logger.error(f"Container init failed: {e}")
-            
-    async def scrape_with_validation(self, url):
-        """Scrape with full validation pipeline"""
-        _coarsened = int(time.time()) // 600 * 600
-        result = {
-            'url': url,
-            'timestamp': datetime.fromtimestamp(_coarsened).isoformat(),
-            'data': {},
-            'validation': {},
-            'risk_score': 0
-        }
-        
-        try:
-            # Pre-flight checks
-            if CONFIG['TARGETING']['PRE_FILTER']:
-                if not self._pre_filter_check(url):
-                    logger.info(f"Pre-filter rejected: {url}")
-                    return None
-                    
-            # Select browser
-            browser = secrets.choice(self.browser_pool) if self.browser_pool else None
-            
-            if not browser or not browser.driver:
-                return None
-                
-            # Rotate identity
-            self._rotate_identity(browser)
-            
-            # Add jitter delay (CSPRNG)
-            _jlo, _jhi = CONFIG['STEALTH']['JITTER_DELAYS']
-            delay = _jlo + secrets.randbelow(int((_jhi - _jlo) * 1000)) / 1000.0
-            await asyncio.sleep(delay)
-            
-            # Navigate
-            browser.driver.get(url)
-            
-            # Wait for load
-            WebDriverWait(browser.driver, 15).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            
-            # Human-like behavior
-            await self._simulate_human_behavior(browser)
-            
-            # Extract content
-            soup = BeautifulSoup(browser.driver.page_source, 'html.parser')
-            text = ' '.join([t.get_text() for t in soup.find_all(text=True)])
-            
-            # Extract patterns
-            extracted = self.extractor.extract_all(text)
-            result['data'] = extracted
-            
-            # AI classification
-            ai_result = self.ai_detector.classify_victim(text)
-            result['validation']['ai_classification'] = ai_result
-            
-            # Check for honeypot
-            honeypot_check = self.ai_detector.detect_honeypot({
-                'content': browser.driver.page_source,
-                'headers': {},
-                'response_time': 100
-            })
-            
-            if honeypot_check['is_honeypot']:
-                logger.warning(f"Honeypot detected: {url}")
-                result['validation']['honeypot'] = True
-                return result
-                
-            # Validate extracted data
-            if extracted.get('EMAIL'):
-                for email in extracted['EMAIL'][:5]:  # Limit
-                    # Check breach databases
-                    breach_result = await self.breach_db.check_hibp(email)
-                    
-                    if breach_result and breach_result.get('breached'):
-                        result['validation']['breached_emails'] = result['validation'].get('breached_emails', [])
-                        result['validation']['breached_emails'].append(breach_result)
-                        result['risk_score'] += 0.3
-                        
-            # Calculate final risk score
-            result['risk_score'] = min(
-                result['risk_score'] + ai_result['confidence'],
-                1.0
-            )
-            
-            # Determine if high-value target
-            if result['risk_score'] > CONFIG['VALIDATION']['MATCH_SCORE_TIERS']['high']:
-                result['high_value_target'] = True
-                
-                # Additional enrichment for high-value
-                if CONFIG['VALIDATION']['BREACH_DB_CHECK']:
-                    await self._enrich_high_value(result)
-                    
-            return result
-            
-        except Exception as e:
-            logger.error(f"Scrape failed for {url}: {e}")
-            return None
-            
-    def _pre_filter_check(self, url):
-        """Pre-filter URLs to save resources"""
-        # Check if crypto-related
-        crypto_patterns = '|'.join(CONFIG['CRYPTO_SPECIFIC']['EXCHANGES'] + 
-                                  CONFIG['CRYPTO_SPECIFIC']['WALLET_TYPES'])
-        
-        if not re.search(crypto_patterns, url, re.I):
-            return False
-            
-        return True
-        
-    def _rotate_identity(self, browser):
-        """Rotate browser identity"""
-        # Change user agent
-        new_ua = browser._generate_user_agent()
-        browser.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            'userAgent': new_ua
-        })
-        
-        # Clear cookies
-        browser.driver.delete_all_cookies()
-        
-        # New fingerprints
-        browser.fingerprints = browser._generate_fingerprints()
-        browser._inject_maximum_stealth()
-        
-    async def _simulate_human_behavior(self, browser):
-        """Simulate human-like behavior"""
-        driver = browser.driver
-        
-        # Random scroll
-        scroll_height = driver.execute_script("return document.body.scrollHeight")
-        
-        for _ in range(1 + secrets.randbelow(3)):
-            scroll_to = 100 + secrets.randbelow(max(scroll_height - 100, 1))
-            driver.execute_script(f"window.scrollTo(0, {scroll_to})")
-            await asyncio.sleep(0.5 + secrets.randbelow(1500) / 1000.0)
-            
-        # Random mouse movements
-        try:
-            action = ActionChains(driver)
-            
-            for _ in range(2 + secrets.randbelow(4)):
-                x = 100 + secrets.randbelow(701)
-                y = 100 + secrets.randbelow(501)
-                action.move_by_offset(x, y)
-                
-            action.perform()
-        except Exception:
-            pass
-            
-    async def _enrich_high_value(self, result):
-        """Enrich high-value targets with additional data"""
-        # This would integrate with people search APIs
-        # Rate limited to avoid detection
-        pass
-
-# ========== DATA EXTRACTOR ==========
 class DataExtractor:
-    """Advanced pattern extraction with validation"""
-    
-    def __init__(self):
-        self.patterns = {
-            'EMAIL': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-            'PHONE': r'[\+]?[(]?[0-9]{1,3}[)]?[-\s\.]?[(]?[0-9]{1,3}[)]?[-\s\.]?[0-9]{3,4}[-\s\.]?[0-9]{3,4}',
-            'BTC_ADDRESS': r'\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}\b',
-            'ETH_ADDRESS': r'\b0x[a-fA-F0-9]{40}\b',
-            'SEED_PHRASE': r'\b(?:seed|phrase|mnemonic|recovery|backup)\s*[:=]?\s*([a-z\s]{20,})\b',
-            'PRIVATE_KEY': r'\b(?:0x)?[a-fA-F0-9]{64}\b',
-            'API_KEY': r'\b[A-Za-z0-9\-_]{32,}\b',
-            'NAME': r'\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b',
-            'COMPLAINT': r'(?:locked|frozen|stuck|missing|lost|hacked|scammed|stolen)',
-            'TRANSACTION_HASH': r'\b0x[a-fA-F0-9]{64}\b',
-            'EXCHANGE_ACCOUNT': r'\b[A-Za-z0-9._%+-]+@(?:coinbase|binance|kraken)\.com\b'
-        }
-        
-    def extract_all(self, text):
-        """Extract all patterns with validation"""
+    """Extract structured data from text using validated regex patterns."""
+
+    PATTERNS = {
+        "email": re.compile(
+            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+        ),
+        "btc_address": re.compile(
+            r"\b(?:bc1[ac-hj-np-z02-9]{25,59}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"
+        ),
+        "eth_address": re.compile(r"\b0x[a-fA-F0-9]{40}\b"),
+        "xmr_address": re.compile(r"\b[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b"),
+        "phone": re.compile(
+            r"(?<!\d)[\+]?[(]?[0-9]{1,3}[)]?[-\s.]?[(]?[0-9]{1,4}[)]?"
+            r"[-\s.]?[0-9]{3,4}[-\s.]?[0-9]{3,4}(?!\d)"
+        ),
+        "onion_v3": re.compile(r"\b[a-z2-7]{56}\.onion\b"),
+        "ipv4": re.compile(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
+            r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+        ),
+        "tx_hash": re.compile(r"\b0x[a-fA-F0-9]{64}\b"),
+    }
+
+    @classmethod
+    def extract_all(cls, text: str) -> Dict[str, List[str]]:
+        """Extract all pattern matches from text, deduplicated and limited."""
         if not text:
             return {}
-            
         results = {}
-        
-        for pattern_name, pattern in self.patterns.items():
-            try:
-                matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
-                
-                if matches:
-                    # Clean and validate
-                    validated = []
-                    
-                    for match in matches:
-                        if pattern_name == 'NAME' and isinstance(match, tuple):
-                            match = ' '.join(match)
-                            
-                        if self._validate_match(pattern_name, match):
-                            validated.append(match)
-                            
-                    if validated:
-                        results[pattern_name] = list(set(validated))[:10]  # Limit and dedupe
-                        
-            except Exception as e:
-                logger.error(f"Extraction error for {pattern_name}: {e}")
-                
+        for name, pattern in cls.PATTERNS.items():
+            matches = pattern.findall(text)
+            if matches:
+                # Deduplicate, limit to 50, validate
+                seen: Set[str] = set()
+                validated = []
+                for m in matches:
+                    m = m.strip()
+                    if m not in seen and cls._validate(name, m):
+                        seen.add(m)
+                        validated.append(m)
+                        if len(validated) >= 50:
+                            break
+                if validated:
+                    results[name] = validated
         return results
-        
-    def _validate_match(self, pattern_type, match):
-        """Validate extracted match"""
-        if pattern_type == 'EMAIL':
-            return '@' in match and '.' in match.split('@')[1]
-            
-        elif pattern_type == 'BTC_ADDRESS':
-            # Basic length check
-            return 26 <= len(match) <= 62
-            
-        elif pattern_type == 'ETH_ADDRESS':
-            # Check format
-            return len(match) == 42 and match.startswith('0x')
-            
-        elif pattern_type == 'PHONE':
-            # Remove non-digits and check length
-            digits = re.sub(r'\D', '', match)
+
+    @classmethod
+    def _validate(cls, pattern_type: str, value: str) -> bool:
+        """Basic validation to reject false positives."""
+        if pattern_type == "email":
+            parts = value.split("@")
+            return len(parts) == 2 and "." in parts[1] and len(parts[1]) > 3
+        elif pattern_type == "btc_address":
+            return 26 <= len(value) <= 62
+        elif pattern_type == "eth_address":
+            return len(value) == 42
+        elif pattern_type == "phone":
+            digits = re.sub(r"\D", "", value)
             return 7 <= len(digits) <= 15
-            
-        elif pattern_type == 'SEED_PHRASE':
-            # Check word count
-            words = match.split()
-            return len(words) in [12, 15, 18, 21, 24]
-            
         return True
 
-# ========== SECURE DATA PROCESSOR ==========
-class SecureDataProcessor:
-    """Process and store data with maximum security"""
-    
-    def __init__(self):
-        self.ram_path = HardwareOPSEC.setup_ram_disk()
-        self.encryption_key = self._derive_key()
-        self.shamir_shares = []
-        
-    def _derive_key(self):
-        """Derive encryption key from hardware"""
-        # Mix multiple entropy sources
-        sources = []
-        
-        # CPU serial
-        try:
-            with open('/proc/cpuinfo', 'rb') as f:
-                sources.append(f.read())
-        except Exception:
-            pass
-            
-        # Machine ID
-        try:
-            with open('/etc/machine-id', 'rb') as f:
-                sources.append(f.read())
-        except Exception:
-            pass
-            
-        # Random
-        sources.append(os.urandom(64))
-        
-        # Derive key
-        combined = b''.join(sources)
-        _dynamic_salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=_dynamic_salt,
-            iterations=100000
-        )
-        
-        return base64.urlsafe_b64encode(kdf.derive(combined))
-        
-    def process_results(self, raw_results):
-        """Process results with categorization"""
-        _coarsened = int(time.time()) // 600 * 600
-        processed = {
-            'metadata': {
-                'timestamp': datetime.fromtimestamp(_coarsened).isoformat(),
-                'total_results': len(raw_results),
-                'processing_id': secrets.token_hex(8)
-            },
-            'high_value_targets': [],
-            'medium_value_targets': [],
-            'low_value_targets': [],
-            'breached_accounts': [],
-            'crypto_addresses': [],
-            'credentials': []
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Honeypot Detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HoneypotDetector:
+    """Detect honeypot/bot-trap pages using content and behavior heuristics."""
+
+    TRAP_PATTERNS = [
+        re.compile(r"(?:honeypot|bot.?trap|bot.?check)", re.I),
+        re.compile(r"please\s+verify\s+you\s+are\s+human", re.I),
+        re.compile(r"unusual\s+activity\s+detected", re.I),
+        re.compile(r"access\s+denied.*cloudflare", re.I),
+        re.compile(r"captcha", re.I),
+    ]
+
+    SUSPICIOUS_HEADERS = {
+        "x-honeypot", "x-trap", "x-security-scan",
+        "x-abuse-info", "cf-mitigated",
+    }
+
+    @classmethod
+    def check(cls, content: str, headers: dict, response_time_ms: float,
+              redirects: int) -> dict:
+        """Returns {is_honeypot: bool, confidence: float, reasons: []}."""
+        score = 0.0
+        reasons = []
+
+        # Content patterns
+        for pat in cls.TRAP_PATTERNS:
+            if pat.search(content[:5000]):
+                score += 0.25
+                reasons.append(f"trap_pattern:{pat.pattern[:30]}")
+
+        # Suspicious headers
+        lower_headers = {k.lower(): v for k, v in headers.items()}
+        for h in cls.SUSPICIOUS_HEADERS:
+            if h in lower_headers:
+                score += 0.2
+                reasons.append(f"suspicious_header:{h}")
+
+        # Too-fast response (bot-served page)
+        if response_time_ms < 30:
+            score += 0.15
+            reasons.append("response_too_fast")
+
+        # Excessive redirects
+        if redirects > 4:
+            score += 0.2
+            reasons.append(f"excessive_redirects:{redirects}")
+
+        # Very small page (likely a block/challenge page)
+        if len(content) < 500 and ("blocked" in content.lower() or "denied" in content.lower()):
+            score += 0.3
+            reasons.append("tiny_block_page")
+
+        return {
+            "is_honeypot": score >= 0.5,
+            "confidence": min(score, 1.0),
+            "reasons": reasons,
         }
-        
-        for result in raw_results:
-            if not result:
-                continue
-                
-            risk_score = result.get('risk_score', 0)
-            data = result.get('data', {})
-            
-            # Create target profile
-            profile = {
-                'url': result['url'],
-                'risk_score': risk_score,
-                'extracted_data': data,
-                'validation': result.get('validation', {}),
-                'timestamp': result['timestamp']
-            }
-            
-            # Categorize by risk
-            if risk_score >= CONFIG['VALIDATION']['MATCH_SCORE_TIERS']['high']:
-                processed['high_value_targets'].append(profile)
-            elif risk_score >= CONFIG['VALIDATION']['MATCH_SCORE_TIERS']['medium']:
-                processed['medium_value_targets'].append(profile)
-            else:
-                processed['low_value_targets'].append(profile)
-                
-            # Extract specific data types
-            if data.get('EMAIL'):
-                for email in data['EMAIL']:
-                    # Hash PII if configured
-                    if CONFIG['VALIDATION']['HASH_ONLY_PII']:
-                        email_hash = hashlib.sha256(email.encode()).hexdigest()
-                        processed['breached_accounts'].append({
-                            'email_hash': email_hash,
-                            'source': result['url']
-                        })
-                    else:
-                        processed['breached_accounts'].append({
-                            'email': email,
-                            'source': result['url']
-                        })
-                        
-            # Crypto addresses
-            for addr_type in ['BTC_ADDRESS', 'ETH_ADDRESS']:
-                if data.get(addr_type):
-                    for addr in data[addr_type]:
-                        processed['crypto_addresses'].append({
-                            'type': addr_type.replace('_ADDRESS', ''),
-                            'address': addr,
-                            'source': result['url']
-                        })
-                        
-            # Potential credentials
-            if data.get('SEED_PHRASE') or data.get('PRIVATE_KEY'):
-                processed['credentials'].append({
-                    'type': 'high_risk',
-                    'source': result['url'],
-                    'data_hash': hashlib.sha256(
-                        json.dumps(data).encode()
-                    ).hexdigest()
-                })
-                
-        return processed
-        
-    def save_encrypted(self, data):
-        """Save data with encryption and Shamir splitting"""
-        try:
-            # Serialize
-            serialized = json.dumps(data).encode()
-            
-            # Encrypt
-            cipher = Fernet(self.encryption_key)
-            encrypted = cipher.encrypt(serialized)
-            
-            # Save to RAM disk with coarsened timestamp
-            _coarsened = int(time.time()) // 600 * 600
-            timestamp = datetime.fromtimestamp(_coarsened).strftime('%Y%m%d_%H%M')
-            output_file = self.ram_path / f'intel_{timestamp}.enc'
-            
-            with open(output_file, 'wb') as f:
-                f.write(encrypted)
-                
-            logger.info(f"Data encrypted and saved to RAM: {output_file}")
-            
-            # Generate Shamir shares
-            self._generate_shamir_shares()
-            
-            # Set auto-wipe timer
-            if CONFIG['DATA_HANDLING']['AUTO_WIPE_INTERVAL']:
-                threading.Timer(
-                    CONFIG['DATA_HANDLING']['AUTO_WIPE_INTERVAL'],
-                    self._secure_wipe,
-                    args=[output_file]
-                ).start()
-                
-            return output_file
-            
-        except Exception as e:
-            logger.error(f"Encryption failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Rate-Limited Tor Session
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TorSession:
+    """Requests session with Tor proxy, rate limiting, and anti-fingerprinting.
+
+    Features:
+    - All requests through socks5h (DNS at proxy)
+    - Per-domain rate tracking with adaptive delays
+    - Automatic circuit rotation every N requests
+    - Browser profile rotation per request
+    - Exponential backoff on 429/503
+    - Cookie persistence within session
+    """
+
+    def __init__(self, proxy_dict: dict):
+        self._proxy = proxy_dict
+        self._session = requests.Session()
+        self._session.proxies.update(proxy_dict)
+
+        # Retry adapter for transient errors (NOT for rate limits)
+        retry = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        # Rate tracking
+        self._domain_last_request: Dict[str, float] = {}
+        self._request_count = 0
+        self._backoff_domains: Dict[str, float] = {}  # domain → backoff_until
+
+    def get(self, url: str, **kwargs) -> Optional[requests.Response]:
+        """GET with rate limiting, anti-fingerprinting, and error handling."""
+        if shutdown_requested():
             return None
-            
-    def _generate_shamir_shares(self):
-        """Split encryption key using Shamir's Secret Sharing"""
-        try:
-            from Crypto.Protocol.SecretSharing import Shamir
-        except ImportError:
-            logger.warning("PyCryptodome Shamir not available — skipping secret sharing")
-            return
+
+        domain = urlparse(url).netloc
+
+        # Check domain backoff
+        backoff_until = self._backoff_domains.get(domain, 0)
+        if time.time() < backoff_until:
+            wait = backoff_until - time.time()
+            if wait > 0:
+                time.sleep(wait)
+
+        # Per-domain rate limit
+        last = self._domain_last_request.get(domain, 0)
+        elapsed = time.time() - last
+        min_delay = DOMAIN_MIN_DELAY + secrets.randbelow(
+            int((DOMAIN_MAX_DELAY - DOMAIN_MIN_DELAY) * 1000)
+        ) / 1000.0
+        if elapsed < min_delay:
+            time.sleep(min_delay - elapsed)
+
+        # Rotate circuit periodically
+        self._request_count += 1
+        if self._request_count % CIRCUIT_ROTATION_EVERY == 0:
+            newnym()
+            time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+
+        # Pick browser profile
+        headers = _pick_profile()
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
+
+        # Set timeout
+        kwargs.setdefault("timeout", 20)
 
         try:
-            # PyCryptodome Shamir expects exactly 16 bytes; derive a 16-byte
-            # share-key from the full encryption key via truncated SHA-256.
-            share_key = hashlib.sha256(self.encryption_key).digest()[:16]
-            shares = Shamir.split(
-                CONFIG['DATA_HANDLING']['SHAMIR_THRESHOLD'],
-                CONFIG['DATA_HANDLING']['SHAMIR_SHARES'],
-                share_key,
-            )
-            
-            # Save shares to separate locations
-            for idx, share in shares:
-                share_file = self.ram_path / f'share_{idx}.key'
-                with open(share_file, 'wb') as f:
-                    f.write(share)
-                    
-                self.shamir_shares.append(share_file)
-                
-            logger.info(f"Generated {len(shares)} Shamir shares")
-            
-        except Exception as e:
-            logger.error(f"Shamir split failed: {e}")
-            
-    def _secure_wipe(self, filepath):
-        """Securely wipe file from RAM"""
-        try:
-            if filepath.exists():
-                # Overwrite with random data
-                size = filepath.stat().st_size
-                
-                with open(filepath, 'rb+') as f:
-                    for _ in range(3):
-                        f.seek(0)
-                        f.write(os.urandom(size))
-                        f.flush()
-                        
-                # Remove
-                filepath.unlink()
-                
-                logger.info(f"Securely wiped: {filepath}")
-                
-        except Exception as e:
-            logger.error(f"Wipe failed: {e}")
+            self._domain_last_request[domain] = time.time()
+            resp = self._session.get(url, headers=headers, **kwargs)
 
-# ========== MAIN ORCHESTRATOR ==========
-class UltimateIntelOrchestrator:
-    """Main orchestration with all features combined"""
-    
-    def __init__(self):
-        # Initialize hardware OPSEC
-        HardwareOPSEC.randomize_hostname()
-        HardwareOPSEC.randomize_mac()
-        HardwareOPSEC.disable_gpu()
-        
-        # Initialize components
-        self.scraper = DistributedScraperEngine()
-        self.processor = SecureDataProcessor()
-        self.breach_db = BreachDatabaseManager()
-        self.ai_detector = AIEnhancedDetector()
-        
-        # Verify integrity
-        if CONFIG['OPSEC']['INTEGRITY_CHECK']:
-            self._verify_integrity()
-            
-    def _verify_integrity(self):
-        """Verify script integrity"""
-        # Calculate hash of current script
-        with open(__file__, 'rb') as f:
-            current_hash = hashlib.sha256(f.read()).hexdigest()
-            
-        logger.info(f"Script integrity hash: {current_hash}")
-        
-    async def execute_campaign(self, keywords=None):
-        """Execute full intelligence campaign"""
-        if not keywords:
-            keywords = CONFIG['CRYPTO_SPECIFIC']['COMPLAINT_KEYWORDS']
-            
-        logger.info("Starting Ultimate Intelligence Campaign")
-        logger.info(f"Keywords: {len(keywords)}")
-        logger.info(f"OPSEC Level: Maximum")
-        
-        all_results = []
-        
-        try:
-            # Phase 1: Generate decoy traffic
-            if CONFIG['STEALTH']['DECOY_TRAFFIC']:
-                asyncio.create_task(self._generate_decoy_traffic())
-                
-            # Phase 2: Search multiple platforms
-            search_tasks = []
-            
-            # Google searches with morphing
-            for keyword in keywords:
-                if CONFIG['TARGETING']['ADAPTIVE_MORPHING']:
-                    keyword = self._morph_query(keyword)
-                    
-                search_tasks.append(self._search_google(keyword))
-                
-            # Telegram searches
-            if self.scraper.telegram.client:
-                for keyword in keywords[:5]:
-                    search_tasks.append(
-                        self.scraper.telegram.search_channels(keyword)
-                    )
-                    
-            # Reddit/Twitter
-            for keyword in keywords[:5]:
-                search_tasks.append(self._search_social(keyword))
-                
-            # Execute searches
-            search_results = await asyncio.gather(*search_tasks)
-            
-            # Flatten results
-            urls_to_scrape = []
-            telegram_results = []
-            
-            for result_set in search_results:
-                if isinstance(result_set, list):
-                    for item in result_set:
-                        if isinstance(item, dict):
-                            if 'url' in item:
-                                urls_to_scrape.append(item['url'])
-                            elif 'channel' in item:
-                                telegram_results.append(item)
-                                
-            logger.info(f"Found {len(urls_to_scrape)} URLs to scrape")
-            logger.info(f"Found {len(telegram_results)} Telegram results")
-            
-            # Phase 3: Deep scraping with validation
-            scrape_tasks = []
-            
-            for url in urls_to_scrape[:50]:  # Limit
-                scrape_tasks.append(
-                    self.scraper.scrape_with_validation(url)
-                )
-                
-                # Circuit rotation
-                if len(scrape_tasks) % CONFIG['STEALTH']['CIRCUIT_ROTATION'] == 0:
-                    # Rotate Tor circuit
-                    logger.info("Rotating Tor circuit")
-                    await asyncio.sleep(5)
-                    
-            # Execute scraping
-            scrape_results = await asyncio.gather(*scrape_tasks)
-            
-            # Filter None results
-            valid_results = [r for r in scrape_results if r is not None]
-            all_results.extend(valid_results)
-            
-            # Add Telegram results
-            for tg_result in telegram_results:
-                all_results.append({
-                    'url': f"telegram:{tg_result.get('channel')}",
-                    'data': tg_result.get('extracted', {}),
-                    'risk_score': 0.5,  # Default medium risk
-                    'timestamp': tg_result.get('date', datetime.now().isoformat())
-                })
-                
-            logger.info(f"Collected {len(all_results)} total results")
-            
-            # Phase 4: Process and categorize
-            processed = self.processor.process_results(all_results)
-            
-            # Phase 5: Generate report
-            report = self._generate_report(processed, all_results)
-            
-            # Phase 6: Save encrypted
-            output_file = self.processor.save_encrypted(report)
-            
-            # Phase 7: Cleanup
-            await self._cleanup()
-            
-            return report
-            
-        except Exception as e:
-            logger.critical(f"Campaign failed: {e}")
-            await self._emergency_cleanup()
-            raise
-            
-    def _morph_query(self, query):
-        """Morph query with typos and synonyms"""
-        # Add typos
-        if secrets.randbelow(10) < 3:
-            pos = secrets.randbelow(len(query))
-            query = query[:pos] + query[pos+1:]
-            
-        # Add synonyms
-        synonyms = {
-            'locked': ['frozen', 'blocked', 'restricted'],
-            'help': ['support', 'assistance', 'urgent'],
-            'account': ['wallet', 'funds', 'balance']
-        }
-        
-        for word, syns in synonyms.items():
-            if word in query.lower():
-                query = query.replace(word, secrets.choice(syns))
-                
-        return query
-        
-    async def _search_google(self, query):
-        """Google search with stealth"""
-        results = []
-        
-        # Implementation would use browser pool
-        # Placeholder
-        
-        return results
-        
-    async def _search_social(self, query):
-        """Search social media platforms"""
-        results = []
-        
-        # Implementation
-        # Placeholder
-        
-        return results
-        
-    async def _generate_decoy_traffic(self):
-        """Generate decoy traffic to mask real activity.
-        Routes through Tor SOCKS proxy to avoid clearnet leaks."""
-        decoy_sites = [
-            'https://www.amazon.com',
-            'https://www.youtube.com',
-            'https://stackoverflow.com',
-            'https://www.nytimes.com',
-            'https://www.wikipedia.org'
-        ]
-        try:
-            from aiohttp_socks import ProxyConnector
-        except ImportError:
-            logging.warning("aiohttp_socks not installed — decoy traffic disabled to avoid clearnet leak")
-            return
+            # Handle rate limiting
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", "60"))
+                retry_after = min(retry_after, 300)  # cap at 5 min
+                self._backoff_domains[domain] = time.time() + retry_after
+                integrity_log("intel", f"rate_limited:{domain}:wait={retry_after}s")
+                return None
 
-        while True:
+            if resp.status_code == 503:
+                # Service unavailable — likely WAF challenge
+                self._backoff_domains[domain] = time.time() + 30
+                return None
+
+            if resp.status_code == 403:
+                # Forbidden — likely blocked
+                integrity_log("intel", f"blocked:{domain}")
+                self._backoff_domains[domain] = time.time() + 120
+                newnym()  # Rotate circuit on block
+                return None
+
+            resp.raise_for_status()
+            return resp
+
+        except requests.exceptions.Timeout:
+            integrity_log("intel", f"timeout:{domain}")
+            return None
+        except requests.exceptions.ConnectionError:
+            integrity_log("intel", f"conn_error:{domain}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            integrity_log("intel", f"http_error:{domain}:{e.response.status_code if e.response else '?'}")
+            return None
+
+    def close(self):
+        """Close the session."""
+        self._session.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Breach Database Integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BreachChecker:
+    """Check emails against breach databases via Tor."""
+
+    def __init__(self, session: TorSession):
+        self._session = session
+
+    def check_hibp(self, email: str) -> Optional[dict]:
+        """Check Have I Been Pwned for email breaches.
+
+        Requires HIBP_KEY env var (paid API key).
+        Uses the v3 breachedaccount endpoint, NOT pwnedpasswords.
+        """
+        if not HIBP_API_KEY:
+            return None
+
+        url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email)}?truncateResponse=true"
+        resp = self._session.get(url, headers={
+            "hibp-api-key": HIBP_API_KEY,
+            "User-Agent": "IntelGather-OSINT",
+        })
+
+        if resp is None:
+            return {"email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                    "status": "error", "source": "hibp"}
+
+        if resp.status_code == 200:
             try:
-                await asyncio.sleep(30 + secrets.randbelow(271))
-                site = secrets.choice(decoy_sites)
-                connector = ProxyConnector.from_url('socks5h://127.0.0.1:9050')
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(site) as resp:
-                        await resp.text()
-            except Exception:
+                breaches = resp.json()
+                return {
+                    "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                    "breached": True,
+                    "breach_count": len(breaches) if isinstance(breaches, list) else 1,
+                    "breach_names": [b.get("Name", "?") for b in breaches[:10]]
+                                    if isinstance(breaches, list) else [],
+                    "source": "hibp",
+                }
+            except (ValueError, KeyError):
                 pass
-                
-    def _generate_report(self, processed, raw_results):
-        """Generate comprehensive report"""
-        _coarsened_ts = int(time.time()) // 600 * 600
-        report = {
-            'metadata': {
-                'campaign_id': secrets.token_hex(16),
-                'timestamp': datetime.fromtimestamp(_coarsened_ts).isoformat(),
-                'version': 'v20+ASF',
-                'opsec_level': 'maximum',
-                'total_results': len(raw_results)
-            },
-            'executive_summary': {
-                'high_value_targets': len(processed['high_value_targets']),
-                'medium_value_targets': len(processed['medium_value_targets']),
-                'breached_accounts': len(processed['breached_accounts']),
-                'crypto_addresses': len(processed['crypto_addresses']),
-                'potential_credentials': len(processed['credentials'])
-            },
-            'risk_analysis': {
-                'critical_findings': [],
-                'recommendations': []
-            },
-            'detailed_results': processed,
-            'raw_intelligence': raw_results[:20]  # Limited sample
+        elif resp.status_code == 404:
+            return {
+                "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                "breached": False,
+                "source": "hibp",
+            }
+
+        return None
+
+    def check_dehashed(self, email: str) -> Optional[dict]:
+        """Check Dehashed API for breach data.
+
+        Requires DEHASHED_KEY and DEHASHED_EMAIL env vars.
+        """
+        if not DEHASHED_API_KEY or not DEHASHED_EMAIL:
+            return None
+
+        url = f"https://api.dehashed.com/search?query=email:{quote(email)}"
+        resp = self._session.get(url, headers={
+            "Accept": "application/json",
+        })
+
+        if resp is None:
+            return None
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                entries = data.get("entries", [])
+                if entries:
+                    return {
+                        "email_hash": hashlib.sha256(email.encode()).hexdigest()[:16],
+                        "breached": True,
+                        "entry_count": len(entries),
+                        "sources": list(set(e.get("database_name", "?")
+                                            for e in entries[:20])),
+                        "source": "dehashed",
+                    }
+            except (ValueError, KeyError):
+                pass
+
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Web Scraper with Anti-Blocking
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IntelScraper:
+    """Scrape web pages for OSINT data with anti-blocking measures."""
+
+    def __init__(self, session: TorSession):
+        self._session = session
+        self._extractor = DataExtractor()
+        self._honeypot = HoneypotDetector()
+
+    def scrape_url(self, url: str) -> Optional[dict]:
+        """Scrape a single URL with full pipeline: fetch → detect → extract."""
+        t0 = time.time()
+        resp = self._session.get(url)
+        elapsed_ms = (time.time() - t0) * 1000
+
+        if resp is None:
+            return None
+
+        content = resp.text
+        headers = dict(resp.headers)
+
+        # Honeypot check
+        hp = self._honeypot.check(
+            content, headers, elapsed_ms, len(resp.history)
+        )
+        if hp["is_honeypot"]:
+            integrity_log("intel", f"honeypot_detected:{urlparse(url).netloc}")
+            return {"url": url, "honeypot": True, "hp_reasons": hp["reasons"]}
+
+        # Parse HTML
+        text = content
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(content, "html.parser")
+                # Remove script/style tags
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ", strip=True)
+                # Also get page title and meta description
+                title = soup.title.string.strip() if soup.title and soup.title.string else ""
+                meta_desc = ""
+                meta_tag = soup.find("meta", attrs={"name": "description"})
+                if meta_tag:
+                    meta_desc = meta_tag.get("content", "")
+            except Exception:
+                title = ""
+                meta_desc = ""
+        else:
+            title = ""
+            meta_desc = ""
+
+        # Extract data patterns
+        extracted = self._extractor.extract_all(text)
+
+        _coarsened = int(time.time()) // 600 * 600
+        return {
+            "url": url,
+            "title": title[:200],
+            "description": meta_desc[:500],
+            "extracted": extracted,
+            "content_length": len(content),
+            "timestamp": _coarsened,
+            "honeypot": False,
         }
-        
-        # Add critical findings
-        if processed['high_value_targets']:
-            report['risk_analysis']['critical_findings'].append(
-                f"Identified {len(processed['high_value_targets'])} high-value targets with confirmed breach data"
-            )
-            
-        if processed['credentials']:
-            report['risk_analysis']['critical_findings'].append(
-                f"Found {len(processed['credentials'])} potential credential exposures"
-            )
-            
-        # Recommendations
-        report['risk_analysis']['recommendations'] = [
-            "Prioritize high-value targets for immediate investigation",
-            "Cross-reference breached accounts with active exchange users",
-            "Monitor identified crypto addresses for suspicious activity"
-        ]
-        
-        return report
-        
-    async def _cleanup(self):
-        """Standard cleanup"""
-        logger.info("Performing cleanup...")
-        
-        # Clear browser caches
-        for browser in self.scraper.browser_pool:
-            if browser.driver:
-                browser.driver.delete_all_cookies()
-                browser.driver.execute_script("window.localStorage.clear();")
-                
-        # Clear logs if configured
-        if CONFIG['OPSEC']['AUTO_SHRED']:
-            logger.wipe()
-            
-        # Garbage collection
-        gc.collect()
-        
-    async def _emergency_cleanup(self):
-        """Emergency cleanup on failure"""
-        logger.critical("Emergency cleanup initiated")
-        
+
+    def scrape_search_results(self, query: str, max_results: int = 20) -> List[dict]:
+        """Search via DuckDuckGo HTML (no API key needed, Tor-friendly).
+
+        DuckDuckGo's HTML endpoint doesn't block Tor and doesn't require
+        JavaScript. Google aggressively blocks automated queries and Tor
+        exit nodes — DDG is the only reliable option for Tor-based search.
+        """
+        results = []
+        encoded_q = quote(query)
+
+        # DuckDuckGo HTML search
+        url = f"https://html.duckduckgo.com/html/?q={encoded_q}"
+        resp = self._session.get(url)
+        if resp is None:
+            return results
+
+        if not HAS_BS4:
+            integrity_log("intel", "bs4_missing:cannot_parse_search")
+            return results
+
         try:
-            # Kill all browsers
-            for browser in self.scraper.browser_pool:
-                if browser.driver:
-                    browser.driver.quit()
-                    
-            # Wipe RAM disk
-            ram_path = Path("/dev/shm/intel")
-            if ram_path.exists():
-                shutil.rmtree(ram_path)
-                
-            # Clear logs
-            logger.wipe()
-            
-            # Kill containers
-            if HAS_DOCKER:
-                for container in self.scraper.container_pool:
-                    try:
-                        container.kill()
-                    except Exception:
-                        pass
-                        
-        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = soup.find_all("a", class_="result__a")
+            for link in links[:max_results]:
+                href = link.get("href", "")
+                title = link.get_text(strip=True)
+                if href and href.startswith("http"):
+                    results.append({"url": href, "title": title, "source": "ddg"})
+        except Exception as e:
+            integrity_log("intel", f"search_parse_error:{str(e)[:40]}")
+
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Secure Output Storage
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SecureStorage:
+    """RAM-only encrypted output with auto-wipe."""
+
+    def __init__(self):
+        self._dir = RAM_DIR
+        self._dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(self._dir), 0o700)
+        self._key = Fernet.generate_key() if HAS_FERNET else None
+        self._cipher = Fernet(self._key) if self._key else None
+
+    def save(self, data: dict, label: str = "intel") -> Path:
+        """Save data to RAM disk, optionally encrypted."""
+        _ts = int(time.time()) // 600 * 600
+        ts_str = datetime.fromtimestamp(_ts, tz=timezone.utc).strftime("%Y%m%d_%H%M")
+        filename = f"{label}_{ts_str}_{secure_hex(4)}"
+
+        serialized = json.dumps(data, indent=2, default=str).encode()
+
+        if self._cipher:
+            encrypted = self._cipher.encrypt(serialized)
+            outpath = self._dir / f"{filename}.enc"
+            outpath.write_bytes(encrypted)
+            secure_file_perms(outpath, 0o600)
+            # Save key separately
+            keypath = self._dir / f"{filename}.key"
+            keypath.write_bytes(self._key)
+            secure_file_perms(keypath, 0o600)
+        else:
+            outpath = self._dir / f"{filename}.json"
+            outpath.write_text(serialized.decode())
+            secure_file_perms(outpath, 0o600)
+
+        return outpath
+
+    def wipe_all(self):
+        """Securely wipe all intel data from RAM disk."""
+        if not self._dir.exists():
+            return
+        for f in self._dir.iterdir():
+            try:
+                size = f.stat().st_size
+                with open(f, "r+b") as fh:
+                    fh.write(os.urandom(size))
+                    fh.flush()
+                f.unlink()
+            except (OSError, PermissionError):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        try:
+            self._dir.rmdir()
+        except OSError:
             pass
 
-# ========== MAIN EXECUTION ==========
-async def main():
-    """Main execution with maximum OPSEC"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main Orchestrator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IntelOrchestrator:
+    """Main orchestration: search → scrape → extract → check → store."""
+
+    def __init__(self, proxy: dict):
+        self._session = TorSession(proxy)
+        self._scraper = IntelScraper(self._session)
+        self._breach = BreachChecker(self._session)
+        self._storage = SecureStorage()
+        self._results: List[dict] = []
+
+    def run_query(self, query: str, max_pages: int = 20):
+        """Search + scrape pipeline for a text query."""
+        print(f"  [*] Searching: {query[:40]}...")
+        search_results = self._scraper.scrape_search_results(query, max_pages)
+        print(f"  [+] Found {len(search_results)} results")
+
+        for i, sr in enumerate(search_results):
+            if shutdown_requested():
+                print("  [!] Shutdown requested, stopping.")
+                break
+            url = sr["url"]
+            print(f"  [*] Scraping [{i+1}/{len(search_results)}] {urlparse(url).netloc}...")
+            result = self._scraper.scrape_url(url)
+            if result:
+                self._results.append(result)
+                # Print extracted data summary
+                extracted = result.get("extracted", {})
+                if extracted:
+                    for etype, evals in extracted.items():
+                        print(f"      {etype}: {len(evals)} found")
+
+    def run_email_check(self, email: str):
+        """Check a single email against breach databases."""
+        print(f"  [*] Checking breaches for: {email[:3]}***@***")
+
+        hibp = self._breach.check_hibp(email)
+        if hibp:
+            if hibp.get("breached"):
+                print(f"  [!] HIBP: BREACHED ({hibp.get('breach_count', '?')} breaches)")
+                for name in hibp.get("breach_names", [])[:5]:
+                    print(f"      - {name}")
+            elif hibp.get("status") == "error":
+                print(f"  [!] HIBP: check failed (rate limit or network issue)")
+            else:
+                print(f"  [+] HIBP: not found in breaches")
+            self._results.append({"type": "breach_check", "data": hibp})
+
+        dehashed = self._breach.check_dehashed(email)
+        if dehashed:
+            if dehashed.get("breached"):
+                print(f"  [!] Dehashed: BREACHED ({dehashed.get('entry_count', '?')} entries)")
+            self._results.append({"type": "breach_check", "data": dehashed})
+
+        if not hibp and not dehashed:
+            print(f"  [*] No breach DB API keys configured (set HIBP_KEY / DEHASHED_KEY)")
+
+    def run_domain_recon(self, domain: str):
+        """Basic domain reconnaissance via public sources."""
+        print(f"  [*] Domain recon: {domain}")
+
+        # Scrape the main page
+        for scheme in ["https", "http"]:
+            url = f"{scheme}://{domain}"
+            result = self._scraper.scrape_url(url)
+            if result and not result.get("honeypot"):
+                self._results.append(result)
+                print(f"  [+] Main page scraped ({result.get('content_length', 0)} bytes)")
+                extracted = result.get("extracted", {})
+                for etype, evals in extracted.items():
+                    print(f"      {etype}: {len(evals)} found")
+                break
+
+        # Search for domain mentions
+        dork_queries = [
+            f'site:{domain}',
+            f'"{domain}" email contact',
+            f'"{domain}" leak breach',
+        ]
+        for dq in dork_queries:
+            if shutdown_requested():
+                break
+            self.run_query(dq, max_pages=10)
+
+    def run_file(self, filepath: Path):
+        """Process targets from a file (one per line: email, domain, or query)."""
+        if not filepath.exists():
+            print(f"  [!] File not found: {scrub_path(filepath)}")
+            return
+
+        lines = filepath.read_text().strip().splitlines()
+        print(f"  [*] Processing {len(lines)} targets from file")
+
+        for i, line in enumerate(lines):
+            if shutdown_requested():
+                break
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            print(f"\n  ── Target {i+1}/{len(lines)} ──")
+            if "@" in line and "." in line:
+                self.run_email_check(line)
+            elif "." in line and " " not in line:
+                self.run_domain_recon(line)
+            else:
+                self.run_query(line, max_pages=10)
+
+    def save_and_report(self) -> Optional[Path]:
+        """Process results, save encrypted, print summary."""
+        if not self._results:
+            print("\n  [*] No results collected.")
+            return None
+
+        # Aggregate
+        all_emails: Set[str] = set()
+        all_btc: Set[str] = set()
+        all_eth: Set[str] = set()
+        all_xmr: Set[str] = set()
+        all_phones: Set[str] = set()
+        all_onions: Set[str] = set()
+        breach_count = 0
+        honeypot_count = 0
+        pages_scraped = 0
+
+        for r in self._results:
+            if r.get("honeypot"):
+                honeypot_count += 1
+                continue
+            if r.get("type") == "breach_check":
+                if r.get("data", {}).get("breached"):
+                    breach_count += 1
+                continue
+
+            pages_scraped += 1
+            ex = r.get("extracted", {})
+            all_emails.update(ex.get("email", []))
+            all_btc.update(ex.get("btc_address", []))
+            all_eth.update(ex.get("eth_address", []))
+            all_xmr.update(ex.get("xmr_address", []))
+            all_phones.update(ex.get("phone", []))
+            all_onions.update(ex.get("onion_v3", []))
+
+        _coarsened = int(time.time()) // 600 * 600
+        report = {
+            "schema": "intel_report_v1",
+            "timestamp": _coarsened,
+            "summary": {
+                "pages_scraped": pages_scraped,
+                "honeypots_detected": honeypot_count,
+                "breached_accounts": breach_count,
+                "unique_emails": len(all_emails),
+                "unique_btc_addresses": len(all_btc),
+                "unique_eth_addresses": len(all_eth),
+                "unique_xmr_addresses": len(all_xmr),
+                "unique_phones": len(all_phones),
+                "unique_onion_services": len(all_onions),
+            },
+            "results": self._results,
+        }
+
+        outpath = self._storage.save(report)
+
+        # Print summary
+        print(f"\n  {'═' * 50}")
+        print(f"  COLLECTION SUMMARY")
+        print(f"  {'═' * 50}")
+        print(f"  Pages scraped:      {pages_scraped}")
+        print(f"  Honeypots detected: {honeypot_count}")
+        print(f"  Breached accounts:  {breach_count}")
+        print(f"  Emails found:       {len(all_emails)}")
+        print(f"  BTC addresses:      {len(all_btc)}")
+        print(f"  ETH addresses:      {len(all_eth)}")
+        print(f"  XMR addresses:      {len(all_xmr)}")
+        print(f"  Phone numbers:      {len(all_phones)}")
+        print(f"  Onion services:     {len(all_onions)}")
+        print(f"  {'═' * 50}")
+        encrypted = "encrypted" if HAS_FERNET else "plaintext"
+        print(f"  [+] Report saved ({encrypted}): {scrub_path(outpath)}")
+
+        return outpath
+
+    def cleanup(self):
+        """Close session and clean up."""
+        self._session.close()
+        gc.collect()
+
+    def emergency_wipe(self):
+        """Wipe all data from RAM disk."""
+        self._storage.wipe_all()
+        self._results.clear()
+        gc.collect()
+        print("  [+] Emergency wipe complete")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        description="Intelligence Gathering System — OSINT via Tor with anti-blocking",
+    )
+    ap.add_argument("--query", "-q", help="Search query to investigate")
+    ap.add_argument("--email", "-e", help="Email to check against breach databases")
+    ap.add_argument("--domain", "-d", help="Domain to perform reconnaissance on")
+    ap.add_argument("--file", "-f", type=Path,
+                    help="File with targets (one per line: email, domain, or query)")
+    ap.add_argument("--tor-proxy", default="socks5h://127.0.0.1:9050",
+                    help="Tor SOCKS5 proxy (default: socks5h://127.0.0.1:9050)")
+    ap.add_argument("--max-results", type=int, default=20,
+                    help="Max search results to scrape per query (default: 20)")
+    ap.add_argument("--wipe", action="store_true",
+                    help="Wipe all intel data from RAM and exit")
+    args = ap.parse_args()
+
+    if args.wipe:
+        storage = SecureStorage()
+        storage.wipe_all()
+        print("  [+] Intel data wiped from RAM.")
+        return
+
+    if not args.query and not args.email and not args.domain and not args.file:
+        ap.error("At least one of --query, --email, --domain, or --file is required")
+
+    # Enforce Tor
+    proxy = require_tor_proxy(args.tor_proxy)
+    integrity_log("intel", "session_start")
+
+    orchestrator = IntelOrchestrator(proxy)
+
     try:
-        print("""
-        ====================================================
-            Intelligence System - Maximum OPSEC Edition
-        ====================================================
-        """)
-        
-        # Create orchestrator
-        orchestrator = UltimateIntelOrchestrator()
-        
-        # Execute campaign
-        report = await orchestrator.execute_campaign()
-        
-        # Summary
-        print("\n" + "="*50)
-        print("CAMPAIGN COMPLETE")
-        print("="*50)
-        print(f"High-Value Targets: {report['executive_summary']['high_value_targets']}")
-        print(f"Breached Accounts: {report['executive_summary']['breached_accounts']}")
-        print(f"Crypto Addresses: {report['executive_summary']['crypto_addresses']}")
-        print(f"Credentials Found: {report['executive_summary']['potential_credentials']}")
-        print("="*50)
-        
+        if args.email:
+            orchestrator.run_email_check(args.email)
+
+        if args.domain:
+            orchestrator.run_domain_recon(args.domain)
+
+        if args.query:
+            orchestrator.run_query(args.query, args.max_results)
+
+        if args.file:
+            orchestrator.run_file(args.file)
+
+        orchestrator.save_and_report()
+
     except KeyboardInterrupt:
-        print("\n[!] Operation interrupted by user")
-        try:
-            await orchestrator._emergency_cleanup()
-        except NameError:
-            pass
-        
+        print("\n  [!] Interrupted — saving partial results...")
+        orchestrator.save_and_report()
     except Exception as e:
-        print(f"\n[!] Critical error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n  [!] Error: {str(e)[:60]}")
+        integrity_log("intel", f"error:{str(e)[:40]}")
+    finally:
+        orchestrator.cleanup()
+        integrity_log("intel", "session_end")
+
+    print()
+    print("  [*] Done. Data is in RAM (/dev/shm/intel/).")
+    print("  [*] Run with --wipe to securely erase when finished.")
+
 
 if __name__ == "__main__":
-    # Check if running as root (recommended for full features)
-    if os.geteuid() != 0:
-        print("[!] Warning: Not running as root. Some features may be limited.")
-        
-    # Run async main
-    asyncio.run(main())
+    main()
