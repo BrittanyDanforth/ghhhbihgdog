@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import List
 
 VERSION = "1.0"
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 RAM_DEFAULT = Path("/dev/shm/fake_errors.log") if Path("/dev/shm").exists() else Path("fake_errors.log")
 
 TAGS = ["WARN", "ERROR", "RPC_FAIL", "TIMEOUT", "SIGSEGV", "OOM", "ASSERT"]

@@ -20,6 +20,7 @@ Usage:
 import argparse, ctypes, hashlib, json, os, secrets, signal, sys, time, threading
 from pathlib import Path
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
 SHM_DIR = Path("/dev/shm")
 SEED_SHM = SHM_DIR / ".gs_seed_active"
 LOCK_SHM = SHM_DIR / ".gs_seed_lock"
@@ -235,7 +236,7 @@ def cmd_verify(args):
             print(f"      TTL:  EXPIRED (wiper should have cleaned this)")
 
     # Check if it was leaked to disk
-    for check_dir in [Path("."), Path.home()]:
+    for check_dir in [_TOOLKIT_ROOT, Path.home()]:
         for pattern in ["entropy_seed*.json", "*seed*.json"]:
             for f in check_dir.glob(pattern):
                 if f != SEED_SHM:

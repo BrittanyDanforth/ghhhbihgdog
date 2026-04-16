@@ -80,9 +80,11 @@ except ImportError:
     QR_AVAILABLE = False
     print("[!] QR code functionality disabled. Install with: pip install qrcode[pil] pillow")
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # Enhanced file paths with OPSEC considerations
-SEED_FILE = Path("entropy_seed.json")
-SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path.cwd() / ".tmp_secure"
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".tmp_secure"
 LOCKED_BUNDLE = SECURE_DIR / ".gs_locked_bundle"
 LOCK_METADATA = SECURE_DIR / ".gs_lock_meta"
 QR_OUTPUT_DIR = SECURE_DIR / "qr_codes"

@@ -56,9 +56,11 @@ import threading
 import subprocess
 import tempfile
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # Enhanced configuration
-SEED_FILE = Path("entropy_seed.json")
-DEFAULT_OUTPUT = Path("mirror_exec.log")
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+DEFAULT_OUTPUT = _TOOLKIT_ROOT / "mirror_exec.log"
 TEMP_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path(tempfile.gettempdir())
 
 # Sophisticated tag mutation maps with context awareness
