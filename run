@@ -28,10 +28,17 @@ def _venv_works() -> bool:
         return False
     try:
         import subprocess as _sp
+        _venv_env = os.environ.copy()
+        for _sk in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE", "HIBP_KEY",
+                     "DEHASHED_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN",
+                     "GH_TOKEN", "SSH_AUTH_SOCK"):
+            _venv_env.pop(_sk, None)
+        _venv_env["HISTFILE"] = "/dev/null"
         r = _sp.run(
             [str(_VENV_PY), "-c",
              "import requests, socks, tenacity, stem, monero, psutil"],
             capture_output=True, timeout=10,
+            env=_venv_env,
         )
         return r.returncode == 0
     except Exception:
@@ -202,6 +209,38 @@ def _sanitized_env(extra_strip: tuple = ()) -> dict:
     return env
 
 
+def _subst_attacker(content: str, attacker_url: str) -> str:
+    """Replace [ATTACKER] placeholders without corrupting existing URLs.
+
+    Replaces [ATTACKER] with the actual URL, then replaces bare ATTACKER
+    only when it appears as a standalone token (not inside the already-
+    substituted URL). Avoids turning https://[ATTACKER] into
+    https://http://127.0.0.1:XXXX.
+    """
+    if not attacker_url:
+        return content
+    # First pass: replace the bracketed placeholder
+    content = content.replace("[ATTACKER]", attacker_url)
+    # Second pass: replace https://ATTACKER only if it wasn't already
+    # substituted (i.e. [ATTACKER] didn't occur at that position)
+    if f"https://{attacker_url}" not in content:
+        content = content.replace("https://ATTACKER", attacker_url)
+    if f"http://{attacker_url}" not in content:
+        content = content.replace("http://ATTACKER", attacker_url)
+    return content
+
+
+def _jittered_delay(lo: float = 1.0, hi: float = 4.0) -> None:
+    """Sleep a jittered duration with wide enough range to avoid fingerprinting."""
+    if hi <= lo:
+        _time_mod.sleep(max(lo, 0.1))
+        return
+    ms_range = int((hi - lo) * 1000)
+    if ms_range <= 0:
+        ms_range = 1
+    _time_mod.sleep(lo + secrets.randbelow(ms_range) / 1000.0)
+
+
 def run_script(path: Path, args: list, label: str = ""):
     if label:
         info(f"Running {label}...")
@@ -212,6 +251,7 @@ def run_script(path: Path, args: list, label: str = ""):
             [python, str(path)] + args,
             timeout=7200,
             env=child_env,
+            cwd=str(ROOT),
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -424,9 +464,10 @@ class ExploitServer:
                     pass
 
                 def do_GET(hself):
-                    raw_path = hself.path.split("?")[0].split("#")[0]
+                    from urllib.parse import unquote
+                    raw_path = unquote(hself.path.split("?")[0].split("#")[0])
                     fname = raw_path.lstrip("/")
-                    if not fname or "/" in fname or "\\" in fname:
+                    if not fname or "/" in fname or "\\" in fname or ".." in fname:
                         hself.send_error(404)
                         return
                     candidate = (Path(_root) / fname).resolve()
@@ -609,6 +650,7 @@ class AuditTrail:
             failures = sum(1 for e in self._entries
                            if e["action"] == "execute" and e.get("success") is False)
             vuln_types = set(e["vuln_type"] for e in self._entries if e["vuln_type"])
+            alert_count = len(self._alerts)
 
         return {
             "session_id": self._session_id,
@@ -620,7 +662,7 @@ class AuditTrail:
             "skips": skips,
             "files_generated": files,
             "edits": edits,
-            "alerts": len(self._alerts),
+            "alerts": alert_count,
             "vuln_types_tested": sorted(vuln_types),
         }
 
@@ -633,13 +675,14 @@ class AuditTrail:
         stats = self.get_stats()
         with self._lock:
             entries_copy = list(self._entries)
+            alerts_copy = list(self._alerts)
 
         if fmt == "json":
             report = {
                 "report_type": "exploit_walkthrough_audit",
                 "session": stats,
                 "entries": entries_copy,
-                "alerts": list(self._alerts),
+                "alerts": alerts_copy,
             }
             return json.dumps(report, indent=2)
 
@@ -672,11 +715,11 @@ class AuditTrail:
                 f"  {i:>3}. [{e['ts_iso']}] {e['action']:16s}"
                 f"{risk_tag} {e.get('detail', '')}{status}"
             )
-        if self._alerts:
+        if alerts_copy:
             lines.append("")
             lines.append("HIGH-RISK ALERTS")
             lines.append("-" * 60)
-            for a in self._alerts:
+            for a in alerts_copy:
                 lines.append(f"  [{a['ts_iso']}] {a['action']}: {a.get('detail', '')}")
         lines.append("")
         lines.append("=" * 60)
@@ -772,7 +815,7 @@ class SafeExecutor:
                 info("Aborted.")
                 self._audit.log("abort", f"critical_risk_rejected: {command[:40]}", risk=risk)
                 return None
-            _time_mod.sleep(1 + secrets.randbelow(2))
+            _jittered_delay(1.0, 4.0)
             if not confirm("SECOND CONFIRMATION: Execute this critical command?"):
                 info("Aborted.")
                 self._audit.log("abort", f"critical_risk_rejected_2nd: {command[:40]}", risk=risk)
@@ -784,13 +827,13 @@ class SafeExecutor:
                 info("Aborted.")
                 self._audit.log("abort", f"high_risk_rejected: {command[:40]}", risk=risk)
                 return None
-            _time_mod.sleep(0.5 + secrets.randbelow(2))
+            _jittered_delay(0.5, 3.0)
         else:
             if not confirm("CONFIRM: Execute this command through Tor?"):
                 info("Aborted.")
                 return None
 
-        _time_mod.sleep(1 + secrets.randbelow(3))
+        _jittered_delay(1.0, 5.0)
 
         try:
             result = subprocess.run(
@@ -1599,7 +1642,8 @@ def _detect_iface() -> str:
     """Auto-detect active network interface."""
     try:
         r = subprocess.run(["ip", "route", "show", "default"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5,
+                           env=_sanitized_env())
         if r.returncode == 0 and "dev " in r.stdout:
             import re
             m = re.search(r"dev\s+(\S+)", r.stdout)
@@ -1893,7 +1937,10 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
         sev = v.get("severity", "?")
         color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C}.get(sev, D)
-        conf = v.get("confidence", 0)
+        try:
+            conf = float(v.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
         ei = v.get("exploit_info", {})
         etype = ei.get("type", "unknown")
         param = ei.get("parameter", "")
@@ -1965,9 +2012,7 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
             finfo = step["generate_file"]
             content = finfo["content"]
             content = content.replace("[TARGET_URL]", target)
-            content = content.replace("[ATTACKER]", attacker_url)
-            content = content.replace("https://ATTACKER", attacker_url)
-            content = content.replace("ATTACKER", attacker_url)
+            content = _subst_attacker(content, attacker_url)
 
             fname = finfo.get("filename", f"{etype}_{secrets.token_hex(3)}.html")
             out_path = file_mgr.generate(
@@ -2011,14 +2056,16 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
         step = steps[step_idx]
         step_num = step_idx + 1
 
+        step_title = step.get("title", f"Step {step_num}")
+
         # Auto-skip steps above preset risk threshold
         step_risk = step.get("risk", "")
         if not step_risk and step.get("warning"):
             step_risk = "HIGH"
         if step_risk in preset.get("skip_risk", ()):
-            print(f"  {D}[SKIP {step_num}/{len(steps)}] {step['title']} "
+            print(f"  {D}[SKIP {step_num}/{len(steps)}] {step_title} "
                   f"(blocked by {preset['label']} preset){N}")
-            audit.log_skip(f"preset_block:{step['title']}", etype)
+            audit.log_skip(f"preset_block:{step_title}", etype)
             step_idx += 1
             continue
 
@@ -2029,7 +2076,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             existing = file_mgr.get_path(fname) if fname else None
             if existing:
                 serve_url = server.get_url(existing.name)
-                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step['title']}{N}")
+                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
                 ok(f"Already generated: {existing.name}")
                 ok(f"Serving at: {serve_url}")
                 if finfo.get("note"):
@@ -2039,12 +2086,10 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 chain_data["last_file"] = existing.name
                 chain_data["last_serve_url"] = serve_url
             else:
-                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step['title']}{N}")
-                content = finfo["content"]
+                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
+                content = finfo.get("content", "")
                 content = content.replace("[TARGET_URL]", test_url)
-                content = content.replace("[ATTACKER]", attacker_url)
-                content = content.replace("https://ATTACKER", attacker_url)
-                content = content.replace("ATTACKER", attacker_url)
+                content = _subst_attacker(content, attacker_url)
 
                 out_path = file_mgr.generate(
                     exploit_type=etype, content=content, custom_name=fname,
@@ -2067,8 +2112,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
         cmd = step.get("command", "")
 
         # Apply chain_data substitutions
-        cmd = cmd.replace("[ATTACKER]", attacker_url)
-        cmd = cmd.replace("ATTACKER", attacker_url)
+        cmd = _subst_attacker(cmd, attacker_url)
         cmd = cmd.replace("[TARGET_URL]", test_url)
         for key, val in chain_data.items():
             placeholder = f"[{key.upper()}]"
@@ -2077,7 +2121,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
 
         is_info = cmd.startswith("#") or cmd.startswith("<!--")
 
-        print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step['title']}{N}")
+        print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step_title}{N}")
         if step.get("warning"):
             print(f"  {R}WARNING: {step['warning']}{N}")
         if not is_info:
@@ -2089,8 +2133,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
         print()
 
         if is_info:
-            info(f"Info: {step.get('note', step['title'])}")
-            audit.log("info_step", step["title"], vuln_type=etype)
+            info(f"Info: {step.get('note', step_title)}")
+            audit.log("info_step", step_title, vuln_type=etype)
             step_idx += 1
             continue
 
@@ -2126,10 +2170,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 continue
 
             if action in ("r", "run"):
-                _time_mod.sleep(
-                    preset["delay_lo"] +
-                    secrets.randbelow(int((preset["delay_hi"] - preset["delay_lo"]) * 1000)) / 1000.0
-                )
+                _jittered_delay(preset["delay_lo"], preset["delay_hi"])
                 result = executor.execute(cmd, step, vuln_type=etype,
                                           timeout=preset["timeout"])
                 if result and result.stdout:
@@ -2149,7 +2190,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 custom = prompt("Enter command to execute", default_cmd)
                 if not custom or custom.startswith("#"):
                     info("No executable command entered — skipping step")
-                    audit.log_skip(f"edit_empty:{step['title']}", etype)
+                    audit.log_skip(f"edit_empty:{step_title}", etype)
                     step_idx += 1
                     break
                 if not confirm(f"Execute: {custom[:80]}... ?"):
@@ -3433,6 +3474,9 @@ def cli_passthrough():
     if not tool_path.exists():
         print(f"  {R}[!]{N} Tool not found: {tool_name}")
         sys.exit(1)
+    _exec_env = _sanitized_env()
+    os.environ.clear()
+    os.environ.update(_exec_env)
     os.execvp(sys.executable, [sys.executable, str(tool_path)] + sys.argv[2:])
 
 
