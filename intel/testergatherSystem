@@ -2156,15 +2156,17 @@ class VulnScanner:
                         (headers,), 0.9, findings)
 
         if depth in ("full", "deep"):
-            # Network checks (can be slow)
             self._run_check("sensitive paths", self._check_sensitive_paths,
                             (base_url,), 0.75, findings)
             self._run_check("HTTP methods", self._check_http_methods,
                             (base_url,), 0.7, findings)
             self._run_check("open redirect", self._check_open_redirect,
                             (base_url,), 0.85, findings)
+            self._run_check("CSRF protection", self._check_csrf,
+                            (html,), 0.8, findings)
+            self._run_check("IDOR indicators", self._check_idor,
+                            (base_url, html), 0.7, findings)
 
-            # For full depth: basic SQLi/XSS on base URL (quick probe)
             if depth == "full":
                 self._run_check("SQL injection (quick)", self._check_sqli_indicators,
                                 (base_url,), 0.85, findings)
@@ -2508,16 +2510,32 @@ class VulnScanner:
         if csp:
             if "unsafe-inline" in csp:
                 findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-inline",
-                                 "detail": "Inline scripts/styles permitted, weakening XSS protection.",
-                                 "evidence": "CSP contains 'unsafe-inline'"})
+                                 "detail": "Inline scripts/styles permitted, weakening XSS protection. "
+                                           "Attacker can inject inline <script> tags that execute.",
+                                 "evidence": "CSP contains 'unsafe-inline'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Inject inline <script> — CSP won't block it.",
+                                                  "risk": "XSS via inline script injection"}})
             if "unsafe-eval" in csp:
                 findings.append({"severity": SEV_MEDIUM, "title": "CSP allows unsafe-eval",
-                                 "detail": "eval() permitted in scripts, enabling code injection.",
-                                 "evidence": "CSP contains 'unsafe-eval'"})
+                                 "detail": "eval() permitted in scripts, enabling code injection via "
+                                           "any input that reaches JavaScript eval/Function/setTimeout.",
+                                 "evidence": "CSP contains 'unsafe-eval'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Inject via eval()-reachable input.",
+                                                  "risk": "Code execution via eval()"}})
             if "'*'" in csp or "* " in csp:
                 findings.append({"severity": SEV_HIGH, "title": "CSP has wildcard source",
-                                 "detail": "Wildcard allows loading resources from any origin.",
-                                 "evidence": "CSP contains '*'"})
+                                 "detail": "Wildcard allows loading scripts/styles from any origin. "
+                                           "Attacker can host malicious JS on any domain.",
+                                 "evidence": "CSP contains '*'",
+                                 "exploitable": True,
+                                 "exploit_info": {"type": "csp_bypass",
+                                                  "method": "Host malicious script on any domain, "
+                                                            "load via <script src=...>.",
+                                                  "risk": "Full XSS via external script loading"}})
 
         return findings
 
@@ -2557,7 +2575,13 @@ class VulnScanner:
                 "title": "CORS allows any origin" + (" WITH credentials" if acac == "true" else ""),
                 "detail": "Access-Control-Allow-Origin: * permits any website to read responses." +
                           (" Combined with credentials=true, this is exploitable." if acac == "true" else ""),
-                "evidence": f"ACAO: {acao}, ACAC: {acac or 'absent'}"
+                "evidence": f"ACAO: {acao}, ACAC: {acac or 'absent'}",
+                "exploitable": True,
+                "exploit_info": {"type": "cors_misconfiguration",
+                                 "method": "Host JS on attacker domain that makes authenticated "
+                                           "cross-origin requests to steal data from API responses.",
+                                 "risk": "Cross-origin data theft" +
+                                         (", authenticated session hijacking" if acac == "true" else "")},
             })
 
         # Test reflective CORS — send Origin header and check if reflected
@@ -2570,8 +2594,14 @@ class VulnScanner:
                     "severity": SEV_HIGH,
                     "title": "Reflective CORS — arbitrary origin accepted",
                     "detail": "Server reflects any Origin header in ACAO. "
-                              "Attacker can read authenticated responses.",
-                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}"
+                              "Attacker can read authenticated responses from any origin.",
+                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}",
+                    "exploitable": True,
+                    "exploit_info": {"type": "cors_misconfiguration",
+                                     "method": "Send requests from attacker.com with credentials. "
+                                               "Server reflects attacker origin in ACAO, "
+                                               "allowing cross-origin data theft.",
+                                     "risk": "Authenticated data theft, API abuse"},
                 })
         return findings
 
@@ -2625,9 +2655,113 @@ class VulnScanner:
         if not xfo and "frame-ancestors" not in csp:
             return [{"severity": SEV_MEDIUM, "title": "Clickjacking possible",
                      "detail": "No X-Frame-Options or CSP frame-ancestors. "
-                               "Page can be embedded in attacker iframes.",
-                     "evidence": "Neither X-Frame-Options nor frame-ancestors directive found"}]
+                               "Page can be embedded in attacker-controlled iframes to "
+                               "trick users into clicking hidden buttons/links.",
+                     "evidence": "Neither X-Frame-Options nor frame-ancestors directive found",
+                     "exploitable": True,
+                     "exploit_info": {"type": "clickjacking",
+                                      "method": "Create page with hidden iframe embedding target. "
+                                                "Overlay fake UI to trick clicks on real buttons.",
+                                      "risk": "UI redressing, unauthorized actions, fund transfers"}}]
         return []
+
+    def _check_csrf(self, html: str) -> List[dict]:
+        """Check if forms lack CSRF protection."""
+        findings = []
+        if not HAS_BS4 or not html:
+            return findings
+        try:
+            soup = BeautifulSoup(html[:100000], "html.parser")
+            csrf_names = {"csrf", "token", "_token", "csrfmiddlewaretoken",
+                          "csrf_token", "authenticity_token", "__requestverificationtoken",
+                          "nonce", "_csrf", "xsrf"}
+            for form in soup.find_all("form"):
+                method = (form.get("method", "GET")).upper()
+                if method != "POST":
+                    continue
+                action = form.get("action", "")
+                inputs = {inp.get("name", "").lower() for inp in form.find_all("input")}
+                has_csrf = bool(inputs & csrf_names)
+                if not has_csrf:
+                    form_desc = action[:40] if action else "(same page)"
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"POST form without CSRF token: {form_desc}",
+                        "detail": "Form submits via POST without an anti-CSRF token. "
+                                  "Attacker can craft a page that auto-submits this form "
+                                  "when the victim visits it.",
+                        "evidence": f"POST form action={form_desc}, no CSRF token field found",
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "csrf",
+                            "method": "Create attacker page with hidden form that auto-submits "
+                                      "to the target action. Victim's session cookies are sent "
+                                      "automatically by the browser.",
+                            "risk": "Unauthorized actions, account modification, fund transfers",
+                        },
+                    })
+                    if len(findings) >= 3:
+                        break
+        except Exception:
+            pass
+        return findings
+
+    def _check_idor(self, base_url: str, html: str) -> List[dict]:
+        """Check for Insecure Direct Object Reference indicators."""
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Look for sequential numeric IDs in URLs
+        id_params = re.findall(r'[?&]((?:id|user_id|uid|account|order|item|doc|file_id|record)'
+                               r')=(\d+)', html[:100000], re.I)
+        if not id_params:
+            return findings
+
+        # Test: can we access id+1 and id-1? If responses differ meaningfully
+        # and both return 200, IDOR is likely
+        tested = set()
+        for param_name, param_val in id_params[:3]:
+            key = f"{param_name}:{param_val}"
+            if key in tested:
+                continue
+            tested.add(key)
+            try:
+                val = int(param_val)
+            except ValueError:
+                continue
+
+            # Fetch original
+            orig_url = f"{base_url}?{param_name}={val}"
+            orig_resp = self._session.get(orig_url, allow_wayback=False)
+            if not orig_resp or orig_resp.status_code != 200:
+                continue
+
+            # Fetch id+1
+            next_url = f"{base_url}?{param_name}={val + 1}"
+            next_resp = self._session.get(next_url, allow_wayback=False)
+            if next_resp and next_resp.status_code == 200 and next_resp.text:
+                diff = self._response_diff(orig_resp.text, next_resp.text)
+                if not diff["similar"] and diff["score"] > 0.3:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible IDOR via '{param_name}' parameter",
+                        "detail": f"Sequential IDs ({val}, {val+1}) return different content. "
+                                  "Access control may not be enforced — test with different sessions.",
+                        "evidence": f"param: {param_name}, id={val} and id={val+1} both return 200 "
+                                    f"with different content (similarity={diff['score']})",
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "idor",
+                            "parameter": param_name,
+                            "method": f"Enumerate '{param_name}' values (1, 2, 3...) to access "
+                                      "other users' data. Test with unauthenticated session.",
+                            "risk": "Unauthorized data access, privacy violation, data theft",
+                        },
+                    })
+                    break
+        return findings
 
     def _check_sensitive_paths(self, base_url: str) -> List[dict]:
         """Probe for exposed sensitive files and directories.
