@@ -39,7 +39,7 @@ from gs_common import (
     safe_get, connect_rpc, require_resources, lock_memory,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
-    scrub_address, normalize_broadcast_result,
+    scrub_address, scrub_path, scrub_amount, normalize_broadcast_result,
     opsec_preflight, opsec_gate, validate_plan_schema,
     validate_wallet_json, data_path, TOOLKIT_ROOT,
 )
@@ -236,10 +236,10 @@ def main():
     if args.resume_plan:
         resume_path = Path(args.resume_plan)
         if not resume_path.exists():
-            sys.exit(f"[!] Resume plan not found: {resume_path}")
+            sys.exit(f"[!] Resume plan not found: {scrub_path(resume_path)}")
         if resume_path.is_symlink():
             sys.exit(
-                f"[!] Resume plan is a symlink: {resume_path}\n"
+                f"[!] Resume plan is a symlink: {scrub_path(resume_path)}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
         try:
@@ -247,7 +247,7 @@ def main():
                 _rp = json.load(f)
         except json.JSONDecodeError as e:
             sys.exit(f"[!] Resume plan is not valid JSON: {e}\n"
-                     f"    File: {resume_path}\n"
+                     f"    File: {scrub_path(resume_path)}\n"
                      f"    The plan file may be corrupt. Re-generate it.")
         except OSError as e:
             sys.exit(f"[!] Cannot read resume plan: {e}")
@@ -260,7 +260,7 @@ def main():
         opsec_preflight(proxy, "resume_init")
         newnym()
 
-        print(f"\n  [*] RESUME MODE: Loading existing plan {resume_path}")
+        print(f"\n  [*] RESUME MODE: Loading existing plan {scrub_path(resume_path)}")
         print(f"  [*] Skipping Stages 0-4, jumping to Stage 5.")
         print(f"  [!] OPSEC: Ensure monero-wallet-rpc was started with --log-level 0")
         print(f"  [!]   to suppress RPC call logging (see Stage 0 warnings).")
@@ -325,10 +325,8 @@ def main():
 
         print("\n  [*] Resume finished. Check Stage 5 summary above for failures.")
         print()
-        print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
-        print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
-        print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
-        print("  [!]   Or run:  python3 opsec/paranoia_mode")
+        print("  [!] OPSEC REMINDER: Clear shell history and temp files.")
+        print("  [!]   Run:  python3 opsec/paranoia_mode --cleanup")
         sys.exit(0)
 
     # ---- Determine mode ----
@@ -339,10 +337,10 @@ def main():
     if receive_mode:
         rw_path = Path(args.receive_wallet)
         if not rw_path.exists():
-            sys.exit(f"[!] Receive wallet file not found: {rw_path}")
+            sys.exit(f"[!] Receive wallet file not found: {scrub_path(rw_path)}")
         if rw_path.is_symlink():
             sys.exit(
-                f"[!] Receive wallet file is a symlink: {rw_path}\n"
+                f"[!] Receive wallet file is a symlink: {scrub_path(rw_path)}\n"
                 f"    Symlinks can point to sensitive files. Use the real path."
             )
         try:
@@ -350,7 +348,7 @@ def main():
                 rw_data = json.load(f)
         except json.JSONDecodeError as e:
             sys.exit(f"[!] Receive wallet file is not valid JSON: {e}\n"
-                     f"    File: {rw_path}\n"
+                     f"    File: {scrub_path(rw_path)}\n"
                      f"    Re-create with option 6 (Create Wallet).")
         except OSError as e:
             sys.exit(f"[!] Cannot read receive wallet file: {e}")
@@ -396,7 +394,7 @@ def main():
     else:
         if not BTC_RE.match(args.btc_entry):
             sys.exit(
-                f"[!] Invalid BTC address: {args.btc_entry}\n"
+                f"[!] Invalid BTC address: {scrub_address(args.btc_entry)}\n"
                 f"    Expected formats:\n"
                 f"      Legacy P2PKH:     1... (25-34 chars)\n"
                 f"      P2SH:             3... (25-34 chars)\n"
@@ -855,6 +853,7 @@ def main():
             print()
             print()
             print("  SENDER INSTRUCTIONS: send BTC to deposit addresses below.")
+            print("  (Full details in output file)")
             for dep in swap_deposits:
                 print(f"\n  --- Chunk {dep['chunk']} ---")
                 print(f"  Send exactly: {dep['btc_amount']} BTC")
@@ -1272,7 +1271,7 @@ def main():
     ufile = outdir / f"unsigned_{secure_hex(8)}.json"
     atomic_write_json(unsigned, ufile)
     integrity_log("stage4", "unsigned_dump_saved")
-    print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
+    print(f"  [+] Unsigned plan: {scrub_path(ufile)} ({len(plan)} TXs)")
 
     if args.cold or args.airgap:
         mode = "cold" if args.cold else "airgap"
@@ -1282,7 +1281,7 @@ def main():
             if stale_path.exists():
                 stale_path.unlink()
                 integrity_log("stage4", f"cleaned_stale:{stale}")
-        print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
+        print(f"  [+] {mode.upper()} mode - transfer {scrub_path(ufile)} to signer manually.")
         if not is_mock_plan:
             print(f"  [!] WARNING: Plan file contains real data.")
             print(f"  [!] {ufile.name} has the full mixing graph.")
@@ -1369,11 +1368,8 @@ def main():
 
     print("\n  [*] Pipeline finished. Check Stage 5 summary above for failures.")
     print()
-    print("  [!] OPSEC REMINDER: Clear your shell history to remove command-line traces:")
-    print("  [!]   bash:  history -c && history -w && rm -f ~/.bash_history")
-    print("  [!]   zsh:   fc -W /dev/null && rm -f ~/.zsh_history")
-    print("  [!]   Or run:  python3 opsec/paranoia_mode")
-    print("  [!]   Also check: ~/.python_history, ~/.lesshst, ~/.viminfo")
+    print("  [!] OPSEC REMINDER: Clear shell history and temp files.")
+    print("  [!]   Run:  python3 opsec/paranoia_mode --cleanup")
 
 
 def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
@@ -1482,7 +1478,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
             plan_data = json.load(_pf)
     except json.JSONDecodeError as e:
         sys.exit(f"[!] Plan file is corrupt or not valid JSON: {e}\n"
-                 f"    File: {ufile}\n"
+                 f"    File: {scrub_path(ufile)}\n"
                  f"    Re-generate the plan with option 1 or 3.")
     except OSError as e:
         sys.exit(f"[!] Cannot read plan file: {e}")
@@ -2083,7 +2079,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
                 print(f"  [!] Key image sync failed for TX {tx_idx}.")
                 print(f"  [!] Next TX will likely fail (double-spend).")
                 print(f"  [!] Transfer outputs to offline signer, export key images,")
-                print(f"  [!] place key_images.hex in {staging_dir}/, re-run with --resume-plan.")
+                print(f"  [!] place key_images.hex in {scrub_path(staging_dir)}/, re-run with --resume-plan.")
                 print(f"  [!] Aborting: key image sync required for view-only wallet.")
                 fail_count += 1
                 break
