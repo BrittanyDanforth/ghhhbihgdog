@@ -1,4 +1,4 @@
-# GhostSpiral — Setup Guide
+# Setup Guide
 
 Everything is copy-paste. You need a Debian/Kali VM with `sudo`.
 
@@ -7,8 +7,16 @@ Everything is copy-paste. You need a Debian/Kali VM with `sudo`.
 ## Step 1: Install
 
 ```
-sudo apt update && sudo apt install -y tor torsocks jq gnupg python3-pip python3-venv curl wget bzip2
 bash install.sh
+```
+
+The installer handles everything: system packages, Python environment,
+dependency verification, and Tor configuration. Run it again any time
+if something breaks — it skips what's already working.
+
+Start Tor if the installer couldn't:
+
+```
 sudo systemctl start tor && sudo systemctl enable tor
 ```
 
@@ -28,17 +36,15 @@ Then fix your browser and CLI tools:
 sudo bash tor_firewall.sh --setup-browser
 ```
 
-This automatically configures:
-- **wget, curl, apt, pip** — work through Tor immediately
-- **Firefox** — SOCKS5 proxy + DNS privacy + WebRTC disabled
+This configures wget, curl, apt, pip, and Firefox to route through Tor.
 
-**For your current terminal** (if wget still fails after the above):
+**For your current terminal** (if wget still fails):
 
 ```
 . /etc/profile.d/tor-proxy.sh
 ```
 
-New terminals get it automatically.
+New terminals get this automatically.
 
 **Make firewall survive reboots:**
 
@@ -56,12 +62,12 @@ sudo bash tor_firewall.sh --setup-bridges
 
 ## Step 3: Install Monero tools
 
-After `--setup-browser`, wget works through Tor automatically. If it still fails, prefix with `torsocks`:
+The installer offers to download these automatically. If you need to
+do it manually:
 
 ```
 cd /tmp
 wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
-# If wget fails: torsocks wget https://downloads.getmonero.org/cli/linux64 -O monero.tar.bz2
 tar xf monero.tar.bz2
 sudo cp monero-x86_64-linux-gnu-*/monerod /usr/local/bin/
 sudo cp monero-x86_64-linux-gnu-*/monero-wallet-cli /usr/local/bin/
@@ -78,32 +84,31 @@ cd -
 monero-wallet-cli --generate-new-wallet ~/my_wallet
 ```
 
-- Pick a password — **remember it**
+- Pick a strong password — **remember it**
 - Write down the 25-word seed — **on paper, store safely**
-- That seed is the ONLY way to recover funds
+- That seed is the ONLY way to recover funds if the wallet file is lost
 
-**If you get "file already exists":** You already have a wallet. Skip this step and use
-your existing wallet in the next step. If you want a fresh wallet, pick a different name:
-```
-monero-wallet-cli --generate-new-wallet ~/my_wallet2
-```
+If you already have a wallet, skip this step.
 
 ---
 
 ## Step 5: Start services (before each session)
 
-**Start blockchain node** (first time downloads ~170 GB):
+**Start blockchain node** (first run downloads ~170 GB):
 
 ```
 monerod --detach --data-dir ~/.bitmonero
 ```
 
-**Start wallet server** — create a password file first (avoids password in shell history):
+**Start wallet server:**
+
+Create a password file (avoids putting the password in shell history):
 
 ```
-echo -n "YOUR_PASSWORD" > /dev/shm/.wallet_pw && chmod 600 /dev/shm/.wallet_pw
+touch /dev/shm/.wallet_pw && chmod 600 /dev/shm/.wallet_pw
 ```
 
+Write your wallet password into that file using a text editor (not echo).
 Then start the wallet server:
 
 ```
@@ -117,22 +122,15 @@ monero-wallet-rpc \
   --detach
 ```
 
-What the flags mean:
-| Flag | Why |
-|------|-----|
+| Flag | Purpose |
+|------|---------|
 | `--rpc-bind-port 18083` | Port the toolkit connects to |
 | `--wallet-file` | Your wallet from Step 4 |
-| `--password-file` | Reads password from file (not visible in `ps aux`) |
-| `--daemon-address` | Your local node from above |
+| `--password-file` | Reads password from file (not visible in process list) |
+| `--daemon-address` | Your local blockchain node |
 | `--disable-rpc-login` | Safe — only listens on localhost |
 | `--log-level 0` | **OPSEC:** prevents logging your operations |
 | `--detach` | Runs in background |
-
-**Set password as env var** (hides it from `ps aux`):
-
-```
-export GS_WALLET_PASSWORD="YOUR_PASSWORD"
-```
 
 ---
 
@@ -152,22 +150,13 @@ Choose `0` to verify everything is connected.
 ./gs
 ```
 
-Choose `9` (Paranoia Cleanup). Then:
+Choose `9` (Paranoia Cleanup) to wipe all toolkit artifacts. Then
+stop the services and clean up:
 
 ```
-pkill monero-wallet-rpc
 monerod exit
 unset GS_WALLET_PASSWORD
-history -c && history -w
 ```
-
-| Command | What it does |
-|---------|-------------|
-| `./gs` → `9` | Wipes all toolkit artifacts and logs |
-| `pkill monero-wallet-rpc` | Stops the wallet server |
-| `monerod exit` | Stops the blockchain node cleanly |
-| `unset GS_WALLET_PASSWORD` | Removes password from shell memory |
-| `history -c && history -w` | Clears command history |
 
 ---
 
@@ -183,10 +172,6 @@ history -c && history -w
 | Keep after reboot | `sudo bash tor_firewall.sh --persist` |
 | Disable firewall | `sudo bash tor_firewall.sh --undo` |
 | Check firewall | `sudo bash tor_firewall.sh --status` |
-| Start node | `monerod --detach --data-dir ~/.bitmonero` |
-| Stop node | `monerod exit` |
-| Start wallet-rpc | See Step 5 |
-| Stop wallet-rpc | `pkill monero-wallet-rpc` |
 | Cleanup | `./gs` → `9` |
 
 ---

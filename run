@@ -374,6 +374,15 @@ def _opsec_preflight():
 
 def flow_full_pipeline(detected_port=None):
     heading("Full Pipeline: BTC → Mixed XMR")
+
+    # Pre-check: warn if prior state exists
+    _lock = ROOT / ".mixer.lock"
+    if _lock.exists():
+        warn("A mixer lock file exists from a prior run.")
+        warn("Another instance may be running, or a prior run crashed.")
+        if not confirm("Continue anyway? (the lock will be checked again by the pipeline)"):
+            return
+
     if not _opsec_preflight():
         return
     tor = get_tor_proxy(detected_port)
@@ -383,12 +392,11 @@ def flow_full_pipeline(detected_port=None):
     btc = prompt("Your BTC address (bc1..., 1..., or 3...)")
     if not btc:
         err("BTC address is required.")
-        info("Expected formats: bc1... (Bech32, 42-62 chars), 1... (25-34 chars), or 3... (P2SH, 34 chars)")
+        info("Expected formats: bc1... (Bech32), 1... (legacy), or 3... (P2SH)")
         return
     if not (btc.startswith("bc1") or btc.startswith("1") or btc.startswith("3")):
-        err(f"Invalid BTC address format: {btc[:12]}...")
+        err(f"Invalid BTC address format.")
         info("Must start with bc1 (Bech32), 1 (legacy), or 3 (P2SH).")
-        info("Example: bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh")
         return
 
     amt = prompt("BTC amount to swap (e.g. 0.1)")
@@ -433,7 +441,11 @@ def flow_full_pipeline(detected_port=None):
         "--rpc-primary", rpc,
     ]
 
-    if not run_script(CORE / "mixer_core", args, "Full pipeline"):
+    if run_script(CORE / "mixer_core", args, "Full pipeline"):
+        print()
+        ok("Pipeline completed.")
+        info("Next: Run option 9 (Paranoia Cleanup) to wipe all traces.")
+    else:
         err("Pipeline failed. Check the output above for details.")
         info("If the pipeline crashed mid-run, use option 5 (Resume) to continue.")
 
@@ -539,7 +551,11 @@ def flow_receive(detected_port=None):
         "--wallets", wallets,
         "--deep", depth,
     ]
-    if not run_script(CORE / "mixer_core", args, "Mixing"):
+    if run_script(CORE / "mixer_core", args, "Mixing"):
+        print()
+        ok("Mixing completed.")
+        info("Next: Run option 9 (Paranoia Cleanup) to wipe all traces.")
+    else:
         err("Mixing failed. Check the output above for details.")
         info("If the pipeline crashed mid-run, use option 5 (Resume) to continue.")
 
@@ -605,7 +621,13 @@ def flow_broadcast(detected_port=None):
         "--rpc", rpc,
         "--wallet-rpc", wrpc,
     ]
-    run_script(CORE / "broadcast_signed_xmr", args, "Broadcaster")
+    if run_script(CORE / "broadcast_signed_xmr", args, "Broadcaster"):
+        print()
+        ok("Broadcast completed.")
+        info("Next: Run option 9 (Paranoia Cleanup) to wipe all traces.")
+    else:
+        err("Broadcast had errors. Check the output above.")
+        info("You may re-run option 4 to retry failed broadcasts.")
 
 
 def flow_resume(detected_port=None):
@@ -669,20 +691,38 @@ def flow_resume(detected_port=None):
                 info("The plan file may be corrupt. Re-generate it with option 1 or 3.")
                 return
 
+        # Check for stale plans (old ThorChain quotes may have expired)
+        _plan_created = _meta.get("created", 0)
+        if _plan_created > 0:
+            import time as _time
+            _age_hours = (_time.time() - _plan_created) / 3600
+            if _age_hours > 24:
+                warn(f"This plan is {_age_hours:.0f} hours old.")
+                warn("ThorChain quotes and fee estimates may be stale.")
+                if not confirm("Continue with this plan?"):
+                    info("Re-generate the plan with option 1 or 3.")
+                    return
+            elif _age_hours > 1:
+                info(f"Plan age: {_age_hours:.1f} hours. Check quote expiry before sending BTC.")
+
+        if _meta.get("mock"):
+            warn("This is a MOCK plan (dry-run) — it cannot be broadcast with real funds.")
+            return
+
         if _meta.get("btc_entry"):
             resume_flag = "--btc-entry"
             wf_arg = _meta["btc_entry"]
-            info(f"Sender resume detected (BTC entry: {wf_arg[:8]}...)")
+            info("Sender resume detected.")
         else:
             wf_arg = wf
     except json.JSONDecodeError as e:
-        err(f"Plan file is not valid JSON (corrupt or truncated): {e}")
+        err("Plan file is not valid JSON (may be corrupt).")
         return
     except OSError as e:
-        err(f"Cannot read plan file: {e}")
+        err("Cannot read plan file.")
         return
     except KeyError as e:
-        warn(f"Could not read plan metadata ({e}), defaulting to receive-wallet mode")
+        warn("Could not read plan metadata, defaulting to receive-wallet mode.")
         wf_arg = wf
 
     args = [
@@ -691,11 +731,25 @@ def flow_resume(detected_port=None):
         "--tor-proxy", tor,
         "--rpc-primary", rpc,
     ]
-    run_script(CORE / "mixer_core", args, "Resume")
+    if run_script(CORE / "mixer_core", args, "Resume"):
+        print()
+        ok("Resume completed.")
+        info("Next: Run option 9 (Paranoia Cleanup) to wipe all traces.")
+    else:
+        err("Resume failed. Check the output above.")
 
 
 def flow_create_wallet(detected_port=None):
     heading("Create Receive Wallet")
+
+    # Check if wallets already exist
+    _existing = _find_wallet_files()
+    if _existing:
+        info(f"You already have {len(_existing)} wallet(s).")
+        if not confirm("Create another wallet?"):
+            info("Use option 2 (Receive) to continue with an existing wallet.")
+            return
+
     tor = get_tor_proxy(detected_port)
     if not tor:
         return
@@ -703,7 +757,10 @@ def flow_create_wallet(detected_port=None):
     args = ["--rpc", rpc, "--tor-proxy", tor]
     if run_script(CORE / "create_receive_wallet", args, "Wallet creator"):
         print()
-        ok("Wallet created. Next: use option 2 (Receive) for the full guided flow.")
+        ok("Wallet created.")
+        info("Next steps:")
+        info("  Option 2 (Receive) — full guided receive flow")
+        info("  Option 7 (Swap Preparer) — generate deposit address for sender")
 
 
 def flow_swap_preparer(detected_port=None):
@@ -894,7 +951,7 @@ TOOLS = {
     "mixer": CORE/"mixer_core", "gs": CORE/"mixer_core",
     "signer": CORE/"airgap_tx_signer", "broadcast": CORE/"broadcast_signed_xmr",
     "wallet": CORE/"create_receive_wallet", "swap": CORE/"thor_swap_preparer",
-    "exit": CORE/"exit_strategy_simulator",
+    "exit": CORE/"exit_strategy_simulator", "exitplan": CORE/"exit_strategy_simulator",
     "dag": MODS/"PAG", "labels": MODS/"labelmask", "poison": MODS/"label_poisoner",
     "leaves": MODS/"fake_leaf_inserter", "noise": MODS/"noise",
     "mutate": MODS/"ghostmutator", "wdna": MODS/"wdna", "seed": MODS/"en_seeder",
@@ -916,7 +973,7 @@ def cli_passthrough():
         sys.exit(1)
     tool_path = TOOLS[tool_name]
     if not tool_path.exists():
-        print(f"  {R}[!]{N} File not found: {tool_path}")
+        print(f"  {R}[!]{N} Tool not found: {tool_name}")
         sys.exit(1)
     os.execvp(sys.executable, [sys.executable, str(tool_path)] + sys.argv[2:])
 
@@ -928,9 +985,26 @@ def main():
     if len(sys.argv) > 1:
         arg = sys.argv[1].lower()
         if arg in ("list", "--list"):
-            print(f"\n  {B}Available tools:{N}")
-            for name, path in sorted(TOOLS.items()):
-                print(f"    {name:14s} → {path.relative_to(ROOT)}")
+            print(f"\n  {B}Core pipeline tools:{N}")
+            _core_tools = {k: v for k, v in TOOLS.items()
+                           if str(v).startswith(str(CORE))}
+            for name in sorted(_core_tools):
+                print(f"    {name:14s} → {_core_tools[name].relative_to(ROOT)}")
+            print(f"\n  {B}Modules (standalone / expert):{N}")
+            _mod_tools = {k: v for k, v in TOOLS.items()
+                          if str(v).startswith(str(MODS))}
+            for name in sorted(_mod_tools):
+                print(f"    {name:14s} → {_mod_tools[name].relative_to(ROOT)}")
+            print(f"\n  {B}OPSEC utilities:{N}")
+            _opsec_tools = {k: v for k, v in TOOLS.items()
+                            if str(v).startswith(str(OPSEC))}
+            for name in sorted(_opsec_tools):
+                print(f"    {name:14s} → {_opsec_tools[name].relative_to(ROOT)}")
+            print(f"\n  {B}Intel (standalone):{N}")
+            _intel_tools = {k: v for k, v in TOOLS.items()
+                            if str(v).startswith(str(INTEL))}
+            for name in sorted(_intel_tools):
+                print(f"    {name:14s} → {_intel_tools[name].relative_to(ROOT)}")
             print(f"\n  Usage: python3 run <tool> [args...]\n")
             return
         if arg in ("help", "--help", "-h"):
