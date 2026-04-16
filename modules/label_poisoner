@@ -27,6 +27,7 @@ Usage
                               --dag dag_structure.json  \
                               --out label_map_poisoned.json
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import json
@@ -37,6 +38,11 @@ import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple
+
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
 
 VERSION = "1.0"
 ZERO_WIDTH = "\u200b"  # zero‑width space — confuses grep/ML
@@ -209,25 +215,25 @@ Examples:
     parser.add_argument(
         "--labels", 
         type=Path, 
-        default=Path("label_map.json"), 
+        default=_TOOLKIT_ROOT / "label_map.json", 
         help="Input label_map.json from label_masker_v3.py (default: label_map.json)"
     )
     parser.add_argument(
         "--dag", 
         type=Path, 
-        default=Path("dag_structure.json"), 
+        default=_TOOLKIT_ROOT / "dag_structure.json", 
         help="DAG JSON for hash seed (default: dag_structure.json)"
     )
     parser.add_argument(
         "--seed", 
         type=Path, 
-        default=Path("entropy_seed.json"), 
+        default=_TOOLKIT_ROOT / "entropy_seed.json", 
         help="entropy_seed.json for deterministic RNG (default: entropy_seed.json)"
     )
     parser.add_argument(
         "--out", "-o", 
         type=Path, 
-        default=Path("label_map_poisoned.json"), 
+        default=_TOOLKIT_ROOT / "label_map_poisoned.json", 
         help="Output path (default: label_map_poisoned.json)"
     )
     parser.add_argument(
@@ -310,40 +316,14 @@ Examples:
         sys.exit(1)
 
     print(f"[*] Writing output to {args.out}...")
-    # Write output with proper error handling
     try:
-        # Ensure output directory exists
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Write to temporary file first, then rename (atomic operation)
-        tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-        
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            os.chmod(tmp_path, 0o600)
-            json.dump(poisoned, fh, indent=2, sort_keys=True, ensure_ascii=False)
-        
-        # Atomic rename
-        tmp_path.replace(args.out)
-        os.chmod(args.out, 0o600)
-        
+        atomic_write_json(poisoned, args.out, perms=0o600)
         print(f"[+] Successfully created poisoned label map → {args.out}")
         print(f"[+] Processed nodes: {processed_count}/{len(labels_data['labels'])}")
         print(f"[+] File size: {args.out.stat().st_size} bytes")
-        
-    except PermissionError:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        print(f"[!] Permission denied writing to {args.out}")
-        sys.exit(1)
-    except OSError as e:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        print(f"[!] OS error writing output file: {e}")
-        sys.exit(1)
     except Exception as e:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        print(f"[!] Unexpected error writing output file: {e}")
+        print(f"[!] Error writing output file: {e}")
         sys.exit(1)
 
 

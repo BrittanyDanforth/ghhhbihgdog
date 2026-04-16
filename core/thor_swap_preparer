@@ -16,6 +16,9 @@ OPSEC hardening:
   - GPG encryption support with import guard
   - Integrity hash-chain per pair
 """
+# NOTE: This is the standalone ThorChain quote fetcher, used by menu options 2 and 7.
+# mixer_core has its own internal _thornode_quote() for the automated pipeline.
+# Both use the same THORNODE_APIS endpoints and quote format.
 from __future__ import annotations
 import argparse, json, os, sys, time, re
 from decimal import Decimal
@@ -30,11 +33,12 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
-    secure_hex,
+    scrub_path, scrub_amount,
+    secure_hex, data_path, TOOLKIT_ROOT,
 )
 
 try:
-    from monero.address import Address as XMRAddress
+    from monero.address import address as _parse_xmr_address
 except ImportError:
     sys.exit("[!] python-monero missing - pip install monero")
 
@@ -57,9 +61,10 @@ BTC_RE = re.compile(
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$")
 
 
-def _btc_per_xmr(proxy: Optional[Dict[str, str]]) -> Decimal:
-    """Fetch current BTC/XMR rate from CoinGecko.
-    Set COINGECKO_API_KEY env var for reliable access (free demo key).
+def _btc_per_xmr(proxy: Optional[Dict[str, str]]) -> Optional[Decimal]:
+    """Fetch current BTC/XMR rate from CoinGecko for slippage checking.
+    Returns None if the oracle fails — caller must skip slippage check
+    rather than use a stale hardcoded rate that could suppress warnings.
     """
     try:
         url = CG_PRICE
@@ -73,21 +78,27 @@ def _btc_per_xmr(proxy: Optional[Dict[str, str]]) -> Decimal:
         return rate
     except Exception as e:
         integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
-        print("[!] Price oracle failed; using hardcoded fallback 0.003 BTC/XMR")
-        print("[!] WARNING: This fallback never updates. If the real XMR/BTC rate has")
-        print("[!] moved significantly, slippage checks will produce false positives")
-        print("[!] or false negatives. Verify the rate manually before proceeding.")
-        return Decimal("0.003")
+        print("[!] Price oracle failed — slippage check will be SKIPPED.")
+        print("[!] Cannot verify ThorChain quotes against market rate.")
+        print("[!] Verify the expected XMR amounts manually before sending BTC.")
+        return None
 
 
 def _validate_xmr_addr(addr: str) -> None:
-    """Validate XMR address format and checksum."""
+    """Validate XMR address format and checksum.
+
+    Uses monero.address.address() (lowercase) which auto-detects address
+    type: standard (4...), subaddress (8...), and integrated (4...106chars).
+    The old XMRAddress() (capital A) only handled standard addresses —
+    subaddresses from create_receive_wallet would fail validation here,
+    causing the operator to think a valid address was corrupt.
+    """
     if not _XMR_RE.match(addr):
         sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
     try:
-        XMRAddress(addr)
-    except Exception:
-        sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
+        _parse_xmr_address(addr)
+    except Exception as e:
+        sys.exit(f"[!] XMR address validation failed: {scrub_address(addr)}: {e}")
 
 
 def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> Optional[dict]:
@@ -171,7 +182,7 @@ def main():
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
                     help="GPG recipient for encrypted output")
-    ap.add_argument("--outfile", default="thor_pairs_batch.json")
+    ap.add_argument("--outfile", default=str(data_path("thor_pairs_batch.json")))
     ap.add_argument("--force", action="store_true",
                     help="Overwrite existing output file (DANGER: old deposit "
                          "addresses are invalidated when new ones are generated)")
@@ -233,8 +244,8 @@ def main():
             integrity_log("thor", f"bad_deposit_format_{i}")
             sys.exit(f"[!] Deposit address not a valid BTC address: {scrub_address(deposit)}")
 
-        # Slippage check
-        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
+        # Slippage check (skipped if oracle failed)
+        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr is not None and btc_per_xmr > 0 else Decimal("0")
         if oracle_xmr > 0:
             deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
             if deviation > Decimal("0.05"):
@@ -277,14 +288,14 @@ def main():
     _out = Path(args.outfile)
     if _out.exists() and not args.force:
         sys.exit(
-            f"[!] Output file {_out} already exists!\n"
+            f"[!] Output file {scrub_path(_out)} already exists!\n"
             f"    Re-running creates NEW deposit addresses — old ones may expire.\n"
             f"    If a sender already sent BTC to the old addresses, DO NOT overwrite.\n"
             f"    Use --force to overwrite, or --outfile <different_name>."
         )
     atomic_write_json(pairs, _out)
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
-    print(f"\n  [+] {len(pairs)} pair(s) written to {_out} (fsync'd, 0600 permissions)")
+    print(f"\n  [+] {len(pairs)} pair(s) written to {_out.name} (fsync'd, 0600 permissions)")
 
     print()
     print(f"  {'=' * 68}")
@@ -301,7 +312,7 @@ def main():
         print(f"  Send exactly: {pair['btc_in']} BTC")
         print(f"  To address:   {pair['deposit']}")
         if pair.get("memo"):
-            print(f"  With memo:    {pair['memo']}")
+            print(f"  With memo:    {pair['memo'][:30]}... (full memo in output file)")
         else:
             print(f"  Memo:         (none required)")
         print(f"  Expected XMR: ~{pair['expected_xmr']}")
@@ -334,7 +345,7 @@ def main():
                 gpg_path.write_bytes(enc.data if isinstance(enc.data, bytes) else str(enc).encode())
                 os.chmod(gpg_path, 0o600)
                 integrity_log("thor", f"gpg_ok:{gpg_path.name}")
-                print(f"  [+] GPG bundle -> {gpg_path}")
+                print(f"  [+] GPG bundle -> {scrub_path(gpg_path)}")
             else:
                 integrity_log("thor", f"gpg_fail:{enc.status}")
                 print(f"  [!] GPG encryption failed: {enc.status}")

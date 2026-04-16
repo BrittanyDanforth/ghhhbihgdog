@@ -80,9 +80,14 @@ except ImportError:
     QR_AVAILABLE = False
     print("[!] QR code functionality disabled. Install with: pip install qrcode[pil] pillow")
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import integrity_log
+
 # Enhanced file paths with OPSEC considerations
-SEED_FILE = Path("entropy_seed.json")
-SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path.cwd() / ".tmp_secure"
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+SECURE_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else _TOOLKIT_ROOT / ".tmp_secure"
 LOCKED_BUNDLE = SECURE_DIR / ".gs_locked_bundle"
 LOCK_METADATA = SECURE_DIR / ".gs_lock_meta"
 QR_OUTPUT_DIR = SECURE_DIR / "qr_codes"
@@ -132,8 +137,8 @@ class SecureMemory:
                     mm.write(secrets.token_bytes(size))
                     mm.flush()
                 mm.close()
-            except Exception:
-                pass
+            except (OSError, ValueError, BufferError) as e:
+                integrity_log("dmswitch", f"secure_mem_cleanup_fail:{type(e).__name__}")
         self._allocations.clear()
 
 class AntiForensics:
@@ -224,8 +229,8 @@ class AntiForensics:
                 AntiForensics.secure_delete_file(decoy_file)
             try:
                 DECOY_DIR.rmdir()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("dmswitch", f"decoy_rmdir_fail:{type(e).__name__}")
 
 class CryptoEngine:
     """Military-grade cryptographic operations"""
@@ -448,8 +453,8 @@ class DeadManSwitch:
             try:
                 if SECURE_DIR.exists() and not any(SECURE_DIR.iterdir()):
                     SECURE_DIR.rmdir()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("dmswitch", f"secure_dir_rmdir_fail:{type(e).__name__}")
                 
             print("[+] Secure cleanup completed")
             
@@ -580,8 +585,8 @@ class DeadManSwitch:
             for tk_file in Path("/dev/shm").glob(".tk_*"):
                 try:
                     AntiForensics.secure_delete_file(tk_file)
-                except Exception:
-                    pass
+                except (OSError, ValueError) as e:
+                    integrity_log("dmswitch", f"ttl_token_wipe_fail:{type(e).__name__}")
             sys.exit(0)
         else:
             print(f"  [*] TTL wiper started (PID {pid})")
@@ -667,7 +672,8 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     """Setup comprehensive CLI argument parser"""
     parser = argparse.ArgumentParser(
         prog="deadman_entropy_qr",
-        description="Enhanced Dead Man's Switch for Entropy Seed Protection"
+        description="Dead Man's Switch — standalone OPSEC tool for entropy seed protection. "
+                    "Not part of the main mixing pipeline.",
     )
     
     # Operation modes
@@ -677,6 +683,10 @@ def setup_argument_parser() -> argparse.ArgumentParser:
                        help="Token to unlock the entropy seed")
     parser.add_argument("--emergency-destruct", action="store_true",
                        help="Emergency destruction of all sensitive data")
+    
+    # Seed file
+    parser.add_argument("--seed-file", type=Path, default=SEED_FILE,
+                       help="Path to entropy_seed.json (default: toolkit root)")
     
     # Lock options
     parser.add_argument("--ttl", type=int, default=300,
@@ -698,6 +708,11 @@ def main():
     """Enhanced main function with comprehensive error handling"""
     parser = setup_argument_parser()
     args = parser.parse_args()
+    
+    # Override global SEED_FILE if --seed-file was provided
+    global SEED_FILE
+    if args.seed_file != SEED_FILE:
+        SEED_FILE = args.seed_file
     
     # Initialize dead man's switch
     switch = DeadManSwitch()

@@ -24,8 +24,9 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
-    require_resources, atomic_write_json,
+    require_resources, atomic_write_json, validate_wallet_json,
     install_signal_handlers, newnym, scrub_address, secure_hex,
+    data_path, TOOLKIT_ROOT,
 )
 
 
@@ -47,8 +48,8 @@ def _detect_network(addr_str: str) -> str:
             return "testnet"
         elif net == "stage":
             return "stagenet"
-    except Exception:
-        pass
+    except Exception as e:
+        integrity_log("wallet", f"network_detect_fallback:{type(e).__name__}")
     if addr_str and addr_str[0] in ("4", "8"):
         return "mainnet"
     elif addr_str and addr_str[0] in ("9", "B"):
@@ -72,8 +73,8 @@ def main():
                     help="label for the new subaddress (default: random hex)")
     ap.add_argument("--account-index", type=int, default=0,
                     help="wallet account index to create subaddress on (default: 0)")
-    ap.add_argument("--output-dir", default=".",
-                    help="directory for wallet JSON output")
+    ap.add_argument("--output-dir", default=str(TOOLKIT_ROOT),
+                    help="directory for wallet JSON output (default: toolkit root)")
     args = ap.parse_args()
 
     require_resources(min_disk_gb=2.0)
@@ -119,10 +120,14 @@ def main():
         sys.exit("[!] wallet-rpc returned empty address — wallet may not be open.")
 
     network = _detect_network(addr_str)
-    if network != "mainnet":
-        print(f"  [!] WARNING: Address belongs to {network.upper()}, not mainnet.")
-        print(f"  [!] Do NOT feed this wallet JSON into a mainnet pipeline.")
-        integrity_log("wallet", f"network_warning:{network}")
+    if network not in ("mainnet", "unknown"):
+        integrity_log("wallet", f"network_BLOCK:{network}")
+        sys.exit(
+            f"[!] Address belongs to {network.upper()}, not mainnet.\n"
+            f"    A {network} wallet JSON fed into a mainnet pipeline will cause\n"
+            f"    all transfers to fail or send funds to unreachable addresses.\n"
+            f"    Connect monero-wallet-rpc to a mainnet wallet and retry."
+        )
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
@@ -136,14 +141,15 @@ def main():
         "network": network,
     }
 
+    validate_wallet_json(out)
+
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 
-    print(f"  [+] Wallet written -> {fname} (fsync'd, 0600 permissions)")
+    print(f"  [+] Wallet written -> {fname.name} (fsync'd, 0600 permissions)")
     print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
-    print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
     print(f"  [+] Network: {network}")
     print(f"  [+] Full address is in the JSON file — do NOT display it in terminal.")
 
@@ -157,18 +163,14 @@ def main():
     # BUG 55 FIX: Don't print full XMR address in terminal output.
     # Terminal scrollback, screen recordings, and shoulder-surfing can
     # capture it. Instead, reference the JSON file which has 0600 perms.
-    print(f"  === RECEIVER FLOW: NEXT STEPS ===")
-    print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
-    print(f"       python3 thor_swap_preparer \\")
-    print(f"         --amounts <BTC_AMOUNT> \\")
-    print(f"         --dests $(jq -r .address {fname}) \\")
-    print(f"         --tor-proxy <SOCKS5H_PROXY>")
-    print(f"  2. Give the BTC deposit address + memo to the sender")
-    print(f"  3. Wait for sender's BTC to arrive and ThorChain to convert to XMR")
-    print(f"  4. Run the mixer pipeline in receive mode:")
-    print(f"       ./gs mixer \\")
-    print(f"         --receive-wallet {fname} \\")
-    print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print(f"  === NEXT STEPS ===")
+    print(f"  From the main menu:")
+    print(f"")
+    print(f"  Option 2 (Receive - guided) walks you through everything:")
+    print(f"    → Select this wallet (it will auto-detect {fname.name})")
+    print(f"    → Generate a BTC deposit address for the sender")
+    print(f"    → Wait for BTC → XMR conversion")
+    print(f"    → Mix the received XMR")
 
 
 if __name__ == "__main__":

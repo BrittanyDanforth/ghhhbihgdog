@@ -25,6 +25,7 @@ Usage
     # Disk output with custom path
     python3 error_log_poisoner.py --source exec.log --out decoy_exec.log
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import datetime as dt
@@ -39,7 +40,11 @@ from pathlib import Path
 from typing import List
 
 VERSION = "1.0"
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_text
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 RAM_DEFAULT = Path("/dev/shm/fake_errors.log") if Path("/dev/shm").exists() else Path("fake_errors.log")
 
 TAGS = ["WARN", "ERROR", "RPC_FAIL", "TIMEOUT", "SIGSEGV", "OOM", "ASSERT"]
@@ -188,11 +193,11 @@ def main():
 
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if args.out.exists() else "w"
-        with args.out.open(mode, encoding="utf-8") as fh:
-            for ln in decoys:
-                fh.write(ln + "\n")
-        os.chmod(args.out, 0o600)
+        existing = ""
+        if args.out.exists():
+            existing = args.out.read_text(encoding="utf-8")
+        content = existing + "\n".join(decoys) + "\n"
+        atomic_write_text(content, args.out, perms=0o600)
         print(f"[+] Injected {len(decoys)} decoy errors → {args.out}")
     except Exception as e:
         print(f"[!] Failed to write output file: {e}", file=sys.stderr)

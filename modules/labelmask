@@ -34,6 +34,7 @@ Usage
     python3 label_masker_v3.py --dag my_dag.json    # custom DAG
     python3 label_masker_v3.py -o /tmp/map.json     # custom output
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib
@@ -46,6 +47,11 @@ import secrets
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
+
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json, integrity_log
 
 VERSION = "3.0"
 
@@ -91,8 +97,8 @@ def secure_wipe(path: Path) -> None:
             # Fallback to simple deletion
             try:
                 path.unlink()
-            except Exception:
-                pass
+            except OSError as e:
+                integrity_log("labelmask", f"secure_wipe_unlink_fail:{type(e).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -286,11 +292,11 @@ def validate_dag_structure(dag: dict) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate randomized label_map.json for a DAG structure.")
-    parser.add_argument("--dag", "-d", type=Path, default=Path("dag_structure.json"), 
+    parser.add_argument("--dag", "-d", type=Path, default=_TOOLKIT_ROOT / "dag_structure.json", 
                        help="Path to DAG JSON from dag_generator_v2.py")
-    parser.add_argument("--seed", "-s", type=Path, default=Path("entropy_seed.json"), 
+    parser.add_argument("--seed", "-s", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json", 
                        help="Path to entropy_seed.json")
-    parser.add_argument("--out", "-o", type=Path, default=Path("label_map.json"), 
+    parser.add_argument("--out", "-o", type=Path, default=_TOOLKIT_ROOT / "label_map.json", 
                        help="Where to write map (default: ./label_map.json)")
     parser.add_argument("--verify", action="store_true", 
                        help="Verify DAG structure before processing")
@@ -346,23 +352,13 @@ def main():
         payload_bytes = json.dumps(temp_payload, sort_keys=True).encode()
         payload["sha256"] = sha256_hex(payload_bytes)
 
-        # Atomic write with secure temp file handling
-        tmp = args.out.with_suffix(".tmp")
+        # Atomic write with secure permissions
         try:
-            with tmp.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2, sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            
-            # Atomic move
-            os.chmod(tmp, 0o600)
-            tmp.replace(args.out)
-            os.chmod(args.out, 0o600)
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(payload, args.out, perms=0o600)
             print(f"[+] Label map saved → {args.out} (labels: {len(label_map)})")
-            
         except Exception as e:
             print(f"[!] Error writing label map: {e}", file=sys.stderr)
-            secure_wipe(tmp)
             sys.exit(1)
             
     except Exception as e:

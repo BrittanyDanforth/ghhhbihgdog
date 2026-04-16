@@ -34,6 +34,7 @@ Usage:
         --aggregator-pool thor_endpoints.yaml \
         --stealth-mode --quantum-entropy
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 from __future__ import annotations
 import argparse
 import base64
@@ -75,13 +76,23 @@ except ImportError as e:
     print("Install with: pip install requests pyyaml tenacity stem psutil cryptography", file=sys.stderr)
     sys.exit(1)
 
+# NETWORK: Uses canonical Tor enforcement from gs_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from gs_common import (
+    validate_proxy as _gs_validate_proxy,
+    verify_tor as _gs_verify_tor,
+    integrity_log,
+)
+
 # -------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
 # -------------------------------------------------------------------
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
 # File paths
-SEED_FILE = Path("entropy_seed.json")
-INTEGRITY_LOG = Path("swap_integrity_v2.log")
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+INTEGRITY_LOG = _TOOLKIT_ROOT / "swap_integrity_v2.log"
 CIRCUIT_LOG = Path("/dev/shm/circuit_burn.log") if Path("/dev/shm").exists() else Path("/tmp/circuit_burn.log")
 RAM_PROGRESS = Path("/dev/shm/swap_progress_secure.json") if Path("/dev/shm").exists() else Path("/tmp/swap_progress_secure.json")
 
@@ -177,8 +188,8 @@ class QuantumEntropyFusion:
             try:
                 sources.append(os.urandom(8))
                 sources.append(struct.pack('d', time.monotonic()))
-            except Exception:
-                pass
+            except (OSError, NotImplementedError, struct.error) as e:
+                integrity_log("swap_retry", f"net_entropy_skip:{type(e).__name__}")
                 
             # Filesystem entropy
             if self.seed_file.exists():
@@ -884,26 +895,15 @@ Examples:
         sys.exit(1)
         
         
-    # Validate proxy chain
+    # Validate proxy chain using canonical gs_common validation
     for proxy_url in args.proxy_chain.split(','):
         proxy_url = proxy_url.strip()
-        if proxy_url.lower().startswith('socks5://') and not proxy_url.lower().startswith('socks5h://'):
-            print(f"[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead: {proxy_url}")
-            sys.exit(1)
-        if not proxy_url.lower().startswith('socks5h://'):
-            print(f"[!] Only socks5h:// proxies are accepted (Tor DNS privacy).", file=sys.stderr)
-            print(f"    Got: {proxy_url}", file=sys.stderr)
-            print(f"    http/https proxies leak DNS and don't route through Tor.", file=sys.stderr)
-            sys.exit(1)
-            
-        # Parse URL to validate
-        try:
-            parsed = urlparse(proxy_url)
-            if not parsed.hostname or not parsed.port:
-                raise ValueError("Missing hostname or port")
-        except Exception:
-            print(f"[!] Invalid proxy URL: {proxy_url}", file=sys.stderr)
-            sys.exit(1)
+        _gs_validate_proxy(proxy_url)
+
+    # Verify Tor on the first proxy in the chain
+    _first_proxy_url = args.proxy_chain.split(',')[0].strip()
+    _first_proxy_dict = {"http": _first_proxy_url, "https": _first_proxy_url}
+    _gs_verify_tor(_first_proxy_dict)
     
     # Security warnings
     if not args.stealth_mode:

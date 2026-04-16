@@ -41,8 +41,8 @@ if _CORE_DIR not in sys.path:
 
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms, lock_memory,
-    install_signal_handlers, shutdown_requested, scrub_address,
-    connect_rpc, validate_proxy, verify_tor,
+    install_signal_handlers, shutdown_requested, scrub_address, scrub_path,
+    connect_rpc, validate_proxy, verify_tor, data_path,
 )
 
 REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
@@ -338,7 +338,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     if failed:
         print(f"  [!] {failed} TX(s) failed. Check RPC connection and balance.")
         sys.exit(1)
-    print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
+    print(f"  [+] Transfer {scrub_path(outdir)}/ to the offline machine for signing.")
 
 
 def phase_sign(args, plan: List[dict]):
@@ -349,7 +349,7 @@ def phase_sign(args, plan: List[dict]):
     """
     outdir = Path(args.outdir)
     if not outdir.is_dir():
-        sys.exit(f"[!] Output dir not found: {outdir}")
+        sys.exit(f"[!] Output dir not found: {scrub_path(outdir)}")
 
     # Load unsigned manifest
     manifest_path = outdir / "unsigned_manifest.json"
@@ -392,7 +392,7 @@ def phase_sign(args, plan: List[dict]):
         import shutil as _shutil_which
         cli_path = _shutil_which.which(args.wallet_cli) or args.wallet_cli
         if not Path(cli_path).exists():
-            sys.exit(f"[!] wallet-cli not found: {cli_path}")
+            sys.exit(f"[!] wallet-cli not found: {scrub_path(cli_path)}")
         actual_hash = hashlib.sha256(Path(cli_path).read_bytes()).hexdigest()
         if actual_hash.lower() != expected_hash.lower():
             integrity_log("signer", f"wallet_cli_hash_MISMATCH:{actual_hash[:16]}")
@@ -420,8 +420,8 @@ def phase_sign(args, plan: List[dict]):
     if dry_run:
         print(f"\n  === DRY RUN (no signing will occur) ===")
         print(f"  Plan fingerprint: {current_fp}")
-        print(f"  Wallet file: {wallet_file}")
-        print(f"  Wallet CLI: {args.wallet_cli}")
+        print(f"  Wallet file: {scrub_path(wallet_file)}")
+        print(f"  Wallet CLI: {scrub_path(args.wallet_cli)}")
         print(f"  TXs to sign: {len(entries)}")
         for entry in entries:
             idx = entry["idx"]
@@ -492,7 +492,7 @@ def phase_sign(args, plan: List[dict]):
             if local_file.exists():
                 unsigned_file = local_file
             else:
-                print(f"  [!] Missing unsigned TX: {unsigned_file} (also tried {local_file})")
+                print(f"  [!] Missing unsigned TX: {scrub_path(unsigned_file)} (not found in outdir)")
                 failed += 1
                 continue
 
@@ -634,7 +634,7 @@ def phase_sign(args, plan: List[dict]):
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
     if failed:
         print(f"  [!] {failed} TX(s) failed during signing. Check wallet password and file integrity.")
-    print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
+    print(f"  [+] Transfer {scrub_path(signed_dir)}/ back to the online machine for broadcast.")
 
 
 def main():
@@ -664,8 +664,8 @@ def main():
     cli.add_argument("--wallet-password", default=None,
                      help="Wallet password (phase=sign only). "
                           "Prefer GS_WALLET_PASSWORD env var to avoid /proc leak")
-    cli.add_argument("--outdir", default="tx_staging",
-                     help="Directory for TX files")
+    cli.add_argument("--outdir", default=str(data_path("tx_staging")),
+                     help="Directory for TX files (default: toolkit root / tx_staging)")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--dry-run", action="store_true",
@@ -681,7 +681,7 @@ def main():
 
     plan_path = Path(args.unsigned_json)
     if not plan_path.exists():
-        sys.exit(f"[!] File not found: {plan_path}")
+        sys.exit(f"[!] File not found: {scrub_path(plan_path)}")
 
     plan, meta = _load_unsigned(plan_path)
     _validate_plan(plan)

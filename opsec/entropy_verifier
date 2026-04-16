@@ -15,6 +15,7 @@ Usage:
     python3 entropy_verifier entropy_seed.json
     python3 entropy_verifier entropy_seed.json --strict
 """
+# NETWORK: This module operates locally only. No network access.
 import argparse, hashlib, json, math, os, sys, stat
 from pathlib import Path
 from collections import Counter

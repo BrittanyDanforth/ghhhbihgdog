@@ -54,6 +54,7 @@ Manifest Schema (wallet_mutation_manifest_v1.json)
 }
 ```
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib
@@ -67,7 +68,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
+
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 MANIFEST_NAME = "wallet_mutation_manifest_v1.json"
 BASE58 = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 
@@ -300,34 +306,10 @@ def mutate_wallet(
     return mutated_data, account_map, subaddress_map
 
 
-def write_file_atomically(path: Path, content: str, encoding: str = 'utf-8') -> None:
-    """Write file atomically using temporary file."""
-    temp_path = None
-    try:
-        # Create temp file in same directory for atomic move
-        with tempfile.NamedTemporaryFile(
-            mode='w', 
-            encoding=encoding, 
-            dir=path.parent, 
-            prefix=f".{path.name}_", 
-            suffix='.tmp', 
-            delete=False
-        ) as temp_file:
-            temp_file.write(content)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-            temp_path = Path(temp_file.name)
-        
-        # Atomic move
-        temp_path.replace(path)
-        os.chmod(path, 0o600)
-        temp_path = None  # Successfully moved
-        
-    except Exception as e:
-        # Clean up temp file on error
-        if temp_path and temp_path.exists():
-            secure_delete_file(temp_path)
-        raise e
+def write_file_atomically(path: Path, data: object) -> None:
+    """Write JSON data atomically with secure permissions via gs_common."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(data, path, perms=0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +325,7 @@ def main():
     ap.add_argument(
         "--out", 
         type=Path, 
-        default=Path("mutated_wallet.json"), 
+        default=_TOOLKIT_ROOT / "mutated_wallet.json", 
         help="Output mutated wallet JSON (default: mutated_wallet.json)"
     )
     ap.add_argument("--dry-run", action="store_true", help="Preview mapping only, no file writes")
@@ -445,13 +427,11 @@ def main():
         args.out.parent.mkdir(parents=True, exist_ok=True)
         
         # Write mutated wallet
-        mutated_json = json.dumps(mutated_data, indent=2, ensure_ascii=False)
-        write_file_atomically(args.out, mutated_json)
+        write_file_atomically(args.out, mutated_data)
         
         # Write manifest
         manifest_path = args.out.parent / MANIFEST_NAME
-        manifest_json = json.dumps(manifest, indent=2, ensure_ascii=False)
-        write_file_atomically(manifest_path, manifest_json)
+        write_file_atomically(manifest_path, manifest)
         
         print(f"[+] Wallet DNA mutated successfully")
         print(f"    Output wallet: {args.out}")

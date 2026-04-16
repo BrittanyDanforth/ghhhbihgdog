@@ -12,7 +12,10 @@ OPSEC hardening:
   - Spoofs MAC with locally-administered unicast address
   - Clears systemd journal (if present)
   - Overwrites swap + shared memory
-  - DNS leak check post-spoof
+  - Wipes Monero daemon/wallet logs (monero-wallet-rpc.log etc.)
+  - Post-spoof connectivity check (interface UP + has IP — no DNS
+    resolution is performed to avoid creating a timing correlation
+    between the new MAC and network activity)
   - Integrity log for every action (even in dry-run)
   - Resource sentinel
   - All actions idempotent and safe to re-run
@@ -375,12 +378,28 @@ def wipe_artifacts(dry: bool, extra_dirs: list = None):
         "integrity_fake.log", "integrity_fake.log.tmp",
         # Catch-all for any remaining .tmp from atomic writes
         "thor_pairs_batch.json.tmp",
+        # Monero daemon/wallet logs — these record EVERY RPC call with
+        # timestamps, IP addresses, block heights, and transaction details.
+        # monero-wallet-rpc.log reveals the exact API call sequence used
+        # by the toolkit (a distinctive fingerprint). monero-wallet-cli.log
+        # records interactive commands. bitmonero.log records peer IPs and
+        # sync state. These are HIGH-VALUE forensic artifacts.
+        "monero-wallet-rpc.log", "monero-wallet-cli.log",
+        "bitmonero.log", "monero*.log",
+        # Key image export files from view-only wallet sync
+        "outputs_after_tx_*.hex", "key_images.hex",
     ]
     dir_patterns = [
         "signed_blobs", "unsigned", "tx_staging", "runtime",
+        # Monero data directory logs subfolder. The daemon stores its log
+        # in ~/.bitmonero/ by default. On Tails/Whonix it may be elsewhere.
+        # We search for the log files by name pattern above; this catches
+        # any toolkit-created staging directories.
     ]
 
+    _toolkit_root = Path(__file__).resolve().parent.parent
     search_roots = list(set([
+        _toolkit_root,
         Path("."),
         Path.home(),
         Path.home() / "ghostspiral",
@@ -670,14 +689,46 @@ def main():
     print("  [*] Phase 12: Environment variables")
     scrub_env_vars(args.dry_run)
     print("  [!] NOTE: env var scrubbing only affects THIS process. Your parent")
-    print("  [!] shell still has the original variables. Close the terminal or run:")
-    print("  [!]   unset GS_WALLET_PASSWORD MASTER_ENTROPY TOR_PROXY  # etc.")
-    print("  [!]   history -c && history -w  # clear shell history of unset commands")
+    print("  [!] shell still has the original variables. Close the terminal or")
+    print("  [!] unset any sensitive env vars manually, then clear shell history.")
 
-    # Phase 13 (toolkit artifacts) MUST run LAST because it wipes
+    print("  [*] Phase 13: Monero daemon/wallet logs")
+    _monero_log_paths = [
+        Path.home() / ".bitmonero" / "bitmonero.log",
+        Path.home() / ".bitmonero" / "testnet" / "bitmonero.log",
+        Path.home() / ".bitmonero" / "stagenet" / "bitmonero.log",
+        Path.home() / "monero-wallet-rpc.log",
+        Path.home() / "monero-wallet-cli.log",
+        Path("monero-wallet-rpc.log"),
+        Path("monero-wallet-cli.log"),
+    ]
+    _monero_log_count = 0
+    for _ml in _monero_log_paths:
+        if _ml.exists():
+            if args.dry_run:
+                print(f"  [dry] would securely delete {_ml}")
+            else:
+                _secure_delete_file(_ml)
+            _monero_log_count += 1
+    for _ml_glob_dir in [Path.home(), Path.home() / ".bitmonero", Path(".")]:
+        if _ml_glob_dir.is_dir():
+            for _ml_glob in _ml_glob_dir.glob("monero*.log"):
+                if _ml_glob.is_file():
+                    if args.dry_run:
+                        print(f"  [dry] would securely delete {_ml_glob}")
+                    else:
+                        _secure_delete_file(_ml_glob)
+                    _monero_log_count += 1
+    if _monero_log_count:
+        print(f"  [+] {'Would delete' if args.dry_run else 'Deleted'} {_monero_log_count} Monero log(s)")
+    else:
+        print(f"  [+] No Monero logs found")
+    integrity_log("paranoia", f"monero_logs:{'dry' if args.dry_run else 'wiped'}:{_monero_log_count}")
+
+    # Phase 14 (toolkit artifacts) MUST run LAST because it wipes
     # integrity_chain.log. Any integrity_log() calls after this point
     # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 13: Toolkit artifacts (runs last — wipes integrity log)")
+    print("  [*] Phase 14: Toolkit artifacts (runs last — wipes integrity log)")
     print("  [!] WARNING: On Copy-on-Write filesystems (btrfs, ZFS), overwrite-then-")
     print("  [!] delete does NOT erase original data blocks. Use 'shred' or full-disk")
     print("  [!] encryption instead. On ext4 with journaling, recently-written file")

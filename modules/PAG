@@ -26,6 +26,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Optional, Any
 import ctypes
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
+
 # Stealth configuration
 STEALTH_MODE = os.environ.get('DEBUG', '0') != '1'
 PARANOID_MODE = True
@@ -38,18 +43,15 @@ class MemoryScrambler:
         self._lock_memory()
     
     def _lock_memory(self):
-        """Lock memory pages to prevent swapping and disable core dumps."""
+        """Lock memory pages to prevent swapping and disable core dumps.
+        All operations are best-effort — failure is not fatal."""
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         except (ImportError, ValueError, OSError):
             pass
         try:
-            import resource
-            resource.setrlimit(resource.RLIMIT_MEMLOCK, 
-                             (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-            
-            libc = ctypes.CDLL("libc.so.6")
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
             MCL_CURRENT = 1
             MCL_FUTURE = 2
             libc.mlockall(MCL_CURRENT | MCL_FUTURE)
@@ -414,7 +416,7 @@ class StealthWriter:
                 
                 # Clear filesystem caches
                 try:
-                    subprocess.run(['sync'], capture_output=True)
+                    subprocess.run(['sync'], capture_output=True, timeout=10)
                     with open('/proc/sys/vm/drop_caches', 'w') as f:
                         f.write('3')
                 except (OSError, PermissionError, FileNotFoundError):
@@ -497,11 +499,9 @@ def generate_dag(args):
     temp_data = json.dumps(output, sort_keys=True).encode()
     output["integrity"] = hashlib.sha3_256(temp_data).hexdigest()
     
-    # Final JSON
-    final_data = json.dumps(output, indent=2, sort_keys=True).encode()
-    
-    # Secure write
-    StealthWriter.write_atomic(args.out, final_data)
+    # Secure atomic write
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output, args.out, perms=0o600)
     
     # Cleanup sensitive data
     mem_guard.scramble()
@@ -511,9 +511,9 @@ def generate_dag(args):
 def main():
     parser = argparse.ArgumentParser(description="Generate polymorphic DAG structure")
     parser.add_argument("--seed", "-s", type=Path, 
-                       default=Path("entropy_seed.json"))
+                       default=_TOOLKIT_ROOT / "entropy_seed.json")
     parser.add_argument("--out", "-o", type=Path, 
-                       default=Path("dag_structure.json"))
+                       default=_TOOLKIT_ROOT / "dag_structure.json")
     parser.add_argument("--amount", "-a", type=float, 
                        default=1.0)
     

@@ -8,13 +8,18 @@ every companion script uses battle-tested, consistent implementations.
 
 OPSEC design principles
 -----------------------
-- All network I/O goes through Tor or aborts.
-- Every sensitive file is written 0600 (owner-only).
-- Integrity log uses SHA-256 hash-chain for tamper evidence.
+- All network I/O goes through validated socks5h proxy or aborts.
+- Every sensitive file is written 0600 (owner-only); write aborts if
+  chmod fails.
+- Integrity log uses SHA-256 hash-chain for tamper evidence (forensic
+  artifact, not a runtime gate — no code reads the chain for decisions).
 - CSPRNG (secrets module) for all security-critical randomness.
 - Timing jitter between operations to frustrate traffic analysis.
 - Proxy format validated before first use.
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
+- newnym() circuit rotation: hard-fails after 3 consecutive failures
+  only when called with required=True (mixer_core broadcast uses this).
+  Other callers get best-effort rotation.
 """
 from __future__ import annotations
 import hashlib, json, os, re, secrets, signal, sys, time, threading as _threading
@@ -30,10 +35,21 @@ from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 #  Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "10.5"
+VERSION = "10.6"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
-INTEGRITY_LOG = Path("integrity_chain.log")
 SOCKS_RE = re.compile(r"^socks5h://[^\s:]+:\d{1,5}$")
+
+# Central toolkit root: all persistent artifacts live here regardless of CWD.
+# Resolved once from gs_common.py's own location (core/ is always inside root).
+TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+def data_path(name: str) -> Path:
+    """Resolve an artifact path under the toolkit root.
+    Every progress file, lock, log, staging dir, and output dir MUST use
+    this instead of raw Path('.') / Path(name) to eliminate CWD coupling."""
+    return TOOLKIT_ROOT / name
+
+INTEGRITY_LOG = data_path("integrity_chain.log")
 # CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
 # because the requests library resolves hostnames BEFORE sending through
 # the SOCKS proxy. With socks5h://, DNS resolution happens at the proxy.
@@ -73,30 +89,32 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     tag = hashlib.sha256(f"{stage}:{msg}".encode()).hexdigest()[:12]
 
     lock_path = log_path.with_suffix(log_path.suffix + ".lock")
-    with open(lock_path, "w") as lf:
+    _lock_fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+    lf = os.fdopen(_lock_fd, "w")
+    try:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            prev = "0" * 64
-            if log_path.exists():
-                try:
-                    text = log_path.read_text()
-                    lines = [l for l in text.splitlines() if l.strip()]
-                    if lines:
-                        parts = lines[-1].split(" | ", 1)
-                        candidate = parts[0].strip()
-                        if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
-                            prev = candidate
-                except (OSError, UnicodeDecodeError):
-                    pass
-            ts = int(time.time()) // 600 * 600
-            line = f"{ts}|{tag}"
-            h = hashlib.sha256((prev + line).encode()).hexdigest()
-            with log_path.open("a") as f:
-                f.write(f"{h} | {line}\n")
-                f.flush()
-                os.fsync(f.fileno())
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+        prev = "0" * 64
+        if log_path.exists():
+            try:
+                text = log_path.read_text()
+                lines = [l for l in text.splitlines() if l.strip()]
+                if lines:
+                    parts = lines[-1].split(" | ", 1)
+                    candidate = parts[0].strip()
+                    if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                        prev = candidate
+            except (OSError, UnicodeDecodeError):
+                pass
+        ts = int(time.time()) // 600 * 600
+        line = f"{ts}|{tag}"
+        h = hashlib.sha256((prev + line).encode()).hexdigest()
+        with log_path.open("a") as f:
+            f.write(f"{h} | {line}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
     secure_file_perms(log_path)
     return h
 
@@ -168,10 +186,10 @@ def _json_safe_default(o):
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
 
-    BUG 35 FIX: The old verify-by-reload silently swallowed parse errors
-    (truncated JSON from disk-full, etc). If the reload fails, that means
-    the file on disk is corrupt — we must crash loudly, not continue.
-    Also fsync the parent directory to ensure the rename is durable.
+    Aborts if chmod fails: sensitive files (wallet JSON, TX plans, progress
+    files) remaining world-readable is a hard security violation, not a
+    warning. If chmod cannot be set, the file stays as .tmp and is not
+    committed.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
@@ -179,7 +197,16 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         f.flush()
         os.fsync(f.fileno())
     if not secure_file_perms(tmp, perms):
-        integrity_log("opsec", f"WARN:atomic_write_chmod_fail:{path.name}")
+        integrity_log("opsec", f"HARD_FAIL:atomic_write_chmod_fail:{path.name}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        sys.exit(
+            f"[!] Cannot set secure permissions (0600) on {path.name}.\n"
+            f"    The file would remain world-readable, exposing sensitive data.\n"
+            f"    Check filesystem permissions and disk space."
+        )
     os.replace(tmp, path)
     try:
         with open(path) as f:
@@ -199,13 +226,26 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
 
 
 def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
-    """Write text atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write text atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    Aborts if chmod fails (same rationale as atomic_write_json).
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
+    if not secure_file_perms(tmp, perms):
+        integrity_log("opsec", f"HARD_FAIL:atomic_write_text_chmod_fail:{path.name}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        sys.exit(
+            f"[!] Cannot set secure permissions (0600) on {path.name}.\n"
+            f"    The file would remain world-readable, exposing sensitive data.\n"
+            f"    Check filesystem permissions and disk space."
+        )
     os.replace(tmp, path)
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
@@ -232,12 +272,12 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
         sys.exit(
             f"[!] CRITICAL: socks5:// leaks DNS locally!\n"
             f"    Use socks5h:// so DNS resolves through the proxy.\n"
-            f"    Change: {proxy_url} -> {proxy_url.replace('socks5://', 'socks5h://')}"
+            f"    Replace socks5:// with socks5h:// in your proxy URL."
         )
     if not SOCKS_RE.match(proxy_lower):
         sys.exit(
-            f"[!] Invalid proxy format: {proxy_url}\n"
-            f"    Expected: socks5h://host:port  (NOT socks5://)"
+            f"[!] Invalid proxy format.\n"
+            f"    Expected: socks5h://host:port  (e.g. socks5h://127.0.0.1:9050)"
         )
     # Extract and validate port range
     port_str = proxy_lower.rsplit(":", 1)[-1]
@@ -432,25 +472,6 @@ def _safe_get_inner(url: str, proxies: Dict[str, str]) -> dict:
     return r.json()
 
 
-def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None,
-              headers: Dict[str, str] = None) -> dict:
-    """POST with retry. Aborts if proxies is None or empty (clearnet leak prevention)."""
-    if not proxies or not proxies.get("https"):
-        sys.exit("[!] safe_post called without valid proxies — clearnet leak. Aborting.")
-    return _safe_post_inner(url, payload, proxies, headers or {})
-
-
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30),
-       before_sleep=_newnym_between_retries)
-def _safe_post_inner(url: str, payload: dict, proxies: Dict[str, str],
-                     headers: Dict[str, str] = None) -> dict:
-    h = dict(_BROWSER_HEADERS)
-    if headers:
-        h.update(headers)
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies, headers=h)
-    r.raise_for_status()
-    return r.json()
-
 # ---------------------------------------------------------------------------
 #  RPC connection (monero-wallet-rpc)
 # ---------------------------------------------------------------------------
@@ -602,8 +623,11 @@ def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
     """Run OPSEC checks before pipeline start. Hard-fails on any issue.
 
     Called by mixer_core at pipeline init (normal and resume paths).
-    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr, etc.)
-    use validate_proxy + verify_tor directly.
+    Also called by run's _opsec_preflight for the UI checklist.
+    Standalone scripts (airgap_tx_signer, broadcast_signed_xmr,
+    create_receive_wallet, thor_swap_preparer, exit_strategy_planner)
+    use validate_proxy + verify_tor directly — they do NOT call this
+    function and are responsible for their own proxy/Tor validation.
     No fallbacks. No soft warnings.
     """
     # 1. Proxy must be valid and populated
@@ -617,7 +641,7 @@ def opsec_preflight(proxy: Dict[str, str], stage: str = "preflight") -> None:
         if val and not val.lower().startswith("socks5h://"):
             integrity_log("opsec", f"HARD_FAIL:non_socks5h_proxy:{stage}")
             sys.exit(
-                f"[!] OPSEC VIOLATION: Proxy {key}={val[:20]}... is not socks5h://\n"
+                f"[!] OPSEC VIOLATION: Proxy is not socks5h://\n"
                 f"    DNS will leak to your ISP. Use socks5h:// (with the h)."
             )
 
@@ -698,14 +722,25 @@ def validate_wallet_json(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
-    """Return True if resources are OK. False if system is stressed."""
+    """Return True if resources are OK. False if system is stressed.
+
+    Falls back to os.statvfs for disk check if psutil is unavailable.
+    If neither psutil nor statvfs works, returns False (fail closed)
+    because we cannot verify system health.
+    """
     try:
         import psutil
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage(".")
+        return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
     except ImportError:
-        return True  # Can't check — assume OK rather than crashing mid-operation
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(".")
-    return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
+        pass
+    try:
+        st = os.statvfs(".")
+        free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+        return free_gb >= min_disk_gb
+    except (OSError, AttributeError):
+        return False
 
 
 def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> None:
@@ -802,3 +837,52 @@ def scrub_address(addr: str, visible: int = 8) -> str:
     if len(addr) <= visible * 2 + 3:
         return f"{addr[:4]}...{addr[-4:]}" if len(addr) > 11 else "****"
     return f"{addr[:visible]}...{addr[-visible:]}"
+
+
+def scrub_path(p) -> str:
+    """Show only the filename component, never the full filesystem path.
+
+    Full paths leak username, OS layout, toolkit location, and operational
+    directory structure. Basenames are enough for user orientation.
+    """
+    if not p:
+        return "<none>"
+    return Path(p).name
+
+
+def scrub_amount(amt, precision: int = 4) -> str:
+    """Round an amount for terminal display.
+
+    Exact amounts in terminal output enable correlation with on-chain
+    values. Rounding to `precision` decimal places reduces this while
+    still being operationally useful. Use precision=2 for fiat,
+    precision=4 for XMR, precision=8 for BTC.
+    """
+    try:
+        d = Decimal(str(amt))
+        return str(d.quantize(Decimal(10) ** -precision))
+    except Exception:
+        return "***"
+
+
+def is_verbose() -> bool:
+    """Return True if the operator explicitly requested verbose output.
+
+    Set GS_VERBOSE=1 in the environment for full detail (paths, addresses,
+    exact amounts) in terminal output. Default is scrubbed output.
+    """
+    return os.environ.get("GS_VERBOSE", "0") == "1"
+
+
+def require_tor_proxy(proxy_url: str = None) -> Dict[str, str]:
+    """One-call Tor enforcement: validate proxy format, verify Tor exit.
+
+    Every script that performs real network access should call this once
+    at startup instead of separate validate_proxy + verify_tor calls.
+    Returns the proxy dict or aborts.
+    """
+    if not proxy_url:
+        sys.exit("[!] --tor-proxy is REQUIRED for network operations. Aborting.")
+    proxy = validate_proxy(proxy_url)
+    verify_tor(proxy)
+    return proxy

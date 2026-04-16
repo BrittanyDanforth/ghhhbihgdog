@@ -29,8 +29,8 @@ if _CORE_DIR not in sys.path:
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json,
-    install_signal_handlers, shutdown_requested,
-    _BROWSER_HEADERS, normalize_broadcast_result,
+    install_signal_handlers, shutdown_requested, scrub_path,
+    _BROWSER_HEADERS, normalize_broadcast_result, data_path, TOOLKIT_ROOT,
 )
 
 _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -139,13 +139,13 @@ def main():
                     if _sf_path.exists():
                         blobs.append(_sf_path)
                     else:
-                        print(f"  [!] Split blob not found: {_sf_path}")
+                        print(f"  [!] Split blob not found: {scrub_path(_sf_path)}")
                         integrity_log("broadcast", f"missing_split_blob:{Path(_sf_name).name}")
             else:
                 if blob_path.exists():
                     blobs.append(blob_path)
                 else:
-                    print(f"  [!] Blob not found: {blob_path}")
+                    print(f"  [!] Blob not found: {scrub_path(blob_path)}")
                     integrity_log("broadcast", f"missing_manifest_blob:{raw_name}")
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
@@ -215,7 +215,7 @@ def main():
 
     # Fallback: unsigned plan (only works if same machine/directory)
     if not tx_delays:
-        plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
+        plan_files = sorted(data_path("unsigned").glob("unsigned_*.json"), reverse=True)
         if len(plan_files) > 1:
             print(f"  [!] WARNING: {len(plan_files)} unsigned plans found in ./unsigned/")
             print(f"  [!] Using newest: {plan_files[0].name}")
@@ -322,7 +322,7 @@ def main():
     blob_fp = _fp_hasher.hexdigest()[:32]
 
     # Progress state
-    progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
+    progF = Path(args.resume) if args.resume else data_path("broadcast_progress.json")
     if progF.exists():
         with open(progF) as f:
             prog = json.load(f)
@@ -354,7 +354,7 @@ def main():
     for idx, blob in enumerate(blobs):
         if shutdown_requested():
             integrity_log("broadcast", f"shutdown_at_blob_{idx}")
-            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progF}")
+            print(f"  [!] Shutdown at TX {idx}. Resume with --resume {scrub_path(progF)}")
             break
 
         if idx <= last_idx:
@@ -393,7 +393,6 @@ def main():
         # Hot wallet blobs (presigned via tx_metadata_list) use relay_tx.
         # Air-gap signed blobs (via wallet-cli sign_transfer) use submit_transfer.
         # The method is determined by _presigned_blobs lookup from unsigned_manifest.
-        use_wallet_rpc = True  # always for our pipeline's .signed files
 
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
@@ -609,7 +608,7 @@ def main():
         print(f"\n  [+] Broadcast finished: {success_count} submitted to mempool, {skip_count} skipped (prior run).")
     if skip_count > 0:
         print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
-    print(f"  [+] Progress: {progF}")
+    print(f"  [+] Progress saved ({progF.name})")
 
 
 if __name__ == "__main__":

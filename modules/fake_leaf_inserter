@@ -11,6 +11,7 @@ Fixed Issues:
 - Removed potentially problematic comments
 - Added proper type checking
 """
+# NETWORK: This module operates locally only. No network access.
 from __future__ import annotations
 import argparse
 import hashlib
@@ -21,7 +22,12 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 
-SEED_FILE = Path("entropy_seed.json")
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
+
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 MANIFEST_NAME = "fake_leaf_manifest_v1.json"
 
 
@@ -41,14 +47,10 @@ def safe_read_json(path: Path) -> Dict[str, Any]:
 
 
 def safe_write_json(path: Path, data: Any) -> None:
-    """Safely write JSON data to file."""
+    """Safely write JSON data to file using atomic write with secure permissions."""
     try:
-        # Write to temporary file first, then atomic rename
-        tmp_path = path.with_suffix(path.suffix + '.tmp')
-        with tmp_path.open('w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        tmp_path.replace(path)
-        os.chmod(path, 0o600)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(data, path, perms=0o600)
     except (PermissionError, OSError) as e:
         print(f"[!] Error writing {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -223,13 +225,13 @@ def main():
     parser.add_argument(
         "--input", "-i", 
         type=Path, 
-        default=Path("dag_structure.json"),
+        default=_TOOLKIT_ROOT / "dag_structure.json",
         help="Input DAG JSON file"
     )
     parser.add_argument(
         "--output", "-o",
         type=Path,
-        default=Path("dag_augmented.json"),
+        default=_TOOLKIT_ROOT / "dag_augmented.json",
         help="Output augmented DAG JSON file"
     )
     parser.add_argument(

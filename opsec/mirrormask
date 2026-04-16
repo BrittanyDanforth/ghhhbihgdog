@@ -36,6 +36,7 @@ Usage Examples:
     python3 forensic_mirrormask.py --sources *.log --paranoid --multiplier 2.5 \
         --anti-forensics --decoy-injection --statistical-masking
 """
+# NETWORK: This module operates locally only. No network access.
 
 import argparse
 import hashlib
@@ -56,9 +57,14 @@ import threading
 import subprocess
 import tempfile
 
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_text, integrity_log
+
 # Enhanced configuration
-SEED_FILE = Path("entropy_seed.json")
-DEFAULT_OUTPUT = Path("mirror_exec.log")
+SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
+DEFAULT_OUTPUT = _TOOLKIT_ROOT / "mirror_exec.log"
 TEMP_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path(tempfile.gettempdir())
 
 # Sophisticated tag mutation maps with context awareness
@@ -113,7 +119,8 @@ class SystemFingerprint:
         # Network interfaces (MAC addresses)
         try:
             import subprocess
-            result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+            result = subprocess.run(
+                ['ip', 'link', 'show'], capture_output=True, text=True, timeout=10)
             network_hash = hashlib.sha256(result.stdout.encode()).hexdigest()[:16]
         except Exception:
             network_hash = str(uuid.getnode())
@@ -163,12 +170,12 @@ class AntiAnalysis:
         ]
         
         try:
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, timeout=10)
             for proc in suspicious_processes:
                 if proc in result.stdout.lower():
                     indicators.append(f"Analysis tool detected: {proc}")
-        except Exception:
-            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            integrity_log("mirrormask", f"ps_aux_fail:{type(e).__name__}")
         
         # Timing analysis detection
         start_time = time.time()
@@ -196,8 +203,8 @@ class AntiAnalysis:
                         temp_file.touch()
                         time.sleep(random.uniform(0.1, 1.0))
                         temp_file.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except (OSError, PermissionError) as e:
+                        integrity_log("mirrormask", f"decoy_fs_fail:{type(e).__name__}")
             
             thread = threading.Thread(target=decoy_worker, args=(proc_name,), daemon=True)
             thread.start()
@@ -569,35 +576,13 @@ class EnhancedForensicMirrormask:
         return int(match.group(1)) if match else None
     
     def write_output(self, mirror_lines: List[str], output_path: Path, overwrite_source: bool = False):
-        """Write output with secure file operations"""
+        """Write output with secure atomic file operations"""
         if not mirror_lines:
             raise ValueError("No mirror lines to write")
         
-        # Use temporary file for atomic operation
-        temp_file = output_path.with_suffix('.tmp')
-        
-        try:
-            # Write to temporary file
-            with temp_file.open('w', encoding='utf-8') as f:
-                f.write('\n'.join(mirror_lines))
-                f.flush()
-                os.fsync(f.fileno())  # Ensure data is written to disk
-            
-            # Atomic move + restrict permissions
-            temp_file.replace(output_path)
-            os.chmod(output_path, 0o600)
-
-            print(f"[+] Mirror log written: {output_path} ({len(mirror_lines)} lines)")
-            
-            # Secure cleanup
-            if temp_file.exists():
-                temp_file.unlink()
-            
-        except Exception as e:
-            # Cleanup on error
-            if temp_file.exists():
-                temp_file.unlink()
-            raise e
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text('\n'.join(mirror_lines), output_path, perms=0o600)
+        print(f"[+] Mirror log written: {output_path} ({len(mirror_lines)} lines)")
 
 def setup_argument_parser() -> argparse.ArgumentParser:
     """Setup comprehensive argument parser"""
@@ -709,8 +694,8 @@ def main():
             for proc_name in DECOY_PROCESSES:
                 for temp_file in TEMP_DIR.glob(f".{proc_name}_*"):
                     temp_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except OSError as e:
+            integrity_log("mirrormask", f"finally_cleanup_fail:{type(e).__name__}")
 
 if __name__ == "__main__":
     main()

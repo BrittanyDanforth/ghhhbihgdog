@@ -54,6 +54,7 @@ Security / OPSEC Notes
 * Network probes are minimal ICMP pings to avoid fingerprinting.
 * Disk I/O tests use temporary files in /tmp with immediate cleanup.
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 from __future__ import annotations
 import argparse, json, math, os, random, sys, time, hashlib, statistics
 import socket, subprocess, tempfile
@@ -70,6 +71,11 @@ try:
     import requests  # for network testing
 except ImportError:
     requests = None
+
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import atomic_write_json
 
 VERSION = "2.0"
 DEFAULT_EVENTS = 50
@@ -148,8 +154,11 @@ def probe_disk_io() -> float:
     try:
         test_data = b"timing_test_" + os.urandom(1024)  # 1KB test
         
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = tmp.name
+        _fd = tempfile.mkstemp(prefix="gs_io_")
+        tmp_path = _fd[1]
+        os.close(_fd[0])
+        os.chmod(tmp_path, 0o600)
+        with open(tmp_path, "r+b") as tmp:
             start = time.perf_counter()
             tmp.write(test_data)
             tmp.flush()
@@ -353,7 +362,7 @@ Examples:
   %(prog)s --seed custom_seed.json --out /tmp/timing.json
         """
     )
-    p.add_argument("--seed", type=Path, default=Path("entropy_seed.json"), 
+    p.add_argument("--seed", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json", 
                    help="entropy_seed.json path")
     p.add_argument("--events", type=int, default=DEFAULT_EVENTS, 
                    help="How many delay values to generate")
@@ -448,31 +457,16 @@ Examples:
     payload_json = json.dumps(payload, sort_keys=True)
     payload["sha256"] = sha256_hex(payload_json.encode())
 
-    # Atomic write
+    # Atomic write with secure permissions
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = args.out.with_suffix(".tmp")
-    
     try:
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp.replace(args.out)
-        os.chmod(args.out, 0o600)
-        
+        atomic_write_json(payload, args.out, perms=0o600)
         print(f"[+] VM timing profile → {args.out}")
         print(f"[+] Events: {len(delays)}, Base delay: {base_delay}s")
         print(f"[+] Delay range: {min(delays):.1f}s - {max(delays):.1f}s")
         if args.tor_proxy:
             print(f"[+] Tor status: {tor_status}")
-            
     except (OSError, IOError) as e:
-        # Clean up stale .tmp on failure to avoid leaving timing data on disk
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
         print(f"[!] Failed to write output: {e}", file=sys.stderr)
         sys.exit(1)
 

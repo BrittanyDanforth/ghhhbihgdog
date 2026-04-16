@@ -29,6 +29,7 @@ Usage
                               --tor-proxy socks5h://127.0.0.1:9050 \
                               --duration 300 --intensity high
 """
+# NETWORK: Performs network I/O. Uses canonical Tor enforcement from gs_common.
 from __future__ import annotations
 import argparse
 import hashlib
@@ -58,6 +59,16 @@ try:
 except ImportError:
     print("[!] Missing TOR control: pip install stem (optional but recommended)", file=sys.stderr)
     stem = None
+
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+# NETWORK: Uses canonical Tor enforcement from gs_common
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+from gs_common import (
+    validate_proxy as _gs_validate_proxy,
+    verify_tor as _gs_verify_tor,
+    integrity_log,
+)
 
 VERSION = "3.0"
 
@@ -158,29 +169,12 @@ def load_json_secure(path: Path) -> Tuple[dict, str]:
 
 
 def validate_proxy(proxy_url: str) -> bool:
-    """Validate proxy connectivity. Only socks5h:// is accepted for OPSEC.
-    http/https proxies are rejected because they don't provide DNS privacy.
-    """
-    if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
-        print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.", file=sys.stderr)
-        return False
-    if not proxy_url.lower().startswith("socks5h://"):
-        print("[!] Only socks5h:// proxies are accepted (DNS privacy).", file=sys.stderr)
-        return False
-
+    """Validate proxy format and Tor connectivity via canonical gs_common."""
     try:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        response = requests.get("https://check.torproject.org/api/ip",
-                                proxies=proxies, timeout=10,
-                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"})
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("IsTor"):
-                return True
-            print("[!] Proxy connected but NOT exiting via Tor.", file=sys.stderr)
-            return False
-        return False
-    except Exception:
+        proxy_dict = _gs_validate_proxy(proxy_url)
+        _gs_verify_tor(proxy_dict)
+        return True
+    except SystemExit:
         return False
 
 
@@ -229,8 +223,8 @@ def new_tor_circuit():
                 controller.authenticate()
                 controller.signal(stem.Signal.NEWNYM)
                 return True
-    except Exception:
-        pass
+    except (stem.SocketError, stem.ProtocolError, stem.ControllerError, OSError) as e:
+        integrity_log("noise", f"newnym_socket_fail:{type(e).__name__}")
 
     for port in (9051, 9151):
         try:
@@ -457,11 +451,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Advanced decoy noise generator for network traffic obfuscation"
     )
-    parser.add_argument("--dag", type=Path, default=Path("dag_structure.json"),
+    parser.add_argument("--dag", type=Path, default=_TOOLKIT_ROOT / "dag_structure.json",
                        help="DAG structure file")
-    parser.add_argument("--labels", type=Path, default=Path("label_map.json"),
+    parser.add_argument("--labels", type=Path, default=_TOOLKIT_ROOT / "label_map.json",
                        help="Label mapping file")
-    parser.add_argument("--seed", type=Path, default=Path("entropy_seed.json"),
+    parser.add_argument("--seed", type=Path, default=_TOOLKIT_ROOT / "entropy_seed.json",
                        help="Entropy seed file")
     parser.add_argument("--tor-proxy", required=True,
                        help="TOR proxy URL (socks5h://127.0.0.1:9050)")
@@ -485,11 +479,9 @@ def main():
         print("  [!] WARNING: Noise traffic exits to clearnet via Tor. "
               "Use --onion-only for onion-only traffic.", file=sys.stderr)
     
-    # Validate proxy
-    if not args.tor_proxy.startswith("socks5h://"):
-        print("[!] Proxy must be socks5h:// for DNS safety", file=sys.stderr)
-        sys.exit(1)
-    
+    # Validate proxy format (aborts on socks5:// or invalid format)
+    _gs_validate_proxy(args.tor_proxy)
+
     if args.verify_proxy:
         print("[*] Verifying proxy connectivity...")
         if not validate_proxy(args.tor_proxy):

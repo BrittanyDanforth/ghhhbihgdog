@@ -47,7 +47,12 @@ from datetime import datetime, timezone
 # Config defaults
 # ---------------------------------------------------------------------------
 
-ROOT      = Path.cwd()
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.insert(0, str(_TOOLKIT_ROOT / "core"))
+from gs_common import install_signal_handlers
+
+ROOT      = _TOOLKIT_ROOT
 _MOD_DIR  = Path(__file__).resolve().parent
 RUNTIME   = ROOT / "runtime"
 SEED      = ROOT / "entropy_seed.json"
@@ -103,22 +108,29 @@ def run_step(cmd: list[str], env: dict[str, str] | None = None, check: bool = Tr
 
 
 def validate_tor_proxy(proxy_url: str) -> bool:
-    """Validate Tor proxy URL format. Only socks5h:// is safe."""
-    if proxy_url.lower().startswith("socks5://") and not proxy_url.lower().startswith("socks5h://"):
-        print("[!] CRITICAL: socks5:// leaks DNS. Use socks5h:// instead.")
-        return False
-    if not proxy_url.lower().startswith("socks5h://"):
-        return False
-    # Basic URL validation - could be more comprehensive
+    """Validate Tor proxy using canonical gs_common check (format + live Tor verification)."""
     try:
-        parts = proxy_url.split("://")[1].split(":")
-        if len(parts) != 2:
-            return False
-        host, port = parts
-        int(port)  # Validate port is numeric
+        _core = str(Path(__file__).resolve().parent.parent / "core")
+        if _core not in sys.path:
+            sys.path.insert(0, _core)
+        from gs_common import validate_proxy as _gs_validate, verify_tor as _gs_verify
+        proxy = _gs_validate(proxy_url)
+        _gs_verify(proxy)
         return True
-    except (ValueError, IndexError):
+    except SystemExit:
         return False
+    except ImportError:
+        if not proxy_url.lower().startswith("socks5h://"):
+            print("[!] Only socks5h:// proxies are accepted (DNS privacy).")
+            return False
+        try:
+            parts = proxy_url.split("://")[1].split(":")
+            if len(parts) != 2:
+                return False
+            int(parts[1])
+            return True
+        except (ValueError, IndexError):
+            return False
 
 
 def check_dependencies():
@@ -149,6 +161,8 @@ def ensure_shm_writable():
 
 
 def main():
+    install_signal_handlers()
+
     p = argparse.ArgumentParser(
         description="Unified driver for session preparation pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter
