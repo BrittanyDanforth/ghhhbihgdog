@@ -2245,7 +2245,7 @@ class VulnScanner:
 
                 # Inject stored XSS markers with unique IDs for cross-endpoint tracking
                 for pi in [p for p in ep["params"] if not p.get("hidden")][:2]:
-                    marker_id = f"GSXSS{secrets.token_hex(4)}"
+                    marker_id = f"x{secrets.token_hex(5)}"
                     stored_payload = f'<img src=x onerror="{marker_id}">'
                     try:
                         inject_resp = self._send_test(ep, pi["name"], stored_payload)
@@ -2274,7 +2274,7 @@ class VulnScanner:
                 # SSTI markers
                 ssti_a, ssti_b = secrets.randbelow(90)+10, secrets.randbelow(90)+10
                 ssti_expected = str(ssti_a * ssti_b)
-                ssti_marker = f"GSSSTI{secrets.token_hex(3)}"
+                ssti_marker = f"t{secrets.token_hex(4)}"
                 for pi in [p for p in ep["params"] if not p.get("hidden")][:1]:
                     try:
                         r = self._send_test(ep, pi["name"], f"{{{{{ssti_a}*{ssti_b}}}}}")
@@ -3590,6 +3590,7 @@ class SecureStorage:
                         with open(fpath, "r+b") as fh:
                             fh.write(os.urandom(size))
                             fh.flush()
+                            os.fsync(fh.fileno())
                     fpath.unlink()
                 except (OSError, PermissionError):
                     try:
@@ -4871,7 +4872,8 @@ class IntelOrchestrator:
                     # Show first few values, not just counts
                     sample = list(v)[:3]
                     more = f" (+{len(v)-3} more)" if len(v) > 3 else ""
-                    print(f"    {k}: {', '.join(str(s)[:40] for s in sample)}{more}")
+                    # Truncate to 20 chars to avoid leaking full secrets/keys to scrollback
+                    print(f"    {k}: {', '.join(str(s)[:20] + '...' if len(str(s)) > 20 else str(s) for s in sample)}{more}")
 
         # Show PoC commands inline
         if pocs:

@@ -1113,7 +1113,7 @@ def _intel_exploit_walkthrough(tor_proxy: str):
             while True:
                 print(f"    {G}r{N}=run  {G}e{N}=edit+run  {G}s{N}=skip step  "
                       f"{G}n{N}=next finding  {G}q{N}=quit")
-                action = prompt(f"  Step {step_num}", "s").lower()
+                action = prompt(f"  Step {step_num}", "r").lower()
 
                 if action in ("q", "quit"):
                     info("Walkthrough ended.")
@@ -1141,7 +1141,7 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                         out_path = out_dir / finfo["filename"]
                         out_path.write_text(finfo["content"])
                         os.chmod(str(out_path), 0o600)
-                        ok(f"File generated: {out_path}")
+                        ok(f"File generated: {out_path.name} (in intel dir)")
                         if finfo.get("note"):
                             info(finfo["note"])
                         print()
@@ -1161,10 +1161,18 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                         info("Aborted.")
                         continue
 
+                    # Sanitized env: strip secrets, proxy vars, wallet info
+                    _safe_env = {k: v for k, v in os.environ.items()
+                                 if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                              "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL",
+                                              "COINGECKO_API_KEY")}
+                    _safe_env["HISTFILE"] = "/dev/null"  # prevent bash history
+
                     try:
                         result = subprocess.run(
-                            ["bash", "-c", cmd],
+                            ["bash", "--norc", "--noprofile", "-c", cmd],
                             capture_output=True, text=True, timeout=30,
+                            env=_safe_env,
                         )
                         if result.stdout:
                             print(f"\n  {G}Output:{N}")
@@ -1184,25 +1192,35 @@ def _intel_exploit_walkthrough(tor_proxy: str):
                     break
 
                 if action in ("e", "edit"):
-                    custom = prompt("Enter custom command (or Enter to keep original)",
-                                    step["command"].split("\n")[0])
-                    if custom:
-                        if not confirm(f"Execute: {custom[:80]}... ?"):
-                            continue
-                        try:
-                            result = subprocess.run(
-                                ["bash", "-c", custom],
-                                capture_output=True, text=True, timeout=30,
-                            )
-                            if result.stdout:
-                                print(f"\n  {G}Output:{N}")
-                                for line in result.stdout.strip().split("\n")[:20]:
-                                    print(f"    {line}")
-                            ok(f"Custom command executed")
-                        except subprocess.TimeoutExpired:
-                            warn("Command timed out (30s)")
-                        except Exception as e:
-                            err(f"Execution failed: {type(e).__name__}")
+                    default_cmd = step["command"].split("\n")[0]
+                    if default_cmd.startswith("#"):
+                        default_cmd = ""
+                    custom = prompt("Enter command to execute", default_cmd)
+                    if not custom or custom.startswith("#"):
+                        info("No executable command entered — skipping step")
+                        step_idx += 1
+                        break
+                    if not confirm(f"Execute: {custom[:80]}... ?"):
+                        continue
+                    _safe_env = {k: v for k, v in os.environ.items()
+                                 if k not in ("GS_WALLET_PASSWORD", "GS_WALLET_FILE",
+                                              "HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL")}
+                    _safe_env["HISTFILE"] = "/dev/null"
+                    try:
+                        result = subprocess.run(
+                            ["bash", "--norc", "--noprofile", "-c", custom],
+                            capture_output=True, text=True, timeout=30,
+                            env=_safe_env,
+                        )
+                        if result.stdout:
+                            print(f"\n  {G}Output:{N}")
+                            for line in result.stdout.strip().split("\n")[:20]:
+                                print(f"    {line}")
+                        ok(f"Custom command executed (exit code: {result.returncode})")
+                    except subprocess.TimeoutExpired:
+                        warn("Command timed out (30s)")
+                    except Exception as e:
+                        err(f"Execution failed: {type(e).__name__}")
                     step_idx += 1
                     break
 
@@ -1216,7 +1234,7 @@ def _intel_exploit_walkthrough(tor_proxy: str):
 
     print()
     ok("Exploit walkthrough complete.")
-    info("Run option 9 (Paranoia Cleanup) when done.")
+    info("Run Intel mode 7 (Wipe Intel Data) to securely erase all findings and exploit files.")
 
 
 def _build_exploit_steps(etype: str, param: str, ei: dict,
@@ -1475,7 +1493,10 @@ def _extract_base_url_from_vulns(vulns: list) -> str:
 def flow_intel(detected_port=None):
     heading("Intelligence Gathering & Vulnerability Scanner")
     print(f"  This tool performs OSINT collection and vulnerability scanning")
-    print(f"  through Tor. All data is stored in RAM only.")
+    print(f"  through Tor. All data is stored in RAM (/dev/shm).")
+    if not Path("/dev/shm").exists():
+        print(f"  {R}WARNING: /dev/shm not available — data will be stored on disk.{N}")
+        print(f"  {R}Use a system with tmpfs/ramfs for OPSEC-safe operation.{N}")
     print()
     print(f"  {B}Modes:{N}")
     print(f"    {G}1{N}  Domain Recon + Vuln Scan    (enter a domain)")
