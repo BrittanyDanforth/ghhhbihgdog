@@ -3422,10 +3422,18 @@ class SubdomainEnumerator:
                 name = entry.get("name_value", "")
                 for line in name.split("\n"):
                     line = line.strip().lower()
-                    if line and (line.endswith(f".{domain}") or line == domain):
-                        # Remove wildcard prefix
-                        line = line.lstrip("*.")
-                        if line and re.match(r"^[a-z0-9.\-]+$", line):
+                    if not line:
+                        continue
+                    # Strip the exact '*.' wildcard prefix. Using
+                    # str.lstrip('*.') treated the argument as a
+                    # character set and also stripped legitimate leading
+                    # dots/stars — so '*foo.example.com' (no dot after
+                    # the asterisk) became 'foo.example.com', which
+                    # isn't actually the same host.
+                    if line.startswith("*."):
+                        line = line[2:]
+                    if line.endswith(f".{domain}") or line == domain:
+                        if re.match(r"^[a-z0-9.\-]+$", line):
                             subdomains.add(line)
         except (ValueError, KeyError):
             pass
@@ -3936,15 +3944,24 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "subdomain_takeover":
-            # Use the service fingerprint from the original finding for verification
+            # Use the service fingerprint from the original finding for
+            # verification. Must match the VulnScanner._check_subdomain_takeover
+            # table above — the previous version dropped Azure, CloudFront,
+            # Ghost, Surge, and Bitbucket, so findings for those providers
+            # could never be marked 'confirmed' on replay.
             ei = finding.get("exploit_info", {})
             service = ei.get("service", "")
             takeover_fingerprints = {
                 "GitHub Pages": "there isn't a github pages site here",
                 "Heroku": "no-such-app",
                 "AWS S3": "nosuchbucket",
+                "Azure": "404 web site not found",
+                "CloudFront": "the request could not be satisfied",
                 "Shopify": "sorry, this shop is currently unavailable",
                 "Fastly": "fastly error: unknown domain",
+                "Ghost": "the thing you were looking for is no longer here",
+                "Surge": "project not found",
+                "Bitbucket": "repository not found",
             }
             fp = takeover_fingerprints.get(service, "")
             if fp and fp in text.lower():
@@ -3956,10 +3973,32 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "open_redirect":
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location", "")
+            # The original scanner issued the request with
+            # allow_redirects=False and checked the Location header on
+            # a 3xx. TorSession.get follows redirects by default, so
+            # when the verifier replays through it the response we
+            # receive is the TARGET of the redirect (usually 200), and
+            # the status_code check below silently fails for every
+            # confirmed open redirect. Replay with allow_redirects=False
+            # via _delay_for_domain + direct session.get so we see the
+            # 3xx response.
+            evil_target = "evil-attacker.com"
+            domain = urlparse(finding.get("test_url", "")).netloc
+            try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
+                resp_nr = self._session._session.get(
+                    finding.get("test_url", ""),
+                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+            except Exception:
+                return False
+            if resp_nr.status_code in (301, 302, 303, 307, 308):
+                location = resp_nr.headers.get("Location", "")
                 loc_host = urlparse(location).netloc
-                return loc_host != "" and loc_host != urlparse(resp.url).netloc
+                return bool(loc_host) and evil_target in loc_host
             return False
 
         return False
@@ -4523,7 +4562,14 @@ class IntelScraper:
         }
 
     def search_ddg(self, query: str, max_results: int = 20) -> List[dict]:
-        """DuckDuckGo HTML search — Tor-friendly, no JS needed."""
+        """DuckDuckGo HTML search — Tor-friendly, no JS needed.
+
+        DDG's HTML frontend frequently routes result links through
+        `/l/?uddg=<urlencoded-target>&...` instead of returning the
+        destination URL directly. The old version rejected those as
+        'duckduckgo' links and lost half the search results. Now we
+        unwrap the uddg parameter when present.
+        """
         results = []
         url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
         resp = self._session.get(url)
@@ -4536,11 +4582,33 @@ class IntelScraper:
             if not links:
                 # Fallback: find any result links
                 links = soup.find_all("a", href=re.compile(r"^https?://"))
-            for link in links[:max_results]:
+            seen: Set[str] = set()
+            for link in links:
+                if len(results) >= max_results:
+                    break
                 href = link.get("href", "")
                 title = link.get_text(strip=True)
-                if href and href.startswith("http") and "duckduckgo" not in href:
-                    results.append({"url": href, "title": title, "source": "ddg"})
+                if not href:
+                    continue
+
+                # Unwrap DDG's /l/?uddg=<target> redirect
+                if href.startswith("/l/?") or "duckduckgo.com/l/?" in href:
+                    try:
+                        qs = parse_qs(urlparse(href).query)
+                        uddg = qs.get("uddg", [""])[0]
+                        if uddg:
+                            href = uddg
+                    except Exception:
+                        pass
+
+                if not href.startswith(("http://", "https://")):
+                    continue
+                if "duckduckgo.com" in urlparse(href).netloc:
+                    continue
+                if href in seen:
+                    continue
+                seen.add(href)
+                results.append({"url": href, "title": title, "source": "ddg"})
         except Exception as e:
             integrity_log("intel", f"ddg_parse_error:{str(e)[:40]}")
         return results
