@@ -1038,7 +1038,15 @@ class VulnScanner:
         for pat in patterns:
             for match in pat.findall(html[:200000]):
                 if match.startswith("http"):
-                    if domain in match:
+                    # Match against the parsed netloc so
+                    # example.com.evil.com / *evil-example.com don't
+                    # count as same-origin just because they contain
+                    # our domain as a substring.
+                    try:
+                        m_netloc = urlparse(match).netloc.lower()
+                    except Exception:
+                        continue
+                    if m_netloc == domain or m_netloc.endswith("." + domain):
                         endpoints.add(match)
                 elif match.startswith("/"):
                     endpoints.add(urljoin(base_url, match))
@@ -2267,36 +2275,24 @@ class VulnScanner:
                                     _href = _a.get("href", "")
                                     if _href and not _href.startswith(("#", "javascript:", "mailto:")):
                                         _full = urljoin(ep["url"], _href)
-                                        if domain in urlparse(_full).netloc:
+                                        _f_netloc = urlparse(_full).netloc.lower()
+                                        if _f_netloc == domain or _f_netloc.endswith("." + domain):
                                             revisit_from_injection.add(_full)
                             except Exception:
                                 pass
                     except Exception:
                         pass
 
-                # SSTI markers
-                ssti_a, ssti_b = secrets.randbelow(90)+10, secrets.randbelow(90)+10
-                ssti_expected = str(ssti_a * ssti_b)
-                ssti_marker = f"t{secrets.token_hex(4)}"
-                for pi in [p for p in ep["params"] if not p.get("hidden")][:1]:
-                    try:
-                        r = self._send_test(ep, pi["name"], f"{{{{{ssti_a}*{ssti_b}}}}}")
-                        if r and r.text and ssti_expected in r.text:
-                            raw = f"{ssti_a}*{ssti_b}"
-                            if raw not in r.text:
-                                ep_findings.append({
-                                    "severity": SEV_CRITICAL,
-                                    "title": f"SSTI via '{pi['name']}' at {path}",
-                                    "detail": f"Template expression evaluated: {ssti_expected}",
-                                    "evidence": f"param: {pi['name']}, {ssti_a}*{ssti_b}={ssti_expected}",
-                                    "exploitable": True,
-                                    "test_url": f"{ep['url']}?{pi['name']}={quote(f'{{{{{ssti_a}*{ssti_b}}}}}')}" if ep["method"] == "GET" else ep["url"],
-                                    "exploit_info": {"type": "ssti", "parameter": pi["name"],
-                                                     "path": path, "method": "SSTI confirmed.",
-                                                     "risk": "Remote code execution"},
-                                })
-                    except Exception:
-                        pass
+                # SSTI — use the dedicated multi-engine test (Jinja2,
+                # Freemarker, ERB, Pebble, Smarty) + template-engine
+                # error indicators. The previous inline probe only tried
+                # Jinja2/Twig syntax and didn't check for engine errors,
+                # so Freemarker/ERB/Smarty SSTI silently went undetected.
+                try:
+                    ssti = self._test_endpoint_ssti(ep)
+                    ep_findings.extend(ssti)
+                except Exception as e:
+                    integrity_log("intel", f"ssti_error:{path}:{type(e).__name__}")
 
                 # LFI
                 try:
