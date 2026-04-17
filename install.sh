@@ -275,17 +275,57 @@ if ! "$VENV_PY" -c "import pip" 2>/dev/null; then
             exit 1
         fi
         if [ "$_getpip_ok" = true ] && [ -s /tmp/_get_pip.py ]; then
-            "$VENV_PY" /tmp/_get_pip.py 2>/dev/null
+            # get-pip.py itself downloads the pip wheel from pypi via
+            # urllib. urllib CAN'T parse socks5h:// (no stdlib SOCKS
+            # support), so if we inherit ALL_PROXY=socks5h:// urllib
+            # will either error out or (worse) fall back to clearnet.
+            # Run under torsocks when available; else temporarily
+            # strip the broken proxy vars AND require --allow-clearnet.
+            if [ "$USE_TORSOCKS" = true ]; then
+                torsocks "$VENV_PY" /tmp/_get_pip.py 2>/dev/null || true
+            elif [ "$TOR_RUNNING" = true ]; then
+                fail "get-pip.py runtime would leak to clearnet without"
+                fail "torsocks (urllib can't use socks5h://). Install"
+                fail "torsocks (apt install torsocks) and re-run."
+                rm -f /tmp/_get_pip.py
+                exit 1
+            elif [ "$ALLOW_CLEARNET" = true ]; then
+                warn "get-pip.py runtime via clearnet (--allow-clearnet)"
+                unset ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+                "$VENV_PY" /tmp/_get_pip.py 2>/dev/null || true
+            else
+                fail "Refusing to run get-pip.py: no Tor, no --allow-clearnet."
+                rm -f /tmp/_get_pip.py
+                exit 1
+            fi
             rm -f /tmp/_get_pip.py
         else
             # Method 3: copy system pip — offline, no network.
+            # NB: the previous code used --target with a literal glob
+            # "python3.*/site-packages/" inside double quotes, which
+            # bash does NOT expand, so it wrote pip into a directory
+            # literally named 'python3.*'. That directory is never on
+            # sys.path, so the fallback was a no-op. Expand the glob
+            # with a shell-level loop and pin to the venv's actual
+            # lib/pythonX.Y/site-packages.
             dim "Trying system pip (offline copy)..."
-            $PY -m pip install --target="$VENV_DIR/lib/python3.*/site-packages/" pip 2>/dev/null || {
-                fail "Cannot install pip. Try:"
-                fail "  sudo apt install python3-pip python3-venv"
-                fail "  rm -rf .venv && bash install.sh"
+            _site_dir=""
+            for _d in "$VENV_DIR"/lib/python*/site-packages; do
+                [ -d "$_d" ] && _site_dir="$_d" && break
+            done
+            if [ -n "$_site_dir" ]; then
+                $PY -m pip install --target="$_site_dir" pip 2>/dev/null || {
+                    fail "Cannot install pip. Try:"
+                    fail "  sudo apt install python3-pip python3-venv"
+                    fail "  rm -rf .venv && bash install.sh"
+                    exit 1
+                }
+            else
+                fail "Cannot find site-packages under $VENV_DIR/lib."
+                fail "Try: sudo apt install python3-pip python3-venv"
+                fail "     rm -rf .venv && bash install.sh"
                 exit 1
-            }
+            fi
         fi
     }
 fi
@@ -299,15 +339,32 @@ _pip_cmd() {
     fi
 }
 
-# Upgrade pip quietly — must clear proxy vars since PySocks may not be installed yet
-_SAVED_PROXY="${ALL_PROXY:-}"
+# Upgrade pip quietly. We must clear proxy vars because PySocks may
+# not be installed yet (pip without PySocks will bail on socks5h://).
+# HOWEVER — unsetting the proxies without a torsocks wrapper would
+# send pip's connection CLEARNET, which on a host without the
+# Tor firewall leaks the operator's real IP to pypi. Behaviors:
+#   * USE_TORSOCKS=true  -> wrap, Tor-routed, safe
+#   * Tor running but no torsocks -> skip upgrade entirely; we'll
+#     retry after PySocks is installed when the proxy vars are
+#     safe to use again
+#   * --allow-clearnet   -> operator has asserted a kernel-level
+#     Tor firewall; clearnet upgrade is allowed
+_SAVED_ALL_PROXY="${ALL_PROXY:-}"
+_SAVED_HTTP_PROXY="${http_proxy:-}"
+_SAVED_HTTPS_PROXY="${https_proxy:-}"
 unset ALL_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null
 if [ "$USE_TORSOCKS" = true ]; then
     torsocks $VENV_PIP install --upgrade pip 2>/dev/null || true
-else
+elif [ "$ALLOW_CLEARNET" = true ]; then
+    warn "pip upgrade via clearnet (--allow-clearnet)"
     $VENV_PIP install --upgrade pip 2>/dev/null || true
+else
+    dim "Skipping pip upgrade until PySocks is bootstrapped (no torsocks)"
 fi
-[ -n "$_SAVED_PROXY" ] && export ALL_PROXY="$_SAVED_PROXY"
+[ -n "$_SAVED_ALL_PROXY" ] && export ALL_PROXY="$_SAVED_ALL_PROXY"
+[ -n "$_SAVED_HTTP_PROXY" ] && export http_proxy="$_SAVED_HTTP_PROXY"
+[ -n "$_SAVED_HTTPS_PROXY" ] && export https_proxy="$_SAVED_HTTPS_PROXY"
 
 # ── Install packages ──────────────────────────────────────────────────────
 # Core deps are required. Extra deps enable optional features.
@@ -339,7 +396,20 @@ if ! "$VENV_PY" -c "import socks" 2>/dev/null; then
     PYSOCKS_OK=false
     if [ "$USE_TORSOCKS" = true ]; then
         torsocks $VENV_PIP install PySocks 2>&1 | tail -3 && PYSOCKS_OK=true
+    elif [ "$TOR_RUNNING" = true ] && [ "$ALLOW_CLEARNET" != true ]; then
+        # Tor running but no torsocks installed → we just unset the
+        # socks5h:// proxy envs so a bare pip install here would CLEARNET
+        # to pypi, leaking the real IP. Refuse.
+        fail "PySocks bootstrap requires torsocks when Tor is the only"
+        fail "supported egress. Install torsocks:"
+        fail "    sudo apt install torsocks"
+        fail "(or re-run with --allow-clearnet if tor_firewall is active)."
+        [ -n "$_SAVED_ALL_PROXY" ] && export ALL_PROXY="$_SAVED_ALL_PROXY"
+        [ -n "$_SAVED_HTTP_PROXY" ] && export http_proxy="$_SAVED_HTTP_PROXY"
+        [ -n "$_SAVED_HTTPS_PROXY" ] && export https_proxy="$_SAVED_HTTPS_PROXY"
+        exit 1
     else
+        # Either no Tor required (--allow-clearnet) or no Tor running.
         $VENV_PIP install PySocks 2>&1 | tail -3 && PYSOCKS_OK=true
     fi
 
