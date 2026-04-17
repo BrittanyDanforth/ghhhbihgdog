@@ -5052,29 +5052,83 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "subdomain_takeover":
-            # Use the service fingerprint from the original finding for
-            # verification. Must match the VulnScanner._check_subdomain_takeover
-            # table above — the previous version dropped Azure, CloudFront,
-            # Ghost, Surge, and Bitbucket, so findings for those providers
-            # could never be marked 'confirmed' on replay.
+            # Look up the fingerprint from the same class-level table
+            # the scanner uses. Previously maintained a separate
+            # hand-copied subset that drifted behind the scanner.
             ei = finding.get("exploit_info", {})
             service = ei.get("service", "")
-            takeover_fingerprints = {
-                "GitHub Pages": "there isn't a github pages site here",
-                "Heroku": "no-such-app",
-                "AWS S3": "nosuchbucket",
-                "Azure": "404 web site not found",
-                "CloudFront": "the request could not be satisfied",
-                "Shopify": "sorry, this shop is currently unavailable",
-                "Fastly": "fastly error: unknown domain",
-                "Ghost": "the thing you were looking for is no longer here",
-                "Surge": "project not found",
-                "Bitbucket": "repository not found",
-            }
-            fp = takeover_fingerprints.get(service, "")
-            if fp and fp in text.lower():
+            service_fp = None
+            for _svc_domain, (_name, fp) in VulnScanner.TAKEOVER_FINGERPRINTS.items():
+                if _name == service:
+                    service_fp = fp
+                    break
+            if service_fp and service_fp in text.lower():
                 return True
             return False
+
+        elif exploit_type == "nosql_injection":
+            # Re-look for NoSQL indicators in the replay body.
+            body_preview = text
+            for pat in VulnScanner.NOSQL_INDICATORS:
+                if pat.search(body_preview):
+                    return True
+            return False
+
+        elif exploit_type == "host_header_injection":
+            # Replay with a unique marker Host header. If the new
+            # marker shows up in the Location or body it's the same
+            # bug, confirmed.
+            import secrets as _secrets
+            marker = f"vx{_secrets.token_hex(4)}.example.test"
+            ei = finding.get("exploit_info", {})
+            hname = ei.get("header", "Host")
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            try:
+                domain_vr = urlparse(url).netloc
+                self._session._delay_for_domain(domain_vr)
+                self._session._maybe_rotate_circuit()
+                r2 = self._session._session.get(
+                    url, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers={**_pick_profile(), hname: marker},
+                )
+            except Exception:
+                return False
+            if r2 is None:
+                return False
+            loc = r2.headers.get("Location", "")
+            if loc and marker in loc:
+                return True
+            if r2.text and marker in r2.text:
+                return True
+            return False
+
+        elif exploit_type == "http_verb_tampering":
+            # Replay with the alternate verb inferred from the evidence.
+            ei = finding.get("exploit_info", {})
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            # Pull the alternate verb out of the evidence string:
+            #   "GET→403, PUT→200"  →  verb = PUT
+            ev = finding.get("evidence", "")
+            verb_match = re.search(r",\s*([A-Z]+)→", ev)
+            verb = verb_match.group(1) if verb_match else "POST"
+            try:
+                domain_vr = urlparse(url).netloc
+                self._session._delay_for_domain(domain_vr)
+                r2 = self._session._session.request(
+                    verb, url, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+            except Exception:
+                return False
+            return bool(r2) and 200 <= r2.status_code < 300
 
         elif exploit_type == "directory_traversal":
             if re.search(r"root:.*:0:0:", text):
