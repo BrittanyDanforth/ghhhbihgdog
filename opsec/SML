@@ -224,9 +224,9 @@ def cmd_verify(args):
         sys.exit(1)
 
     age = int(time.time()) - loaded_at
-    seed_bytes = len(seed_hex) // 2
+    seed_len = len(seed_hex) // 2
     print(f"  [+] Seed is loaded and verified")
-    print(f"      Size: {seed_bytes} bytes ({seed_bytes * 8} bits)")
+    print(f"      Size: {seed_len} bytes ({seed_len * 8} bits)")
     print(f"      Hash: {actual_hash[:16]}...")
     print(f"      Age:  {age // 60} minutes")
     if ttl:

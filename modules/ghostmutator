@@ -180,7 +180,13 @@ class Renamer(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str:
-    """Insert junk comments roughly every N lines to fuzz hash."""
+    """Insert junk comments roughly every `every_n` lines to fuzz hash.
+
+    Each source line gets a junk comment appended with probability
+    1/every_n (clamped to avoid div-by-zero), so the expected gap between
+    injections is ~every_n lines while keeping the per-line decision
+    deterministic under a seeded RNG.
+    """
     lines = src.splitlines()
     junk_prefixes = ["TODO", "FIXME", "HACK", "NOTE", "DEBUG", "OPTIMIZE", "REFACTOR"]
     junk_suffixes = [
@@ -188,17 +194,18 @@ def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str
         "temporary workaround", "performance bottleneck?",
         "¯\\_(ツ)_/¯", "( ͡° ͜ʖ ͡°)", "🤔", "🚀"
     ]
-    
+
+    prob = 1.0 / max(int(every_n), 1)
     out: List[str] = []
     for idx, line in enumerate(lines, 1):
         out.append(line)
-        if rng.random() < 0.08:
+        if rng.random() < prob:
             prefix = rng.choice(junk_prefixes)
             suffix = rng.choice(junk_suffixes)
             garbage = f"{prefix}: {rand_name(rng, 8)} - {suffix}"
             indent = len(line) - len(line.lstrip())
             out.append(" " * indent + f"# {garbage}")
-    
+
     return "\n".join(out)
 
 
@@ -415,9 +422,21 @@ def main():
         print(f"[!] Source file not found: {args.source}")
         sys.exit(1)
     
-    # Default output path
+    # Default output path — seed the RNG from the session entropy seed so
+    # the filename is reproducible within a session (matches the rest of
+    # the toolkit's deterministic-per-session contract). Falls back to a
+    # fresh random name if the seed isn't available yet.
     if not args.out:
-        rnd = rand_name(random.Random(), 6)
+        try:
+            _seed_blob = json.loads(args.seed.read_text())
+            _seed_bytes = bytes.fromhex(_seed_blob.get("seed_hex", ""))
+            _name_rng = random.Random(
+                hashlib.sha256(b"ghostmutator:name:" + _seed_bytes
+                               + args.source.name.encode()).digest()
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            _name_rng = random.Random()
+        rnd = rand_name(_name_rng, 6)
         args.out = _TOOLKIT_ROOT / "runtime" / f"{args.source.stem}_{rnd}.py"
     
     mutate(args.source, args.out, args.seed, write_manifest=args.manifest)
