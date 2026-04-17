@@ -3071,8 +3071,16 @@ class VulnScanner:
         if not id_params:
             return findings
 
-        # Test: can we access id+1 and id-1? If responses differ meaningfully
-        # and both return 200, IDOR is likely
+        # Test: compare baseline to id+1 AND id-1. Both need to return
+        # 200 with DIFFERENT content from the baseline for a real IDOR
+        # signal (otherwise it's likely the same page regardless of ID).
+        # Login-wall responses are filtered: status==200 + a denial phrase
+        # is skipped.
+        _idor_deny = re.compile(
+            r"(?:access\s+denied|permission\s+denied|unauthori[sz]ed|"
+            r"please\s+(?:log|sign)\s+in|login\s+required)",
+            re.I,
+        )
         tested = set()
         for param_name, param_val in id_params[:3]:
             key = f"{param_name}:{param_val}"
@@ -3084,35 +3092,57 @@ class VulnScanner:
             except ValueError:
                 continue
 
-            # Fetch original
             orig_url = f"{base_url}?{param_name}={val}"
             orig_resp = self._session.get(orig_url, allow_wayback=False)
-            if not orig_resp or orig_resp.status_code != 200:
+            if not orig_resp or orig_resp.status_code != 200 or not orig_resp.text:
+                continue
+            if _idor_deny.search(orig_resp.text[:4000]):
                 continue
 
-            # Fetch id+1
-            next_url = f"{base_url}?{param_name}={val + 1}"
-            next_resp = self._session.get(next_url, allow_wayback=False)
-            if next_resp and next_resp.status_code == 200 and next_resp.text:
-                diff = self._response_diff(orig_resp.text, next_resp.text)
+            hits: List[Tuple[int, float]] = []
+            for offset in (1, -1, 2, 10):
+                target_id = val + offset
+                if target_id <= 0:
+                    continue
+                t_url = f"{base_url}?{param_name}={target_id}"
+                t_resp = self._session.get(t_url, allow_wayback=False)
+                if not t_resp or t_resp.status_code != 200 or not t_resp.text:
+                    continue
+                if _idor_deny.search(t_resp.text[:4000]):
+                    continue
+                diff = self._response_diff(orig_resp.text, t_resp.text)
                 if not diff["similar"] and diff["score"] > 0.3:
-                    findings.append({
-                        "severity": SEV_HIGH,
-                        "title": f"Possible IDOR via '{param_name}' parameter",
-                        "detail": f"Sequential IDs ({val}, {val+1}) return different content. "
-                                  "Access control may not be enforced — test with different sessions.",
-                        "evidence": f"param: {param_name}, id={val} and id={val+1} both return 200 "
-                                    f"with different content (similarity={diff['score']})",
-                        "exploitable": True,
-                        "exploit_info": {
-                            "type": "idor",
-                            "parameter": param_name,
-                            "method": f"Enumerate '{param_name}' values (1, 2, 3...) to access "
-                                      "other users' data. Test with unauthenticated session.",
-                            "risk": "Unauthorized data access, privacy violation, data theft",
-                        },
-                    })
-                    break
+                    hits.append((target_id, diff["score"]))
+
+            # Require at least TWO distinct IDs to return different-but-
+            # similar content before flagging. One off-by-one could be
+            # coincidence; two is a pattern.
+            if len(hits) >= 2:
+                ids_s = ", ".join(str(h[0]) for h in hits)
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"Possible IDOR via '{param_name}' parameter",
+                    "detail": (f"Sequential IDs return different content "
+                               f"(baseline={val}, other IDs: {ids_s}). "
+                               f"Access control appears absent — test "
+                               f"with an unauthenticated session to "
+                               f"confirm."),
+                    "evidence": (f"param: {param_name}, baseline={val}, "
+                                 f"others={ids_s} — all return 200 with "
+                                 f"different bodies"),
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "idor",
+                        "parameter": param_name,
+                        "method": (f"Enumerate '{param_name}' (for/while "
+                                   f"range) to access other users' data. "
+                                   f"Also test with your session cookie "
+                                   f"removed — if IDs still return data, "
+                                   f"there's no auth check."),
+                        "risk": "Unauthorized data access, privacy violation, data theft",
+                    },
+                })
+                break
         return findings
 
     # Per-path content validators: given a path and the response body,
@@ -6017,7 +6047,23 @@ class IntelOrchestrator:
             print(f"  [!] The site may be down, blocking Tor, or require authentication.")
             print(f"  [*] Continuing with header/DNS checks only...")
         elif result.get("honeypot"):
-            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+            # Honeypot flag doesn't block DNS + subdomain + header checks
+            # since those don't hit the suspicious path. Keep going —
+            # just record the honeypot flag as a finding and proceed.
+            print(f"  [!] Honeypot/WAF detected "
+                  f"({', '.join(result.get('hp_reasons', [])[:3])}). "
+                  f"Surface checks may be noisy; DNS / subdomain recon "
+                  f"continues.")
+            self._vuln_findings.append({
+                "severity": SEV_INFO,
+                "title": "Probable honeypot / aggressive WAF",
+                "detail": ("Main-page fetch matched multiple honeypot "
+                           "/ WAF signals. Subsequent checks should be "
+                           "treated with extra scepticism — 200s may be "
+                           "trap responses, 403s may be WAF fooling us."),
+                "evidence": ", ".join(result.get("hp_reasons", [])[:4]),
+                "confidence": 0.7,
+            })
         else:
             self._results.append(result)
             self._print_extraction(result)
