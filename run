@@ -202,10 +202,20 @@ _SECRETS_TO_STRIP = (
 )
 
 
-def _sanitized_env(extra_strip: tuple = ()) -> dict:
-    """Build a sanitized environment with secrets stripped."""
+def _sanitized_env(extra_strip: tuple = (), keep: tuple = ()) -> dict:
+    """Build a sanitized environment with secrets stripped.
+
+    `keep` is a tuple of env var names that should NOT be stripped even
+    if they appear in _SECRETS_TO_STRIP. This is how we let specific
+    subprocesses see the credentials they need (e.g. HIBP_KEY for the
+    intel breach checker) without punching a hole in the default-deny
+    policy for every other subprocess.
+    """
     env = os.environ.copy()
+    keep_set = set(keep)
     for _k in _SECRETS_TO_STRIP + extra_strip:
+        if _k in keep_set:
+            continue
         env.pop(_k, None)
     env["HISTFILE"] = "/dev/null"
     return env
@@ -276,11 +286,18 @@ def _jittered_delay(lo: float = 1.0, hi: float = 4.0) -> None:
     _time_mod.sleep(lo + secrets.randbelow(ms_range) / 1000.0)
 
 
-def run_script(path: Path, args: list, label: str = ""):
+def run_script(path: Path, args: list, label: str = "",
+               keep_env: tuple = ()):
+    """Launch a child script under the toolkit's sanitized env.
+
+    `keep_env` is a whitelist of env vars the child is allowed to see
+    even though they're normally stripped (API keys for intel scans,
+    wallet password for signing, etc.).
+    """
     if label:
         info(f"Running {label}...")
     python = sys.executable
-    child_env = _sanitized_env()
+    child_env = _sanitized_env(keep=keep_env)
     try:
         result = subprocess.run(
             [python, str(path)] + args,
@@ -2098,7 +2115,8 @@ def flow_receive(detected_port=None):
         _swap_outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
         swap_args = ["--amounts", btc_amt, "--dests", _addr, "--tor-proxy", tor,
                      "--outfile", _swap_outfile, "--force"]
-        if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer"):
+        if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer",
+                           keep_env=("COINGECKO_API_KEY",)):
             err("Swap preparation failed.")
             return
     else:
@@ -2384,7 +2402,8 @@ def flow_swap_preparer(detected_port=None):
     _outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
     args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor,
             "--outfile", _outfile, "--force"]
-    if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer"):
+    if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer",
+                       keep_env=("COINGECKO_API_KEY",)):
         err("Swap preparation failed.")
     else:
         ok("Deposit instructions generated — see output above.")
@@ -2413,7 +2432,8 @@ def flow_exit_planner(detected_port=None):
         err(f"Unknown method: {method}")
         return
     args = [amt, "--method", method, "--tor-proxy", tor]
-    if run_script(CORE / "exit_strategy_planner", args, "Exit planner"):
+    if run_script(CORE / "exit_strategy_planner", args, "Exit planner",
+                   keep_env=("COINGECKO_API_KEY",)):
         ok("Exit plan generated.")
     else:
         err("Exit planning failed — see output above.")
@@ -5018,7 +5038,9 @@ def flow_intel(detected_port=None):
                 ck = ck.strip()
                 if "=" in ck:
                     args.extend(["--cookie", ck])
-        if run_script(INTEL / "testergatherSystem", args, "Intel scan"):
+        if run_script(INTEL / "testergatherSystem", args, "Intel scan",
+                       keep_env=("HIBP_KEY", "DEHASHED_KEY",
+                                 "DEHASHED_EMAIL", "COINGECKO_API_KEY")):
             if depth == "deep":
                 print()
                 print(f"  {B}Post-scan options:{N}")
@@ -5038,7 +5060,11 @@ def flow_intel(detected_port=None):
             err("Valid email address required.")
             return
         args = ["--email", email, "--tor-proxy", tor]
-        run_script(INTEL / "testergatherSystem", args, "Breach check")
+        # Breach-DB API keys are normally stripped from child env by the
+        # default-deny policy. Let them through here or the breach
+        # check is a silent no-op.
+        run_script(INTEL / "testergatherSystem", args, "Breach check",
+                   keep_env=("HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL"))
 
     elif mode == "3":
         query = prompt("Search query")
@@ -5073,7 +5099,11 @@ def flow_intel(detected_port=None):
                 ck = ck.strip()
                 if "=" in ck:
                     args.extend(["--cookie", ck])
-        run_script(INTEL / "testergatherSystem", args, "Batch intel")
+        # Batch mode can dispatch to breach checks for email targets, so
+        # let the API keys through too.
+        run_script(INTEL / "testergatherSystem", args, "Batch intel",
+                   keep_env=("HIBP_KEY", "DEHASHED_KEY",
+                             "DEHASHED_EMAIL", "COINGECKO_API_KEY"))
 
     else:
         warn(f"Unknown mode: {mode}")
