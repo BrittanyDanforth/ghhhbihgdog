@@ -64,27 +64,20 @@ class CryptoSecureRNG:
         self._init_rng()
     
     def _ensure_entropy(self):
-        """Generate or load high-entropy seed for deterministic chaos"""
+        """Require a pre-existing seed; integrity_faker is downstream of en_seeder.
+
+        Silently writing a new seed here would clobber the session-wide
+        seed every module in the pipeline derives from, making
+        'deterministic chaos' non-reproducible. Fail loudly so the
+        operator runs `en_seeder` first (or the full ghost_unifier
+        pipeline).
+        """
         if not self.seed_file.exists():
-            seed_hex = secrets.token_hex(32)
-            entropy_data = {
-                "seed_hex": seed_hex,
-                "sha256": hashlib.sha256(bytes.fromhex(seed_hex)).hexdigest(),
-                "timestamp": int(time.time()),
-                "sources": {"auto_generated": True}
-            }
-            
-            # Write atomically with secure permissions
-            temp_file = self.seed_file.with_suffix('.tmp')
-            with open(temp_file, 'w') as f:
-                json.dump(entropy_data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(temp_file, 0o600)
-            temp_file.replace(self.seed_file)
-            os.chmod(self.seed_file, 0o600)
-            
-            print(f"[+] Generated cryptographic entropy seed: {self.seed_file}")
+            raise FileNotFoundError(
+                f"entropy seed file not found: {self.seed_file}\n"
+                f"    Run `python3 modules/en_seeder` first so every "
+                f"module shares the same seed."
+            )
     
     def _init_rng(self):
         """Initialize deterministic RNG from entropy sources"""

@@ -67,6 +67,12 @@ SEED_FILE = _TOOLKIT_ROOT / "entropy_seed.json"
 DEFAULT_OUTPUT = _TOOLKIT_ROOT / "mirror_exec.log"
 TEMP_DIR = Path("/dev/shm") if Path("/dev/shm").exists() else Path(tempfile.gettempdir())
 
+# Per-run tag used to namespace our temp files under TEMP_DIR. Without
+# this, the finally block's cleanup would glob `decoy_*.log` (and
+# `.${proc}_*`) from TEMP_DIR and delete unrelated files belonging to
+# other users or processes on a shared /tmp.
+_RUN_TAG = secrets.token_hex(4)
+
 # Sophisticated tag mutation maps with context awareness
 CONTEXT_AWARE_MUTATIONS = {
     "system": {
@@ -191,14 +197,14 @@ class AntiAnalysis:
         if AntiAnalysis.detect_analysis_environment():
             return  # Don't create decoys if under analysis
         
-        # Create background threads that mimic system processes
+        # Create background threads that mimic system processes.
+        # Names are namespaced by _RUN_TAG so cleanup won't touch any
+        # similarly-named files from other processes on shared /tmp.
         for proc_name in random.sample(DECOY_PROCESSES, 3):
             def decoy_worker(name):
-                # Simulate system process behavior
                 while True:
                     time.sleep(random.uniform(5, 30))
-                    # Simulate file system activity
-                    temp_file = TEMP_DIR / f".{name}_{secrets.token_hex(8)}"
+                    temp_file = TEMP_DIR / f".{name}_{_RUN_TAG}_{secrets.token_hex(8)}"
                     try:
                         temp_file.touch()
                         time.sleep(random.uniform(0.1, 1.0))
@@ -221,21 +227,22 @@ class CryptoSecureRNG:
         """Initialize with maximum entropy from multiple sources"""
         entropy_components = []
         
-        # Primary seed file
+        # Primary seed file. mirrormask is downstream of en_seeder in the
+        # ghost_unifier pipeline — if the toolkit-wide seed is missing,
+        # that means the pipeline was skipped or the seed was wiped. In
+        # either case, silently generating a new one here would break
+        # every other module's "same seed this session" contract AND
+        # write the file in a schema that differs from en_seeder's
+        # (primary_seed vs seed_hex). Fail loudly instead.
         if self.seed_file.exists():
             entropy_components.append(self.seed_file.read_bytes())
         else:
-            # Generate secure seed if missing
-            secure_seed = secrets.token_bytes(64)
-            seed_data = {
-                "primary_seed": secure_seed.hex(),
-                "created": datetime.now(timezone.utc).isoformat(),
-                "hardware_id": SystemFingerprint.get_hardware_id(),
-                "runtime_entropy": SystemFingerprint.get_runtime_entropy()
-            }
-            self.seed_file.write_text(json.dumps(seed_data, indent=2))
-            os.chmod(self.seed_file, 0o600)
-            entropy_components.append(secure_seed)
+            raise FileNotFoundError(
+                f"entropy seed file not found: {self.seed_file}\n"
+                f"    Run `python3 modules/en_seeder` first (or the full "
+                f"ghost_unifier pipeline) so every module shares the same "
+                f"deterministic seed."
+            )
         
         # Source file hashes
         for source in self.sources:
@@ -433,9 +440,10 @@ class EnhancedForensicMirrormask:
         """Execute countermeasures if analysis is detected"""
         print("[!] Analysis environment detected. Executing countermeasures...")
         
-        # Create decoy files
+        # Create decoy files. Prefix each name with the per-run tag so
+        # cleanup only removes decoys we created this run.
         for _ in range(5):
-            decoy_file = TEMP_DIR / f"decoy_{secrets.token_hex(8)}.log"
+            decoy_file = TEMP_DIR / f"decoy_{_RUN_TAG}_{secrets.token_hex(8)}.log"
             decoy_content = self._generate_decoy_content()
             decoy_file.write_text(decoy_content)
             os.chmod(decoy_file, 0o600)
@@ -686,13 +694,14 @@ def main():
         sys.exit(1)
     finally:
         try:
-            # Only clean up our own temp files (mirror_exec prefix)
+            # Only clean up our own temp files — namespace by _RUN_TAG
+            # so we don't stomp on unrelated files on a shared /tmp.
             for temp_file in TEMP_DIR.glob("mirror_exec*.tmp"):
                 temp_file.unlink(missing_ok=True)
-            for temp_file in TEMP_DIR.glob("decoy_*.log"):
+            for temp_file in TEMP_DIR.glob(f"decoy_{_RUN_TAG}_*.log"):
                 temp_file.unlink(missing_ok=True)
             for proc_name in DECOY_PROCESSES:
-                for temp_file in TEMP_DIR.glob(f".{proc_name}_*"):
+                for temp_file in TEMP_DIR.glob(f".{proc_name}_{_RUN_TAG}_*"):
                     temp_file.unlink(missing_ok=True)
         except OSError as e:
             integrity_log("mirrormask", f"finally_cleanup_fail:{type(e).__name__}")

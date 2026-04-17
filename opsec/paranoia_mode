@@ -418,12 +418,20 @@ def wipe_artifacts(dry: bool, extra_dirs: list = None):
     # Wipe toolkit files in /dev/shm (RAM-only storage)
     shm = Path("/dev/shm")
     if shm.is_dir():
+        # Only match filenames we actually write in /dev/shm. The old
+        # entry "gs_*" is a global wildcard that would delete unrelated
+        # files created by any other process whose names happen to
+        # start with "gs_", which is not acceptable on shared hosts.
+        # "gs_seed_active", "gs_unlock_token", "gs_paranoia_wipe" are
+        # listed explicitly below; .tk_* is scoped under /dev/shm and
+        # unique to this toolkit (see dmswitch).
         shm_patterns = [
             ".gs_seed_active", ".gs_seed_active.tmp",
             ".gs_seed_lock",
-            "gs_*", "vm_timing.json", "vm_timing.tmp",
+            "vm_timing.json", "vm_timing.tmp",
             "swap_progress_secure.json", "swap_progress_secure.tmp",
-            "circuit_burn.log", "gs_unlock_token", "gs_paranoia_wipe",
+            "circuit_burn.log",
+            "gs_seed_active", "gs_unlock_token", "gs_paranoia_wipe",
             ".gs_locked_bundle", ".gs_lock_meta",
             ".tk_*",
             "fake_errors.log",
@@ -431,6 +439,7 @@ def wipe_artifacts(dry: bool, extra_dirs: list = None):
         shm_dir_patterns = [
             "qr_codes",
             "decoys",
+            "intel",  # testergatherSystem + exploit file manager RAM dir
         ]
         for pat in shm_patterns:
             for f in shm.glob(pat):
@@ -447,39 +456,83 @@ def wipe_artifacts(dry: bool, extra_dirs: list = None):
                 else:
                     _secure_delete_dir(d)
                 count += 1
+    # Roots we own (toolkit install dir + typical user-scoped dirs) get a
+    # full recursive search via rglob — the trees are bounded and missing
+    # a nested artifact here is a real OPSEC failure. Roots that can be
+    # enormous or contain unrelated data (/media, /mnt, /run/media, $HOME)
+    # are scanned with a bounded glob depth so we don't chew through every
+    # mounted drive looking for wallet_*.json.
+    _bounded_roots = {
+        Path("/media"), Path("/mnt"), Path("/run/media"),
+        Path.home(), Path(".").resolve(),
+    }
+    bounded_depth_patterns = [
+        "",          # root itself
+        "*/",        # 1 level
+        "*/*/",      # 2 levels
+        "*/*/*/",    # 3 levels
+        "*/*/*/*/",  # 4 levels
+    ]
+
     for root in search_roots:
         if not root.is_dir():
             continue
 
-        # Use recursive glob (**/) to find artifacts at any depth.
-        # The old code only searched one level deep, missing artifacts
-        # in nested directories (e.g. ~/projects/toolkit/run3/unsigned/).
-        # Limit depth to 4 levels to avoid scanning huge trees like /mnt.
-        depth_patterns = [
-            "",          # root itself
-            "*/",        # 1 level
-            "*/*/",      # 2 levels
-            "*/*/*/",    # 3 levels
-        ]
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            root_resolved = root
 
-        for pattern in file_patterns:
-            for depth in depth_patterns:
-                for f in root.glob(f"{depth}{pattern}"):
-                    if dry:
-                        print(f"  [dry] would securely delete {f}")
-                    else:
-                        _secure_delete_file(f)
-                    count += 1
+        recursive = root_resolved not in {
+            p.resolve() if p.exists() else p for p in _bounded_roots
+        }
 
-        for dirname in dir_patterns:
-            for depth in depth_patterns:
-                for d in root.glob(f"{depth}{dirname}"):
-                    if d.is_dir():
+        if recursive:
+            for pattern in file_patterns:
+                try:
+                    for f in root.rglob(pattern):
                         if dry:
-                            print(f"  [dry] would securely delete dir {d}")
+                            print(f"  [dry] would securely delete {f}")
                         else:
-                            _secure_delete_dir(d)
+                            _secure_delete_file(f)
                         count += 1
+                except (OSError, PermissionError):
+                    pass
+            for dirname in dir_patterns:
+                try:
+                    for d in root.rglob(dirname):
+                        if d.is_dir():
+                            if dry:
+                                print(f"  [dry] would securely delete dir {d}")
+                            else:
+                                _secure_delete_dir(d)
+                            count += 1
+                except (OSError, PermissionError):
+                    pass
+        else:
+            for pattern in file_patterns:
+                for depth in bounded_depth_patterns:
+                    try:
+                        for f in root.glob(f"{depth}{pattern}"):
+                            if dry:
+                                print(f"  [dry] would securely delete {f}")
+                            else:
+                                _secure_delete_file(f)
+                            count += 1
+                    except (OSError, PermissionError):
+                        pass
+            for dirname in dir_patterns:
+                for depth in bounded_depth_patterns:
+                    try:
+                        for d in root.glob(f"{depth}{dirname}"):
+                            if d.is_dir():
+                                if dry:
+                                    print(f"  [dry] would securely delete dir {d}")
+                                else:
+                                    _secure_delete_dir(d)
+                                count += 1
+                    except (OSError, PermissionError):
+                        pass
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
     integrity_log("paranoia", f"artifacts:{'dry' if dry else 'wiped'}:{count}")
