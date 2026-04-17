@@ -71,7 +71,7 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets, signal, threading, time as _time_mod, shlex
+import json, subprocess, shutil, secrets, signal, threading, time as _time_mod
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, quote, urlencode, urljoin
 from dataclasses import dataclass, field
@@ -1498,6 +1498,12 @@ class StepExecutor:
             method=method, url=url, params=params, data=data,
             headers=headers,
         )
+
+        # Default success for the audit: the HTTP exchange itself completed
+        # cleanly (2xx/3xx, no transport error). A validator, when present,
+        # overrides this with a semantic verdict (vuln confirmed / not).
+        if not result.error and 200 <= result.status_code < 400:
+            result.success = True
 
         # Run validation callback if provided
         validate = step.get("validate")
@@ -4700,11 +4706,11 @@ def flow_intel(detected_port=None):
 
         print(f"  {B}Ephemeral Exploit Files:{N}")
         print(f"  {'─' * 55}")
-        for f in exploit_files:
+        for idx, f in enumerate(exploit_files, 1):
             size_kb = f.stat().st_size / 1024
             age_min = (_time_mod.time() - f.stat().st_mtime) / 60
             age_str = f"{age_min:.0f}m ago" if age_min < 60 else f"{age_min/60:.1f}h ago"
-            print(f"    {f.name:35s}  {size_kb:.1f}KB  {age_str}")
+            print(f"    {idx:>2}  {f.name:35s}  {size_kb:.1f}KB  {age_str}")
         print()
         print(f"  {B}Actions:{N}")
         print(f"    {G}1{N}  View a file")
