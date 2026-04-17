@@ -5801,12 +5801,87 @@ class IntelScraper:
             combined = " ".join(comments)
             secrets_in_comments = self._extractor.extract_all(combined)
 
+        # ── Fetch first-party JS bundles and scan for secrets ───────
+        # Front-end bundles routinely embed API keys, JWT fragments,
+        # internal API paths, and debug URLs that never appear in the
+        # HTML. We fetch up to 6 same-origin .js files (capped at
+        # 256 KB each), extract the same patterns, and report any
+        # hits as 'js_secrets'.
+        js_secrets: Dict[str, List[str]] = {}
+        js_urls_fetched: List[str] = []
+        if HAS_BS4:
+            try:
+                base_host = urlparse(url).netloc
+                soup2 = BeautifulSoup(content[:200000], "html.parser")
+                js_candidates: List[str] = []
+                for s in soup2.find_all("script", src=True):
+                    src = s.get("src", "")
+                    if not src or src.startswith(("data:", "#", "javascript:")):
+                        continue
+                    full = urljoin(url, src)
+                    if not full.lower().endswith((".js", ".mjs")):
+                        # Some bundlers serve /static/main.<hash> without .js
+                        if ".js?" not in full.lower():
+                            continue
+                    if urlparse(full).netloc != base_host:
+                        continue  # skip CDN-hosted third-party JS
+                    if full not in js_candidates:
+                        js_candidates.append(full)
+                # Cap + fetch
+                for js_url in js_candidates[:6]:
+                    if shutdown_requested():
+                        break
+                    js_resp = self._session.get(js_url, allow_wayback=False)
+                    if not js_resp or js_resp.status_code != 200:
+                        continue
+                    js_body = js_resp.text[:256 * 1024] if js_resp.text else ""
+                    if not js_body:
+                        continue
+                    js_urls_fetched.append(js_url)
+                    hits = self._extractor.extract_all(js_body)
+                    # Merge into cumulative js_secrets dict (set-semantics
+                    # is what the extractor returns as values).
+                    for k, v_list in hits.items():
+                        if not v_list:
+                            continue
+                        bucket = js_secrets.setdefault(k, [])
+                        for val in v_list:
+                            if val not in bucket:
+                                bucket.append(val)
+                    # Also check for sourcemap pointer: /*# sourceMappingURL=... */
+                    m = re.search(
+                        r"[#@]\s*sourceMappingURL\s*=\s*(\S+)",
+                        js_body[-4096:],
+                    )
+                    if m:
+                        map_url = urljoin(js_url, m.group(1))
+                        if urlparse(map_url).netloc == base_host:
+                            try:
+                                sm_resp = self._session.get(
+                                    map_url, allow_wayback=False,
+                                )
+                                if sm_resp and sm_resp.status_code == 200 and sm_resp.text:
+                                    # Source maps leak the original source
+                                    # paths in "sources": [...]. We flag
+                                    # the fact they're accessible as a
+                                    # finding by storing it in js_secrets
+                                    # under a dedicated key.
+                                    js_secrets.setdefault(
+                                        "sourcemap_exposed", [],
+                                    ).append(map_url)
+                            except Exception:
+                                pass
+            except Exception as e:
+                integrity_log("intel", f"js_scrape_error:{type(e).__name__}")
+
         _coarsened = int(time.time()) // 600 * 600
         return {
             "url": url, "title": title[:200], "description": meta_desc[:500],
             "extracted": extracted, "urls_found": len(urls),
             "comments": len(comments),
             "secrets_in_comments": secrets_in_comments,
+            "js_secrets": js_secrets,
+            "js_urls_fetched": js_urls_fetched,
             "content_length": len(content), "timestamp": _coarsened,
             "raw_html": content, "raw_headers": headers,
             "raw_set_cookies": raw_set_cookies,
@@ -5948,6 +6023,64 @@ class IntelOrchestrator:
             self._print_extraction(result)
             if result.get("url", "").startswith("http://"):
                 base_url = f"http://{domain}"
+
+            # Turn JS-bundle secrets into top-tier vulnerability
+            # findings — an AWS key embedded in main.js is much more
+            # actionable than a line in the "extracted" bucket.
+            js_secrets = result.get("js_secrets", {}) or {}
+            for stype, values in js_secrets.items():
+                if stype == "sourcemap_exposed":
+                    for sm_url in values[:3]:
+                        self._vuln_findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": "Source map exposed",
+                            "detail": (f"Source map at {sm_url} is publicly "
+                                       f"accessible. Attacker can reconstruct "
+                                       f"original source tree (directory "
+                                       f"names, file paths, JSX/TS before "
+                                       f"minification)."),
+                            "evidence": sm_url,
+                            "confidence": 0.95,
+                            "exploit_info": {
+                                "type": "sourcemap_exposure",
+                                "path": urlparse(sm_url).path,
+                                "method": ("Fetch the .map file, parse "
+                                           "'sources' array — full source "
+                                           "tree of the SPA is recoverable."),
+                                "risk": "Source code disclosure, leaked "
+                                        "internal paths + comments",
+                            },
+                            "exploitable": True,
+                        })
+                    continue
+                if not values:
+                    continue
+                # Key types that are near-always critical:
+                critical_types = {"aws_key", "github_token", "stripe_key",
+                                  "jwt_token", "generic_secret"}
+                sev = SEV_CRITICAL if stype in critical_types else SEV_MEDIUM
+                self._vuln_findings.append({
+                    "severity": sev,
+                    "title": f"{stype} leaked in first-party JS bundle",
+                    "detail": (f"Scanning same-origin JS bundles surfaced "
+                               f"{len(values)} {stype} value(s). Front-end "
+                               f"minifiers don't strip secrets from the "
+                               f"source — anything bundled in is shipped "
+                               f"to the browser in the clear."),
+                    "evidence": (f"{stype} count: {len(values)}; "
+                                 f"sample: {str(values[0])[:40]}..."),
+                    "confidence": 0.95,
+                    "exploit_info": {
+                        "type": "js_secret_leak",
+                        "secret_kind": stype,
+                        "method": ("Pull the JS bundle, grep for the key, "
+                                   "test it against the corresponding "
+                                   "provider's API."),
+                        "risk": ("Credential theft — provider account "
+                                 "compromise depending on key type"),
+                    },
+                    "exploitable": True,
+                })
 
         # Phase 2: Technology fingerprinting
         html = result.get("raw_html", "") if result else ""
@@ -6319,6 +6452,8 @@ class IntelOrchestrator:
                 all_data[etype].update(evals)
             for etype, evals in r.get("secrets_in_comments", {}).items():
                 all_data[f"comment_{etype}"].update(evals)
+            for etype, evals in r.get("js_secrets", {}).items():
+                all_data[f"js_{etype}"].update(evals)
 
         # Dedup vuln findings BEFORE counting / exporting — phase-B
         # revisit passes + chain rules + the base-url checks all
