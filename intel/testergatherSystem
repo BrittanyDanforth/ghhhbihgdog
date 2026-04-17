@@ -5570,6 +5570,86 @@ class FindingChain:
                                   "POST system.listMethods to enumerate available methods.",
                         "risk": "Brute-force, SSRF via pingback, denial of service",
                     }
+
+        # ── User enumeration via REST API ───────────────────────────
+        if not shutdown_requested():
+            users_url = urljoin(base_url, "/wp-json/wp/v2/users")
+            u_resp = self._session.get(users_url, allow_wayback=False)
+            if u_resp and u_resp.status_code == 200 and u_resp.text:
+                try:
+                    users = u_resp.json()
+                except Exception:
+                    users = None
+                if isinstance(users, list) and users:
+                    slugs = [u.get("slug") for u in users if isinstance(u, dict) and u.get("slug")]
+                    names = [u.get("name") for u in users if isinstance(u, dict) and u.get("name")]
+                    sample = slugs[:5] or names[:5]
+                    if sample:
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"WordPress user enumeration: {len(users)} account(s) exposed",
+                            "detail": (f"GET /wp-json/wp/v2/users returns the "
+                                       f"full user list (slug + display name + "
+                                       f"avatar). Usernames needed for brute-force "
+                                       f"are now public."),
+                            "evidence": f"Slugs: {', '.join(sample[:5])}",
+                            "confidence": 0.95,
+                            "exploitable": True,
+                            "chain_source": "wordpress_deep_scan",
+                            "exploit_info": {
+                                "type": "wp_user_enum",
+                                "path": "/wp-json/wp/v2/users",
+                                "usernames": sample,
+                                "method": (f"Usernames ({', '.join(sample[:3])}) "
+                                           f"are now known. Feed them to "
+                                           f"wpscan/hydra against /wp-login.php "
+                                           f"or /xmlrpc.php. Test the most "
+                                           f"common ones with common passwords "
+                                           f"before escalating to a wordlist."),
+                                "risk": "Credential brute-force, account takeover",
+                            },
+                        })
+
+        # ── /?author=N enumeration fallback ──
+        # If REST API is blocked, author-N permalinks often leak the
+        # same info via redirect.
+        if not shutdown_requested():
+            author_usernames: List[str] = []
+            for author_id in range(1, 6):
+                a_url = urljoin(base_url, f"/?author={author_id}")
+                a_resp = self._session.get(a_url, allow_wayback=False,
+                                           method="HEAD")
+                if not a_resp:
+                    continue
+                # WP redirects /?author=N to /author/<login>/
+                if a_resp.status_code in (301, 302, 303):
+                    loc = a_resp.headers.get("Location", "")
+                    m = re.search(r"/author/([^/?&#]+)", loc, re.I)
+                    if m:
+                        uname = m.group(1)
+                        if uname and uname not in author_usernames:
+                            author_usernames.append(uname)
+            if author_usernames:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "WordPress author-ID enumeration leaks usernames",
+                    "detail": (f"Requesting /?author=N for N=1..5 redirects "
+                               f"to /author/<login>/, leaking {len(author_usernames)} "
+                               f"username(s) even if the REST API is blocked."),
+                    "evidence": f"Usernames: {', '.join(author_usernames)}",
+                    "confidence": 0.95,
+                    "exploitable": True,
+                    "chain_source": "wordpress_deep_scan",
+                    "exploit_info": {
+                        "type": "wp_user_enum",
+                        "path": "/?author=N",
+                        "usernames": author_usernames,
+                        "method": ("Brute-force xmlrpc.php or wp-login.php "
+                                   "with these usernames + common passwords."),
+                        "risk": "Credential brute-force, account takeover",
+                    },
+                })
+
         return findings
 
     def _admin_check(self, base_url: str) -> List[dict]:
@@ -6075,8 +6155,22 @@ class IntelOrchestrator:
         ex = result.get("extracted", {})
         if ex:
             print(f"  [+] Data extracted:")
+            # Show samples inline for the 'soft' categories (email,
+            # social handles, IPs) so the operator sees signal without
+            # having to open the encrypted report. Hide raw values for
+            # the 'sensitive' categories (keys/tokens/private) — they
+            # land in the report only.
+            _sensitive = {"aws_key", "github_token", "stripe_key",
+                          "jwt_token", "generic_secret"}
             for etype, evals in ex.items():
-                print(f"      {etype}: {len(evals)} found")
+                if etype in _sensitive:
+                    print(f"      {etype}: {len(evals)} found "
+                          f"(values redacted — see report)")
+                    continue
+                sample = list(evals)[:3]
+                samp_str = ", ".join(str(s)[:40] for s in sample)
+                more = f" (+{len(evals)-3} more)" if len(evals) > 3 else ""
+                print(f"      {etype}: {len(evals)} found — {samp_str}{more}")
         sc = result.get("secrets_in_comments", {})
         if sc:
             print(f"  [!] Secrets found in HTML comments:")
@@ -6099,10 +6193,57 @@ class IntelOrchestrator:
         if tech.get("meta_generator"):
             print(f"  [+] Generator: {tech['meta_generator']}")
 
+    @staticmethod
+    def _dedup_findings(vulns: List[dict]) -> List[dict]:
+        """Collapse findings whose identity (type + parameter + path)
+        is identical, keeping the highest-confidence instance.
+
+        A deep scan of a big site can produce 4-5 identical-looking
+        'Missing HSTS' findings from different crawled pages, or two
+        copies of the same SQLi discovery (one from _check_sqli_indicators,
+        one from _test_endpoint_sqli). Collapsing them makes the
+        report actionable instead of a wall of repeats.
+        """
+        best: Dict[str, dict] = {}
+        order_preserved: List[str] = []
+        for v in vulns:
+            ei = v.get("exploit_info") or {}
+            # Identity: (vuln_type, parameter, path, title_prefix).
+            # Title_prefix covers generic findings like "Missing HSTS"
+            # that have no param/path.
+            vtype = ei.get("type") or v.get("title", "")[:40].lower()
+            pkey = (
+                vtype,
+                ei.get("parameter", ""),
+                ei.get("path", "") or v.get("path", ""),
+                v.get("title", "")[:40],
+            )
+            key = "::".join(str(p) for p in pkey)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = v
+                order_preserved.append(key)
+            else:
+                # Keep the higher-confidence one; merge any exploit_info
+                # fields from the other.
+                new_conf = v.get("confidence", 0) or 0
+                old_conf = existing.get("confidence", 0) or 0
+                winner = v if new_conf > old_conf else existing
+                # Prefer a winner that has exploit_info over one that doesn't.
+                if (not winner.get("exploit_info") and
+                        v is not winner and v.get("exploit_info")):
+                    winner = v
+                if (not winner.get("exploit_info") and
+                        existing is not winner and existing.get("exploit_info")):
+                    winner = existing
+                best[key] = winner
+        return [best[k] for k in order_preserved]
+
     def _print_vulns(self, vulns: List[dict]):
         if not vulns:
             print(f"  [+] No vulnerabilities found at this scan depth")
             return
+        vulns = self._dedup_findings(vulns)
         # Sort by severity
         order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
         vulns.sort(key=lambda v: order.get(v["severity"], 5))
@@ -6178,6 +6319,11 @@ class IntelOrchestrator:
                 all_data[etype].update(evals)
             for etype, evals in r.get("secrets_in_comments", {}).items():
                 all_data[f"comment_{etype}"].update(evals)
+
+        # Dedup vuln findings BEFORE counting / exporting — phase-B
+        # revisit passes + chain rules + the base-url checks all
+        # routinely re-discover the same issue. Collapse them.
+        self._vuln_findings = self._dedup_findings(self._vuln_findings)
 
         vuln_counts = defaultdict(int)
         for v in self._vuln_findings:
