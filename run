@@ -2775,7 +2775,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
     sel = prompt("Enter number (or 'all' for sequential, 'q' to quit)", "all")
     if sel.lower() in ("q", "quit"):
-        return
+        return client, executor
 
     if sel.isdigit():
         idx = int(sel) - 1
@@ -2783,7 +2783,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             targets = [exploitable[idx]]
         else:
             err(f"Invalid number: {sel}")
-            return
+            return client, executor
     else:
         targets = exploitable
 
@@ -4916,13 +4916,19 @@ def flow_intel(detected_port=None):
         if not filepath:
             err("File path is required.")
             return
-        if not Path(filepath).exists():
+        # run_script() chdirs child into ROOT, so a relative path
+        # entered by the operator (resolved against their shell's
+        # CWD) would suddenly resolve against ROOT inside the child
+        # and silently miss the file. Resolve once, here, so what the
+        # user typed is what the child sees.
+        filepath_abs = str(Path(filepath).expanduser().resolve())
+        if not Path(filepath_abs).exists():
             err(f"File not found: {Path(filepath).name}")
             return
         depth = prompt("Scan depth (quick/full/deep)", "full").lower()
         if depth not in ("quick", "full", "deep"):
             depth = "full"
-        args = ["--file", filepath, "--scan", depth, "--tor-proxy", tor]
+        args = ["--file", filepath_abs, "--scan", depth, "--tor-proxy", tor]
         cookie_input = prompt("Session cookies (name=value, comma-separated, or Enter to skip)", "")
         if cookie_input.strip():
             for ck in cookie_input.split(","):

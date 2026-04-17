@@ -636,8 +636,13 @@ class TechFingerprinter:
         tech = {"server": None, "cms": [], "frameworks": [], "powered_by": None,
                 "language": None, "cdn": None}
 
+        # Build a lower-keyed snapshot once — dict(resp.headers) can
+        # preserve whatever casing the server sent, so relying on
+        # 'Server' OR 'server' still misses 'SERVER' / 'serveR'.
+        h_lower = {k.lower(): v for k, v in headers.items()}
+
         # Server header
-        server = headers.get("Server", headers.get("server", ""))
+        server = h_lower.get("server", "")
         if server:
             tech["server"] = server
             for name, pat in cls.SERVER_PATTERNS.items():
@@ -647,7 +652,7 @@ class TechFingerprinter:
                     break
 
         # X-Powered-By
-        powered = headers.get("X-Powered-By", headers.get("x-powered-by", ""))
+        powered = h_lower.get("x-powered-by", "")
         if powered:
             tech["powered_by"] = powered
             if "PHP" in powered.upper():
@@ -657,16 +662,16 @@ class TechFingerprinter:
             elif "Express" in powered:
                 tech["language"] = "Node.js (Express)"
 
-        # CDN detection
-        for cdn_header in ["cf-ray", "x-cache", "x-cdn", "x-amz-cf-id"]:
-            if cdn_header in {k.lower() for k in headers}:
-                if "cf-ray" in {k.lower() for k in headers}:
-                    tech["cdn"] = "Cloudflare"
-                elif "x-amz-cf-id" in {k.lower() for k in headers}:
-                    tech["cdn"] = "AWS CloudFront"
-                else:
-                    tech["cdn"] = "CDN detected"
-                break
+        # CDN detection — check the lower-keyed snapshot directly
+        # (was rebuilding {k.lower() for k in headers} inside the loop
+        # on every iteration + twice per match, which is wasteful and
+        # loses the values anyway).
+        if "cf-ray" in h_lower:
+            tech["cdn"] = "Cloudflare"
+        elif "x-amz-cf-id" in h_lower:
+            tech["cdn"] = "AWS CloudFront"
+        elif any(h in h_lower for h in ("x-cache", "x-cdn")):
+            tech["cdn"] = "CDN detected"
 
         # CMS detection from HTML
         for cms_name, patterns in cls.CMS_PATTERNS.items():
