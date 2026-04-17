@@ -336,12 +336,30 @@ class ExploitFileManager:
         self._ttl = ttl_seconds
         self._files: dict = {}  # path -> {created, type, ttl}
         self._lock = threading.Lock()
-        if Path("/dev/shm").exists():
-            self._base = Path("/dev/shm/intel")
+        # Prefer /dev/shm (tmpfs — contents stay off spinning rust).
+        # Also verify it's writable by the current user; on some
+        # hardened distros /dev/shm exists but is 1777 mounted read-
+        # only or with noexec set. If the write probe fails, fall back
+        # to an under-toolkit tmpdir and flag disk_warning so the
+        # walkthrough banner tells the operator.
+        self._disk_warning = True
+        shm = Path("/dev/shm")
+        if shm.is_dir() and os.access(str(shm), os.W_OK):
+            self._base = shm / "intel"
+            self._disk_warning = False
         else:
             self._base = ROOT / ".intel_tmp"
+        # Permissions matter: on a shared host, leaving the dir at the
+        # default (0755) means every other user can see what we
+        # generated. 0700 restricts it to the current uid.
         self._base.mkdir(parents=True, exist_ok=True)
-        self._disk_warning = not Path("/dev/shm").exists()
+        try:
+            os.chmod(str(self._base), 0o700)
+        except OSError:
+            # chmod may fail on exotic filesystems. Not fatal —
+            # individual files are 0600 via generate(), so the dir
+            # entry names might leak but the contents don't.
+            pass
 
     @property
     def disk_warning(self) -> bool:
