@@ -47,10 +47,26 @@ if SELENIUM_AVAILABLE:
         logger.warning("geckodriver is not installed or not in PATH. Selenium functionality disabled.")
         SELENIUM_AVAILABLE = False
 
-# Check targ_graber dependency - make optional
-targ_script = "targ_graber_v14.py"
-if not (os.path.isfile(targ_script) and os.access(targ_script, os.X_OK)):
-    logger.warning("Script '%s' is missing or not executable. Using default targets.", targ_script)
+# Check targ_graber dependency - make optional. Search the toolkit root
+# as well as CWD so the user doesn't have to cd into the toolkit dir to
+# use this script.
+_TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
+_targ_candidates = [
+    Path("targ_graber_v14.py"),
+    _TOOLKIT_ROOT / "targ_graber_v14.py",
+    _TOOLKIT_ROOT / "intel" / "targ_graber_v14.py",
+]
+targ_script = ""
+for _tc in _targ_candidates:
+    if _tc.is_file() and os.access(str(_tc), os.X_OK):
+        targ_script = str(_tc)
+        break
+if not targ_script:
+    logger.warning(
+        "Script 'targ_graber_v14.py' is missing or not executable. "
+        "Using default targets."
+    )
+    targ_script = "targ_graber_v14.py"  # retained for later error messages
 
 # Proxy setup is deferred to _init_tor_proxy() — called at runtime, not import time.
 # This allows --help and other non-network operations to work without Tor.
@@ -203,7 +219,10 @@ def load_targets():
     """Load targets from fingerprinting script or other sources."""
     targets = []
     
-    # Try to load from targ_graber_v14.py fingerprinting script
+    # Try to load from targ_graber_v14.py fingerprinting script.
+    # `targ_script` is resolved at import time to an absolute path when
+    # found, so this works regardless of which directory collectgrab
+    # was launched from.
     if os.path.isfile(targ_script) and os.access(targ_script, os.X_OK):
         try:
             result = subprocess.run([sys.executable, targ_script], 
@@ -239,23 +258,33 @@ def load_targets():
         except Exception as e:
             logger.warning("Failed to load targets from %s: %s", targ_script, e)
     
-    # Try loading from targets.json (output from previous fingerprinting)
-    if not targets and os.path.exists("targets.json"):
-        try:
-            with open("targets.json", 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    targets = data
-                elif isinstance(data, dict):
-                    # Extract from structured fingerprint data
-                    target_set = set()
-                    for field in ['emails', 'names', 'phones', 'targets']:
-                        if field in data and isinstance(data[field], list):
-                            target_set.update(data[field])
-                    targets = list(target_set)
-            logger.info("Loaded %d targets from targets.json", len(targets))
-        except Exception as e:
-            logger.warning("Failed to load targets.json: %s", e)
+    # Try loading from targets.json (output from previous fingerprinting).
+    # Look in CWD, toolkit root, and intel/ so operators don't need to
+    # stage the file next to their shell's current directory.
+    if not targets:
+        _tj_candidates = [
+            Path("targets.json"),
+            _TOOLKIT_ROOT / "targets.json",
+            _TOOLKIT_ROOT / "intel" / "targets.json",
+        ]
+        for _tj in _tj_candidates:
+            if not _tj.exists():
+                continue
+            try:
+                with open(_tj, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        targets = data
+                    elif isinstance(data, dict):
+                        target_set = set()
+                        for field in ['emails', 'names', 'phones', 'targets']:
+                            if field in data and isinstance(data[field], list):
+                                target_set.update(data[field])
+                        targets = list(target_set)
+                logger.info("Loaded %d targets from %s", len(targets), _tj)
+                break
+            except Exception as e:
+                logger.warning("Failed to load %s: %s", _tj, e)
     
     # Fallback to command line arguments
     if not targets and len(sys.argv) > 1:
