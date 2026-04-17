@@ -4892,7 +4892,15 @@ class VulnScanner:
         # Previously we did 6 probes + an "admin" enumeration probe;
         # the admin probe risked locking a real account on a
         # lockout-after-N-attempts policy, so it's gone.
-        throwaway_user = f"gsprobe{secrets.token_hex(4)}notareal"
+        # If the username field is named "email" (or similar), use an
+        # email-shaped throwaway so apps that reject non-email input
+        # don't short-circuit the rate-limit probe on syntax validation
+        # before the login logic even runs.
+        _uname_field = login_form["username_field"].lower()
+        if "email" in _uname_field or "mail" in _uname_field:
+            throwaway_user = f"gsprobe{secrets.token_hex(4)}@notareal.test"
+        else:
+            throwaway_user = f"gsprobe{secrets.token_hex(4)}notareal"
         statuses: List[int] = []
         lengths: List[int] = []
         for _ in range(4):
