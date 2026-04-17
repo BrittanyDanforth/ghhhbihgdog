@@ -1377,31 +1377,6 @@ class VulnScanner:
 
         return profile
 
-    def _classify_response(self, resp: Optional[requests.Response],
-                           baseline_len: int = 0) -> str:
-        """Classify a response as normal, error, blocked, or redirect."""
-        if resp is None:
-            return "failed"
-        if resp.status_code in (403, 429, 503):
-            text_lower = resp.text[:1000].lower() if resp.text else ""
-            if any(kw in text_lower for kw in ("captcha", "challenge", "cloudflare",
-                                                "ddos", "rate limit", "blocked")):
-                return "waf"
-            return "blocked"
-        if resp.status_code in (301, 302, 303, 307, 308):
-            return "redirect"
-        if resp.status_code >= 500:
-            return "error"
-        if resp.status_code == 404:
-            return "not_found"
-        if resp.status_code == 200:
-            if baseline_len > 0 and resp.text:
-                ratio = len(resp.text) / max(baseline_len, 1)
-                if ratio < 0.3:
-                    return "truncated"
-            return "normal"
-        return "other"
-
     def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
         """Crawl the site to discover testable endpoints (URLs with params + forms).
 
@@ -1518,8 +1493,73 @@ class VulnScanner:
         # Phase 1: extract from the initial page HTML
         _extract_from_html(base_url, html)
 
-        # Phase 2: crawl discovered pages (1 level deep, max 15 pages)
-        max_crawl = 15
+        # Phase 1b: seed pages_to_crawl with robots.txt disallow entries
+        # and sitemap.xml URLs. These are the two most effective crawl
+        # extensions — operators who hide admin paths in robots.txt give
+        # away exactly the paths an attacker wants.
+        try:
+            rob_url = urljoin(base_url, "/robots.txt")
+            rob_resp = self._session.get(rob_url, allow_wayback=False)
+            if rob_resp and rob_resp.status_code == 200 and rob_resp.text:
+                for line in rob_resp.text[:20000].splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Both Disallow and Allow leak structure — crawl either.
+                    for directive in ("disallow:", "allow:"):
+                        if line.lower().startswith(directive):
+                            val = line[len(directive):].strip()
+                            if val and val != "/" and " " not in val:
+                                full = urljoin(base_url, val.split("?")[0].split("#")[0])
+                                p = urlparse(full)
+                                if (p.netloc == domain and
+                                        full not in seen_urls):
+                                    seen_urls.add(full)
+                                    pages_to_crawl.append(full)
+                        break
+                    if line.lower().startswith("sitemap:"):
+                        sm = line[len("sitemap:"):].strip()
+                        if sm:
+                            try:
+                                sm_resp = self._session.get(
+                                    sm, allow_wayback=False,
+                                )
+                                if sm_resp and sm_resp.status_code == 200 and sm_resp.text:
+                                    for m in re.findall(
+                                        r"<loc>\s*(https?://[^<\s]+)\s*</loc>",
+                                        sm_resp.text[:200000],
+                                        re.I,
+                                    ):
+                                        sm_p = urlparse(m)
+                                        if (sm_p.netloc == domain and
+                                                m not in seen_urls):
+                                            seen_urls.add(m)
+                                            pages_to_crawl.append(m)
+                            except Exception:
+                                pass
+        except Exception as _rex:
+            integrity_log("intel", f"robots_crawl_error:{type(_rex).__name__}")
+
+        # Phase 1c: also try /sitemap.xml directly even if robots didn't
+        # advertise it.
+        try:
+            sm_url = urljoin(base_url, "/sitemap.xml")
+            sm_resp = self._session.get(sm_url, allow_wayback=False)
+            if sm_resp and sm_resp.status_code == 200 and sm_resp.text:
+                for m in re.findall(
+                    r"<loc>\s*(https?://[^<\s]+)\s*</loc>",
+                    sm_resp.text[:200000],
+                    re.I,
+                ):
+                    sm_p = urlparse(m)
+                    if sm_p.netloc == domain and m not in seen_urls:
+                        seen_urls.add(m)
+                        pages_to_crawl.append(m)
+        except Exception as _sex:
+            integrity_log("intel", f"sitemap_crawl_error:{type(_sex).__name__}")
+
+        # Phase 2: crawl discovered pages (1 level deep, max 25 pages)
+        max_crawl = 25
         crawled = 0
         while pages_to_crawl and crawled < max_crawl:
             if shutdown_requested():
@@ -3654,53 +3694,6 @@ class VulnScanner:
                     return findings
         return findings
 
-    def _check_lfi(self, base_url: str) -> List[dict]:
-        """Check for Local File Inclusion (LFI) vulnerabilities."""
-        findings = []
-        lfi_params = self._get_test_params(["page", "file", "include", "template", "path", "doc", "view"])
-        lfi_payloads = [
-            ("..%2F..%2F..%2F..%2Fetc%2Fpasswd", "etc/passwd via URL encoding"),
-            ("....//....//....//....//etc/passwd", "etc/passwd via double-dot bypass"),
-            ("/etc/passwd", "etc/passwd direct path"),
-            ("php://filter/convert.base64-encode/resource=index.php",
-             "PHP filter wrapper — reads source code as base64"),
-        ]
-        passwd_indicators = [
-            re.compile(r"root:.*:0:0:"),
-            re.compile(r"daemon:.*:/usr/sbin"),
-            re.compile(r"www-data:"),
-        ]
-
-        for param in lfi_params[:5]:
-            for payload, desc in lfi_payloads[:2]:
-                if shutdown_requested():
-                    return findings
-                test_url = f"{base_url}?{param}={payload}"
-                resp = self._session.get(test_url, allow_wayback=False)
-                if resp and resp.text:
-                    for ind in passwd_indicators:
-                        if ind.search(resp.text[:3000]):
-                            findings.append({
-                                "severity": SEV_CRITICAL,
-                                "title": f"Local File Inclusion via '{param}' parameter",
-                                "detail": "Arbitrary local files readable through the web server. "
-                                          "Attacker can read /etc/passwd, config files, source code, "
-                                          "and potentially achieve RCE via log poisoning.",
-                                "evidence": f"Parameter: {param}, payload: {desc}",
-                                "exploitable": True,
-                                "exploit_info": {
-                                    "type": "lfi",
-                                    "parameter": param,
-                                    "method": f"Supply file paths via '{param}'. "
-                                              "Read sensitive files: /etc/passwd, /etc/shadow (if readable), "
-                                              "application config files, database credentials. "
-                                              "For RCE: poison access logs then include them.",
-                                    "risk": "Full file system read, potential remote code execution",
-                                },
-                            })
-                            return findings
-        return findings
-
     def _check_command_injection(self, base_url: str) -> List[dict]:
         """Check for OS command injection indicators."""
         findings = []
@@ -4389,13 +4382,20 @@ class DNSRecon:
     """
 
     DOH_URL = "https://cloudflare-dns.com/dns-query"
-    RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA"]
+    RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA", "CAA", "DNSKEY"]
+
+    # ── Email-spoofing posture ──────────────────────────────────────
+    # SPF / DMARC / DKIM aren't "vulnerabilities" in the scanner sense,
+    # but a missing / weak SPF or DMARC is directly exploitable: it
+    # lets an attacker send forged email from the target's domain. We
+    # surface findings so they land in the same report as the web
+    # vulns.
 
     def __init__(self, session: TorSession):
         self._session = session
 
     def lookup(self, domain: str) -> Dict[str, List[str]]:
-        """Query multiple DNS record types for a domain."""
+        """Query multiple DNS record types for a domain + _dmarc subdomain."""
         results = {}
         for rtype in self.RECORD_TYPES:
             if shutdown_requested():
@@ -4403,7 +4403,178 @@ class DNSRecon:
             records = self._query(domain, rtype)
             if records:
                 results[rtype] = records
+
+        # DMARC lives at _dmarc.<domain> as a TXT record. Query
+        # separately so the main results dict keeps its
+        # by-record-type structure for the printer.
+        if not shutdown_requested():
+            dmarc_records = self._query(f"_dmarc.{domain}", "TXT")
+            if dmarc_records:
+                results["DMARC"] = dmarc_records
         return results
+
+    def analyze_email_posture(self, records: Dict[str, List[str]],
+                               domain: str = "") -> List[dict]:
+        """Produce vuln-shaped findings for SPF / DMARC weaknesses.
+
+        Maps the raw records to the exact same finding dict shape the
+        VulnScanner emits so the orchestrator can render them alongside
+        the web findings without special casing.
+        """
+        findings: List[dict] = []
+
+        txt_records = records.get("TXT", []) or []
+        dmarc_records = records.get("DMARC", []) or []
+        mx_records = records.get("MX", []) or []
+
+        # ── SPF ────────────────────────────────────────────────────
+        spf = [t for t in txt_records if t.lower().lstrip().startswith("v=spf1")]
+        if not spf:
+            # Domains that accept mail (MX set) without SPF are particularly bad.
+            sev = SEV_MEDIUM if mx_records else SEV_LOW
+            findings.append({
+                "severity": sev,
+                "title": "Missing SPF record",
+                "detail": ("No v=spf1 TXT record. Anyone on the public "
+                           "internet can send email claiming to be from "
+                           "this domain without tripping receiver checks."),
+                "evidence": "No TXT record starting with 'v=spf1'",
+                "exploit_info": {
+                    "type": "email_spoof",
+                    "method": ("Send forged email with the target's "
+                               "domain in From:. No SPF means receivers "
+                               "have no basis to reject it."),
+                    "risk": "Phishing under the target's name",
+                },
+                "exploitable": True,
+            })
+        else:
+            spf_val = spf[0].lower()
+            # SPF terminator: -all = hardfail, ~all = softfail, ?all = neutral, +all = allow-any
+            if " +all" in spf_val or spf_val.endswith("+all"):
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": "SPF record allows any sender (+all)",
+                    "detail": ("The SPF record ends with +all, which "
+                               "explicitly allows ANY IP to send email "
+                               "as this domain. Equivalent to no SPF."),
+                    "evidence": spf[0][:200],
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Send forged email — SPF passes regardless of source IP.",
+                        "risk": "Phishing under the target's name",
+                    },
+                    "exploitable": True,
+                })
+            elif " ?all" in spf_val or spf_val.endswith("?all"):
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "SPF record ends with ?all (neutral)",
+                    "detail": ("The SPF ends with ?all (neutral). "
+                               "Receivers treat unlisted senders as "
+                               "undefined, and most accept the mail."),
+                    "evidence": spf[0][:200],
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Send forged email — SPF neutral is widely treated as pass.",
+                        "risk": "Phishing under the target's name",
+                    },
+                })
+            elif " ~all" in spf_val or spf_val.endswith("~all"):
+                findings.append({
+                    "severity": SEV_LOW,
+                    "title": "SPF record uses ~all (softfail)",
+                    "detail": ("The SPF ends with ~all (softfail). "
+                               "Mail still gets delivered — usually to "
+                               "spam, but delivered. Consider -all for "
+                               "hardfail."),
+                    "evidence": spf[0][:200],
+                })
+            # SPF lookup-explosion (RFC 7208 bans >10 DNS lookups)
+            lookup_tokens = spf_val.count("include:") + spf_val.count("a:") + \
+                spf_val.count("mx:") + spf_val.count("ptr:") + \
+                spf_val.count("exists:") + spf_val.count("redirect=")
+            if lookup_tokens > 10:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "SPF record exceeds 10-DNS-lookup limit",
+                    "detail": (f"SPF uses {lookup_tokens} DNS-lookup "
+                               f"mechanisms (include:, a:, mx:, ptr:, "
+                               f"exists:, redirect=). RFC 7208 caps at "
+                               f"10; receivers return PermError, which "
+                               f"most treat as SPF fail ≡ no SPF."),
+                    "evidence": f"{lookup_tokens} lookups in SPF",
+                })
+
+        # ── DMARC ─────────────────────────────────────────────────
+        dmarc = [t for t in dmarc_records if t.lower().lstrip().startswith("v=dmarc1")]
+        if not dmarc:
+            sev = SEV_MEDIUM if mx_records or spf else SEV_LOW
+            findings.append({
+                "severity": sev,
+                "title": "Missing DMARC record",
+                "detail": ("No DMARC record at _dmarc.<domain>. Even if "
+                           "SPF is configured, receivers have no "
+                           "aligned policy to apply, so forged mail "
+                           "often passes."),
+                "evidence": f"No v=dmarc1 TXT at _dmarc.{domain or '<target>'}",
+                "exploit_info": {
+                    "type": "email_spoof",
+                    "method": ("Mismatched From: / Return-Path: passes "
+                               "SPF but fails DMARC alignment — with no "
+                               "DMARC policy, receivers accept it."),
+                    "risk": "Phishing with realistic From: line",
+                },
+                "exploitable": True,
+            })
+        else:
+            dmarc_val = dmarc[0].lower()
+            # DMARC policy: p=none (monitor only), p=quarantine, p=reject.
+            if "p=none" in dmarc_val:
+                findings.append({
+                    "severity": SEV_LOW,
+                    "title": "DMARC policy is p=none (monitor only)",
+                    "detail": ("DMARC is configured but set to p=none, "
+                               "which tells receivers to accept "
+                               "failing mail and only report it. No "
+                               "protection against spoofing."),
+                    "evidence": dmarc[0][:200],
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Spoof freely — DMARC failures are reported, not rejected.",
+                        "risk": "Phishing under the target's name",
+                    },
+                })
+            if "pct=" in dmarc_val:
+                m = re.search(r"pct=(\d+)", dmarc_val)
+                if m:
+                    pct = int(m.group(1))
+                    if 0 < pct < 100:
+                        findings.append({
+                            "severity": SEV_LOW,
+                            "title": f"DMARC pct={pct} (partial enforcement)",
+                            "detail": (f"Only {pct}% of failing mail is "
+                                       f"enforced. The other {100-pct}% "
+                                       f"slips through regardless of "
+                                       f"the p= policy."),
+                            "evidence": dmarc[0][:200],
+                        })
+
+        # ── DNSSEC ────────────────────────────────────────────────
+        if not records.get("DNSKEY"):
+            # Informational only — most domains don't deploy DNSSEC.
+            findings.append({
+                "severity": SEV_INFO,
+                "title": "DNSSEC not deployed",
+                "detail": ("No DNSKEY records returned. Zone is "
+                           "vulnerable to cache-poisoning / on-path DNS "
+                           "attacks. Not a web vulnerability per se."),
+                "evidence": "No DNSKEY records",
+            })
+
+        return findings
 
     def _query(self, domain: str, rtype: str) -> List[str]:
         """Single DNS-over-HTTPS query."""
@@ -5674,6 +5845,18 @@ class IntelOrchestrator:
             self._print_dns(dns_records)
             if dns_records:
                 self._results.append({"type": "dns", "domain": domain, "records": dns_records})
+                # Turn SPF / DMARC / DNSSEC posture into findings that
+                # get rendered in the same list as the web vulns.
+                try:
+                    email_findings = self._dns.analyze_email_posture(
+                        dns_records, domain=domain,
+                    )
+                    if email_findings:
+                        self._vulns._add_confidence(email_findings, 0.9)
+                        self._vuln_findings.extend(email_findings)
+                        self._print_vulns(email_findings)
+                except Exception as e:
+                    integrity_log("intel", f"email_posture_error:{type(e).__name__}")
 
         # Phase 5: Subdomain enumeration (deep only)
         if self._scan_depth == "deep":
