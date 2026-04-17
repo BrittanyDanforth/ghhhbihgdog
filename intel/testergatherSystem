@@ -4663,29 +4663,65 @@ class VulnScanner:
     # proves a specific WAF / CDN is in the path. Header names that
     # are generic (x-request-id, server, x-powered-by) are NOT here;
     # we match those by value via _WAF_SERVER_VALUE_FINGERPRINTS.
+    # Name-only fingerprints: presence of the header alone uniquely
+    # identifies the vendor. Do NOT put generic trace/CDN headers here.
+    #
+    # Headers that were previously listed here but are actually too
+    # generic (and have been moved to value-match or removed):
+    #   x-cdn              -> many CDNs use this; only flag when value
+    #                         says 'incapsula'
+    #   x-amzn-trace-id    -> stamped by every AWS ALB, not WAF-specific
+    #                         (e.g. plain apps behind ALB w/o WAF)
+    #   x-amz-cf-id        -> this ONE actually is CloudFront-unique, kept
+    #   x-cloud-trace-context -> any GCP request; not WAF at all
+    #   x-request-id       -> too generic; used by nginx, nodejs logs, …
     _WAF_HEADER_FINGERPRINTS = {
         "cf-ray":               "Cloudflare",
         "cf-cache-status":      "Cloudflare",
         "x-sucuri-id":          "Sucuri CloudProxy",
         "x-sucuri-cache":       "Sucuri CloudProxy",
         "x-iinfo":              "Imperva Incapsula",
-        "x-cdn":                "Imperva Incapsula",
         "x-amz-cf-id":          "AWS CloudFront",
         "x-amz-cf-pop":         "AWS CloudFront",
-        "x-amzn-trace-id":      "AWS ALB",
-        "x-amzn-requestid":     "AWS (API Gateway / Lambda)",
         "x-citrix-session-id":  "Citrix NetScaler",
         "x-waf-event-info":     "FortiGate",
-        "x-waf-status":         "Generic WAF (unnamed vendor)",
         "x-dcid":               "Yundun / DDoS-GUARD",
         "x-bigip-selfip":       "F5 BIG-IP",
         "x-bigip-ltm":          "F5 BIG-IP",
         "x-fireeye":            "FireEye NX",
         "x-barracuda":          "Barracuda WAF",
         "x-varnish":            "Varnish cache",
-        "x-cloud-trace-context": "Google Cloud",
         "x-azure-ref":          "Azure Front Door",
         "x-azure-clientip":     "Azure WAF",
+    }
+
+    # Value-match fingerprints: (header_name, (substring, vendor)...). A
+    # header whose NAME alone is generic (could mean anything) only
+    # counts when its VALUE contains a known WAF signature. Substring
+    # matches are lowercased.
+    _WAF_HEADER_VALUE_FINGERPRINTS: Dict[str, Tuple[Tuple[str, str], ...]] = {
+        "x-cdn": (
+            ("incapsula", "Imperva Incapsula"),
+            ("imperva",   "Imperva Incapsula"),
+            ("akamai",    "Akamai"),
+            ("sucuri",    "Sucuri CloudProxy"),
+            ("fastly",    "Fastly"),
+            ("cloudfront", "AWS CloudFront"),
+        ),
+        "x-powered-by-plesk": (
+            ("fortiweb", "FortiWeb WAF"),
+        ),
+        "x-waf-status": (
+            # Only flag when the value actually names a vendor; bare
+            # 'block'/'allow' shouldn't light up a fingerprint that
+            # gets paraded on the report.
+            ("fortiweb",  "FortiWeb WAF"),
+            ("imperva",   "Imperva Incapsula"),
+            ("barracuda", "Barracuda WAF"),
+        ),
+        "x-iinfo": (
+            ("incap",     "Imperva Incapsula"),
+        ),
     }
 
     # Server-header value matches — we look inside the 'server:' value
@@ -4739,10 +4775,22 @@ class VulnScanner:
         h_lower = {k.lower(): v for k, v in headers.items()}
         seen_names: Set[str] = set()
 
-        # Exact-header-name fingerprints
+        # Exact-header-name fingerprints (presence alone is uniquely a WAF)
         for hname, waf in self._WAF_HEADER_FINGERPRINTS.items():
             if hname in h_lower:
                 seen_names.add(waf)
+
+        # Value-match fingerprints: the header name alone is ambiguous,
+        # only flag when the value contains a known vendor substring.
+        for hname, vendor_patterns in self._WAF_HEADER_VALUE_FINGERPRINTS.items():
+            if hname not in h_lower:
+                continue
+            h_val = str(h_lower[hname] or "").lower()
+            if not h_val:
+                continue
+            for needle, vendor in vendor_patterns:
+                if needle in h_val:
+                    seen_names.add(vendor)
 
         # Server-header value fingerprints (substring match on the value)
         server_val = h_lower.get("server", "").lower()
