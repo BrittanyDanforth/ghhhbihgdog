@@ -103,7 +103,14 @@ def _validate_xmr_addr(addr: str) -> None:
 
 def _thornode_quote(amt_btc: Decimal, xmr_dest: str, proxy: dict) -> Optional[dict]:
     """Try THORNode native API for a swap quote. Returns deposit info or None."""
-    amt_sats = int(amt_btc * Decimal("100000000"))
+    # FUNDS-LOSS FIX: quantize to satoshi resolution with explicit
+    # ROUND_DOWN before converting to integer; `int(amt * 1e8)` on a
+    # Decimal with more than 8 dp silently truncates and the quoted
+    # amount stops matching what the operator actually deposits.
+    from decimal import ROUND_DOWN
+    amt_quantized = Decimal(amt_btc).quantize(
+        Decimal("0.00000001"), rounding=ROUND_DOWN)
+    amt_sats = int(amt_quantized * Decimal(100000000))
     for node in THORNODE_APIS:
         try:
             url = (f"{node}/thorchain/quote/swap"
@@ -186,6 +193,19 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="Overwrite existing output file (DANGER: old deposit "
                          "addresses are invalidated when new ones are generated)")
+    ap.add_argument("--max-slippage-pct", type=Decimal, default=Decimal("5"),
+                    help="Maximum tolerated deviation (%%) between THORNode "
+                         "quote and oracle price. Pairs above this abort "
+                         "unless --accept-slippage is set. Default: 5%%.")
+    ap.add_argument("--accept-slippage", action="store_true",
+                    help="Accept quotes that deviate from oracle by more "
+                         "than --max-slippage-pct. Only for operators who "
+                         "understand why THORChain is quoting this far off "
+                         "(illiquid pool, pool halt, oracle stale, etc.).")
+    ap.add_argument("--min-xmr-per-btc", type=Decimal, default=Decimal("0"),
+                    help="Abort any pair whose quoted XMR/BTC rate is below "
+                         "this value. Protects against catastrophic quotes "
+                         "when the oracle check is unavailable.")
     args = ap.parse_args()
 
     if len(args.amounts) != len(args.dests):
@@ -244,13 +264,54 @@ def main():
             integrity_log("thor", f"bad_deposit_format_{i}")
             sys.exit(f"[!] Deposit address not a valid BTC address: {scrub_address(deposit)}")
 
-        # Slippage check (skipped if oracle failed)
-        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr is not None and btc_per_xmr > 0 else Decimal("0")
+        # Slippage check (skipped if oracle failed).
+        # FUNDS-LOSS FIX: Previously this was warn-only and the operator
+        # always proceeded. A manipulated / stale / low-liquidity quote
+        # could silently produce a huge rate haircut. Now any deviation
+        # above --max-slippage-pct (default 5%) hard-aborts unless the
+        # operator explicitly passes --accept-slippage.
+        oracle_xmr = ((amt / btc_per_xmr)
+                      if btc_per_xmr is not None and btc_per_xmr > 0
+                      else Decimal("0"))
+        max_dev = (args.max_slippage_pct / Decimal("100"))
         if oracle_xmr > 0:
             deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
-            if deviation > Decimal("0.05"):
-                print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
-                integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
+            if deviation > max_dev:
+                integrity_log(
+                    "thor",
+                    f"slippage_abort_{i}:dev={deviation:.4f}:"
+                    f"oracle={oracle_xmr}:quote={expected_xmr}")
+                if args.accept_slippage:
+                    print(f"  [!] Pair {i}: quote deviates "
+                          f"{deviation * 100:.1f}% from oracle "
+                          f"(ACCEPTED by --accept-slippage)")
+                else:
+                    sys.exit(
+                        f"[!] Pair {i}: THORNode quote deviates "
+                        f"{deviation * 100:.1f}% from oracle "
+                        f"(max {args.max_slippage_pct}%).\n"
+                        f"    quote={expected_xmr} XMR, "
+                        f"oracle={oracle_xmr:.8f} XMR.\n"
+                        f"    Refusing — check pool liquidity / oracle\n"
+                        f"    freshness, or re-run with --accept-slippage.")
+        elif btc_per_xmr is None:
+            print(f"  [!] Pair {i}: oracle price unavailable — skipping "
+                  f"slippage check")
+            integrity_log("thor", f"slippage_skipped_{i}:no_oracle")
+
+        # Absolute minimum quoted rate protects against catastrophic
+        # quotes even when the oracle check was skipped.
+        if args.min_xmr_per_btc > 0 and amt > 0:
+            quoted_rate = expected_xmr / amt
+            if quoted_rate < args.min_xmr_per_btc:
+                integrity_log(
+                    "thor",
+                    f"rate_floor_abort_{i}:quoted={quoted_rate:.8f}:"
+                    f"min={args.min_xmr_per_btc}")
+                sys.exit(
+                    f"[!] Pair {i}: quoted rate {quoted_rate:.8f} "
+                    f"XMR/BTC is below --min-xmr-per-btc "
+                    f"({args.min_xmr_per_btc}). Aborting.")
 
         expiry = tn_result.get("expiry", 0)
         memo_bytes = tn_result.get("memo_bytes", 0)

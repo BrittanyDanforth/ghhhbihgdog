@@ -128,6 +128,30 @@ def main():
             f"    all transfers to fail or send funds to unreachable addresses.\n"
             f"    Connect monero-wallet-rpc to a mainnet wallet and retry."
         )
+    # FUNDS-LOSS FIX: 'unknown' previously passed the gate. A malformed
+    # or unusual subaddress that our local parser didn't recognise would
+    # be blessed as mainnet-compatible and wired into the pipeline. If
+    # monero-python is available we REQUIRE it to classify the address;
+    # refusing 'unknown' is safer than leaking into a mainnet broadcast.
+    if network == "unknown":
+        try:
+            from monero.address import address as _parse_address  # noqa
+            _have_monero_python = True
+        except Exception:
+            _have_monero_python = False
+        if _have_monero_python:
+            integrity_log("wallet", "network_BLOCK:unknown_with_parser")
+            sys.exit(
+                "[!] Could not classify the subaddress's network even "
+                "though monero-python is installed.\n"
+                "    Refusing to write a wallet JSON for an unclassified "
+                "address — funds sent here might be unreachable.")
+        else:
+            print("  [!] monero-python is not installed; network could not "
+                  "be confirmed.")
+            print("  [!] Continuing with network='unknown' ONLY because the "
+                  "local parser couldn't help.")
+            integrity_log("wallet", "network_UNKNOWN_accepted_no_parser")
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 

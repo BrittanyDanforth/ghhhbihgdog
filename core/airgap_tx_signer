@@ -700,21 +700,57 @@ def main():
     # If sign phase had failures, exit non-zero so mixer_core detects it
     # via subprocess return code. Without this, mixer_core assumes success
     # when it checks `result.returncode == 0`.
+    #
+    # FUNDS-LOSS FIX: previously a missing, corrupt, or unparsable manifest
+    # was silently ignored (`except: pass`), so mixer_core would proceed to
+    # the broadcast stage believing every TX had been signed. That can
+    # cause either lost funds (broadcasting against stale blobs) or, worse,
+    # the operator re-running sign later against a partial manifest. Any
+    # manifest anomaly now exits non-zero.
     if args.phase == "sign":
         plan_data, _ = _load_unsigned(plan_path)
+        expected = len(plan_data)
         signed_dir = Path(args.outdir) / "signed"
         manifest_path = signed_dir / "signed_manifest_v1.json"
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(manifest_path.read_text())
-                entries = manifest.get("entries", [])
-                if len(entries) < len(plan_data):
-                    sys.exit(
-                        f"[!] Only {len(entries)}/{len(plan_data)} TXs signed. "
-                        f"Check wallet password and file integrity."
-                    )
-            except (json.JSONDecodeError, OSError):
-                pass
+        if not manifest_path.exists():
+            sys.exit(
+                f"[!] Sign phase completed without writing signed_manifest_v1.json.\n"
+                f"    Expected {expected} TX(s). Manifest missing — refusing\n"
+                f"    to report success. Check wallet password / permissions.")
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as _mfe:
+            sys.exit(
+                f"[!] signed_manifest_v1.json unreadable/corrupt: "
+                f"{type(_mfe).__name__}: {str(_mfe)[:80]}\n"
+                f"    Refusing to report sign-phase success. Do not run\n"
+                f"    broadcast until the manifest is valid or regenerated.")
+        if not isinstance(manifest, dict):
+            sys.exit(
+                "[!] signed_manifest_v1.json has wrong shape "
+                "(expected object). Refusing to report success.")
+        entries = manifest.get("entries")
+        if not isinstance(entries, list):
+            sys.exit(
+                "[!] signed_manifest_v1.json missing 'entries' list. "
+                "Refusing to report success.")
+        if len(entries) < expected:
+            sys.exit(
+                f"[!] Only {len(entries)}/{expected} TXs signed. "
+                f"Check wallet password and file integrity.")
+        # All signed entries must reference a blob that actually exists
+        # and isn't empty — otherwise the broadcast phase will skip it and
+        # the operator may miss a gap.
+        for _e in entries:
+            _blob = _e.get("file") if isinstance(_e, dict) else None
+            if not _blob:
+                sys.exit(
+                    "[!] signed_manifest_v1.json entry missing 'file'.")
+            _bp = signed_dir / Path(_blob).name
+            if not _bp.exists() or _bp.stat().st_size == 0:
+                sys.exit(
+                    f"[!] Signed blob {_bp.name} missing or empty on disk.\n"
+                    f"    Manifest claims success but the blob isn't there.")
 
 
 if __name__ == "__main__":

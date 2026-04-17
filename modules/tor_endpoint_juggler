@@ -343,10 +343,26 @@ class RealEndpointProber:
             if response.status_code == 200:
                 try:
                     json_response = response.json()
-                    if 'result' in json_response or 'error' in json_response:
+                    # FUNDS-LOSS-ADJACENT FIX: the previous check accepted
+                    # ANY JSON-RPC shape — even payloads carrying `error`
+                    # were marked as "success", so broken nodes could be
+                    # promoted into the rotation for subsequent money
+                    # flows. A success must have `result` present AND
+                    # `error` absent (or null).
+                    rpc_err = json_response.get('error') if isinstance(
+                        json_response, dict) else 'non-dict'
+                    rpc_res = json_response.get('result') if isinstance(
+                        json_response, dict) else None
+                    if rpc_err in (None, {}, "", False) and rpc_res is not None:
                         result['success'] = True
                         result['response_data'] = json_response
-                        logger.debug(f"Endpoint {url} validated successfully in {response_time:.2f}s")
+                        logger.debug(
+                            f"Endpoint {url} validated in {response_time:.2f}s")
+                    else:
+                        result['error'] = (
+                            f"RPC error: {str(rpc_err)[:60]}"
+                            if rpc_err not in (None, {}, "", False)
+                            else "RPC result missing")
                 except json.JSONDecodeError:
                     result['error'] = 'Invalid JSON response'
             else:
