@@ -669,9 +669,27 @@ class AttackerInfra:
         return f"{base}/{kind}/{self._token}"
 
     def get_url(self, filename: str) -> str:
-        """Get the serve URL for a generated file. Uses onion when live."""
+        """Get the serve URL for a generated file. Uses onion when live.
+
+        REQUIRES the server to already be started. Previously this
+        method auto-called self.start() on demand, which silently
+        masked wiring bugs:
+          * caller forgot to explicitly start() — URLs were handed out
+            with an implicit server instance the operator never saw
+          * hidden-service creation was skipped because start_hidden_
+            service() was never called by the walkthrough flow — every
+            returned URL pointed at 127.0.0.1 regardless of infra_mode
+          * port binding contention (the 5-retry loop) happened LATE
+            during serving, after file content had already been
+            generated with a stale port in callback URLs.
+        Fail loudly so the caller fixes the wiring instead.
+        """
         if not self._running:
-            self.start()
+            raise RuntimeError(
+                "AttackerInfra.get_url() called before start(); the "
+                "caller must explicitly start the server and (for onion "
+                "mode) start_hidden_service() before requesting URLs."
+            )
         base = self.get_attacker_url(prefer_onion=True)
         return f"{base}/f/{filename}" if base else ""
 
