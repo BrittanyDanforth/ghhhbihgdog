@@ -550,7 +550,7 @@ class ProductionEndpointJuggler:
         }
         
         # Atomic write operation. Create the temp file with tight perms up
-        # front (O_CREAT|O_EXCL, 0o600) so the data is never briefly
+        # front (O_CREAT|O_TRUNC, mode 0o600) so the data is never briefly
         # world-readable between open() and chmod(). Then dump, fsync,
         # replace, and re-assert perms on the final name.
         temp_path = output_path.with_suffix('.tmp')

@@ -700,7 +700,8 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steganography", action="store_true",
                        help="Hide QR code using steganographic techniques")
     parser.add_argument("--no-auto-clear", action="store_true", default=False,
-                       help="Auto-clear terminal QR after 30 seconds")
+                       help="Disable the 30-second terminal auto-clear after "
+                            "the QR is displayed (default: auto-clear ON)")
     
     return parser
 

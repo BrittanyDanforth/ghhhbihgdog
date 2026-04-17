@@ -161,28 +161,44 @@ def main():
     rng_seed = int((seed_sha + src_sha)[:32], 16)
     rng = random.Random(rng_seed)
 
-    # Determine base_ts as most recent real line timestamp (best‑effort)
+    # Determine base_ts as most recent real line timestamp (best-effort).
+    # All comparisons are done in UTC so the decoy timestamps line up with
+    # the rest of the toolkit (which logs in UTC via datetime.now(tz=utc)).
+    # Using time.mktime() previously interpreted naive datetimes as the
+    # host's local time, so any system whose TZ != UTC would see decoy
+    # lines shifted by the local offset relative to the real log — an
+    # obvious fingerprint for a forensic analyst.
+    def _parse_ts(s: str) -> int:
+        s = s.strip().rstrip(",").rstrip(";")
+        try:
+            d = dt.datetime.fromisoformat(s)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                        "%m/%d/%Y %H:%M:%S"):
+                try:
+                    d = dt.datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return int(d.timestamp())
+
     try:
         content = src_path.read_text(encoding='utf-8', errors='ignore')
         lines = content.splitlines()
         if lines:
             last_line = lines[-1]
-            # Try to extract timestamp from various formats
-            timestamp_part = last_line.split(" | ")[0] if " | " in last_line else last_line.split()[0]
+            timestamp_part = (
+                last_line.split(" | ")[0] if " | " in last_line
+                else last_line.split()[0]
+            )
             try:
-                # Try ISO format first
-                base_ts = int(time.mktime(dt.datetime.fromisoformat(timestamp_part).timetuple()))
+                base_ts = _parse_ts(timestamp_part)
             except ValueError:
-                # Try other common formats
-                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"]:
-                    try:
-                        base_ts = int(time.mktime(dt.datetime.strptime(timestamp_part, fmt).timetuple()))
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    # Fallback to current time
-                    base_ts = int(time.time())
+                base_ts = int(time.time())
         else:
             base_ts = int(time.time())
     except Exception as e:
@@ -192,10 +208,23 @@ def main():
     decoys = generate_entries(args.count, base_ts, rng)
 
     try:
+        out_abs = args.out.resolve()
+        src_abs = src_path.resolve()
+    except OSError:
+        out_abs, src_abs = args.out, src_path
+    if out_abs == src_abs:
+        print(f"[!] Refusing to write decoys into the source log itself "
+              f"({args.out}). Use --out to pick a different path.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         existing = ""
         if args.out.exists():
             existing = args.out.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
         content = existing + "\n".join(decoys) + "\n"
         atomic_write_text(content, args.out, perms=0o600)
         print(f"[+] Injected {len(decoys)} decoy errors → {args.out}")
