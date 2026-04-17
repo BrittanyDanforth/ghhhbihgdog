@@ -2536,7 +2536,13 @@ class VulnScanner:
                                  "exploit_info": {"type": "csp_bypass",
                                                   "method": "Inject via eval()-reachable input.",
                                                   "risk": "Code execution via eval()"}})
-            if "'*'" in csp or "* " in csp:
+            # Match a bare '*' as a source in any directive — look for
+            # `*` bounded by whitespace, directive separator (;), or
+            # end of string. The old check was a naive '* ' substring
+            # which missed `script-src *;` (no trailing space) and
+            # 'script-src 'self' *' in some shapes, while matching an
+            # innocuous `*.example.com` inside directive values.
+            if re.search(r"(?:^|[\s;])\*(?=[\s;]|$)", csp):
                 findings.append({"severity": SEV_HIGH, "title": "CSP has wildcard source",
                                  "detail": "Wildcard allows loading scripts/styles from any origin. "
                                            "Attacker can host malicious JS on any domain.",
