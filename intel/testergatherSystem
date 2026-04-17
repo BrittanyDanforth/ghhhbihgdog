@@ -2908,7 +2908,14 @@ class VulnScanner:
         return findings
 
     def _check_cors(self, url: str, headers: dict) -> List[dict]:
-        """Check for CORS misconfiguration."""
+        """Check for CORS misconfiguration.
+
+        Goes beyond the 'ACAO: *' and 'reflective ACAO' cases to probe:
+          - null origin trust (sandbox iframes / file:// / data:)
+          - subdomain reflection (any *.<target>)
+          - 'starts with legit domain' trust bug (legit.com.evil.com)
+          - preflight-exposed credentialed methods
+        """
         findings = []
         h_lower = {k.lower(): v for k, v in headers.items()}
         acao = h_lower.get("access-control-allow-origin", "")
@@ -2930,25 +2937,89 @@ class VulnScanner:
                                          (", authenticated session hijacking" if acac == "true" else "")},
             })
 
-        # Test reflective CORS — send Origin header and check if reflected
-        if not acao:
-            evil_origin = "https://evil-attacker.com"
-            resp = self._session.get(url, allow_wayback=False,
-                                     headers={"Origin": evil_origin})
-            if resp and resp.headers.get("Access-Control-Allow-Origin") == evil_origin:
+        # ── Reflective CORS probes ─────────────────────────────────
+        # Derive a realistic target-domain variant for probes. If the
+        # base url is https://example.com, test:
+        #   evil-attacker.com          (arbitrary reflection)
+        #   example.com.attacker.com   (bad prefix match)
+        #   subevil.example.com        (any subdomain trust)
+        #   null                       (sandboxed iframes, file://, data:)
+        target_netloc = urlparse(url).netloc.lower()
+        # Strip port if any
+        target_host = target_netloc.split(":", 1)[0]
+
+        probes = [
+            ("https://evil-attacker.com",
+             "Reflective CORS — arbitrary origin accepted",
+             "Server reflects any Origin header in ACAO.",
+             SEV_HIGH),
+            (f"https://{target_host}.evil-attacker.com",
+             "Reflective CORS — bad prefix-match trust",
+             (f"ACAO trusts any origin that starts with {target_host} "
+              f"— 'startsWith(target)' check is the classic misconfig."),
+             SEV_HIGH),
+            (f"https://evilsub.{target_host}",
+             "Reflective CORS — all-subdomains trust",
+             (f"ACAO trusts any subdomain of {target_host}. A single "
+              f"XSS / takeover on any subdomain pivots into full "
+              f"cross-origin read of this API."),
+             SEV_MEDIUM),
+            ("null",
+             "CORS trusts Origin: null",
+             ("Origin: null is produced by sandboxed iframes, "
+              "file:// origins, and data: URIs. Trusting it means "
+              "any embedded iframe can read this API with the user's "
+              "credentials."),
+             SEV_HIGH),
+        ]
+
+        for probe_origin, title, detail, sev in probes:
+            if shutdown_requested():
+                break
+            try:
+                resp = self._session.get(url, allow_wayback=False,
+                                         headers={"Origin": probe_origin})
+            except Exception:
+                continue
+            if not resp:
+                continue
+            reflected = resp.headers.get("Access-Control-Allow-Origin", "")
+            if reflected == probe_origin:
+                acac_p = resp.headers.get(
+                    "Access-Control-Allow-Credentials", "").lower()
+                with_creds = (acac_p == "true")
+                # If creds are reflected too, bump to CRITICAL.
+                eff_sev = (
+                    SEV_CRITICAL if with_creds and sev in (SEV_HIGH, SEV_MEDIUM)
+                    else sev
+                )
                 findings.append({
-                    "severity": SEV_HIGH,
-                    "title": "Reflective CORS — arbitrary origin accepted",
-                    "detail": "Server reflects any Origin header in ACAO. "
-                              "Attacker can read authenticated responses from any origin.",
-                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}",
+                    "severity": eff_sev,
+                    "title": title + (" (with credentials)" if with_creds else ""),
+                    "detail": (f"{detail} "
+                               + ("ACAC=true reflected — full "
+                                  "credentialed exfil is exploitable."
+                                  if with_creds else "")),
+                    "evidence": (f"Sent Origin: {probe_origin} → "
+                                 f"ACAO: {reflected}"
+                                 f"{', ACAC: true' if with_creds else ''}"),
                     "exploitable": True,
-                    "exploit_info": {"type": "cors_misconfiguration",
-                                     "method": "Send requests from attacker.com with credentials. "
-                                               "Server reflects attacker origin in ACAO, "
-                                               "allowing cross-origin data theft.",
-                                     "risk": "Authenticated data theft, API abuse"},
+                    "exploit_info": {
+                        "type": "cors_misconfiguration",
+                        "method": (f"Attacker page with Origin: "
+                                   f"{probe_origin} can fetch this "
+                                   f"endpoint" +
+                                   (" with the victim's cookies"
+                                    if with_creds else "") +
+                                   " and read the body."),
+                        "risk": ("Authenticated data theft, API abuse"
+                                 if with_creds
+                                 else "Cross-origin data theft"),
+                    },
                 })
+                # Only emit the first positive — don't pile them on
+                # every probe.
+                break
         return findings
 
     def _check_info_disclosure(self, headers: dict, html: str) -> List[dict]:
