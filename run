@@ -5059,6 +5059,22 @@ def flow_intel(detected_port=None):
         if not email or "@" not in email:
             err("Valid email address required.")
             return
+        # Proactive sanity check — the child script silently no-ops
+        # when the API keys aren't set, which confuses operators into
+        # thinking the breach databases have no records on the email.
+        _have_hibp = bool(os.environ.get("HIBP_KEY"))
+        _have_dehashed = bool(os.environ.get("DEHASHED_KEY") and
+                              os.environ.get("DEHASHED_EMAIL"))
+        if not _have_hibp and not _have_dehashed:
+            warn("No breach-database API keys configured.")
+            info("Set HIBP_KEY (https://haveibeenpwned.com/API/Key) or")
+            info("DEHASHED_EMAIL + DEHASHED_KEY (https://dehashed.com/api)")
+            info("in your environment before launching, then retry.")
+            if not confirm("Continue anyway? (will produce empty results)"):
+                return
+        elif os.environ.get("DEHASHED_KEY") and not os.environ.get("DEHASHED_EMAIL"):
+            warn("DEHASHED_KEY is set but DEHASHED_EMAIL is not — "
+                 "DeHashed auth will fail. Set both to use DeHashed.")
         args = ["--email", email, "--tor-proxy", tor]
         # Breach-DB API keys are normally stripped from child env by the
         # default-deny policy. Let them through here or the breach
