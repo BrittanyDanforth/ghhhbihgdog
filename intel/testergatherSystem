@@ -411,6 +411,71 @@ class TorSession:
             return self._wayback_fetch(url)
         return None
 
+    def request(self, method: str, url: str,
+                allow_redirects: bool = True,
+                extra_headers: Optional[Dict[str, str]] = None,
+                **kwargs) -> Optional[requests.Response]:
+        """Generic HTTP request that honors block tracking + rotation.
+
+        The scanner used to do `self._session._session.request(...)` in
+        a dozen places to get verbs other than GET/HEAD/POST-form, which
+        bypassed BLOCK_THRESHOLD, the per-domain delay, circuit
+        rotation, and timeout-retry. That meant a 429-ing target could
+        soak up every verb-tampering / host-header probe and never trip
+        the circuit breaker. Now everyone goes through this.
+        """
+        if shutdown_requested():
+            return None
+        domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
+        self._total_requests += 1
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        m_up = method.upper()
+
+        for attempt in range(MAX_RETRIES_PER_URL):
+            self._delay_for_domain(domain)
+            self._maybe_rotate_circuit()
+            headers = _pick_profile()
+            if extra_headers:
+                headers.update(extra_headers)
+            try:
+                self._domain_last[domain] = time.time()
+                resp = self._session.request(
+                    m_up, url,
+                    allow_redirects=allow_redirects,
+                    headers=headers,
+                    **kwargs,
+                )
+            except requests.exceptions.Timeout:
+                self._total_timeouts += 1
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                return None
+            except requests.exceptions.ConnectionError:
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                return None
+            except Exception:
+                return None
+
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+                if self.is_domain_blocked(domain):
+                    integrity_log("intel", f"domain_circuit_breaker:{domain}")
+                    return resp  # still return so caller can inspect
+                # Don't retry every verb — checks like verb tampering
+                # expect 4xx; only rotate circuit + return.
+                return resp
+            return resp
+        return None
+
     def get_stats(self) -> dict:
         """Return session statistics for reporting."""
         return {
@@ -2312,14 +2377,10 @@ class VulnScanner:
 
                 if endpoint["method"] == "GET":
                     test_url = f"{url}?{pname}={payload}"
-                    try:
-                        self._session._delay_for_domain(domain)
-                        resp = self._session._session.get(
-                            test_url, timeout=REQUEST_TIMEOUT,
-                            proxies=self._session._proxy, headers=_pick_profile(),
-                            allow_redirects=False
-                        )
-                    except Exception:
+                    resp = self._session.request(
+                        "GET", test_url, allow_redirects=False,
+                    )
+                    if resp is None:
                         continue
                 else:
                     resp = self._send_test(endpoint, pname, payload)
@@ -3469,11 +3530,7 @@ class VulnScanner:
             return findings
 
         try:
-            self._session._delay_for_domain(domain)
-            self._session._maybe_rotate_circuit()
-            opt_resp = self._session._session.options(base_url, timeout=REQUEST_TIMEOUT,
-                                                       proxies=self._session._proxy,
-                                                       headers=_pick_profile())
+            opt_resp = self._session.request("OPTIONS", base_url)
             # Servers commonly advertise Allow: from OPTIONS with status
             # 200 OR 204 (No Content). requiring 200 specifically misses
             # every correctly-implemented RFC-7231 server that returns
@@ -3511,11 +3568,8 @@ class VulnScanner:
                 break
             test_url = f"{base_url}?{param}={quote(evil_target)}"
             try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                resp = self._session._session.get(
-                    test_url, timeout=REQUEST_TIMEOUT, allow_redirects=False,
-                    proxies=self._session._proxy, headers=_pick_profile()
+                resp = self._session.request(
+                    "GET", test_url, allow_redirects=False,
                 )
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location", "")
@@ -3712,12 +3766,7 @@ class VulnScanner:
                 break
             url = urljoin(base_url, gql_path)
             try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                resp = self._session._session.post(
-                    url, json=introspection_query, timeout=REQUEST_TIMEOUT,
-                    proxies=self._session._proxy, headers=_pick_profile()
-                )
+                resp = self._session.post_json(url, introspection_query)
                 if resp and resp.status_code == 200:
                     try:
                         data = resp.json()
@@ -3965,21 +4014,13 @@ class VulnScanner:
         for headers, hname in probes:
             if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
-            # Use bare session.get with allow_redirects=False so we can
-            # see what the server wrote in Location.
-            try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                pick = _pick_profile()
-                pick.update(headers)
-                resp = self._session._session.get(
-                    base_url, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=pick,
-                )
-            except Exception:
-                continue
+            # allow_redirects=False so we can see what the server wrote
+            # in Location.
+            resp = self._session.request(
+                "GET", base_url,
+                allow_redirects=False,
+                extra_headers=headers,
+            )
             if resp is None:
                 continue
 
@@ -4071,37 +4112,30 @@ class VulnScanner:
                 except Exception:
                     continue
 
-        for path in candidates[:8]:
+        # Cap the total probe budget. Each path triggers 1 baseline + 6
+        # verbs + 1 override = 8 requests. 4 paths = 32 requests,
+        # which is enough to catch the common cases without killing a
+        # Tor circuit. Previous version allowed 8 paths = 64 requests,
+        # which almost always tripped the target's rate limit.
+        for path in candidates[:4]:
             if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             url = urljoin(base_url, path)
 
-            # Baseline GET
-            try:
-                self._session._delay_for_domain(domain)
-                g_resp = self._session._session.get(
-                    url, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=_pick_profile(),
-                )
-            except Exception:
-                continue
+            # Baseline GET — only interesting when GET is walled.
+            g_resp = self._session.request(
+                "GET", url, allow_redirects=False,
+            )
             if g_resp is None or g_resp.status_code not in (401, 403):
-                # Only interesting when GET is walled.
                 continue
 
+            found_this_path = False
             for verb in ("HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
-                try:
-                    self._session._delay_for_domain(domain)
-                    v_resp = self._session._session.request(
-                        verb, url, timeout=REQUEST_TIMEOUT,
-                        allow_redirects=False,
-                        proxies=self._session._proxy,
-                        headers=_pick_profile(),
-                    )
-                except Exception:
-                    continue
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+                v_resp = self._session.request(
+                    verb, url, allow_redirects=False,
+                )
                 if v_resp is None:
                     continue
                 # Bypass signal: verb returns 200 / 2xx while GET returned 403/401.
@@ -4127,18 +4161,15 @@ class VulnScanner:
                             "risk": "Auth bypass, admin access",
                         },
                     })
+                    found_this_path = True
                     return findings
+            if found_this_path:
+                break
             # Method-override header
-            try:
-                self._session._delay_for_domain(domain)
-                o_resp = self._session._session.get(
-                    url, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers={**_pick_profile(), "X-HTTP-Method-Override": "GET"},
-                )
-            except Exception:
-                continue
+            o_resp = self._session.request(
+                "GET", url, allow_redirects=False,
+                extra_headers={"X-HTTP-Method-Override": "GET"},
+            )
             if o_resp and 200 <= o_resp.status_code < 300:
                 findings.append({
                     "severity": SEV_HIGH,
@@ -4457,9 +4488,10 @@ class VulnScanner:
             return findings
 
         login_form = login_forms[0]
+        path_disp = urlparse(login_form['url']).path or '/'
         findings.append({
             "severity": SEV_INFO,
-            "title": f"Login form at {urlparse(login_form['url']).path or '/'}",
+            "title": f"Login form at {path_disp}",
             "detail": (f"Login form discovered — "
                        f"user={login_form['username_field']} / "
                        f"pass={login_form['password_field']}. "
@@ -4468,57 +4500,73 @@ class VulnScanner:
                          f"{login_form['url']} with "
                          f"{len(login_form['hidden_fields'])} hidden field(s)"),
             "confidence": 0.95,
+            "exploit_info": {
+                "type": "login_form",
+                "path": path_disp,
+                "username_field": login_form["username_field"],
+                "password_field": login_form["password_field"],
+                "hidden_fields": list(login_form["hidden_fields"].keys()),
+            },
         })
 
-        # Probe rate limiting — 6 rapid-fire wrong-password POSTs with
-        # a non-existent username. If the 6th still returns the same
-        # status as the 1st, there's no rate limit. Non-existent
-        # username avoids locking out any real account.
-        throwaway_user = f"gs_probe_{secrets.token_hex(4)}"
+        # Probe rate limiting — 4 rapid-fire wrong-password POSTs with
+        # a distinctive-looking throwaway username (clearly fake so no
+        # human account gets locked). We compare status codes + body
+        # lengths. If EVERY request returns the same code and a similar
+        # length, and no 429 shows up, we flag brute-force-friendly.
+        # Previously we did 6 probes + an "admin" enumeration probe;
+        # the admin probe risked locking a real account on a
+        # lockout-after-N-attempts policy, so it's gone.
+        throwaway_user = f"gsprobe{secrets.token_hex(4)}notareal"
         statuses: List[int] = []
         lengths: List[int] = []
-        for _ in range(6):
-            if shutdown_requested():
+        for _ in range(4):
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             data = {
                 login_form["username_field"]: throwaway_user,
                 login_form["password_field"]: secrets.token_hex(6),
             }
             data.update(login_form["hidden_fields"])
-            try:
-                self._session._delay_for_domain(domain)
-                resp = self._session._session.post(
-                    login_form["url"], data=data,
-                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=_pick_profile(),
-                )
-            except Exception:
-                break
+            # post_form already honors the block/delay machinery.
+            resp = self._session.post_form(
+                login_form["url"], data, allow_redirects=False,
+            )
             if resp is None:
                 break
             statuses.append(resp.status_code)
             lengths.append(len(resp.text or ""))
-        if len(statuses) >= 5:
-            # If every attempt had the same status AND no 429 anywhere,
-            # we have a brute-force-friendly login.
-            got_429 = any(s == 429 for s in statuses)
-            got_retry_after = False  # We'd need headers; skip for now
-            if not got_429 and len(set(statuses)) == 1:
+            # If the site just returned a Retry-After or 429 on any
+            # request, rate limiting is present — stop probing.
+            if resp.status_code == 429:
+                break
+
+        if len(statuses) >= 3 and 429 not in statuses:
+            # Tight window on body-length jitter: 5% variance is normal
+            # (CSRF token changes, random ad slots), more than that
+            # means the server's responses aren't uniform.
+            avg_len = sum(lengths) / len(lengths) if lengths else 0
+            max_dev = (max(abs(l - avg_len) for l in lengths)
+                       if lengths and avg_len else 0)
+            uniform_len = avg_len > 0 and max_dev <= max(100, avg_len * 0.05)
+            same_status = len(set(statuses)) == 1
+
+            if same_status and uniform_len:
                 findings.append({
                     "severity": SEV_MEDIUM,
                     "title": "Login form lacks rate limiting",
-                    "detail": (f"6 failed login attempts all returned the "
-                               f"same status ({statuses[0]}). No 429 Too "
-                               f"Many Requests, no progressive delay. "
-                               f"Brute-force is practical — combine with "
-                               f"any leaked usernames."),
+                    "detail": (f"{len(statuses)} failed-login attempts all "
+                               f"returned HTTP {statuses[0]} with a near-"
+                               f"identical body length (avg={avg_len:.0f}B, "
+                               f"max dev={max_dev:.0f}B). No 429, no "
+                               f"progressive slowdown. Brute-force is "
+                               f"practical when you have a username list."),
                     "evidence": f"statuses: {statuses}, lengths: {lengths}",
                     "confidence": 0.85,
                     "exploitable": True,
                     "exploit_info": {
                         "type": "brute_force_viable",
-                        "path": urlparse(login_form["url"]).path or "/",
+                        "path": path_disp,
                         "username_field": login_form["username_field"],
                         "password_field": login_form["password_field"],
                         "method": (f"POST {login_form['url']} with "
@@ -4529,53 +4577,6 @@ class VulnScanner:
                         "risk": "Account takeover via brute-force",
                     },
                 })
-
-        # User enumeration oracle: compare wrong-username vs likely-valid
-        # username (admin). If lengths differ meaningfully, the app
-        # leaks whether a username exists.
-        if len(lengths) >= 1:
-            try:
-                data_admin = {
-                    login_form["username_field"]: "admin",
-                    login_form["password_field"]: secrets.token_hex(6),
-                }
-                data_admin.update(login_form["hidden_fields"])
-                self._session._delay_for_domain(domain)
-                r_admin = self._session._session.post(
-                    login_form["url"], data=data_admin,
-                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=_pick_profile(),
-                )
-                if r_admin is not None:
-                    admin_len = len(r_admin.text or "")
-                    base_len = lengths[0] if lengths else 0
-                    # 20% size difference is meaningful
-                    if base_len > 0 and abs(admin_len - base_len) > base_len * 0.2:
-                        findings.append({
-                            "severity": SEV_MEDIUM,
-                            "title": "Login form leaks usernames (response-length oracle)",
-                            "detail": (f"Login with 'admin' + bogus password "
-                                       f"returned a {admin_len}-byte body; "
-                                       f"login with a random username + "
-                                       f"bogus password returned a "
-                                       f"{base_len}-byte body. The delta "
-                                       f"reveals which usernames exist."),
-                            "evidence": f"admin={admin_len} vs bogus={base_len} bytes",
-                            "confidence": 0.8,
-                            "exploitable": True,
-                            "exploit_info": {
-                                "type": "user_enumeration",
-                                "path": urlparse(login_form["url"]).path or "/",
-                                "method": ("POST with each candidate "
-                                           "username + bogus password; "
-                                           "compare body length. Matches "
-                                           "'exists' length = valid user."),
-                                "risk": "Username enumeration, brute-force shortlist",
-                            },
-                        })
-            except Exception:
-                pass
 
         return findings
 
@@ -5245,11 +5246,9 @@ class ExploitVerifier:
         # Execute replay
         try:
             if exploit_type == "graphql_introspection":
-                resp = self._session._session.post(
+                resp = self._session.post_json(
                     replay_url,
-                    json={"query": "{ __schema { types { name } } }"},
-                    timeout=15, proxies=self._session._proxy,
-                    headers=_pick_profile(),
+                    {"query": "{ __schema { types { name } } }"},
                 )
             else:
                 resp = self._session.get(replay_url, allow_wayback=False)
@@ -5380,18 +5379,10 @@ class ExploitVerifier:
             url = finding.get("test_url", "")
             if not url:
                 return False
-            try:
-                domain_vr = urlparse(url).netloc
-                self._session._delay_for_domain(domain_vr)
-                self._session._maybe_rotate_circuit()
-                r2 = self._session._session.get(
-                    url, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers={**_pick_profile(), hname: marker},
-                )
-            except Exception:
-                return False
+            r2 = self._session.request(
+                "GET", url, allow_redirects=False,
+                extra_headers={hname: marker},
+            )
             if r2 is None:
                 return False
             loc = r2.headers.get("Location", "")
@@ -5412,17 +5403,9 @@ class ExploitVerifier:
             ev = finding.get("evidence", "")
             verb_match = re.search(r",\s*([A-Z]+)→", ev)
             verb = verb_match.group(1) if verb_match else "POST"
-            try:
-                domain_vr = urlparse(url).netloc
-                self._session._delay_for_domain(domain_vr)
-                r2 = self._session._session.request(
-                    verb, url, timeout=REQUEST_TIMEOUT,
-                    allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=_pick_profile(),
-                )
-            except Exception:
-                return False
+            r2 = self._session.request(
+                verb, url, allow_redirects=False,
+            )
             return bool(r2) and 200 <= r2.status_code < 300
 
         elif exploit_type == "directory_traversal":
@@ -5430,27 +5413,18 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "open_redirect":
-            # The original scanner issued the request with
-            # allow_redirects=False and checked the Location header on
-            # a 3xx. TorSession.get follows redirects by default, so
-            # when the verifier replays through it the response we
-            # receive is the TARGET of the redirect (usually 200), and
-            # the status_code check below silently fails for every
-            # confirmed open redirect. Replay with allow_redirects=False
-            # via _delay_for_domain + direct session.get so we see the
-            # 3xx response.
+            # TorSession.get follows redirects by default, so a replay
+            # through it would resolve to the target of the redirect
+            # and we'd never see the Location header. Use the session's
+            # request() method with allow_redirects=False.
             evil_target = "evil-attacker.com"
-            domain = urlparse(finding.get("test_url", "")).netloc
-            try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                resp_nr = self._session._session.get(
-                    finding.get("test_url", ""),
-                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
-                    proxies=self._session._proxy,
-                    headers=_pick_profile(),
-                )
-            except Exception:
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            resp_nr = self._session.request(
+                "GET", url, allow_redirects=False,
+            )
+            if resp_nr is None:
                 return False
             if resp_nr.status_code in (301, 302, 303, 307, 308):
                 location = resp_nr.headers.get("Location", "")
@@ -5981,12 +5955,7 @@ class FindingChain:
 
         query = '{ __schema { types { name fields { name type { name } } } } }'
         try:
-            self._session._delay_for_domain(domain)
-            self._session._maybe_rotate_circuit()
-            resp = self._session._session.post(
-                url, json={"query": query}, timeout=REQUEST_TIMEOUT,
-                proxies=self._session._proxy, headers=_pick_profile(),
-            )
+            resp = self._session.post_json(url, {"query": query})
             if resp and resp.status_code == 200:
                 data = resp.json()
                 types = data.get("data", {}).get("__schema", {}).get("types", [])
