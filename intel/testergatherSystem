@@ -83,6 +83,7 @@ import re
 import secrets
 import ssl
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -3695,10 +3696,17 @@ class CapturedRequest:
 
 
 class RequestLog:
-    """Thread-safe log of captured requests for a scan session."""
+    """Thread-safe log of captured requests for a scan session.
+
+    The class advertises thread safety because consumers (ExploitVerifier,
+    FindingChain, PoCExporter) reach into the list from different call
+    sites and concurrency could grow later. A threading.Lock around every
+    list mutation / iteration is cheap and makes the contract honest.
+    """
 
     def __init__(self):
         self._requests: List[CapturedRequest] = []
+        self._lock = threading.Lock()
 
     def capture(self, method: str, url: str, headers: dict, body: str,
                 resp: Optional[requests.Response]) -> CapturedRequest:
@@ -3709,17 +3717,21 @@ class RequestLog:
             resp_headers=dict(resp.headers) if resp else {},
             resp_body=resp.text[:50000] if resp else "",
         )
-        self._requests.append(cr)
+        with self._lock:
+            self._requests.append(cr)
         return cr
 
     def get_for_url(self, url: str) -> List[CapturedRequest]:
-        return [r for r in self._requests if r.url == url]
+        with self._lock:
+            return [r for r in self._requests if r.url == url]
 
     def get_all(self) -> List[CapturedRequest]:
-        return list(self._requests)
+        with self._lock:
+            return list(self._requests)
 
     def clear(self):
-        self._requests.clear()
+        with self._lock:
+            self._requests.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════
