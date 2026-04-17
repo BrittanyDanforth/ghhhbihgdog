@@ -391,9 +391,28 @@ class ExploitFileManager:
         # walkthrough banner tells the operator.
         self._disk_warning = True
         shm = Path("/dev/shm")
-        if shm.is_dir() and os.access(str(shm), os.W_OK):
-            self._base = shm / "intel"
-            self._disk_warning = False
+        # os.access() only reads DAC bits — it says 'writable' on a
+        # read-only remount or a noexec tmpfs. We need to confirm by
+        # actually creating + fsyncing a probe file.
+        if shm.is_dir():
+            _probe = shm / f".exfm_probe_{os.getpid()}_{secrets.token_hex(3)}"
+            try:
+                fd = os.open(str(_probe),
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.write(fd, b"t")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                self._base = shm / "intel"
+                self._disk_warning = False
+            except OSError:
+                self._base = ROOT / ".intel_tmp"
+            finally:
+                try:
+                    _probe.unlink()
+                except Exception:
+                    pass
         else:
             self._base = ROOT / ".intel_tmp"
         # Permissions matter: on a shared host, leaving the dir at the
@@ -1933,6 +1952,60 @@ def check_prereqs() -> dict:
         except ImportError:
             status[name] = False
 
+    # /dev/shm ACTUAL writability probe. The toolkit's core OPSEC
+    # promise is that exploit files + in-memory captures stay on
+    # tmpfs and never touch disk. On hardened distros /dev/shm
+    # exists but is:
+    #   - remounted read-only (docker --read-only-tmpfs, some
+    #     CIS-hardened images)
+    #   - bind-mounted to a directory on disk (some LXC/Proxmox
+    #     templates where tmpfs isn't configured)
+    #   - mounted with size=0 (stripped minimal containers)
+    # Previous code only checked existence, so failures were deferred
+    # until the first write — at which point we'd silently fall back
+    # to ROOT/.intel_tmp on DISK, defeating the OPSEC promise.
+    shm_path = Path("/dev/shm")
+    status["shm_exists"] = shm_path.exists()
+    status["shm_writable"] = False
+    status["shm_is_tmpfs"] = False
+    status["shm_reason"] = ""
+    if shm_path.exists():
+        # Is it actually tmpfs? /proc/mounts tells us.
+        try:
+            mounts = Path("/proc/mounts").read_text("utf-8", errors="replace")
+            for line in mounts.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "/dev/shm":
+                    status["shm_is_tmpfs"] = parts[2] in ("tmpfs", "ramfs")
+                    # Extra: detect readonly mount early
+                    if len(parts) >= 4 and ("ro" in parts[3].split(",")):
+                        status["shm_reason"] = "mounted read-only"
+                    break
+        except Exception:
+            pass
+        # Now actually try to write + fsync + unlink a probe file.
+        _probe = shm_path / f".toolkit_probe_{os.getpid()}_{secrets.token_hex(4)}"
+        try:
+            fd = os.open(str(_probe), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, b"t")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            status["shm_writable"] = True
+        except OSError as _shm_err:
+            status["shm_reason"] = (
+                status["shm_reason"]
+                or f"{type(_shm_err).__name__}: {_shm_err.strerror or _shm_err}"
+            )
+        finally:
+            try:
+                _probe.unlink()
+            except Exception:
+                pass
+    else:
+        status["shm_reason"] = "/dev/shm does not exist"
+
     # Tor (system tor SOCKS 9050; Tor Browser embedded tor 9150)
     status["tor"] = False
     status["tor_port"] = None
@@ -1994,6 +2067,18 @@ def show_status(st: dict):
     for tool in ["monerod", "monero-wallet-cli", "monero-wallet-rpc"]:
         (ok if st.get(tool) else warn)(f"{tool}")
     (ok if st.get("wallet_rpc") else warn)("wallet-rpc responding (127.0.0.1:18083)")
+
+    _shm_writable = st.get("shm_writable")
+    _shm_tmpfs = st.get("shm_is_tmpfs")
+    _shm_reason = st.get("shm_reason") or ""
+    if _shm_writable and _shm_tmpfs:
+        ok("/dev/shm is tmpfs and writable (RAM-only storage)")
+    elif _shm_writable and not _shm_tmpfs:
+        warn("/dev/shm is writable but NOT tmpfs — files may hit disk")
+    else:
+        _detail = f" ({_shm_reason})" if _shm_reason else ""
+        err(f"/dev/shm is NOT writable{_detail} — OPSEC degraded; "
+            f"the toolkit will fall back to ROOT/.intel_tmp on disk")
 
     missing = [n for n in ["requests","PySocks","stem","monero","psutil","tenacity"] if not st.get(n)]
     if missing:
@@ -5632,9 +5717,17 @@ def flow_intel(detected_port=None):
     heading("Intelligence Gathering & Vulnerability Scanner")
     print(f"  This tool performs OSINT collection and vulnerability scanning")
     print(f"  through Tor. All data is stored in RAM (/dev/shm).")
-    if not Path("/dev/shm").exists():
-        print(f"  {R}WARNING: /dev/shm not available — data will be stored on disk.{N}")
-        print(f"  {R}Use a system with tmpfs/ramfs for OPSEC-safe operation.{N}")
+    _pr = check_prereqs()
+    if not _pr.get("shm_writable"):
+        _why = _pr.get("shm_reason") or "unknown"
+        print(f"  {R}WARNING: /dev/shm is NOT usable ({_why}) — intel data "
+              f"WILL be stored on disk in ROOT/.intel_tmp.{N}")
+        print(f"  {R}Use a system with a writable tmpfs/ramfs mount for "
+              f"OPSEC-safe operation.{N}")
+    elif not _pr.get("shm_is_tmpfs"):
+        print(f"  {Y}Note: /dev/shm exists and is writable but does NOT "
+              f"appear to be a tmpfs/ramfs mount. Files may persist on "
+              f"physical media.{N}")
     print()
     print(f"  {B}Modes:{N}")
     print(f"    {G}1{N}  Domain Recon + Vuln Scan    (enter a domain)")
