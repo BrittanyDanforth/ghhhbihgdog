@@ -2587,6 +2587,8 @@ class VulnScanner:
             if depth == "full":
                 self._run_check("SQL injection (quick)", self._check_sqli_indicators,
                                 (base_url,), 0.85, findings)
+                self._run_check("SQL injection in headers", self._check_sqli_headers,
+                                (base_url,), 0.7, findings)
                 self._run_check("XSS reflection (quick)", self._check_xss_reflection,
                                 (base_url,), 0.85, findings)
                 self._run_check("NoSQL injection (quick)",
@@ -3660,9 +3662,23 @@ class VulnScanner:
         if the SQL error pattern appears ONLY in the injected response (not the baseline),
         which eliminates false positives from generic error pages or debug-mode sites that
         always show SQL traces.
+
+        Also tries a broader payload set for the same parameter —
+        apostrophe, double-quote, and an OR-TRUE comment. The old
+        code only tried the apostrophe, which misses every int-
+        context parameter.
         """
         findings = []
         test_params = self._get_test_params(["id", "page", "q", "search", "user", "item", "cat"])
+
+        # Ordered payload set. Each payload is '<raw>' as passed to
+        # the URL query string; we URL-encode it per request.
+        probes = [
+            ("'",  "'"),
+            ('"',  '"'),
+            (" OR 1=1-- -", " OR 1=1-- -"),
+            ("' OR '1'='1'-- -", "' OR '1'='1'-- -"),
+        ]
 
         for param in test_params[:5]:
             if shutdown_requested():
@@ -3678,21 +3694,25 @@ class VulnScanner:
                 continue
             baseline_text = baseline_resp.text[:5000]
 
-            # Payload: single apostrophe injection
-            test_url = f"{base_url}?{param}=1%27"
-            resp = self._session.get(test_url, allow_wayback=False)
-            if resp and resp.text:
+            for probe_name, payload in probes:
+                if shutdown_requested():
+                    break
+                test_url = f"{base_url}?{param}=1{quote(payload)}"
+                resp = self._session.get(test_url, allow_wayback=False)
+                if not resp or not resp.text:
+                    continue
                 for indicator in self.SQLI_INDICATORS:
-                    # Only count if the pattern is NEW in the injected response
                     in_payload = indicator.search(resp.text[:5000])
                     in_baseline = indicator.search(baseline_text)
                     if in_payload and not in_baseline:
                         findings.append({
                             "severity": SEV_CRITICAL,
                             "title": f"SQL injection indicator via '{param}' parameter",
-                            "detail": "SQL error message appears ONLY in response to apostrophe injection "
-                                      "(not in baseline). Input likely reaches SQL query without parameterization.",
-                            "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}",
+                            "detail": ("SQL error message appears ONLY in response "
+                                       f"to probe '{probe_name}' (not in baseline). "
+                                       "Input likely reaches SQL query without "
+                                       "parameterization."),
+                            "evidence": f"Parameter: {param}, probe: {probe_name}, matched: {indicator.pattern[:60]}",
                             "exploitable": True,
                             "test_url": test_url,
                             "exploit_info": {
@@ -3704,6 +3724,73 @@ class VulnScanner:
                             },
                         })
                         return findings
+        return findings
+
+    def _check_sqli_headers(self, base_url: str) -> List[dict]:
+        """Detect SQLi in request headers the app logs or passes to SQL.
+
+        Apps that log User-Agent / Referer / X-Forwarded-For into a
+        DB without parameterization are extremely common and usually
+        go undetected by URL-param scanners. Probe the canonical
+        loggable headers with a single-quote and look for SQL errors
+        in the response body.
+
+        Not every target will echo its own errors to the page (most
+        log them silently), so this is an upper-bound probe —
+        positives are strong, negatives don't mean clean.
+        """
+        findings = []
+        baseline = self._session.get(base_url, allow_wayback=False)
+        if not baseline or not baseline.text:
+            return findings
+        baseline_text = baseline.text[:6000]
+
+        probe_headers = (
+            "User-Agent", "Referer", "X-Forwarded-For",
+            "X-Real-IP", "X-Client-IP", "Cookie",
+        )
+        for hname in probe_headers:
+            if shutdown_requested():
+                break
+            # Use `Mozilla/5.0'` for User-Agent — breaking the
+            # existing string mid-value is the most likely to reach
+            # a logging query.
+            if hname == "Cookie":
+                payload_val = f"sess=gs{secrets.token_hex(4)}'"
+            else:
+                payload_val = f"gs{secrets.token_hex(4)}'"
+            resp = self._session.request(
+                "GET", base_url,
+                extra_headers={hname: payload_val},
+            )
+            if not resp or not resp.text:
+                continue
+            body = resp.text[:6000]
+            for indicator in self.SQLI_INDICATORS:
+                if indicator.search(body) and not indicator.search(baseline_text):
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"SQL error reflected in response to injected {hname} header",
+                        "detail": (f"Setting {hname} to a value containing "
+                                   f"a single quote caused a database "
+                                   f"error to appear in the response. "
+                                   f"Common SQLi-via-logging pattern."),
+                        "evidence": f"{hname}: {payload_val[:40]}, matched: {indicator.pattern[:60]}",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "sqli",
+                            "parameter": f"header:{hname}",
+                            "method": (f"Inject into {hname}. Works "
+                                       f"against apps that log requests "
+                                       f"to a DB. Good starting point: "
+                                       f"try UNION SELECT via "
+                                       f"time-based blind because "
+                                       f"errors don't always echo."),
+                            "risk": "Database compromise via a header the WAF rarely inspects",
+                        },
+                    })
+                    return findings
         return findings
 
     def _check_xss_reflection(self, base_url: str) -> List[dict]:
@@ -4424,12 +4511,19 @@ class VulnScanner:
 
     def _check_nosql_injection(self, base_url: str) -> List[dict]:
         """Detect MongoDB-style NoSQL injection via error signatures
-        and differential-response boolean probes.
+        plus a THREE-point boolean differential to kill false positives.
 
-        The $ne="x" / [$ne]=x payloads coerce most MongoDB queries to
-        'true for every document'; comparing the response length to a
-        baseline reveals whether the DB returned more documents than a
-        normal query would.
+        We compare three responses:
+          (a) baseline-bogus: ?p=<random> — the 'should-not-match' case
+          (b) baseline-plain: ?p=1 — the 'might-match' case
+          (c) ne-bogus: ?p[$ne]=<random> — the 'match-everything'
+              case IF the app interprets $ne
+
+        Real MongoDB injection makes (c) look like 'match everything',
+        which differs from BOTH (a) and (b). If (c) only differs from
+        (a) (but matches (b)), the framework is just coalescing
+        'param[$ne]=...' back to the plain-param behavior — common in
+        Node/Express with qs enabled — and is NOT injection.
         """
         findings = []
         test_params = self._get_test_params(["id", "user", "username", "email",
@@ -4438,85 +4532,107 @@ class VulnScanner:
             if shutdown_requested():
                 break
 
-            baseline_url = f"{base_url}?{param}=x{secrets.token_hex(3)}"
-            b_resp = self._session.get(baseline_url, allow_wayback=False)
-            if not b_resp or not b_resp.text:
+            bogus = f"x{secrets.token_hex(3)}"
+            base_url_no_q = base_url.split("?")[0]
+
+            # (a) Bogus scalar — 'does not exist'
+            url_a = f"{base_url_no_q}?{param}={bogus}"
+            # (b) Real-ish scalar — 'does exist' most of the time
+            url_b = f"{base_url_no_q}?{param}=1"
+            # (c) [$ne] operator — MongoDB: match everything except bogus
+            url_c = f"{base_url_no_q}?{param}[$ne]={bogus}"
+
+            r_a = self._session.get(url_a, allow_wayback=False)
+            if not r_a or not r_a.text:
                 continue
-            b_body = b_resp.text[:6000]
-            b_len = len(b_resp.text)
+            r_b = self._session.get(url_b, allow_wayback=False)
+            r_c = self._session.get(url_c, allow_wayback=False)
+            if not r_c or not r_c.text:
+                continue
 
-            # 1. Error-based probe: $ne payload
-            err_url = f"{base_url}?{param}[$ne]=0"
-            e_resp = self._session.get(err_url, allow_wayback=False)
-            if e_resp and e_resp.text:
-                for ind in self.NOSQL_INDICATORS:
-                    if ind.search(e_resp.text[:6000]) and not ind.search(b_body):
-                        findings.append({
-                            "severity": SEV_CRITICAL,
-                            "title": f"NoSQL injection indicator via '{param}'",
-                            "detail": ("MongoDB-class error appeared only in "
-                                       "response to a [$ne] payload. Input "
-                                       "reaches a NoSQL query without "
-                                       "sanitization."),
-                            "evidence": f"param: {param}, pattern: {ind.pattern[:60]}",
-                            "exploitable": True,
-                            "test_url": err_url,
-                            "exploit_info": {
-                                "type": "nosql_injection",
-                                "parameter": param,
-                                "method": ("Use operators that coerce to "
-                                           "'true' for every document: "
-                                           "?user[$ne]=0&pass[$ne]=0 to "
-                                           "bypass auth. For data "
-                                           "extraction: [$regex]=.*"),
-                                "risk": "Auth bypass, data exfiltration, DB enumeration",
-                            },
-                        })
-                        return findings
+            body_a = r_a.text[:6000]
+            body_c = r_c.text[:6000]
+            len_a = len(r_a.text)
+            len_b = len(r_b.text) if r_b and r_b.text else 0
+            len_c = len(r_c.text)
 
-            # 2. Boolean differential: $ne always true → often returns
-            # more data than the bogus baseline value did.
-            true_url = f"{base_url}?{param}[$ne]=x{secrets.token_hex(3)}"
-            t_resp = self._session.get(true_url, allow_wayback=False)
-            if t_resp and t_resp.text and t_resp.status_code == 200:
-                if b_resp.status_code in (404, 400) and t_resp.status_code == 200:
-                    # Baseline said 'not found', $ne says 'OK' → strong.
+            # Signal 1: MongoDB-class error ONLY in the [$ne] response
+            # (not in the bogus baseline → rules out generic 500s that
+            # a badly-written param handler always emits).
+            for ind in self.NOSQL_INDICATORS:
+                if ind.search(body_c) and not ind.search(body_a):
                     findings.append({
-                        "severity": SEV_HIGH,
-                        "title": f"Possible NoSQL injection via '{param}' (boolean)",
-                        "detail": (f"?{param}=<bogus> → HTTP {b_resp.status_code} "
-                                   f"but ?{param}[$ne]=<bogus> → HTTP "
-                                   f"{t_resp.status_code}. Operator was "
-                                   f"interpreted by the DB."),
-                        "evidence": f"param: {param}, baseline={b_resp.status_code}, $ne={t_resp.status_code}",
+                        "severity": SEV_CRITICAL,
+                        "title": f"NoSQL injection error via '{param}'",
+                        "detail": ("MongoDB-class error appeared only in "
+                                   "response to a [$ne] payload. Input "
+                                   "reaches a NoSQL query without "
+                                   "sanitization."),
+                        "evidence": f"param: {param}, pattern: {ind.pattern[:60]}",
                         "exploitable": True,
-                        "test_url": true_url,
+                        "test_url": url_c,
                         "exploit_info": {
                             "type": "nosql_injection",
                             "parameter": param,
-                            "method": ("Swap the parameter for a "
-                                       "[$ne]/[$gt]/[$regex] payload — "
-                                       "most endpoints will leak "
-                                       "information by returning results "
-                                       "for every document."),
+                            "method": ("Use operators that coerce to "
+                                       "'true' for every document: "
+                                       "?user[$ne]=0&pass[$ne]=0 to "
+                                       "bypass auth. For data "
+                                       "extraction: [$regex]=.*"),
+                            "risk": "Auth bypass, data exfiltration, DB enumeration",
+                        },
+                    })
+                    return findings
+
+            # Signal 2: Three-point boolean differential.
+            # Only flag if (c) is BOTH:
+            #   - meaningfully larger than (a) AND
+            #   - different enough from (b) to look like 'more than
+            #     one match' (not just the same match rendered twice)
+            if r_c.status_code == 200 and len_c > len_a + 1024:
+                # If the baseline-plain is similar to (c), then the app
+                # just treats [$ne] like the plain param; that's not
+                # injection.
+                plain_matches_ne = (
+                    len_b > 0 and
+                    abs(len_c - len_b) < max(512, len_b * 0.1)
+                )
+                # If (a) was a hard error (4xx) and (c) was 200, that's
+                # a very strong signal regardless of length.
+                a_was_error = r_a.status_code in (400, 404)
+                if a_was_error and r_c.status_code == 200:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible NoSQL injection via '{param}' (404→200)",
+                        "detail": (f"?{param}=<bogus> → HTTP {r_a.status_code} "
+                                   f"but ?{param}[$ne]=<bogus> → HTTP 200. "
+                                   f"Operator was interpreted by the DB."),
+                        "evidence": f"baseline={r_a.status_code}, $ne={r_c.status_code}",
+                        "exploitable": True,
+                        "test_url": url_c,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Swap the parameter for "
+                                       "[$ne]/[$gt]/[$regex] — most "
+                                       "endpoints will leak everything."),
                             "risk": "Auth bypass, data extraction",
                         },
                     })
                     return findings
-                # Length-based differential: $ne=true returns substantially more
-                t_len = len(t_resp.text)
-                if t_len > b_len * 2 and t_len - b_len > 1024:
+                if not plain_matches_ne:
                     findings.append({
                         "severity": SEV_HIGH,
                         "title": f"Possible NoSQL injection via '{param}' (length diff)",
-                        "detail": (f"[$ne] payload returned a response "
-                                   f"{t_len} bytes vs baseline {b_len} "
-                                   f"bytes. DB likely returned all "
-                                   f"documents that don't match the "
-                                   f"bogus value."),
-                        "evidence": f"param: {param}, baseline={b_len}, $ne={t_len}",
+                        "detail": (f"[$ne] payload returned {len_c} bytes "
+                                   f"vs {len_a}-byte bogus baseline "
+                                   f"(and {len_b}-byte plain baseline) — "
+                                   f"response differs from both, "
+                                   f"consistent with match-everything."),
+                        "evidence": (f"bogus={len_a}B, plain={len_b}B, "
+                                     f"$ne={len_c}B"),
                         "exploitable": True,
-                        "test_url": true_url,
+                        "test_url": url_c,
                         "exploit_info": {
                             "type": "nosql_injection",
                             "parameter": param,
