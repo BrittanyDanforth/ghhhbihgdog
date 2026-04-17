@@ -6449,6 +6449,32 @@ class IntelOrchestrator:
             sep = ", " if blocked and timeouts else ""
             print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
 
+        # Quick exploitable summary grouped by type — tells the operator
+        # which walkthrough branches are worth opening before they dig
+        # through the full report.
+        _dedup_vulns = self._vulns._dedup_findings(self._vuln_findings)
+        by_type: Dict[str, int] = defaultdict(int)
+        for v in _dedup_vulns:
+            if not v.get("exploitable"):
+                continue
+            t = (v.get("exploit_info") or {}).get("type", "other")
+            by_type[t] += 1
+        if by_type:
+            print(f"  [!] Exploitable findings by type:")
+            for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
+                print(f"      {n:>3}  {t}")
+        elif _dedup_vulns:
+            # No EXPLOITABLE findings but we still have findings —
+            # that's a good sign the target is well-configured. Say so.
+            sev_count = defaultdict(int)
+            for v in _dedup_vulns:
+                sev_count[v["severity"]] += 1
+            counts_s = ", ".join(f"{sev_count[s]} {s}"
+                                 for s in (SEV_CRITICAL, SEV_HIGH,
+                                           SEV_MEDIUM, SEV_LOW, SEV_INFO)
+                                 if sev_count[s])
+            print(f"  [+] No exploitable findings. Informational: {counts_s}")
+
     def run_email(self, email: str):
         """Breach database check for email."""
         print(f"  [*] Checking: {email[:3]}***@***")

