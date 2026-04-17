@@ -1160,17 +1160,28 @@ class AuditTrail:
             return list(self._alerts)
 
     def get_stats(self) -> dict:
-        """Return summary statistics for the session."""
+        """Return summary statistics for the session.
+
+        Counts both the legacy 'execute' action (log_execution) and
+        the StepExecutor's 'exploit_step' action (used for every HTTP
+        step in the smart walkthrough). Without that, every stat that
+        the session-end banner prints — executions, successes,
+        failures — read as 0 even after dozens of real steps had run.
+        """
+        exec_actions = {"execute", "exploit_step"}
         with self._lock:
             total = len(self._entries)
-            executions = sum(1 for e in self._entries if e["action"] == "execute")
+            executions = sum(1 for e in self._entries
+                             if e["action"] in exec_actions)
             skips = sum(1 for e in self._entries if e["action"] == "skip")
             files = sum(1 for e in self._entries if e["action"] == "file_generated")
             edits = sum(1 for e in self._entries if e["action"] == "edit_run")
             successes = sum(1 for e in self._entries
-                           if e["action"] == "execute" and e.get("success") is True)
+                           if e["action"] in exec_actions
+                           and e.get("success") is True)
             failures = sum(1 for e in self._entries
-                           if e["action"] == "execute" and e.get("success") is False)
+                           if e["action"] in exec_actions
+                           and e.get("success") is False)
             vuln_types = set(e["vuln_type"] for e in self._entries if e["vuln_type"])
             alert_count = len(self._alerts)
 
