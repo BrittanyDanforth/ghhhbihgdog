@@ -28,6 +28,7 @@ import argparse, json, math, os, re, requests, secrets, sys, time, subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional, Tuple
+from urllib.parse import urlparse
 
 # Ensure gs_common is found when run from any working directory
 _CORE_DIR = str(Path(__file__).resolve().parent)
@@ -2260,9 +2261,13 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal, rpc):
 
         # Clean Monero RPC/CLI logs if present — these record every RPC call
         # including the distinctive API sequence of this toolkit.
+        # Search both CWD and toolkit root, since the wallet-rpc may have been
+        # launched from either and writes its log relative to its CWD.
         for _monero_log in [
             Path("monero-wallet-rpc.log"),
             Path("monero-wallet-cli.log"),
+            TOOLKIT_ROOT / "monero-wallet-rpc.log",
+            TOOLKIT_ROOT / "monero-wallet-cli.log",
             Path.home() / "monero-wallet-rpc.log",
             Path.home() / "monero-wallet-cli.log",
         ]:
