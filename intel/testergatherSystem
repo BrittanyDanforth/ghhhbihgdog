@@ -3484,12 +3484,21 @@ class VulnScanner:
                 return True
             return False
 
+        # Inline progress for a long probe list. Without this the
+        # operator stares at a blank terminal for minutes while the
+        # scan churns through 90 HEAD requests.
+        _last_progress = 0
         for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
                 break
             if self._session.is_domain_blocked(domain):
                 skipped = total - idx
                 break
+
+            # Tick progress every 15 probes.
+            if idx - _last_progress >= 15:
+                print(f" [{idx}/{total}]", end="", flush=True)
+                _last_progress = idx
 
             url = urljoin(base_url, path)
             resp = self._session.get(url, allow_wayback=False, method="HEAD")
@@ -6147,14 +6156,20 @@ class IntelScraper:
         # ── Fetch first-party JS bundles and scan for secrets ───────
         # Front-end bundles routinely embed API keys, JWT fragments,
         # internal API paths, and debug URLs that never appear in the
-        # HTML. We fetch up to 6 same-origin .js files (capped at
-        # 256 KB each), extract the same patterns, and report any
-        # hits as 'js_secrets'.
+        # HTML. We fetch up to _JS_MAX_FILES same-origin JS files
+        # (capped at _JS_PER_FILE_CAP each, total budget
+        # _JS_TOTAL_CAP) and extract the same patterns the HTML went
+        # through. Caps are enforced so we don't spend 10 minutes
+        # downloading 2 MB bundles on a big SPA.
+        _JS_MAX_FILES = 6
+        _JS_PER_FILE_CAP = 256 * 1024          # 256 KB per bundle
+        _JS_TOTAL_CAP = 1_200_000              # ~1.2 MB session-wide
         js_secrets: Dict[str, List[str]] = {}
         js_urls_fetched: List[str] = []
+        js_bytes_fetched = 0
         if HAS_BS4:
             try:
-                base_host = urlparse(url).netloc
+                base_host = urlparse(url).netloc.lower()
                 soup2 = BeautifulSoup(content[:200000], "html.parser")
                 js_candidates: List[str] = []
                 for s in soup2.find_all("script", src=True):
@@ -6162,28 +6177,38 @@ class IntelScraper:
                     if not src or src.startswith(("data:", "#", "javascript:")):
                         continue
                     full = urljoin(url, src)
-                    if not full.lower().endswith((".js", ".mjs")):
-                        # Some bundlers serve /static/main.<hash> without .js
-                        if ".js?" not in full.lower():
-                            continue
-                    if urlparse(full).netloc != base_host:
-                        continue  # skip CDN-hosted third-party JS
+                    # Must look JS-like. Allow .js / .mjs / .cjs plus
+                    # extensionless bundler outputs that carry a
+                    # cache-busting query (/static/main.<hash>?v=...).
+                    low_full = full.lower()
+                    if not (low_full.endswith((".js", ".mjs", ".cjs"))
+                            or ".js?" in low_full
+                            or ".mjs?" in low_full):
+                        continue
+                    # Strict same-origin — netloc exact match OR a
+                    # subdomain of base_host. Skips CDN-hosted libs.
+                    jp_netloc = urlparse(full).netloc.lower()
+                    if jp_netloc != base_host and not jp_netloc.endswith(
+                        "." + base_host,
+                    ):
+                        continue
                     if full not in js_candidates:
                         js_candidates.append(full)
                 # Cap + fetch
-                for js_url in js_candidates[:6]:
+                for js_url in js_candidates[:_JS_MAX_FILES]:
                     if shutdown_requested():
+                        break
+                    if js_bytes_fetched >= _JS_TOTAL_CAP:
                         break
                     js_resp = self._session.get(js_url, allow_wayback=False)
                     if not js_resp or js_resp.status_code != 200:
                         continue
-                    js_body = js_resp.text[:256 * 1024] if js_resp.text else ""
+                    js_body = js_resp.text[:_JS_PER_FILE_CAP] if js_resp.text else ""
                     if not js_body:
                         continue
+                    js_bytes_fetched += len(js_body)
                     js_urls_fetched.append(js_url)
                     hits = self._extractor.extract_all(js_body)
-                    # Merge into cumulative js_secrets dict (set-semantics
-                    # is what the extractor returns as values).
                     for k, v_list in hits.items():
                         if not v_list:
                             continue
@@ -6191,24 +6216,21 @@ class IntelScraper:
                         for val in v_list:
                             if val not in bucket:
                                 bucket.append(val)
-                    # Also check for sourcemap pointer: /*# sourceMappingURL=... */
+                    # Source-map pointer in the tail of the bundle.
                     m = re.search(
                         r"[#@]\s*sourceMappingURL\s*=\s*(\S+)",
                         js_body[-4096:],
                     )
                     if m:
                         map_url = urljoin(js_url, m.group(1))
-                        if urlparse(map_url).netloc == base_host:
+                        mp_netloc = urlparse(map_url).netloc.lower()
+                        if (mp_netloc == base_host or
+                                mp_netloc.endswith("." + base_host)):
                             try:
                                 sm_resp = self._session.get(
                                     map_url, allow_wayback=False,
                                 )
                                 if sm_resp and sm_resp.status_code == 200 and sm_resp.text:
-                                    # Source maps leak the original source
-                                    # paths in "sources": [...]. We flag
-                                    # the fact they're accessible as a
-                                    # finding by storing it in js_secrets
-                                    # under a dedicated key.
                                     js_secrets.setdefault(
                                         "sourcemap_exposed", [],
                                     ).append(map_url)
