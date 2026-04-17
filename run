@@ -282,6 +282,53 @@ def _subst_attacker(content: str, attacker_url: str,
     return content
 
 
+_CALLBACK_PLACEHOLDERS = (
+    "[ATTACKER]/c", "[ATTACKER]/x", "[ATTACKER]/k",
+    "[ATTACKER]/s", "[ATTACKER]/b",
+    "[C_URL]", "[X_URL]", "[K_URL]", "[S_URL]", "[B_URL]",
+)
+
+
+def _step_needs_callback(step: dict) -> bool:
+    """Return True if a walkthrough step is *only* meaningful when the
+    attacker callback server is reachable from the victim (i.e. not
+    loopback-only). Scans the step's payload / request URL / params /
+    data / extra_headers for any of the [ATTACKER]/<kind> or [?_URL]
+    placeholders."""
+    blob_parts: List[str] = []
+    req = step.get("request") or {}
+    for key in ("url", "data"):
+        val = req.get(key)
+        if isinstance(val, str):
+            blob_parts.append(val)
+    for collection_key in ("params", "extra_headers", "headers"):
+        collection = req.get(collection_key)
+        if isinstance(collection, dict):
+            for v in collection.values():
+                if isinstance(v, str):
+                    blob_parts.append(v)
+    gen = step.get("generate_file") or {}
+    if isinstance(gen.get("content"), str):
+        blob_parts.append(gen["content"])
+    blob = "\n".join(blob_parts)
+    return any(ph in blob for ph in _CALLBACK_PLACEHOLDERS)
+
+
+def _attacker_url_is_loopback(attacker_url: str) -> bool:
+    """True when the attacker base resolves to 127.0.0.1/localhost/::1.
+    Victims on the real internet can't reach any of those, so steps that
+    rely on [ATTACKER]/... callbacks are guaranteed to produce zero
+    evidence and should be warned about."""
+    if not attacker_url:
+        return True
+    try:
+        host = urlparse(attacker_url).hostname or ""
+    except Exception:
+        host = ""
+    host = host.lower()
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "")
+
+
 def _jittered_delay(lo: float = 1.0, hi: float = 4.0) -> None:
     """Sleep a jittered duration with wide enough range to avoid fingerprinting."""
     if hi <= lo:
@@ -2948,13 +2995,28 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     info(f"Callback /c:      {callback_urls['c']}")
     info(f"Callback /x:      {callback_urls['x']}")
     info(f"Beacon   /b:      {callback_urls['b']}")
+
+    # Heads-up if the attacker base is loopback-only. Anything that relies
+    # on [ATTACKER]/... callbacks (stored XSS payloads, cookie-exfil,
+    # CSRF confirmations, CRLF Location-override probes) will produce
+    # ZERO evidence in this mode because victims on the real internet
+    # cannot hit 127.0.0.1. Steps marked callback-dependent will be
+    # flagged in the per-step prompt so the operator is never silently
+    # running a useless payload.
+    infra_is_loopback = _attacker_url_is_loopback(attacker_url)
+    if infra_is_loopback:
+        warn("Loopback-only mode: callbacks to [ATTACKER]/... only arrive "
+             "if the victim's browser is on THIS host. Stored XSS / "
+             "cookie-exfil / CSRF confirm / CRLF-Location probes will "
+             "be auto-skipped unless you force-run them.")
     print()
 
     # ── Pre-generate all exploit files upfront ──
     if preset["auto_files"]:
         _pre_generate_all_files(exploitable, base_url, _sp, attacker_url,
                                 file_mgr, server, audit,
-                                callback_urls=callback_urls)
+                                callback_urls=callback_urls,
+                                infra_is_loopback=infra_is_loopback)
 
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     exploitable.sort(key=lambda v: sev_order.get(v.get("severity", ""), 5))
@@ -3030,7 +3092,8 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         quit_requested = _run_steps_smart(
             steps, etype, test_url, vi, executor, file_mgr,
             server, audit, chain_data, attacker_url, preset, auto_mode,
-            callback_urls=callback_urls)
+            callback_urls=callback_urls,
+            infra_is_loopback=infra_is_loopback)
 
         if quit_requested:
             break
@@ -3052,15 +3115,21 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
                             file_mgr, server, audit,
-                            callback_urls: Optional[dict] = None):
+                            callback_urls: Optional[dict] = None,
+                            infra_is_loopback: bool = False):
     """Pre-generate all exploit HTML files at session start.
 
     This creates every file upfront so they're ready to use/serve
     when the user reaches that step. Files are tracked and served
-    via ExploitServer automatically.
+    via ExploitServer automatically. When the attacker base is
+    loopback-only we still generate the files (operator might use
+    them in a local lab browser), but we stamp them with a big
+    visible notice so nobody mistakes the absence of captures for
+    target immunity.
     """
     heading("Pre-generating Exploit Files")
     count = 0
+    skipped_callback = 0
     for v in exploitable:
         ei = v.get("exploit_info", {})
         etype = ei.get("type", "unknown")
@@ -3071,6 +3140,9 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
         steps = _build_exploit_steps(etype, param, ei, test_url, base_url, sp)
         for step in steps:
             if not step.get("generate_file"):
+                continue
+            if infra_is_loopback and _step_needs_callback(step):
+                skipped_callback += 1
                 continue
             finfo = step["generate_file"]
             content = finfo["content"]
@@ -3091,6 +3163,10 @@ def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
         ok(f"Pre-generated {count} exploit file(s) — all served on :{server.port}")
     else:
         info("No file-generation steps found in current findings.")
+    if skipped_callback > 0:
+        warn(f"Skipped pre-generation of {skipped_callback} callback-"
+             "dependent file(s) because the attacker base is loopback-"
+             "only. Re-run with 'onion' or 'custom' mode to enable.")
     print()
 
 
@@ -3100,7 +3176,8 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                      server: ExploitServer, audit: AuditTrail,
                      chain_data: dict, attacker_url: str,
                      preset: dict, auto_mode: bool,
-                     callback_urls: Optional[dict] = None) -> bool:
+                     callback_urls: Optional[dict] = None,
+                     infra_is_loopback: bool = False) -> bool:
     """Smart step execution — user controls each step but output chains.
     Returns True if user requested quit (q).
 
@@ -3134,6 +3211,30 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             audit.log_skip(f"preset_block:{step_title}", etype)
             step_idx += 1
             continue
+
+        # Skip callback-dependent steps when the attacker base is
+        # loopback-only. In non-auto mode we prompt so the operator
+        # can still force-run for lab validation; in auto mode we skip
+        # silently (but still log) to avoid chewing through victim
+        # rate-limits on probes that can never return evidence.
+        if infra_is_loopback and _step_needs_callback(step):
+            if auto_mode:
+                print(f"  {D}[SKIP {step_num}/{len(steps)}] {step_title} "
+                      f"(needs reachable attacker URL; loopback-only){N}")
+                audit.log_skip(f"loopback_callback:{step_title}", etype)
+                step_idx += 1
+                continue
+            print(f"  {Y}[CALLBACK-DEPENDENT {step_num}/{len(steps)}]{N} "
+                  f"{B}{step_title}{N}")
+            warn("This step relies on the victim hitting [ATTACKER]/... "
+                 "but your attacker base is loopback-only. Unless the "
+                 "victim browser runs on THIS host, you will see zero "
+                 "captures.")
+            _force = prompt("Run anyway? y/N", "n").strip().lower()
+            if _force not in ("y", "yes"):
+                audit.log_skip(f"loopback_callback:{step_title}", etype)
+                step_idx += 1
+                continue
 
         # ── File-generation steps: already pre-generated ──
         if step.get("generate_file"):
