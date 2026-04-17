@@ -747,19 +747,27 @@ def validate_wallet_json(data: dict) -> None:
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
     """Return True if resources are OK. False if system is stressed.
 
+    Disk checks are run against the toolkit's own directory (the one that
+    actually holds tx_staging/, unsigned/, progress JSON, etc.), not the
+    process CWD. That matters when someone launches ./gs from $HOME while
+    the toolkit lives on a different mount — a CWD-based check could
+    happily return True against a large /home while the toolkit mount is
+    too small to hold intermediate artifacts.
+
     Falls back to os.statvfs for disk check if psutil is unavailable.
     If neither psutil nor statvfs works, returns False (fail closed)
     because we cannot verify system health.
     """
+    _target = str(TOOLKIT_ROOT) if TOOLKIT_ROOT.exists() else "."
     try:
         import psutil
         mem = psutil.virtual_memory()
-        disk = psutil.disk_usage(".")
+        disk = psutil.disk_usage(_target)
         return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
     except ImportError:
         pass
     try:
-        st = os.statvfs(".")
+        st = os.statvfs(_target)
         free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
         return free_gb >= min_disk_gb
     except (OSError, AttributeError):

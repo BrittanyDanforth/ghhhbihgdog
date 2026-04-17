@@ -3496,11 +3496,20 @@ class BreachChecker:
         return None
 
     def check_dehashed(self, email: str) -> Optional[dict]:
+        # DeHashed's /search endpoint requires HTTP Basic auth with the
+        # account email as the username and the API key as the password.
+        # Without this, every request comes back 401 and the check is a
+        # silent no-op. Both values are read from DEHASHED_EMAIL /
+        # DEHASHED_KEY at module load.
         if not DEHASHED_API_KEY or not DEHASHED_EMAIL:
             return None
         url = f"https://api.dehashed.com/search?query=email:{quote(email)}"
-        resp = self._session.get(url, allow_wayback=False,
-                                 headers={"Accept": "application/json"})
+        resp = self._session.get(
+            url,
+            allow_wayback=False,
+            headers={"Accept": "application/json"},
+            auth=(DEHASHED_EMAIL, DEHASHED_API_KEY),
+        )
         if resp and resp.status_code == 200:
             try:
                 data = resp.json()
