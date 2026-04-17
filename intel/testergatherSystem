@@ -2907,7 +2907,12 @@ class VulnScanner:
             opt_resp = self._session._session.options(base_url, timeout=REQUEST_TIMEOUT,
                                                        proxies=self._session._proxy,
                                                        headers=_pick_profile())
-            if opt_resp and opt_resp.status_code == 200:
+            # Servers commonly advertise Allow: from OPTIONS with status
+            # 200 OR 204 (No Content). requiring 200 specifically misses
+            # every correctly-implemented RFC-7231 server that returns
+            # 204. Look at Allow whenever the response exists and the
+            # status isn't a hard error.
+            if opt_resp and opt_resp.status_code < 400:
                 allow = opt_resp.headers.get("Allow", "")
                 if allow:
                     dangerous = {"PUT", "DELETE", "TRACE", "PATCH"}

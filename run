@@ -4150,22 +4150,45 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                           "validate": _ssrf_check, "note": f"Internal service: {name}"})
 
     elif etype == "ssti":
+        # Use per-session arithmetic markers so a response containing a
+        # literal '49' (phone number, timestamp, ID) doesn't get
+        # flagged as template evaluation. The raw expression must NOT
+        # appear in the response body (that would mean the server just
+        # echoed our input) AND the computed result MUST appear.
+        _ssti_a = secrets.randbelow(60) + 20   # 20..79
+        _ssti_b = secrets.randbelow(60) + 20
+        _ssti_expected = str(_ssti_a * _ssti_b)   # 400..6241, distinctive
+        _ssti_raw = f"{_ssti_a}*{_ssti_b}"
+
         def _ssti_check(r: ExploitResult):
-            if "49" in r.response_body:
-                r.success = True
-                r.confidence = 0.9
-                r.evidence = "49 found — template expression evaluated"
-                r.false_positive_risk = "low"
-            elif _re.search(r"uid=\d+", r.response_body):
+            body = r.response_body
+            if _re.search(r"uid=\d+", body):
                 r.success = True
                 r.confidence = 0.95
                 r.evidence = "OS command output in template response"
                 r.false_positive_risk = "very_low"
+                return
+            # Require the expected numeric result to appear, and the raw
+            # expression to NOT appear (otherwise the server just echoed
+            # the input).
+            if _ssti_expected in body and _ssti_raw not in body:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = (f"Template expression evaluated: "
+                              f"{_ssti_a}*{_ssti_b}={_ssti_expected}")
+                r.false_positive_risk = "low"
+            elif _ssti_raw in body:
+                r.confidence = 0.25
+                r.evidence = "Expression echoed — likely just reflection"
+                r.false_positive_risk = "high"
 
         ssti_payloads = [
-            ("Jinja2/Twig (7*7)", "{{7*7}}"),
-            ("Freemarker/Velocity", "${7*7}"),
-            ("ERB/EJS", "<%= 7*7 %>"),
+            (f"Jinja2/Twig ({_ssti_a}*{_ssti_b})",
+             f"{{{{{_ssti_a}*{_ssti_b}}}}}"),
+            (f"Freemarker/Velocity ({_ssti_a}*{_ssti_b})",
+             f"${{{_ssti_a}*{_ssti_b}}}"),
+            (f"ERB/EJS ({_ssti_a}*{_ssti_b})",
+             f"<%= {_ssti_a}*{_ssti_b} %>"),
         ]
         steps = []
         for name, payload in ssti_payloads:
@@ -4173,7 +4196,9 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 "title": f"Test {name}",
                 "request": _get_param(payload),
                 "validate": _ssti_check,
-                "note": f"49 in response = {name} engine confirmed",
+                "note": (f"{_ssti_expected} in response (without the raw "
+                         f"'{_ssti_raw}' expression) = {name} engine "
+                         f"confirmed"),
             })
         steps.extend([
             {"title": "Jinja2 RCE: read /etc/passwd",
