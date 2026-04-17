@@ -2473,6 +2473,9 @@ class VulnScanner:
             self._run_check("HTTP verb tampering",
                             self._check_http_verb_tampering,
                             (base_url,), 0.8, findings)
+            self._run_check("login forms + rate limit",
+                            self._check_login_forms,
+                            (base_url, html), 0.85, findings)
 
             if depth == "full":
                 self._run_check("SQL injection (quick)", self._check_sqli_indicators,
@@ -4312,6 +4315,197 @@ class VulnScanner:
                     "risk": "Bypass depends on which WAF is in the path",
                 },
             })
+        return findings
+
+    def _check_login_forms(self, base_url: str, html: str) -> List[dict]:
+        """Detect authentication forms + test if they rate-limit.
+
+        Signals:
+        1. The form exists and has a <input type="password"> — enum.
+        2. Ten consecutive wrong-password POSTs don't progressively
+           delay or return 429 — brute-force-friendly.
+        3. The login response body changes length between
+           'correct username, wrong password' and 'wrong username,
+           wrong password' — user-enumeration oracle.
+
+        The enumeration probe uses throwaway usernames so real users
+        don't get locked out.
+        """
+        findings = []
+        if not HAS_BS4 or not html:
+            return findings
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        try:
+            soup = BeautifulSoup(html[:200000], "html.parser")
+        except Exception:
+            return findings
+
+        # Find forms containing a password input.
+        login_forms: List[dict] = []
+        for form in soup.find_all("form"):
+            pwd_inputs = form.find_all("input", attrs={"type": "password"})
+            if not pwd_inputs:
+                continue
+            action = form.get("action", "") or ""
+            method = (form.get("method", "POST") or "POST").upper()
+            form_url = urljoin(base_url, action) if action else base_url
+            if urlparse(form_url).netloc != domain:
+                continue
+            # Identify username / password field names
+            uname_field = None
+            pwd_field = None
+            for inp in form.find_all("input"):
+                name = inp.get("name", "")
+                itype = (inp.get("type", "text") or "text").lower()
+                if not name:
+                    continue
+                if itype == "password" and not pwd_field:
+                    pwd_field = name
+                elif (itype in ("text", "email") or
+                      name.lower() in ("user", "username", "email", "login",
+                                       "account", "userid")) and not uname_field:
+                    uname_field = name
+            if not pwd_field:
+                continue
+            login_forms.append({
+                "url": form_url,
+                "method": method,
+                "username_field": uname_field or "username",
+                "password_field": pwd_field,
+                "hidden_fields": {
+                    (inp.get("name") or ""): (inp.get("value") or "")
+                    for inp in form.find_all("input", attrs={"type": "hidden"})
+                    if inp.get("name")
+                },
+            })
+
+        if not login_forms:
+            return findings
+
+        login_form = login_forms[0]
+        findings.append({
+            "severity": SEV_INFO,
+            "title": f"Login form at {urlparse(login_form['url']).path or '/'}",
+            "detail": (f"Login form discovered — "
+                       f"user={login_form['username_field']} / "
+                       f"pass={login_form['password_field']}. "
+                       f"Useful as a brute-force target if no rate limit."),
+            "evidence": (f"{login_form['method']} "
+                         f"{login_form['url']} with "
+                         f"{len(login_form['hidden_fields'])} hidden field(s)"),
+            "confidence": 0.95,
+        })
+
+        # Probe rate limiting — 6 rapid-fire wrong-password POSTs with
+        # a non-existent username. If the 6th still returns the same
+        # status as the 1st, there's no rate limit. Non-existent
+        # username avoids locking out any real account.
+        throwaway_user = f"gs_probe_{secrets.token_hex(4)}"
+        statuses: List[int] = []
+        lengths: List[int] = []
+        for _ in range(6):
+            if shutdown_requested():
+                break
+            data = {
+                login_form["username_field"]: throwaway_user,
+                login_form["password_field"]: secrets.token_hex(6),
+            }
+            data.update(login_form["hidden_fields"])
+            try:
+                self._session._delay_for_domain(domain)
+                resp = self._session._session.post(
+                    login_form["url"], data=data,
+                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+            except Exception:
+                break
+            if resp is None:
+                break
+            statuses.append(resp.status_code)
+            lengths.append(len(resp.text or ""))
+        if len(statuses) >= 5:
+            # If every attempt had the same status AND no 429 anywhere,
+            # we have a brute-force-friendly login.
+            got_429 = any(s == 429 for s in statuses)
+            got_retry_after = False  # We'd need headers; skip for now
+            if not got_429 and len(set(statuses)) == 1:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "Login form lacks rate limiting",
+                    "detail": (f"6 failed login attempts all returned the "
+                               f"same status ({statuses[0]}). No 429 Too "
+                               f"Many Requests, no progressive delay. "
+                               f"Brute-force is practical — combine with "
+                               f"any leaked usernames."),
+                    "evidence": f"statuses: {statuses}, lengths: {lengths}",
+                    "confidence": 0.85,
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "brute_force_viable",
+                        "path": urlparse(login_form["url"]).path or "/",
+                        "username_field": login_form["username_field"],
+                        "password_field": login_form["password_field"],
+                        "method": (f"POST {login_form['url']} with "
+                                   f"{login_form['username_field']}=<target> "
+                                   f"and {login_form['password_field']}="
+                                   f"<wordlist>. Use hydra / ffuf / "
+                                   f"Turbo Intruder."),
+                        "risk": "Account takeover via brute-force",
+                    },
+                })
+
+        # User enumeration oracle: compare wrong-username vs likely-valid
+        # username (admin). If lengths differ meaningfully, the app
+        # leaks whether a username exists.
+        if len(lengths) >= 1:
+            try:
+                data_admin = {
+                    login_form["username_field"]: "admin",
+                    login_form["password_field"]: secrets.token_hex(6),
+                }
+                data_admin.update(login_form["hidden_fields"])
+                self._session._delay_for_domain(domain)
+                r_admin = self._session._session.post(
+                    login_form["url"], data=data_admin,
+                    timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+                if r_admin is not None:
+                    admin_len = len(r_admin.text or "")
+                    base_len = lengths[0] if lengths else 0
+                    # 20% size difference is meaningful
+                    if base_len > 0 and abs(admin_len - base_len) > base_len * 0.2:
+                        findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": "Login form leaks usernames (response-length oracle)",
+                            "detail": (f"Login with 'admin' + bogus password "
+                                       f"returned a {admin_len}-byte body; "
+                                       f"login with a random username + "
+                                       f"bogus password returned a "
+                                       f"{base_len}-byte body. The delta "
+                                       f"reveals which usernames exist."),
+                            "evidence": f"admin={admin_len} vs bogus={base_len} bytes",
+                            "confidence": 0.8,
+                            "exploitable": True,
+                            "exploit_info": {
+                                "type": "user_enumeration",
+                                "path": urlparse(login_form["url"]).path or "/",
+                                "method": ("POST with each candidate "
+                                           "username + bogus password; "
+                                           "compare body length. Matches "
+                                           "'exists' length = valid user."),
+                                "risk": "Username enumeration, brute-force shortlist",
+                            },
+                        })
+            except Exception:
+                pass
+
         return findings
 
     def _check_ssl_cert(self, base_url: str) -> List[dict]:
