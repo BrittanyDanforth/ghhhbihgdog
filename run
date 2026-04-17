@@ -2368,7 +2368,10 @@ def flow_exit_planner(detected_port=None):
         err(f"Unknown method: {method}")
         return
     args = [amt, "--method", method, "--tor-proxy", tor]
-    run_script(CORE / "exit_strategy_planner", args, "Exit planner")
+    if run_script(CORE / "exit_strategy_planner", args, "Exit planner"):
+        ok("Exit plan generated.")
+    else:
+        err("Exit planning failed — see output above.")
 
 
 def _detect_iface() -> str:
@@ -2433,10 +2436,14 @@ def flow_testnet(detected_port=None):
         wf = prompt("Wallet JSON (or press Enter to create one)", str(wallet_files[0]))
     else:
         info("No wallet found — creating one first...")
-        run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor], "Wallet creator")
+        if not run_script(CORE / "create_receive_wallet",
+                           ["--rpc", rpc, "--tor-proxy", tor],
+                           "Wallet creator"):
+            err("Wallet creator failed — cannot continue dry run.")
+            return
         wallet_files = _find_wallet_files()
         if not wallet_files:
-            err("Failed to create wallet")
+            err("Wallet creator ran but no wallet_*.json was produced.")
             return
         wf = str(wallet_files[0])
 

@@ -746,6 +746,7 @@ def main():
     print("  [!] unset any sensitive env vars manually, then clear shell history.")
 
     print("  [*] Phase 13: Monero daemon/wallet logs")
+    _toolkit_root_for_monero = Path(__file__).resolve().parent.parent
     _monero_log_paths = [
         Path.home() / ".bitmonero" / "bitmonero.log",
         Path.home() / ".bitmonero" / "testnet" / "bitmonero.log",
@@ -754,24 +755,43 @@ def main():
         Path.home() / "monero-wallet-cli.log",
         Path("monero-wallet-rpc.log"),
         Path("monero-wallet-cli.log"),
+        _toolkit_root_for_monero / "monero-wallet-rpc.log",
+        _toolkit_root_for_monero / "monero-wallet-cli.log",
     ]
     _monero_log_count = 0
+    _seen_paths = set()
     for _ml in _monero_log_paths:
+        try:
+            _ml_key = _ml.resolve()
+        except OSError:
+            _ml_key = _ml
+        if _ml_key in _seen_paths:
+            continue
         if _ml.exists():
+            _seen_paths.add(_ml_key)
             if args.dry_run:
                 print(f"  [dry] would securely delete {_ml}")
             else:
                 _secure_delete_file(_ml)
             _monero_log_count += 1
-    for _ml_glob_dir in [Path.home(), Path.home() / ".bitmonero", Path(".")]:
+    for _ml_glob_dir in [Path.home(), Path.home() / ".bitmonero",
+                         Path("."), _toolkit_root_for_monero]:
         if _ml_glob_dir.is_dir():
             for _ml_glob in _ml_glob_dir.glob("monero*.log"):
-                if _ml_glob.is_file():
-                    if args.dry_run:
-                        print(f"  [dry] would securely delete {_ml_glob}")
-                    else:
-                        _secure_delete_file(_ml_glob)
-                    _monero_log_count += 1
+                if not _ml_glob.is_file():
+                    continue
+                try:
+                    _g_key = _ml_glob.resolve()
+                except OSError:
+                    _g_key = _ml_glob
+                if _g_key in _seen_paths:
+                    continue
+                _seen_paths.add(_g_key)
+                if args.dry_run:
+                    print(f"  [dry] would securely delete {_ml_glob}")
+                else:
+                    _secure_delete_file(_ml_glob)
+                _monero_log_count += 1
     if _monero_log_count:
         print(f"  [+] {'Would delete' if args.dry_run else 'Deleted'} {_monero_log_count} Monero log(s)")
     else:
