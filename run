@@ -200,6 +200,13 @@ _SECRETS_TO_STRIP = (
     "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "SSH_AUTH_SOCK",
     "GPG_AGENT_INFO", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 )
+# TOR_CONTROL_PASSWORD is intentionally NOT in _SECRETS_TO_STRIP.
+# Every child script's newnym() call reads it from os.environ to
+# authenticate against the Tor control port — stripping it would
+# silently break circuit rotation on every single mixer / swap /
+# broadcast / intel run. If an operator has TOR_CONTROL_PASSWORD set
+# at all, they've already accepted that any descendant process sees
+# it. paranoia_mode wipes it from the parent env at end-of-session.
 
 
 def _sanitized_env(extra_strip: tuple = (), keep: tuple = ()) -> dict:
@@ -2766,10 +2773,40 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             ok(f"Hidden service: {onion_host}")
             audit.log("hs_start", onion_host, risk=AuditTrail.RISK_MEDIUM)
         else:
-            warn("Hidden service setup failed (is tor ControlPort open with "
-                 "CookieAuth or HashedControlPassword?). Falling back to local.")
-            info("For real victims: expose the port through your own tunnel.")
-            infra_mode = "local"
+            # Silent fallback to 'local' mode would render every
+            # exploit payload unreachable — victims on the real
+            # internet can't hit 127.0.0.1. Previously the operator
+            # would learn this only when captures never arrived. Make
+            # them consciously opt out of onion mode.
+            err("Hidden service setup FAILED. Likely reasons:")
+            err("  * Tor ControlPort not open (add 'ControlPort 9051'")
+            err("    to /etc/tor/torrc and restart tor)")
+            err("  * Neither CookieAuthentication nor HashedControlPassword")
+            err("    is configured (add 'CookieAuthentication 1' to torrc,")
+            err("    or set TOR_CONTROL_PASSWORD env before launching).")
+            err("  * stem python package not importable under this venv.")
+            err("")
+            err("Without an onion, victims on the real internet cannot")
+            err("reach your callback server. You have three options:")
+            err("  1. abort this walkthrough, fix the Tor control port,")
+            err("     and retry with 'onion' again")
+            err("  2. fall back to 'local' (loopback only — LAB USE ONLY)")
+            err("  3. fall back to 'custom' (you'll be prompted for a")
+            err("     reachable URL that proxies to the local server)")
+            _choice = prompt("Choose 1/2/3 (default: 1 = abort)", "1").strip()
+            if _choice == "2":
+                warn("Continuing in 'local' mode — callbacks WILL NOT "
+                     "be received from real targets.")
+                infra_mode = "local"
+            elif _choice == "3":
+                info("Switching to 'custom' mode.")
+                infra_mode = "custom"
+            else:
+                audit.log("hs_setup_failed_abort",
+                          "operator aborted after onion failure",
+                          risk=AuditTrail.RISK_MEDIUM)
+                err("Aborting walkthrough.")
+                return client, executor
 
     if infra_mode == "local":
         attacker_url = f"http://127.0.0.1:{local_port}"
