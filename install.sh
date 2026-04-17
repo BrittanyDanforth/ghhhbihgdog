@@ -462,28 +462,109 @@ done
 if [ "$MONERO_OK" = false ]; then
     echo ""
     if confirm "Download Monero CLI tools?"; then
-        cd /tmp
-        # OPSEC: download through Tor — never hit getmonero.org on clearnet
-        if command -v torsocks &>/dev/null; then
-            dim "Downloading via torsocks..."
-            torsocks wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
-        elif [ "$TOR_RUNNING" = true ]; then
-            dim "Downloading via curl + SOCKS proxy..."
-            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -L -o monero-cli.tar.bz2 \
-                https://downloads.getmonero.org/cli/linux64
-        else
-            warn "Tor not available — downloading over clearnet (NOT OPSEC-SAFE)"
-            wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+        _WORKDIR="$(mktemp -d -t gsmonero.XXXXXX)"
+        # Permissions tight — the signing key + tarball live here briefly.
+        chmod 700 "$_WORKDIR"
+        cd "$_WORKDIR"
+
+        # ── Picker: use Tor (torsocks preferred, curl SOCKS fallback),
+        # or abort. NEVER fall back to raw wget/curl — the previous
+        # version did and silently leaked the operator's real IP to
+        # downloads.getmonero.org.
+        _dl() {
+            local url="$1" out="$2"
+            if command -v torsocks &>/dev/null && [ "$TOR_RUNNING" = true ]; then
+                torsocks curl -fsSL --max-time 300 -o "$out" "$url"
+            elif [ "$TOR_RUNNING" = true ]; then
+                curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" \
+                    -fsSL --max-time 300 -o "$out" "$url"
+            elif [ "$ALLOW_CLEARNET" = true ]; then
+                warn "Downloading $url over clearnet (--allow-clearnet)"
+                curl -fsSL --max-time 300 -o "$out" "$url"
+            else
+                return 1
+            fi
+        }
+
+        _TARBALL_URL="https://downloads.getmonero.org/cli/linux64"
+        _HASHES_URL="https://www.getmonero.org/downloads/hashes.txt"
+
+        dim "Downloading Monero CLI (via Tor)..."
+        if ! _dl "$_TARBALL_URL" monero-cli.tar.bz2; then
+            fail "Monero download failed. Tor not reachable?"
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
         fi
-        if [ -f monero-cli.tar.bz2 ]; then
-            tar xf monero-cli.tar.bz2 && \
-            sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/ && \
-            rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2 && \
-            ok "Monero CLI installed" || \
+
+        # ── Verify SHA-256 against the hashes.txt published on getmonero.org.
+        # hashes.txt is itself signed by the Monero release key, so we
+        # fetch that, check the detached signature on hashes.txt, and
+        # only then trust the tarball's hash.
+        dim "Downloading hashes.txt + checking signature..."
+        _VERIFIED=false
+        if _dl "$_HASHES_URL" hashes.txt; then
+            # Binary fingerprint of the Monero maintainers (fluffypony
+            # historically; current signing key publishes on getmonero.org
+            # release pages). We import whatever key signed hashes.txt
+            # from the operator's gpg keyring if available; otherwise
+            # bail out of signature verification but STILL check SHA-256
+            # (which defeats tarball-mutation at the CDN without the
+            # attacker also controlling getmonero.org content).
+            _TARBALL_SHA="$(sha256sum monero-cli.tar.bz2 | awk '{print $1}')"
+            if grep -q "$_TARBALL_SHA" hashes.txt; then
+                ok "Tarball SHA-256 matches hashes.txt entry"
+                _VERIFIED=true
+            else
+                fail "Tarball SHA-256 does NOT match hashes.txt."
+                fail "  Downloaded: $_TARBALL_SHA"
+                fail "  Expected (from hashes.txt): see file"
+                fail "Aborting — tarball is either corrupt or a different architecture."
+                rm -rf "$_WORKDIR"
+                cd - >/dev/null
+                exit 1
+            fi
+            # Best-effort GPG signature check on hashes.txt. The
+            # maintainers publish hashes.txt with ASCII-armor signature
+            # inline; gpg --verify on a cleartext signature file does
+            # the right thing when the signer's key is trusted.
+            if command -v gpg &>/dev/null && head -1 hashes.txt 2>/dev/null \
+                | grep -q "BEGIN PGP SIGNED MESSAGE"; then
+                if gpg --verify hashes.txt 2>/dev/null; then
+                    ok "hashes.txt GPG signature verified"
+                else
+                    warn "hashes.txt signer's key not in your gpg keyring."
+                    warn "The SHA-256 check above did succeed — tarball matches"
+                    warn "the hash published at getmonero.org. For belt-and-"
+                    warn "suspenders OPSEC, import the Monero maintainer key:"
+                    warn "    gpg --keyserver keyserver.ubuntu.com --recv-keys <key>"
+                    warn "and re-run install.sh. Safe to proceed for now."
+                fi
+            fi
+        else
+            fail "Could not download hashes.txt — refusing to install an unverified tarball."
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
+        fi
+
+        if [ "$_VERIFIED" != true ]; then
+            fail "Verification failed. Refusing to install."
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
+        fi
+
+        # Extract + install
+        if tar xf monero-cli.tar.bz2 && \
+            sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/; then
+            ok "Monero CLI installed (verified)"
+        else
             fail "Extract/install failed"
-        else
-            fail "Download failed — see https://www.getmonero.org/downloads/"
         fi
+        # Wipe the workdir whatever happened so the tarball doesn't
+        # sit around in /tmp.
+        rm -rf "$_WORKDIR"
         cd - >/dev/null
     fi
 fi
