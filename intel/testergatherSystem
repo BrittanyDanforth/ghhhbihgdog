@@ -6979,30 +6979,53 @@ class IntelOrchestrator:
                 self.run_query(line, 10)
 
     def _print_extraction(self, result: dict):
-        ex = result.get("extracted", {})
-        if ex:
-            print(f"  [+] Data extracted:")
-            # Show samples inline for the 'soft' categories (email,
-            # social handles, IPs) so the operator sees signal without
-            # having to open the encrypted report. Hide raw values for
-            # the 'sensitive' categories (keys/tokens/private) — they
-            # land in the report only.
-            _sensitive = {"aws_key", "github_token", "stripe_key",
-                          "jwt_token", "generic_secret"}
-            for etype, evals in ex.items():
+        _sensitive = {"aws_key", "github_token", "stripe_key",
+                      "jwt_token", "generic_secret"}
+
+        def _render_bucket(label: str, data: Dict[str, list],
+                           marker: str = "[+]") -> None:
+            if not data:
+                return
+            print(f"  {marker} {label}:")
+            for etype, evals in data.items():
                 if etype in _sensitive:
                     print(f"      {etype}: {len(evals)} found "
                           f"(values redacted — see report)")
+                    continue
+                if etype == "sourcemap_exposed":
+                    print(f"      source maps exposed: {len(evals)} "
+                          f"({evals[0][:60]}{'...' if len(evals) > 1 else ''})")
                     continue
                 sample = list(evals)[:3]
                 samp_str = ", ".join(str(s)[:40] for s in sample)
                 more = f" (+{len(evals)-3} more)" if len(evals) > 3 else ""
                 print(f"      {etype}: {len(evals)} found — {samp_str}{more}")
-        sc = result.get("secrets_in_comments", {})
-        if sc:
-            print(f"  [!] Secrets found in HTML comments:")
-            for stype, svals in sc.items():
-                print(f"      {stype}: {len(svals)}")
+
+        _render_bucket("Data extracted", result.get("extracted", {}))
+        _render_bucket("Secrets found in HTML comments",
+                       result.get("secrets_in_comments", {}),
+                       marker="[!]")
+        # JS bundle secrets get the [!] marker because an API key in a
+        # bundle is a CRITICAL in the vuln findings; calling it out here
+        # so the operator sees it without scrolling through the main
+        # vuln list.
+        js = result.get("js_secrets", {})
+        if js:
+            fetched = len(result.get("js_urls_fetched", []))
+            print(f"  [!] JS-bundle secrets (scanned {fetched} bundle(s)):")
+            for etype, evals in js.items():
+                if etype in _sensitive:
+                    print(f"      {etype}: {len(evals)} found "
+                          f"(values redacted — see report)")
+                    continue
+                if etype == "sourcemap_exposed":
+                    print(f"      source maps exposed: {len(evals)} "
+                          f"({evals[0][:60]}{'...' if len(evals) > 1 else ''})")
+                    continue
+                sample = list(evals)[:3]
+                samp_str = ", ".join(str(s)[:40] for s in sample)
+                more = f" (+{len(evals)-3} more)" if len(evals) > 3 else ""
+                print(f"      {etype}: {len(evals)} found — {samp_str}{more}")
 
     def _print_tech(self, tech: dict):
         if tech.get("server"):
@@ -7109,8 +7132,22 @@ class IntelOrchestrator:
         if not records:
             print(f"  [*] No DNS records found (DoH may be blocked)")
             return
-        for rtype, values in records.items():
-            print(f"  [+] {rtype}: {', '.join(values[:5])}")
+        # Sort key types so the printer shows A/AAAA/MX/NS first, then
+        # TXT (which often has SPF + DKIM + Google-site-verify mixed
+        # together), then CAA/DMARC/DNSKEY, then anything else.
+        order = {
+            "A": 0, "AAAA": 1, "CNAME": 2, "MX": 3, "NS": 4, "SOA": 5,
+            "TXT": 6, "DMARC": 7, "CAA": 8, "DNSKEY": 9,
+        }
+        for rtype in sorted(records, key=lambda r: order.get(r, 99)):
+            values = records[rtype]
+            if not values:
+                continue
+            # Trim per-value length so one pathological record doesn't
+            # blow out the line.
+            shown = [str(v)[:120] for v in values[:5]]
+            tail = f" (+{len(values) - 5} more)" if len(values) > 5 else ""
+            print(f"  [+] {rtype}: {', '.join(shown)}{tail}")
 
     def save_report(self) -> Optional[Path]:
         """Show results in terminal, then save report.
