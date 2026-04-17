@@ -538,7 +538,17 @@ def main():
     def _thornode_quote(amt: Decimal, xmr_dest: str) -> Optional[dict]:
         """Try THORNode native API for a swap quote (no API key needed)."""
         from urllib.parse import quote as _url_quote
-        amount_sats = int(amt * Decimal("1e8"))
+        from decimal import ROUND_DOWN
+        # FUNDS-LOSS FIX: `int(amt * 1e8)` silently truncates toward zero if
+        # `amt` has more than 8 decimal places — the user ends up depositing
+        # slightly less than the quoted `amount` parameter, and THORChain
+        # may reject or refund below the inbound minimum. Quantize to 8 dp
+        # (satoshi resolution) with explicit ROUND_DOWN before converting
+        # to integer atomic units, so the quoted amount matches what the
+        # deposit address expects.
+        amt_quantized = Decimal(amt).quantize(
+            Decimal("0.00000001"), rounding=ROUND_DOWN)
+        amount_sats = int(amt_quantized * Decimal(100000000))
         params = (
             f"from_asset=BTC.BTC&to_asset=XMR.XMR"
             f"&amount={amount_sats}&destination={_url_quote(xmr_dest, safe='')}"

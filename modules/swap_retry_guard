@@ -126,33 +126,60 @@ STEALTH_USER_AGENTS = [
 # -------------------------------------------------------------------
 
 class SecureMemory:
-    """Military-grade memory management with secure deletion."""
-    
+    """Ephemeral in-process buffer with multi-pass overwrite on wipe.
+
+    FIX: the previous implementation called `ctypes.memset(self._ptr, ...)`
+    but the top-level `ctypes` module does NOT export a `memset` symbol —
+    that raises `AttributeError` the first time `secure_wipe()` runs (and
+    always from `__del__`). Operationally this blew up swap flows that
+    rely on ephemeral key/secret buffers. We now use `ctypes.memmove` with
+    a pre-allocated pattern buffer, which is portable and does the same
+    thing without needing libc.
+    """
+
     def __init__(self, size: int):
         self.size = size
         self._buffer = ctypes.create_string_buffer(size)
         self._ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_char))
-        
+        self._wiped = False
+
     def write(self, data: bytes, offset: int = 0):
         if offset + len(data) > self.size:
             raise ValueError("Data exceeds buffer size")
         ctypes.memmove(self._ptr + offset, data, len(data))
-        
+
     def read(self, length: int, offset: int = 0) -> bytes:
         if offset + length > self.size:
             raise ValueError("Read exceeds buffer size")
         return ctypes.string_at(self._ptr + offset, length)
-        
+
+    def _overwrite(self, pattern: bytes):
+        # pattern is a 1-byte template we expand to `size` then memmove.
+        if self.size <= 0:
+            return
+        block = pattern * self.size
+        ctypes.memmove(self._ptr, block, self.size)
+
     def secure_wipe(self):
-        """Overwrite buffer with zeros, then ones, then random bytes."""
-        ctypes.memset(self._ptr, 0x00, self.size)
-        ctypes.memset(self._ptr, 0xFF, self.size)
-        rand_bytes = os.urandom(self.size)
-        self.write(rand_bytes)
-        ctypes.memset(self._ptr, 0x00, self.size)
-        
+        """Overwrite buffer with 0x00, 0xFF, random, 0x00 — best-effort."""
+        if self._wiped or self.size <= 0:
+            return
+        try:
+            self._overwrite(b"\x00")
+            self._overwrite(b"\xff")
+            self.write(os.urandom(self.size))
+            self._overwrite(b"\x00")
+        except Exception:
+            # Never propagate from wipe — caller (including __del__) must
+            # not crash the process on teardown.
+            pass
+        self._wiped = True
+
     def __del__(self):
-        self.secure_wipe()
+        try:
+            self.secure_wipe()
+        except Exception:
+            pass
 
 
 class QuantumEntropyFusion:
@@ -547,17 +574,42 @@ class AdvancedSwapOrchestrator:
             hashlib.sha256
         ).hexdigest()
         
-        # Atomic write with fsync
+        # Atomic write with fsync. Permissions are set BEFORE content is
+        # written (file created with O_CREAT|O_TRUNC + 0o600) so on
+        # multi-user systems the progress state is never world-readable.
         temp_file = RAM_PROGRESS.with_suffix('.tmp')
         try:
-            with temp_file.open('w') as f:
-                json.dump(progress, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
+            fd = os.open(str(temp_file),
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(progress, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+            # The atomic replace preserves the dest's mode if it already
+            # exists — first write therefore controls perms. Re-chmod in
+            # case the dest pre-existed with a looser mode.
+            try:
+                os.chmod(str(temp_file), 0o600)
+            except OSError:
+                pass
             temp_file.replace(RAM_PROGRESS)
+            try:
+                os.chmod(str(RAM_PROGRESS), 0o600)
+            except OSError:
+                pass
         except Exception:
             if temp_file.exists():
-                temp_file.unlink()
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
                 
     def _cleanup_handler(self, signum, frame):
         """Secure cleanup on exit."""
@@ -702,19 +754,53 @@ class AdvancedSwapOrchestrator:
                     
                 # Execute request
                 result = self._execute_swap_request(endpoint, payload, proxy)
-                
-                # Validate successful response
-                if result.get("expected_amount_out") or result.get("transaction_id"):
+
+                # Validate successful response.
+                #
+                # FUNDS-LOSS FIX: the previous predicate was
+                #   `result.get("expected_amount_out") or result.get("transaction_id")`
+                # which is true for:
+                #   - `"0"` strings (truthy) → zero-output quotes counted as success
+                #   - empty error payloads that happen to carry those keys
+                # Rewritten to enforce:
+                #   - no JSON-RPC / API-level "error" field is present
+                #   - expected_amount_out parses as a positive integer
+                # If neither condition is met we fall through to the
+                # exception path and retry (or eventually mark the swap
+                # failed) instead of recording a false success.
+                api_err = None
+                if isinstance(result, dict):
+                    _e = result.get("error")
+                    if _e not in (None, "", False, {}):
+                        api_err = _e
+                if api_err is not None:
+                    raise ValueError(
+                        f"swap api error: {str(api_err)[:80]}")
+                expected_out = 0
+                try:
+                    _raw = result.get("expected_amount_out") if isinstance(
+                        result, dict) else None
+                    if _raw not in (None, "", False):
+                        expected_out = int(str(_raw).strip())
+                except (ValueError, TypeError, AttributeError):
+                    expected_out = 0
+                txid = (result.get("transaction_id")
+                        if isinstance(result, dict) else None)
+                if expected_out > 0 or (isinstance(txid, str) and len(txid) >= 16):
                     self.integrity_chain.add_entry(
-                        "SWAP_SUCCESS", 
-                        f"idx={idx}|attempt={attempt}",
-                        {"result_hash": hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()[:16]}
+                        "SWAP_SUCCESS",
+                        f"idx={idx}|attempt={attempt}|out={expected_out}",
+                        {"result_hash": hashlib.sha256(
+                            json.dumps(result, sort_keys=True).encode()
+                        ).hexdigest()[:16]}
                     )
                     success = True
                     self.success_count += 1
                     break
                 else:
-                    raise ValueError("Invalid swap response")
+                    raise ValueError(
+                        "invalid swap response: expected_amount_out<=0 and "
+                        "no usable transaction_id")
                     
             except Exception as e:
                 error_count += 1

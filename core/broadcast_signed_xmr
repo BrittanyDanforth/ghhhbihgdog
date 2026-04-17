@@ -87,6 +87,12 @@ def main():
     cli.add_argument("--mine-wait", type=int, default=MAX_MINE_WAIT_SECONDS,
                      help="max seconds to wait for mining confirmation")
     cli.add_argument("--resume", help="progress file for crash-resume")
+    cli.add_argument(
+        "--assume-submit-transfer", action="store_true",
+        help="If the unsigned_manifest cannot be read, force submit_transfer "
+             "for every blob. Only safe for pure offline-signed batches — "
+             "using this on hot-wallet tx_metadata blobs can lock funds in "
+             "wallet state.")
     args = cli.parse_args()
 
     if not args.tor_proxy:
@@ -301,11 +307,54 @@ def main():
                 _um_data = json.load(_umf)
             _um_entries = _um_data.get("entries", []) if isinstance(_um_data, dict) else _um_data
             for _ue in _um_entries:
-                if isinstance(_ue, dict) and _ue.get("presigned"):
-                    _fname = Path(_ue.get("file", "")).name
+                if not isinstance(_ue, dict) or not _ue.get("presigned"):
+                    continue
+                # Base blob filename — e.g. tx_0.unsigned when there is a
+                # single part, or still tx_0.unsigned / tx_0.signed as the
+                # manifest 'file' key when the entry has split siblings.
+                _fname = Path(_ue.get("file", "")).name
+                if _fname:
                     _presigned_blobs[_fname] = True
+                    # Common renamed-extension variants: airgap signer
+                    # produces .unsigned blobs for presigned tx_metadata but
+                    # broadcasters may see them renamed to .signed in a
+                    # single-file flow.
+                    if _fname.endswith(".unsigned"):
+                        _presigned_blobs[_fname[:-len(".unsigned")] + ".signed"] = True
+                    elif _fname.endswith(".signed"):
+                        _presigned_blobs[_fname[:-len(".signed")] + ".unsigned"] = True
+                # FUNDS-LOSS FIX: every split of a presigned entry is also
+                # a tx_metadata blob — it MUST be relayed via relay_tx, not
+                # submit_transfer. Previously only the base name was
+                # registered, so tx_<idx>_split<N>.signed fell through to
+                # submit_transfer and either errored or mis-relayed.
+                for _sf in _ue.get("split_files", []) or []:
+                    _sname = Path(_sf).name
+                    if not _sname:
+                        continue
+                    _presigned_blobs[_sname] = True
+                    if _sname.endswith(".unsigned"):
+                        _presigned_blobs[_sname[:-len(".unsigned")] + ".signed"] = True
+                    elif _sname.endswith(".signed"):
+                        _presigned_blobs[_sname[:-len(".signed")] + ".unsigned"] = True
         except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
-            print(f"  [!] Warning: could not load unsigned manifest for presigned detection: {e}")
+            # Be LOUD about this: if we couldn't read the manifest we may
+            # pick the wrong RPC method for every hot-wallet blob. Make the
+            # operator confirm before we use fallback classification.
+            print(f"  [!] Warning: could not load unsigned manifest for "
+                  f"presigned detection: {e}")
+            integrity_log("broadcast",
+                          f"manifest_read_fail:{str(e)[:40]}")
+            if not args.assume_submit_transfer:
+                sys.exit(
+                    "[!] Refusing to broadcast without a readable unsigned "
+                    "manifest.\n"
+                    "    Presigned/hot-wallet blobs need relay_tx, view-only\n"
+                    "    signed blobs need submit_transfer. Using the wrong\n"
+                    "    RPC method can lock funds in wallet state.\n"
+                    "    Re-run with --assume-submit-transfer to force the\n"
+                    "    submit_transfer path if you are certain every blob\n"
+                    "    came from an offline sign_transfer.")
 
     # Compute blob fingerprint to bind progress to this specific set of blobs.
     # MUST include file content hashes, not just names. Otherwise, re-signed
