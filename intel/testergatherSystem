@@ -1426,7 +1426,13 @@ class VulnScanner:
 
         if live["method"] == "GET":
             qs = urlencode(data)
-            return self._session.get(f"{live['url']}?{qs}", allow_wayback=False)
+            # Endpoints from crawl_for_endpoints strip the query string,
+            # but a 'fallback' endpoint can still carry base_url with a
+            # pre-existing query. Use '&' to merge instead of '?' so we
+            # don't produce 'foo.com/?a=1?b=2' which the server will
+            # reject.
+            sep = "&" if ("?" in live["url"]) else "?"
+            return self._session.get(f"{live['url']}{sep}{qs}", allow_wayback=False)
         else:
             resp = self._session.post_form(live["url"], data)
             # Follow redirect to see the actual result page
