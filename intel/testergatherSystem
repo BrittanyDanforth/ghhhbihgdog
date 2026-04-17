@@ -2130,7 +2130,8 @@ class VulnScanner:
             integrity_log("intel", f"check_error:{name}:{type(e).__name__}")
 
     def scan_full(self, base_url: str, html: str = "", headers: dict = None,
-                  depth: str = "full") -> List[dict]:
+                  depth: str = "full",
+                  raw_set_cookies: Optional[List[str]] = None) -> List[dict]:
         """Run all applicable vulnerability checks with progress display.
 
         Each check runs independently — one failure doesn't block others.
@@ -2149,7 +2150,8 @@ class VulnScanner:
         # Header checks (instant, no network)
         self._run_check("security headers", self._check_security_headers,
                         (headers,), 0.95, findings)
-        self._run_check("cookies", self._check_cookies, (headers,), 0.9, findings)
+        self._run_check("cookies", self._check_cookies,
+                        (headers, raw_set_cookies), 0.9, findings)
         self._run_check("CORS", self._check_cors, (base_url, headers), 0.85, findings)
         self._run_check("info disclosure", self._check_info_disclosure,
                         (headers, html), 0.8, findings)
@@ -2540,27 +2542,62 @@ class VulnScanner:
 
         return findings
 
-    def _check_cookies(self, headers: dict) -> List[dict]:
-        """Audit Set-Cookie headers for security flags."""
+    def _check_cookies(self, headers: dict,
+                       raw_set_cookies: Optional[List[str]] = None) -> List[dict]:
+        """Audit Set-Cookie headers for security flags.
+
+        If `raw_set_cookies` is provided (a list of individual Set-Cookie
+        header values as emitted by the server), audit each one
+        independently. Otherwise fall back to the merged `headers` dict,
+        which is lossy when the server sets multiple cookies (Python's
+        `requests` joins duplicate headers with commas, so we can still
+        split them naively).
+        """
         findings = []
-        for key, val in headers.items():
-            if key.lower() != "set-cookie":
-                continue
-            cookie_name = val.split("=")[0].strip() if "=" in val else "unknown"
+        cookies_to_audit: List[str] = []
+
+        if raw_set_cookies:
+            cookies_to_audit = [c for c in raw_set_cookies if c]
+        else:
+            for key, val in headers.items():
+                if key.lower() != "set-cookie":
+                    continue
+                # Best-effort split on ", " for the merged-header case. A
+                # comma inside an Expires= date would otherwise split the
+                # date in half; use `, ` (comma + space) which matches
+                # the library's merger and is unlikely to appear inside
+                # the Expires date value (RFC 7231 uses "GMT", not a
+                # space-preceded comma).
+                for c in val.split(", "):
+                    c = c.strip()
+                    if c:
+                        cookies_to_audit.append(c)
+
+        seen_reports: Set[str] = set()
+        for val in cookies_to_audit:
+            cookie_name = val.split("=", 1)[0].strip() if "=" in val else "unknown"
             val_lower = val.lower()
 
-            if "secure" not in val_lower:
-                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing Secure flag",
-                                 "detail": "Cookie sent over HTTP (unencrypted), exposable via MITM.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
-            if "httponly" not in val_lower:
-                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing HttpOnly flag",
-                                 "detail": "Cookie accessible via JavaScript — stealable via XSS.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
-            if "samesite" not in val_lower:
-                findings.append({"severity": SEV_LOW, "title": f"Cookie '{cookie_name}' missing SameSite flag",
-                                 "detail": "Cookie sent on cross-site requests — CSRF risk.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
+            for flag, sev, title_suffix, detail in (
+                ("secure", SEV_MEDIUM, "missing Secure flag",
+                 "Cookie sent over HTTP (unencrypted), exposable via MITM."),
+                ("httponly", SEV_MEDIUM, "missing HttpOnly flag",
+                 "Cookie accessible via JavaScript — stealable via XSS."),
+                ("samesite", SEV_LOW, "missing SameSite flag",
+                 "Cookie sent on cross-site requests — CSRF risk."),
+            ):
+                if flag in val_lower:
+                    continue
+                key = f"{cookie_name}:{flag}"
+                if key in seen_reports:
+                    continue
+                seen_reports.add(key)
+                findings.append({
+                    "severity": sev,
+                    "title": f"Cookie '{cookie_name}' {title_suffix}",
+                    "detail": detail,
+                    "evidence": f"Set-Cookie: {val[:80]}",
+                })
         return findings
 
     def _check_cors(self, url: str, headers: dict) -> List[dict]:
@@ -2929,7 +2966,13 @@ class VulnScanner:
             # Baseline: clean request with a safe value
             baseline_url = f"{base_url}?{param}=1"
             baseline_resp = self._session.get(baseline_url, allow_wayback=False)
-            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+            # If the baseline request failed, we have nothing to compare
+            # against. Treating "no baseline" as "pattern absent in baseline"
+            # turned every transient network failure into a false-positive
+            # SQLi hit. Skip this parameter instead.
+            if not baseline_resp or not baseline_resp.text:
+                continue
+            baseline_text = baseline_resp.text[:5000]
 
             # Payload: single apostrophe injection
             test_url = f"{base_url}?{param}=1%27"
@@ -2938,7 +2981,7 @@ class VulnScanner:
                 for indicator in self.SQLI_INDICATORS:
                     # Only count if the pattern is NEW in the injected response
                     in_payload = indicator.search(resp.text[:5000])
-                    in_baseline = indicator.search(baseline_text) if baseline_text else False
+                    in_baseline = indicator.search(baseline_text)
                     if in_payload and not in_baseline:
                         findings.append({
                             "severity": SEV_CRITICAL,
@@ -4406,6 +4449,29 @@ class IntelScraper:
             return None
         content = resp.text
         headers = dict(resp.headers)
+        # dict(resp.headers) merges duplicate Set-Cookie values with commas,
+        # which breaks cookie-flag auditing when the server sets more than one
+        # cookie. Capture the raw multi-valued list separately so
+        # _check_cookies can audit each cookie independently.
+        raw_set_cookies: List[str] = []
+        try:
+            raw_set_cookies = list(resp.raw.headers.getlist("Set-Cookie"))
+        except (AttributeError, Exception):
+            # Fallback: at least walk resp.cookies to rebuild one Set-Cookie
+            # string per cookie with the flags that requests preserved.
+            try:
+                for ck in resp.cookies:
+                    parts = [f"{ck.name}={ck.value or ''}"]
+                    if ck.secure:
+                        parts.append("Secure")
+                    if ck.has_nonstandard_attr("HttpOnly"):
+                        parts.append("HttpOnly")
+                    ss = ck.get_nonstandard_attr("SameSite") if hasattr(ck, "get_nonstandard_attr") else None
+                    if ss:
+                        parts.append(f"SameSite={ss}")
+                    raw_set_cookies.append("; ".join(parts))
+            except Exception:
+                pass
         hp = self._honeypot.check(content, headers, elapsed_ms, len(resp.history))
         if hp["is_honeypot"]:
             integrity_log("intel", f"honeypot:{urlparse(url).netloc}")
@@ -4443,6 +4509,7 @@ class IntelScraper:
             "secrets_in_comments": secrets_in_comments,
             "content_length": len(content), "timestamp": _coarsened,
             "raw_html": content, "raw_headers": headers,
+            "raw_set_cookies": raw_set_cookies,
             "honeypot": False,
         }
 
@@ -4556,6 +4623,7 @@ class IntelOrchestrator:
         # Phase 2: Technology fingerprinting
         html = result.get("raw_html", "") if result else ""
         headers = result.get("raw_headers", {}) if result else {}
+        raw_set_cookies = result.get("raw_set_cookies", []) if result else []
         tech = self._run_phase(2, "Technology fingerprinting",
                                self._tech.fingerprint, headers, html) or {}
         if tech:
@@ -4564,7 +4632,7 @@ class IntelOrchestrator:
         # Phase 3: Vulnerability scanning (headers + path probes)
         vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
                                 self._vulns.scan_full, base_url, html, headers,
-                                self._scan_depth) or []
+                                self._scan_depth, raw_set_cookies) or []
         self._vuln_findings.extend(vulns)
         self._print_vulns(vulns)
 
