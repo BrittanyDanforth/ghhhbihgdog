@@ -364,7 +364,11 @@ def main():
     parser.add_argument("--verify", action="store_true",
                        help="Verify chain integrity after generation")
     parser.add_argument("--overwrite", action="store_true",
-                       help="Overwrite source file (dangerous!)")
+                       help="Overwrite the --source file with the fake "
+                            "chain (destructive — original log is lost). "
+                            "Requires --i-understand-overwrite.")
+    parser.add_argument("--i-understand-overwrite", action="store_true",
+                       help="Acknowledge that --overwrite is destructive.")
     
     args = parser.parse_args()
     
@@ -399,6 +403,11 @@ def main():
         # Determine output path
         output_path = args.out
         if args.overwrite and args.source:
+            if not args.i_understand_overwrite:
+                print("[!] --overwrite permanently replaces the real log "
+                      f"{args.source} with a fake chain.")
+                print("[!] Re-run with --i-understand-overwrite to confirm.")
+                sys.exit(1)
             output_path = args.source
             print(f"[!] WARNING: Overwriting source file {args.source}")
         
