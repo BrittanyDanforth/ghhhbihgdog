@@ -2404,6 +2404,8 @@ class VulnScanner:
                 print(f"      found {len(self._page_params)} testable parameters")
 
         # Header checks (instant, no network)
+        self._run_check("WAF/CDN fingerprint", self._check_waf_fingerprint,
+                        (base_url, html, headers), 0.95, findings)
         self._run_check("security headers", self._check_security_headers,
                         (headers,), 0.95, findings)
         self._run_check("cookies", self._check_cookies,
@@ -2425,11 +2427,20 @@ class VulnScanner:
                             (html,), 0.8, findings)
             self._run_check("IDOR indicators", self._check_idor,
                             (base_url, html), 0.7, findings)
+            self._run_check("Host-header injection",
+                            self._check_host_header_injection,
+                            (base_url,), 0.8, findings)
+            self._run_check("HTTP verb tampering",
+                            self._check_http_verb_tampering,
+                            (base_url,), 0.8, findings)
 
             if depth == "full":
                 self._run_check("SQL injection (quick)", self._check_sqli_indicators,
                                 (base_url,), 0.85, findings)
                 self._run_check("XSS reflection (quick)", self._check_xss_reflection,
+                                (base_url,), 0.85, findings)
+                self._run_check("NoSQL injection (quick)",
+                                self._check_nosql_injection,
                                 (base_url,), 0.85, findings)
 
         if depth == "deep":
@@ -2440,6 +2451,9 @@ class VulnScanner:
                             (base_url,), 0.95, findings)
             self._run_check("directory traversal", self._check_directory_traversal,
                             (base_url,), 0.95, findings)
+            self._run_check("NoSQL injection (deep)",
+                            self._check_nosql_injection,
+                            (base_url,), 0.9, findings)
 
             # Crawl to discover real endpoints with parameters
             if html:
@@ -3731,55 +3745,550 @@ class VulnScanner:
                 return findings
         return findings
 
+    # Subdomain-takeover service fingerprints. Kept at class scope so
+    # ExploitVerifier can read the same table for replay-confirmation.
+    TAKEOVER_FINGERPRINTS = {
+        "github.io":         ("GitHub Pages",   "there isn't a github pages site here"),
+        "herokuapp.com":     ("Heroku",         "no such app"),
+        "herokudns.com":     ("Heroku (dns)",   "no such app"),
+        "herokussl.com":     ("Heroku (ssl)",   "no such app"),
+        "s3.amazonaws.com":  ("AWS S3",         "nosuchbucket"),
+        "s3-website":        ("AWS S3 (website)", "nosuchbucket"),
+        "azurewebsites.net": ("Azure Websites", "404 web site not found"),
+        "cloudapp.net":      ("Azure Classic",  "microsoft-iis/7.5"),
+        "cloudapp.azure.com":("Azure Cloud",    "microsoft-iis/"),
+        "trafficmanager.net":("Azure Traffic Manager", "page you requested was not found"),
+        "cloudfront.net":    ("CloudFront",     "the request could not be satisfied"),
+        "shopify.com":       ("Shopify",        "sorry, this shop is currently unavailable"),
+        "myshopify.com":     ("Shopify (myshopify)", "sorry, this shop is currently unavailable"),
+        "fastly.net":        ("Fastly",         "fastly error: unknown domain"),
+        "ghost.io":          ("Ghost",          "the thing you were looking for is no longer here"),
+        "surge.sh":          ("Surge",          "project not found"),
+        "bitbucket.io":      ("Bitbucket",      "repository not found"),
+        "readthedocs.io":    ("Read the Docs",  "unknown to read the docs"),
+        "readthedocs.org":   ("Read the Docs",  "unknown to read the docs"),
+        "netlify.com":       ("Netlify",        "not found - request id"),
+        "netlify.app":       ("Netlify (app)",  "not found - request id"),
+        "vercel.app":        ("Vercel",         "the deployment could not be found"),
+        "now.sh":            ("Vercel (now)",   "the deployment could not be found"),
+        "pantheonsite.io":   ("Pantheon",       "the gods are wise, but do not know of the site which you seek"),
+        "pantheon.io":       ("Pantheon",       "the gods are wise"),
+        "zendesk.com":       ("Zendesk",        "help center closed"),
+        "uservoice.com":     ("UserVoice",      "this uservoice subdomain is currently available"),
+        "helpscoutdocs.com": ("Help Scout",     "no settings were found for this company"),
+        "tumblr.com":        ("Tumblr",         "whatever you were looking for doesn't currently exist at this address"),
+        "desk.com":          ("Desk.com",       "please try again or try desk.com/contact-us"),
+        "fly.dev":           ("Fly.io",         "this app has no running instances"),
+        "appspot.com":       ("Google App Engine", "404 - server not found"),
+        "webflow.io":        ("Webflow",        "the page you are looking for doesn't exist or has been moved"),
+        "canny.io":          ("Canny",          "company not found"),
+        "strikingly.com":    ("Strikingly",     "page not found"),
+        "smugmug.com":       ("SmugMug",        "page not found"),
+        "intercom.help":     ("Intercom",       "this page is reserved for artistic"),
+        "agilecrm.com":      ("Agile CRM",      "sorry, this page is no longer available"),
+        "tilda.ws":          ("Tilda",          "please renew your subscription"),
+        "tilda.cc":          ("Tilda",          "please renew your subscription"),
+        "wordpress.com":     ("WordPress.com",  "do you want to register"),
+        "blogspot.com":      ("Blogspot",       "blog not found"),
+        "statuspage.io":     ("Statuspage",     "this page is reserved for artistic"),
+        "mailgun.org":       ("Mailgun",        "mailgun domain is not found"),
+        "sendgrid.net":      ("SendGrid",       "the provided authentication"),
+        "fastmail.fm":       ("FastMail",       "fastmail does not serve"),
+        "pagerduty.com":     ("PagerDuty",      "account not found"),
+        "unbounceapps.com":  ("Unbounce",       "the requested url was not found on this server"),
+        "zoho.com":          ("Zoho",           "you have landed on an invalid"),
+        "cargocollective.com": ("Cargo",        "404 not found"),
+        "wishpond.com":      ("Wishpond",       "this page doesn't exist"),
+        "ngrok.io":          ("ngrok",          "tunnel"),
+        "smarterqueue.com":  ("SmarterQueue",   "page not found"),
+    }
+
     def _check_subdomain_takeover(self, domain: str, cnames: List[str]) -> List[dict]:
         """Check for subdomain takeover via dangling CNAME records."""
         findings = []
-        # Services that are commonly vulnerable to takeover when CNAME exists
-        # but the resource is unclaimed
-        takeover_fingerprints = {
-            "github.io": ("GitHub Pages", "There isn't a GitHub Pages site here"),
-            "herokuapp.com": ("Heroku", "no-such-app"),
-            "s3.amazonaws.com": ("AWS S3", "NoSuchBucket"),
-            "azurewebsites.net": ("Azure", "404 Web Site not found"),
-            "cloudfront.net": ("CloudFront", "The request could not be satisfied"),
-            "shopify.com": ("Shopify", "Sorry, this shop is currently unavailable"),
-            "fastly.net": ("Fastly", "Fastly error: unknown domain"),
-            "ghost.io": ("Ghost", "The thing you were looking for is no longer here"),
-            "surge.sh": ("Surge", "project not found"),
-            "bitbucket.io": ("Bitbucket", "Repository not found"),
-        }
 
         for cname in cnames:
             cname_lower = cname.lower().rstrip(".")
-            for service_domain, (service_name, fingerprint) in takeover_fingerprints.items():
-                if cname_lower.endswith(service_domain):
-                    # Verify: try to access the subdomain and check for takeover fingerprint
-                    for scheme in ["https", "http"]:
-                        try:
-                            resp = self._session.get(f"{scheme}://{domain}", allow_wayback=False)
-                            if resp and fingerprint.lower() in resp.text.lower():
-                                findings.append({
-                                    "severity": SEV_HIGH,
-                                    "title": f"Subdomain takeover possible via {service_name}",
-                                    "detail": f"CNAME points to {cname_lower} but the {service_name} "
-                                              f"resource is unclaimed. An attacker can claim it and "
-                                              f"serve arbitrary content on {domain}.",
-                                    "evidence": f"CNAME: {cname_lower}, fingerprint: '{fingerprint[:40]}'",
-                                    "exploitable": True,
-                                    "exploit_info": {
-                                        "type": "subdomain_takeover",
-                                        "service": service_name,
-                                        "cname": cname_lower,
-                                        "method": f"Register the unclaimed resource on {service_name} "
-                                                  f"to take control of {domain}. "
-                                                  f"Then serve phishing pages, steal cookies, or "
-                                                  f"bypass CSP/CORS restrictions.",
-                                        "risk": "Phishing, cookie theft, CSP bypass",
-                                    },
-                                })
-                                return findings
-                        except Exception as e:
-                            integrity_log("intel", f"unknown_error:{type(e).__name__}")
+            for service_domain, (service_name, fingerprint) in self.TAKEOVER_FINGERPRINTS.items():
+                if service_domain not in cname_lower:
+                    continue
+                # Verify: try to access the subdomain and check for takeover fingerprint
+                for scheme in ["https", "http"]:
+                    try:
+                        resp = self._session.get(f"{scheme}://{domain}", allow_wayback=False)
+                        if resp and fingerprint.lower() in resp.text.lower():
+                            findings.append({
+                                "severity": SEV_HIGH,
+                                "title": f"Subdomain takeover possible via {service_name}",
+                                "detail": f"CNAME points to {cname_lower} but the {service_name} "
+                                          f"resource is unclaimed. An attacker can claim it and "
+                                          f"serve arbitrary content on {domain}.",
+                                "evidence": f"CNAME: {cname_lower}, fingerprint: '{fingerprint[:40]}'",
+                                "exploitable": True,
+                                "exploit_info": {
+                                    "type": "subdomain_takeover",
+                                    "service": service_name,
+                                    "cname": cname_lower,
+                                    "method": f"Register the unclaimed resource on {service_name} "
+                                              f"to take control of {domain}. "
+                                              f"Then serve phishing pages, steal cookies, or "
+                                              f"bypass CSP/CORS restrictions.",
+                                    "risk": "Phishing, cookie theft, CSP bypass",
+                                },
+                            })
+                            return findings
+                    except Exception as e:
+                        integrity_log("intel", f"unknown_error:{type(e).__name__}")
+        return findings
+
+    def _check_host_header_injection(self, base_url: str) -> List[dict]:
+        """Detect Host-header injection / absolute-URL override.
+
+        Two signals:
+        1. The target reflects an attacker-controlled Host value back
+           into a Location header (password-reset URL poisoning class).
+        2. The target reflects X-Forwarded-Host into a Location or
+           into the body as an absolute URL.
+
+        Both are exploitable for cache poisoning, password-reset link
+        hijacking, and in some frameworks, auth bypass.
+        """
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        marker = f"h{secrets.token_hex(4)}.example.test"
+        probes = [
+            ({"Host": marker}, "Host"),
+            ({"X-Forwarded-Host": marker}, "X-Forwarded-Host"),
+            ({"X-Forwarded-Server": marker}, "X-Forwarded-Server"),
+            ({"X-Host": marker}, "X-Host"),
+        ]
+        for headers, hname in probes:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            # Use bare session.get with allow_redirects=False so we can
+            # see what the server wrote in Location.
+            try:
+                self._session._delay_for_domain(domain)
+                self._session._maybe_rotate_circuit()
+                pick = _pick_profile()
+                pick.update(headers)
+                resp = self._session._session.get(
+                    base_url, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=pick,
+                )
+            except Exception:
+                continue
+            if resp is None:
+                continue
+
+            # Signal 1: Location reflects the marker host.
+            loc = resp.headers.get("Location", "")
+            if loc:
+                loc_host = urlparse(loc).netloc.lower()
+                if loc_host == marker.lower():
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Host-header injection via {hname}",
+                        "detail": (f"Server built the Location header using "
+                                   f"the attacker-supplied {hname}: value. "
+                                   f"Usable for password-reset link "
+                                   f"poisoning, cache poisoning, and in "
+                                   f"some frameworks auth-bypass."),
+                        "evidence": f"{hname}: {marker} → Location: {loc[:120]}",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "host_header_injection",
+                            "header": hname,
+                            "method": (f"Send the target's password-reset "
+                                       f"flow with {hname}: attacker.com. "
+                                       f"The reset link in the victim's "
+                                       f"email will point at attacker.com."),
+                            "risk": "Password reset link hijacking, cache poisoning, auth bypass",
+                        },
+                    })
+                    return findings  # one reflected header is enough
+
+            # Signal 2: the body renders the marker as a same-origin absolute URL.
+            body = resp.text[:20000] if resp.text else ""
+            if marker in body:
+                # Make sure the marker appears in a URL-ish context
+                # (href=, src=, action=, or a literal http(s)://marker).
+                urlish = re.search(
+                    r"""(?:href|src|action)\s*=\s*['"][^'"]*""" + re.escape(marker)
+                    + r"""[^'"]*['"]""",
+                    body, re.I,
+                )
+                if urlish or f"//{marker}" in body or f"://{marker}" in body:
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"{hname} reflected as absolute URL in body",
+                        "detail": (f"Server rendered {hname}: into an "
+                                   f"absolute URL in the response body. "
+                                   f"Any generated links (emails, OAuth "
+                                   f"redirects) likely use this value — "
+                                   f"usable for cache poisoning."),
+                        "evidence": f"{hname}: {marker} appeared in HTML URL context",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "host_header_injection",
+                            "header": hname,
+                            "method": (f"Poison cache by sending {hname}: "
+                                       f"attacker.com — cached response "
+                                       f"serves attacker URLs to everyone."),
+                            "risk": "Cache poisoning, link injection, phishing",
+                        },
+                    })
+                    return findings
+        return findings
+
+    def _check_http_verb_tampering(self, base_url: str) -> List[dict]:
+        """Detect auth bypass via alternate HTTP verbs.
+
+        Many WAFs + frameworks only protect the GET/POST path for a
+        protected resource. Sending PUT, DELETE, HEAD, PATCH, or the
+        override header 'X-HTTP-Method-Override: GET' can slip past
+        the rule and return 200 for a path that normally returns 403.
+        """
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Pick candidate paths: start with /admin and any 403 we know.
+        candidates = ["/admin", "/admin/", "/admin/index", "/dashboard",
+                      "/api/admin", "/api/users"]
+        # If the scan has already crawled endpoints, include them.
+        if self._crawled_urls:
+            for ep in self._crawled_urls[:10]:
+                try:
+                    path = urlparse(ep["url"]).path
+                    if path and path not in candidates:
+                        candidates.append(path)
+                except Exception:
+                    continue
+
+        for path in candidates[:8]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            url = urljoin(base_url, path)
+
+            # Baseline GET
+            try:
+                self._session._delay_for_domain(domain)
+                g_resp = self._session._session.get(
+                    url, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers=_pick_profile(),
+                )
+            except Exception:
+                continue
+            if g_resp is None or g_resp.status_code not in (401, 403):
+                # Only interesting when GET is walled.
+                continue
+
+            for verb in ("HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                try:
+                    self._session._delay_for_domain(domain)
+                    v_resp = self._session._session.request(
+                        verb, url, timeout=REQUEST_TIMEOUT,
+                        allow_redirects=False,
+                        proxies=self._session._proxy,
+                        headers=_pick_profile(),
+                    )
+                except Exception:
+                    continue
+                if v_resp is None:
+                    continue
+                # Bypass signal: verb returns 200 / 2xx while GET returned 403/401.
+                if 200 <= v_resp.status_code < 300:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"HTTP verb tampering bypass at {path}",
+                        "detail": (f"GET {path} returns {g_resp.status_code} "
+                                   f"but {verb} {path} returns "
+                                   f"{v_resp.status_code}. WAF or framework "
+                                   f"auth check is verb-specific and can be "
+                                   f"bypassed by switching methods."),
+                        "evidence": f"GET→{g_resp.status_code}, {verb}→{v_resp.status_code}",
+                        "exploitable": True,
+                        "test_url": url,
+                        "exploit_info": {
+                            "type": "http_verb_tampering",
+                            "path": path,
+                            "method": (f"Send {verb} instead of GET — WAF's "
+                                       f"verb-specific auth check is "
+                                       f"bypassed. Works for admin panels "
+                                       f"protected only on GET."),
+                            "risk": "Auth bypass, admin access",
+                        },
+                    })
+                    return findings
+            # Method-override header
+            try:
+                self._session._delay_for_domain(domain)
+                o_resp = self._session._session.get(
+                    url, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
+                    proxies=self._session._proxy,
+                    headers={**_pick_profile(), "X-HTTP-Method-Override": "GET"},
+                )
+            except Exception:
+                continue
+            if o_resp and 200 <= o_resp.status_code < 300:
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"X-HTTP-Method-Override bypass at {path}",
+                    "detail": (f"GET {path} returns {g_resp.status_code} "
+                               f"but X-HTTP-Method-Override: GET returns "
+                               f"{o_resp.status_code}. Framework honors the "
+                               f"override header AFTER the WAF rule fires."),
+                    "evidence": f"GET→{g_resp.status_code}, override→{o_resp.status_code}",
+                    "exploitable": True,
+                    "test_url": url,
+                    "exploit_info": {
+                        "type": "http_verb_tampering",
+                        "path": path,
+                        "method": ("Send GET with header "
+                                   "'X-HTTP-Method-Override: GET' — the "
+                                   "framework treats it as the override "
+                                   "verb while the WAF already saw GET."),
+                        "risk": "Auth bypass, admin access",
+                    },
+                })
+                return findings
+        return findings
+
+    # Common NoSQL error signatures that leak from unparameterised queries.
+    NOSQL_INDICATORS = [
+        re.compile(r"MongoError|MongoServerError", re.I),
+        re.compile(r"E11000 duplicate key", re.I),
+        re.compile(r"CastError:.*ObjectId", re.I),
+        re.compile(r"\$where.*not allowed", re.I),
+        re.compile(r"BSON.*parse", re.I),
+        re.compile(r"Syntax error near.*\$ne", re.I),
+        re.compile(r"CouchDB error", re.I),
+        re.compile(r"Unable to parse.*Redis", re.I),
+        re.compile(r"mongoose.*ValidationError", re.I),
+        re.compile(r"unknown top level operator", re.I),
+    ]
+
+    def _check_nosql_injection(self, base_url: str) -> List[dict]:
+        """Detect MongoDB-style NoSQL injection via error signatures
+        and differential-response boolean probes.
+
+        The $ne="x" / [$ne]=x payloads coerce most MongoDB queries to
+        'true for every document'; comparing the response length to a
+        baseline reveals whether the DB returned more documents than a
+        normal query would.
+        """
+        findings = []
+        test_params = self._get_test_params(["id", "user", "username", "email",
+                                              "name", "search", "q"])
+        for param in test_params[:5]:
+            if shutdown_requested():
+                break
+
+            baseline_url = f"{base_url}?{param}=x{secrets.token_hex(3)}"
+            b_resp = self._session.get(baseline_url, allow_wayback=False)
+            if not b_resp or not b_resp.text:
+                continue
+            b_body = b_resp.text[:6000]
+            b_len = len(b_resp.text)
+
+            # 1. Error-based probe: $ne payload
+            err_url = f"{base_url}?{param}[$ne]=0"
+            e_resp = self._session.get(err_url, allow_wayback=False)
+            if e_resp and e_resp.text:
+                for ind in self.NOSQL_INDICATORS:
+                    if ind.search(e_resp.text[:6000]) and not ind.search(b_body):
+                        findings.append({
+                            "severity": SEV_CRITICAL,
+                            "title": f"NoSQL injection indicator via '{param}'",
+                            "detail": ("MongoDB-class error appeared only in "
+                                       "response to a [$ne] payload. Input "
+                                       "reaches a NoSQL query without "
+                                       "sanitization."),
+                            "evidence": f"param: {param}, pattern: {ind.pattern[:60]}",
+                            "exploitable": True,
+                            "test_url": err_url,
+                            "exploit_info": {
+                                "type": "nosql_injection",
+                                "parameter": param,
+                                "method": ("Use operators that coerce to "
+                                           "'true' for every document: "
+                                           "?user[$ne]=0&pass[$ne]=0 to "
+                                           "bypass auth. For data "
+                                           "extraction: [$regex]=.*"),
+                                "risk": "Auth bypass, data exfiltration, DB enumeration",
+                            },
+                        })
+                        return findings
+
+            # 2. Boolean differential: $ne always true → often returns
+            # more data than the bogus baseline value did.
+            true_url = f"{base_url}?{param}[$ne]=x{secrets.token_hex(3)}"
+            t_resp = self._session.get(true_url, allow_wayback=False)
+            if t_resp and t_resp.text and t_resp.status_code == 200:
+                if b_resp.status_code in (404, 400) and t_resp.status_code == 200:
+                    # Baseline said 'not found', $ne says 'OK' → strong.
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible NoSQL injection via '{param}' (boolean)",
+                        "detail": (f"?{param}=<bogus> → HTTP {b_resp.status_code} "
+                                   f"but ?{param}[$ne]=<bogus> → HTTP "
+                                   f"{t_resp.status_code}. Operator was "
+                                   f"interpreted by the DB."),
+                        "evidence": f"param: {param}, baseline={b_resp.status_code}, $ne={t_resp.status_code}",
+                        "exploitable": True,
+                        "test_url": true_url,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Swap the parameter for a "
+                                       "[$ne]/[$gt]/[$regex] payload — "
+                                       "most endpoints will leak "
+                                       "information by returning results "
+                                       "for every document."),
+                            "risk": "Auth bypass, data extraction",
+                        },
+                    })
+                    return findings
+                # Length-based differential: $ne=true returns substantially more
+                t_len = len(t_resp.text)
+                if t_len > b_len * 2 and t_len - b_len > 1024:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible NoSQL injection via '{param}' (length diff)",
+                        "detail": (f"[$ne] payload returned a response "
+                                   f"{t_len} bytes vs baseline {b_len} "
+                                   f"bytes. DB likely returned all "
+                                   f"documents that don't match the "
+                                   f"bogus value."),
+                        "evidence": f"param: {param}, baseline={b_len}, $ne={t_len}",
+                        "exploitable": True,
+                        "test_url": true_url,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Data extraction: "
+                                       "?user=admin&pass[$regex]=^a.* "
+                                       "leaks the password one character "
+                                       "at a time."),
+                            "risk": "Auth bypass, credential extraction",
+                        },
+                    })
+                    return findings
+        return findings
+
+    # Common WAF/IPS fingerprints by response headers and body signatures.
+    # Value is (Short name, detail).
+    _WAF_FINGERPRINTS = [
+        # Header-based (exact header name → WAF)
+        ("header", "cf-ray",              ("Cloudflare",          "Cloudflare fronts this target.")),
+        ("header", "x-sucuri-id",         ("Sucuri CloudProxy",   "Sucuri CloudProxy WAF")),
+        ("header", "x-sucuri-cache",      ("Sucuri CloudProxy",   "Sucuri CloudProxy WAF")),
+        ("header", "x-iinfo",             ("Incapsula / Imperva", "Imperva Incapsula WAF")),
+        ("header", "x-cdn",               ("Imperva",             "Generic Imperva CDN+WAF")),
+        ("header", "x-amzn-trace-id",     ("AWS",                 "AWS ALB (may front AWS WAF)")),
+        ("header", "x-amz-cf-id",         ("AWS CloudFront",      "Possibly AWS WAF on CloudFront")),
+        ("header", "x-citrix-session-id", ("Citrix NetScaler",    "Citrix NetScaler / ADC")),
+        ("header", "x-waf-event-info",    ("FortiGate",           "FortiGate web filtering")),
+        ("header", "x-dcid",              ("Yundun",              "Yundun WAF")),
+        ("header", "server",              ("BigIP/F5",            "F5 BIG-IP")),  # match by value
+        ("header", "x-bigip-selfip",      ("BigIP/F5",            "F5 BIG-IP")),
+        ("header", "x-waf-status",        ("Generic WAF",         "Unnamed WAF header")),
+        ("header", "x-fireeye",           ("FireEye",             "FireEye NX")),
+        ("header", "x-barracuda",         ("Barracuda WAF",       "Barracuda Web App Firewall")),
+        ("header", "x-proxy-id",          ("Varnish/Proxy",       "Varnish or generic proxy")),
+        ("header", "x-varnish",           ("Varnish",             "Varnish cache (often fronts WAF)")),
+        ("header", "x-request-id",        (None,                  None)),  # too generic
+    ]
+
+    _WAF_BODY_SIGNATURES = [
+        (re.compile(r"<title>Access denied.*Sucuri", re.I), ("Sucuri CloudProxy", "Sucuri block page")),
+        (re.compile(r"Cloudflare Ray ID:", re.I),            ("Cloudflare",        "Cloudflare block page")),
+        (re.compile(r"Incapsula incident ID", re.I),         ("Imperva Incapsula", "Incapsula block page")),
+        (re.compile(r"Reference\s*#\d+\.\w+\.",),            ("Akamai",            "Akamai reference # pattern")),
+        (re.compile(r"AkamaiGHost", re.I),                    ("Akamai",            "Akamai GHost")),
+        (re.compile(r"Request\s+unsuccessful\.\s*Incapsula"), ("Imperva Incapsula", "Incapsula block page")),
+        (re.compile(r"blocked.*Barracuda", re.I),             ("Barracuda WAF",     "Barracuda block page")),
+        (re.compile(r"<TITLE>Web Page Blocked!</TITLE>", re.I),("Palo Alto",        "Palo Alto URL-filter block")),
+        (re.compile(r"FortiGate web filtering", re.I),        ("FortiGate",         "FortiGate block page")),
+        (re.compile(r"/waf_block\.html", re.I),               ("SafeDog",           "SafeDog WAF")),
+        (re.compile(r"ModSecurity", re.I),                    ("ModSecurity",       "ModSecurity (OWASP CRS)")),
+        (re.compile(r"<title>403 Forbidden</title>.*nginx", re.I),
+         ("nginx/403", "Vanilla nginx 403 — no WAF fingerprint detected")),
+    ]
+
+    def _check_waf_fingerprint(self, base_url: str, html: str,
+                               headers: dict) -> List[dict]:
+        """Identify the WAF / CDN fronting the target.
+
+        Not a vulnerability per se, but a massively useful INFO-class
+        finding — every subsequent bypass technique depends on which
+        WAF you're up against. Emitted early so the walkthrough can
+        tailor its payload mutation.
+        """
+        findings = []
+        h_lower = {k.lower(): v for k, v in headers.items()}
+        seen_names: Set[str] = set()
+
+        # Server-header special case: F5 BIG-IP, Incapsula, etc.
+        server = h_lower.get("server", "")
+        server_l = server.lower()
+        if "bigip" in server_l or "big-ip" in server_l:
+            seen_names.add("BigIP/F5")
+        if "awselb" in server_l or "awsalb" in server_l:
+            seen_names.add("AWS ELB/ALB")
+        if "cloudfront" in server_l:
+            seen_names.add("AWS CloudFront")
+
+        # Direct header matches
+        for where, hname, (name, detail) in self._WAF_FINGERPRINTS:
+            if name is None:
+                continue
+            if where == "header" and hname in h_lower:
+                seen_names.add(name)
+
+        # Specific-value matches
+        if "x-powered-by" in h_lower and "ASP.NET" in h_lower["x-powered-by"]:
+            seen_names.add("ASP.NET")  # not a WAF but interesting fingerprint
+
+        # Body signatures — only run if the page status is 403/429/503
+        # (we don't want random pages matching "nginx" etc.)
+        body_scan = html[:10000] if html else ""
+        for pat, (name, detail) in self._WAF_BODY_SIGNATURES:
+            if pat.search(body_scan):
+                seen_names.add(name)
+
+        if seen_names:
+            names_s = ", ".join(sorted(seen_names))
+            findings.append({
+                "severity": SEV_INFO,
+                "title": f"WAF / CDN detected: {names_s}",
+                "detail": (f"Target is fronted by {names_s}. Payload "
+                           f"mutations (case-flip, inline comments, "
+                           f"whitespace substitution) may be required."),
+                "evidence": f"Detected via: {names_s}",
+                "exploit_info": {
+                    "type": "waf_fingerprint",
+                    "waf": names_s,
+                    "method": ("Use WAF-specific bypass catalogs. "
+                               "Cloudflare: IP-direct origin, X-Originating-IP "
+                               "trust. Imperva: HTTP/2 smuggling. "
+                               "F5: oversized cookie/header tricks. "
+                               "Akamai: cache-poisoning + pragma-cache."),
+                    "risk": "Bypass depends on which WAF is in the path",
+                },
+            })
         return findings
 
     def _check_ssl_cert(self, base_url: str) -> List[dict]:
