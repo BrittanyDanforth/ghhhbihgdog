@@ -144,6 +144,25 @@ SEV_MEDIUM = "MEDIUM"
 SEV_LOW = "LOW"
 SEV_INFO = "INFO"
 
+# ── Content-validator regexes for _check_sensitive_paths ─────────────
+# Module-level so the VulnScanner lambdas can reference them without
+# recompiling on every probe. Each regex is intentionally cheap.
+_re_hex40 = re.compile(r"^[a-f0-9]{40}$", re.I)  # bare SHA-1 (detached HEAD)
+_re_git_log = re.compile(r"^[a-f0-9]{40}\s+[a-f0-9]{40}\s+", re.I | re.M)
+_re_env_line = re.compile(
+    r"^(?:export\s+)?[A-Z][A-Z0-9_]{1,60}\s*=\s*\S", re.M
+)
+_re_htpasswd = re.compile(
+    r"^[\w.-]+:(?:\$apr1\$|\$2[aby]\$|\$1\$|\$5\$|\$6\$|{SHA})", re.M
+)
+_re_requirements = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+)(?:[<>=!]=|~=)?\s*[\d.]*\s*(?:#.*)?$", re.M
+)
+_re_dockerfile = re.compile(
+    r"^\s*(?:FROM|RUN|CMD|EXPOSE|ENV|COPY|ADD|WORKDIR|ENTRYPOINT|ARG)\s+",
+    re.M | re.I,
+)
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Browser Profile Rotation
 # ══════════════════════════════════════════════════════════════════════════
@@ -711,60 +730,278 @@ class VulnScanner:
     {severity, title, detail, evidence} dicts.
     """
 
-    # Sensitive paths to probe — common misconfigs that expose data
+    # Sensitive paths to probe — common misconfigs that expose data.
+    # Ordered by severity so the circuit-breaker bails out AFTER the
+    # highest-value paths have been tested.
     SENSITIVE_PATHS = [
+        # ── VCS exposure (full source code) ──────────────────────────
         ("/.git/HEAD", "Git repository exposed", SEV_CRITICAL,
          "Full source code + commit history downloadable"),
-        ("/.env", "Environment file exposed", SEV_CRITICAL,
-         "Database credentials, API keys, secrets in plaintext"),
         ("/.git/config", "Git config exposed", SEV_HIGH,
          "Remote repository URLs, author info revealed"),
+        ("/.git/logs/HEAD", "Git log exposed", SEV_HIGH,
+         "Commit history + author emails reveal dev workflow"),
+        ("/.svn/entries", "SVN metadata exposed", SEV_HIGH,
+         "Subversion repository structure and file listing"),
+        ("/.svn/wc.db", "SVN database exposed", SEV_CRITICAL,
+         "Full SVN working-copy database — file contents recoverable"),
+        ("/.hg/store/00manifest.i", "Mercurial repo exposed", SEV_HIGH,
+         "Mercurial repository metadata — source recoverable"),
+        ("/.bzr/branch/branch.conf", "Bazaar repo exposed", SEV_HIGH,
+         "Bazaar branch config exposed"),
+        ("/CVS/Root", "CVS metadata exposed", SEV_HIGH,
+         "CVS repository location leaked"),
+        # ── Env / config files ──────────────────────────────────────
+        ("/.env", "Environment file exposed", SEV_CRITICAL,
+         "Database credentials, API keys, secrets in plaintext"),
+        ("/.env.local", ".env.local exposed", SEV_CRITICAL,
+         "Local dev secrets (often stronger than prod)"),
+        ("/.env.production", ".env.production exposed", SEV_CRITICAL,
+         "Production secrets in plaintext"),
+        ("/.env.development", ".env.development exposed", SEV_HIGH,
+         "Development secrets — often reuse prod passwords"),
+        ("/.env.backup", ".env backup exposed", SEV_CRITICAL,
+         "Backup of production env file"),
+        ("/.env.bak", ".env.bak exposed", SEV_CRITICAL,
+         "Backup of production env file"),
         ("/wp-config.php.bak", "WordPress config backup", SEV_CRITICAL,
          "Database credentials in plaintext backup file"),
         ("/wp-config.php~", "WordPress config editor backup", SEV_CRITICAL,
          "Database credentials in editor temp file"),
+        ("/wp-config.php.save", "WordPress config .save", SEV_CRITICAL,
+         "nano/emacs WordPress config backup"),
+        ("/config.php.bak", "PHP config backup", SEV_HIGH,
+         "Application configuration backup"),
+        ("/web.config.bak", ".NET web.config backup", SEV_HIGH,
+         "IIS / ASP.NET config backup"),
+        ("/.htaccess", "Apache config exposed", SEV_MEDIUM,
+         "Rewrite rules, auth config, internal paths"),
+        ("/.htpasswd", "Apache password file exposed", SEV_CRITICAL,
+         "Basic-auth password hashes"),
+        ("/WEB-INF/web.xml", "Java config exposed", SEV_CRITICAL,
+         "Servlet mappings, security constraints, database config"),
+        ("/WEB-INF/classes/application.properties",
+         "Spring application.properties exposed", SEV_CRITICAL,
+         "Spring Boot config with DB URLs + credentials"),
+        ("/WEB-INF/classes/application.yml",
+         "Spring application.yml exposed", SEV_CRITICAL,
+         "Spring Boot YAML config"),
+        ("/crossdomain.xml", "Flash crossdomain policy", SEV_LOW,
+         "Overly permissive Flash cross-origin policy"),
+        ("/clientaccesspolicy.xml", "Silverlight policy", SEV_LOW,
+         "Silverlight client access policy exposed"),
+        # ── Discovery / metadata ────────────────────────────────────
         ("/.DS_Store", "macOS directory metadata", SEV_LOW,
          "File listing of directory contents leaked"),
         ("/robots.txt", "Robots.txt", SEV_INFO,
          "May reveal hidden directories and admin paths"),
         ("/sitemap.xml", "Sitemap", SEV_INFO,
          "Full site structure enumeration"),
+        ("/sitemap_index.xml", "Sitemap index", SEV_INFO,
+         "Sitemap index — enumerates all sitemaps"),
+        ("/humans.txt", "humans.txt", SEV_INFO,
+         "Developer credits — OSINT for social engineering"),
         ("/.well-known/security.txt", "Security.txt", SEV_INFO,
          "Security contact and disclosure policy"),
+        ("/security.txt", "security.txt (non-standard)", SEV_INFO,
+         "Security contact — non-.well-known location"),
+        ("/.well-known/openid-configuration",
+         "OpenID discovery", SEV_INFO,
+         "OIDC endpoints, supported scopes, issuer"),
+        ("/.well-known/oauth-authorization-server",
+         "OAuth discovery", SEV_INFO,
+         "OAuth2 server metadata"),
+        ("/.well-known/assetlinks.json",
+         "Android Asset Links", SEV_INFO,
+         "Digital asset links for Android app bindings"),
+        ("/.well-known/apple-app-site-association",
+         "iOS universal-links manifest", SEV_INFO,
+         "iOS universal-links — app bundle IDs + path mappings"),
+        # ── Server-status / info ────────────────────────────────────
         ("/server-status", "Apache server-status", SEV_HIGH,
          "Live request info, client IPs, internal paths"),
         ("/server-info", "Apache server-info", SEV_HIGH,
          "Full server configuration exposed"),
+        ("/nginx_status", "nginx stub_status", SEV_MEDIUM,
+         "Active connections and request counts"),
+        ("/stub_status", "nginx stub_status (alt)", SEV_MEDIUM,
+         "Active connections and request counts"),
+        ("/status", "Generic /status endpoint", SEV_INFO,
+         "Health/status endpoint — may expose build info"),
+        ("/.well-known/status", ".well-known/status", SEV_INFO,
+         "Status info at well-known location"),
         ("/phpinfo.php", "PHP info page", SEV_HIGH,
          "Server config, paths, loaded modules, environment"),
         ("/info.php", "PHP info page (alt)", SEV_HIGH,
          "Server config, paths, loaded modules, environment"),
-        ("/wp-json/wp/v2/users", "WordPress user enumeration", SEV_MEDIUM,
-         "Usernames and user IDs publicly accessible"),
-        ("/api/", "API root endpoint", SEV_INFO,
-         "API endpoint may expose documentation or data"),
-        ("/graphql", "GraphQL endpoint", SEV_MEDIUM,
-         "GraphQL introspection may expose full schema"),
-        ("/debug", "Debug endpoint", SEV_HIGH,
-         "Debug information and internal state exposed"),
-        ("/.htaccess", "Apache config exposed", SEV_MEDIUM,
-         "Rewrite rules, auth config, internal paths"),
-        ("/crossdomain.xml", "Flash crossdomain policy", SEV_LOW,
-         "Overly permissive Flash cross-origin policy"),
-        ("/backup/", "Backup directory", SEV_HIGH,
-         "Database dumps, source code backups"),
-        ("/admin/", "Admin panel", SEV_INFO,
-         "Administrative interface accessible"),
+        ("/test.php", "test.php file", SEV_MEDIUM,
+         "Developer test script — often phpinfo() or raw eval"),
+        # ── Debug / admin consoles ──────────────────────────────────
         ("/console", "Debug console", SEV_CRITICAL,
          "Interactive debug console (e.g., Werkzeug, Rails)"),
+        ("/__debug__/", "Debug console", SEV_CRITICAL,
+         "Django/debug_toolbar console"),
+        ("/debug", "Debug endpoint", SEV_HIGH,
+         "Debug information and internal state exposed"),
+        ("/_debugbar/", "Debugbar panel", SEV_HIGH,
+         "Laravel/Symfony debug bar exposed"),
         ("/elmah.axd", "ELMAH error log (.NET)", SEV_HIGH,
          "Full error logs with stack traces and request data"),
         ("/trace.axd", ".NET trace", SEV_HIGH,
          "Request tracing with headers, cookies, session data"),
-        ("/.svn/entries", "SVN metadata exposed", SEV_HIGH,
-         "Subversion repository structure and file listing"),
-        ("/WEB-INF/web.xml", "Java config exposed", SEV_CRITICAL,
-         "Servlet mappings, security constraints, database config"),
+        # ── Spring / Java actuators ─────────────────────────────────
+        ("/actuator", "Spring actuator root", SEV_HIGH,
+         "Spring Boot Actuator — lists all management endpoints"),
+        ("/actuator/env", "Spring actuator env", SEV_CRITICAL,
+         "Full environment incl. DB passwords and API keys"),
+        ("/actuator/heapdump", "Spring actuator heapdump", SEV_CRITICAL,
+         "Full JVM heap — secrets, sessions, DB conns in memory"),
+        ("/actuator/mappings", "Spring actuator mappings", SEV_MEDIUM,
+         "Complete list of URL → handler mappings"),
+        ("/actuator/trace", "Spring actuator trace", SEV_HIGH,
+         "Last 100 HTTP requests including auth headers"),
+        ("/actuator/httptrace", "Spring actuator httptrace", SEV_HIGH,
+         "Last HTTP traces — request / response bodies"),
+        ("/actuator/loggers", "Spring actuator loggers", SEV_MEDIUM,
+         "Logger configuration — modifiable via POST"),
+        ("/actuator/beans", "Spring actuator beans", SEV_MEDIUM,
+         "Enumerates every Spring bean — attack surface map"),
+        ("/actuator/configprops", "Spring actuator configprops",
+         SEV_HIGH, "Config properties with credentials redacted (or not)"),
+        ("/actuator/threaddump", "Spring actuator threaddump",
+         SEV_MEDIUM, "Full thread dump incl. stack traces"),
+        ("/actuator/info", "Spring actuator info", SEV_INFO,
+         "Build and git-commit info"),
+        ("/manage", "Spring legacy /manage", SEV_HIGH,
+         "Pre-Actuator management endpoint — same surface"),
+        ("/jolokia/", "Jolokia JMX HTTP bridge", SEV_CRITICAL,
+         "JMX over HTTP — pre-auth RCE on misconfig"),
+        # ── API / docs ──────────────────────────────────────────────
+        ("/api/", "API root endpoint", SEV_INFO,
+         "API endpoint may expose documentation or data"),
+        ("/api/v1/", "API v1 root", SEV_INFO,
+         "Versioned API root"),
+        ("/api/v2/", "API v2 root", SEV_INFO,
+         "Versioned API root"),
+        ("/swagger-ui.html", "Swagger UI", SEV_MEDIUM,
+         "API documentation UI — full endpoint catalog"),
+        ("/swagger-ui/", "Swagger UI (dir)", SEV_MEDIUM,
+         "API documentation UI — full endpoint catalog"),
+        ("/swagger/", "Swagger (dir)", SEV_MEDIUM,
+         "API documentation UI"),
+        ("/swagger.json", "Swagger/OpenAPI 2 spec", SEV_MEDIUM,
+         "Machine-readable API schema — full attack surface"),
+        ("/openapi.json", "OpenAPI 3 spec", SEV_MEDIUM,
+         "Machine-readable API schema"),
+        ("/v2/api-docs", "Springfox API docs", SEV_MEDIUM,
+         "Spring/Springfox auto-generated API spec"),
+        ("/v3/api-docs", "Springdoc API docs", SEV_MEDIUM,
+         "Springdoc auto-generated OpenAPI 3 spec"),
+        ("/api-docs", "Generic API docs", SEV_MEDIUM,
+         "Machine-readable API schema"),
+        # ── GraphQL ─────────────────────────────────────────────────
+        ("/graphql", "GraphQL endpoint", SEV_MEDIUM,
+         "GraphQL introspection may expose full schema"),
+        ("/graphiql", "GraphiQL IDE exposed", SEV_MEDIUM,
+         "Interactive GraphQL IDE — schema + query interface"),
+        ("/graphql-playground", "GraphQL Playground exposed",
+         SEV_MEDIUM, "Interactive GraphQL playground"),
+        ("/v1/graphql", "GraphQL v1", SEV_MEDIUM,
+         "Versioned GraphQL endpoint"),
+        # ── WordPress ───────────────────────────────────────────────
+        ("/wp-json/wp/v2/users", "WordPress user enumeration",
+         SEV_MEDIUM, "Usernames and user IDs publicly accessible"),
+        ("/wp-login.php", "WordPress login", SEV_INFO,
+         "Login endpoint — enables brute-force"),
+        ("/xmlrpc.php", "WordPress XML-RPC", SEV_MEDIUM,
+         "Brute-force amplification, pingback SSRF"),
+        ("/wp-content/debug.log", "WordPress debug log",
+         SEV_HIGH, "Debug output — paths, queries, errors"),
+        ("/readme.html", "WordPress readme", SEV_LOW,
+         "Exact WordPress version disclosure"),
+        # ── Admin panels ────────────────────────────────────────────
+        ("/admin/", "Admin panel", SEV_INFO,
+         "Administrative interface accessible"),
+        ("/administrator/", "Joomla admin", SEV_INFO,
+         "Joomla admin panel"),
+        ("/admin.php", "Generic admin.php", SEV_INFO,
+         "PHP-based admin panel"),
+        ("/login", "Generic /login", SEV_INFO,
+         "Login page exists at standard path"),
+        ("/user/login", "Drupal-style login", SEV_INFO,
+         "Drupal login page"),
+        # ── Backup archives ─────────────────────────────────────────
+        ("/backup/", "Backup directory", SEV_HIGH,
+         "Database dumps, source code backups"),
+        ("/backup.sql", "DB dump in document root",
+         SEV_CRITICAL, "Full DB dump downloadable"),
+        ("/backup.tar.gz", "tarball in document root",
+         SEV_CRITICAL, "Site/source backup"),
+        ("/backup.zip", "zip in document root",
+         SEV_CRITICAL, "Site/source backup"),
+        ("/db.sql", "Raw DB dump", SEV_CRITICAL,
+         "Full database SQL dump"),
+        ("/dump.sql", "Raw DB dump (alt)", SEV_CRITICAL,
+         "Full database SQL dump"),
+        # ── Cloud / runtime leaks ───────────────────────────────────
+        ("/.aws/credentials", "AWS credentials file", SEV_CRITICAL,
+         "AWS access key / secret exposed"),
+        ("/.aws/config", "AWS config file", SEV_HIGH,
+         "AWS region / profile leaked"),
+        ("/docker-compose.yml", "docker-compose.yml", SEV_HIGH,
+         "Container composition incl. secret env vars"),
+        ("/docker-compose.yaml", "docker-compose.yaml", SEV_HIGH,
+         "Container composition incl. secret env vars"),
+        ("/Dockerfile", "Dockerfile exposed", SEV_MEDIUM,
+         "Build instructions — reveals base image, cmd, env"),
+        ("/.dockerignore", ".dockerignore exposed", SEV_INFO,
+         "Build exclusion list"),
+        ("/kubernetes.yaml", "K8s manifest exposed", SEV_MEDIUM,
+         "Workload spec incl. secrets mount mapping"),
+        # ── IDE / editor artefacts ──────────────────────────────────
+        ("/.idea/workspace.xml", "IntelliJ workspace", SEV_MEDIUM,
+         "IDE workspace — paths, remote URLs, VCS config"),
+        ("/.vscode/settings.json", "VS Code settings",
+         SEV_LOW, "Editor settings — may contain secrets"),
+        ("/.vscode/sftp.json", "VS Code SFTP config", SEV_HIGH,
+         "SFTP deploy credentials"),
+        # ── Node / JS ecosystem ─────────────────────────────────────
+        ("/package.json", "package.json exposed", SEV_LOW,
+         "Node dependencies — attack-surface mapping"),
+        ("/package-lock.json", "package-lock.json", SEV_LOW,
+         "Full dependency tree incl. transitives"),
+        ("/yarn.lock", "yarn.lock exposed", SEV_LOW,
+         "Full dependency tree incl. transitives"),
+        # ── Python ecosystem ────────────────────────────────────────
+        ("/requirements.txt", "requirements.txt exposed",
+         SEV_LOW, "Python dependencies — attack-surface mapping"),
+        ("/Pipfile", "Pipfile exposed", SEV_LOW,
+         "Pipenv dependencies"),
+        ("/Pipfile.lock", "Pipfile.lock exposed", SEV_LOW,
+         "Pipenv full dependency tree"),
+        # ── PHP misc ────────────────────────────────────────────────
+        ("/composer.json", "composer.json exposed", SEV_LOW,
+         "PHP composer dependencies"),
+        ("/composer.lock", "composer.lock exposed", SEV_LOW,
+         "PHP composer full dependency tree"),
+        # ── Log files ───────────────────────────────────────────────
+        ("/access.log", "Access log exposed", SEV_HIGH,
+         "HTTP access log — client IPs, request patterns"),
+        ("/error.log", "Error log exposed", SEV_HIGH,
+         "Application error log with stack traces"),
+        ("/laravel.log", "Laravel log exposed", SEV_HIGH,
+         "Laravel error log — paths, queries, traces"),
+        ("/storage/logs/laravel.log", "Laravel log (in-app)",
+         SEV_HIGH, "Laravel error log"),
+        # ── CI / metadata leaks ─────────────────────────────────────
+        ("/.gitlab-ci.yml", ".gitlab-ci.yml exposed", SEV_MEDIUM,
+         "GitLab CI pipeline — deploy keys, stages"),
+        ("/.github/workflows/", "GitHub workflows exposed",
+         SEV_MEDIUM, "CI workflow files"),
+        ("/.travis.yml", ".travis.yml exposed", SEV_LOW,
+         "Travis CI config"),
+        ("/.circleci/config.yml", "CircleCI config exposed",
+         SEV_MEDIUM, "CircleCI pipeline config"),
     ]
 
     # Open redirect parameters to test
@@ -2824,30 +3061,163 @@ class VulnScanner:
                     break
         return findings
 
+    # Per-path content validators: given a path and the response body,
+    # returns True iff the body looks like the real artefact (not a
+    # soft-404 or login-wall). Only paths where blind HTTP-200 is
+    # noisy need a validator here.
+    _PATH_CONTENT_VALIDATORS = {
+        "/.git/HEAD": lambda b: "ref:" in b[:100] or _re_hex40.match(b.strip()),
+        "/.git/config": lambda b: "[core]" in b[:200] or "[remote" in b[:200],
+        "/.git/logs/HEAD": lambda b: _re_git_log.search(b[:500]) is not None,
+        "/.svn/entries": lambda b: b.strip()[:4].isdigit() or "<?xml" in b[:100],
+        "/.svn/wc.db": lambda b: b.startswith("SQLite format 3"),
+        "/.env": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.local": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.production": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.development": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.backup": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.bak": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.htpasswd": lambda b: ":" in b[:200] and _re_htpasswd.search(b[:2000]) is not None,
+        "/phpinfo.php": lambda b: "phpinfo()" in b[:5000] or "PHP Version" in b[:5000],
+        "/info.php": lambda b: "phpinfo()" in b[:5000] or "PHP Version" in b[:5000],
+        "/server-status": lambda b: "Apache Server Status" in b[:500] or "Total accesses" in b[:500],
+        "/server-info": lambda b: "Apache Server Information" in b[:500],
+        "/nginx_status": lambda b: b.strip().startswith("Active connections:"),
+        "/stub_status": lambda b: b.strip().startswith("Active connections:"),
+        "/swagger.json": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/openapi.json": lambda b: '"openapi"' in b[:200] or '"swagger"' in b[:200],
+        "/v2/api-docs": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/v3/api-docs": lambda b: '"openapi"' in b[:200],
+        "/api-docs": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/graphql": lambda b: "__schema" in b[:2000] or '"errors"' in b[:200] or "Must provide query" in b[:200],
+        "/graphiql": lambda b: "graphiql" in b[:5000].lower(),
+        "/graphql-playground": lambda b: "playground" in b[:5000].lower() and "graphql" in b[:5000].lower(),
+        "/actuator": lambda b: '"_links"' in b[:500],
+        "/actuator/env": lambda b: '"propertySources"' in b[:500] or '"activeProfiles"' in b[:500],
+        "/actuator/mappings": lambda b: '"mappings"' in b[:500] or '"contexts"' in b[:500],
+        "/actuator/beans": lambda b: '"beans"' in b[:500],
+        "/actuator/info": lambda b: b.strip().startswith("{") and len(b) > 5,
+        "/actuator/heapdump": lambda b: b.startswith("JAVA PROFILE") or b[:4] == "\x1f\x8b\x08\x00" or b[:8] == "JAVA PRO",
+        "/actuator/httptrace": lambda b: '"traces"' in b[:500],
+        "/actuator/trace": lambda b: '"traces"' in b[:500] or b.strip().startswith("["),
+        "/actuator/loggers": lambda b: '"loggers"' in b[:500],
+        "/actuator/configprops": lambda b: '"contexts"' in b[:500],
+        "/actuator/threaddump": lambda b: '"threads"' in b[:500],
+        "/jolokia/": lambda b: '"status"' in b[:200] and '"request"' in b[:500],
+        "/xmlrpc.php": lambda b: "XML-RPC server accepts POST" in b[:200],
+        "/.htaccess": lambda b: (
+            "RewriteEngine" in b[:500] or "AuthType" in b[:500]
+            or "Order " in b[:200] or "Allow " in b[:200]
+            or "Require " in b[:200]
+        ),
+        "/robots.txt": lambda b: "user-agent" in b[:500].lower(),
+        "/sitemap.xml": lambda b: "<urlset" in b[:500] or "<sitemapindex" in b[:500],
+        "/sitemap_index.xml": lambda b: "<sitemapindex" in b[:500],
+        "/.well-known/security.txt": lambda b: "contact:" in b[:500].lower(),
+        "/.well-known/openid-configuration": lambda b: '"issuer"' in b[:500],
+        "/.well-known/oauth-authorization-server": lambda b: '"issuer"' in b[:500],
+        "/crossdomain.xml": lambda b: "<cross-domain-policy" in b[:500],
+        "/wp-json/wp/v2/users": lambda b: b.strip().startswith("[") and ('"id":' in b[:500] or '"slug":' in b[:500]),
+        "/wp-login.php": lambda b: "wp-login" in b[:3000].lower() or "loginform" in b[:3000].lower(),
+        "/readme.html": lambda b: "WordPress" in b[:500],
+        "/elmah.axd": lambda b: "Error Log" in b[:500] or "ELMAH" in b[:500],
+        "/trace.axd": lambda b: "Application Trace" in b[:500] or "Trace.axd" in b[:200],
+        "/console": lambda b: (
+            "werkzeug" in b[:2000].lower()
+            or "rails" in b[:2000].lower()
+            or "console" in b[:500].lower() and "debug" in b[:500].lower()
+        ),
+        "/WEB-INF/web.xml": lambda b: "<web-app" in b[:500] or "<servlet" in b[:1000],
+        "/.aws/credentials": lambda b: "[default]" in b[:200] or "aws_access_key_id" in b[:500],
+        "/backup.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+            or "-- MySQL dump" in b[:200] or "-- PostgreSQL database dump" in b[:200]
+        ),
+        "/db.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+            or "-- MySQL dump" in b[:200]
+        ),
+        "/dump.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+        ),
+        "/package.json": lambda b: '"dependencies"' in b[:2000] or '"name"' in b[:200],
+        "/package-lock.json": lambda b: '"lockfileVersion"' in b[:500],
+        "/yarn.lock": lambda b: "# yarn lockfile" in b[:200] or b.lstrip().startswith("# THIS IS"),
+        "/requirements.txt": lambda b: _re_requirements.search(b[:1000]) is not None,
+        "/composer.json": lambda b: '"require"' in b[:1000] or '"name"' in b[:200],
+        "/composer.lock": lambda b: '"packages"' in b[:2000],
+        "/Dockerfile": lambda b: _re_dockerfile.search(b[:500]) is not None,
+        "/docker-compose.yml": lambda b: "version:" in b[:200] or "services:" in b[:200],
+        "/docker-compose.yaml": lambda b: "version:" in b[:200] or "services:" in b[:200],
+        "/kubernetes.yaml": lambda b: "apiVersion:" in b[:200] and "kind:" in b[:500],
+        "/.gitlab-ci.yml": lambda b: "stages:" in b[:500] or "script:" in b[:1000],
+        "/.travis.yml": lambda b: "language:" in b[:500] or "script:" in b[:1000],
+    }
+
+    # What HTTP statuses prove a path EXISTS on this server (not blanket 200).
+    # A few specific high-value endpoints (like actuator/env) typically
+    # answer 401/403 when protected — still a finding because the
+    # endpoint exists and protection is the only thing between the
+    # attacker and it.
+    _AUTH_WALL_EXISTS = frozenset((
+        "/actuator", "/actuator/env", "/actuator/heapdump",
+        "/actuator/mappings", "/actuator/trace", "/actuator/httptrace",
+        "/actuator/loggers", "/actuator/beans", "/actuator/configprops",
+        "/actuator/threaddump", "/actuator/info",
+        "/manage", "/jolokia/",
+        "/server-status", "/server-info", "/nginx_status", "/stub_status",
+        "/elmah.axd", "/trace.axd",
+        "/_debugbar/", "/__debug__/",
+    ))
+
     def _check_sensitive_paths(self, base_url: str) -> List[dict]:
         """Probe for exposed sensitive files and directories.
 
-        Uses domain circuit breaker — if the site is actively blocking us,
-        stops probing after BLOCK_THRESHOLD failures instead of trying all 26 paths.
-
-        Soft-404 detection: many sites return HTTP 200 for nonexistent paths
-        with a generic "not found" page. We first fetch a known-nonexistent path
-        to get the baseline 404 page length, then compare against it.
+        Two-pass: HEAD first, GET only on promising responses. Soft-404
+        and per-path content validation filter out the mountain of false
+        positives we'd get from a blind "HTTP 200 = vuln" rule on a
+        site that wildcards everything to a SPA shell.
         """
         findings = []
         domain = urlparse(base_url).netloc
         total = len(self.SENSITIVE_PATHS)
         skipped = 0
+        hits = 0
 
-        # Soft-404 baseline: fetch a random path that definitely doesn't exist
+        # Soft-404 baseline — hash the 'this path does not exist' body so
+        # we can detect template-identical soft-404s even when their
+        # length jitters by a few bytes.
         _baseline_url = urljoin(base_url, f"/gs_nonexistent_{secrets.token_hex(4)}")
         _baseline_resp = self._session.get(_baseline_url, allow_wayback=False, method="GET")
-        _soft404_length = len(_baseline_resp.text) if _baseline_resp and _baseline_resp.status_code == 200 else -1
+        if _baseline_resp and _baseline_resp.status_code == 200 and _baseline_resp.text:
+            _baseline_body = _baseline_resp.text
+            _soft404_length = len(_baseline_body)
+            # Hash the first ~4KB so tiny dynamic bits (timestamps, CSRF
+            # tokens) don't ruin the comparison.
+            _soft404_head = hashlib.sha256(_baseline_body[:4096].encode("utf-8", "ignore")).hexdigest()
+        else:
+            _soft404_length = -1
+            _soft404_head = None
         _soft404_patterns = re.compile(
-            r"not\s*found|404|page\s*(does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
+            r"not\s*found|page\s*(?:does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
             r"this\s*page\s*could\s*not|we\s*couldn.t\s*find|error\s*404",
             re.I
         )
+
+        def _looks_like_soft_404(body: str) -> bool:
+            if not body:
+                return False
+            if _soft404_length > 0 and abs(len(body) - _soft404_length) < 200:
+                # Confirm template match via head hash
+                head_hash = hashlib.sha256(body[:4096].encode("utf-8", "ignore")).hexdigest()
+                if _soft404_head == head_hash:
+                    return True
+                # Close in length AND the body says "not found" → soft-404
+                if _soft404_patterns.search(body[:1500]):
+                    return True
+            if _soft404_patterns.search(body[:1500]) and len(body) < 3000:
+                return True
+            return False
 
         for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
@@ -2858,40 +3228,79 @@ class VulnScanner:
 
             url = urljoin(base_url, path)
             resp = self._session.get(url, allow_wayback=False, method="HEAD")
-            if resp and resp.status_code == 200:
-                if severity in (SEV_CRITICAL, SEV_HIGH):
-                    resp_full = self._session.get(url, allow_wayback=False)
-                    if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
-                        body = resp_full.text
-                        # Soft-404 check: skip if body matches baseline or has 404 patterns
-                        if _soft404_length > 0 and abs(len(body) - _soft404_length) < 100:
+            if not resp:
+                continue
+
+            status = resp.status_code
+            # "Auth wall exists" is itself a finding for a small set of
+            # endpoints where the fact that /actuator/env answers at all
+            # (even with 401) means the endpoint is mounted.
+            auth_wall_hit = (
+                status in (401, 403)
+                and path in self._AUTH_WALL_EXISTS
+            )
+            if status == 200 or auth_wall_hit:
+                if auth_wall_hit:
+                    findings.append({
+                        "severity": severity,
+                        "title": f"{title} (auth-walled)",
+                        "detail": (f"{detail} — endpoint exists at {path} but "
+                                   f"returns HTTP {status}. Test with "
+                                   f"default creds / bearer tokens / the "
+                                   f"Actuator default port (8081)."),
+                        "evidence": f"HTTP {status} at {path}",
+                        "path": path,
+                        "exploitable": severity in (SEV_CRITICAL, SEV_HIGH),
+                        "exploit_info": {
+                            "type": "auth_walled_endpoint",
+                            "path": path,
+                            "method": (f"Endpoint {path} is mounted but "
+                                       f"requires auth. Try default creds, "
+                                       f"JWT leaks, or direct access "
+                                       f"from inside the network."),
+                            "risk": "Information disclosure if auth weak",
+                        } if severity in (SEV_CRITICAL, SEV_HIGH) else {},
+                    })
+                    hits += 1
+                    continue
+
+                # HTTP 200: verify content to avoid soft-404 false positives.
+                resp_full = self._session.get(url, allow_wayback=False)
+                if not resp_full or resp_full.status_code != 200:
+                    continue
+                body = resp_full.text or ""
+                if len(body) < 2 and path not in ("/.git/HEAD", "/.env"):
+                    continue
+
+                if _looks_like_soft_404(body):
+                    continue
+
+                validator = self._PATH_CONTENT_VALIDATORS.get(path)
+                if validator is not None:
+                    try:
+                        if not validator(body):
                             continue
-                        if _soft404_patterns.search(body[:1000]):
-                            continue
-                        # For git/env, verify content looks real
-                        if path == "/.git/HEAD" and "ref:" not in body[:100]:
-                            continue
-                        if path == "/.env" and "=" not in body[:500]:
-                            continue
-                        findings.append({"severity": severity, "title": title,
-                                         "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                         "path": path, "content_length": len(body)})
-                else:
-                    # For INFO/LOW/MEDIUM: check for soft-404 to avoid false positives
-                    # on sites that return 200 with generic pages for every path
-                    if severity in (SEV_INFO, SEV_LOW, SEV_MEDIUM) and _soft404_length > 0:
-                        resp_check = self._session.get(url, allow_wayback=False)
-                        if resp_check:
-                            if abs(len(resp_check.text) - _soft404_length) < 100:
-                                continue
-                            if _soft404_patterns.search(resp_check.text[:1000]):
-                                continue
-                    findings.append({"severity": severity, "title": title,
-                                     "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                     "path": path})
+                    except Exception:
+                        continue
+                elif severity in (SEV_CRITICAL, SEV_HIGH):
+                    # No validator + high-severity = be conservative:
+                    # require the body NOT be an HTML shell (SPAs serve
+                    # the same index.html for every path).
+                    low_head = body[:256].lstrip().lower()
+                    if low_head.startswith("<!doctype html") or low_head.startswith("<html"):
+                        continue
+
+                findings.append({
+                    "severity": severity, "title": title,
+                    "detail": detail, "evidence": f"HTTP 200 at {path}",
+                    "path": path, "content_length": len(body),
+                })
+                hits += 1
 
         if skipped:
             print(f"        (skipped {skipped} paths — site is blocking probes)")
+        if hits:
+            print(f"        (confirmed {hits}/{total - skipped} sensitive path(s))")
         return findings
 
     def _check_http_methods(self, base_url: str) -> List[dict]:
