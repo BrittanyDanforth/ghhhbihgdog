@@ -2679,7 +2679,14 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     # ── Target URL override ──
     custom_url = prompt("Override target URL (or Enter to use detected)", "")
     if custom_url.strip():
-        base_url = custom_url.strip()
+        custom_url = custom_url.strip().rstrip("/")
+        # Accept either a full URL or a bare host — the rest of the
+        # walkthrough assumes base_url has a scheme so urlparse().netloc
+        # works. Defaulting to https:// is safer than http://.
+        if not (custom_url.startswith("http://") or
+                custom_url.startswith("https://")):
+            custom_url = f"https://{custom_url}"
+        base_url = custom_url
         audit.log("url_override", f"target changed to: {base_url[:60]}")
         ok(f"Target URL set to: {base_url}")
         print()
