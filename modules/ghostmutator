@@ -210,22 +210,21 @@ def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str
 
 
 def obfuscate_strings(tree: ast.Module, rng: random.Random) -> None:
-    """Add zero-width spaces to string literals randomly."""
+    """Add zero-width spaces to string literals randomly.
+
+    Python 3.8 unified string literals under ast.Constant; ast.Str was
+    formally removed in 3.12 (type reference raises AttributeError). We
+    only visit ast.Constant here — that covers every supported version
+    (3.8+) of this toolkit and avoids referencing the removed type.
+    """
     class StringObfuscator(ast.NodeTransformer):
-        def visit_Str(self, node: ast.Str) -> ast.Str:
-            # Legacy AST node (Python < 3.8)
-            if rng.random() < 0.3 and len(node.s) > 5:
-                idx = rng.randint(1, len(node.s) - 1)
-                node.s = node.s[:idx] + ZERO_WIDTH + node.s[idx:]
-            return node
-        
         def visit_Constant(self, node: ast.Constant) -> ast.Constant:
-            # Modern AST node (Python >= 3.8)
-            if isinstance(node.value, str) and rng.random() < 0.3 and len(node.value) > 5:
+            if (isinstance(node.value, str) and
+                    rng.random() < 0.3 and len(node.value) > 5):
                 idx = rng.randint(1, len(node.value) - 1)
                 node.value = node.value[:idx] + ZERO_WIDTH + node.value[idx:]
             return node
-    
+
     StringObfuscator().visit(tree)
 
 
