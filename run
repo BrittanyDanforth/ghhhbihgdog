@@ -4942,15 +4942,15 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "validate": _hh_check,
              "note": "Legit Host + malicious X-Forwarded-Host often bypasses "
                      "validators that only check Host"},
-            {"title": "Password-reset-style probe",
-             "request": _get(
-                 urljoin(base_url, "/password/reset"),
-                 extra_headers={"Host": _hh_marker},
-                 allow_redirects=False,
-             ),
-             "validate": _hh_check,
-             "warning": "May trigger a password-reset email if POST is not required",
-             "note": "Target common password-reset routes that build links from Host"},
+            {"title": "Manual: test against the real reset flow",
+             "note": ("Many password-reset handlers build the reset "
+                      "email's link from the Host: header. Once you've "
+                      "confirmed above that Host reflects, exercise "
+                      "the REAL reset form manually — don't let the "
+                      "scanner fire it. Use a throwaway email with "
+                      "your chosen Host: header and watch the email "
+                      "for a link pointing at the marker host."),
+             "request": None},
         ]
 
     elif etype == "http_verb_tampering":

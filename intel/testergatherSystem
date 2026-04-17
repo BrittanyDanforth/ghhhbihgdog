@@ -3337,7 +3337,10 @@ class VulnScanner:
         "/.git/config": lambda b: "[core]" in b[:200] or "[remote" in b[:200],
         "/.git/logs/HEAD": lambda b: _re_git_log.search(b[:500]) is not None,
         "/.svn/entries": lambda b: b.strip()[:4].isdigit() or "<?xml" in b[:100],
-        "/.svn/wc.db": lambda b: b.startswith("SQLite format 3"),
+        # SQLite's magic bytes are "SQLite format 3\0"; once decoded
+        # as text the NUL survives, but we only check the printable
+        # prefix to stay resilient to charset coercion.
+        "/.svn/wc.db": lambda b: "SQLite format 3" in b[:32],
         "/.env": lambda b: _re_env_line.search(b[:2000]) is not None,
         "/.env.local": lambda b: _re_env_line.search(b[:2000]) is not None,
         "/.env.production": lambda b: _re_env_line.search(b[:2000]) is not None,
@@ -3364,7 +3367,14 @@ class VulnScanner:
         "/actuator/mappings": lambda b: '"mappings"' in b[:500] or '"contexts"' in b[:500],
         "/actuator/beans": lambda b: '"beans"' in b[:500],
         "/actuator/info": lambda b: b.strip().startswith("{") and len(b) > 5,
-        "/actuator/heapdump": lambda b: b.startswith("JAVA PROFILE") or b[:4] == "\x1f\x8b\x08\x00" or b[:8] == "JAVA PRO",
+        # HPROF heap dumps start with 'JAVA PROFILE 1.0.1\0' (or .2).
+        # Gzipped dumps start with gzip magic \x1f\x8b; once text-
+        # decoded that becomes two ASCII bytes we can pin via
+        # chr() to avoid literal control chars in source.
+        "/actuator/heapdump": lambda b: (
+            "JAVA PROFILE" in b[:32]
+            or b[:2] == "\x1f\x8b"
+        ),
         "/actuator/httptrace": lambda b: '"traces"' in b[:500],
         "/actuator/trace": lambda b: '"traces"' in b[:500] or b.strip().startswith("["),
         "/actuator/loggers": lambda b: '"loggers"' in b[:500],
@@ -4783,18 +4793,20 @@ class VulnScanner:
         return findings
 
     def _check_login_forms(self, base_url: str, html: str) -> List[dict]:
-        """Detect authentication forms + test if they rate-limit.
+        """Detect authentication forms + test whether they rate-limit.
 
         Signals:
-        1. The form exists and has a <input type="password"> — enum.
-        2. Ten consecutive wrong-password POSTs don't progressively
-           delay or return 429 — brute-force-friendly.
-        3. The login response body changes length between
-           'correct username, wrong password' and 'wrong username,
-           wrong password' — user-enumeration oracle.
+        1. Form exists with <input type="password"> — INFO finding,
+           captures the field names / hidden-token fields so the
+           walkthrough can build a hydra-friendly brute-force command.
+        2. 4 consecutive wrong-password POSTs (with a clearly-fake
+           throwaway username) all return the same status + near-
+           identical body length and no 429 — MEDIUM
+           'brute_force_viable' finding.
 
-        The enumeration probe uses throwaway usernames so real users
-        don't get locked out.
+        The throwaway username is 'gsprobe<hex>notareal' so no real
+        account can ever get locked by the probe. The probe loop
+        stops early on 429.
         """
         findings = []
         if not HAS_BS4 or not html:
@@ -6868,7 +6880,7 @@ class IntelOrchestrator:
         # Quick exploitable summary grouped by type — tells the operator
         # which walkthrough branches are worth opening before they dig
         # through the full report.
-        _dedup_vulns = self._vulns._dedup_findings(self._vuln_findings)
+        _dedup_vulns = self._dedup_findings(self._vuln_findings)
         by_type: Dict[str, int] = defaultdict(int)
         for v in _dedup_vulns:
             if not v.get("exploitable"):
