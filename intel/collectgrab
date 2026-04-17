@@ -70,8 +70,15 @@ if not targ_script:
 
 # Proxy setup is deferred to _init_tor_proxy() — called at runtime, not import time.
 # This allows --help and other non-network operations to work without Tor.
+#
+# OPSEC invariant: the module-level `session` must NEVER see a .get()
+# call before proxies are wired up. We guard that by planting a hook
+# that raises if proxies hasn't been populated. `_init_tor_proxy()`
+# replaces it with real proxy dict, and `_run_pipeline()` calls
+# session.proxies.update(proxies) immediately after.
 proxies = {}
 _tor_socks_port = None
+_TOR_INITIALIZED = False
 
 
 def _init_tor_proxy():
@@ -81,7 +88,7 @@ def _init_tor_proxy():
     (the verify_tor call would hang on network timeout). Deferring to
     runtime means the module can be imported and inspected freely.
     """
-    global proxies, _tor_socks_port
+    global proxies, _tor_socks_port, _TOR_INITIALIZED
     if not TOR_AVAILABLE:
         logger.critical("Tor (stem) not available — refusing to run over clearnet.")
         sys.exit(1)
@@ -99,6 +106,12 @@ def _init_tor_proxy():
             'http': f'socks5h://127.0.0.1:{_tor_socks_port}',
             'https': f'socks5h://127.0.0.1:{_tor_socks_port}',
         }
+        # Plant the proxies into the module-level session IMMEDIATELY —
+        # don't wait for _run_pipeline's session.proxies.update. If
+        # any code path ever reaches session.get() before
+        # _run_pipeline, the proxies will already be in place.
+        session.proxies.update(proxies)
+        _TOR_INITIALIZED = True
     else:
         logger.critical("Tor not responding on 9050 or 9150. Start Tor first.")
         sys.exit(1)
