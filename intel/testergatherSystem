@@ -2603,10 +2603,11 @@ class VulnScanner:
     def _check_cors(self, url: str, headers: dict) -> List[dict]:
         """Check for CORS misconfiguration."""
         findings = []
-        acao = headers.get("Access-Control-Allow-Origin", headers.get("access-control-allow-origin", ""))
+        h_lower = {k.lower(): v for k, v in headers.items()}
+        acao = h_lower.get("access-control-allow-origin", "")
 
         if acao == "*":
-            acac = headers.get("Access-Control-Allow-Credentials", "").lower()
+            acac = h_lower.get("access-control-allow-credentials", "").lower()
             sev = SEV_HIGH if acac == "true" else SEV_MEDIUM
             findings.append({
                 "severity": sev,
@@ -2644,17 +2645,24 @@ class VulnScanner:
         return findings
 
     def _check_info_disclosure(self, headers: dict, html: str) -> List[dict]:
-        """Check for information disclosure in headers and HTML."""
+        """Check for information disclosure in headers and HTML.
+
+        HTTP header names are case-insensitive (RFC 9110 §5.1), but
+        plain-dict lookups are not. Build a lower-keyed snapshot so a
+        server emitting 'server:' instead of 'Server:' doesn't silently
+        slip past these checks.
+        """
         findings = []
+        h_lower = {k.lower(): v for k, v in headers.items()}
 
         # Server version strings
-        server = headers.get("Server", "")
+        server = h_lower.get("server", "")
         if server and re.search(r"\d+\.\d+", server):
             findings.append({"severity": SEV_LOW, "title": "Server version disclosed",
                              "detail": f"Server header reveals version info. Aids attacker reconnaissance.",
                              "evidence": f"Server: {server[:80]}"})
 
-        powered = headers.get("X-Powered-By", "")
+        powered = h_lower.get("x-powered-by", "")
         if powered:
             findings.append({"severity": SEV_LOW, "title": "X-Powered-By header present",
                              "detail": "Technology stack revealed. Remove this header.",
@@ -2662,7 +2670,7 @@ class VulnScanner:
 
         # Debug headers
         for debug_h in ["X-Debug-Token", "X-Debug-Info", "X-Debug-Link"]:
-            if debug_h in headers or debug_h.lower() in {k.lower() for k in headers}:
+            if debug_h.lower() in h_lower:
                 findings.append({"severity": SEV_HIGH, "title": f"Debug header present: {debug_h}",
                                  "detail": "Debug mode likely enabled in production.",
                                  "evidence": f"{debug_h} header found"})
@@ -5219,15 +5227,32 @@ def main():
 
     # ── Input validation ──
     if args.domain:
-        # Normalize domain: strip protocol, trailing path, whitespace
+        # Normalize: strip protocol + path + fragment; drop optional
+        # userinfo; preserve any explicit :port so non-standard-port
+        # targets still scan. The previous hostname-only regex rejected
+        # 'example.com:8080' outright, which made it impossible to scan
+        # dev/staging/internal services that listen off 80/443.
         d = args.domain.strip().lower()
         if d.startswith("http://") or d.startswith("https://"):
             d = urlparse(d).netloc or d
         d = d.split("/")[0].split("?")[0].split("#")[0]
-        if not re.match(r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$", d):
+        if "@" in d:
+            d = d.rsplit("@", 1)[1]
+        host, port = d, None
+        if ":" in d:
+            host, _, port_str = d.rpartition(":")
+            if port_str.isdigit() and 1 <= int(port_str) <= 65535:
+                port = port_str
+            else:
+                host = d  # colon wasn't a port; let the regex reject it
+                port = None
+        if not re.match(
+            r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$",
+            host,
+        ):
             print(f"  [!] Invalid domain: {d[:40]}")
             sys.exit(1)
-        args.domain = d
+        args.domain = f"{host}:{port}" if port else host
 
     if args.email:
         e = args.email.strip()
