@@ -180,7 +180,13 @@ class Renamer(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str:
-    """Insert junk comments roughly every N lines to fuzz hash."""
+    """Insert junk comments roughly every `every_n` lines to fuzz hash.
+
+    Each source line gets a junk comment appended with probability
+    1/every_n (clamped to avoid div-by-zero), so the expected gap between
+    injections is ~every_n lines while keeping the per-line decision
+    deterministic under a seeded RNG.
+    """
     lines = src.splitlines()
     junk_prefixes = ["TODO", "FIXME", "HACK", "NOTE", "DEBUG", "OPTIMIZE", "REFACTOR"]
     junk_suffixes = [
@@ -188,37 +194,37 @@ def inject_junk_comments(src: str, rng: random.Random, every_n: int = 40) -> str
         "temporary workaround", "performance bottleneck?",
         "¯\\_(ツ)_/¯", "( ͡° ͜ʖ ͡°)", "🤔", "🚀"
     ]
-    
+
+    prob = 1.0 / max(int(every_n), 1)
     out: List[str] = []
     for idx, line in enumerate(lines, 1):
         out.append(line)
-        if rng.random() < 0.08:
+        if rng.random() < prob:
             prefix = rng.choice(junk_prefixes)
             suffix = rng.choice(junk_suffixes)
             garbage = f"{prefix}: {rand_name(rng, 8)} - {suffix}"
             indent = len(line) - len(line.lstrip())
             out.append(" " * indent + f"# {garbage}")
-    
+
     return "\n".join(out)
 
 
 def obfuscate_strings(tree: ast.Module, rng: random.Random) -> None:
-    """Add zero-width spaces to string literals randomly."""
+    """Add zero-width spaces to string literals randomly.
+
+    Python 3.8 unified string literals under ast.Constant; ast.Str was
+    formally removed in 3.12 (type reference raises AttributeError). We
+    only visit ast.Constant here — that covers every supported version
+    (3.8+) of this toolkit and avoids referencing the removed type.
+    """
     class StringObfuscator(ast.NodeTransformer):
-        def visit_Str(self, node: ast.Str) -> ast.Str:
-            # Legacy AST node (Python < 3.8)
-            if rng.random() < 0.3 and len(node.s) > 5:
-                idx = rng.randint(1, len(node.s) - 1)
-                node.s = node.s[:idx] + ZERO_WIDTH + node.s[idx:]
-            return node
-        
         def visit_Constant(self, node: ast.Constant) -> ast.Constant:
-            # Modern AST node (Python >= 3.8)
-            if isinstance(node.value, str) and rng.random() < 0.3 and len(node.value) > 5:
+            if (isinstance(node.value, str) and
+                    rng.random() < 0.3 and len(node.value) > 5):
                 idx = rng.randint(1, len(node.value) - 1)
                 node.value = node.value[:idx] + ZERO_WIDTH + node.value[idx:]
             return node
-    
+
     StringObfuscator().visit(tree)
 
 
@@ -415,9 +421,21 @@ def main():
         print(f"[!] Source file not found: {args.source}")
         sys.exit(1)
     
-    # Default output path
+    # Default output path — seed the RNG from the session entropy seed so
+    # the filename is reproducible within a session (matches the rest of
+    # the toolkit's deterministic-per-session contract). Falls back to a
+    # fresh random name if the seed isn't available yet.
     if not args.out:
-        rnd = rand_name(random.Random(), 6)
+        try:
+            _seed_blob = json.loads(args.seed.read_text())
+            _seed_bytes = bytes.fromhex(_seed_blob.get("seed_hex", ""))
+            _name_rng = random.Random(
+                hashlib.sha256(b"ghostmutator:name:" + _seed_bytes
+                               + args.source.name.encode()).digest()
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            _name_rng = random.Random()
+        rnd = rand_name(_name_rng, 6)
         args.out = _TOOLKIT_ROOT / "runtime" / f"{args.source.stem}_{rnd}.py"
     
     mutate(args.source, args.out, args.seed, write_manifest=args.manifest)

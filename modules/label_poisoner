@@ -154,23 +154,21 @@ def validate_label_data(data: Dict[str, Any]) -> None:
 
 
 def generate_seed_from_hashes(seed_sha: str, dag_sha: str, lbl_sha: str) -> int:
-    """Generate a deterministic seed from multiple hash strings."""
-    try:
-        # Combine hashes and take first 32 hex chars
-        combined = seed_sha + dag_sha + lbl_sha
-        if len(combined) < 32:
-            # If somehow we don't have enough data, pad with zeros
-            combined = combined.ljust(32, '0')
-        
-        # Convert to integer, handling potential errors
-        seed_hex = combined[:32]
-        return int(seed_hex, 16)
-        
-    except ValueError as e:
-        print(f"[!] Error generating seed from hashes: {e}")
-        # Fallback to a hash of the combined string
-        fallback_hash = hashlib.sha256(combined.encode()).hexdigest()
-        return int(fallback_hash[:32], 16)
+    """Generate a deterministic seed from multiple hash strings.
+
+    The original implementation took the first 32 hex chars of
+    seed_sha + dag_sha + lbl_sha. Since each of those is a 64-char
+    SHA-256 hex digest, the first 32 chars are always entirely from
+    seed_sha — dag_sha and lbl_sha had no effect on the seed. That
+    made poisoning identical across different DAGs / label sets,
+    defeating the whole point of mixing all three inputs.
+
+    Now we hash all three digests together and derive the 128-bit seed
+    from the result so every input actually contributes.
+    """
+    combined = f"{seed_sha}:{dag_sha}:{lbl_sha}".encode()
+    digest = hashlib.sha256(combined).hexdigest()
+    return int(digest[:32], 16)
 
 
 def create_extra_field_value(meta: Dict[str, Any], rng: random.Random) -> str:
@@ -275,6 +273,7 @@ Examples:
 
     # Process each label entry
     processed_count = 0
+    error_count = 0
     for nid, meta in labels_data["labels"].items():
         try:
             # Create a deep copy to avoid modifying original
@@ -305,15 +304,22 @@ Examples:
             
             poisoned["labels"][nid] = new_meta
             processed_count += 1
-            
+
         except Exception as e:
             print(f"[!] Error processing label entry '{nid}': {e}")
-            # Continue with other entries rather than failing completely
-            continue
+            # Continue with other entries rather than failing completely,
+            # but remember that this happened — a partial output is a
+            # silent fingerprint (some nodes poisoned, some not).
+            error_count += 1
 
+    total_entries = len(labels_data["labels"])
     if processed_count == 0:
         print("[!] No label entries were successfully processed")
         sys.exit(1)
+    if error_count:
+        print(f"[!] {error_count}/{total_entries} entries failed to poison. "
+              f"Output is partial — unpoisoned nodes are a fingerprint.")
+        sys.exit(2)
 
     print(f"[*] Writing output to {args.out}...")
     try:

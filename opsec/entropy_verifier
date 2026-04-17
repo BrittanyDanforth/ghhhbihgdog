@@ -4,16 +4,19 @@ entropy_verifier — Verify entropy seed integrity
 ==================================================
 Validates that an entropy_seed.json bundle:
   1. Exists and is valid JSON
-  2. Has required fields (seed_hex, sha256, timestamp)
-  3. sha256 matches the actual seed_hex content
-  4. Seed has sufficient entropy (min 256 bits)
-  5. Seed is not all zeros or a known weak pattern
-  6. File permissions are 0600 (owner-only)
-  7. Optionally verify against a GPG signature
+  2. Has the fields for its format:
+       - SML/manual format: seed_hex + sha256 (+ optional timestamp)
+       - en_seeder format:  sha256 + sources (+ created_utc + seed_hex)
+  3. The sha256 matches the actual content (seed_hex bytes in SML format,
+     or canonical-JSON bundle hash in en_seeder format)
+  4. Seed has sufficient Shannon entropy (`--min-bits`, default 256)
+  5. Seed isn't all zeros / all 0xFF / a single repeating byte /
+     sequential bytes
+  6. File permissions are 0o600 (owner-only); warns otherwise
 
 Usage:
-    python3 entropy_verifier entropy_seed.json
-    python3 entropy_verifier entropy_seed.json --strict
+    python3 opsec/entropy_verifier entropy_seed.json
+    python3 opsec/entropy_verifier entropy_seed.json --strict
 """
 # NETWORK: This module operates locally only. No network access.
 import argparse, hashlib, json, math, os, sys, stat
@@ -181,9 +184,14 @@ def main():
     elif created_utc:
         print(f"  [*] Created: {created_utc}")
 
-    # Check extra fields
-    sources = data.get("sources", [])
-    if sources:
+    # Check extra fields. en_seeder writes `sources` as a dict (field
+    # name -> value/hash); SML/manual format may use a list. Handle both
+    # so "Entropy sources: N" is the number of independent inputs.
+    sources = data.get("sources")
+    if isinstance(sources, dict):
+        print(f"  [*] Entropy sources: {len(sources)} ({', '.join(sorted(sources)[:6])}"
+              f"{'...' if len(sources) > 6 else ''})")
+    elif isinstance(sources, list) and sources:
         print(f"  [*] Entropy sources: {len(sources)}")
 
     # Summary

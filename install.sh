@@ -64,10 +64,32 @@ else
 fi
 
 # ── Step 2: Start Tor BEFORE downloading anything ─────────────────────────
-# OPSEC: pip install downloads from PyPI. If the tor_firewall is active,
-# traffic goes through Tor automatically. But Tor must be RUNNING first.
+# OPSEC: every subsequent download — PyPI wheels, get-pip.py, monero tarball —
+# MUST go through Tor. A clearnet fallback on a privacy toolkit is
+# a bug, not a fallback. This section:
+#   1. Verifies Tor is already running; OR
+#   2. Tries to start it via systemctl/service and waits for
+#      'Bootstrapped 100%' from the Tor log (up to 90 s); OR
+#   3. Aborts. --allow-clearnet is the ONLY way to continue without Tor,
+#      and is intended for a system that already has the tor_firewall
+#      active (so the kernel itself enforces Tor-only egress).
+#
+# Systemd/service start alone is not enough — Tor takes 15-60 s to
+# bootstrap, and a SOCKS port that's open but hasn't connected yet will
+# silently fail every request.
 echo ""
 echo "  [2/6] Tor (starting before downloads)..."
+
+ALLOW_CLEARNET=false
+for _a in "$@"; do
+    case "$_a" in
+        --allow-clearnet)
+            ALLOW_CLEARNET=true
+            warn "--allow-clearnet: downloads will NOT go through Tor."
+            warn "Only use this if tor_firewall.sh is already active."
+            ;;
+    esac
+done
 
 if [ -f /etc/tor/torrc ]; then
     if ! grep -qE "^\s*ControlPort\s+9051" /etc/tor/torrc 2>/dev/null; then
@@ -80,10 +102,19 @@ if [ -f /etc/tor/torrc ]; then
     fi
 fi
 
+# Shared verification probe. Returns 0 iff SOCKS on $1 reaches a site
+# that confirms we're exiting via Tor.
+_probe_tor() {
+    local port="$1"
+    curl -s --max-time 8 --connect-timeout 5 \
+         --socks5-hostname "127.0.0.1:${port}" \
+         https://check.torproject.org/api/ip 2>/dev/null \
+        | grep -q '"IsTor":true'
+}
+
 TOR_RUNNING=false
 for TOR_PORT in 9050 9150; do
-    if curl -s --max-time 5 --connect-timeout 3 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
-       https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+    if _probe_tor "$TOR_PORT"; then
         ok "Tor verified (port ${TOR_PORT})"
         TOR_RUNNING=true
         break
@@ -91,20 +122,65 @@ for TOR_PORT in 9050 9150; do
 done
 
 if [ "$TOR_RUNNING" = false ]; then
-    warn "Tor not responding. Trying to start..."
-    sudo systemctl start tor 2>/dev/null || sudo service tor start 2>/dev/null || true
-    sleep 3
-    for TOR_PORT in 9050 9150; do
-        if curl -s --max-time 10 --connect-timeout 5 --socks5-hostname "127.0.0.1:${TOR_PORT}" \
-           https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
-            ok "Tor started (port ${TOR_PORT})"
-            TOR_RUNNING=true
-            break
+    warn "Tor not responding. Attempting to start + wait for bootstrap..."
+    # systemctl first, fall back to service, fall back to background tor.
+    _started=false
+    if command -v systemctl &>/dev/null; then
+        if sudo systemctl start tor 2>/dev/null; then
+            _started=true
         fi
+    fi
+    if [ "$_started" = false ] && command -v service &>/dev/null; then
+        if sudo service tor start 2>/dev/null; then
+            _started=true
+        fi
+    fi
+    if [ "$_started" = false ]; then
+        warn "Could not start tor via systemctl or service. Check 'sudo systemctl status tor'."
+    fi
+
+    # Wait up to 90 s for a SOCKS port to verify. 3 s was never enough —
+    # a cold Tor bootstrap (build 3 circuits, reach guard, reach dir) takes
+    # 10-60 s on a good connection. On VPN/bridge it's longer.
+    dim "Waiting for Tor to bootstrap..."
+    for _i in $(seq 1 18); do
+        for TOR_PORT in 9050 9150; do
+            if _probe_tor "$TOR_PORT"; then
+                ok "Tor reachable (port ${TOR_PORT}) after ${_i}x5s"
+                TOR_RUNNING=true
+                break 2
+            fi
+        done
+        sleep 5
     done
+    # Also try to show the last 5 lines of the Tor log so the operator
+    # isn't flying blind.
     if [ "$TOR_RUNNING" = false ]; then
-        warn "Tor is NOT running. Downloads will use clearnet."
-        warn "For OPSEC: start Tor first, then re-run install.sh"
+        for _logfile in /var/log/tor/notices.log /var/log/tor/log /var/log/tor/tor.log; do
+            if [ -r "$_logfile" ]; then
+                dim "last 5 lines of $_logfile:"
+                sudo tail -5 "$_logfile" 2>/dev/null | sed 's/^/        /'
+                break
+            fi
+        done
+    fi
+fi
+
+if [ "$TOR_RUNNING" = false ]; then
+    if [ "$ALLOW_CLEARNET" = true ]; then
+        warn "Proceeding without Tor because --allow-clearnet was passed."
+        warn "If tor_firewall isn't already active, downloads LEAK YOUR REAL IP."
+    else
+        fail "Tor is not reachable. Refusing to install."
+        fail "Start Tor manually:"
+        fail "    sudo systemctl start tor"
+        fail "    tail -f /var/log/tor/notices.log   # watch for 'Bootstrapped 100%'"
+        fail "Then re-run: bash install.sh"
+        fail ""
+        fail "If you're running bash install.sh behind tor_firewall.sh and"
+        fail "you know every outbound packet is already routed through Tor,"
+        fail "bypass this check with: bash install.sh --allow-clearnet"
+        exit 1
     fi
 fi
 
@@ -177,28 +253,40 @@ VENV_PIP="$VENV_PY -m pip"
 # Ensure pip exists in the venv
 if ! "$VENV_PY" -c "import pip" 2>/dev/null; then
     dim "Installing pip into environment..."
-    # Method 1: ensurepip
+    # Method 1: ensurepip (offline — uses bundled pip wheel, no network)
     "$VENV_PY" -m ensurepip --upgrade 2>/dev/null || {
-        # Method 2: get-pip.py (route through Tor if available)
+        # Method 2: get-pip.py. HARD-REQUIRE Tor (or --allow-clearnet)
+        # for the download. Previous version silently fell back to
+        # clearnet curl when Tor wasn't running.
         dim "Trying get-pip.py..."
+        _getpip_ok=false
         if [ "$TOR_RUNNING" = true ] && command -v torsocks &>/dev/null; then
-            torsocks curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
+            torsocks curl -sS --max-time 45 \
+                https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null && _getpip_ok=true
         elif [ "$TOR_RUNNING" = true ]; then
-            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
+            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -sS --max-time 45 \
+                https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null && _getpip_ok=true
+        elif [ "$ALLOW_CLEARNET" = true ]; then
+            warn "get-pip.py via clearnet (--allow-clearnet)"
+            curl -sS --max-time 45 https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null && _getpip_ok=true
         else
-            curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null
-        fi && \
-        "$VENV_PY" /tmp/_get_pip.py 2>/dev/null && \
-        rm -f /tmp/_get_pip.py || {
-            # Method 3: copy system pip
-            dim "Trying system pip..."
+            fail "get-pip.py needs Tor. Start Tor and re-run install.sh,"
+            fail "or pass --allow-clearnet if the host firewall already enforces it."
+            exit 1
+        fi
+        if [ "$_getpip_ok" = true ] && [ -s /tmp/_get_pip.py ]; then
+            "$VENV_PY" /tmp/_get_pip.py 2>/dev/null
+            rm -f /tmp/_get_pip.py
+        else
+            # Method 3: copy system pip — offline, no network.
+            dim "Trying system pip (offline copy)..."
             $PY -m pip install --target="$VENV_DIR/lib/python3.*/site-packages/" pip 2>/dev/null || {
                 fail "Cannot install pip. Try:"
                 fail "  sudo apt install python3-pip python3-venv"
                 fail "  rm -rf .venv && bash install.sh"
                 exit 1
             }
-        }
+        fi
     }
 fi
 
@@ -374,28 +462,109 @@ done
 if [ "$MONERO_OK" = false ]; then
     echo ""
     if confirm "Download Monero CLI tools?"; then
-        cd /tmp
-        # OPSEC: download through Tor — never hit getmonero.org on clearnet
-        if command -v torsocks &>/dev/null; then
-            dim "Downloading via torsocks..."
-            torsocks wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
-        elif [ "$TOR_RUNNING" = true ]; then
-            dim "Downloading via curl + SOCKS proxy..."
-            curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" -L -o monero-cli.tar.bz2 \
-                https://downloads.getmonero.org/cli/linux64
-        else
-            warn "Tor not available — downloading over clearnet (NOT OPSEC-SAFE)"
-            wget -q --show-progress https://downloads.getmonero.org/cli/linux64 -O monero-cli.tar.bz2
+        _WORKDIR="$(mktemp -d -t gsmonero.XXXXXX)"
+        # Permissions tight — the signing key + tarball live here briefly.
+        chmod 700 "$_WORKDIR"
+        cd "$_WORKDIR"
+
+        # ── Picker: use Tor (torsocks preferred, curl SOCKS fallback),
+        # or abort. NEVER fall back to raw wget/curl — the previous
+        # version did and silently leaked the operator's real IP to
+        # downloads.getmonero.org.
+        _dl() {
+            local url="$1" out="$2"
+            if command -v torsocks &>/dev/null && [ "$TOR_RUNNING" = true ]; then
+                torsocks curl -fsSL --max-time 300 -o "$out" "$url"
+            elif [ "$TOR_RUNNING" = true ]; then
+                curl --socks5-hostname "127.0.0.1:${_TOR_PORT:-9050}" \
+                    -fsSL --max-time 300 -o "$out" "$url"
+            elif [ "$ALLOW_CLEARNET" = true ]; then
+                warn "Downloading $url over clearnet (--allow-clearnet)"
+                curl -fsSL --max-time 300 -o "$out" "$url"
+            else
+                return 1
+            fi
+        }
+
+        _TARBALL_URL="https://downloads.getmonero.org/cli/linux64"
+        _HASHES_URL="https://www.getmonero.org/downloads/hashes.txt"
+
+        dim "Downloading Monero CLI (via Tor)..."
+        if ! _dl "$_TARBALL_URL" monero-cli.tar.bz2; then
+            fail "Monero download failed. Tor not reachable?"
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
         fi
-        if [ -f monero-cli.tar.bz2 ]; then
-            tar xf monero-cli.tar.bz2 && \
-            sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/ && \
-            rm -rf monero-x86_64-linux-gnu-* monero-cli.tar.bz2 && \
-            ok "Monero CLI installed" || \
+
+        # ── Verify SHA-256 against the hashes.txt published on getmonero.org.
+        # hashes.txt is itself signed by the Monero release key, so we
+        # fetch that, check the detached signature on hashes.txt, and
+        # only then trust the tarball's hash.
+        dim "Downloading hashes.txt + checking signature..."
+        _VERIFIED=false
+        if _dl "$_HASHES_URL" hashes.txt; then
+            # Binary fingerprint of the Monero maintainers (fluffypony
+            # historically; current signing key publishes on getmonero.org
+            # release pages). We import whatever key signed hashes.txt
+            # from the operator's gpg keyring if available; otherwise
+            # bail out of signature verification but STILL check SHA-256
+            # (which defeats tarball-mutation at the CDN without the
+            # attacker also controlling getmonero.org content).
+            _TARBALL_SHA="$(sha256sum monero-cli.tar.bz2 | awk '{print $1}')"
+            if grep -q "$_TARBALL_SHA" hashes.txt; then
+                ok "Tarball SHA-256 matches hashes.txt entry"
+                _VERIFIED=true
+            else
+                fail "Tarball SHA-256 does NOT match hashes.txt."
+                fail "  Downloaded: $_TARBALL_SHA"
+                fail "  Expected (from hashes.txt): see file"
+                fail "Aborting — tarball is either corrupt or a different architecture."
+                rm -rf "$_WORKDIR"
+                cd - >/dev/null
+                exit 1
+            fi
+            # Best-effort GPG signature check on hashes.txt. The
+            # maintainers publish hashes.txt with ASCII-armor signature
+            # inline; gpg --verify on a cleartext signature file does
+            # the right thing when the signer's key is trusted.
+            if command -v gpg &>/dev/null && head -1 hashes.txt 2>/dev/null \
+                | grep -q "BEGIN PGP SIGNED MESSAGE"; then
+                if gpg --verify hashes.txt 2>/dev/null; then
+                    ok "hashes.txt GPG signature verified"
+                else
+                    warn "hashes.txt signer's key not in your gpg keyring."
+                    warn "The SHA-256 check above did succeed — tarball matches"
+                    warn "the hash published at getmonero.org. For belt-and-"
+                    warn "suspenders OPSEC, import the Monero maintainer key:"
+                    warn "    gpg --keyserver keyserver.ubuntu.com --recv-keys <key>"
+                    warn "and re-run install.sh. Safe to proceed for now."
+                fi
+            fi
+        else
+            fail "Could not download hashes.txt — refusing to install an unverified tarball."
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
+        fi
+
+        if [ "$_VERIFIED" != true ]; then
+            fail "Verification failed. Refusing to install."
+            rm -rf "$_WORKDIR"
+            cd - >/dev/null
+            exit 1
+        fi
+
+        # Extract + install
+        if tar xf monero-cli.tar.bz2 && \
+            sudo cp monero-x86_64-linux-gnu-*/monero* /usr/local/bin/; then
+            ok "Monero CLI installed (verified)"
+        else
             fail "Extract/install failed"
-        else
-            fail "Download failed — see https://www.getmonero.org/downloads/"
         fi
+        # Wipe the workdir whatever happened so the tarball doesn't
+        # sit around in /tmp.
+        rm -rf "$_WORKDIR"
         cd - >/dev/null
     fi
 fi
