@@ -3807,48 +3807,207 @@ class VulnScanner:
                         return findings
         return findings
 
+    # Common GraphQL mount points. Ordered by how likely they are.
+    _GQL_PATHS = [
+        "/graphql", "/graphql/", "/api/graphql", "/v1/graphql",
+        "/v2/graphql", "/query", "/gql", "/api/gql",
+        "/index.php?graphql", "/api/v1/graphql",
+    ]
+
     def _check_graphql_introspection(self, base_url: str) -> List[dict]:
-        """Check if GraphQL introspection is enabled (exposes full API schema)."""
+        """Probe GraphQL endpoints and detect multiple misconfigs:
+
+        1. Introspection enabled (the classic finding).
+        2. GET-based query execution (GraphQL-over-GET, exploitable
+           for CSRF — state-changing mutations via a 1x1 <img src=...>).
+        3. Batched-query / alias amplification accepted (brute-force
+           within a single request, bypasses rate limits).
+        4. Specific sensitive types present in the schema (User,
+           Credential, Session, etc.) — emitted as an additional
+           HIGH finding pointing at the concrete types.
+        """
         findings = []
-        gql_paths = ["/graphql", "/graphql/", "/api/graphql", "/v1/graphql"]
-        introspection_query = {"query": '{ __schema { types { name } } }'}
         domain = urlparse(base_url).netloc
 
-        for gql_path in gql_paths:
-            if shutdown_requested():
-                break
-            if self._session.is_domain_blocked(domain):
+        intro_short = {"query": "{ __schema { queryType { name } } }"}
+        intro_full = {"query": "{ __schema { types { name fields { name } } } }"}
+
+        for gql_path in self._GQL_PATHS:
+            if shutdown_requested() or self._session.is_domain_blocked(domain):
                 break
             url = urljoin(base_url, gql_path)
+
+            # A. Confirm the endpoint exists with a short introspection.
+            r_short = self._session.post_json(url, intro_short)
+            if not r_short or r_short.status_code not in (200, 400):
+                continue
             try:
-                resp = self._session.post_json(url, introspection_query)
-                if resp and resp.status_code == 200:
+                d_short = r_short.json()
+            except Exception:
+                continue
+            # A GraphQL endpoint returns either data.__schema or
+            # errors[].message mentioning a query. Either confirms it
+            # IS GraphQL; neither means we're hitting a 404-page-that-
+            # happens-to-return-200.
+            has_schema = bool(isinstance(d_short.get("data"), dict) and
+                              d_short["data"].get("__schema"))
+            errs = d_short.get("errors", []) if isinstance(d_short, dict) else []
+            looks_gql = has_schema or bool(errs) or d_short.get("data") is not None
+            if not looks_gql:
+                continue
+
+            # B. Full introspection — emits the main finding if it works.
+            if has_schema:
+                r_full = self._session.post_json(url, intro_full)
+                types = []
+                if r_full and r_full.status_code == 200:
                     try:
-                        data = resp.json()
-                        if data.get("data", {}).get("__schema"):
-                            types = data["data"]["__schema"].get("types", [])
-                            type_names = [t.get("name", "") for t in types[:10]]
-                            findings.append({
-                                "severity": SEV_HIGH,
-                                "title": f"GraphQL introspection enabled at {gql_path}",
-                                "detail": "Full API schema exposed. Attacker can discover all "
-                                          "queries, mutations, types, and fields — then craft "
-                                          "targeted queries to extract sensitive data.",
-                                "evidence": f"Schema returned {len(types)} types: {', '.join(type_names[:5])}...",
-                                "exploitable": True,
-                                "exploit_info": {
-                                    "type": "graphql_introspection",
-                                    "path": gql_path,
-                                    "method": "POST introspection query to enumerate full schema, "
-                                              "then query for sensitive types (User, Account, Order, etc.)",
-                                    "risk": "Data exfiltration of all API-accessible data",
-                                },
-                            })
-                            return findings
-                    except (ValueError, KeyError):
-                        pass
-            except Exception as e:
-                integrity_log("intel", f"unknown_error:{type(e).__name__}")
+                        types = (r_full.json().get("data", {})
+                                 .get("__schema", {}).get("types", []))
+                    except Exception:
+                        types = []
+                type_names = [t.get("name", "") for t in types
+                              if isinstance(t, dict) and t.get("name")]
+                sensitive_types = [
+                    n for n in type_names
+                    if any(kw in n.lower() for kw in
+                           ("user", "account", "credential", "session",
+                            "token", "secret", "payment", "order",
+                            "invoice", "admin"))
+                ]
+                findings.append({
+                    "severity": SEV_HIGH,
+                    "title": f"GraphQL introspection enabled at {gql_path}",
+                    "detail": ("Full API schema exposed. Attacker can "
+                               "discover all queries, mutations, types, "
+                               "and fields — then craft targeted queries "
+                               "to extract sensitive data."),
+                    "evidence": (f"Schema returned {len(type_names)} types. "
+                                 f"Sample: {', '.join(type_names[:5])}"
+                                 f"{'...' if len(type_names) > 5 else ''}"),
+                    "exploitable": True,
+                    "test_url": url,
+                    "exploit_info": {
+                        "type": "graphql_introspection",
+                        "path": gql_path,
+                        "sensitive_types": sensitive_types[:10],
+                        "method": ("POST full introspection, then query "
+                                   "sensitive types directly. Common "
+                                   "dumps: '{ users { id email } }', "
+                                   "'{ me { role } }', '{ orders { "
+                                   "userId total } }'."),
+                        "risk": "Data exfiltration of all API-accessible data",
+                    },
+                })
+                if sensitive_types:
+                    findings.append({
+                        "severity": SEV_HIGH,
+                        "title": (f"GraphQL exposes sensitive type(s): "
+                                  f"{', '.join(sensitive_types[:5])}"),
+                        "detail": (f"The schema defines "
+                                   f"{len(sensitive_types)} type name(s) "
+                                   f"that look like auth/user/payment "
+                                   f"primitives. Direct queries against "
+                                   f"these types, authenticated or not, "
+                                   f"are often unrestricted."),
+                        "evidence": f"Types: {', '.join(sensitive_types[:10])}",
+                        "exploitable": True,
+                        "test_url": url,
+                        "exploit_info": {
+                            "type": "graphql_data_exposure",
+                            "path": gql_path,
+                            "sensitive_types": sensitive_types[:10],
+                            "method": ("Craft per-type queries "
+                                       "following the schema's "
+                                       "fields[]. Many endpoints "
+                                       "enforce auth on REST but not "
+                                       "GraphQL."),
+                            "risk": "Unauthenticated data exfiltration",
+                        },
+                    })
+
+            # C. GraphQL-over-GET (CSRF class): same query via GET.
+            if not shutdown_requested():
+                from urllib.parse import quote as _q
+                q = "{ __schema { queryType { name } } }"
+                get_url = f"{url}?query={_q(q)}"
+                r_get = self._session.get(get_url, allow_wayback=False)
+                if r_get and r_get.status_code == 200 and r_get.text:
+                    try:
+                        d_get = r_get.json()
+                    except Exception:
+                        d_get = None
+                    if (isinstance(d_get, dict) and
+                            isinstance(d_get.get("data"), dict) and
+                            d_get["data"].get("__schema")):
+                        findings.append({
+                            "severity": SEV_HIGH,
+                            "title": f"GraphQL accepts queries via GET at {gql_path}",
+                            "detail": ("GraphQL-over-GET makes every "
+                                       "mutation CSRF-exploitable: "
+                                       "<img src=...?query=mutation...> "
+                                       "fires with the victim's cookies "
+                                       "attached. CSRF tokens don't "
+                                       "apply to GETs."),
+                            "evidence": f"GET {gql_path}?query=... returned __schema",
+                            "exploitable": True,
+                            "test_url": url,
+                            "exploit_info": {
+                                "type": "graphql_introspection",
+                                "path": gql_path,
+                                "method": ("Craft a GET URL with a "
+                                           "state-changing mutation as "
+                                           "the query and embed it in "
+                                           "an <img> on an attacker "
+                                           "page. Victim cookies "
+                                           "authenticate it."),
+                                "risk": "CSRF on every GraphQL mutation",
+                            },
+                        })
+
+            # D. Batched-query amplification check.
+            # Many servers execute a list of queries in a single request —
+            # the perfect rate-limit bypass for brute-force (login
+            # mutations, one-time-password guesses, etc.).
+            if not shutdown_requested():
+                batch = [intro_short, intro_short, intro_short]
+                r_batch = self._session.post_json(url, batch)
+                if r_batch and r_batch.status_code == 200 and r_batch.text:
+                    try:
+                        d_batch = r_batch.json()
+                    except Exception:
+                        d_batch = None
+                    if isinstance(d_batch, list) and len(d_batch) >= 2:
+                        findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": f"GraphQL accepts batched queries at {gql_path}",
+                            "detail": ("The server returned a list of "
+                                       "responses for a batched query "
+                                       "array. Combine with a login "
+                                       "mutation and you get N "
+                                       "password guesses per HTTP "
+                                       "request — rate limits applied "
+                                       "per HTTP request can be "
+                                       "bypassed."),
+                            "evidence": f"Batch of {len(batch)} queries → list of {len(d_batch)} results",
+                            "exploitable": True,
+                            "test_url": url,
+                            "exploit_info": {
+                                "type": "graphql_batching",
+                                "path": gql_path,
+                                "method": ("POST [{mutation: login(x)}, "
+                                           "{mutation: login(y)}, ...] "
+                                           "— one HTTP request, many "
+                                           "login attempts."),
+                                "risk": "Rate-limit bypass, brute-force amplification",
+                            },
+                        })
+
+            # We found a live GraphQL endpoint; no point probing more
+            # paths. (Multiple mounts of the same service at different
+            # paths would just repeat the same findings.)
+            if findings:
+                return findings
         return findings
 
     def _check_ssrf_indicators(self, base_url: str) -> List[dict]:

