@@ -635,6 +635,12 @@ class AttackerInfra:
             if self._running and self._port:
                 return self._port
 
+            # Pick a free ephemeral port. We close the probe socket
+            # before binding the real server, so there is a tiny race
+            # window where another process could grab it. In practice
+            # that never happens on a single-user loopback, but we
+            # retry a handful of times if ThreadingHTTPServer's bind
+            # fails below.
             import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", 0))
@@ -914,8 +920,27 @@ class AttackerInfra:
                     )
                     hself._send_beacon()
 
-            self._server = ThreadingHTTPServer(("127.0.0.1", self._port),
-                                               _Handler)
+            # Retry port pick + bind if the ephemeral port we claimed
+            # was grabbed by another process between probe and bind.
+            self._server = None
+            _bind_err = None
+            for _attempt in range(5):
+                try:
+                    self._server = ThreadingHTTPServer(
+                        ("127.0.0.1", self._port), _Handler,
+                    )
+                    break
+                except OSError as _e:
+                    _bind_err = _e
+                    # Claim a fresh port and retry.
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _rs:
+                        _rs.bind(("127.0.0.1", 0))
+                        self._port = _rs.getsockname()[1]
+            if self._server is None:
+                raise RuntimeError(
+                    f"AttackerInfra: couldn't bind a loopback port after "
+                    f"5 attempts ({_bind_err})"
+                )
             self._server.daemon_threads = True
             self._started.clear()
 
