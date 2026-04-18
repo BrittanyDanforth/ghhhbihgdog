@@ -510,13 +510,17 @@ class TorSession:
 
     def _build_referer(self, url: str) -> Optional[str]:
         """Honest per-host Referer chain. Returns None when no
-        Referer should be sent (first request on a known API host)."""
+        Referer should be sent (first request on a known API host,
+        or when the URL is malformed)."""
         host = self._host_key(url)
-        if host in self._no_referer_hosts:
+        if host in self._no_referer_hosts or host == "__unknown__":
             return None
         last = self._last_url_per_host.get(host)
         if last and last != url:
             return last
+        # Drop port for the search-query forgery — a real DDG search
+        # for 'target.com:8443' looks stupid, and _host_key already
+        # stripped default ports so only non-default ports remain.
         bare = host.split(":", 1)[0]
         if not bare:
             return None
@@ -530,16 +534,37 @@ class TorSession:
             self._last_url_per_host[host] = url
 
     def _host_key(self, url: str) -> str:
-        """Canonical key for the per-host cookie jar. We use the full
-        netloc (host[:port]) lowercased — subdomains don't share a
-        jar, which is stricter than a browser would be but cheap
-        insurance when the "authenticated" host is scoped to a single
-        app under target.com but crt.sh also matches *.target.com."""
+        """Canonical key for the per-host cookie jar + rotation role +
+        Referer chain.
+
+        Normalizations applied:
+          * Lowercase the netloc (DNS is case-insensitive).
+          * Strip the DEFAULT port for the scheme ('target.com:443'
+            under https and 'target.com:80' under http become plain
+            'target.com'). Without this, 'https://target.com/' and
+            'https://target.com:443/' got SEPARATE cookie jars —
+            duplicate setups per host and (worse) explicit-port URLs
+            were starved of the auth cookies the operator set on the
+            implicit-port form.
+          * Unknown/invalid URL → sentinel key so jar lookups don't
+            collide with the empty string.
+        """
         try:
-            netloc = urlparse(url).netloc.lower()
+            parsed = urlparse(url)
+            netloc = (parsed.netloc or "").lower()
+            scheme = (parsed.scheme or "").lower()
         except Exception:
-            netloc = ""
-        return netloc or "__unknown__"
+            return "__unknown__"
+        if not netloc:
+            return "__unknown__"
+        if ":" in netloc:
+            host, _, port = netloc.rpartition(":")
+            if port.isdigit():
+                p = int(port)
+                if (scheme == "https" and p == 443) or \
+                        (scheme == "http" and p == 80):
+                    netloc = host
+        return netloc
 
     def _get_host_jar(self, url: str) -> "requests.cookies.RequestsCookieJar":
         """Return (creating if needed) the per-host cookie jar for
@@ -561,6 +586,82 @@ class TorSession:
         jar = self._get_host_jar(url)
         self._session.cookies = jar
         return key
+
+    @staticmethod
+    def _cookie_matches_host(cookie_domain: str, host: str) -> bool:
+        """RFC-6265-ish match: a cookie with domain 'example.com' is
+        valid for 'example.com' and 'sub.example.com'. A cookie with
+        domain 'sub.example.com' is NOT valid for 'example.com'."""
+        if not cookie_domain:
+            # Host-only cookie (no Domain attribute sent) — requests
+            # still stores a synthetic domain equal to the request
+            # host. If cookie_domain is empty we err on the side of
+            # 'keeps belonging to the jar' (the request host was this
+            # jar's host, so it stays).
+            return True
+        cookie_domain = cookie_domain.lstrip(".").lower()
+        host = (host or "").lower()
+        if not host:
+            return False
+        return host == cookie_domain or host.endswith("." + cookie_domain)
+
+    def _quarantine_foreign_cookies(self, origin_host: str):
+        """Walk the jar we installed for `origin_host` and move any
+        cookie whose Domain attribute doesn't match origin_host into
+        the correct per-host jar.
+
+        This is the redirect-leak remediation. When requests follows
+        a cross-host redirect it applies Set-Cookie headers to the
+        active session jar — which for us is origin_host's jar. So
+        if https://target.com/login -> https://sso.example.net/auth,
+        the SSO's Set-Cookie lands in target.com's jar. We detect
+        that (cookie.domain says sso.example.net, jar is
+        target.com's) and relocate it.
+
+        This DOES NOT undo the fact that cookies for origin_host
+        were already sent on the subsequent hops (that's a
+        fundamental limitation of requests' follow-redirect path
+        with allow_redirects=True). But it prevents future requests
+        to origin_host from also shipping the foreign SSO cookie to
+        the target.
+        """
+        jar = self._host_cookies.get(origin_host)
+        if jar is None:
+            return
+        foreign = []
+        for cookie in list(jar):
+            cookie_dom = (cookie.domain or "").lstrip(".").lower()
+            if cookie_dom and not self._cookie_matches_host(cookie_dom,
+                                                             origin_host):
+                foreign.append(cookie)
+        if not foreign:
+            return
+        for cookie in foreign:
+            # Relocate to the jar whose host MATCHES the cookie's
+            # declared domain.
+            dest_host = (cookie.domain or "").lstrip(".").lower()
+            dest = self._host_cookies.setdefault(
+                dest_host, requests.cookies.RequestsCookieJar())
+            try:
+                dest.set_cookie(cookie)
+            except Exception:
+                pass
+            try:
+                # requests.cookies.remove_cookie_by_name honors
+                # path/domain; fall back to clearing the attribute.
+                requests.cookies.remove_cookie_by_name(
+                    jar, cookie.name,
+                    domain=cookie.domain,
+                    path=cookie.path,
+                )
+            except Exception:
+                pass
+        if foreign:
+            integrity_log(
+                "intel",
+                f"quarantined_foreign_cookies:origin={origin_host}:"
+                f"count={len(foreign)}",
+            )
 
     def set_cookies(self, cookies: dict, host: Optional[str] = None):
         """Set session cookies for authenticated scanning, scoped to a
@@ -692,13 +793,19 @@ class TorSession:
 
             # Isolate cookies: only this host's jar is visible for the
             # duration of the call. See _swap_in_jar docstring.
-            self._swap_in_jar(url)
+            origin_host = self._swap_in_jar(url)
             try:
                 self._domain_last[domain] = time.time()
                 if method.upper() == "HEAD":
                     resp = self._session.head(url, headers=headers, allow_redirects=True, **req_kwargs)
                 else:
                     resp = self._session.get(url, headers=headers, **req_kwargs)
+
+                # Redirect-leak remediation: if requests followed a
+                # cross-host redirect, cookies from the destination
+                # landed in origin_host's jar. Walk the jar and move
+                # any cookie whose Domain doesn't match origin_host.
+                self._quarantine_foreign_cookies(origin_host)
 
                 if resp.status_code in (200, 301, 302, 304):
                     self._domain_blocks[domain] = max(0, self._domain_blocks[domain] - 1)
@@ -780,7 +887,7 @@ class TorSession:
                 headers["Referer"] = ref
             if extra_headers:
                 headers.update(extra_headers)
-            self._swap_in_jar(url)
+            origin_host = self._swap_in_jar(url)
             try:
                 self._domain_last[domain] = time.time()
                 resp = self._session.request(
@@ -805,6 +912,8 @@ class TorSession:
                 return None
             except Exception:
                 return None
+
+            self._quarantine_foreign_cookies(origin_host)
 
             if resp.status_code in (403, 429, 503):
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
@@ -836,8 +945,9 @@ class TorSession:
             headers = _pick_profile()
             # Wayback's own cookies (ia-id, donation banners, etc.) live
             # in their own jar — never co-mingled with the target's.
-            self._swap_in_jar(wb_url)
+            origin_host = self._swap_in_jar(wb_url)
             resp = self._session.get(wb_url, headers=headers, timeout=20)
+            self._quarantine_foreign_cookies(origin_host)
             if resp.status_code == 200:
                 integrity_log("intel", f"wayback_ok:{urlparse(url).netloc}")
                 return resp
@@ -866,10 +976,11 @@ class TorSession:
             headers["Referer"] = ref
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
-        self._swap_in_jar(url)
+        origin_host = self._swap_in_jar(url)
         try:
             self._domain_last[domain] = time.time()
             resp = self._session.post(url, json=json_data, headers=headers, **kwargs)
+            self._quarantine_foreign_cookies(origin_host)
             if resp.status_code in (403, 429, 503):
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 self._total_blocks += 1
@@ -896,10 +1007,11 @@ class TorSession:
             headers["Referer"] = ref
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
-        self._swap_in_jar(url)
+        origin_host = self._swap_in_jar(url)
         try:
             self._domain_last[domain] = time.time()
             resp = self._session.post(url, data=form_data, headers=headers, **kwargs)
+            self._quarantine_foreign_cookies(origin_host)
             if resp.status_code in (403, 429, 503):
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 self._total_blocks += 1
