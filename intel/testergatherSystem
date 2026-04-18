@@ -252,6 +252,27 @@ class TorSession:
         self._total_requests = 0
         self._total_blocks = 0
         self._total_timeouts = 0
+        # Per-host cookie jars. Previously self._session.cookies was
+        # shared across every request in the session, which meant:
+        #   * cookies set by target.com (tracking, session, CSRF) would
+        #     be sent on the next call to crt.sh / Cloudflare DoH /
+        #     DuckDuckGo / Wayback / certspotter / OTX / rapiddns.
+        #     That's both an OPSEC leak (cookies correlate requests
+        #     across wildly different-purpose endpoints on the same
+        #     Tor circuit) and an exfil risk (a target-issued JWT
+        #     in a cookie would literally ship to third parties).
+        #   * cookies set via set_cookies() for authenticated scanning
+        #     of one host would be sent on ANY subsequent request,
+        #     including unrelated domains — a classic auth-cookie leak.
+        # We isolate cookies by registrable "host key" (the netloc's
+        # last two labels plus any recognized 2LD suffix). Each call
+        # to the underlying session gets ONLY that host's jar.
+        self._host_cookies: Dict[str, "requests.cookies.RequestsCookieJar"] = {}
+        self._explicit_auth_host: Optional[str] = None
+        # Shared hosts that the scanner itself calls (crt.sh, DoH,
+        # DDG, Wayback, etc.) — we still isolate their jars, but we
+        # also tag them so set_cookies() never applies to them.
+        self._auxiliary_hosts: Set[str] = set()
 
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
@@ -264,6 +285,11 @@ class TorSession:
         # require_tor_proxy() before session creation, so this is a belt-and-suspenders.
         verified = False
         try:
+            # Dedicated jar for check.torproject.org; stays isolated
+            # from every target host.
+            self._host_cookies["check.torproject.org"] = \
+                requests.cookies.RequestsCookieJar()
+            self._session.cookies = self._host_cookies["check.torproject.org"]
             resp = self._session.get(
                 "https://check.torproject.org/api/ip",
                 timeout=8, headers=_pick_profile(),
@@ -318,9 +344,65 @@ class TorSession:
         old = self._domain_blocks.get(domain, 0)
         self._domain_blocks[domain] = max(0, old // 2)
 
-    def set_cookies(self, cookies: dict):
-        """Set session cookies for authenticated scanning."""
-        self._session.cookies.update(cookies)
+    def _host_key(self, url: str) -> str:
+        """Canonical key for the per-host cookie jar. We use the full
+        netloc (host[:port]) lowercased — subdomains don't share a
+        jar, which is stricter than a browser would be but cheap
+        insurance when the "authenticated" host is scoped to a single
+        app under target.com but crt.sh also matches *.target.com."""
+        try:
+            netloc = urlparse(url).netloc.lower()
+        except Exception:
+            netloc = ""
+        return netloc or "__unknown__"
+
+    def _get_host_jar(self, url: str) -> "requests.cookies.RequestsCookieJar":
+        """Return (creating if needed) the per-host cookie jar for
+        the given URL. Never falls back to a shared jar."""
+        key = self._host_key(url)
+        jar = self._host_cookies.get(key)
+        if jar is None:
+            jar = requests.cookies.RequestsCookieJar()
+            self._host_cookies[key] = jar
+        return jar
+
+    def _swap_in_jar(self, url: str):
+        """Install the per-host jar as session.cookies for the
+        duration of ONE request. requests.Session updates this jar
+        in place from Set-Cookie headers, so we install the host's
+        jar, make the call, and the target's cookies are persisted
+        back to the right bucket — never bled to other hosts."""
+        key = self._host_key(url)
+        jar = self._get_host_jar(url)
+        self._session.cookies = jar
+        return key
+
+    def set_cookies(self, cookies: dict, host: Optional[str] = None):
+        """Set session cookies for authenticated scanning, scoped to a
+        SPECIFIC host. Passing host=None uses the caller's last-seen
+        'explicit auth host' (or fails loudly if none has been set).
+
+        Previously set_cookies() applied cookies to the shared session
+        jar, so every subsequent request — including scanner-internal
+        calls to Cloudflare DoH, crt.sh, DuckDuckGo, Wayback — would
+        ship those cookies off-target. An auth cookie (JWT, session
+        id) could leak to five third parties in a single deep scan.
+        """
+        target_host: Optional[str] = None
+        if host:
+            target_host = host.lower()
+        elif self._explicit_auth_host:
+            target_host = self._explicit_auth_host
+        else:
+            raise ValueError(
+                "set_cookies(cookies) requires a host argument on first "
+                "use; later calls inherit the last-set auth host."
+            )
+        self._explicit_auth_host = target_host
+        jar = self._host_cookies.setdefault(
+            target_host, requests.cookies.RequestsCookieJar())
+        for k, v in (cookies or {}).items():
+            jar.set(k, v)
 
     def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
             **kwargs) -> Optional[requests.Response]:
@@ -356,6 +438,9 @@ class TorSession:
                 headers.update(extra_headers)
             req_kwargs = {k: v for k, v in kwargs.items() if k != "headers"}
 
+            # Isolate cookies: only this host's jar is visible for the
+            # duration of the call. See _swap_in_jar docstring.
+            self._swap_in_jar(url)
             try:
                 self._domain_last[domain] = time.time()
                 if method.upper() == "HEAD":
@@ -439,6 +524,7 @@ class TorSession:
             headers = _pick_profile()
             if extra_headers:
                 headers.update(extra_headers)
+            self._swap_in_jar(url)
             try:
                 self._domain_last[domain] = time.time()
                 resp = self._session.request(
@@ -490,6 +576,9 @@ class TorSession:
         wb_url = f"https://web.archive.org/web/2/{url}"
         try:
             headers = _pick_profile()
+            # Wayback's own cookies (ia-id, donation banners, etc.) live
+            # in their own jar — never co-mingled with the target's.
+            self._swap_in_jar(wb_url)
             resp = self._session.get(wb_url, headers=headers, timeout=20)
             if resp.status_code == 200:
                 integrity_log("intel", f"wayback_ok:{urlparse(url).netloc}")
@@ -516,6 +605,7 @@ class TorSession:
         headers["Content-Type"] = "application/json"
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
+        self._swap_in_jar(url)
         try:
             self._domain_last[domain] = time.time()
             resp = self._session.post(url, json=json_data, headers=headers, **kwargs)
@@ -540,6 +630,7 @@ class TorSession:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
+        self._swap_in_jar(url)
         try:
             self._domain_last[domain] = time.time()
             resp = self._session.post(url, data=form_data, headers=headers, **kwargs)
