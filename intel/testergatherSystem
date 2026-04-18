@@ -268,21 +268,48 @@ class TorSession:
     and Wayback Machine fallback for blocked pages."""
 
     def __init__(self, proxy_dict: dict):
+        # CRITICAL INIT ORDER.
+        #
+        # Every attribute this class uses MUST be set BEFORE the
+        # first call to any helper method, including _verify_dns_
+        # safety(). Previously _verify_dns_safety() was called on
+        # line 2 of __init__ (right after building self._session)
+        # but referenced self._host_cookies["check.torproject.org"]
+        # — which was only assigned ~40 lines later. Result: every
+        # fresh scan crashed with
+        #     AttributeError: 'TorSession' object has no attribute
+        #                     '_host_cookies'
+        # at startup, before the scanner ever issued a real request.
+        #
+        # The fix is to populate ALL state first, THEN run the
+        # bootstrap probe. The probe itself only needs the
+        # requests.Session (self._session) and self._host_cookies;
+        # once those exist, everything else it indirectly touches
+        # (via _pick_profile at module scope, integrity_log,
+        # print, sys.exit) is module-level and independent of
+        # instance state.
         self._proxy = proxy_dict
         self._session = requests.Session()
         self._session.proxies.update(proxy_dict)
-        # Verify DNS goes through proxy
-        self._verify_dns_safety()
-        retry = Retry(total=0, backoff_factor=0)  # we handle retries ourselves
+
+        # HTTP adapter pooling. Retry=0 because we handle retries
+        # ourselves in get()/request() so urllib3's retry loop
+        # doesn't blindly replay our probes on a fresh circuit
+        # before we've had a chance to bump block counters, rotate,
+        # or fail the circuit breaker.
+        retry = Retry(total=0, backoff_factor=0)
         adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
+
+        # Counters + per-domain state.
         self._domain_last: Dict[str, float] = {}
         self._domain_blocks: Dict[str, int] = defaultdict(int)
         self._request_count = 0
         self._total_requests = 0
         self._total_blocks = 0
         self._total_timeouts = 0
+
         # Per-session salt for integrity-log entries that would
         # otherwise contain the target domain. integrity_log() stores
         # only a SHA-256 prefix of (stage, msg), so plaintext targets
@@ -295,6 +322,7 @@ class TorSession:
         # makes that attack require the salt too (which is only in
         # memory, wiped on close).
         self._log_salt = secrets.token_hex(16)
+
         # Per-host cookie jars. Previously self._session.cookies was
         # shared across every request in the session, which meant:
         #   * cookies set by target.com (tracking, session, CSRF) would
@@ -312,6 +340,7 @@ class TorSession:
         # to the underlying session gets ONLY that host's jar.
         self._host_cookies: Dict[str, "requests.cookies.RequestsCookieJar"] = {}
         self._explicit_auth_host: Optional[str] = None
+
         # Browser-profile pinning: one fresh real browser chooses a
         # profile ONCE per session (User-Agent, Accept-*, Sec-Ch-*)
         # and doesn't flip Chrome<->Firefox<->macOS<->Windows between
@@ -326,33 +355,16 @@ class TorSession:
         # headers. Same session on the same circuit = pinned profile.
         self._profile_cache: Dict[Tuple[str, int], dict] = {}
         self._circuit_generation: int = 0
+
         # Shared hosts that the scanner itself calls (crt.sh, DoH,
         # DDG, Wayback, etc.) — we still isolate their jars, but we
         # also tag them so set_cookies() never applies to them.
         self._auxiliary_hosts: Set[str] = set()
+
         # Per-host Referer chain state. Replaces the buggy global
-        # "request_count > 1 -> DDG referer" heuristic that:
-        #   * Sent a DDG search referer on EVERY request after the
-        #     second one in the session, including internal hops
-        #     ({'/robots.txt', '/.env', '/api/foo'}) where a real
-        #     user would be coming from the previous page of the
-        #     same site.
-        #   * Sent DDG referers to Cloudflare DoH, certspotter,
-        #     Wayback, etc. — nobody reaches api.cloudflare.com via
-        #     DDG.
-        #   * Double-quoted the domain (quote() on an already-escaped
-        #     host).
-        #
-        # The new chain:
-        #   1st hit on a host    -> Referer = DDG search for host (or
-        #                            none for known aux hosts like
-        #                            Cloudflare DoH / crt.sh which
-        #                            are typically hit programmatically)
-        #   2nd+ hit on same host -> Referer = last URL we fetched ON
-        #                            that host, so it looks like a real
-        #                            user clicking around within the
-        #                            site.
+        # "request_count > 1 -> DDG referer" heuristic.
         self._last_url_per_host: Dict[str, str] = {}
+
         # Circuit rotation state. See _maybe_rotate_circuit.
         self._last_role: Optional[bool] = None
         # Initialize the next-rotation point LAZILY to a random value
@@ -364,6 +376,7 @@ class TorSession:
         # 'first-request-always-rotates' signature. Start at None so
         # the first call draws a proper delta.
         self._next_rotation_at: Optional[int] = None
+
         # Hosts where we should NEVER forge a Referer, AND where the
         # circuit-rotation role-boundary detector treats the host as
         # 'aux/recon' rather than 'target'. Keeping this list in sync
@@ -396,6 +409,12 @@ class TorSession:
             "api.haveibeenpwned.com",
             "api.dehashed.com",
         }
+
+        # Bootstrap probe LAST. All state above must be populated
+        # so any indirect access from inside _verify_dns_safety()
+        # or the helpers it may transitively touch finds the right
+        # attributes.
+        self._verify_dns_safety()
 
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
