@@ -520,30 +520,178 @@ class TorSession:
         old = self._domain_blocks.get(domain, 0)
         self._domain_blocks[domain] = max(0, old // 2)
 
+    # Query-param names that indicate a URL is a PROBE, not a
+    # natural internal page. When the previous URL on a host had one
+    # of these, it's almost certainly got an injection payload in
+    # the value — shipping that as Referer of the next request is
+    # (a) a scanner fingerprint and (b) a secondary injection vector
+    # into the target's logging/SIEM. We drop the query entirely in
+    # that case and use just the origin path.
+    _PROBE_PARAM_MARKERS: Set[str] = {
+        "q", "query", "search", "id", "uid", "pid", "page", "file",
+        "path", "url", "redirect", "return", "returnto", "next",
+        "callback", "cb", "jsonp", "cmd", "exec", "action", "debug",
+    }
+
+    @staticmethod
+    def _url_looks_like_probe(url: str) -> bool:
+        """True if the URL's query string contains markers that this
+        scanner commonly puts payloads into. Conservative: we'd
+        rather strip a legitimate Referer than leak a probe payload."""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return True
+        if not parsed.query:
+            return False
+        q_lower = parsed.query.lower()
+        # Direct payload tells — any of these sitting in the query
+        # string of a URL we just fetched means our OWN probe put
+        # them there.
+        payload_markers = (
+            "<script", "onerror=", "javascript:", "' or ", "\" or ",
+            "union select", "../", "..%2f", "%00", "${", "{{",
+            "..\\", "etc/passwd", "\x00", "<?php", "{$", "file://",
+            "gopher://", "dict://", "sleep(", "benchmark(",
+        )
+        if any(m in q_lower for m in payload_markers):
+            return True
+        # Also treat "known probe-holding parameters" as probe-ish
+        # even when the value looks innocent — that cuts down on the
+        # 'Referer: /search?q=<previous>' pattern that's itself a
+        # fingerprint.
+        for pair in parsed.query.split("&"):
+            name = pair.split("=", 1)[0].lower()
+            if name in TorSession._PROBE_PARAM_MARKERS:
+                return True
+        return False
+
     def _build_referer(self, url: str) -> Optional[str]:
-        """Honest per-host Referer chain. Returns None when no
-        Referer should be sent (first request on a known API host,
-        or when the URL is malformed)."""
+        """Construct an OPSEC-sound Referer value for THIS request.
+
+        Rules:
+          * Aux/API hosts (Cloudflare DoH, DDG, crt.sh, certspotter,
+            Wayback, etc.) get NO Referer at all — real scripted
+            access doesn't carry one.
+          * Any URL with a missing/malformed host also gets no Referer.
+          * For the FIRST request on a target host: we used to emit
+            'https://duckduckgo.com/?q=<target-host>'. That leaks the
+            target hostname to the target's OWN access log in an
+            extremely bot-shaped pattern (real users don't DDG-search
+            for the bare domain they're visiting). Now we emit
+            NOTHING on first hit — matching a user who typed the URL
+            directly. That's the LEAST identifiable pattern.
+          * For the 2nd+ request on the same host we use the last
+            successfully-fetched URL on that host — BUT we strip the
+            query string and fragment if that previous URL was a
+            probe (xss/sqli/lfi/etc. payload in the query). Otherwise
+            every follow-up probe to the target would ship the
+            PREVIOUS probe's payload as Referer — both a scanner
+            fingerprint AND a secondary injection vector into the
+            target's logging/SIEM.
+
+        Returns None when no Referer should be sent. Callers
+        MUST treat None as 'omit the header entirely', not as
+        'Referer: ' or 'Referer: null'.
+        """
         host = self._host_key(url)
         if host in self._no_referer_hosts or host == "__unknown__":
             return None
         last = self._last_url_per_host.get(host)
         if last and last != url:
+            # Strip query+fragment if it's a probe-looking URL to
+            # avoid leaking the previous probe's payload in this
+            # request's Referer.
+            if self._url_looks_like_probe(last):
+                try:
+                    p = urlparse(last)
+                    scheme = p.scheme or "https"
+                    netloc = p.netloc or ""
+                    path = p.path or "/"
+                    if netloc:
+                        return f"{scheme}://{netloc}{path}"
+                except Exception:
+                    # If we can't even strip it safely, omit
+                    # Referer entirely rather than leak.
+                    return None
             return last
-        # Drop port for the search-query forgery — a real DDG search
-        # for 'target.com:8443' looks stupid, and _host_key already
-        # stripped default ports so only non-default ports remain.
-        bare = host.split(":", 1)[0]
-        if not bare:
-            return None
-        return f"https://duckduckgo.com/?q={quote(bare, safe='')}"
+        # First-on-host: OMIT. Safer than forging a DDG-search
+        # referer that contains the target hostname.
+        return None
 
     def _record_referer_src(self, url: str):
         """After a successful fetch record the URL as the next
-        'internal' referer for requests to the same host."""
+        'internal' referer for requests to the same host.
+
+        We store the full URL; _build_referer() handles probe-query
+        stripping at read time (so if a call later flags the URL as
+        probe-ish, we don't have to re-compute at store time)."""
         host = self._host_key(url)
         if host and host not in self._no_referer_hosts:
             self._last_url_per_host[host] = url
+
+    def _apply_sec_fetch(self, headers: Dict[str, str], url: str,
+                         referer: Optional[str]):
+        """Rewrite Sec-Fetch-* to match the REAL request context.
+
+        Every BROWSER_PROFILE hard-codes:
+            Sec-Fetch-Site: none
+            Sec-Fetch-Mode: navigate
+            Sec-Fetch-Dest: document
+
+        Those are correct for the FIRST navigation to a tab. Real
+        browsers set Sec-Fetch-Site dynamically:
+          - 'none'        : direct URL-bar typing / bookmark
+          - 'same-origin' : click/fetch within same origin
+          - 'same-site'   : click between eTLD+1 subdomains
+          - 'cross-site'  : click from an unrelated origin
+
+        Shipping 'none' on every subsequent same-host request is a
+        clean scanner fingerprint. We now derive the value from the
+        Referer we're about to send (or lack thereof).
+
+        Also: for calls that clearly aren't top-level HTML navigations
+        (DoH JSON, API JSON, POST form submits) we align
+        Sec-Fetch-Dest and Sec-Fetch-Mode accordingly — 'navigate'
+        is strictly for clicking a link or typing in the address
+        bar, not for XHR/fetch().
+        """
+        if not headers:
+            return
+        try:
+            req_origin = urlparse(url).netloc.lower()
+        except Exception:
+            req_origin = ""
+
+        # Sec-Fetch-Site
+        if not referer:
+            headers["Sec-Fetch-Site"] = "none"
+        else:
+            try:
+                ref_origin = urlparse(referer).netloc.lower()
+            except Exception:
+                ref_origin = ""
+            if ref_origin == req_origin:
+                headers["Sec-Fetch-Site"] = "same-origin"
+            elif ref_origin and req_origin and \
+                    (ref_origin.endswith("." + req_origin) or
+                     req_origin.endswith("." + ref_origin)):
+                headers["Sec-Fetch-Site"] = "same-site"
+            else:
+                headers["Sec-Fetch-Site"] = "cross-site"
+
+        # Sec-Fetch-Dest / Sec-Fetch-Mode overrides for sub-resource
+        # requests. Callers set this via headers={'_sf_mode': 'xhr'}
+        # which we consume and strip. Default stays 'navigate' +
+        # 'document' because the vuln probes fetch HTML pages.
+        sf_hint = headers.pop("_sf_mode", None)
+        if sf_hint == "xhr":
+            headers["Sec-Fetch-Mode"] = "cors"
+            headers["Sec-Fetch-Dest"] = "empty"
+        elif sf_hint == "form":
+            headers["Sec-Fetch-Mode"] = "navigate"
+            headers["Sec-Fetch-Dest"] = "document"
+            headers["Sec-Fetch-User"] = "?1"
 
     def _salt_tag(self, raw: str) -> str:
         """Return a salted 12-hex-char tag for a domain-ish string,
@@ -811,6 +959,10 @@ class TorSession:
             extra_headers = kwargs.get("headers", {})
             if extra_headers:
                 headers.update(extra_headers)
+            # Sec-Fetch-* correction AFTER caller overrides — the
+            # profile default 'none' is only correct for the first
+            # top-level nav. See _apply_sec_fetch docstring.
+            self._apply_sec_fetch(headers, url, ref)
             req_kwargs = {k: v for k, v in kwargs.items() if k != "headers"}
 
             # Isolate cookies: only this host's jar is visible for the
@@ -912,6 +1064,7 @@ class TorSession:
                 headers["Referer"] = ref
             if extra_headers:
                 headers.update(extra_headers)
+            self._apply_sec_fetch(headers, url, ref)
             origin_host = self._swap_in_jar(url)
             try:
                 self._domain_last[domain] = time.time()
@@ -1005,6 +1158,9 @@ class TorSession:
         ref = self._build_referer(url)
         if ref:
             headers["Referer"] = ref
+        # POST JSON is XHR, not a top-level navigation.
+        headers["_sf_mode"] = "xhr"
+        self._apply_sec_fetch(headers, url, ref)
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
         origin_host = self._swap_in_jar(url)
@@ -1036,6 +1192,9 @@ class TorSession:
         ref = self._build_referer(url)
         if ref:
             headers["Referer"] = ref
+        # HTML form submit: same-user-gesture navigation.
+        headers["_sf_mode"] = "form"
+        self._apply_sec_fetch(headers, url, ref)
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
         origin_host = self._swap_in_jar(url)
