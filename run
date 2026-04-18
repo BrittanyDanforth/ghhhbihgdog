@@ -71,7 +71,7 @@ if not _VENV_PY.exists() and not _system_has_deps():
     print(f"  [!] Run: bash install.sh")
     sys.exit(1)
 
-import json, subprocess, shutil, secrets, signal, threading, time as _time_mod
+import json, subprocess, shutil, secrets, signal, threading, time as _time_mod, re
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse, quote, urlencode, urljoin
 from dataclasses import dataclass, field
@@ -6918,6 +6918,97 @@ def _extract_base_url_from_vulns(vulns: list) -> str:
     return ""
 
 
+_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+_IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_PRIVATE_HOSTS = {
+    "localhost", "ip6-localhost", "ip6-loopback",
+}
+_PRIVATE_TLDS = (".local", ".localhost", ".internal", ".lan",
+                 ".home", ".corp", ".intranet", ".private", ".test",
+                 ".example", ".invalid")
+
+
+def _sanitize_domain_input(raw: str) -> Tuple[str, Optional[str]]:
+    """Normalize + validate a user-supplied domain.
+
+    Returns (clean_domain, problem_message). problem_message is None
+    when the domain looks OK. On problem the first return value is
+    the closest clean-up we could produce (may be empty).
+
+    Rules enforced (in order):
+      * Strip whitespace / trailing slashes / http:// or https:// wrapper.
+      * Split off any path / query / fragment.
+      * Reject empty.
+      * Reject raw IPv4 — DoH over an IP is pointless AND announces
+        operator intent to recon a specific machine without any
+        passive-DNS cover.
+      * Reject .onion suggestion (scanner doesn't support DoH over
+        Tor for .onion; operator should connect directly via
+        SOCKS rather than running the DoH-heavy scanner).
+      * Reject localhost/RFC-6761 private names — those are never
+        real targets and running a scanner against them leaks the
+        attempt via DoH while providing zero recon value.
+      * Validate each DNS label (length + charset).
+      * Require at least 2 labels and a TLD.
+
+    We DON'T allow the operator to type a password / port / query
+    string into this field. Those are scanner-CLI-level concerns,
+    not target-host concerns.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", "domain is empty"
+    if s.startswith("http://"):
+        s = s[7:]
+    elif s.startswith("https://"):
+        s = s[8:]
+    s = s.strip().strip("/").lower()
+    # Split off path + query + fragment.
+    for sep in ("/", "?", "#"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    # Drop userinfo if they somehow pasted user:pass@host.
+    if "@" in s:
+        s = s.rsplit("@", 1)[1]
+    # Strip port.
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+        if port.isdigit():
+            s = host
+    if not s:
+        return "", "domain is empty after stripping wrapper"
+    # IPv4 → reject
+    if _IPV4_RE.match(s):
+        return s, ("looks like an IPv4 address; this scanner is "
+                   "hostname-oriented (DoH lookups, CT log queries, "
+                   "subdomain enumeration) — scanning an IP is both "
+                   "pointless in this mode and leaks operator intent "
+                   "to DoH")
+    # .onion → reject
+    if s.endswith(".onion"):
+        return s, ("looks like a .onion — the intel scanner uses DoH "
+                   "+ clearnet CT aggregators which cannot see onion "
+                   "hosts. Use the walkthrough or a direct Tor client "
+                   "instead")
+    # Private / reserved TLDs → reject
+    if s in _PRIVATE_HOSTS or any(s.endswith(t) for t in _PRIVATE_TLDS):
+        return s, ("looks like a private / RFC-6761 reserved name; "
+                   "running passive-DNS and CT-log queries against it "
+                   "only leaks the attempt and produces zero real data")
+    # Label-level validation
+    labels = s.split(".")
+    if len(labels) < 2:
+        return s, ("needs at least one dot (e.g. 'example.com'), got "
+                   f"{s!r}")
+    if any(not _DOMAIN_LABEL_RE.match(lab) for lab in labels):
+        return s, ("one or more DNS labels contain invalid characters "
+                   "or are too long (must be 1-63 chars each, letters "
+                   "+ digits + hyphen, no leading/trailing hyphen)")
+    if len(s) > 253:
+        return s, f"name too long ({len(s)}/253 chars)"
+    return s, None
+
+
 def flow_intel(detected_port=None):
     heading("Intelligence Gathering & Vulnerability Scanner")
     print(f"  This tool performs OSINT collection and vulnerability scanning")
@@ -7088,13 +7179,18 @@ def flow_intel(detected_port=None):
         if not domain:
             err("Domain is required.")
             return
-        # Clean domain input
-        domain = domain.strip().lower()
-        if domain.startswith("http://") or domain.startswith("https://"):
-            from urllib.parse import urlparse as _up
-            domain = _up(domain).netloc or domain
-        if "/" in domain:
-            domain = domain.split("/")[0]
+        # Full-featured validator. The previous inline 'clean domain'
+        # stripped http:// and / but silently accepted an IPv4
+        # address (scanner would then burn Tor circuits running DoH
+        # and CT-log queries on an IP — pointless AND announces
+        # operator intent to three different log aggregators), a
+        # .onion (which DoH can't resolve), localhost, etc.
+        domain, problem = _sanitize_domain_input(domain)
+        if problem:
+            err(f"Target domain rejected: {problem}")
+            if domain:
+                info(f"  closest cleanup would have been: {domain}")
+            return
 
         print()
         print(f"  {B}Scan depth:{N}")
@@ -7182,6 +7278,38 @@ def flow_intel(detected_port=None):
         if not Path(filepath_abs).exists():
             err(f"File not found: {Path(filepath).name}")
             return
+        # Pre-flight validate every line BEFORE launching the child.
+        # The child's batch loop would fail per-line anyway, but by
+        # that point it may have already made Tor requests for
+        # earlier lines. Rejecting known-bad lines here prevents
+        # wasted circuits + announces to the operator which lines
+        # are problematic.
+        try:
+            raw_lines = Path(filepath_abs).read_text("utf-8", errors="replace"
+                                                    ).strip().splitlines()
+        except Exception as _e:
+            err(f"Cannot read targets file: {type(_e).__name__}: {_e}")
+            return
+        problems = []
+        for _lineno, _line in enumerate(raw_lines, 1):
+            _l = _line.strip()
+            if not _l or _l.startswith("#"):
+                continue
+            if "@" in _l:
+                continue  # email, handled by run_email
+            if " " in _l:
+                continue  # free-form search query
+            _, _problem = _sanitize_domain_input(_l)
+            if _problem:
+                problems.append((_lineno, _l, _problem))
+        if problems:
+            warn(f"{len(problems)} line(s) in targets file look unsafe:")
+            for _no, _l, _p in problems[:10]:
+                warn(f"  line {_no}: {_l!r} — {_p}")
+            if len(problems) > 10:
+                warn(f"  ... and {len(problems)-10} more")
+            if not confirm("Proceed with the remaining valid lines?"):
+                return
         depth = prompt("Scan depth (quick/full/deep)", "full").lower()
         if depth not in ("quick", "full", "deep"):
             depth = "full"
