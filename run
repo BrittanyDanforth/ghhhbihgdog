@@ -3902,7 +3902,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         # blank input just re-prompts.
         try:
             cmd = prompt(
-                "Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/Z/Q)",
+                "Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/E/Z/Q)",
                 "").strip().upper()
         except KeyboardInterrupt:
             # Ctrl+C at the deck prompt = 'I hit Ctrl+C while
@@ -3925,6 +3925,23 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
             break
         if not cmd:
             continue
+
+        # CRITICAL: every deck command is a fresh operator intent.
+        # If a previous command aborted via Ctrl+C (or any earlier
+        # phase set the shutdown flag), that flag must NOT bleed
+        # into the next command — otherwise commands like R/P that
+        # internally call _run_findings_loop will see
+        # shutdown_requested()=True on the first line and return
+        # immediately with zero output. That is the exact bug from
+        # the 'types 1 at R/P prompt, nothing happens, deck redraws'
+        # screenshot. Clearing here means Ctrl+C during a running
+        # command still aborts THAT command (the signal handler
+        # re-raises KeyboardInterrupt which the command's own
+        # try/except handles), but the NEXT command starts clean.
+        try:
+            _shutdown_event.clear()
+        except Exception:
+            pass
 
         if cmd == "Q":
             # Double-confirm quit ALWAYS, regardless of capture count,
