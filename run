@@ -1555,13 +1555,47 @@ _USER_AGENTS = [
 ]
 
 
+def _tc_detect_supported_encodings() -> str:
+    """Same logic we use in intel/testergatherSystem — only advertise
+    Content-Encodings we can actually decode. Advertising 'br' without
+    the brotli package means every brotli-encoded walkthrough response
+    lands as opaque bytes, so SQLi / XSS / reflection / evidence
+    validators silently false-negative. Also, advertising an encoding
+    we can't decode IS a bot fingerprint."""
+    encs = ["gzip", "deflate"]
+    try:
+        import brotli  # noqa: F401
+        encs.append("br")
+    except ImportError:
+        try:
+            import brotlicffi  # noqa: F401
+            encs.append("br")
+        except ImportError:
+            pass
+    try:
+        import zstandard  # noqa: F401
+        encs.append("zstd")
+    except ImportError:
+        pass
+    return ", ".join(encs)
+
+
+_TC_SUPPORTED_ENCODINGS = _tc_detect_supported_encodings()
+
+
 class TorClient:
     """HTTP client that routes all traffic through Tor SOCKS proxy.
 
     Features:
     - All requests through socks5h (DNS at proxy)
-    - User-Agent rotation per request
-    - Randomized Accept-Language and Sec-Fetch headers
+    - Per-host pinned User-Agent + browser profile (same UA across
+      requests to same host on same circuit; fresh pick on circuit
+      change)
+    - Per-host cookie jars (cookies from target A don't ship to
+      target B, and cookies from the target never ship to any
+      incidentally-hit aux host)
+    - Accept-Encoding lists ONLY encodings we can decode
+    - Correct Sec-Fetch-Site derivation per request
     - Per-request jitter delay (configurable via preset)
     - Rate limiting
     - Full request/response capture for audit trail
@@ -1582,22 +1616,147 @@ class TorClient:
         self._exec_count = 0
         self._exec_times: list = []
         self._lock = threading.Lock()
+        # Cookie-jar + browser-profile + referer-chain state.
+        # Mirrors what the testergatherSystem TorSession does; the
+        # walkthrough's TorClient had none of this, so every HTTP
+        # step in a walkthrough shared one cookie jar, picked a
+        # brand-new random UA per request (a bot tell), and hard-
+        # coded Sec-Fetch-Site to whatever secrets.choice picked.
+        self._host_jars: Dict[str, Any] = {}
+        self._last_url_per_host: Dict[str, str] = {}
+        self._profile_cache: Dict[Tuple[str, int], str] = {}
+        self._circuit_gen: int = 0
 
-    def _rotate_headers(self) -> dict:
-        ua = secrets.choice(_USER_AGENTS)
+    def _host_key(self, url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            netloc = (parsed.netloc or "").lower()
+            scheme = (parsed.scheme or "").lower()
+        except Exception:
+            return "__unknown__"
+        if not netloc:
+            return "__unknown__"
+        if ":" in netloc:
+            host, _, port = netloc.rpartition(":")
+            if port.isdigit():
+                p = int(port)
+                if (scheme == "https" and p == 443) or \
+                        (scheme == "http" and p == 80):
+                    netloc = host
+        return netloc
+
+    def _get_jar(self, url: str):
+        import requests as _req
+        key = self._host_key(url)
+        jar = self._host_jars.get(key)
+        if jar is None:
+            jar = _req.cookies.RequestsCookieJar()
+            self._host_jars[key] = jar
+        return jar, key
+
+    def _pinned_ua(self, url: str) -> str:
+        key = (self._host_key(url), self._circuit_gen)
+        ua = self._profile_cache.get(key)
+        if ua is None:
+            ua = secrets.choice(_USER_AGENTS)
+            self._profile_cache[key] = ua
+        return ua
+
+    def bump_circuit_generation(self):
+        """Called by the control deck after a Tor NEWNYM so we
+        redraw per-host User-Agents (new exit = new 'browser'
+        session). Also resets the Referer chain since old
+        internal URLs aren't our history on a fresh circuit."""
+        self._circuit_gen += 1
+        self._last_url_per_host.clear()
+
+    def clear_host_jars(self, host: Optional[str] = None) -> int:
+        """Drop per-host cookie jars. host=None clears every jar."""
+        if host is None:
+            n = len(self._host_jars)
+            self._host_jars.clear()
+            self._last_url_per_host.clear()
+            return n
+        key = (host or "").lower()
+        if key in self._host_jars:
+            try:
+                self._host_jars[key].clear()
+            except Exception:
+                pass
+            del self._host_jars[key]
+            self._last_url_per_host.pop(key, None)
+            return 1
+        return 0
+
+    @staticmethod
+    def _cookie_matches_host_tc(cookie_domain: str, host: str) -> bool:
+        if not cookie_domain:
+            return True
+        cookie_domain = cookie_domain.lstrip(".").lower()
+        host = (host or "").lower()
+        if not host:
+            return False
+        return host == cookie_domain or host.endswith("." + cookie_domain)
+
+    def _quarantine_cookies_tc(self, origin_host: str):
+        """Post-redirect: move any cookie that doesn't belong to
+        origin_host into the correct per-host jar. See the
+        corresponding helper in testergatherSystem TorSession."""
+        import requests as _req
+        jar = self._host_jars.get(origin_host)
+        if jar is None:
+            return
+        foreign = []
+        for cookie in list(jar):
+            cd = (cookie.domain or "").lstrip(".").lower()
+            if cd and not self._cookie_matches_host_tc(cd, origin_host):
+                foreign.append(cookie)
+        for cookie in foreign:
+            dest_host = (cookie.domain or "").lstrip(".").lower()
+            dest = self._host_jars.setdefault(
+                dest_host, _req.cookies.RequestsCookieJar())
+            try:
+                dest.set_cookie(cookie)
+            except Exception:
+                pass
+            try:
+                _req.cookies.remove_cookie_by_name(
+                    jar, cookie.name,
+                    domain=cookie.domain,
+                    path=cookie.path,
+                )
+            except Exception:
+                pass
+
+    def _rotate_headers(self, url: str = "") -> dict:
+        # User-Agent is now PINNED per (host, circuit) — rotating
+        # the UA on every request to the same host is a pure bot
+        # fingerprint. See _pinned_ua docstring.
+        ua = self._pinned_ua(url) if url else secrets.choice(_USER_AGENTS)
         langs = secrets.choice([
             "en-US,en;q=0.5", "en-GB,en;q=0.5", "en-US,en;q=0.9",
         ])
+        # Sec-Fetch-Site: derive from whether we have a previous URL
+        # on this host (same-origin) or none (the 'user typed in the
+        # address bar' story). Random cross-site on every request
+        # was never realistic — real users don't teleport across
+        # origins on every click.
+        host = self._host_key(url) if url else ""
+        prev = self._last_url_per_host.get(host) if host else ""
+        if prev:
+            sf_site = "same-origin"
+        else:
+            sf_site = "none"
         return {
             "User-Agent": ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": langs,
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": _TC_SUPPORTED_ENCODINGS,
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": secrets.choice(["none", "same-origin", "cross-site"]),
+            "Sec-Fetch-Site": sf_site,
             "Sec-Fetch-User": "?1",
         }
 
@@ -1626,7 +1785,7 @@ class TorClient:
 
         _jittered_delay(self._delay_lo, self._delay_hi)
 
-        req_headers = self._rotate_headers()
+        req_headers = self._rotate_headers(url)
         if headers:
             req_headers.update(headers)
 
@@ -1634,6 +1793,15 @@ class TorClient:
             request_url=url[:200],
             request_method=method,
         )
+
+        # Swap in the per-host cookie jar for the duration of this
+        # single request. Previously self._session.cookies was one
+        # shared jar: a walkthrough that authenticated to target A's
+        # /login page then issued a GET to an unrelated [ATTACKER]/b
+        # beacon would ship target A's session cookie to the
+        # attacker server too. Now each host has its own jar.
+        host_jar, origin_host = self._get_jar(url)
+        self._session.cookies = host_jar
 
         _t_start = _time_mod.perf_counter()
         try:
@@ -1646,6 +1814,18 @@ class TorClient:
             result.status_code = resp.status_code
             result.response_body = resp.text[:50000]
             result.response_headers = dict(resp.headers)
+
+            # Remember the URL we just fetched so the next same-host
+            # request's Sec-Fetch-Site value says 'same-origin'
+            # instead of the falsified 'none'/'cross-site' random.
+            if 200 <= resp.status_code < 400:
+                self._last_url_per_host[origin_host] = url
+
+            # Redirect-leak remediation: if requests followed a
+            # cross-host redirect, Set-Cookie from the redirect
+            # target landed in origin_host's jar. Walk the jar and
+            # move any foreign-Domain cookies to the correct jar.
+            self._quarantine_cookies_tc(origin_host)
 
             self._audit.log(
                 action="http_request",
@@ -1687,6 +1867,24 @@ class TorClient:
         return self._exec_count
 
     def close(self):
+        """Secure teardown. Clears every per-host cookie jar,
+        Referer chain, UA cache, and underlying connection pool.
+        See the same rationale in TorSession.close()."""
+        try:
+            for _jar in list(self._host_jars.values()):
+                try:
+                    _jar.clear()
+                except Exception:
+                    pass
+            self._host_jars.clear()
+        except Exception:
+            pass
+        try:
+            self._last_url_per_host.clear()
+            self._profile_cache.clear()
+            self._exec_times.clear()
+        except Exception:
+            pass
         try:
             self._session.close()
         except Exception:
