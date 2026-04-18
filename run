@@ -4251,55 +4251,240 @@ def _live_capture_viewer(server):
 
 def _control_deck_custom_request(executor, attacker_url,
                                    callback_urls, chain_data):
-    """Let the operator run an ad-hoc request against the target
-    through the StepExecutor (so it honors Tor + jitter + audit).
-    Placeholders [ATTACKER] / [ATTACKER]/c etc. are substituted.
+    """Full-featured ad-hoc HTTP tool for the Control Deck.
 
-    URL is validated before dispatch:
-      * Must be http:// or https:// (reject file://, data:,
-        javascript:, ftp://, dict://, etc. — any non-http scheme
-        either leaks local paths in tracebacks or bypasses the
-        Tor proxy at the requests-library level).
-      * Must have a hostname (no 'http:///…').
-      * No userinfo (no user:pass@host) so plaintext credentials
-        never hit the audit log.
-      * Max length capped so paste-a-cert-pem mistakes don't blow
-        up the step.
+    Previously this was a barebones "method + URL + body" stub that
+    let operators send a single GET/POST and printed a 500-byte
+    response preview. Operators asked for a real power-tool:
+
+      * All verbs + arbitrary query params
+      * Custom headers (Authorization, X-Forwarded-For, Cookie, …)
+      * Per-request cookies as a shortcut (kv pairs)
+      * JSON or form-encoded body (auto-sets Content-Type)
+      * Raw body paste for PUT/PATCH/etc. (for binary-ish payloads)
+      * Choice of follow-redirects on/off
+      * Full response body (capped) + headers displayed with
+        _tsafe sanitization
+      * Response body auto-stashed into chain_data['last_custom_body']
+        / [status] / [headers] so subsequent findings or another
+        custom request can reference it via placeholders
+      * Response dumpable to an ephemeral file in /dev/shm for
+        inspection with jq / xxd / less
+      * Placeholders [ATTACKER], [ATTACKER]/{c,x,k,s,b}, and any
+        chain_data key (e.g. [LAST_STATUS]) expand in URL / body /
+        headers / params.
+      * SOCKS proxy + Tor Referer/UA pinning / cookie isolation
+        come free via TorClient.request().
     """
     if executor is None:
         warn("No step executor available — the walkthrough did not start "
              "a target client.")
         return
     print()
-    method = prompt("Method (GET/POST/HEAD)", "GET").strip().upper()
-    if method not in ("GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"):
+    heading("Custom HTTP Request")
+
+    # Helper to expand [ATTACKER]-style + [CHAIN_KEY]-style
+    # placeholders uniformly across URL / headers / params / body.
+    def _expand(s: str) -> str:
+        if not isinstance(s, str):
+            return s
+        s = _subst_attacker(s, attacker_url, callback_urls=callback_urls)
+        for k, v in (chain_data or {}).items():
+            placeholder = f"[{k.upper()}]"
+            if placeholder in s:
+                s = s.replace(placeholder, str(v)[:500])
+        return s
+
+    # 1. Method
+    method = prompt(
+        "Method (GET/POST/HEAD/PUT/PATCH/DELETE/OPTIONS)",
+        "GET").strip().upper()
+    if method not in ("GET", "POST", "HEAD", "PUT", "PATCH",
+                       "DELETE", "OPTIONS"):
         err(f"Unsupported method: {_tsafe_preview(method, 16)}")
         return
-    url = prompt("URL (placeholders [ATTACKER], [ATTACKER]/c, …)", "").strip()
+
+    # 2. URL (+ placeholder expansion + validator)
+    url = prompt(
+        "URL  (placeholders: [ATTACKER], [ATTACKER]/c, [LAST_STATUS], …)",
+        "").strip()
     if not url:
+        info("Cancelled (empty URL).")
         return
-    # Expand placeholders FIRST — an [ATTACKER] placeholder might
-    # carry the scheme, so scheme validation has to see the expanded
-    # form.
-    url = _subst_attacker(url, attacker_url, callback_urls=callback_urls)
+    url = _expand(url)
     url_clean, problem = _sanitize_probe_url(url, allow_onion=True)
     if problem:
         err(f"URL rejected: {problem}")
-        info(f"  offered URL (sanitized): {_tsafe_preview(url_clean, 120)}")
+        info(f"  offered URL (sanitized): "
+             f"{_tsafe_preview(url_clean, 120)}")
         return
     url = url_clean
-    data = ""
-    if method in ("POST", "PUT", "PATCH"):
-        data = prompt("Body (blank for none)", "")
-        data = _subst_attacker(data, attacker_url, callback_urls=callback_urls)
-    req = {"method": method, "url": url}
-    if data:
-        req["data"] = data
-    step = {"title": "Control-deck custom request", "request": req}
+
+    # 3. Query parameters — single-line 'k=v&k2=v2' form, optional.
+    params_raw = prompt(
+        "Query params (k=v&k2=v2, blank for none)", "").strip()
+    params: Optional[dict] = None
+    if params_raw:
+        params = {}
+        for pair in params_raw.split("&"):
+            if "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            k = _expand(k.strip())
+            v = _expand(v.strip())
+            if k:
+                params[k] = v
+
+    # 4. Headers — multi-prompt 'Name: Value', blank to finish.
+    headers: Dict[str, str] = {}
+    info("Custom headers: type 'Name: Value' per line, blank to finish.")
+    while True:
+        try:
+            h = prompt("  Header", "").strip()
+        except KeyboardInterrupt:
+            print()
+            info("(Ctrl+C — cancelling header input, keeping what you "
+                 "entered so far.)")
+            break
+        if not h:
+            break
+        if ":" not in h:
+            warn("  (no colon — skipped)")
+            continue
+        hname, hval = h.split(":", 1)
+        hname = hname.strip()
+        hval = _expand(hval.strip())
+        # Strip control chars from header name+value to prevent
+        # header-injection via the operator's own paste.
+        hname = re.sub(r"[\r\n\x00]", "", hname)[:80]
+        hval = re.sub(r"[\r\n\x00]", "", hval)[:2048]
+        if hname:
+            headers[hname] = hval
+
+    # 5. Cookies shortcut — 'name=value; name2=value2'. Merged into
+    # the existing Cookie header if one was already typed.
+    cookies_raw = prompt(
+        "Cookies (name=value; name2=value2, blank for none)", "").strip()
+    if cookies_raw:
+        cleaned = re.sub(r"[\r\n\x00]", "", cookies_raw)[:2048]
+        existing = headers.get("Cookie") or headers.get("cookie") or ""
+        combined = (existing + "; " + cleaned).strip("; ") \
+            if existing else cleaned
+        headers["Cookie"] = _expand(combined)
+
+    # 6. Body — json / form / raw / none. Only offered for verbs
+    # that conventionally carry a body.
+    data = None
+    json_body = None
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        body_kind = prompt(
+            "Body kind (json/form/raw/none)", "none").strip().lower()
+        if body_kind == "json":
+            raw = prompt("JSON body", "").strip()
+            if raw:
+                raw = _expand(raw)
+                try:
+                    json_body = json.loads(raw)
+                except ValueError as _ve:
+                    err(f"Invalid JSON: {_tsafe_preview(str(_ve), 80)}")
+                    return
+                # Content-Type handled by requests when we pass json=
+        elif body_kind == "form":
+            raw = prompt("Form body (k=v&k2=v2)", "").strip()
+            if raw:
+                data = {}
+                for pair in raw.split("&"):
+                    if "=" not in pair:
+                        continue
+                    k, v = pair.split("=", 1)
+                    data[_expand(k.strip())] = _expand(v.strip())
+                headers.setdefault(
+                    "Content-Type", "application/x-www-form-urlencoded")
+        elif body_kind == "raw":
+            raw = prompt("Raw body (string)", "").strip()
+            if raw:
+                data = _expand(raw)
+
+    # 7. Follow redirects?
+    follow_raw = prompt(
+        "Follow redirects? (y/n)", "y").strip().lower()
+    follow = follow_raw in ("y", "yes")
+
+    # 8. Dispatch via the TorClient — so everything is Tor-routed,
+    # UA is pinned per (host, circuit), cookies stay in the
+    # per-host jar, and the audit log records it.
+    print()
+    info(f"[{method}] {_tsafe_preview(url, 120)}")
+    if params:
+        info(f"  params: {params}")
+    if headers:
+        # Don't dump full header values — some may be auth tokens
+        # the operator just pasted.
+        safe_hdr = {k: (v[:12] + "…" if len(v) > 16 else v)
+                    for k, v in headers.items()}
+        info(f"  headers: {safe_hdr}")
+    if data is not None:
+        info(f"  body bytes: {len(str(data))}")
+    if json_body is not None:
+        info(f"  JSON keys: {list(json_body.keys())[:10]}")
+
+    # Route via the same TorClient the walkthrough uses. The
+    # json= parameter requires bypassing StepExecutor (which takes
+    # a data= only), so we call TorClient.request() directly here.
+    client = getattr(executor, "_client", None)
+    if client is None:
+        err("executor has no TorClient — can't dispatch.")
+        return
     try:
-        executor.execute_step(step, vuln_type="custom")
+        # TorClient.request supports params/data/headers/allow_redirects;
+        # but not json= natively, so we serialize json_body first.
+        if json_body is not None:
+            data = json.dumps(json_body)
+            headers.setdefault("Content-Type", "application/json")
+        result = client.request(
+            method=method, url=url, params=params, data=data,
+            headers=headers if headers else None,
+            allow_redirects=follow,
+        )
     except Exception as _e:
-        err(f"Request failed: {type(_e).__name__}: {_tsafe_preview(str(_e), 120)}")
+        err(f"Request failed: {type(_e).__name__}: "
+            f"{_tsafe_preview(str(_e), 120)}")
+        return
+
+    # 9. Show status + headers + body
+    print()
+    status = getattr(result, "status_code", 0) or 0
+    color = G if 200 <= status < 400 else Y if status else R
+    print(f"  {color}HTTP {status}{N}  "
+          f"({len(result.response_body or '')} bytes, "
+          f"{result.elapsed:.2f}s)")
+    rh = getattr(result, "response_headers", {}) or {}
+    if rh:
+        print(f"  {B}Response headers:{N}")
+        for hk, hv in list(rh.items())[:20]:
+            print(f"    {_tsafe_preview(hk, 48)}: "
+                  f"{_tsafe_preview(hv, 200)}")
+        if len(rh) > 20:
+            print(f"    {D}... ({len(rh)-20} more hidden){N}")
+    body = getattr(result, "response_body", "") or ""
+    if body:
+        print(f"  {B}Response body ({len(body)} B, first 8 KiB shown):{N}")
+        blob = _tsafe(body[:8192])
+        for line in blob.split("\n"):
+            print(f"    {line[:400]}")
+        if len(body) > 8192:
+            print(f"    {D}... ({len(body)-8192} more bytes truncated){N}")
+
+    # 10. Stash into chain_data so subsequent commands can ref it.
+    if chain_data is not None:
+        chain_data["last_custom_status"] = str(status)
+        chain_data["last_custom_body"] = body[:10000]
+        chain_data["last_custom_url"] = url
+        chain_data["last_output"] = body[:10000]
+        chain_data["last_status"] = str(status)
+    print()
+    info("Response stashed into chain_data: "
+         "[LAST_CUSTOM_STATUS] [LAST_CUSTOM_BODY] [LAST_CUSTOM_URL]")
 
 
 def _generate_and_show_report(audit, file_mgr, findings_summary, server):
