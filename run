@@ -3517,6 +3517,7 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
         executor, file_mgr, server, audit, chain_data,
         preset, auto_mode, callback_urls, infra_is_loopback,
         findings_summary,
+        tor_proxy=tor_proxy,
     )
 
     return client, executor
@@ -3596,7 +3597,8 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
                                attacker_url, executor, file_mgr,
                                server, audit, chain_data, preset,
                                auto_mode, callback_urls,
-                               infra_is_loopback, findings_summary):
+                               infra_is_loopback, findings_summary,
+                               tor_proxy: str = ""):
     """Post-run control center. Keeps the attacker server + hidden
     service + generated files alive and lets the operator:
       R   re-run a finding (pick index)
@@ -3848,7 +3850,8 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
 
         elif cmd == "T":
             # Tor + HS status panel
-            _tor_hs_status_panel(server, infra_is_loopback, audit)
+            _tor_hs_status_panel(server, infra_is_loopback, audit,
+                                  tor_proxy=tor_proxy)
 
         elif cmd == "I":
             # Inspect a single captured callback by index (detailed
@@ -4203,7 +4206,8 @@ def _new_identity_now(executor, audit, attacker_url):
     print()
 
 
-def _tor_hs_status_panel(server, infra_is_loopback: bool, audit):
+def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
+                           tor_proxy: str = ""):
     """One-stop status dashboard: Tor connectivity, current exit IP,
     hidden-service liveness, and attacker infra summary.
 
@@ -4211,19 +4215,38 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit):
     is my onion still reachable from the outside?' without requiring
     them to leave the Control Deck. It also logs the exit IP for
     post-mortem visibility (useful if captures stop arriving and
-    you want to know which exit to blame later)."""
+    you want to know which exit to blame later).
+
+    OPSEC NOTE on proxy selection:
+      The previous implementation fell back to
+        os.environ.get('TOR_PROXY_URL', 'socks5h://127.0.0.1:9050')
+      — so if the walkthrough was launched with a NON-default proxy
+      (e.g. Tor Browser's bundled tor on 9150, or a remote tor on
+      a unix socket), the status panel would silently probe a
+      different, possibly non-existent proxy — or worse, it would
+      succeed via the default system tor on 9050 and report 'yes
+      you're on Tor' when the walkthrough was actually routing
+      through a DIFFERENT circuit entirely. That's a status-panel
+      lie that could make the operator believe their session is
+      safe when it's not. We now pass the walkthrough's actual
+      tor_proxy through explicitly so the probe hits the SAME
+      SOCKS endpoint the walkthrough is using.
+    """
     print()
     heading("Tor + Attacker-Infra Status")
 
     # 1. Tor reachability + exit IP via check.torproject.org.
-    # We construct a fresh ephemeral session through the operator's
-    # Tor proxy (env var or default port). This intentionally does
-    # NOT use the walkthrough TorClient because we don't want this
-    # probe polluting TorClient's per-host cookie jars or Referer
-    # chain.
+    # Use the EXACT proxy the walkthrough is configured with.
+    # Fall back to the env var / 9050 only if absolutely nothing was
+    # passed (shouldn't happen — _walkthrough_control_deck always
+    # forwards tor_proxy). If this panel probes a different proxy
+    # than the walkthrough uses, the "is_tor" answer is a LIE
+    # w.r.t. the walkthrough's actual traffic.
     import requests as _req
-    _torproxy = os.environ.get("TOR_PROXY_URL",
-                               "socks5h://127.0.0.1:9050")
+    _torproxy = (tor_proxy
+                 or os.environ.get("TOR_PROXY_URL")
+                 or "socks5h://127.0.0.1:9050")
+    print(f"  {B}Probing via:{N}           {_tsafe_preview(_torproxy, 64)}")
     probe_ok = False
     exit_ip = "unknown"
     is_tor = None
