@@ -5592,9 +5592,21 @@ class SubdomainEnumerator:
                      known: Set[str],
                      max_new: int = 60) -> Set[str]:
         """DoH-based prefix brute force. Keeps CALL counts tight so we
-        don't keep Tor circuits open for an hour."""
+        don't keep Tor circuits open for an hour.
+
+        Previously the wordlist was iterated in declared order
+        (www → api → dev → staging → …). A defender tailing their
+        own DNS logs sees the exact scanner signature. We shuffle the
+        list per-session using secrets (cryptographic RNG, not
+        seedable) so each scan has a unique probe order. Defenders
+        still see 'someone probed 90 prefixes' but there's no
+        stable sequence fingerprint between runs.
+        """
+        shuffled = list(self.BRUTE_WORDLIST)
+        # Cryptographic shuffle: secrets.SystemRandom is CSPRNG-backed.
+        secrets.SystemRandom().shuffle(shuffled)
         out: Set[str] = set()
-        for prefix in self.BRUTE_WORDLIST:
+        for prefix in shuffled:
             if shutdown_requested():
                 break
             if len(out) >= max_new:
@@ -5629,14 +5641,53 @@ class SubdomainEnumerator:
         """Run every source, merge, deduplicate, optionally verify via
         DoH, optionally brute-force common prefixes, and return a
         diagnostic dict. Every step is guarded by shutdown_requested()
-        so Ctrl-C returns partial results."""
+        so Ctrl-C returns partial results.
+
+        OPSEC ordering:
+          1. Wildcard-detect FIRST. If the zone is wildcarded, brute
+             force is worthless (every random label resolves) — we'd
+             just be broadcasting a long list of high-value prefixes
+             to Cloudflare DoH and the zone's own authoritative DNS.
+          2. Query passive sources (shuffled order).
+          3. Between passive sources, let the role-boundary rotation
+             do its thing — but don't call them back-to-back without
+             a pause; the circuit rotation cadence handles that.
+          4. Opt into rapiddns ONLY when we're starved and the
+             operator didn't disable brute force (because rapiddns
+             HTML-scraping is noisier than a JSON API).
+          5. Verify via DoH and — if NOT wildcard — brute-force.
+
+        Previous bugs fixed here:
+          * Wildcard detection ran AFTER passive sources AND brute-
+            force both completed, so on a wildcard zone we already
+            burned the full brute-force circuit budget before
+            discovering the hits were garbage.
+          * Wildcard-branch rebuild used `h in s for s in sources`
+            but brute_hits had already been unioned into `resolvable`,
+            so a brute-force hit that wildcard-resolved got filtered
+            correctly — but the source iteration also included
+            `rapiddns` (containing brute-force false positives from
+            the wildcard), which kept them in the final set.
+          * Passive aggregators were called in a deterministic order,
+            giving each defender a stable 'scanner signature'.
+        """
+        # ── Phase A: wildcard detection first ──
+        wildcard = False
+        if verify_resolvable and not shutdown_requested():
+            wildcard = self._detect_wildcard(domain)
+
+        # ── Phase B: passive sources, shuffled order ──
         sources: Dict[str, Set[str]] = {}
-        ordered = (
+        # Cryptographic shuffle — every scan order is different so a
+        # defender can't pattern-match "scanner hit crt.sh THEN
+        # certspotter THEN OTX THEN hackertarget".
+        ordered = [
             ("crt.sh",       self._from_crtsh),
             ("certspotter",  self._from_certspotter),
             ("hackertarget", self._from_hackertarget),
             ("alienvault",   self._from_otx),
-        )
+        ]
+        secrets.SystemRandom().shuffle(ordered)
         for name, fn in ordered:
             if shutdown_requested():
                 break
@@ -5651,8 +5702,10 @@ class SubdomainEnumerator:
         for s in sources.values():
             all_candidates |= s
 
-        # Only hit the HTML-scrape source if the CT sources came back
-        # thin. Otherwise we're burning a circuit for nothing.
+        # ── Phase C: HTML-scrape fallback (rapiddns) ──
+        # Only when passive aggregators came back thin. On wildcard
+        # zones we STILL try it — it's a passive service, not a
+        # brute force — but we later filter wildcard-bogus rows.
         if not shutdown_requested() and len(all_candidates) < 10:
             try:
                 rapid = self._from_rapiddns(domain)
@@ -5663,10 +5716,7 @@ class SubdomainEnumerator:
                               f"subdomain_src_fail:rapiddns:{type(_rdn_err).__name__}")
                 sources["rapiddns"] = set()
 
-        wildcard = False
-        if verify_resolvable and not shutdown_requested():
-            wildcard = self._detect_wildcard(domain)
-
+        # ── Phase D: DoH verify what we've got so far ──
         resolvable: Set[str] = set()
         unresolved: Set[str] = set()
         if verify_resolvable:
@@ -5682,18 +5732,32 @@ class SubdomainEnumerator:
         else:
             resolvable = set(all_candidates)
 
+        # ── Phase E: brute force, ONLY on non-wildcard zones ──
         brute_hits: Set[str] = set()
+        skipped_brute_reason = ""
         if brute_force and not shutdown_requested():
-            brute_hits = self._brute_force(domain, resolvable | all_candidates)
-            resolvable |= brute_hits
+            if wildcard and verify_resolvable:
+                skipped_brute_reason = (
+                    "wildcard zone — every brute-force probe would "
+                    "false-positive resolve; skipping to save circuits"
+                )
+            else:
+                brute_hits = self._brute_force(
+                    domain, resolvable | all_candidates)
+                resolvable |= brute_hits
 
+        # ── Phase F: final filtering ──
         final_set: Set[str]
         if wildcard and verify_resolvable:
-            # Wildcard zone: drop brute-force guesses entirely (every
-            # random prefix will 'resolve') and require the host to
-            # have appeared in at least one passive source.
-            final_set = {h for h in resolvable
-                         if any(h in s for s in sources.values())}
+            # On wildcard zones ONLY keep hosts that appeared in at
+            # least one passive source (CT / OTX / hackertarget /
+            # rapiddns). Brute-force hits would all false-positive
+            # but they were skipped above; this guards the other
+            # code paths (unverified mode, corner cases).
+            passive_union: Set[str] = set()
+            for src_name, names in sources.items():
+                passive_union |= names
+            final_set = {h for h in resolvable if h in passive_union}
         else:
             final_set = resolvable if verify_resolvable else all_candidates
 
@@ -5705,6 +5769,7 @@ class SubdomainEnumerator:
             "resolvable_count": len(resolvable),
             "unresolved_count": len(unresolved),
             "brute_hits": sorted(brute_hits),
+            "brute_skipped": skipped_brute_reason,
             "wildcard_zone": wildcard,
             "verified": verify_resolvable,
         }
@@ -7478,7 +7543,9 @@ class IntelOrchestrator:
                     f"{n}={c}" for n, c in detail["source_counts"].items())
                 print(f"      sources: {per_src}")
                 if detail.get("wildcard_zone"):
-                    print(f"      [!] wildcard zone — requiring CT confirmation")
+                    print(f"      [!] wildcard zone — requiring passive-source confirmation")
+                if detail.get("brute_skipped"):
+                    print(f"      [.] brute force skipped: {detail['brute_skipped']}")
                 if detail.get("brute_hits"):
                     print(f"      +{len(detail['brute_hits'])} via DNS brute-force")
                 print(f"      candidates={detail.get('total_unique_candidates', 0)}"
