@@ -5939,6 +5939,172 @@ class VulnScanner:
 #  Subdomain Enumerator (via crt.sh certificate transparency)
 # ══════════════════════════════════════════════════════════════════════════
 
+def _build_subdomain_progress_cb():
+    """Return a callback that renders SubdomainEnumerator progress
+    events on the operator's TTY.
+
+    Uses carriage-return overwrite (\r) to keep the status on ONE
+    line that updates in place, so the scroll buffer doesn't fill
+    with thousands of per-probe lines — but important events
+    (source done / wildcard result / brute hits / phase done) get
+    a full newline so they stay in history.
+
+    Writes to sys.stdout with explicit flush so it shows through
+    pipes and wrappers that otherwise line-buffer the output.
+
+    Tick throttle: DoH verification of 400 hosts would emit 400
+    'host=X' updates — on a slow terminal that's itself a drag.
+    We throttle to max ~10 redraws per second.
+    """
+    import sys as _sys
+    import time as _t
+
+    state = {
+        "last_redraw": 0.0,
+        "phase_t0": 0.0,
+        "last_line_len": 0,
+    }
+
+    def _overwrite(line: str, final: bool = False):
+        """Overwrite the current status line in place. If final,
+        also emit a newline so subsequent prints don't stomp the
+        status."""
+        pad = max(0, state["last_line_len"] - len(line))
+        try:
+            _sys.stdout.write("\r      " + line + (" " * pad))
+            if final:
+                _sys.stdout.write("\n")
+                state["last_line_len"] = 0
+            else:
+                state["last_line_len"] = len(line)
+            _sys.stdout.flush()
+        except Exception:
+            pass
+
+    def _throttled(force: bool = False) -> bool:
+        now = _t.time()
+        if force or (now - state["last_redraw"]) >= 0.1:
+            state["last_redraw"] = now
+            return True
+        return False
+
+    def _elapsed() -> str:
+        if state["phase_t0"] == 0.0:
+            return ""
+        s = _t.time() - state["phase_t0"]
+        if s < 60:
+            return f"{s:.0f}s"
+        m, ss = divmod(int(s), 60)
+        return f"{m}m{ss:02d}s"
+
+    def cb(event: str, payload: dict):
+        # Passive-source lifecycle
+        if event == "phase_start":
+            state["phase_t0"] = _t.time()
+            _overwrite("[Phase A] wildcard detect…", final=False)
+        elif event == "wildcard_check":
+            _overwrite("[Phase A] wildcard detect…", final=False)
+        elif event == "wildcard_result":
+            if payload.get("wildcard"):
+                _overwrite(f"[Phase A] wildcard zone DETECTED "
+                           f"(brute-force will be skipped) "
+                           f"[{_elapsed()}]", final=True)
+            else:
+                _overwrite(f"[Phase A] wildcard: clean [{_elapsed()}]",
+                           final=True)
+        elif event == "rotating_circuit":
+            _overwrite(f"[Phase B {payload.get('idx',0)+1}/"
+                       f"{payload.get('total',0)}] "
+                       f"rotating circuit before "
+                       f"{payload.get('source_next','?')}…",
+                       final=False)
+        elif event == "source_start":
+            tot = payload.get("total", 0)
+            idx = payload.get("idx", 0)
+            if tot:
+                label = f"[Phase B {idx}/{tot}] {payload['source']}…"
+            else:
+                label = f"[Phase C] {payload['source']} fallback…"
+            _overwrite(label, final=False)
+        elif event == "source_done":
+            tot = payload.get("total", 0)
+            idx = payload.get("idx", 0)
+            cnt = payload.get("count", 0)
+            el = payload.get("elapsed", 0.0)
+            tag = f"B {idx}/{tot}" if tot else "C"
+            _overwrite(f"[Phase {tag}] {payload['source']} "
+                       f"→ {cnt} host(s) ({el:.1f}s)",
+                       final=True)
+        elif event == "source_fail":
+            tot = payload.get("total", 0)
+            idx = payload.get("idx", 0)
+            tag = f"B {idx}/{tot}" if tot else "C"
+            _overwrite(f"[Phase {tag}] {payload['source']} "
+                       f"FAIL: {payload.get('error','?')}",
+                       final=True)
+        # DoH verification — THROTTLE, this runs 400 times
+        elif event == "verify_start":
+            total = payload.get("total", 0)
+            _overwrite(f"[Phase D] DoH verifying {total} host(s)…",
+                       final=False)
+        elif event == "verify_tick":
+            if _throttled():
+                done = payload.get("done", 0)
+                total = payload.get("total", 0)
+                resv = payload.get("resolved", 0)
+                _overwrite(f"[Phase D] DoH {done}/{total} "
+                           f"resolved={resv} [{_elapsed()}]",
+                           final=False)
+        elif event == "verify_done":
+            total = payload.get("total", 0)
+            resv = payload.get("resolved", 0)
+            unres = payload.get("unresolved", 0)
+            _overwrite(f"[Phase D] DoH done: {resv}/{total} "
+                       f"resolvable ({unres} dead) [{_elapsed()}]",
+                       final=True)
+        # Brute force
+        elif event == "brute_start":
+            total = payload.get("total", 0)
+            _overwrite(f"[Phase E] brute-force 0/{total}…",
+                       final=False)
+        elif event == "brute_tick":
+            if _throttled():
+                tried = payload.get("tried", 0)
+                total = payload.get("total", 0)
+                hits = payload.get("hits", 0)
+                _overwrite(f"[Phase E] brute {tried}/{total} "
+                           f"hits={hits} [{_elapsed()}]",
+                           final=False)
+        elif event == "brute_hit":
+            # Hit messages get promoted to their own line so the
+            # operator sees what was discovered without losing
+            # the status line.
+            host = payload.get("host", "?")
+            hits = payload.get("hits", 0)
+            _overwrite(f"[Phase E] hit #{hits}: {host}",
+                       final=True)
+        elif event == "brute_done":
+            tried = payload.get("tried", 0)
+            hits = payload.get("hits", 0)
+            _overwrite(f"[Phase E] brute done: {hits} hit(s) "
+                       f"across {tried} probe(s) [{_elapsed()}]",
+                       final=True)
+        elif event == "brute_skip":
+            reason = payload.get("reason", "")
+            _overwrite(f"[Phase E] brute-force skipped "
+                       f"({reason[:60]})", final=True)
+        elif event == "phase_done":
+            _overwrite(f"[Phase F] done: {payload.get('subdomains',0)} "
+                       f"subdomain(s) kept "
+                       f"(candidates={payload.get('candidates',0)}, "
+                       f"brute={payload.get('brute_hits',0)}, "
+                       f"wildcard={payload.get('wildcard',False)}) "
+                       f"[{_elapsed()}]",
+                       final=True)
+
+    return cb
+
+
 class SubdomainEnumerator:
     """Enumerate subdomains from multiple independent sources, validate
     each candidate is DNS-resolvable (to kill wildcard/stale CT noise),
@@ -6012,6 +6178,27 @@ class SubdomainEnumerator:
     def __init__(self, session: TorSession):
         self._session = session
         self._resolved: Dict[str, Optional[str]] = {}
+        # Progress sink: either None (silent — old behaviour) or a
+        # callable taking (event, payload_dict). enumerate_detailed
+        # sets this for the duration of a scan. The orchestrator
+        # passes in a tty-writing callback so the operator sees:
+        #   phase_start   source   wildcard_{check,hit,clean}
+        #   verify_tick   brute_tick   done
+        # without us having to import print/sys from inside every
+        # collector method.
+        self._progress: Optional[Any] = None
+
+    def _emit(self, event: str, **payload):
+        """Safe progress emit. No-op if no sink is installed."""
+        cb = self._progress
+        if cb is None:
+            return
+        try:
+            cb(event, payload)
+        except Exception:
+            # A broken progress callback must never take down the
+            # scan. Swallow + continue.
+            pass
 
     # ── DoH helpers ────────────────────────────────────────────────
     def _doh_resolve(self, name: str, rtype: str = "A") -> List[str]:
@@ -6196,27 +6383,48 @@ class SubdomainEnumerator:
         seedable) so each scan has a unique probe order. Defenders
         still see 'someone probed 90 prefixes' but there's no
         stable sequence fingerprint between runs.
+
+        Progress is emitted every probe via self._emit('brute_tick',
+        ...) so the orchestrator's TTY callback can redraw the
+        status line — previously this loop could take 2-5 minutes
+        over Tor with ZERO visible output, leaving operators
+        unsure whether the scanner was hung.
         """
         shuffled = list(self.BRUTE_WORDLIST)
         # Cryptographic shuffle: secrets.SystemRandom is CSPRNG-backed.
         secrets.SystemRandom().shuffle(shuffled)
         out: Set[str] = set()
+        tried = 0
+        total = len(shuffled)
+        self._emit("brute_start", total=total, max_new=max_new)
         for prefix in shuffled:
             if shutdown_requested():
                 break
             if len(out) >= max_new:
                 break
             host = f"{prefix}.{domain}"
+            tried += 1
             if host in known:
+                # Skip, but still bump the counter so the displayed
+                # "X/total" reflects actual loop progress.
+                self._emit("brute_tick", tried=tried, total=total,
+                           hits=len(out), host=host, skipped=True)
                 continue
+            self._emit("brute_tick", tried=tried, total=total,
+                       hits=len(out), host=host, probing=True)
             if self._is_resolvable(host):
                 out.add(host)
+                self._emit("brute_hit", tried=tried, total=total,
+                           hits=len(out), host=host)
+        self._emit("brute_done", tried=tried, total=total,
+                   hits=len(out))
         return out
 
     # ── Orchestration ──────────────────────────────────────────────
     def enumerate(self, domain: str,
                   brute_force: bool = True,
-                  verify_resolvable: bool = True) -> List[str]:
+                  verify_resolvable: bool = True,
+                  progress: Optional[Any] = None) -> List[str]:
         """Multi-source enumeration with optional DNS validation.
 
         Back-compat: returns the same List[str] the old enumerator did.
@@ -6228,11 +6436,13 @@ class SubdomainEnumerator:
             domain,
             brute_force=brute_force,
             verify_resolvable=verify_resolvable,
+            progress=progress,
         )["subdomains"]
 
     def enumerate_detailed(self, domain: str,
                            brute_force: bool = True,
-                           verify_resolvable: bool = True) -> Dict[str, Any]:
+                           verify_resolvable: bool = True,
+                           progress: Optional[Any] = None) -> Dict[str, Any]:
         """Run every source, merge, deduplicate, optionally verify via
         DoH, optionally brute-force common prefixes, and return a
         diagnostic dict. Every step is guarded by shutdown_requested()
@@ -6266,125 +6476,188 @@ class SubdomainEnumerator:
           * Passive aggregators were called in a deterministic order,
             giving each defender a stable 'scanner signature'.
         """
-        # ── Phase A: wildcard detection first ──
-        wildcard = False
-        if verify_resolvable and not shutdown_requested():
-            wildcard = self._detect_wildcard(domain)
+        # Progress sink: installed for the duration of this call.
+        # Non-None callback keeps the operator informed sub-phase by
+        # sub-phase. Without it, the whole pipeline could run for
+        # 10 minutes over Tor with no visible output — indistinguishable
+        # from a hang.
+        self._progress = progress
+        try:
+            self._emit("phase_start", name="enumerate",
+                       domain=domain,
+                       brute_force=brute_force,
+                       verify=verify_resolvable)
 
-        # ── Phase B: passive sources, shuffled order ──
-        sources: Dict[str, Set[str]] = {}
-        # Cryptographic shuffle — every scan order is different so a
-        # defender can't pattern-match "scanner hit crt.sh THEN
-        # certspotter THEN OTX THEN hackertarget".
-        ordered = [
-            ("crt.sh",       self._from_crtsh),
-            ("certspotter",  self._from_certspotter),
-            ("hackertarget", self._from_hackertarget),
-            ("alienvault",   self._from_otx),
-        ]
-        secrets.SystemRandom().shuffle(ordered)
-        for src_idx, (name, fn) in enumerate(ordered):
-            if shutdown_requested():
-                break
-            # Force a fresh Tor circuit between consecutive passive
-            # sources. Without this, mutual observers (e.g. a CT
-            # aggregator and Cloudflare) see the SAME exit IP hit
-            # both services back-to-back — a trivial linkage
-            # ('someone enumerated target.example.com via both').
-            # Rotation failure is non-fatal; we continue on the
-            # current circuit rather than aborting the scan.
-            if src_idx > 0:
-                try:
-                    newnym()
-                    time.sleep(0.5 + secrets.randbelow(2000) / 1000.0)
-                    # Redraw browser fingerprints for the new circuit.
-                    self._session._circuit_generation += 1
-                except Exception:
-                    integrity_log(
-                        "intel",
-                        "subdomain_inter_source_rotate_failed")
-            try:
-                sources[name] = fn(domain)
-            except Exception as _src_err:
-                integrity_log("intel",
-                              f"subdomain_src_fail:{name}:{type(_src_err).__name__}")
-                sources[name] = set()
+            # ── Phase A: wildcard detection first ──
+            wildcard = False
+            if verify_resolvable and not shutdown_requested():
+                self._emit("wildcard_check", domain=domain)
+                wildcard = self._detect_wildcard(domain)
+                self._emit("wildcard_result", domain=domain,
+                           wildcard=wildcard)
 
-        all_candidates: Set[str] = set()
-        for s in sources.values():
-            all_candidates |= s
-
-        # ── Phase C: HTML-scrape fallback (rapiddns) ──
-        # Only when passive aggregators came back thin. On wildcard
-        # zones we STILL try it — it's a passive service, not a
-        # brute force — but we later filter wildcard-bogus rows.
-        if not shutdown_requested() and len(all_candidates) < 10:
-            try:
-                rapid = self._from_rapiddns(domain)
-                sources["rapiddns"] = rapid
-                all_candidates |= rapid
-            except Exception as _rdn_err:
-                integrity_log("intel",
-                              f"subdomain_src_fail:rapiddns:{type(_rdn_err).__name__}")
-                sources["rapiddns"] = set()
-
-        # ── Phase D: DoH verify what we've got so far ──
-        resolvable: Set[str] = set()
-        unresolved: Set[str] = set()
-        if verify_resolvable:
-            # Cap verification so we don't do 5000 DoH lookups over Tor.
-            to_verify = sorted(all_candidates)[:400]
-            for host in to_verify:
+            # ── Phase B: passive sources, shuffled order ──
+            sources: Dict[str, Set[str]] = {}
+            # Cryptographic shuffle — every scan order is different so a
+            # defender can't pattern-match "scanner hit crt.sh THEN
+            # certspotter THEN OTX THEN hackertarget".
+            ordered = [
+                ("crt.sh",       self._from_crtsh),
+                ("certspotter",  self._from_certspotter),
+                ("hackertarget", self._from_hackertarget),
+                ("alienvault",   self._from_otx),
+            ]
+            secrets.SystemRandom().shuffle(ordered)
+            total_sources = len(ordered)
+            for src_idx, (name, fn) in enumerate(ordered):
                 if shutdown_requested():
                     break
-                if self._is_resolvable(host):
-                    resolvable.add(host)
-                else:
-                    unresolved.add(host)
-        else:
-            resolvable = set(all_candidates)
+                # Force a fresh Tor circuit between consecutive passive
+                # sources. Without this, mutual observers (e.g. a CT
+                # aggregator and Cloudflare) see the SAME exit IP hit
+                # both services back-to-back — a trivial linkage
+                # ('someone enumerated target.example.com via both').
+                # Rotation failure is non-fatal; we continue on the
+                # current circuit rather than aborting the scan.
+                if src_idx > 0:
+                    self._emit("rotating_circuit",
+                               source_next=name,
+                               idx=src_idx, total=total_sources)
+                    try:
+                        newnym()
+                        time.sleep(0.5 + secrets.randbelow(2000) / 1000.0)
+                        # Redraw browser fingerprints for the new circuit.
+                        self._session._circuit_generation += 1
+                    except Exception:
+                        integrity_log(
+                            "intel",
+                            "subdomain_inter_source_rotate_failed")
+                self._emit("source_start", source=name,
+                           idx=src_idx + 1, total=total_sources)
+                try:
+                    _t = time.time()
+                    sources[name] = fn(domain)
+                    self._emit("source_done", source=name,
+                               idx=src_idx + 1, total=total_sources,
+                               count=len(sources[name]),
+                               elapsed=time.time() - _t)
+                except Exception as _src_err:
+                    integrity_log("intel",
+                                  f"subdomain_src_fail:{name}:"
+                                  f"{type(_src_err).__name__}")
+                    sources[name] = set()
+                    self._emit("source_fail", source=name,
+                               idx=src_idx + 1, total=total_sources,
+                               error=type(_src_err).__name__)
 
-        # ── Phase E: brute force, ONLY on non-wildcard zones ──
-        brute_hits: Set[str] = set()
-        skipped_brute_reason = ""
-        if brute_force and not shutdown_requested():
-            if wildcard and verify_resolvable:
-                skipped_brute_reason = (
-                    "wildcard zone — every brute-force probe would "
-                    "false-positive resolve; skipping to save circuits"
-                )
+            all_candidates: Set[str] = set()
+            for s in sources.values():
+                all_candidates |= s
+
+            # ── Phase C: HTML-scrape fallback (rapiddns) ──
+            # Only when passive aggregators came back thin. On wildcard
+            # zones we STILL try it — it's a passive service, not a
+            # brute force — but we later filter wildcard-bogus rows.
+            if not shutdown_requested() and len(all_candidates) < 10:
+                self._emit("source_start", source="rapiddns",
+                           idx=0, total=0)
+                try:
+                    _t = time.time()
+                    rapid = self._from_rapiddns(domain)
+                    sources["rapiddns"] = rapid
+                    all_candidates |= rapid
+                    self._emit("source_done", source="rapiddns",
+                               idx=0, total=0,
+                               count=len(rapid),
+                               elapsed=time.time() - _t)
+                except Exception as _rdn_err:
+                    integrity_log("intel",
+                                  f"subdomain_src_fail:rapiddns:"
+                                  f"{type(_rdn_err).__name__}")
+                    sources["rapiddns"] = set()
+                    self._emit("source_fail", source="rapiddns",
+                               idx=0, total=0,
+                               error=type(_rdn_err).__name__)
+
+            # ── Phase D: DoH verify what we've got so far ──
+            resolvable: Set[str] = set()
+            unresolved: Set[str] = set()
+            if verify_resolvable:
+                # Cap verification so we don't do 5000 DoH lookups over Tor.
+                to_verify = sorted(all_candidates)[:400]
+                total = len(to_verify)
+                self._emit("verify_start", total=total)
+                for i, host in enumerate(to_verify, 1):
+                    if shutdown_requested():
+                        break
+                    self._emit("verify_tick", done=i, total=total,
+                               host=host,
+                               resolved=len(resolvable),
+                               unresolved=len(unresolved))
+                    if self._is_resolvable(host):
+                        resolvable.add(host)
+                    else:
+                        unresolved.add(host)
+                self._emit("verify_done", total=total,
+                           resolved=len(resolvable),
+                           unresolved=len(unresolved))
             else:
-                brute_hits = self._brute_force(
-                    domain, resolvable | all_candidates)
-                resolvable |= brute_hits
+                resolvable = set(all_candidates)
 
-        # ── Phase F: final filtering ──
-        final_set: Set[str]
-        if wildcard and verify_resolvable:
-            # On wildcard zones ONLY keep hosts that appeared in at
-            # least one passive source (CT / OTX / hackertarget /
-            # rapiddns). Brute-force hits would all false-positive
-            # but they were skipped above; this guards the other
-            # code paths (unverified mode, corner cases).
-            passive_union: Set[str] = set()
-            for src_name, names in sources.items():
-                passive_union |= names
-            final_set = {h for h in resolvable if h in passive_union}
-        else:
-            final_set = resolvable if verify_resolvable else all_candidates
+            # ── Phase E: brute force, ONLY on non-wildcard zones ──
+            brute_hits: Set[str] = set()
+            skipped_brute_reason = ""
+            if brute_force and not shutdown_requested():
+                if wildcard and verify_resolvable:
+                    skipped_brute_reason = (
+                        "wildcard zone — every brute-force probe would "
+                        "false-positive resolve; skipping to save circuits"
+                    )
+                    self._emit("brute_skip",
+                               reason=skipped_brute_reason)
+                else:
+                    brute_hits = self._brute_force(
+                        domain, resolvable | all_candidates)
+                    resolvable |= brute_hits
 
-        subs_sorted = sorted(final_set)[:400]
-        return {
-            "subdomains": subs_sorted,
-            "source_counts": {n: len(s) for n, s in sources.items()},
-            "total_unique_candidates": len(all_candidates),
-            "resolvable_count": len(resolvable),
-            "unresolved_count": len(unresolved),
-            "brute_hits": sorted(brute_hits),
-            "brute_skipped": skipped_brute_reason,
-            "wildcard_zone": wildcard,
-            "verified": verify_resolvable,
-        }
+            # ── Phase F: final filtering ──
+            final_set: Set[str]
+            if wildcard and verify_resolvable:
+                # On wildcard zones ONLY keep hosts that appeared in at
+                # least one passive source (CT / OTX / hackertarget /
+                # rapiddns). Brute-force hits would all false-positive
+                # but they were skipped above; this guards the other
+                # code paths (unverified mode, corner cases).
+                passive_union: Set[str] = set()
+                for src_name, names in sources.items():
+                    passive_union |= names
+                final_set = {h for h in resolvable if h in passive_union}
+            else:
+                final_set = resolvable if verify_resolvable else all_candidates
+
+            subs_sorted = sorted(final_set)[:400]
+            self._emit("phase_done",
+                       subdomains=len(subs_sorted),
+                       candidates=len(all_candidates),
+                       resolvable=len(resolvable),
+                       unresolved=len(unresolved),
+                       brute_hits=len(brute_hits),
+                       wildcard=wildcard)
+            return {
+                "subdomains": subs_sorted,
+                "source_counts": {n: len(s) for n, s in sources.items()},
+                "total_unique_candidates": len(all_candidates),
+                "resolvable_count": len(resolvable),
+                "unresolved_count": len(unresolved),
+                "brute_hits": sorted(brute_hits),
+                "brute_skipped": skipped_brute_reason,
+                "wildcard_zone": wildcard,
+                "verified": verify_resolvable,
+            }
+        finally:
+            # Always detach the progress sink so subsequent calls
+            # without a sink really stay silent.
+            self._progress = None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -8154,11 +8427,33 @@ class IntelOrchestrator:
         # prefix brute force. We show per-source counts so the
         # operator sees WHICH aggregator is blocking us when a
         # domain comes back thin.
+        #
+        # LIVE PROGRESS: this phase can legitimately take 8-15
+        # minutes over Tor:
+        #   - 4 passive sources with inter-source circuit rotation
+        #     (1.5-3.5s sleep each)
+        #   - up to 400 DoH verification lookups (per-domain delay +
+        #     rate-limit + circuit rotation every 4-12 requests)
+        #   - up to 60 brute-force prefix lookups
+        #   - plus optional rapiddns fallback
+        # Previously there was ZERO output between the initial
+        # "Phase 5:" line and the final results — indistinguishable
+        # from a hang. We now install a progress callback that
+        # redraws a status line each sub-step.
         if self._scan_depth == "deep":
+            progress_cb = _build_subdomain_progress_cb()
             detail = self._run_phase(
                 5, "Subdomain enumeration (multi-source + DoH verify)",
                 self._subdomains.enumerate_detailed, domain,
+                progress=progress_cb,
             ) or {}
+            # End the progress line cleanly so subsequent prints
+            # start on a fresh line.
+            try:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
             subs = detail.get("subdomains", []) if isinstance(detail, dict) else []
             if isinstance(detail, dict) and detail.get("source_counts"):
                 per_src = ", ".join(
