@@ -5052,50 +5052,354 @@ class VulnScanner:
 # ══════════════════════════════════════════════════════════════════════════
 
 class SubdomainEnumerator:
-    """Enumerate subdomains via certificate transparency logs.
+    """Enumerate subdomains from multiple independent sources, validate
+    each candidate is DNS-resolvable (to kill wildcard/stale CT noise),
+    and fall back to a targeted DNS wordlist brute force when the
+    passive sources return thin results.
 
-    crt.sh is a free public service that indexes certificate transparency
-    logs. It's Tor-friendly and doesn't block automated queries.
+    Why multiple sources: crt.sh by itself is fragile — it rate-limits
+    aggressively from Tor exits, sometimes returns HTML instead of JSON
+    (503 with a friendly error page), and has stale entries for hosts
+    that were decomissioned years ago. A weak-list of 'what survived'
+    gives operators false confidence that they mapped the attack surface.
+    We query:
+
+      1. crt.sh                — CT via postgres-backed JSON
+      2. certspotter.com       — independent CT aggregator
+      3. api.hackertarget.com  — host-search reverse DNS (only first
+                                 50 rows; free tier is throttled).
+      4. AlienVault OTX         — passive DNS history
+      5. RapidDNS               — HTML-scrape fallback (last resort)
+
+    Then every candidate gets a DoH A-record probe to confirm it's
+    actually resolvable today. Dead entries get filtered out, ALIVE
+    get marked — operators see a count of each. Finally we brute-force
+    a small wordlist of high-value prefixes (admin/dev/staging/api/…)
+    via DoH to catch subdomains that never appeared in a cert.
+
+    Wildcard detection: if a random nonce-prefix resolves we mark the
+    zone as wildcard-aware and require a CT hit to keep a host, so we
+    don't dump 500 bogus 'abc123.target.com' rows.
     """
 
+    # Free sources. Each returns a structured JSON payload we can
+    # parse; when one blocks/errs we fall through to the next.
     CRTSH_URL = "https://crt.sh/?q={domain}&output=json"
+    CERTSPOTTER_URL = ("https://api.certspotter.com/v1/issuances"
+                       "?domain={domain}&include_subdomains=true&expand=dns_names")
+    HACKERTARGET_URL = "https://api.hackertarget.com/hostsearch/?q={domain}"
+    OTX_URL = ("https://otx.alienvault.com/api/v1/indicators/"
+               "domain/{domain}/passive_dns")
+    RAPIDDNS_URL = "https://rapiddns.io/subdomain/{domain}?full=1#result"
+
+    DOH_URL = "https://cloudflare-dns.com/dns-query"
+
+    # High-value DNS bruteforce prefixes. We keep this tight so that
+    # even with per-domain delays we don't spend ten minutes enumerating
+    # a single zone over Tor.
+    BRUTE_WORDLIST = (
+        "www", "api", "dev", "staging", "stage", "test", "qa", "uat",
+        "admin", "administrator", "adminpanel", "cpanel", "portal",
+        "console", "dashboard", "control", "panel", "manage",
+        "auth", "login", "sso", "idp", "okta", "saml", "oauth",
+        "mail", "smtp", "imap", "pop", "webmail", "owa", "exchange",
+        "git", "gitlab", "gitea", "jira", "confluence", "wiki",
+        "jenkins", "ci", "build", "drone", "circle", "teamcity",
+        "mon", "monitor", "grafana", "prometheus", "kibana",
+        "elastic", "es", "splunk", "logs",
+        "vpn", "rdp", "ssh", "ftp", "sftp", "s3", "storage",
+        "cdn", "static", "assets", "media", "img", "images",
+        "files", "docs", "download", "uploads",
+        "blog", "news", "shop", "store", "pay", "payments", "billing",
+        "secure", "private", "internal", "intranet",
+        "status", "health", "metrics",
+        "db", "database", "mysql", "pg", "postgres", "mongo",
+        "cache", "redis", "memcache",
+        "beta", "alpha", "preview", "sandbox", "demo",
+        "old", "legacy", "archive", "backup",
+        "m", "mobile", "api-v1", "api-v2", "api-v3", "v1", "v2",
+        "ws", "websocket",
+    )
 
     def __init__(self, session: TorSession):
         self._session = session
+        self._resolved: Dict[str, Optional[str]] = {}
 
-    def enumerate(self, domain: str) -> List[str]:
-        """Query crt.sh for subdomains of the given domain."""
+    # ── DoH helpers ────────────────────────────────────────────────
+    def _doh_resolve(self, name: str, rtype: str = "A") -> List[str]:
+        """Single DoH lookup. Returns the list of answer data strings,
+        or [] on any failure. Cached by (name, rtype) to avoid burning
+        circuits on duplicate probes."""
+        cache_key = f"{name}|{rtype}"
+        if cache_key in self._resolved:
+            cached = self._resolved[cache_key]
+            return cached if isinstance(cached, list) else []
+        url = f"{self.DOH_URL}?name={quote(name)}&type={rtype}"
+        resp = self._session.get(
+            url,
+            headers={"Accept": "application/dns-json"},
+            allow_wayback=False,
+        )
+        data: List[str] = []
+        if resp is not None:
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    for ans in payload.get("Answer", []) or []:
+                        d = (ans.get("data") or "").strip('"')
+                        if d:
+                            data.append(d)
+            except (ValueError, KeyError):
+                pass
+        self._resolved[cache_key] = data
+        return data
+
+    def _is_resolvable(self, host: str) -> bool:
+        """True if the name resolves to ANY A or AAAA record."""
+        if self._doh_resolve(host, "A"):
+            return True
+        return bool(self._doh_resolve(host, "AAAA"))
+
+    def _detect_wildcard(self, domain: str) -> bool:
+        """Some zones answer every *.zone with the same IP. Probe a
+        nonce-prefix to detect that, so we don't dump 500 garbage
+        results from sources that honor wildcards."""
+        nonce = secrets.token_hex(8)
+        return bool(self._doh_resolve(f"{nonce}.{domain}", "A"))
+
+    # ── Source-specific collectors ─────────────────────────────────
+    def _parse_valid_subdomain(self, raw: str, domain: str) -> Optional[str]:
+        line = (raw or "").strip().lower()
+        if not line:
+            return None
+        if line.startswith("*."):
+            line = line[2:]
+        # Kill embedded whitespace / control chars. CT entries
+        # occasionally contain email addresses in CN fields.
+        if "@" in line or " " in line or "\t" in line:
+            return None
+        if not (line == domain or line.endswith("." + domain)):
+            return None
+        if not re.match(r"^[a-z0-9.\-]+$", line):
+            return None
+        if len(line) > 253:
+            return None
+        return line
+
+    def _from_crtsh(self, domain: str) -> Set[str]:
+        out: Set[str] = set()
         url = self.CRTSH_URL.format(domain=quote(f"%.{domain}"))
         resp = self._session.get(url)
-        if not resp:
-            return []
-
-        subdomains: Set[str] = set()
+        if not resp or resp.status_code != 200:
+            return out
         try:
             entries = resp.json()
-            if not isinstance(entries, list):
-                return []
-            for entry in entries:
-                name = entry.get("name_value", "")
-                for line in name.split("\n"):
-                    line = line.strip().lower()
-                    if not line:
-                        continue
-                    # Strip the exact '*.' wildcard prefix. Using
-                    # str.lstrip('*.') treated the argument as a
-                    # character set and also stripped legitimate leading
-                    # dots/stars — so '*foo.example.com' (no dot after
-                    # the asterisk) became 'foo.example.com', which
-                    # isn't actually the same host.
-                    if line.startswith("*."):
-                        line = line[2:]
-                    if line.endswith(f".{domain}") or line == domain:
-                        if re.match(r"^[a-z0-9.\-]+$", line):
-                            subdomains.add(line)
         except (ValueError, KeyError):
-            pass
+            return out
+        if not isinstance(entries, list):
+            return out
+        for entry in entries[:5000]:
+            name = entry.get("name_value") or ""
+            for piece in name.split("\n"):
+                cand = self._parse_valid_subdomain(piece, domain)
+                if cand:
+                    out.add(cand)
+        return out
 
-        return sorted(subdomains)[:200]
+    def _from_certspotter(self, domain: str) -> Set[str]:
+        out: Set[str] = set()
+        url = self.CERTSPOTTER_URL.format(domain=quote(domain))
+        resp = self._session.get(url)
+        if not resp or resp.status_code != 200:
+            return out
+        try:
+            entries = resp.json()
+        except (ValueError, KeyError):
+            return out
+        if not isinstance(entries, list):
+            return out
+        for entry in entries[:5000]:
+            for n in entry.get("dns_names") or []:
+                cand = self._parse_valid_subdomain(n, domain)
+                if cand:
+                    out.add(cand)
+        return out
+
+    def _from_hackertarget(self, domain: str) -> Set[str]:
+        out: Set[str] = set()
+        url = self.HACKERTARGET_URL.format(domain=quote(domain))
+        resp = self._session.get(url)
+        if not resp or resp.status_code != 200:
+            return out
+        text = resp.text or ""
+        if "API count exceeded" in text or "error" in text.lower()[:80]:
+            return out
+        for row in text.splitlines():
+            host = row.split(",", 1)[0]
+            cand = self._parse_valid_subdomain(host, domain)
+            if cand:
+                out.add(cand)
+        return out
+
+    def _from_otx(self, domain: str) -> Set[str]:
+        out: Set[str] = set()
+        url = self.OTX_URL.format(domain=quote(domain))
+        resp = self._session.get(url)
+        if not resp or resp.status_code != 200:
+            return out
+        try:
+            payload = resp.json()
+        except (ValueError, KeyError):
+            return out
+        if not isinstance(payload, dict):
+            return out
+        for item in payload.get("passive_dns", []) or []:
+            host = item.get("hostname") or ""
+            cand = self._parse_valid_subdomain(host, domain)
+            if cand:
+                out.add(cand)
+        return out
+
+    def _from_rapiddns(self, domain: str) -> Set[str]:
+        """HTML-scrape fallback. Only used when everything else
+        returned <10 results — this service occasionally shadow-bans
+        Tor exits."""
+        out: Set[str] = set()
+        url = self.RAPIDDNS_URL.format(domain=quote(domain))
+        resp = self._session.get(url)
+        if not resp or resp.status_code != 200:
+            return out
+        # Names appear inside <td>host.example.com</td> cells. A
+        # tight regex is cheaper than bs4 for this single page.
+        body = resp.text or ""
+        for m in re.finditer(r">\s*([a-z0-9][a-z0-9.\-]+?\." +
+                             re.escape(domain) + r")\s*<",
+                             body, re.I):
+            cand = self._parse_valid_subdomain(m.group(1), domain)
+            if cand:
+                out.add(cand)
+        return out
+
+    def _brute_force(self, domain: str,
+                     known: Set[str],
+                     max_new: int = 60) -> Set[str]:
+        """DoH-based prefix brute force. Keeps CALL counts tight so we
+        don't keep Tor circuits open for an hour."""
+        out: Set[str] = set()
+        for prefix in self.BRUTE_WORDLIST:
+            if shutdown_requested():
+                break
+            if len(out) >= max_new:
+                break
+            host = f"{prefix}.{domain}"
+            if host in known:
+                continue
+            if self._is_resolvable(host):
+                out.add(host)
+        return out
+
+    # ── Orchestration ──────────────────────────────────────────────
+    def enumerate(self, domain: str,
+                  brute_force: bool = True,
+                  verify_resolvable: bool = True) -> List[str]:
+        """Multi-source enumeration with optional DNS validation.
+
+        Back-compat: returns the same List[str] the old enumerator did.
+        Callers that want the full diagnostic (per-source counts,
+        wildcard status, resolvable vs unresolved) should use
+        enumerate_detailed().
+        """
+        return self.enumerate_detailed(
+            domain,
+            brute_force=brute_force,
+            verify_resolvable=verify_resolvable,
+        )["subdomains"]
+
+    def enumerate_detailed(self, domain: str,
+                           brute_force: bool = True,
+                           verify_resolvable: bool = True) -> Dict[str, Any]:
+        """Run every source, merge, deduplicate, optionally verify via
+        DoH, optionally brute-force common prefixes, and return a
+        diagnostic dict. Every step is guarded by shutdown_requested()
+        so Ctrl-C returns partial results."""
+        sources: Dict[str, Set[str]] = {}
+        ordered = (
+            ("crt.sh",       self._from_crtsh),
+            ("certspotter",  self._from_certspotter),
+            ("hackertarget", self._from_hackertarget),
+            ("alienvault",   self._from_otx),
+        )
+        for name, fn in ordered:
+            if shutdown_requested():
+                break
+            try:
+                sources[name] = fn(domain)
+            except Exception as _src_err:
+                integrity_log("intel",
+                              f"subdomain_src_fail:{name}:{type(_src_err).__name__}")
+                sources[name] = set()
+
+        all_candidates: Set[str] = set()
+        for s in sources.values():
+            all_candidates |= s
+
+        # Only hit the HTML-scrape source if the CT sources came back
+        # thin. Otherwise we're burning a circuit for nothing.
+        if not shutdown_requested() and len(all_candidates) < 10:
+            try:
+                rapid = self._from_rapiddns(domain)
+                sources["rapiddns"] = rapid
+                all_candidates |= rapid
+            except Exception as _rdn_err:
+                integrity_log("intel",
+                              f"subdomain_src_fail:rapiddns:{type(_rdn_err).__name__}")
+                sources["rapiddns"] = set()
+
+        wildcard = False
+        if verify_resolvable and not shutdown_requested():
+            wildcard = self._detect_wildcard(domain)
+
+        resolvable: Set[str] = set()
+        unresolved: Set[str] = set()
+        if verify_resolvable:
+            # Cap verification so we don't do 5000 DoH lookups over Tor.
+            to_verify = sorted(all_candidates)[:400]
+            for host in to_verify:
+                if shutdown_requested():
+                    break
+                if self._is_resolvable(host):
+                    resolvable.add(host)
+                else:
+                    unresolved.add(host)
+        else:
+            resolvable = set(all_candidates)
+
+        brute_hits: Set[str] = set()
+        if brute_force and not shutdown_requested():
+            brute_hits = self._brute_force(domain, resolvable | all_candidates)
+            resolvable |= brute_hits
+
+        final_set: Set[str]
+        if wildcard and verify_resolvable:
+            # Wildcard zone: drop brute-force guesses entirely (every
+            # random prefix will 'resolve') and require the host to
+            # have appeared in at least one passive source.
+            final_set = {h for h in resolvable
+                         if any(h in s for s in sources.values())}
+        else:
+            final_set = resolvable if verify_resolvable else all_candidates
+
+        subs_sorted = sorted(final_set)[:400]
+        return {
+            "subdomains": subs_sorted,
+            "source_counts": {n: len(s) for n, s in sources.items()},
+            "total_unique_candidates": len(all_candidates),
+            "resolvable_count": len(resolvable),
+            "unresolved_count": len(unresolved),
+            "brute_hits": sorted(brute_hits),
+            "wildcard_zone": wildcard,
+            "verified": verify_resolvable,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -6849,10 +7153,29 @@ class IntelOrchestrator:
                 except Exception as e:
                     integrity_log("intel", f"email_posture_error:{type(e).__name__}")
 
-        # Phase 5: Subdomain enumeration (deep only)
+        # Phase 5: Subdomain enumeration (deep only). Multi-source
+        # (crt.sh + certspotter + hackertarget + OTX + rapiddns
+        # fallback) with DoH resolvability verification and a tight
+        # prefix brute force. We show per-source counts so the
+        # operator sees WHICH aggregator is blocking us when a
+        # domain comes back thin.
         if self._scan_depth == "deep":
-            subs = self._run_phase(5, "Subdomain enumeration (crt.sh)",
-                                   self._subdomains.enumerate, domain) or []
+            detail = self._run_phase(
+                5, "Subdomain enumeration (multi-source + DoH verify)",
+                self._subdomains.enumerate_detailed, domain,
+            ) or {}
+            subs = detail.get("subdomains", []) if isinstance(detail, dict) else []
+            if isinstance(detail, dict) and detail.get("source_counts"):
+                per_src = ", ".join(
+                    f"{n}={c}" for n, c in detail["source_counts"].items())
+                print(f"      sources: {per_src}")
+                if detail.get("wildcard_zone"):
+                    print(f"      [!] wildcard zone — requiring CT confirmation")
+                if detail.get("brute_hits"):
+                    print(f"      +{len(detail['brute_hits'])} via DNS brute-force")
+                print(f"      candidates={detail.get('total_unique_candidates', 0)}"
+                      f"  resolvable={detail.get('resolvable_count', 0)}"
+                      f"  unresolved={detail.get('unresolved_count', 0)}")
             if subs:
                 print(f"  [+] Found {len(subs)} subdomains")
                 for s in subs[:20]:
@@ -6860,7 +7183,8 @@ class IntelOrchestrator:
                 if len(subs) > 20:
                     print(f"      ... and {len(subs) - 20} more")
                 self._results.append({"type": "subdomains", "domain": domain,
-                                      "subdomains": subs, "count": len(subs)})
+                                      "subdomains": subs, "count": len(subs),
+                                      "detail": detail if isinstance(detail, dict) else {}})
 
                 # Phase 5b: subdomain takeover check (limit to 10, with progress)
                 print(f"\n  [*] Phase 5b: Checking subdomains for takeover...")
