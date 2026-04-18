@@ -167,12 +167,43 @@ _re_dockerfile = re.compile(
 #  Browser Profile Rotation
 # ══════════════════════════════════════════════════════════════════════════
 
+# Content-encodings we can ACTUALLY decode. urllib3 decodes gzip
+# and deflate unconditionally; brotli only works if the 'brotli' or
+# 'brotlipy' package is importable; zstd only if the 'zstandard'
+# package is importable. Advertising encodings we can't decode means
+# the server returns opaque bytes that requests leaves as-is, so
+# resp.text is garbage — every body-based check (sqli indicators,
+# xss reflection, honeypot detection, path validators) silently
+# false-negatives. Worse, advertising an encoding without the
+# decoder is itself a bot fingerprint a WAF can trip on.
+def _detect_supported_encodings() -> str:
+    encs = ["gzip", "deflate"]
+    try:
+        import brotli  # noqa: F401
+        encs.append("br")
+    except ImportError:
+        try:
+            import brotlicffi  # noqa: F401
+            encs.append("br")
+        except ImportError:
+            pass
+    try:
+        import zstandard  # noqa: F401
+        encs.append("zstd")
+    except ImportError:
+        pass
+    return ", ".join(encs)
+
+
+_SUPPORTED_ENCODINGS = _detect_supported_encodings()
+
+
 BROWSER_PROFILES = [
     {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": _SUPPORTED_ENCODINGS,
         "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
@@ -186,7 +217,7 @@ BROWSER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": _SUPPORTED_ENCODINGS,
         "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"macOS"',
@@ -200,7 +231,7 @@ BROWSER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": _SUPPORTED_ENCODINGS,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
@@ -211,7 +242,7 @@ BROWSER_PROFILES = [
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": _SUPPORTED_ENCODINGS,
         "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Linux"',
