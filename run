@@ -3546,7 +3546,8 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
               f"{G}V{N}  Save captures to file")
         print(f"  {G}G{N}  Generate report        "
               f"{G}S{N}  Stop attacker server")
-        print(f"  {G}Q{N}  Quit + wipe everything")
+        print(f"  {R}Z{N}  NEW IDENTITY (panic purge)  "
+              f"{G}Q{N}  Quit + wipe everything")
         print()
         # DANGEROUS DEFAULT REMOVED.
         # Previously the default prompt value was 'Q' — meaning that
@@ -3556,7 +3557,7 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         # just spent an hour working a target could wipe it with a
         # single reflex-Enter. Default is now empty (no-op loop) so
         # blank input just re-prompts.
-        cmd = prompt("Control deck (R/P/L/C/A/F/U/T/N/H/X/V/G/S/Q)",
+        cmd = prompt("Control deck (R/P/L/C/A/F/U/T/N/H/X/V/G/S/Z/Q)",
                      "").strip().upper()
         if not cmd:
             continue
@@ -3774,9 +3775,35 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
                 continue
             _save_captures_to_file(server, file_mgr)
 
+        elif cmd == "Z":
+            # New Identity — Tor Browser's Ctrl+Shift+U equivalent.
+            # Full OPSEC panic-button: new circuit, purge every
+            # cookie jar + referer chain in both the scanner
+            # TorSession AND the walkthrough TorClient, and log
+            # the action at HIGH risk so post-mortem analysts
+            # see the state break.
+            warn("'New Identity' will PURGE all session state:")
+            warn("  - current Tor circuit (NEWNYM signal)")
+            warn("  - every per-host cookie jar (walkthrough)")
+            warn("  - per-host browser UA pinning")
+            warn("  - Referer chain")
+            _cap = server.capture_count() if server.is_running else 0
+            if _cap > 0:
+                warn(f"  * {_cap} captured callback(s) STAY in the "
+                     "buffer (callback tokens are scoped to the "
+                     "attacker server, not a Tor circuit). Use 'X' "
+                     "first if you want them gone too.")
+            _confirm = prompt(
+                f"{R}Type 'NEW IDENTITY' to proceed (anything else cancels){N}",
+                "").strip().upper()
+            if _confirm != "NEW IDENTITY":
+                info("New Identity cancelled.")
+                continue
+            _new_identity_now(executor, audit, attacker_url)
+
         else:
             warn(f"Unknown command: {cmd!r}")
-            info("Valid commands: R P L C A F U T N H X V G S Q "
+            info("Valid commands: R P L C A F U T N H X V G S Z Q "
                  "(single letter, case-insensitive).")
 
 
@@ -3872,44 +3899,153 @@ def _generate_and_show_report(audit, file_mgr, findings_summary, server):
         print()
 
 
-def _new_circuit_now(executor, audit):
-    """Force a fresh Tor circuit via the TorClient (if available) or
-    stem's newnym; falls back to a direct control-port signal. Used
-    by the control deck 'N' command and whenever the operator wants
-    to sever the current exit from previous observation."""
-    # Prefer an already-imported gs_common.newnym — it knows how to
-    # talk to the control port with whatever auth we've configured.
+def _raw_newnym() -> bool:
+    """Low-level: signal Tor NEWNYM. Returns True on success. Tries
+    gs_common.newnym() first (handles auth plumbing) then falls back
+    to a direct stem.Controller signal."""
     try:
         from core import gs_common as _gsc
         _gsc.newnym()
-        ok("Tor circuit rotated (newnym signal accepted)")
-        audit.log("circuit_rotate",
-                  "operator_requested",
-                  risk=AuditTrail.RISK_LOW)
-        return
+        return True
     except Exception:
         pass
     try:
         import stem.control as _sc  # type: ignore
-        import os as _os
-        _port = int(_os.environ.get("TOR_CONTROL_PORT", "9051"))
-        _pw = _os.environ.get("TOR_CONTROL_PASSWORD", "")
+        _port = int(os.environ.get("TOR_CONTROL_PORT", "9051"))
+        _pw = os.environ.get("TOR_CONTROL_PASSWORD", "")
         with _sc.Controller.from_port(port=_port) as ctrl:
             if _pw:
                 ctrl.authenticate(password=_pw)
             else:
                 ctrl.authenticate()
             ctrl.signal(_sc.Signal.NEWNYM)
-        ok("Tor circuit rotated (direct stem signal)")
+        return True
+    except Exception:
+        return False
+
+
+def _new_circuit_now(executor, audit):
+    """Force a fresh Tor circuit and cascade the rotation into the
+    walkthrough's TorClient (new per-host UAs, reset Referer chain).
+
+    Previously this JUST called gs_common.newnym(), which tells Tor
+    to build a new circuit but leaves the walkthrough TorClient's
+    in-memory state (UA cache, Referer chain) unchanged — meaning
+    the new circuit carried the OLD UA and referers, creating a
+    correlatable 'same fingerprint across exit change' signature
+    AND defeating half the point of rotating. Now we explicitly
+    bump the TorClient's circuit generation so it redraws UAs on
+    the next request, and reset the Referer chain.
+
+    Note: Tor NEWNYM is rate-limited to once every 10 seconds. If
+    the operator mashes N repeatedly we print a warning but don't
+    error — the user's intent is clear.
+    """
+    if _raw_newnym():
+        ok("Tor circuit rotated (newnym signal accepted)")
+        # Cascade into the walkthrough TorClient if we have one.
+        if executor is not None:
+            client = getattr(executor, "_client", None)
+            if client is not None and hasattr(client, "bump_circuit_generation"):
+                try:
+                    client.bump_circuit_generation()
+                    info("TorClient state bumped "
+                         "(new UA on next per-host request, "
+                         "Referer chain reset)")
+                except Exception:
+                    pass
         audit.log("circuit_rotate",
                   "operator_requested",
                   risk=AuditTrail.RISK_LOW)
-    except Exception as _e:
-        err(f"Could not rotate circuit: {type(_e).__name__}: {_e}")
-        err("Is Tor's ControlPort open and cookie/password auth configured?")
+        # Give Tor a moment to actually build the new circuit before
+        # the next request — calling NEWNYM then immediately firing
+        # a request often hits the OLD circuit because the new one
+        # isn't fully up yet.
+        _time_mod.sleep(1.5 + secrets.randbelow(1500) / 1000.0)
+    else:
+        err("Could not rotate circuit via Tor control port.")
+        err("Is Tor's ControlPort open and cookie/password auth "
+            "configured? (torrc: 'ControlPort 9051' + "
+            "'CookieAuthentication 1')")
         audit.log("circuit_rotate_failed",
-                  f"{type(_e).__name__}",
+                  "newnym_signal_failed",
                   risk=AuditTrail.RISK_MEDIUM)
+
+
+def _new_identity_now(executor, audit, attacker_url):
+    """Full-panic state purge. Tor Browser's 'New Identity' button
+    equivalent for the walkthrough.
+
+    What this does (in order):
+      1. Tor NEWNYM — new circuit, new exit IP.
+      2. Walkthrough TorClient: bump circuit generation (new UA
+         on next per-host request), clear every per-host cookie
+         jar (bump_circuit_generation clears referer chain too
+         via close_host_jars when we call clear_host_jars(None)).
+      3. Brief sleep so the new circuit actually builds before
+         any follow-up request reuses the connection pool.
+      4. Audit-log at HIGH risk so post-mortem analysis sees
+         the clean break between pre- and post-purge activity.
+
+    What this DOES NOT do:
+      - Stop the attacker server (operator uses 'S' for that).
+      - Clear the capture buffer (operator uses 'X' for that).
+      - Delete generated exploit files (they stay pre-generated
+        for re-use on the same target, new circuit or not).
+      - Reset per-kind callback tokens (those are bound to the
+        attacker server's master_secret, not the Tor circuit).
+
+    Anything target-visible is rotated; everything attacker-side
+    is preserved.
+    """
+    print()
+    # 1. Tor circuit
+    if _raw_newnym():
+        ok("Tor circuit rotated (newnym accepted)")
+        audit.log("new_identity:newnym",
+                  "operator_requested",
+                  risk=AuditTrail.RISK_HIGH)
+    else:
+        err("NEWNYM failed — current Tor circuit NOT rotated.")
+        err("New Identity ABORTING (partial state purge would be "
+            "worse than no purge: would drop jars + UAs while "
+            "keeping the same exit IP, linking old + new activity).")
+        audit.log("new_identity:aborted_no_newnym",
+                  "control_port_unavailable",
+                  risk=AuditTrail.RISK_HIGH)
+        return
+
+    # Sleep so the new circuit actually builds before anything
+    # reuses the connection pool on the old one.
+    _time_mod.sleep(1.5 + secrets.randbelow(2000) / 1000.0)
+
+    # 2. Walkthrough TorClient state purge
+    if executor is not None:
+        client = getattr(executor, "_client", None)
+        if client is not None:
+            try:
+                cleared = 0
+                if hasattr(client, "clear_host_jars"):
+                    cleared = client.clear_host_jars(host=None)
+                if hasattr(client, "bump_circuit_generation"):
+                    client.bump_circuit_generation()
+                ok(f"Walkthrough state purged "
+                   f"({cleared} cookie jar(s), UA/Referer reset)")
+                audit.log("new_identity:torclient_purged",
+                          f"jars={cleared}",
+                          risk=AuditTrail.RISK_HIGH)
+            except Exception as _e:
+                warn(f"TorClient state purge partial: "
+                     f"{type(_e).__name__}: {_e}")
+                audit.log("new_identity:torclient_partial",
+                          f"{type(_e).__name__}",
+                          risk=AuditTrail.RISK_HIGH)
+
+    ok("New Identity complete. Next request uses the new circuit "
+       "with a fresh per-host fingerprint.")
+    if attacker_url:
+        info(f"Attacker base is unchanged: {attacker_url}")
+    print()
 
 
 def _target_health_check(executor, attacker_url, server, audit):
