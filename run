@@ -4964,18 +4964,64 @@ def _control_deck_write_to_live(exploitable, executor, file_mgr,
     print(f"  {color}HTTP {write_status}{N}  ({write_elapsed:.2f}s, "
           f"{len(write_body)} B)")
 
+    # FROM HERE: the write MAY have committed to the live target.
+    # Every exit path below MUST log 'write_live_committed_unverified'
+    # so post-mortem review knows we sent the payload even if the
+    # verify step couldn't complete. No silent 'we don't know'.
+    audit.log("write_live_dispatched",
+              f"{etype} inject={_tsafe_preview(inject_url, 60)} "
+              f"http={write_status} tag={tag}",
+              risk=AuditTrail.RISK_CRITICAL)
+
     # 10. Verify persistence — re-fetch render URL with a small
     # delay so the backend has a tick to commit.
+    # Ctrl+C during this window is the worst failure mode — the
+    # write already happened, but the code returns without a verify
+    # record. We catch KeyboardInterrupt and log explicitly.
     print()
     info("Waiting 1.5s for backend commit, then re-fetching render URL…")
-    _time_mod.sleep(1.5)
+    try:
+        _time_mod.sleep(1.5)
+    except KeyboardInterrupt:
+        print()
+        warn("(Ctrl+C during verify wait — write ALREADY SENT, but "
+             "verify step was aborted.)")
+        audit.log("write_live_verify_aborted",
+                  f"tag={tag} phase=sleep",
+                  risk=AuditTrail.RISK_CRITICAL)
+        info("Inspect render URL manually: "
+             f"{_tsafe_preview(render_url, 100)}")
+        info(f"  tag to grep for: {tag}")
+        try:
+            _shutdown_event.clear()
+        except Exception:
+            pass
+        return
     try:
         post = client.request("GET", render_url, allow_redirects=True)
+    except KeyboardInterrupt:
+        print()
+        warn("(Ctrl+C during verify fetch — write ALREADY SENT, verify "
+             "abandoned.)")
+        audit.log("write_live_verify_aborted",
+                  f"tag={tag} phase=fetch",
+                  risk=AuditTrail.RISK_CRITICAL)
+        info("Inspect render URL manually: "
+             f"{_tsafe_preview(render_url, 100)}")
+        info(f"  tag to grep for: {tag}")
+        try:
+            _shutdown_event.clear()
+        except Exception:
+            pass
+        return
     except Exception as _e:
         err(f"Could not re-fetch render URL: {type(_e).__name__}")
         audit.log("write_live_verify_fail",
-                  f"{type(_e).__name__}",
+                  f"tag={tag} err={type(_e).__name__}",
                   risk=AuditTrail.RISK_CRITICAL)
+        info("Write WAS SENT; verify failed. Manual inspection needed: "
+             f"{_tsafe_preview(render_url, 100)}")
+        info(f"  tag to grep for: {tag}")
         return
     post_status = getattr(post, "status_code", 0) or 0
     post_body = getattr(post, "response_body", "") or ""
@@ -5182,7 +5228,21 @@ def _control_deck_write_to_live(exploitable, executor, file_mgr,
             allow_redirects=True,
         )
         rv_status = getattr(rv, "status_code", 0) or 0
-        _time_mod.sleep(1.0)
+        try:
+            _time_mod.sleep(1.0)
+        except KeyboardInterrupt:
+            # Revert request ALREADY SENT; verify-of-revert abandoned.
+            print()
+            warn("(Ctrl+C — revert request was sent but verify-of-"
+                 "revert was skipped.)")
+            audit.log("write_live_revert_verify_aborted",
+                      f"tag={tag} status={rv_status}",
+                      risk=AuditTrail.RISK_HIGH)
+            try:
+                _shutdown_event.clear()
+            except Exception:
+                pass
+            return
         post2 = client.request("GET", render_url, allow_redirects=True)
         post2_body = getattr(post2, "response_body", "") or ""
         still_there = (tag in post2_body)
