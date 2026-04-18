@@ -5482,7 +5482,14 @@ class SubdomainEnumerator:
     def _from_crtsh(self, domain: str) -> Set[str]:
         out: Set[str] = set()
         url = self.CRTSH_URL.format(domain=quote(f"%.{domain}"))
-        resp = self._session.get(url)
+        # allow_wayback=False on EVERY aggregator call. The default
+        # get() method falls back to https://web.archive.org/web/2/<url>
+        # on timeout, which literally submits the target-bearing
+        # URL (e.g. crt.sh/?q=%.target.example.com) to Internet
+        # Archive's public logs — a permanent record that THIS target
+        # was enumerated. Every subdomain source below gets the same
+        # treatment.
+        resp = self._session.get(url, allow_wayback=False)
         if not resp or resp.status_code != 200:
             return out
         try:
@@ -5502,7 +5509,7 @@ class SubdomainEnumerator:
     def _from_certspotter(self, domain: str) -> Set[str]:
         out: Set[str] = set()
         url = self.CERTSPOTTER_URL.format(domain=quote(domain))
-        resp = self._session.get(url)
+        resp = self._session.get(url, allow_wayback=False)
         if not resp or resp.status_code != 200:
             return out
         try:
@@ -5521,7 +5528,7 @@ class SubdomainEnumerator:
     def _from_hackertarget(self, domain: str) -> Set[str]:
         out: Set[str] = set()
         url = self.HACKERTARGET_URL.format(domain=quote(domain))
-        resp = self._session.get(url)
+        resp = self._session.get(url, allow_wayback=False)
         if not resp or resp.status_code != 200:
             return out
         text = resp.text or ""
@@ -5537,7 +5544,7 @@ class SubdomainEnumerator:
     def _from_otx(self, domain: str) -> Set[str]:
         out: Set[str] = set()
         url = self.OTX_URL.format(domain=quote(domain))
-        resp = self._session.get(url)
+        resp = self._session.get(url, allow_wayback=False)
         if not resp or resp.status_code != 200:
             return out
         try:
@@ -5559,15 +5566,23 @@ class SubdomainEnumerator:
         Tor exits."""
         out: Set[str] = set()
         url = self.RAPIDDNS_URL.format(domain=quote(domain))
-        resp = self._session.get(url)
+        resp = self._session.get(url, allow_wayback=False)
         if not resp or resp.status_code != 200:
             return out
-        # Names appear inside <td>host.example.com</td> cells. A
-        # tight regex is cheaper than bs4 for this single page.
+        # Names appear inside <td>host.example.com</td> cells. The
+        # page body is case-preserving so we match case-insensitively
+        # AND normalize to lowercase before _parse_valid_subdomain
+        # (which requires lowercase). Old regex anchored on a lazy
+        # quantifier with [a-z0-9.\-]+? which minimum-matched and
+        # frequently captured just the TLD; widen to a reasonable
+        # greedy bound and drop the bogus first-char class.
         body = resp.text or ""
-        for m in re.finditer(r">\s*([a-z0-9][a-z0-9.\-]+?\." +
-                             re.escape(domain) + r")\s*<",
-                             body, re.I):
+        # Match <td>...>label.label...<target-domain></td>-style cells.
+        # The host label set is case-insensitive; we lowercase via
+        # _parse_valid_subdomain. Length cap (253) is enforced there.
+        pat = (r">\s*([A-Za-z0-9][A-Za-z0-9.\-]{0,250}\."
+               + re.escape(domain) + r")\s*<")
+        for m in re.finditer(pat, body):
             cand = self._parse_valid_subdomain(m.group(1), domain)
             if cand:
                 out.add(cand)
