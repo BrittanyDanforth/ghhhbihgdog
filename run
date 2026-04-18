@@ -1651,6 +1651,72 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 ]
 
+# Full, coherent browser profiles. A real browser doesn't send a
+# Chrome UA with missing Sec-Ch-Ua client hints, or a Firefox UA
+# with Chromium-only Sec-Ch-Ua. Previous code rotated only the UA
+# string; target WAFs / bot detectors trip on the UA/CH-UA
+# mismatch even when the UA itself is perfectly valid.
+#
+# Each profile locks:
+#   user_agent         — self-explanatory
+#   accept_language    — pinned per-profile (locale-consistent with UA)
+#   sec_ch_ua          — tuple (Sec-Ch-Ua, Sec-Ch-Ua-Mobile,
+#                         Sec-Ch-Ua-Platform) — omitted for Firefox
+#                         / Safari since those browsers DON'T send
+#                         client hints in the wild.
+#
+# On a given (host, circuit) the TorClient picks ONE profile and
+# uses ALL fields together. That's identity-coherent traffic.
+_BROWSER_PROFILES = [
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36",
+        "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua": ('"Chromium";v="124", "Google Chrome";v="124", '
+                      '"Not-A.Brand";v="99"', "?0", '"Windows"'),
+    },
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36",
+        "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua": ('"Chromium";v="124", "Google Chrome";v="124", '
+                      '"Not-A.Brand";v="99"', "?0", '"macOS"'),
+    },
+    {
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36",
+        "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua": ('"Chromium";v="124", "Google Chrome";v="124", '
+                      '"Not-A.Brand";v="99"', "?0", '"Linux"'),
+    },
+    {
+        # Firefox — deliberately NO sec_ch_ua. Firefox does not send
+        # client hints. Sending them alongside a Firefox UA is a bot
+        # tell that some WAFs key on.
+        "ua": "Mozilla/5.0 (Windows NT 10.0; rv:128.0) "
+              "Gecko/20100101 Firefox/128.0",
+        "accept_language": "en-US,en;q=0.5",
+        "sec_ch_ua": None,
+    },
+    {
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+              "Gecko/20100101 Firefox/128.0",
+        "accept_language": "en-US,en;q=0.5",
+        "sec_ch_ua": None,
+    },
+    {
+        # Safari — also no sec_ch_ua, same reason.
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+              "Version/17.4 Safari/605.1.15",
+        "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua": None,
+    },
+]
+
 
 def _tc_detect_supported_encodings() -> str:
     """Same logic we use in intel/testergatherSystem — only advertise
@@ -1721,7 +1787,7 @@ class TorClient:
         # coded Sec-Fetch-Site to whatever secrets.choice picked.
         self._host_jars: Dict[str, Any] = {}
         self._last_url_per_host: Dict[str, str] = {}
-        self._profile_cache: Dict[Tuple[str, int], str] = {}
+        self._profile_cache: Dict[Tuple[str, int], dict] = {}
         self._circuit_gen: int = 0
 
     def _host_key(self, url: str) -> str:
@@ -1751,13 +1817,32 @@ class TorClient:
             self._host_jars[key] = jar
         return jar, key
 
-    def _pinned_ua(self, url: str) -> str:
+    def _pinned_profile(self, url: str) -> dict:
+        """Return a FULL browser profile dict for this (host, circuit)
+        pair. Previously only the UA was pinned; Accept-Language was
+        still randomized per-request (flipping between en-US/en-GB
+        mid-session on the same Chrome UA — unrealistic), and
+        Sec-Ch-Ua was omitted entirely (so Chrome UAs shipped
+        WITHOUT client hints — a WAF-visible anomaly for modern
+        Chrome traffic).
+
+        Now the cache stores the entire profile, so UA +
+        Accept-Language + Sec-Ch-Ua (if applicable) are internally
+        consistent AND pinned across same-host same-circuit
+        requests. Fresh circuit (via bump_circuit_generation)
+        redraws the profile."""
         key = (self._host_key(url), self._circuit_gen)
-        ua = self._profile_cache.get(key)
-        if ua is None:
-            ua = secrets.choice(_USER_AGENTS)
-            self._profile_cache[key] = ua
-        return ua
+        prof = self._profile_cache.get(key)
+        if prof is None:
+            prof = _BROWSER_PROFILES[
+                secrets.randbelow(len(_BROWSER_PROFILES))]
+            self._profile_cache[key] = prof
+        return prof
+
+    # Kept for back-compat if any caller still expects the older
+    # UA-only helper. Same cache key.
+    def _pinned_ua(self, url: str) -> str:
+        return self._pinned_profile(url)["ua"]
 
     def bump_circuit_generation(self):
         """Called by the control deck after a Tor NEWNYM so we
@@ -1826,13 +1911,15 @@ class TorClient:
                 pass
 
     def _rotate_headers(self, url: str = "") -> dict:
-        # User-Agent is now PINNED per (host, circuit) — rotating
-        # the UA on every request to the same host is a pure bot
-        # fingerprint. See _pinned_ua docstring.
-        ua = self._pinned_ua(url) if url else secrets.choice(_USER_AGENTS)
-        langs = secrets.choice([
-            "en-US,en;q=0.5", "en-GB,en;q=0.5", "en-US,en;q=0.9",
-        ])
+        # Full browser profile PINNED per (host, circuit) — UA,
+        # Accept-Language, Sec-Ch-Ua* all stay consistent across
+        # a session instead of the old per-request flip that was
+        # itself a scanner tell.
+        if url:
+            prof = self._pinned_profile(url)
+        else:
+            prof = _BROWSER_PROFILES[
+                secrets.randbelow(len(_BROWSER_PROFILES))]
         # Sec-Fetch-Site: derive from whether we have a previous URL
         # on this host (same-origin) or none (the 'user typed in the
         # address bar' story). Random cross-site on every request
@@ -1840,14 +1927,12 @@ class TorClient:
         # origins on every click.
         host = self._host_key(url) if url else ""
         prev = self._last_url_per_host.get(host) if host else ""
-        if prev:
-            sf_site = "same-origin"
-        else:
-            sf_site = "none"
-        return {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": langs,
+        sf_site = "same-origin" if prev else "none"
+        headers = {
+            "User-Agent": prof["ua"],
+            "Accept": ("text/html,application/xhtml+xml,application/xml"
+                       ";q=0.9,image/avif,image/webp,*/*;q=0.8"),
+            "Accept-Language": prof["accept_language"],
             "Accept-Encoding": _TC_SUPPORTED_ENCODINGS,
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -1856,6 +1941,17 @@ class TorClient:
             "Sec-Fetch-Site": sf_site,
             "Sec-Fetch-User": "?1",
         }
+        # Client hints: ONLY emit for profiles that actually send
+        # them in the wild (Chrome / Edge / Opera). Firefox + Safari
+        # deliberately don't, and emitting them with a Firefox UA is
+        # the kind of inconsistency a WAF can flag in one rule.
+        ch = prof.get("sec_ch_ua")
+        if ch:
+            ua_list, mobile, platform = ch
+            headers["Sec-Ch-Ua"] = ua_list
+            headers["Sec-Ch-Ua-Mobile"] = mobile
+            headers["Sec-Ch-Ua-Platform"] = platform
+        return headers
 
     def _check_rate_limit(self) -> bool:
         now = _time_mod.time()
