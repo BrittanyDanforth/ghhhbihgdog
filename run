@@ -3757,9 +3757,27 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
     }
     _already_reported = False
 
+    # The Control Deck is the AUTHORITATIVE handler for the
+    # walkthrough session — the operator drives teardown from here,
+    # not from the earlier step loop or the finding picker. So:
+    #   (a) on entry we CLEAR any earlier shutdown flag that may
+    #       have been set by a stray Ctrl+C during scan phases.
+    #       A global flag that forces us out of the deck the first
+    #       iteration is a footgun: the operator hit Ctrl+C to
+    #       abort A FINDING, not to wipe the whole session.
+    #   (b) we do NOT break on shutdown_requested() at the top of
+    #       the loop; the only ways out are explicit Q (type QUIT)
+    #       or a real second Ctrl+C handled as KeyboardInterrupt
+    #       at the input() level (see the signal-handler fix).
+    #       A first Ctrl+C that reached the deck after the step
+    #       loop should be visible as a log line but must NOT
+    #       exit.
+    try:
+        _shutdown_event.clear()
+    except Exception:
+        pass
+
     while True:
-        if shutdown_requested():
-            break
         print()
         heading("Control Deck")
         stats = audit.get_stats()
