@@ -3352,7 +3352,20 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
 
         if cmd == "Q":
             if server and server.is_running and cap_count > 0:
-                warn(f"{cap_count} captured callback(s) will be wiped on quit.")
+                warn(f"{cap_count} captured callback(s) are still in the "
+                     "in-memory buffer.")
+                # Offer to preserve them in the session report BEFORE
+                # wiping. Previous code just confirmed 'really quit?' and
+                # on 'yes' silently dropped them — which meant the one
+                # piece of evidence the operator actually wanted
+                # (what the victim sent back) vanished with the
+                # teardown. The report embeds the captures via
+                # ReportGenerator, so generating + displaying first is
+                # lossless from the operator's perspective.
+                if confirm("Dump captures + session report before wiping?"):
+                    _generate_and_show_report(
+                        audit, file_mgr, findings_summary, server)
+                    _already_reported = True
                 if not confirm("Really quit and wipe everything?"):
                     continue
             elif not _already_reported and len(findings_summary) > 0:
