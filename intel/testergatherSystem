@@ -364,17 +364,37 @@ class TorSession:
         # 'first-request-always-rotates' signature. Start at None so
         # the first call draws a proper delta.
         self._next_rotation_at: Optional[int] = None
-        # Hosts where we should NEVER forge a Referer (direct-API
-        # style hosts where a browser Referer would be anomalous).
+        # Hosts where we should NEVER forge a Referer, AND where the
+        # circuit-rotation role-boundary detector treats the host as
+        # 'aux/recon' rather than 'target'. Keeping this list in sync
+        # across every scanner-internal service we hit is critical:
+        # a host missing from here gets a DDG-search Referer forged
+        # against it (which the service's access log will file as a
+        # scraper signal AND leak target-discovery relationships),
+        # AND it'll share a circuit with the next target request,
+        # defeating the mutual-observer-unlinkability property.
         self._no_referer_hosts: Set[str] = {
-            "cloudflare-dns.com",
-            "dns.google",
-            "dns.quad9.net",
+            # Passive-DNS / CT aggregators
+            "crt.sh",
             "api.certspotter.com",
             "api.hackertarget.com",
             "otx.alienvault.com",
-            "crt.sh",
+            "rapiddns.io",
+            # DNS-over-HTTPS resolvers
+            "cloudflare-dns.com",
+            "dns.google",
+            "dns.quad9.net",
+            "mozilla.cloudflare-dns.com",
+            # Tor verify + archive + search
             "check.torproject.org",
+            "web.archive.org",
+            "archive.org",
+            "html.duckduckgo.com",
+            "duckduckgo.com",
+            # Breach/OSINT APIs (if/when wired up)
+            "haveibeenpwned.com",
+            "api.haveibeenpwned.com",
+            "api.dehashed.com",
         }
 
     def _verify_dns_safety(self):
