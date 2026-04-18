@@ -283,6 +283,18 @@ class TorSession:
         self._total_requests = 0
         self._total_blocks = 0
         self._total_timeouts = 0
+        # Per-session salt for integrity-log entries that would
+        # otherwise contain the target domain. integrity_log() stores
+        # only a SHA-256 prefix of (stage, msg), so plaintext targets
+        # don't hit disk directly — but (stage, msg) is deterministic,
+        # so an attacker with the log could dictionary-attack the
+        # 12-char tag over a known domain list + a small set of
+        # scanner error tags ('conn_error', 'timeout',
+        # 'domain_circuit_breaker', ...) and confirm which target
+        # was scanned. A per-session random salt mixed into the msg
+        # makes that attack require the salt too (which is only in
+        # memory, wiped on close).
+        self._log_salt = secrets.token_hex(16)
         # Per-host cookie jars. Previously self._session.cookies was
         # shared across every request in the session, which meant:
         #   * cookies set by target.com (tracking, session, CSRF) would
@@ -532,6 +544,16 @@ class TorSession:
         host = self._host_key(url)
         if host and host not in self._no_referer_hosts:
             self._last_url_per_host[host] = url
+
+    def _salt_tag(self, raw: str) -> str:
+        """Return a salted 12-hex-char tag for a domain-ish string,
+        for safe inclusion in integrity_log() entries. The salt is
+        per-session and only lives in memory, so a disk-only attacker
+        (the intended adversary model for the integrity log) can't
+        dictionary-attack the tag."""
+        return hashlib.sha256(
+            (self._log_salt + "|" + (raw or "")).encode()
+        ).hexdigest()[:12]
 
     def _host_key(self, url: str) -> str:
         """Canonical key for the per-host cookie jar + rotation role +
@@ -816,7 +838,8 @@ class TorSession:
                     self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                     self._total_blocks += 1
                     if self.is_domain_blocked(domain):
-                        integrity_log("intel", f"domain_circuit_breaker:{domain}")
+                        integrity_log("intel",
+                                      f"domain_circuit_breaker:host_tag={self._salt_tag(domain)}")
                         return None
                     newnym()
                     time.sleep(2 + secrets.randbelow(3000) / 1000.0)
@@ -835,7 +858,8 @@ class TorSession:
 
             except requests.exceptions.Timeout:
                 self._total_timeouts += 1
-                integrity_log("intel", f"timeout:{domain}:attempt={attempt}")
+                integrity_log("intel",
+                              f"timeout:host_tag={self._salt_tag(domain)}:attempt={attempt}")
                 if attempt < MAX_RETRIES_PER_URL - 1:
                     newnym()
                     time.sleep(1 + secrets.randbelow(2000) / 1000.0)
@@ -843,7 +867,8 @@ class TorSession:
                 return None
             except requests.exceptions.ConnectionError:
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
-                integrity_log("intel", f"conn_error:{domain}")
+                integrity_log("intel",
+                              f"conn_error:host_tag={self._salt_tag(domain)}")
                 # Don't return immediately — fall through to Wayback on last attempt
                 if attempt < MAX_RETRIES_PER_URL - 1:
                     newnym()
@@ -919,7 +944,8 @@ class TorSession:
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 self._total_blocks += 1
                 if self.is_domain_blocked(domain):
-                    integrity_log("intel", f"domain_circuit_breaker:{domain}")
+                    integrity_log("intel",
+                                  f"domain_circuit_breaker:host_tag={self._salt_tag(domain)}")
                     return resp  # still return so caller can inspect
                 # Don't retry every verb — checks like verb tampering
                 # expect 4xx; only rotate circuit + return.
@@ -948,16 +974,21 @@ class TorSession:
             origin_host = self._swap_in_jar(wb_url)
             resp = self._session.get(wb_url, headers=headers, timeout=20)
             self._quarantine_foreign_cookies(origin_host)
+            _origin_tag = self._salt_tag(urlparse(url).netloc)
             if resp.status_code == 200:
-                integrity_log("intel", f"wayback_ok:{urlparse(url).netloc}")
+                integrity_log("intel", f"wayback_ok:host_tag={_origin_tag}")
                 return resp
-            integrity_log("intel", f"wayback_fail:{urlparse(url).netloc}:status={resp.status_code}")
+            integrity_log("intel",
+                          f"wayback_fail:host_tag={_origin_tag}:status={resp.status_code}")
         except requests.exceptions.Timeout:
-            integrity_log("intel", f"wayback_timeout:{urlparse(url).netloc}")
+            integrity_log("intel",
+                          f"wayback_timeout:host_tag={self._salt_tag(urlparse(url).netloc)}")
         except requests.exceptions.ConnectionError:
-            integrity_log("intel", f"wayback_conn_error:{urlparse(url).netloc}")
+            integrity_log("intel",
+                          f"wayback_conn_error:host_tag={self._salt_tag(urlparse(url).netloc)}")
         except Exception as e:
-            integrity_log("intel", f"wayback_error:{urlparse(url).netloc}:{type(e).__name__}")
+            integrity_log("intel",
+                          f"wayback_error:host_tag={self._salt_tag(urlparse(url).netloc)}:{type(e).__name__}")
         return None
 
     def post_json(self, url: str, json_data: dict, **kwargs) -> Optional[requests.Response]:
@@ -5866,9 +5897,24 @@ class SubdomainEnumerator:
             ("alienvault",   self._from_otx),
         ]
         secrets.SystemRandom().shuffle(ordered)
-        for name, fn in ordered:
+        for src_idx, (name, fn) in enumerate(ordered):
             if shutdown_requested():
                 break
+            # Force a fresh Tor circuit between consecutive passive
+            # sources. Without this, mutual observers (e.g. a CT
+            # aggregator and Cloudflare) see the SAME exit IP hit
+            # both services back-to-back — a trivial linkage
+            # ('someone enumerated target.example.com via both').
+            # Rotation failure is non-fatal; we continue on the
+            # current circuit rather than aborting the scan.
+            if src_idx > 0:
+                try:
+                    newnym()
+                    time.sleep(0.5 + secrets.randbelow(2000) / 1000.0)
+                except Exception:
+                    integrity_log(
+                        "intel",
+                        "subdomain_inter_source_rotate_failed")
             try:
                 sources[name] = fn(domain)
             except Exception as _src_err:
@@ -7324,7 +7370,10 @@ class IntelScraper:
                 pass
         hp = self._honeypot.check(content, headers, elapsed_ms, len(resp.history))
         if hp["is_honeypot"]:
-            integrity_log("intel", f"honeypot:{urlparse(url).netloc}")
+            integrity_log(
+                "intel",
+                f"honeypot:host_tag={self._session._salt_tag(urlparse(url).netloc)}",
+            )
             return {"url": url, "honeypot": True, "hp_reasons": hp["reasons"]}
 
         text = content
@@ -7764,7 +7813,11 @@ class IntelOrchestrator:
                                 for t in takeover:
                                     print(f"  [!] TAKEOVER: {t['title']}")
                     except Exception as e:
-                        integrity_log("intel", f"takeover_check_error:{sub}:{type(e).__name__}")
+                        integrity_log(
+                            "intel",
+                            f"takeover_check_error:host_tag="
+                            f"{self._session._salt_tag(sub)}:{type(e).__name__}",
+                        )
                 print(f"      checked {checked}/{min(len(subs), 10)} subdomains")
 
         # Phase 6: Search engine OSINT (limit scraping to avoid hanging)
