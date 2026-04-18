@@ -3342,6 +3342,10 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
               f"{G}F{N}  List generated files")
         print(f"  {G}U{N}  Show callback URLs     "
               f"{G}T{N}  Toggle auto-mode")
+        print(f"  {G}N{N}  New Tor circuit        "
+              f"{G}H{N}  Target health check")
+        print(f"  {G}X{N}  Clear captures buffer  "
+              f"{G}V{N}  Save captures to file")
         print(f"  {G}G{N}  Generate report        "
               f"{G}S{N}  Stop attacker server")
         print(f"  {G}Q{N}  Quit + wipe everything")
@@ -3490,10 +3494,55 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
             if _cap > 0:
                 warn(f"Stopping the server discards {_cap} captured "
                      "callback(s).")
+                # Offer to dump-to-file before teardown so the operator
+                # doesn't lose the evidence buffer.
+                if confirm("Save captures to an ephemeral file first?"):
+                    _save_captures_to_file(server, file_mgr)
             if not confirm("Stop the attacker server now?"):
                 continue
             server.stop()
             ok("Attacker server stopped.")
+
+        elif cmd == "N":
+            # Force a fresh Tor circuit on demand. Useful when the
+            # operator suspects the current exit node is rate-limited
+            # or burned, or before moving to a new phase of the
+            # walkthrough.
+            _new_circuit_now(executor, audit)
+
+        elif cmd == "H":
+            # Target health probe: is it still alive, did our
+            # captures stop arriving because the target is down
+            # or because we're being blocked?
+            _target_health_check(executor, attacker_url, server, audit)
+
+        elif cmd == "X":
+            if not server.is_running:
+                warn("Server is already stopped — buffer empty.")
+                continue
+            _cap = server.capture_count()
+            if _cap == 0:
+                info("Capture buffer is already empty.")
+                continue
+            warn(f"About to clear {_cap} captured callback(s) from the "
+                 "in-memory buffer — this is IRREVERSIBLE.")
+            if confirm("Save captures to an ephemeral file first?"):
+                _save_captures_to_file(server, file_mgr)
+            if not confirm("Clear the buffer now?"):
+                continue
+            cleared = server.clear_captures()
+            audit.log("captures_cleared", f"count={cleared}",
+                      risk=AuditTrail.RISK_LOW)
+            ok(f"Cleared {cleared} capture(s).")
+
+        elif cmd == "V":
+            if not server.is_running:
+                warn("Server is stopped — no captures to save.")
+                continue
+            if server.capture_count() == 0:
+                info("No captures in buffer yet.")
+                continue
+            _save_captures_to_file(server, file_mgr)
 
         else:
             warn(f"Unknown command: {cmd}")
@@ -3589,6 +3638,131 @@ def _generate_and_show_report(audit, file_mgr, findings_summary, server):
         print()
         print(report_content)
         print()
+
+
+def _new_circuit_now(executor, audit):
+    """Force a fresh Tor circuit via the TorClient (if available) or
+    stem's newnym; falls back to a direct control-port signal. Used
+    by the control deck 'N' command and whenever the operator wants
+    to sever the current exit from previous observation."""
+    # Prefer an already-imported gs_common.newnym — it knows how to
+    # talk to the control port with whatever auth we've configured.
+    try:
+        from core import gs_common as _gsc
+        _gsc.newnym()
+        ok("Tor circuit rotated (newnym signal accepted)")
+        audit.log("circuit_rotate",
+                  "operator_requested",
+                  risk=AuditTrail.RISK_LOW)
+        return
+    except Exception:
+        pass
+    try:
+        import stem.control as _sc  # type: ignore
+        import os as _os
+        _port = int(_os.environ.get("TOR_CONTROL_PORT", "9051"))
+        _pw = _os.environ.get("TOR_CONTROL_PASSWORD", "")
+        with _sc.Controller.from_port(port=_port) as ctrl:
+            if _pw:
+                ctrl.authenticate(password=_pw)
+            else:
+                ctrl.authenticate()
+            ctrl.signal(_sc.Signal.NEWNYM)
+        ok("Tor circuit rotated (direct stem signal)")
+        audit.log("circuit_rotate",
+                  "operator_requested",
+                  risk=AuditTrail.RISK_LOW)
+    except Exception as _e:
+        err(f"Could not rotate circuit: {type(_e).__name__}: {_e}")
+        err("Is Tor's ControlPort open and cookie/password auth configured?")
+        audit.log("circuit_rotate_failed",
+                  f"{type(_e).__name__}",
+                  risk=AuditTrail.RISK_MEDIUM)
+
+
+def _target_health_check(executor, attacker_url, server, audit):
+    """Quick 'is the target still alive?' probe. Previously when
+    captures stopped arriving operators had no way to tell whether
+    their target had gone down, the Tor exit had gotten burned, or
+    their payload was silently being dropped — they'd just wait,
+    assume the worst, and quit. The health check fires ONE HEAD
+    request against a caller-supplied target URL, reports the
+    status + elapsed, and logs the result to the audit."""
+    if executor is None:
+        warn("No step executor — can't probe without a Tor client.")
+        return
+    last_url = prompt(
+        "Target URL to probe (blank to cancel)", "").strip()
+    if not last_url:
+        return
+    if not last_url.startswith(("http://", "https://")):
+        last_url = "https://" + last_url
+    step = {
+        "title": "Target health check (HEAD)",
+        "request": {"method": "HEAD", "url": last_url},
+    }
+    t0 = _time_mod.time()
+    try:
+        result = executor.execute_step(step, vuln_type="health",
+                                        skip_low_risk_confirm=True)
+    except Exception as _e:
+        err(f"Probe failed: {type(_e).__name__}: {_e}")
+        audit.log("health_probe_failed",
+                  f"{last_url[:60]}: {type(_e).__name__}",
+                  risk=AuditTrail.RISK_LOW)
+        return
+    elapsed = _time_mod.time() - t0
+    if result is None:
+        warn(f"Probe returned no response after {elapsed:.1f}s.")
+        warn("  - Target may be down, or")
+        warn("  - Current Tor exit may be blocked by the target, or")
+        warn("  - Firewall / rate-limiter in between.")
+        warn("Try 'N' (new circuit) and probe again.")
+        audit.log("health_probe_empty", last_url[:60])
+        return
+    status = getattr(result, "status_code", 0) or 0
+    _kc = G if 200 <= status < 400 else Y if status else R
+    print(f"  {_kc}HTTP {status}{N}  ({elapsed:.2f}s elapsed)")
+    if 200 <= status < 400:
+        ok("Target responding normally. If captures stopped arriving, "
+           "the payload is the likely culprit (not target availability).")
+    elif status in (403, 429, 503):
+        warn("Target is blocking this Tor exit. Rotate with 'N' and retry.")
+    elif status in (502, 504):
+        warn("Upstream gateway / bad-gateway — target service is flapping.")
+    audit.log("health_probe",
+              f"{last_url[:60]} -> {status} in {elapsed:.1f}s",
+              risk=AuditTrail.RISK_LOW,
+              success=(200 <= status < 400))
+
+
+def _save_captures_to_file(server, file_mgr):
+    """Dump the current capture buffer to an ephemeral JSON file in
+    /dev/shm/intel. Operator can inspect without the buffer being
+    wiped by a future teardown."""
+    if not server or not server.is_running:
+        warn("Server is not running — nothing to save.")
+        return
+    caps = server.get_captures(last_n=9999)
+    if not caps:
+        info("Capture buffer is empty.")
+        return
+    blob = json.dumps(
+        {
+            "captured": len(caps),
+            "attacker_base": server.get_attacker_url(prefer_onion=True),
+            "onion_host": server.onion_host,
+            "captures": caps,
+        },
+        indent=2,
+    )
+    out_path = file_mgr.generate(
+        exploit_type="captures",
+        content=blob,
+        extension=".json",
+    )
+    ok(f"Saved {len(caps)} captures to {out_path.name} "
+       f"(ephemeral, 0o600, auto-wipes)")
 
 
 def _pre_generate_all_files(exploitable, base_url, sp, attacker_url,
