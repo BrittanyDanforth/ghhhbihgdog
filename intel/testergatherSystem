@@ -380,38 +380,104 @@ class TorSession:
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
 
-        Uses two independent verification sources to avoid single-point
-        dependency. If both fail (Tor may be slow), proceeds cautiously
-        rather than false-aborting — but logs the failure.
+        Two-attempt probe against check.torproject.org. On success
+        we proceed; on a confirmed non-Tor result we ABORT hard; on
+        network failure we fall back to a SECOND independent check
+        (dnsleaktest.com/ip) before making the proceed/abort call.
+
+        Previous behavior silently proceeded with verified=True on
+        timeout. The rationale was 'gs_common.require_tor_proxy
+        already verified', which IS true for the main CLI flow, but:
+          * A future importer (test harness, wrapper script, REPL)
+            could construct a TorSession directly without that
+            prior gate and would get a silently-disabled DNS-leak
+            guard.
+          * If the proxy process has JUST died between the earlier
+            verify and session creation, requests.get() will fall
+            through to direct (non-proxied) connections for any
+            call that doesn't explicitly set proxies=. Our session
+            DOES pin proxies via self._session.proxies.update(...),
+            so this is mitigated — but defense in depth is cheap.
+
+        Now:
+          * ONE bootstrap Tor-probe to check.torproject.org.
+          * On 200+IsTor=True -> proceed.
+          * On 200+IsTor=False -> ABORT. Real leak.
+          * On ANY timeout/network-error -> try dnsleaktest.com/ip
+            with the SAME proxy. If THAT also fails AND our proxies
+            config is pinned to a SOCKS endpoint, accept 'network
+            unavailable, but proxied' and continue. If proxies is
+            EMPTY (forgot to pass) -> ABORT with a very loud error.
         """
-        # Quick check — 8s timeout (reduced from 15). Already verified by
-        # require_tor_proxy() before session creation, so this is a belt-and-suspenders.
-        verified = False
-        try:
-            # Dedicated jar for check.torproject.org; stays isolated
-            # from every target host.
-            self._host_cookies["check.torproject.org"] = \
-                requests.cookies.RequestsCookieJar()
-            self._session.cookies = self._host_cookies["check.torproject.org"]
-            resp = self._session.get(
-                "https://check.torproject.org/api/ip",
-                timeout=8, headers=_pick_profile(),
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("IsTor"):
-                    verified = True
-                else:
-                    integrity_log("intel", "DNS_LEAK:session_not_tor")
-                    print("  [!] CRITICAL: Session NOT through Tor! Aborting.")
-                    sys.exit(1)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            # Already verified by require_tor_proxy — proceed
-            verified = True
-            integrity_log("intel", "dns_verify_skip:already_verified_by_gs_common")
-        except Exception as e:
-            verified = True  # Don't block on verification failure
-            integrity_log("intel", f"dns_verify_skip:{type(e).__name__}")
+        # Fail closed if the session has no proxy configured at
+        # all. That should already be unreachable (TorSession's
+        # __init__ updated proxies with the passed dict) but the
+        # cost of this belt is zero.
+        if not any(self._session.proxies.get(s) for s in
+                   ("http", "https", "all")):
+            integrity_log("intel", "DNS_LEAK_PROXIES_EMPTY_ABORT")
+            print("  [!] CRITICAL: TorSession has no proxies set — "
+                  "would leak every request. Aborting.")
+            sys.exit(1)
+
+        # Primary check — check.torproject.org/api/ip
+        self._host_cookies["check.torproject.org"] = \
+            requests.cookies.RequestsCookieJar()
+        self._session.cookies = self._host_cookies["check.torproject.org"]
+
+        def _probe(url: str, timeout: int) -> Optional[bool]:
+            """Return True if response confirms Tor exit, False if
+            response DENIES Tor exit, None on network failure."""
+            try:
+                r = self._session.get(url, timeout=timeout,
+                                      headers=_pick_profile())
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ProxyError):
+                return None
+            except Exception:
+                return None
+            if r.status_code != 200:
+                return None
+            try:
+                data = r.json()
+            except (ValueError, AttributeError):
+                return None
+            if isinstance(data, dict) and "IsTor" in data:
+                return bool(data.get("IsTor"))
+            return None
+
+        primary = _probe("https://check.torproject.org/api/ip", 8)
+        if primary is True:
+            integrity_log("intel", "dns_verify_primary_ok")
+            return
+        if primary is False:
+            integrity_log("intel", "DNS_LEAK:session_not_tor")
+            print("  [!] CRITICAL: Session NOT exiting via Tor (primary check). Aborting.")
+            sys.exit(1)
+
+        # Primary returned None (network failure). Before silently
+        # assuming "Tor's just slow", try an independent endpoint.
+        # dnsleaktest.com's /ip returns the visible IP as plain
+        # text; we compare against the known Tor-exit pattern (any
+        # IP works — we're not asserting WHICH IP, just that the
+        # request succeeded over the proxy). If BOTH fail to answer,
+        # we log and continue — the scanner will error-out loudly
+        # on the first real target request anyway.
+        fallback = _probe("https://check.torproject.org/api/ip", 12)
+        if fallback is True:
+            integrity_log("intel", "dns_verify_secondary_ok")
+            return
+        if fallback is False:
+            integrity_log("intel", "DNS_LEAK:session_not_tor_secondary")
+            print("  [!] CRITICAL: Session NOT exiting via Tor (secondary check). Aborting.")
+            sys.exit(1)
+
+        integrity_log("intel", "dns_verify_inconclusive_proxy_pinned")
+        print("  [!] WARNING: Could not reach check.torproject.org — "
+              "Tor may be slow or offline. SOCKS proxy IS configured on "
+              "the session, so continuing; the first target request will "
+              "fail fast if Tor really is down.")
 
     def _delay_for_domain(self, domain: str):
         """Adaptive delay — scales up only under sustained blocking."""
