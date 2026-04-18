@@ -5397,25 +5397,58 @@ def _control_deck_exploit_shell(exploitable, executor, file_mgr,
 
         # Parse a few high-signal patterns so we can tell at a
         # glance whether the payload executed.
+        # Canonical output patterns that INDISPUTABLY indicate the
+        # payload executed. We deliberately DO NOT include any
+        # 'probably worked' heuristics here; a false-positive here
+        # would claim RCE when there isn't any.
+        #
+        # Previously a '1111111111' pattern labeled 'ssti-49-marker'
+        # lived in this list. That was stale stub code: the scanner's
+        # real SSTI verifier uses per-session RANDOM markers and
+        # computes their product, so a hardcoded 1111111111 never
+        # matches anything the scanner actually emits. It was a fake
+        # signal that could never fire — removed.
         signals = []
         for pat, label in [
-            (r"uid=\d+\([^)]*\)", "uid"),
-            (r"root:x:0:0:", "/etc/passwd"),
-            (r"Linux\s+\S+\s+[\d.]+", "uname"),
-            (r"Microsoft Windows", "Windows"),
-            (r"ami-id|instance-id|AccessKeyId", "cloud-metadata"),
-            (r"redis_version|role:master", "redis"),
-            (r"1111111111", "ssti-49-marker"),  # raw SSTI success
+            (r"uid=\d+\([^)]*\)", "uid (unix whoami)"),
+            (r"root:x:0:0:", "/etc/passwd line"),
+            (r"Linux\s+\S+\s+[\d.]+", "uname Linux"),
+            (r"Microsoft Windows", "Windows systeminfo"),
+            (r"(ami-id|instance-id|AccessKeyId|SecretAccessKey)",
+             "cloud-metadata"),
+            (r"(redis_version|role:master)", "redis INFO"),
         ]:
             m = re.search(pat, body)
             if m:
                 signals.append(f"{label}: "
                                f"{_tsafe_preview(m.group(0), 60)}")
+        # DIFFERENTIAL: even without a canonical signal, a response
+        # that is MUCH longer than the baseline (first prior command
+        # in the session) suggests command output. We track the
+        # shortest-response baseline and compare.
+        _ss_state = getattr(_control_deck_exploit_shell,
+                             "_baseline_len", None)
+        if _ss_state is None:
+            _control_deck_exploit_shell._baseline_len = len(body)
+        else:
+            if len(body) > _ss_state + 256 and not signals:
+                # Response grew — MIGHT be exec output, MIGHT be
+                # target's own error page. Explicitly not a 'signal'.
+                info(f"  response is {len(body) - _ss_state} bytes "
+                     f"larger than baseline — INSPECT manually, "
+                     f"do NOT assume command executed.")
+
         if signals:
             for s in signals:
                 ok(s)
         else:
-            info("no canonical command-output patterns matched.")
+            # Explicit non-success verdict: 'no canonical command-
+            # output patterns matched' — operator MUST NOT read this
+            # as 'probably worked'.
+            info("NO canonical output patterns matched. The payload "
+                 "may have been filtered, the response format may be "
+                 "non-text, or the injection point may not reach a "
+                 "shell. Do not assume execution.")
 
         if body:
             shown = _tsafe(body[:4096])
