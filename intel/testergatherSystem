@@ -312,6 +312,20 @@ class TorSession:
         # to the underlying session gets ONLY that host's jar.
         self._host_cookies: Dict[str, "requests.cookies.RequestsCookieJar"] = {}
         self._explicit_auth_host: Optional[str] = None
+        # Browser-profile pinning: one fresh real browser chooses a
+        # profile ONCE per session (User-Agent, Accept-*, Sec-Ch-*)
+        # and doesn't flip Chrome<->Firefox<->macOS<->Windows between
+        # requests. Previously _pick_profile() was called on every
+        # request inside get()/request()/post_*, so a single target
+        # saw random UA per-request — the purest possible bot
+        # fingerprint.
+        # Now we keep one profile per (host_key, circuit_generation).
+        # On NEWNYM we bump the circuit generation and force a fresh
+        # pick, which also matches real behaviour: if you open a new
+        # Tor Browser window (=new circuit) you get fresh identifying
+        # headers. Same session on the same circuit = pinned profile.
+        self._profile_cache: Dict[Tuple[str, int], dict] = {}
+        self._circuit_generation: int = 0
         # Shared hosts that the scanner itself calls (crt.sh, DoH,
         # DDG, Wayback, etc.) — we still isolate their jars, but we
         # also tag them so set_cookies() never applies to them.
@@ -472,6 +486,12 @@ class TorSession:
                 else:
                     # 1.0 - 4.0 s, same range Tor uses for natural guard hops
                     time.sleep(1.0 + secrets.randbelow(3000) / 1000.0)
+                    # New circuit → new browser fingerprint too. Bump
+                    # the generation counter so _profile_for() returns
+                    # freshly-picked profiles for every host going
+                    # forward, matching how a real 'new Tor Browser
+                    # window' would have freshly-randomized headers.
+                    self._circuit_generation += 1
             # Reset counters: the next rotation point is counted from
             # this moment, not from the start of the session.
             self._next_rotation_at = (
@@ -503,6 +523,8 @@ class TorSession:
         # fair shot without instantly re-tripping the breaker.
         for k in list(self._domain_blocks):
             self._domain_blocks[k] = max(0, self._domain_blocks[k] // 2)
+        # New circuit = new fingerprint. Same as the automatic rotate.
+        self._circuit_generation += 1
         self._next_rotation_at = self._draw_next_rotation()
         return True
 
@@ -757,6 +779,34 @@ class TorSession:
         self._session.cookies = jar
         return key
 
+    def _profile_for(self, url: str) -> dict:
+        """Return the pinned browser profile for the given URL's host
+        under the current Tor circuit. If this is the first time we
+        see (host, circuit) together, pick a profile, cache it, and
+        return a fresh copy. Subsequent calls return a fresh copy of
+        the SAME profile — consistent UA / Accept-* / Sec-Ch-Ua* /
+        platform throughout the session on a given circuit.
+
+        Why the circuit generation is part of the key:
+          When newnym() fires, requests look like they come from a
+          new IP. A real browser on a newly-popped Tor-Browser
+          session would also have a freshly-randomized fingerprint
+          — so we redraw the profile. That's both more realistic
+          AND prevents long-term correlation of 'same UA across
+          two wildly different exit nodes' which is a light
+          fingerprint in its own right.
+        """
+        host = self._host_key(url)
+        key = (host, self._circuit_generation)
+        cached = self._profile_cache.get(key)
+        if cached is None:
+            cached = BROWSER_PROFILES[
+                secrets.randbelow(len(BROWSER_PROFILES))]
+            self._profile_cache[key] = cached
+        # Return a copy so callers can mutate headers without
+        # corrupting the cached master profile.
+        return cached.copy()
+
     @staticmethod
     def _cookie_matches_host(cookie_domain: str, host: str) -> bool:
         """RFC-6265-ish match: a cookie with domain 'example.com' is
@@ -952,7 +1002,7 @@ class TorSession:
             self._delay_for_domain(domain)
             self._maybe_rotate_circuit(url)
 
-            headers = _pick_profile()
+            headers = self._profile_for(url)
             ref = self._build_referer(url)
             if ref:
                 headers["Referer"] = ref
@@ -1058,7 +1108,7 @@ class TorSession:
         for attempt in range(MAX_RETRIES_PER_URL):
             self._delay_for_domain(domain)
             self._maybe_rotate_circuit(url)
-            headers = _pick_profile()
+            headers = self._profile_for(url)
             ref = self._build_referer(url)
             if ref:
                 headers["Referer"] = ref
@@ -1121,7 +1171,11 @@ class TorSession:
         """Fetch cached page from Wayback Machine. web.archive.org is Tor-friendly."""
         wb_url = f"https://web.archive.org/web/2/{url}"
         try:
-            headers = _pick_profile()
+            # Profile keyed to the actual URL we're about to hit
+            # (Wayback), not the original target — pinning to the
+            # target would leak a correlation between target scans
+            # and Wayback fallbacks (same UA on both).
+            headers = self._profile_for(wb_url)
             # Wayback's own cookies (ia-id, donation banners, etc.) live
             # in their own jar — never co-mingled with the target's.
             origin_host = self._swap_in_jar(wb_url)
@@ -1153,7 +1207,7 @@ class TorSession:
             return None
         self._delay_for_domain(domain)
         self._maybe_rotate_circuit(url)
-        headers = _pick_profile()
+        headers = self._profile_for(url)
         headers["Content-Type"] = "application/json"
         ref = self._build_referer(url)
         if ref:
@@ -1187,7 +1241,7 @@ class TorSession:
             return None
         self._delay_for_domain(domain)
         self._maybe_rotate_circuit(url)
-        headers = _pick_profile()
+        headers = self._profile_for(url)
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         ref = self._build_referer(url)
         if ref:
@@ -6070,6 +6124,8 @@ class SubdomainEnumerator:
                 try:
                     newnym()
                     time.sleep(0.5 + secrets.randbelow(2000) / 1000.0)
+                    # Redraw browser fingerprints for the new circuit.
+                    self._session._circuit_generation += 1
                 except Exception:
                     integrity_log(
                         "intel",
