@@ -4142,7 +4142,19 @@ def _control_deck_custom_request(executor, attacker_url,
                                    callback_urls, chain_data):
     """Let the operator run an ad-hoc request against the target
     through the StepExecutor (so it honors Tor + jitter + audit).
-    Placeholders [ATTACKER] / [ATTACKER]/c etc. are substituted."""
+    Placeholders [ATTACKER] / [ATTACKER]/c etc. are substituted.
+
+    URL is validated before dispatch:
+      * Must be http:// or https:// (reject file://, data:,
+        javascript:, ftp://, dict://, etc. — any non-http scheme
+        either leaks local paths in tracebacks or bypasses the
+        Tor proxy at the requests-library level).
+      * Must have a hostname (no 'http:///…').
+      * No userinfo (no user:pass@host) so plaintext credentials
+        never hit the audit log.
+      * Max length capped so paste-a-cert-pem mistakes don't blow
+        up the step.
+    """
     if executor is None:
         warn("No step executor available — the walkthrough did not start "
              "a target client.")
@@ -4150,12 +4162,21 @@ def _control_deck_custom_request(executor, attacker_url,
     print()
     method = prompt("Method (GET/POST/HEAD)", "GET").strip().upper()
     if method not in ("GET", "POST", "HEAD", "PUT", "DELETE", "PATCH"):
-        err(f"Unsupported method: {method}")
+        err(f"Unsupported method: {_tsafe_preview(method, 16)}")
         return
     url = prompt("URL (placeholders [ATTACKER], [ATTACKER]/c, …)", "").strip()
     if not url:
         return
+    # Expand placeholders FIRST — an [ATTACKER] placeholder might
+    # carry the scheme, so scheme validation has to see the expanded
+    # form.
     url = _subst_attacker(url, attacker_url, callback_urls=callback_urls)
+    url_clean, problem = _sanitize_probe_url(url, allow_onion=True)
+    if problem:
+        err(f"URL rejected: {problem}")
+        info(f"  offered URL (sanitized): {_tsafe_preview(url_clean, 120)}")
+        return
+    url = url_clean
     data = ""
     if method in ("POST", "PUT", "PATCH"):
         data = prompt("Body (blank for none)", "")
@@ -4167,7 +4188,7 @@ def _control_deck_custom_request(executor, attacker_url,
     try:
         executor.execute_step(step, vuln_type="custom")
     except Exception as _e:
-        err(f"Request failed: {type(_e).__name__}: {_e}")
+        err(f"Request failed: {type(_e).__name__}: {_tsafe_preview(str(_e), 120)}")
 
 
 def _generate_and_show_report(audit, file_mgr, findings_summary, server):
@@ -4385,6 +4406,12 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
     probe_ok = False
     exit_ip = "unknown"
     is_tor = None
+    # try/finally ensures _ephemeral.close() runs even if .get()
+    # raises. The previous layout put .close() INSIDE the try after
+    # the .get(), so on timeout / connection error the close was
+    # skipped and the session's adapter pool + any in-flight SOCKS
+    # handshake state survived until GC.
+    _ephemeral = None
     try:
         _ephemeral = _req.Session()
         _ephemeral.proxies = {"http": _torproxy, "https": _torproxy}
@@ -4396,9 +4423,8 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
             data = _resp.json()
             if isinstance(data, dict):
                 probe_ok = True
-                exit_ip = data.get("IP", "unknown")
+                exit_ip = str(data.get("IP", "unknown"))
                 is_tor = bool(data.get("IsTor"))
-        _ephemeral.close()
     except Exception as _e:
         integrity_log_stub = f"{type(_e).__name__}"
         audit.log(
@@ -4406,16 +4432,26 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
             integrity_log_stub,
             risk=AuditTrail.RISK_LOW,
         )
+    finally:
+        if _ephemeral is not None:
+            try:
+                _ephemeral.close()
+            except Exception:
+                pass
+    # Sanitize exit_ip — it's from a trusted endpoint (Tor Project's
+    # API) but defense-in-depth against a compromised/spoofed
+    # response injecting ANSI into the operator's terminal.
+    exit_ip_safe = _tsafe_preview(exit_ip, 48)
     if probe_ok:
         _tor_tag = f"{G}YES{N}" if is_tor else f"{R}NO{N}"
         print(f"  {B}Tor exit reachable:{N}    {G}yes{N}")
         print(f"  {B}IsTor confirmed:{N}       {_tor_tag}")
-        print(f"  {B}Exit IP seen by probe:{N} {exit_ip}")
+        print(f"  {B}Exit IP seen by probe:{N} {exit_ip_safe}")
         if not is_tor:
             err("!! Traffic is NOT exiting via Tor. This is a LEAK. "
                 "Abort operations immediately.")
             audit.log("tor_status_LEAK",
-                      f"exit_ip={exit_ip}",
+                      f"exit_ip={exit_ip_safe}",
                       risk=AuditTrail.RISK_CRITICAL)
     else:
         print(f"  {B}Tor exit reachable:{N}    {R}NO{N}")
@@ -4453,6 +4489,7 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
         hs_url = f"http://{server.onion_host}/"
         hs_ok = False
         hs_latency_ms = None
+        _e2 = None
         try:
             _t0 = _time_mod.perf_counter()
             _e2 = _req.Session()
@@ -4464,13 +4501,20 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
             # the hidden service is descriptor-published and an exit
             # can reach it. 200 means the "/" path responded.
             hs_ok = _hr.status_code in (200, 204, 301, 302, 400, 404)
-            _e2.close()
         except Exception as _e:
             print(f"  {B}HS round-trip:{N}         "
                   f"{R}FAIL{N} ({type(_e).__name__})")
             audit.log("hs_liveness_fail",
                       f"{type(_e).__name__}",
                       risk=AuditTrail.RISK_MEDIUM)
+        finally:
+            # Same try/finally rationale as the primary probe —
+            # ensure close() runs on every exit path.
+            if _e2 is not None:
+                try:
+                    _e2.close()
+                except Exception:
+                    pass
         if hs_ok:
             print(f"  {B}HS round-trip:{N}         "
                   f"{G}OK{N}  ({hs_latency_ms:.0f} ms)")
@@ -4482,7 +4526,7 @@ def _tor_hs_status_panel(server, infra_is_loopback: bool, audit,
     # came from circuit X, exit IP Y' to the audit trail.
     audit.log(
         "tor_status_snapshot",
-        f"is_tor={is_tor} exit_ip={exit_ip[:39]}",
+        f"is_tor={is_tor} exit_ip={_tsafe_preview(exit_ip, 48)}",
         risk=AuditTrail.RISK_LOW,
     )
     print()
@@ -4581,6 +4625,18 @@ def _target_health_check(executor, attacker_url, server, audit):
         return
     if not last_url.startswith(("http://", "https://")):
         last_url = "https://" + last_url
+    # Full scheme/host validation — same rules as the custom
+    # request command. No file://, no userinfo, no absurdly long
+    # pastes. This command issues exactly ONE request so we can
+    # afford the strictness.
+    last_url_clean, problem = _sanitize_probe_url(last_url,
+                                                    allow_onion=True)
+    if problem:
+        err(f"URL rejected: {problem}")
+        info(f"  offered URL (sanitized): "
+             f"{_tsafe_preview(last_url_clean, 120)}")
+        return
+    last_url = last_url_clean
     step = {
         "title": "Target health check (HEAD)",
         "request": {"method": "HEAD", "url": last_url},
@@ -4590,9 +4646,9 @@ def _target_health_check(executor, attacker_url, server, audit):
         result = executor.execute_step(step, vuln_type="health",
                                         skip_low_risk_confirm=True)
     except Exception as _e:
-        err(f"Probe failed: {type(_e).__name__}: {_e}")
+        err(f"Probe failed: {type(_e).__name__}: {_tsafe_preview(str(_e), 120)}")
         audit.log("health_probe_failed",
-                  f"{last_url[:60]}: {type(_e).__name__}",
+                  f"{_tsafe_preview(last_url, 60)}: {type(_e).__name__}",
                   risk=AuditTrail.RISK_LOW)
         return
     elapsed = _time_mod.time() - t0
@@ -4615,7 +4671,8 @@ def _target_health_check(executor, attacker_url, server, audit):
     elif status in (502, 504):
         warn("Upstream gateway / bad-gateway — target service is flapping.")
     audit.log("health_probe",
-              f"{last_url[:60]} -> {status} in {elapsed:.1f}s",
+              f"{_tsafe_preview(last_url, 60)} -> {status} in "
+              f"{elapsed:.1f}s",
               risk=AuditTrail.RISK_LOW,
               success=(200 <= status < 400))
 
@@ -7325,6 +7382,70 @@ def _sanitize_domain_input(raw: str) -> Tuple[str, Optional[str]]:
                    "+ digits + hyphen, no leading/trailing hyphen)")
     if len(s) > 253:
         return s, f"name too long ({len(s)}/253 chars)"
+    return s, None
+
+
+def _sanitize_probe_url(raw: str,
+                        allow_onion: bool = True,
+                        max_len: int = 2048) -> Tuple[str, Optional[str]]:
+    """Normalize + validate an operator-supplied URL for the Control
+    Deck's custom-request and target-health commands.
+
+    Rules (enforced in order):
+      * Strip whitespace. Reject empty / too-long.
+      * Require http:// or https:// scheme. Reject file://, ftp://,
+        gopher://, dict://, data:, javascript:, about:, chrome://,
+        and anything exotic. requests CAN be made to do file://
+        with adapters — and even without adapters a ProxyError
+        traceback can leak host paths into the audit log. We fail
+        closed.
+      * Parse with urlparse; ensure .netloc exists (no 'http:///path').
+      * Disallow userinfo (user:pass@host) — walkthrough audit shouldn't
+        contain plaintext credentials.
+      * Enforce a netloc sanity check: single-label like 'localhost'
+        is allowed (debug probes), but IPv4/IPv6 directly are
+        allowed only when the operator is clearly targeting an IP.
+      * Allow onion hosts when allow_onion=True (default) — the
+        walkthrough's hidden-service path legitimately needs them.
+
+    Returns (clean_url, problem_message). problem_message is None
+    on success.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", "URL is empty"
+    if len(s) > max_len:
+        return s[:max_len], f"URL too long ({len(s)}/{max_len} chars)"
+    # Quick reject for dangerous schemes BEFORE urlparse so even
+    # malformed 'jAvAsCrIpT:' variants don't slip through.
+    lowered = s.lower()
+    for bad in ("javascript:", "data:", "file:", "ftp:", "gopher:",
+                "dict:", "telnet:", "about:", "chrome:", "vbscript:",
+                "ldap:", "sftp:", "ssh:", "mailto:", "view-source:"):
+        if lowered.startswith(bad):
+            return s, (f"scheme {bad!r} not allowed — only http:// "
+                       f"and https:// URLs can be probed through the "
+                       f"walkthrough's Tor client")
+    try:
+        parsed = urlparse(s)
+    except Exception as _parse_err:
+        return s, f"URL parse failed: {type(_parse_err).__name__}"
+    if parsed.scheme not in ("http", "https"):
+        return s, (f"scheme must be http or https (got "
+                   f"{parsed.scheme!r})")
+    if not parsed.netloc:
+        return s, "missing hostname (did you forget the scheme?)"
+    if "@" in parsed.netloc:
+        return s, ("URL contains userinfo (user:pass@host) — strip it "
+                   "before probing; plaintext credentials would land "
+                   "in the audit log")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return s, "cannot extract hostname from URL"
+    if host.endswith(".onion") and not allow_onion:
+        return s, ("onion host not allowed for this command")
+    # Looks OK. Return the URL as-is (path/query preserved) — we
+    # don't want to silently rewrite operator input.
     return s, None
 
 
