@@ -564,30 +564,96 @@ class TorSession:
 
     def set_cookies(self, cookies: dict, host: Optional[str] = None):
         """Set session cookies for authenticated scanning, scoped to a
-        SPECIFIC host. Passing host=None uses the caller's last-seen
-        'explicit auth host' (or fails loudly if none has been set).
+        SPECIFIC host.
 
-        Previously set_cookies() applied cookies to the shared session
-        jar, so every subsequent request — including scanner-internal
-        calls to Cloudflare DoH, crt.sh, DuckDuckGo, Wayback — would
-        ship those cookies off-target. An auth cookie (JWT, session
-        id) could leak to five third parties in a single deep scan.
+        Back-compat: historical callers (including the CLI entry
+        point and any scripts wrapping the scanner) pass a dict with
+        no `host` argument. Previously this wrote to a shared jar —
+        which bled those cookies across crt.sh / DoH / DDG / Wayback
+        every time the scanner made an aux call. We fixed the sharing
+        but MUST NOT break the old call shape: those callers know
+        the target, they just didn't think to pass it.
+
+        Resolution ladder:
+          1. If the caller passes host=, use it.
+          2. Else, if we've ever set auth cookies on a host before,
+             reuse THAT host (explicit_auth_host), same as the old
+             shared-jar behaviour would have implied.
+          3. Else, stash the cookies in a *pending* slot keyed to a
+             sentinel host; the first orch.run_domain()/run_email()
+             call will reify them via rebind_pending_auth(). This
+             way set_cookies({'sid': '...'}) BEFORE knowing the
+             target still works (CLI ordering).
         """
-        target_host: Optional[str] = None
         if host:
             target_host = host.lower()
-        elif self._explicit_auth_host:
-            target_host = self._explicit_auth_host
-        else:
-            raise ValueError(
-                "set_cookies(cookies) requires a host argument on first "
-                "use; later calls inherit the last-set auth host."
-            )
+            self._explicit_auth_host = target_host
+            jar = self._host_cookies.setdefault(
+                target_host, requests.cookies.RequestsCookieJar())
+            for k, v in (cookies or {}).items():
+                jar.set(k, v)
+            return
+
+        if self._explicit_auth_host:
+            jar = self._host_cookies.setdefault(
+                self._explicit_auth_host,
+                requests.cookies.RequestsCookieJar())
+            for k, v in (cookies or {}).items():
+                jar.set(k, v)
+            return
+
+        # Pending — will be rebound as soon as we know the target.
+        # We do NOT write to any host jar yet, so there's zero risk
+        # the cookies ship to an aux service before rebinding.
+        if not hasattr(self, "_pending_auth_cookies"):
+            self._pending_auth_cookies: Dict[str, str] = {}
+        for k, v in (cookies or {}).items():
+            self._pending_auth_cookies[k] = v
+        integrity_log(
+            "intel",
+            f"set_cookies_pending:count={len(cookies or {})}:"
+            "awaiting_target_bind",
+        )
+
+    def rebind_pending_auth(self, host: str) -> int:
+        """Bind any pending auth cookies (set_cookies called before a
+        target was known) to the given host. Returns count bound.
+        Safe to call even when there's nothing pending."""
+        if not host:
+            return 0
+        pending = getattr(self, "_pending_auth_cookies", None)
+        if not pending:
+            return 0
+        target_host = host.lower()
         self._explicit_auth_host = target_host
         jar = self._host_cookies.setdefault(
             target_host, requests.cookies.RequestsCookieJar())
-        for k, v in (cookies or {}).items():
+        n = 0
+        for k, v in pending.items():
             jar.set(k, v)
+            n += 1
+        self._pending_auth_cookies = {}
+        return n
+
+    def clear_host_cookies(self, host: Optional[str] = None) -> int:
+        """Drop the cookie jar for a host (or every host, if host=None).
+        Useful between target switches in a multi-target scan so the
+        next target doesn't inherit stale sessions from the previous
+        one. Returns count of jars cleared."""
+        if host is None:
+            n = len(self._host_cookies)
+            self._host_cookies.clear()
+            self._last_url_per_host.clear()
+            self._explicit_auth_host = None
+            return n
+        key = host.lower()
+        if key in self._host_cookies:
+            del self._host_cookies[key]
+            self._last_url_per_host.pop(key, None)
+            if self._explicit_auth_host == key:
+                self._explicit_auth_host = None
+            return 1
+        return 0
 
     def get(self, url: str, allow_wayback: bool = True, method: str = "GET",
             **kwargs) -> Optional[requests.Response]:
@@ -7385,6 +7451,13 @@ class IntelOrchestrator:
         print(f"  TARGET: {domain}")
         print(f"  DEPTH:  {self._scan_depth}")
         print(f"  {'═' * 55}")
+
+        # Bind any auth cookies that set_cookies() stashed before the
+        # target was known (e.g. CLI --cookie sid=... run_domain
+        # ordering). See TorSession.rebind_pending_auth().
+        bound = self._session.rebind_pending_auth(domain)
+        if bound:
+            print(f"  [+] {bound} pending auth cookie(s) now scoped to {domain}")
 
         t_start = time.time()
         base_url = f"https://{domain}"
