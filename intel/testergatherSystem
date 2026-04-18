@@ -327,6 +327,9 @@ class TorSession:
         #                            user clicking around within the
         #                            site.
         self._last_url_per_host: Dict[str, str] = {}
+        # Circuit rotation state. See _maybe_rotate_circuit.
+        self._last_role: Optional[bool] = None
+        self._next_rotation_at: int = 0  # draw on first use
         # Hosts where we should NEVER forge a Referer (direct-API
         # style hosts where a browser Referer would be anomalous).
         self._no_referer_hosts: Set[str] = {
@@ -390,11 +393,77 @@ class TorSession:
         if elapsed < needed:
             time.sleep(needed - elapsed)
 
-    def _maybe_rotate_circuit(self):
+    def _maybe_rotate_circuit(self, url: Optional[str] = None):
+        """Jittered circuit rotation.
+
+        Problems with the old cadence (rotate when count % 8 == 0):
+          * Perfectly periodic pauses at counts 8, 16, 24, 32 are
+            trivial to correlate from the server side — every exit
+            observer sees 'new connection, same fingerprint' on a
+            fixed cycle.
+          * No rotation when switching roles: a circuit used to scrape
+            crt.sh ('surveillance' role) would then carry target
+            probes on the SAME circuit, so a mutual adversary watching
+            both services could trivially link 'scanner' to 'target'.
+
+        New rotation:
+          * Next rotation point is drawn uniformly from [min_every,
+            max_every] after each rotation, NOT fixed cadence. The
+            spacing varies between ~4 and ~12 requests.
+          * If url crosses a role boundary (aux host <-> target host
+            since the last request), force-rotate NOW — the circuit
+            should never carry both roles.
+          * Post-rotate sleep jitter is ~1.0-4.0 s (was 2-5 s) so the
+            quiet window blends better with normal server pauses.
+        """
         self._request_count += 1
-        if self._request_count % CIRCUIT_ROTATION_EVERY == 0:
+        cur_aux = url is not None and self._host_key(url) in self._no_referer_hosts
+        need_boundary = False
+        if url is not None and self._last_role is not None \
+                and self._last_role != cur_aux:
+            need_boundary = True
+        self._last_role = cur_aux if url is not None else self._last_role
+
+        if not hasattr(self, "_next_rotation_at"):
+            self._next_rotation_at = self._draw_next_rotation()
+
+        if need_boundary or self._request_count >= self._next_rotation_at:
             newnym()
-            time.sleep(2 + secrets.randbelow(3000) / 1000.0)
+            # 1.0 - 4.0 s, same range Tor uses for natural guard hops
+            time.sleep(1.0 + secrets.randbelow(3000) / 1000.0)
+            # Reset counters: the next rotation point is counted from
+            # this moment, not from the start of the session.
+            self._next_rotation_at = (
+                self._request_count + self._draw_next_rotation_delta())
+
+    @staticmethod
+    def _draw_next_rotation_delta() -> int:
+        """Uniformly random 4-12 requests until next rotation. The
+        upper bound is ~1.5x CIRCUIT_ROTATION_EVERY, lower bound ~0.5x
+        so the running average matches the configured value but the
+        individual spacing is unpredictable to an external observer."""
+        return 4 + secrets.randbelow(9)  # 4..12 inclusive
+
+    def _draw_next_rotation(self) -> int:
+        return self._request_count + self._draw_next_rotation_delta()
+
+    def rotate_circuit_now(self):
+        """Public handle for the operator / control deck to force an
+        immediate Tor circuit rotation without waiting for cadence.
+        Resets per-host block counters as a bonus since a new circuit
+        probably isn't associated with the previous blocks."""
+        try:
+            newnym()
+        except Exception:
+            integrity_log("intel", "rotate_circuit_now:newnym_failed")
+            return False
+        time.sleep(1.0 + secrets.randbelow(2500) / 1000.0)
+        # Halve each domain's block counter so a new circuit gets a
+        # fair shot without instantly re-tripping the breaker.
+        for k in list(self._domain_blocks):
+            self._domain_blocks[k] = max(0, self._domain_blocks[k] // 2)
+        self._next_rotation_at = self._draw_next_rotation()
+        return True
 
     def is_domain_blocked(self, domain: str) -> bool:
         """Check if a domain has blocked us too many times."""
@@ -515,7 +584,7 @@ class TorSession:
 
         for attempt in range(MAX_RETRIES_PER_URL):
             self._delay_for_domain(domain)
-            self._maybe_rotate_circuit()
+            self._maybe_rotate_circuit(url)
 
             headers = _pick_profile()
             ref = self._build_referer(url)
@@ -609,7 +678,7 @@ class TorSession:
 
         for attempt in range(MAX_RETRIES_PER_URL):
             self._delay_for_domain(domain)
-            self._maybe_rotate_circuit()
+            self._maybe_rotate_circuit(url)
             headers = _pick_profile()
             ref = self._build_referer(url)
             if ref:
@@ -694,7 +763,7 @@ class TorSession:
         if self.is_domain_blocked(domain):
             return None
         self._delay_for_domain(domain)
-        self._maybe_rotate_circuit()
+        self._maybe_rotate_circuit(url)
         headers = _pick_profile()
         headers["Content-Type"] = "application/json"
         ref = self._build_referer(url)
@@ -724,7 +793,7 @@ class TorSession:
         if self.is_domain_blocked(domain):
             return None
         self._delay_for_domain(domain)
-        self._maybe_rotate_circuit()
+        self._maybe_rotate_circuit(url)
         headers = _pick_profile()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         ref = self._build_referer(url)
