@@ -1650,8 +1650,31 @@ class AuditTrail:
 
 @dataclass
 class ExploitResult:
-    """Structured result from an exploit step execution."""
+    """Structured result from an exploit step execution.
+
+    Two separate verdict fields — `success` and `exploit_confirmed`
+    — exist because operators previously conflated them:
+
+      success
+        TRUE iff the HTTP exchange completed with a 2xx/3xx status
+        AND the step's validator callback (if any) didn't flip it
+        back to False. Default-True purely from HTTP status means
+        a step with NO validator always 'succeeded' — which is
+        wildly misleading when the step is an EXPLOIT probe
+        (e.g. 'is the target vulnerable?' — the probe got HTTP
+        200 but that says nothing about the vuln).
+
+      exploit_confirmed
+        TRUE iff a validator callback ran and explicitly decided
+        the vuln is confirmed. None of the HTTP-level layers
+        touch this; only step-specific validators do.
+
+    _run_steps_smart uses exploit_confirmed for the green 'Step
+    N succeeded' banner so probes with no validator attached
+    are NOT reported as confirmed.
+    """
     success: bool = False
+    exploit_confirmed: bool = False
     confidence: float = 0.0
     evidence: str = ""
     status_code: int = 0
@@ -2195,16 +2218,36 @@ class StepExecutor:
         # Default success for the audit: the HTTP exchange itself completed
         # cleanly (2xx/3xx, no transport error). A validator, when present,
         # overrides this with a semantic verdict (vuln confirmed / not).
+        # Note the distinction from exploit_confirmed below.
         if not result.error and 200 <= result.status_code < 400:
             result.success = True
 
-        # Run validation callback if provided
+        # Run validation callback if provided. Track whether a
+        # validator actually ran — absence of a validator means we
+        # cannot claim exploit_confirmed no matter what HTTP code
+        # came back. This is the fix for 'steps with no validator
+        # were labeled green on HTTP-200 alone'.
         validate = step.get("validate")
+        validator_ran = False
         if validate and callable(validate):
+            # Snapshot success BEFORE the validator runs so we can
+            # tell whether the validator explicitly flipped it.
+            pre_success = result.success
             try:
                 validate(result)
+                validator_ran = True
             except Exception:
-                pass
+                validator_ran = False
+            # exploit_confirmed is TRUE iff a validator ran AND the
+            # final result.success is True. If the validator flipped
+            # success to False (its semantic 'not vulnerable') we
+            # leave exploit_confirmed False.
+            if validator_ran and result.success:
+                result.exploit_confirmed = True
+            # If the validator raised, preserve the pre-validator
+            # success state but DO NOT claim exploit_confirmed.
+            if not validator_ran:
+                result.success = pre_success
 
         # Display result
         if result.error:
@@ -2220,12 +2263,16 @@ class StepExecutor:
                     for line in body_preview.split("\n")[:10]:
                         print(f"    {line[:120]}")
 
+        # audit.success now reflects EXPLOIT success, not HTTP
+        # success, so the session-end report's success count
+        # stops inflating via probes that never had a validator.
         self._audit.log(
             action="exploit_step",
             detail=f"{method} {url[:60]} -> {result.status_code} "
-                   f"conf={result.confidence:.0%}",
+                   f"conf={result.confidence:.0%} "
+                   f"confirmed={result.exploit_confirmed}",
             risk=risk, vuln_type=vuln_type,
-            success=result.success,
+            success=result.exploit_confirmed,
         )
 
         return result
@@ -6530,12 +6577,34 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
                     chain_data[f"{etype}_output_{step_idx}"] = result.response_body[:2000]
                     chain_data["last_status"] = str(result.status_code)
                     _auto_extract_chain_data(result.response_body, etype, chain_data)
-                    if result.success:
-                        ok(f"Step {step_num}: {result.evidence}")
+                    # Three-way verdict (replaces the old 2-way
+                    # 'success/error/else' that falsely painted any
+                    # HTTP-200 step GREEN even when no validator
+                    # had actually run):
+                    #
+                    #   exploit_confirmed (validator ran AND said
+                    #                       'yes, vuln confirmed')
+                    #                    -> green OK + evidence
+                    #   error            -> red FAIL
+                    #   success but not exploit_confirmed
+                    #                    (HTTP worked but no
+                    #                     semantic judgement)
+                    #                    -> blue info 'no validator'
+                    #   everything else  -> blue info 'check output'
+                    if result.exploit_confirmed:
+                        ok(f"Step {step_num} CONFIRMED: "
+                           f"{result.evidence or '(validator said yes)'}")
                     elif result.error:
                         err(f"Step {step_num}: {result.error}")
+                    elif result.success:
+                        # HTTP completed but no validator ran. DO
+                        # NOT claim exploit success from this. The
+                        # operator must look at the output.
+                        info(f"Step {step_num}: HTTP {result.status_code} "
+                             f"(no validator ran — inspect manually)")
                     else:
-                        info(f"Step {step_num}: {result.evidence or 'Check output'}")
+                        info(f"Step {step_num}: "
+                             f"{result.evidence or 'Check output'}")
                 print()
                 step_idx += 1
                 break
