@@ -3643,8 +3643,20 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
     chain_data: dict = {}
 
     # First pass: let the operator pick which findings to run up front.
-    sel = prompt("Enter number (or 'all' for sequential, 'q' to skip directly "
-                 "to control deck)", "all")
+    # Ctrl+C here must drop to the Control Deck (the authoritative
+    # handler) — NOT propagate up as 'tear down the session'.
+    try:
+        sel = prompt(
+            "Enter number (or 'all' for sequential, 'q' to skip "
+            "directly to control deck)", "all")
+    except KeyboardInterrupt:
+        print()
+        info("(Ctrl+C — dropping to Control Deck.)")
+        try:
+            _shutdown_event.clear()
+        except Exception:
+            pass
+        sel = "q"
     if sel.lower() in ("q", "quit"):
         targets: list = []
     elif sel.isdigit():
@@ -3664,6 +3676,11 @@ def _walkthrough_main(exploitable, vulns, tor_proxy, auto_mode,
             preset, auto_mode, callback_urls, infra_is_loopback,
             findings_summary,
         )
+    else:
+        # No findings queued (operator picked 'q' or hit Ctrl+C).
+        # Announce the transition explicitly so the screen
+        # doesn't look like it jumped straight to teardown.
+        info("Skipping finding run — going to Control Deck.")
 
     # Control deck: keep the session live until the operator explicitly
     # tears it down. Previously the walkthrough auto-ran
@@ -3749,7 +3766,19 @@ def _run_findings_loop(targets, exploitable, base_url, _sp,
             print(f"  {D}[Session: {stats['executions']} exec, "
                   f"{stats['files_generated']} files, "
                   f"{stats['skips']} skip]{N}")
-            if not confirm("Continue to next finding?"):
+            # Ctrl+C here also means 'stop batch, go to deck',
+            # not 'wipe session'.
+            try:
+                go_on = confirm("Continue to next finding?")
+            except KeyboardInterrupt:
+                print()
+                info("(Ctrl+C — dropping to Control Deck.)")
+                try:
+                    _shutdown_event.clear()
+                except Exception:
+                    pass
+                return True
+            if not go_on:
                 return False
     return False
 
