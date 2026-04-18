@@ -3350,11 +3350,25 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
               f"{G}S{N}  Stop attacker server")
         print(f"  {G}Q{N}  Quit + wipe everything")
         print()
-        cmd = prompt("Control deck", "Q").strip().upper()
+        # DANGEROUS DEFAULT REMOVED.
+        # Previously the default prompt value was 'Q' — meaning that
+        # pressing Enter on an empty line (or losing terminal focus,
+        # or a stray newline from a pasted command) QUIT the entire
+        # session and wiped every buffered capture. Operators who'd
+        # just spent an hour working a target could wipe it with a
+        # single reflex-Enter. Default is now empty (no-op loop) so
+        # blank input just re-prompts.
+        cmd = prompt("Control deck (R/P/L/C/A/F/U/T/N/H/X/V/G/S/Q)",
+                     "").strip().upper()
         if not cmd:
-            cmd = "Q"
+            continue
 
         if cmd == "Q":
+            # Double-confirm quit ALWAYS, regardless of capture count,
+            # because 'break' here tears down the hidden service,
+            # drops every file in /dev/shm/intel, and ends the audit.
+            # A misread of a similar-looking letter (O, 0) shouldn't
+            # be able to do that.
             if server and server.is_running and cap_count > 0:
                 warn(f"{cap_count} captured callback(s) are still in the "
                      "in-memory buffer.")
@@ -3370,13 +3384,31 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
                     _generate_and_show_report(
                         audit, file_mgr, findings_summary, server)
                     _already_reported = True
-                if not confirm("Really quit and wipe everything?"):
+                # Explicit text confirmation. Low friction but it
+                # prevents a single typo from nuking the session.
+                _confirm = prompt(
+                    f"{R}Type 'QUIT' to confirm teardown (anything else cancels){N}",
+                    "").strip().upper()
+                if _confirm != "QUIT":
+                    info("Quit cancelled.")
                     continue
             elif not _already_reported and len(findings_summary) > 0:
                 if confirm("Generate session report before wiping?"):
                     _generate_and_show_report(
                         audit, file_mgr, findings_summary, server)
                     _already_reported = True
+                _confirm = prompt(
+                    f"{R}Type 'QUIT' to confirm teardown (anything else cancels){N}",
+                    "").strip().upper()
+                if _confirm != "QUIT":
+                    info("Quit cancelled.")
+                    continue
+            else:
+                # Cold session: still confirm. The teardown is not
+                # free — exploit files get scrubbed, hidden service
+                # is torn down, etc.
+                if not confirm("Quit and tear down the session?"):
+                    continue
             break
 
         elif cmd in ("R", "P"):
@@ -3545,7 +3577,9 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
             _save_captures_to_file(server, file_mgr)
 
         else:
-            warn(f"Unknown command: {cmd}")
+            warn(f"Unknown command: {cmd!r}")
+            info("Valid commands: R P L C A F U T N H X V G S Q "
+                 "(single letter, case-insensitive).")
 
 
 def _live_capture_viewer(server):
