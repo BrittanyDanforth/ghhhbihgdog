@@ -81,7 +81,33 @@ from typing import Callable
 _shutdown_event = threading.Event()
 
 def _handle_signal(signum, frame):
+    """Signal handler used for SIGINT + SIGTERM.
+
+    Sets the shutdown flag AND — for SIGINT specifically — raises
+    KeyboardInterrupt so blocking input() calls unwind normally.
+
+    Previous handler only called _shutdown_event.set() and returned
+    without raising. That meant:
+      * operator hits Ctrl+C at an input() prompt
+      * flag is set, but input() keeps blocking (no exception)
+      * operator presses Enter to unblock (or input times out)
+      * every downstream shutdown_requested() check now returns
+        True for the remainder of the session — including inside
+        the Control Deck loop, which then short-circuits
+      * whole session is torn down even though the operator only
+        wanted to abort what they were currently doing
+    SIGTERM is kept flag-only because SIGTERM is a process-exit
+    signal and raising inside random code paths is worse than
+    letting the flag check handle it at safe points.
+    """
     _shutdown_event.set()
+    if signum == signal.SIGINT:
+        # Re-raise as the standard interrupt so input()/time.sleep()
+        # /requests etc. unwind and the caller's try/except can
+        # decide what to do. Individual layers catch this and map it
+        # to 'abort this finding + return to the deck' rather than
+        # 'teardown the whole session'.
+        raise KeyboardInterrupt()
 
 def shutdown_requested() -> bool:
     return _shutdown_event.is_set()
@@ -3845,8 +3871,29 @@ def _walkthrough_control_deck(exploitable, base_url, _sp,
         # just spent an hour working a target could wipe it with a
         # single reflex-Enter. Default is now empty (no-op loop) so
         # blank input just re-prompts.
-        cmd = prompt("Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/Z/Q)",
-                     "").strip().upper()
+        try:
+            cmd = prompt(
+                "Control deck (R/P/L/C/A/F/U/M/N/H/T/I/X/V/G/S/Z/Q)",
+                "").strip().upper()
+        except KeyboardInterrupt:
+            # Ctrl+C at the deck prompt = 'I hit Ctrl+C while
+            # deciding what to do next', NOT 'teardown now'. Clear
+            # the flag, redraw the deck. A real teardown requires
+            # explicit Q + typing 'QUIT'.
+            try:
+                _shutdown_event.clear()
+            except Exception:
+                pass
+            print()
+            info("(Ctrl+C at deck prompt — use Q + type 'QUIT' to "
+                 "really tear down.)")
+            continue
+        except EOFError:
+            # stdin closed — caller is non-interactive. Fall through
+            # to the teardown, but politely.
+            print()
+            warn("stdin closed — tearing down session.")
+            break
         if not cmd:
             continue
 
