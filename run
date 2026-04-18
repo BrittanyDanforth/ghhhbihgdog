@@ -5026,11 +5026,34 @@ def _run_steps_smart(steps: list, etype: str, test_url: str,
             cap_tag = f" ({cap_count} captured)" if cap_count else ""
             print(f"    {G}r{N}=run  {G}s{N}=skip  {G}n{N}=next finding  "
                   f"{G}d{N}=files  {G}c{N}=captures{cap_tag}  "
-                  f"{G}a{N}=audit  {G}q{N}=quit")
-            action = prompt(f"  Step {step_num}", default_action).lower()
+                  f"{G}a{N}=audit  {G}q{N}=deck")
+            try:
+                action = prompt(
+                    f"  Step {step_num}", default_action).lower()
+            except KeyboardInterrupt:
+                # Ctrl+C at a step prompt = 'abort THIS step and
+                # send me to the deck', NOT 'teardown now'.
+                print()
+                info("(Ctrl+C — dropping to Control Deck.)")
+                audit.log("step_interrupt",
+                          f"finding_{vi+1}_step_{step_num}",
+                          risk=AuditTrail.RISK_LOW)
+                try:
+                    _shutdown_event.clear()
+                except Exception:
+                    pass
+                return True
 
-            if action in ("q", "quit"):
-                audit.log("session_end", "user_quit")
+            if action in ("q", "quit", "deck"):
+                # 'q' at a step = drop to Control Deck. The deck is
+                # the operator's teardown UI; a single 'q' at a
+                # step should NEVER wipe the session. Operator
+                # still confirms the real teardown from the deck
+                # via Q + type-QUIT.
+                audit.log("step_drop_to_deck",
+                          f"finding_{vi+1}_step_{step_num}",
+                          risk=AuditTrail.RISK_LOW)
+                info("Dropping to Control Deck…")
                 return True
 
             if action in ("n", "next"):
