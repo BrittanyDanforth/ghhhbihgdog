@@ -329,7 +329,15 @@ class TorSession:
         self._last_url_per_host: Dict[str, str] = {}
         # Circuit rotation state. See _maybe_rotate_circuit.
         self._last_role: Optional[bool] = None
-        self._next_rotation_at: int = 0  # draw on first use
+        # Initialize the next-rotation point LAZILY to a random value
+        # in the future. Previous version set this to 0, which meant
+        # the very first call to _maybe_rotate_circuit had
+        # request_count=1 >= target=0 → forced an unnecessary NEWNYM
+        # on the first scan request. That burned a Tor circuit before
+        # any real work had been done, and created an observable
+        # 'first-request-always-rotates' signature. Start at None so
+        # the first call draws a proper delta.
+        self._next_rotation_at: Optional[int] = None
         # Hosts where we should NEVER forge a Referer (direct-API
         # style hosts where a browser Referer would be anomalous).
         self._no_referer_hosts: Set[str] = {
@@ -424,13 +432,34 @@ class TorSession:
             need_boundary = True
         self._last_role = cur_aux if url is not None else self._last_role
 
-        if not hasattr(self, "_next_rotation_at"):
+        # Lazy init: draw the first rotation point on first call.
+        # _next_rotation_at is None until we get here for the first
+        # time; previous code initialized it to 0, which caused a
+        # guaranteed rotation on request #1 before any real work had
+        # been done (and was itself a fingerprint).
+        if self._next_rotation_at is None:
             self._next_rotation_at = self._draw_next_rotation()
-
+            # First-request rotation: skip it unless we genuinely need
+            # a boundary crossing. Fall through to the check below.
         if need_boundary or self._request_count >= self._next_rotation_at:
-            newnym()
-            # 1.0 - 4.0 s, same range Tor uses for natural guard hops
-            time.sleep(1.0 + secrets.randbelow(3000) / 1000.0)
+            # Guard against rotation-before-any-work: if we've done <2
+            # real requests, don't bother rotating just because cadence
+            # said so. Boundary crossings still force rotation since
+            # that's an OPSEC-critical invariant.
+            if need_boundary or self._request_count >= 2:
+                try:
+                    newnym()
+                except Exception:
+                    # Rotation failure is a WARNING, not fatal —
+                    # continue the scan on the current circuit rather
+                    # than aborting mid-flight. Logged so operator can
+                    # investigate (stale ControlPort password, missing
+                    # stem, etc.).
+                    integrity_log("intel",
+                                  "maybe_rotate:newnym_failed_continuing")
+                else:
+                    # 1.0 - 4.0 s, same range Tor uses for natural guard hops
+                    time.sleep(1.0 + secrets.randbelow(3000) / 1000.0)
             # Reset counters: the next rotation point is counted from
             # this moment, not from the start of the session.
             self._next_rotation_at = (
