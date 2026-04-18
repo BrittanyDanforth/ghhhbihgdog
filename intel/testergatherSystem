@@ -1353,7 +1353,65 @@ class TorSession:
             return None
 
     def close(self):
-        self._session.close()
+        """Secure session teardown. Zeros out all OPSEC-relevant state
+        on the TorSession before dropping the underlying requests
+        session.
+
+        Previously close() just called self._session.close() — which
+        released HTTP connections but left cookie jars, the Referer
+        chain, the per-host browser-profile cache, the log salt, and
+        block counters ALIVE on the TorSession instance. If the
+        instance was then garbage-collected normally that memory
+        gets returned to the heap; but under many conditions (e.g.
+        the IntelOrchestrator is still alive, a REPL keeps a
+        reference, a post-mortem core dump of the python process)
+        those in-memory artifacts remain readable — a target-
+        identifying cookie jar, the list of last-URL-per-host used
+        as Referers, the salt that de-obfuscates integrity-log
+        tags, and so on.
+
+        We now explicitly clear each container and zero the log salt.
+        Python strings can't be truly scrubbed (immutable + interned),
+        but overwriting + deleting the reference minimizes the
+        window during which post-mortem tools can recover it.
+        """
+        try:
+            # Cookie jars: clear every host's jar and drop the dict.
+            for _jar in list(self._host_cookies.values()):
+                try:
+                    _jar.clear()
+                except Exception:
+                    pass
+            self._host_cookies.clear()
+        except Exception:
+            pass
+        try:
+            # Referer chain, profile cache, block counters.
+            self._last_url_per_host.clear()
+            self._profile_cache.clear()
+            self._domain_blocks.clear()
+            self._domain_last.clear()
+        except Exception:
+            pass
+        try:
+            # Pending auth cookies: drop without any forwarding.
+            pending = getattr(self, "_pending_auth_cookies", None)
+            if pending:
+                pending.clear()
+        except Exception:
+            pass
+        try:
+            # Log salt: overwrite with a throwaway before dropping
+            # so at least the GC window doesn't contain the live
+            # value.
+            self._log_salt = secrets.token_hex(16)
+            self._log_salt = ""
+        except Exception:
+            pass
+        try:
+            self._session.close()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3460,14 +3518,18 @@ class VulnScanner:
                     sqli = self._test_endpoint_sqli(ep)
                     ep_findings.extend(sqli)
                 except Exception as e:
-                    integrity_log("intel", f"sqli_error:{path}:{type(e).__name__}")
+                    integrity_log("intel",
+                                  f"sqli_error:path_tag={self._session._salt_tag(path)}:"
+                                  f"{type(e).__name__}")
 
                 # XSS — inject tracked markers for stored detection
                 try:
                     xss = self._test_endpoint_xss(ep)
                     ep_findings.extend(xss)
                 except Exception as e:
-                    integrity_log("intel", f"xss_error:{path}:{type(e).__name__}")
+                    integrity_log("intel",
+                                  f"xss_error:path_tag={self._session._salt_tag(path)}:"
+                                  f"{type(e).__name__}")
 
                 # Inject stored XSS markers with unique IDs for cross-endpoint tracking
                 for pi in [p for p in ep["params"] if not p.get("hidden")][:2]:
@@ -3507,21 +3569,27 @@ class VulnScanner:
                     ssti = self._test_endpoint_ssti(ep)
                     ep_findings.extend(ssti)
                 except Exception as e:
-                    integrity_log("intel", f"ssti_error:{path}:{type(e).__name__}")
+                    integrity_log("intel",
+                                  f"ssti_error:path_tag={self._session._salt_tag(path)}:"
+                                  f"{type(e).__name__}")
 
                 # LFI
                 try:
                     lfi = self._test_endpoint_lfi(ep)
                     ep_findings.extend(lfi)
                 except Exception as e:
-                    integrity_log("intel", f"lfi_error:{path}:{type(e).__name__}")
+                    integrity_log("intel",
+                                  f"lfi_error:path_tag={self._session._salt_tag(path)}:"
+                                  f"{type(e).__name__}")
 
                 # CRLF
                 try:
                     crlf = self._test_endpoint_crlf(ep)
                     ep_findings.extend(crlf)
                 except Exception as e:
-                    integrity_log("intel", f"crlf_error:{path}:{type(e).__name__}")
+                    integrity_log("intel",
+                                  f"crlf_error:path_tag={self._session._salt_tag(path)}:"
+                                  f"{type(e).__name__}")
 
                 if ep_findings:
                     self._add_confidence(ep_findings, 0.9)
