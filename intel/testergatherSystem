@@ -304,6 +304,41 @@ class TorSession:
         # DDG, Wayback, etc.) — we still isolate their jars, but we
         # also tag them so set_cookies() never applies to them.
         self._auxiliary_hosts: Set[str] = set()
+        # Per-host Referer chain state. Replaces the buggy global
+        # "request_count > 1 -> DDG referer" heuristic that:
+        #   * Sent a DDG search referer on EVERY request after the
+        #     second one in the session, including internal hops
+        #     ({'/robots.txt', '/.env', '/api/foo'}) where a real
+        #     user would be coming from the previous page of the
+        #     same site.
+        #   * Sent DDG referers to Cloudflare DoH, certspotter,
+        #     Wayback, etc. — nobody reaches api.cloudflare.com via
+        #     DDG.
+        #   * Double-quoted the domain (quote() on an already-escaped
+        #     host).
+        #
+        # The new chain:
+        #   1st hit on a host    -> Referer = DDG search for host (or
+        #                            none for known aux hosts like
+        #                            Cloudflare DoH / crt.sh which
+        #                            are typically hit programmatically)
+        #   2nd+ hit on same host -> Referer = last URL we fetched ON
+        #                            that host, so it looks like a real
+        #                            user clicking around within the
+        #                            site.
+        self._last_url_per_host: Dict[str, str] = {}
+        # Hosts where we should NEVER forge a Referer (direct-API
+        # style hosts where a browser Referer would be anomalous).
+        self._no_referer_hosts: Set[str] = {
+            "cloudflare-dns.com",
+            "dns.google",
+            "dns.quad9.net",
+            "api.certspotter.com",
+            "api.hackertarget.com",
+            "otx.alienvault.com",
+            "crt.sh",
+            "check.torproject.org",
+        }
 
     def _verify_dns_safety(self):
         """Verify DNS queries go through Tor, not local resolver.
@@ -374,6 +409,27 @@ class TorSession:
         """
         old = self._domain_blocks.get(domain, 0)
         self._domain_blocks[domain] = max(0, old // 2)
+
+    def _build_referer(self, url: str) -> Optional[str]:
+        """Honest per-host Referer chain. Returns None when no
+        Referer should be sent (first request on a known API host)."""
+        host = self._host_key(url)
+        if host in self._no_referer_hosts:
+            return None
+        last = self._last_url_per_host.get(host)
+        if last and last != url:
+            return last
+        bare = host.split(":", 1)[0]
+        if not bare:
+            return None
+        return f"https://duckduckgo.com/?q={quote(bare, safe='')}"
+
+    def _record_referer_src(self, url: str):
+        """After a successful fetch record the URL as the next
+        'internal' referer for requests to the same host."""
+        host = self._host_key(url)
+        if host and host not in self._no_referer_hosts:
+            self._last_url_per_host[host] = url
 
     def _host_key(self, url: str) -> str:
         """Canonical key for the per-host cookie jar. We use the full
@@ -462,8 +518,9 @@ class TorSession:
             self._maybe_rotate_circuit()
 
             headers = _pick_profile()
-            if self._request_count > 1:
-                headers["Referer"] = f"https://duckduckgo.com/?q={quote(domain)}"
+            ref = self._build_referer(url)
+            if ref:
+                headers["Referer"] = ref
             extra_headers = kwargs.get("headers", {})
             if extra_headers:
                 headers.update(extra_headers)
@@ -481,6 +538,7 @@ class TorSession:
 
                 if resp.status_code in (200, 301, 302, 304):
                     self._domain_blocks[domain] = max(0, self._domain_blocks[domain] - 1)
+                    self._record_referer_src(url)
                     return resp
 
                 if resp.status_code in (403, 429, 503):
@@ -553,6 +611,9 @@ class TorSession:
             self._delay_for_domain(domain)
             self._maybe_rotate_circuit()
             headers = _pick_profile()
+            ref = self._build_referer(url)
+            if ref:
+                headers["Referer"] = ref
             if extra_headers:
                 headers.update(extra_headers)
             self._swap_in_jar(url)
@@ -590,6 +651,8 @@ class TorSession:
                 # Don't retry every verb — checks like verb tampering
                 # expect 4xx; only rotate circuit + return.
                 return resp
+            if 200 <= resp.status_code < 400:
+                self._record_referer_src(url)
             return resp
         return None
 
@@ -634,6 +697,9 @@ class TorSession:
         self._maybe_rotate_circuit()
         headers = _pick_profile()
         headers["Content-Type"] = "application/json"
+        ref = self._build_referer(url)
+        if ref:
+            headers["Referer"] = ref
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
         self._swap_in_jar(url)
@@ -643,6 +709,8 @@ class TorSession:
             if resp.status_code in (403, 429, 503):
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 self._total_blocks += 1
+            elif 200 <= resp.status_code < 400:
+                self._record_referer_src(url)
             return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             self._total_timeouts += 1
@@ -659,6 +727,9 @@ class TorSession:
         self._maybe_rotate_circuit()
         headers = _pick_profile()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        ref = self._build_referer(url)
+        if ref:
+            headers["Referer"] = ref
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         self._total_requests += 1
         self._swap_in_jar(url)
@@ -668,6 +739,8 @@ class TorSession:
             if resp.status_code in (403, 429, 503):
                 self._domain_blocks[domain] = self._domain_blocks.get(domain, 0) + 1
                 self._total_blocks += 1
+            elif 200 <= resp.status_code < 400:
+                self._record_referer_src(url)
             return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             self._total_timeouts += 1
