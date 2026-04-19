@@ -129,6 +129,21 @@ monero-wallet-cli --generate-new-wallet ~/my_wallet
 - Write down the 25-word seed — **on paper, store safely**
 - That seed is the ONLY way to recover funds
 
+**If you already have a wallet**, skip this step — `~/my_wallet`
+(or whatever path you used before) is what you'll point wallet-rpc at
+in Step 7.
+
+**If you get** `Error: failed to generate new wallet: file already
+exists`, that means the wallet file at that path already exists from a
+previous attempt. Either:
+- use a different path (e.g. `~/my_wallet_2`), **or**
+- open the existing one:
+  `monero-wallet-cli --wallet-file ~/my_wallet` and confirm you still
+  know the password.
+
+Never delete an existing wallet file unless you have the 25-word
+recovery seed written down — the wallet file is your keypair.
+
 ### Step 7: Start services (before each session)
 
 **Start blockchain node** (first run downloads ~170 GB):

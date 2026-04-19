@@ -10,33 +10,39 @@ mutation engines, etc.).
 
 ⚠️  OPSEC Practice
 ──────────────────
-• Writes to *exactly one* JSON file (default `entropy_seed.json`) in the
-  current working directory unless overridden.
+• Writes to *exactly one* JSON file. Default path is
+  `<toolkit-root>/entropy_seed.json`, NOT the caller's CWD — every
+  downstream module reads from the toolkit root, so putting the seed
+  anywhere else breaks the pipeline. Override with `--out`.
 • Immediately overwrites any previous seed file with new entropy, so leaked
   bundles can't be replayed.
 • Prints the SHA‑256 hash of the bundle to stdout — keep or scan via QR for
   Dead‑Man unlock systems.
-• Never exposes raw `os.urandom()` bytes on stdout or logs.
+• Never exposes raw `os.urandom()` bytes on stdout or logs; only hashes
+  of CSPRNG output make it into the JSON (see `urandom_hash` below).
 
 Usage:
-    python3 entropy_seeder.py              # writes ./entropy_seed.json
-    python3 entropy_seeder.py --out /tmp/my_seed.json --bytes 128
+    python3 modules/en_seeder
+    python3 modules/en_seeder --out /tmp/my_seed.json --bytes 128
 
-The resulting JSON schema:
+The resulting JSON schema (real field names):
 {
     "version"       : "1.0",
-    "created_utc"  : "2025-06-20T12:34:56.789Z",
-    "bytes_len"    : 96,
-    "sha256"       : "…",
-    "sources"      : {
-        "urandom"  : "<hex>…",
-        "time_ns" : 17984761234876,
-        "pids"     : [1234, 1],
-        "cpu"      : {"times_user": …},
-        "mem"      : {"total": …},
-        "net"      : {"bytes_sent": …},
-        "hostname" : "t480-ghost",
-        "extra"    : "<hex>…"     # optional CLI --extra-file entropy
+    "created_utc"   : "2025-06-20T12:34:56.789Z",
+    "bytes_len"     : 96,
+    "seed_hex"      : "…",     # primary seed, sha256 of the sources dict
+    "sha256"        : "…",     # hash of the bundle itself (integrity)
+    "sources"       : {
+        "urandom_hash"   : "<sha256(os.urandom(bytes_len))>",
+        "time_ns"        : 17984761234876,
+        "pids"           : [1234, 1],
+        "cpu_hash"       : "<sha256(psutil.cpu_times)>",
+        "mem_hash"       : "<sha256(psutil.virtual_memory)>",
+        "net_hash"       : "<sha256(psutil.net_io_counters)>",
+        "hostname"       : "<sha256(gethostname())>",
+        "random_state"   : "<sha256(random.getstate())>",
+        "extra_entropy"  : "<sha256(pid:time_ns:token_hex)>",
+        "extra"          : "<sha256(--extra-file)>"  # only if supplied
     }
 }
 """
@@ -168,10 +174,10 @@ def main():
         description="Generate high‑grade entropy seed bundle from multiple system sources."
     )
     parser.add_argument(
-        "--out", "-o", 
-        type=Path, 
-        default=_TOOLKIT_ROOT / "entropy_seed.json", 
-        help="Output JSON path (default: ./entropy_seed.json)"
+        "--out", "-o",
+        type=Path,
+        default=_TOOLKIT_ROOT / "entropy_seed.json",
+        help="Output JSON path (default: <toolkit-root>/entropy_seed.json)"
     )
     parser.add_argument(
         "--bytes", "-b", 

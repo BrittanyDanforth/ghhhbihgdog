@@ -278,17 +278,26 @@ class AdvancedNoiseGenerator:
         self.events: List[NoiseEvent] = []
         self.session = create_session(proxy_url, rng)
         self.circuit_refresh_count = 0
-        
+        # Serialize session swaps against in-flight workers. Concurrent
+        # workers using the same requests.Session are fine for pure get/
+        # post calls, but _refresh_session() replaces self.session and
+        # closes the old one, which races with any worker still reading
+        # self.session. Hold _session_lock during the swap, and take a
+        # snapshot of self.session before each request.
+        self._session_lock = threading.Lock()
+
     def _make_request(self, url: str, method: str = "GET", data: Optional[Dict] = None) -> NoiseEvent:
         """Make a single request with timing and error handling"""
         start_time = time.time()
         timestamp = datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
-        
+
+        with self._session_lock:
+            session = self.session
         try:
             if method == "GET":
-                response = self.session.get(url, timeout=20)
+                response = session.get(url, timeout=20)
             elif method == "POST":
-                response = self.session.post(url, json=data, timeout=25)
+                response = session.post(url, json=data, timeout=25)
             else:
                 raise ValueError(f"Unsupported method: {method}")
             
@@ -350,14 +359,23 @@ class AdvancedNoiseGenerator:
     
     def _refresh_session(self):
         """Refresh session and potentially TOR circuit"""
-        self.session.close()
-        self.session = create_session(self.proxy_url, self.rng)
-        
+        new_session = create_session(self.proxy_url, self.rng)
+        with self._session_lock:
+            old_session = self.session
+            self.session = new_session
+        # Close the old session outside the lock so any worker that just
+        # finished with it doesn't have to wait, and a straggler that
+        # already snapshotted it can still complete its request.
+        try:
+            old_session.close()
+        except Exception:
+            pass
+
         # Refresh TOR circuit occasionally
         if self.circuit_refresh_count % 10 == 0:
             if new_tor_circuit():
                 time.sleep(2)  # Wait for circuit establishment
-        
+
         self.circuit_refresh_count += 1
     
     def generate_burst(self, num_events: int) -> List[NoiseEvent]:

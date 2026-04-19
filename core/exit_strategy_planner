@@ -38,10 +38,17 @@ from gs_common import (
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
-# Bisq pricenodes now run as Tor hidden services only (Oct 2023+).
-# This URL may time out — kept as best-effort fallback. The code aborts
-# gracefully if both CoinGecko and Bisq fail (no silent wrong prices).
-BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
+# Bisq pricenodes run primarily as Tor hidden services. The clearnet
+# mirror `price.bisq.wiz.biz` has been intermittent/retired at
+# different times; this fallback is explicitly best-effort. The code
+# aborts gracefully if both CoinGecko and Bisq fail — never uses a
+# stale price to size an off-ramp.
+# (Override at runtime via GS_BISQ_PRICE_URL if you run your own
+# pricenode or the mirror has moved.)
+BISQ_PRICE_URL = os.environ.get(
+    "GS_BISQ_PRICE_URL",
+    "https://price.bisq.wiz.biz/getAllMarketPrices",
+)
 
 METHODS: Dict[str, Dict] = {
     "bisq":   {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.01"),  "kyc": False},

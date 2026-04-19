@@ -168,8 +168,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--tor", required=True, help="Tor proxy (socks5h://…)")
-    p.add_argument("--core", default="core_script.py", 
-                   help="Path to base core script for mutation")
+    p.add_argument("--core", default="core_script.py",
+                   help="Path to base core script for mutation. The default "
+                        "'core_script.py' is a placeholder — pass --core "
+                        "<your-script.py> explicitly; the script must exist "
+                        "or ghost_unifier will abort.")
     p.add_argument("--force", action="store_true", 
                    help="Rebuild artefacts even if they exist")
     p.add_argument("--skip-noise", action="store_true", 

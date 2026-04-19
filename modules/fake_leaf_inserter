@@ -80,27 +80,42 @@ def deterministic_rng(dag_path: Path) -> random.Random:
     return random.Random(seed_value)
 
 
+_SEQUENTIAL_PREFIXES = ('n', 'v', 't', 'f', 'x')
+
+
 def extract_numeric_id(node_id: str) -> Optional[int]:
-    """Extract numeric part from node ID, handling both 'n' and 'f' prefixes."""
+    """Extract numeric part from a sequential PAG-style node ID.
+
+    PAG generates node IDs with a leading single-char prefix
+    ('n', 'v', 't', 'x') followed by a decimal counter at
+    obfuscation <= 3, or "x<hex>" (8 hex chars) at obfuscation > 3.
+
+    Only the *sequential* (counter-based) form is a monotonic integer we
+    can feed into get_next_id_counter to avoid collisions with the new
+    'f<n>' IDs this module creates. The hex form is random and
+    collision risk against 'f<n>' is negligible, so we ignore it here
+    instead of letting `int('abcd1234', 10)` raise and hide a real
+    match.
+    """
     if not node_id:
         return None
-    
-    # Handle IDs that start with 'n' or 'f'
-    if node_id.startswith(('n', 'f')):
-        try:
-            return int(node_id[1:])
-        except ValueError:
-            return None
-    
-    # Try to parse as pure number
-    try:
-        return int(node_id)
-    except ValueError:
+    if node_id[0] in _SEQUENTIAL_PREFIXES:
+        rest = node_id[1:]
+        if rest.isdigit():
+            return int(rest)
         return None
+    if node_id.isdigit():
+        return int(node_id)
+    return None
 
 
 def get_next_id_counter(nodes: List[Dict[str, Any]]) -> int:
-    """Find the highest numeric ID to start counter from."""
+    """Find the highest numeric ID to start counter from.
+
+    Counts any single-letter-prefixed sequential ID so we don't
+    collide with PAG IDs like 'v7', 't3', or 'x42' when we append
+    'f<n>' leaves.
+    """
     max_id = 0
     for node in nodes:
         node_id = node.get("id", "")

@@ -217,7 +217,22 @@ class TorCircuitManager:
             raise
     
     def force_new_circuit(self) -> bool:
-        """Force new Tor circuit creation"""
+        """Force new Tor circuit creation.
+
+        Prefer gs_common.newnym(): it handles the cookie-auth /
+        password-auth / socket-vs-port fallback the rest of the toolkit
+        already uses (including TOR_CONTROL_PASSWORD). Fall back to the
+        local controller path only if gs_common isn't usable in this
+        deployment (e.g. stem missing).
+        """
+        try:
+            if _gs_newnym():
+                self.last_newnym = datetime.now(timezone.utc)
+                logger.info("Forced new Tor circuit (via gs_common)")
+                return True
+        except Exception as e:
+            logger.debug(f"gs_common.newnym failed, falling back: {e}")
+
         try:
             with self._get_controller() as controller:
                 controller.signal(Signal.NEWNYM)
@@ -534,12 +549,18 @@ class ProductionEndpointJuggler:
             }
         }
         
-        # Atomic write operation
+        # Atomic write operation. Create the temp file with tight perms up
+        # front (O_CREAT|O_TRUNC, mode 0o600) so the data is never briefly
+        # world-readable between open() and chmod(). Then dump, fsync,
+        # replace, and re-assert perms on the final name.
         temp_path = output_path.with_suffix('.tmp')
+        fd = os.open(str(temp_path),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            with open(temp_path, 'w') as f:
-                os.chmod(temp_path, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 json.dump(operational_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             temp_path.replace(output_path)
             os.chmod(output_path, 0o600)
         except Exception:

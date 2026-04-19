@@ -350,16 +350,26 @@ class PolymorphicGenerator:
         
         # Post-processing
         if self.obfuscation_level > 2:
-            # Add phantom edges (non-tree edges) — only from earlier to later
-            # nodes in the list to preserve DAG acyclicity.
+            # Add phantom edges (non-tree edges). `nodes` is emitted in
+            # BFS insertion order from the single root, so list index
+            # order is a valid topological order for the tree. We only
+            # add edges from an earlier index to a later index, which
+            # keeps the graph acyclic. We also swap if i1 > i2 instead
+            # of silently dropping that attempt, which the previous code
+            # did (it only emitted an edge when the first random draw
+            # happened to be smaller), losing ~half the intended
+            # phantom-edge count.
             num_phantom = rng.randint(0, max(1, len(edges) // 10))
-            node_order = {n['id']: i for i, n in enumerate(nodes)}
             for _ in range(num_phantom):
-                if len(nodes) > 2:
-                    i1 = rng.randint(1, len(nodes) - 1)
-                    i2 = rng.randint(1, len(nodes) - 1)
-                    if i1 < i2:
-                        edges.append([nodes[i1]['id'], nodes[i2]['id']])
+                if len(nodes) <= 2:
+                    break
+                i1 = rng.randint(1, len(nodes) - 1)
+                i2 = rng.randint(1, len(nodes) - 1)
+                if i1 == i2:
+                    continue
+                if i1 > i2:
+                    i1, i2 = i2, i1
+                edges.append([nodes[i1]['id'], nodes[i2]['id']])
         
         # Clean internal data
         for node in nodes:

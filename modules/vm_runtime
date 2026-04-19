@@ -270,7 +270,13 @@ def snapshot_metrics(network_probe: Optional[str] = None,
     if psutil:
         try:
             boot_time = psutil.boot_time()
-            metrics["boot_time_hash"] = hash(str(boot_time)) % 10000
+            # CPython's builtin hash() for str is salted per process
+            # (PYTHONHASHSEED), so hash(str(boot_time)) is not stable
+            # across runs and would break deterministic replay for every
+            # consumer that hashes metrics into its RNG. Use a stable
+            # digest of the canonical string form instead.
+            _bt_digest = hashlib.sha256(repr(boot_time).encode()).digest()
+            metrics["boot_time_hash"] = int.from_bytes(_bt_digest[:2], "big") % 10000
         except Exception:
             metrics["boot_time_hash"] = 0
     else:
