@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 - Off-Ramp Planner w/ Liquidity Probe
-====================================================================
+exit_strategy_simulator v10.0 - Off-Ramp Planner (heuristic liquidity guidance)
+==============================================================================
 Part of the GhostSpiral v10 tool-chain. Generates a schema-tagged
 exitplan_v1.json bundle.
+
+Prices are LIVE (CoinGecko, Bisq oracle fallback) or the tool aborts -- it never
+serves a made-up price. Fees/slippage per method are STATIC ESTIMATES, not live
+quotes, and the "liquidity" output is a HEURISTIC based on trade size only, NOT
+a real order-book/depth probe (Bisq/Haveno P2P markets have no queryable book).
 
 OPSEC hardening:
   - Tor verified before any API access
@@ -11,7 +16,7 @@ OPSEC hardening:
   - Atomic fsync-rename output with 0600 perms
   - Integrity hash-chain logging
   - KYC risk flagging
-  - Liquidity depth validation (warns if thin)
+  - Heuristic liquidity guidance by trade size (clearly labelled; not a probe)
 """
 from __future__ import annotations
 import argparse, sys, time
@@ -72,15 +77,20 @@ def fetch_prices(proxy):
 
         if "xmr_btc" in prices and "btc_usd" in prices:
             xmr_usd = prices["xmr_btc"] * prices["btc_usd"]
-            xmr_eur = prices["xmr_btc"] * prices.get("btc_eur", prices["btc_usd"])
-            integrity_log("exit", "bisq_price_oracle_ok")
-            return {
+            out = {
                 "xmr_usd": xmr_usd.quantize(Decimal("0.01")),
-                "xmr_eur": xmr_eur.quantize(Decimal("0.01")),
                 "btc_usd": prices["btc_usd"].quantize(Decimal("0.01")),
-                "btc_eur": prices.get("btc_eur", prices["btc_usd"]).quantize(Decimal("0.01")),
                 "source": "bisq_oracle",
             }
+            # Only emit EUR fields if Bisq actually returned a EUR/BTC price.
+            # The old code fell back to btc_usd for a missing EUR rate, which
+            # silently reported USD figures under a EUR label. If EUR wasn't
+            # quoted, leave it out — main() will refuse a --currency it lacks.
+            if "btc_eur" in prices:
+                out["xmr_eur"] = (prices["xmr_btc"] * prices["btc_eur"]).quantize(Decimal("0.01"))
+                out["btc_eur"] = prices["btc_eur"].quantize(Decimal("0.01"))
+            integrity_log("exit", "bisq_price_oracle_ok")
+            return out
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{str(e)[:40]}")
 
@@ -146,7 +156,15 @@ def main():
     if net <= 0:
         sys.exit(f"[!] Net amount after fees+slippage is non-positive: {net}")
 
-    fiat_rate = prices[f"xmr_{args.currency}"]
+    rate_key = f"xmr_{args.currency}"
+    if rate_key not in prices:
+        sys.exit(
+            f"[!] The active price oracle ({prices.get('source', '?')}) did not "
+            f"provide an {args.currency.upper()} rate for XMR.\n"
+            f"    Re-run with --currency usd, or use a source that quotes "
+            f"{args.currency.upper()}. Refusing to fabricate the rate."
+        )
+    fiat_rate = prices[rate_key]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
     liq_guidance = liquidity_estimate(args.method, gross)
@@ -182,7 +200,7 @@ def main():
     print(f"  Net         : {net:.4f} XMR")
     print(f"  Value       : {fiat_val} {args.currency.upper()}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
-    print(f"  Liquidity   : {liq_guidance}")
+    print(f"  Liquidity   : {liq_guidance} (heuristic)")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
     print(f"  [+] Plan saved -> {args.outfile}")

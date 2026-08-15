@@ -66,6 +66,28 @@ if LOG.exists():
 para.wipe_gs_artifacts(dry=True, extra_dirs=[])
 check("paranoia: dry wipe still logs", LOG.exists())
 
+# ---------------------------------------------------------------------------
+# paranoia _secure_delete_file must OVERWRITE the file's FULL extent IN PLACE.
+# Proven with a hardlink: after deleting one link, the shared inode's bytes
+# (read via the other link) must be all-zero and the ORIGINAL full size -- not
+# 64 KB-capped, not left intact (the old truncate-then-64KB bug failed both).
+# ---------------------------------------------------------------------------
+para2 = load("paranoia_mode")        # fresh module: real _secure_delete_file,
+                                     # not the no-op the BUG-4 test patched in
+big = b"SECRETDATA" * 20000  # 200 KB, well over the old 64 KB cap
+fa = Path(os.getcwd()) / "sd_a.bin"; fb = Path(os.getcwd()) / "sd_b.bin"
+fa.write_bytes(big)
+os.link(str(fa), str(fb))            # hardlink: same inode + data blocks
+ok = para2._secure_delete_file(fa)
+check("secure_delete: returns True", ok is True)
+check("secure_delete: path unlinked", not fa.exists())
+residual = fb.read_bytes()           # the inode survives via fb; read its bytes
+check("secure_delete: full size overwritten (not 64KB-capped)", len(residual) == len(big))
+check("secure_delete: original bytes gone (zeroed in place)", b"SECRET" not in residual and set(residual) == {0})
+fb.unlink()
+check("secure_delete: missing file -> False",
+      para2._secure_delete_file(Path(os.getcwd()) / "nope_xyz_missing") is False)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

@@ -26,6 +26,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
+    bech32_checksum_ok, secure_delete_file,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -152,16 +153,25 @@ def main():
         try:
             expected_xmr = Decimal(str(route.get("expectedOutput") or "0"))
         except Exception:
-            integrity_log("thor", f"bad_expected_output_{i}")
             expected_xmr = Decimal(0)
+        if expected_xmr <= 0:
+            # A silent expected_xmr=0 defeats the slippage cross-check below and
+            # prints "Expected XMR: ~0" in the sender instructions. Say so loudly
+            # -- it usually means the route field name changed.
+            integrity_log("thor", f"expected_output_unreadable_{i}")
+            print(f"  [!] Pair {i}: could not read expected XMR from the quote "
+                  f"(field name may have changed) — slippage check disabled for it.")
 
         if not deposit:
             integrity_log("thor", f"no_deposit_{i}")
             sys.exit(f"[!] ThorChain returned no deposit address for pair {i}")
 
-        if not BTC_RE.match(deposit):
-            integrity_log("thor", f"bad_deposit_format_{i}")
-            sys.exit(f"[!] Deposit address not valid bech32: {scrub_address(deposit)}")
+        # Real checksum validation, not just charset/length: a typo'd but
+        # in-charset address would pass BTC_RE and send real BTC into the void.
+        if not BTC_RE.match(deposit) or not bech32_checksum_ok(deposit):
+            integrity_log("thor", f"bad_deposit_{i}")
+            sys.exit(f"[!] Deposit address failed bech32 checksum validation: "
+                     f"{scrub_address(deposit)} — refusing to instruct a BTC send to it.")
 
         # Slippage check
         oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
@@ -214,21 +224,39 @@ def main():
     print("  ============================================================")
 
     if args.gpg_recipient:
+        # Encryption was explicitly requested. The plaintext bundle (deposit
+        # addresses, memos, XMR destinations) is already on disk from
+        # atomic_write_json above. If we cannot produce the encrypted copy, do
+        # NOT continue as if the file were protected -- abort loudly, and once
+        # the .gpg exists, securely remove the plaintext so it isn't left
+        # readable (the old code left the plaintext on disk in every case).
         try:
             import gnupg
-            g = gnupg.GPG()
-            enc = g.encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
-            if enc.ok:
-                gpg_path = Path(str(_out) + ".gpg")
-                gpg_path.write_text(str(enc))
-                os.chmod(gpg_path, 0o600)
-                integrity_log("thor", f"gpg_ok:{gpg_path.name}")
-                print(f"  [+] GPG bundle -> {gpg_path}")
-            else:
-                integrity_log("thor", f"gpg_fail:{enc.status}")
-                print(f"  [!] GPG encryption failed: {enc.status}")
         except ImportError:
-            print("[!] python-gnupg not installed - skipping GPG encryption")
+            integrity_log("thor", "gpg_missing")
+            sys.exit(
+                f"[!] --gpg-recipient given but python-gnupg is not installed.\n"
+                f"    The UNENCRYPTED bundle is at {_out} — encrypt or securely\n"
+                f"    delete it yourself. Aborting rather than pretend it's protected."
+            )
+        enc = gnupg.GPG().encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+        if not enc.ok:
+            integrity_log("thor", f"gpg_fail:{enc.status}")
+            sys.exit(
+                f"[!] GPG encryption failed ({enc.status}). The UNENCRYPTED bundle\n"
+                f"    remains at {_out}. Fix the recipient key or delete it — not\n"
+                f"    leaving you a plaintext file with a false sense of protection."
+            )
+        gpg_path = Path(str(_out) + ".gpg")
+        gpg_path.write_text(str(enc))
+        os.chmod(gpg_path, 0o600)
+        if secure_delete_file(_out):
+            integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wiped")
+            print(f"  [+] GPG bundle -> {gpg_path}  (plaintext {_out.name} securely deleted)")
+        else:
+            integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wipe_FAILED")
+            print(f"  [!] GPG bundle -> {gpg_path}, but could NOT delete plaintext "
+                  f"{_out} — remove it manually.")
 
     if proxy:
         newnym()

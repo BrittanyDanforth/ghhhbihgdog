@@ -268,14 +268,25 @@ class MoneroRPC:
                     f"    Either: (a) use 127.0.0.1 with a local RPC, or\n"
                     f"            (b) tunnel the RPC through Tor externally (socat/ssh)."
                 )
-            integrity_log("rpc", f"WARN:non_local_rpc:{host}:{port}:proxy_patched")
-
         self._backend = JSONRPCWallet(host=host, port=port)
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:
+            # Only log success AFTER the patch actually applies. The old code
+            # logged "proxy_patched" up front, so if the session attribute wasn't
+            # present the proxy silently didn't apply yet the integrity chain
+            # asserted it was patched -- a clearnet IP leak under a green log.
             proxies = {"http": proxy_url, "https": proxy_url}
-            if hasattr(self._backend, '_session'):
+            if hasattr(self._backend, "_session"):
                 self._backend._session.proxies.update(proxies)
+                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_applied")
+            else:
+                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_UNAVAILABLE")
+                sys.exit(
+                    f"[!] Cannot attach the proxy to monero-python's session for\n"
+                    f"    non-localhost RPC {host}:{port}; the connection would be\n"
+                    f"    clearnet and leak your IP. Aborting. Tunnel the RPC\n"
+                    f"    externally (socat/ssh) and point at 127.0.0.1 instead."
+                )
 
         self._wallet = XMRWallet(self._backend)
 
@@ -408,3 +419,72 @@ def scrub_address(addr: str, visible: int = 8) -> str:
     if len(addr) <= visible * 2:
         return addr
     return f"{addr[:visible]}...{addr[-visible:]}"
+
+
+# ---------------------------------------------------------------------------
+#  Real BTC bech32/bech32m checksum verification (BIP173 / BIP350)
+# ---------------------------------------------------------------------------
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _bech32_polymod(values) -> int:
+    gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_hrp_expand(hrp: str):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def bech32_checksum_ok(addr: str) -> bool:
+    """Verify a BTC bech32/bech32m address's CHECKSUM, not just its charset.
+
+    A format regex accepts a typo'd address as long as the wrong characters stay
+    in-charset; for an address we tell someone to send real BTC to, that risks
+    irrecoverable funds. This runs the actual BIP173 (v0) / BIP350 (v1+ taproot)
+    polymod and returns True only when the checksum is genuinely valid.
+    """
+    if not addr or any(ord(c) < 33 or ord(c) > 126 for c in addr):
+        return False
+    if addr.lower() != addr and addr.upper() != addr:  # mixed case is invalid
+        return False
+    a = addr.lower()
+    pos = a.rfind("1")
+    if pos < 1 or pos + 7 > len(a) or len(a) > 90:
+        return False
+    hrp, data_part = a[:pos], a[pos + 1:]
+    try:
+        data = [_BECH32_CHARSET.index(c) for c in data_part]
+    except ValueError:
+        return False
+    const = _bech32_polymod(_bech32_hrp_expand(hrp) + data)
+    return const in (1, 0x2bc830a3)   # bech32 (v0) or bech32m (v1+)
+
+
+def secure_delete_file(path: Path) -> bool:
+    """Overwrite a file's full extent in place (random then zeros), then unlink.
+    Returns True on success. Same real primitive as paranoia_mode uses -- for
+    callers that must not leave plaintext (e.g. a GPG-encrypted bundle's source).
+    """
+    try:
+        path = Path(path)
+        size = path.stat().st_size
+        if size > 0:
+            with open(path, "r+b") as f:
+                for filler in (os.urandom, lambda n: b"\x00" * n):
+                    f.seek(0)
+                    left = size
+                    while left > 0:
+                        n = min(left, 1 << 20)
+                        f.write(filler(n)); left -= n
+                    f.flush(); os.fsync(f.fileno())
+        path.unlink()
+        return True
+    except (PermissionError, OSError, FileNotFoundError):
+        return False

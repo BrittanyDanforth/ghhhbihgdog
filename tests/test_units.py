@@ -165,6 +165,16 @@ check("jm: multiple distinct outputs",
       ghost.parse_jm_amounts(f"0.1 BTC to {DEST}\n0.2 BTC to {DEST}", DEST) == [Decimal("0.1"), Decimal("0.2")])
 
 # ---------------------------------------------------------------------------
+# gs_common.bech32_checksum_ok: REAL BTC checksum validation (not just charset)
+# ---------------------------------------------------------------------------
+check("bech32: valid mainnet passes", gs.bech32_checksum_ok("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
+check("bech32: valid testnet passes", gs.bech32_checksum_ok("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"))
+check("bech32: corrupted checksum fails", not gs.bech32_checksum_ok("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"))
+check("bech32: legacy 1-addr fails", not gs.bech32_checksum_ok("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))
+check("bech32: mixed case fails", not gs.bech32_checksum_ok("bc1qw508D6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
+check("bech32: empty fails", not gs.bech32_checksum_ok(""))
+
+# ---------------------------------------------------------------------------
 # gs_common misc: validate_proxy, scrub_address, secure_hex
 # ---------------------------------------------------------------------------
 check("validate_proxy: socks5h ok",
@@ -226,6 +236,43 @@ check("nullsafe: null expectedOutput -> 0",
       parse_route({"transaction": {"to": "X"}, "expectedOutput": None})[2] == Decimal(0))
 check("nullsafe: calldata fallback",
       parse_route({"transaction": None, "calldata": {"depositAddress": "Y"}, "expectedOutput": "1.2"})[1] == "Y")
+
+# ---------------------------------------------------------------------------
+# exit_strategy_simulator Bisq fallback: EUR must NOT be fabricated from the
+# USD rate. If Bisq only quoted USD, the returned dict must have no xmr_eur/
+# btc_eur keys (so main() refuses --currency eur instead of lying).
+# ---------------------------------------------------------------------------
+exitsim = load("exit_strategy_simulator")
+
+def _fake_bisq(data_entries):
+    """Monkeypatch safe_get to return a Bisq-shaped payload, run fetch_prices."""
+    orig = exitsim.safe_get
+    exitsim.safe_get = lambda url, proxy=None: (_ for _ in ()).throw(Exception("cg down")) \
+        if "coingecko" in url else {"data": data_entries}
+    try:
+        return exitsim.fetch_prices(None)
+    finally:
+        exitsim.safe_get = orig
+
+_usd_only = _fake_bisq([
+    {"currencyCode": "XMR", "price": 0.004},
+    {"currencyCode": "USD", "price": 60000},
+])
+check("exitsim: bisq usd-only has xmr_usd", "xmr_usd" in _usd_only)
+check("exitsim: bisq usd-only OMITS xmr_eur (no fabrication)", "xmr_eur" not in _usd_only)
+check("exitsim: bisq usd-only OMITS btc_eur", "btc_eur" not in _usd_only)
+check("exitsim: bisq usd_val = 0.004*60000 = 240", _usd_only["xmr_usd"] == Decimal("240.00"))
+
+_with_eur = _fake_bisq([
+    {"currencyCode": "XMR", "price": 0.004},
+    {"currencyCode": "USD", "price": 60000},
+    {"currencyCode": "EUR", "price": 55000},
+])
+check("exitsim: bisq w/eur has xmr_eur", "xmr_eur" in _with_eur)
+check("exitsim: bisq eur = 0.004*55000 = 220 (real EUR rate, not USD)",
+      _with_eur["xmr_eur"] == Decimal("220.00"))
+check("exitsim: bisq eur != usd (proves not fabricated)",
+      _with_eur["xmr_eur"] != _with_eur["xmr_usd"])
 
 # ---------------------------------------------------------------------------
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

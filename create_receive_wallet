@@ -2,8 +2,11 @@
 """
 create_receive_wallet - GhostSpiral companion (v10-ready)
 ==========================================================
-Generates a fresh Monero receive wallet / sub-address bundle that
-conforms to the GhostSpiral v10 JSON schema.
+Creates a fresh receive SUBADDRESS on the wallet that monero-wallet-rpc
+already has open, and writes a gs_receive_wallet_v1 reference (address +
+account/subaddress index + rpc_endpoint) for GhostSpiral receive mode.
+It does NOT create a new wallet and does NOT export spend/view keys --
+GhostSpiral reaches the funds through the same wallet-rpc endpoint.
 
 OPSEC hardening:
   - Tor leak check before RPC contact
@@ -58,8 +61,18 @@ def main():
         integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
-    if not wallet_rpc.accounts:
-        wallet_rpc.new_account(label="GhostSpiral")
+    # A subaddress can only be created on an already-open wallet. The old code
+    # here did `if not wallet_rpc.accounts: new_account(...)`, which is a dead,
+    # confused branch: accessing .accounts with no open wallet RAISES (never
+    # returns empty), and if it somehow did, new_account creates account 1 while
+    # the next line spends from account 0. Fail clearly instead.
+    try:
+        if not wallet_rpc.accounts:
+            raise RuntimeError("no accounts")
+    except Exception as ex:
+        integrity_log("wallet", "no_open_wallet")
+        sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
+                 f"Open/create a wallet in wallet-rpc first, then re-run.")
     addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
         account_index=0, label=args.label,
     )
@@ -81,7 +94,7 @@ def main():
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 
-    print(f"  [+] Wallet saved -> {fname}")
+    print(f"  [+] Receive subaddress bundle saved -> {fname}")
     print(f"  [+] Address (full): {addr_str}")
     print(f"  [+] Subaddress index: {sub_idx} (account 0)")
     print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
