@@ -326,14 +326,18 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     return MoneroRPC(url, proxy_url=proxy_url)
 
 
-def daemon_fee_per_byte(daemon_url: str, proxies: Optional[Dict[str, str]] = None) -> int:
-    """Return monerod's base fee-per-byte (atomic units), or 0 on any failure.
+def daemon_fee_estimate(daemon_url: str, proxies: Optional[Dict[str, str]] = None) -> dict:
+    """Return monerod's get_fee_estimate 'result' dict, or {} on any failure.
+
+    The result carries a base per-byte 'fee' and (on modern monerod) an explicit
+    per-priority 'fees' array -- callers should prefer the array so the estimate
+    matches exactly what transfer_split charges at a given priority.
 
     get_fee_estimate is a monerod (DAEMON) json_rpc method; monero-wallet-rpc
     does NOT expose it, so callers wanting a live fee estimate must query the
     daemon endpoint (e.g. :18081), not the wallet-rpc (:18083). A localhost
     daemon is queried directly; a non-localhost daemon is queried through the
-    given Tor proxies, or refused (returns 0) if none were provided, so the
+    given Tor proxies, or refused (returns {}) if none were provided, so the
     query is never leaked to a remote node over clearnet.
     """
     parsed = urlparse(daemon_url)
@@ -341,7 +345,7 @@ def daemon_fee_per_byte(daemon_url: str, proxies: Optional[Dict[str, str]] = Non
     use_proxies = None
     if host not in _LOCALHOST_NAMES:
         if not proxies:
-            return 0
+            return {}
         use_proxies = proxies
     try:
         endpoint = daemon_url.rstrip("/") + "/json_rpc"
@@ -351,9 +355,9 @@ def daemon_fee_per_byte(daemon_url: str, proxies: Optional[Dict[str, str]] = Non
             timeout=20, proxies=use_proxies,
         )
         r.raise_for_status()
-        return int(r.json().get("result", {}).get("fee", 0) or 0)
+        return r.json().get("result", {}) or {}
     except Exception:
-        return 0
+        return {}
 
 # ---------------------------------------------------------------------------
 #  Resource sentinel

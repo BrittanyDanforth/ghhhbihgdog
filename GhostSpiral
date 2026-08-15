@@ -31,7 +31,7 @@ from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, daemon_fee_per_byte, require_resources,
+    safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
@@ -49,17 +49,13 @@ NUM_DECOYS = 4
 # Updated periodically; safe to overshoot slightly (operator keeps the change).
 FALLBACK_FEE_XMR = Decimal("0.00005")
 
-# Monero's default fee-priority multipliers. monero-wallet-rpc scales the
-# per-byte base fee (returned by get_fee_estimate) by one of these depending on
-# the 'priority' passed to transfer_split. These are the values wired into
-# monero's src (wallet2::get_fee_multipliers / simplewallet's priority table)
-# and have been stable since the 2019 dynamic-fee overhaul (1 / 4 / 20 / 166).
-#
-# The budget math below MUST use the SAME multiplier the RPC will actually
-# charge in Stage 5a, or a high --fee-priority run overspends its fee
-# reservation and aborts mid-batch. If a future Monero hard fork changes these
-# ratios, this table and the RPC move together -- update both, or the estimate
-# silently drifts from the charged fee.
+# FALLBACK per-priority fee multipliers, used ONLY when monerod's
+# get_fee_estimate doesn't return an explicit per-priority 'fees' array (older
+# daemons). Modern monerod DOES return that array, and fetch_fee_from_daemon
+# prefers it -- the exact per-priority fee the daemon will charge -- so this
+# table is a best-effort approximation, not authoritative. The 1/4/20/166 set
+# is the classic multiplier table; real ratios can differ by daemon version, so
+# do not treat a match at high priority as guaranteed. At priority 1 it's exact.
 PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
 
 # Fan-out outputs are spendable only after they confirm and unlock (~10 blocks,
@@ -81,18 +77,27 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
     """Estimate per-TX fee in XMR from monerod's get_fee_estimate.
 
     get_fee_estimate is a DAEMON json_rpc method -- the wallet-rpc (:18083) does
-    NOT expose it, so the earlier version that queried rpc_primary for it always
-    threw and silently fell back to the constant on every run. Query the daemon
-    (args.rpc_daemon, :18081) for the base per-byte fee, scale by a ~2kB typical
-    TX size and the priority multiplier (matching what transfer_split charges),
-    and fall back to FALLBACK_FEE_XMR on any failure."""
+    NOT expose it, so the original version that queried rpc_primary always threw
+    and silently used the constant every run. Query the daemon (args.rpc_daemon,
+    :18081) instead. Prefer monerod's explicit per-priority 'fees' array (the
+    exact per-byte fee transfer_split will charge at this priority); only if the
+    daemon doesn't return it fall back to base-fee x PRIORITY_FEE_MULTIPLIER,
+    then to FALLBACK_FEE_XMR. Scaled by a ~2kB typical TX size throughout."""
     multiplier = Decimal(PRIORITY_FEE_MULTIPLIER.get(fee_priority, 1))
-    fee_per_byte = daemon_fee_per_byte(daemon_url, proxies)
-    if fee_per_byte > 0:
-        # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
-        fee_xmr = (Decimal(fee_per_byte * 2000) / Decimal(10 ** 12)) * multiplier
+    est = daemon_fee_estimate(daemon_url, proxies)
+    fees = est.get("fees")
+    # Exact path: monerod's per-priority array, indexed by priority (1-based).
+    if isinstance(fees, list) and len(fees) >= fee_priority and fees[fee_priority - 1] > 0:
+        fee_xmr = Decimal(int(fees[fee_priority - 1]) * 2000) / Decimal(10 ** 12)
         if fee_xmr > 0:
-            integrity_log("fee", "daemon_fee_estimate_ok")
+            integrity_log("fee", "daemon_fee:per_priority_array")
+            return fee_xmr
+    # Approximate path: older daemon with only a base 'fee'.
+    base = est.get("fee", 0) or 0
+    if base > 0:
+        fee_xmr = (Decimal(int(base) * 2000) / Decimal(10 ** 12)) * multiplier
+        if fee_xmr > 0:
+            integrity_log("fee", "daemon_fee:base_times_multiplier")
             return fee_xmr
     integrity_log("fee", "using_fallback_fee")
     return FALLBACK_FEE_XMR * multiplier
@@ -594,24 +599,26 @@ def main():
             f"[!] Usable balance {usable} XMR too small to fan out across "
             f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
         )
-    fanout_plan = []
-    for fi in range(fanout_count):
-        if shutdown_requested():
-            integrity_log("stage4", f"shutdown_at_fanout_{fi}")
-            break
-        fanout_plan.append({
-            "src": ENTRY,
-            "src_index": _src_index(ENTRY),
-            "dst": mix_targets[fi],
-            "amt": str(fanout_amt),
-            "delay": _secrets.randbelow(540) + 180,
-            "extra": secure_hex(16),
-        })
-    integrity_log("stage4", f"fanout_plan:{len(fanout_plan)}_txs:amt_each={fanout_amt}")
+    # Fan-out is ONE transaction: a single transfer_split from ENTRY's single
+    # confirmed output to all fanout_count mix subaddresses at once (one input
+    # -> many outputs). Emitting fanout_count SEPARATE TXs from ENTRY would fail
+    # for the SAME reason the DAG round is confirmation-gated: ENTRY holds ONE
+    # confirmed output (one swap / one deposit), spendable once per batch, so
+    # the 2nd..Nth separate TX would fail 'no unlocked output' and abort the run
+    # (the change output from TX0 is unconfirmed and unspendable in the batch).
+    fanout_dests = list(mix_targets[:fanout_count])
+    fanout_plan = [{
+        "src": ENTRY,
+        "src_index": _src_index(ENTRY),
+        "destinations": [{"address": a, "amount": str(fanout_amt)} for a in fanout_dests],
+        "delay": _secrets.randbelow(540) + 180,
+        "extra": secure_hex(16),
+    }]
+    integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests:amt_each={fanout_amt}")
 
-    # Subaddresses that actually received a fan-out output, with the (account,
-    # index) pair Stage 5 polls to confirm they've unlocked before hop-mixing.
-    funded_targets = [tx["dst"] for tx in fanout_plan]
+    # Subaddresses that will receive a fan-out output, with the (account, index)
+    # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
+    funded_targets = list(fanout_dests)
     fanout_targets_indexed = [(sub_account, _src_index(a)) for a in funded_targets]
 
     # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------

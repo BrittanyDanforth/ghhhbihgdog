@@ -40,22 +40,36 @@ from gs_common import (
     connect_rpc, validate_proxy, verify_tor,
 )
 
-REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
-
-
 def _validate_plan(plan: List[dict]) -> None:
+    """Validate each TX. A TX is either single-destination (dst+amt, used by DAG
+    hops) or multi-destination (destinations[], used by the one fan-out TX that
+    sends ENTRY's single input to many mix subaddresses at once)."""
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
-        for k, typ in REQUIRED_TX_FIELDS.items():
-            if k not in tx or not isinstance(tx[k], typ):
-                sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
-        try:
-            val = Decimal(tx["amt"])
-            if val <= 0:
-                sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
-        except Exception:
-            sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
+        if not isinstance(tx.get("src"), str):
+            sys.exit(f"[!] Schema error at TX {i}: 'src' missing or wrong type")
+        dests = tx.get("destinations")
+        if dests is not None:
+            if not isinstance(dests, list) or not dests:
+                sys.exit(f"[!] Schema error at TX {i}: 'destinations' must be a non-empty list")
+            for j, d in enumerate(dests):
+                if not isinstance(d.get("address"), str):
+                    sys.exit(f"[!] TX {i} dest {j}: 'address' missing or wrong type")
+                try:
+                    if Decimal(str(d.get("amount"))) <= 0:
+                        sys.exit(f"[!] TX {i} dest {j}: amount must be positive")
+                except Exception:
+                    sys.exit(f"[!] TX {i} dest {j}: amount not parsable: {d.get('amount')}")
+        else:
+            for k in ("dst", "amt"):
+                if not isinstance(tx.get(k), str):
+                    sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
+            try:
+                if Decimal(tx["amt"]) <= 0:
+                    sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
+            except Exception:
+                sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
 
 
 def _load_unsigned(path: Path) -> tuple:
@@ -75,7 +89,11 @@ def _load_unsigned(path: Path) -> tuple:
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
     h = hashlib.sha256()
     for tx in plan:
-        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
+        if tx.get("destinations"):
+            for d in tx["destinations"]:
+                h.update(f"{d.get('address','')}:{d.get('amount','')}".encode())
+        else:
+            h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
     return h.hexdigest()[:32]
 
 
@@ -115,16 +133,30 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] Shutdown at TX {idx}")
             break
 
-        dst = tx["dst"]
-        amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
         src_index = tx.get("src_index", 0)
+        # Multi-destination (fan-out: one input -> many outputs) or single
+        # (DAG hop). transfer_split takes a destinations list either way.
+        if tx.get("destinations"):
+            dests = [
+                {"amount": int(Decimal(str(d["amount"])) * Decimal(10 ** 12)),
+                 "address": d["address"]}
+                for d in tx["destinations"]
+            ]
+            mani_dst = f"{len(dests)}_dests"
+            mani_amt = str(sum(Decimal(str(d["amount"])) for d in tx["destinations"]))
+            desc = f"{len(dests)} dests, {mani_amt} XMR total"
+        else:
+            dests = [{"amount": int(Decimal(tx["amt"]) * Decimal(10 ** 12)),
+                      "address": tx["dst"]}]
+            mani_dst = scrub_address(tx["dst"])
+            mani_amt = tx["amt"]
+            desc = f"{tx['amt']} XMR -> {scrub_address(tx['dst'])}"
 
-        print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: "
-              f"{tx['amt']} XMR -> {scrub_address(dst)}...")
+        print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: {desc}...")
 
         try:
             result = rpc.raw_request("transfer_split", {
-                "destinations": [{"amount": amt_atomic, "address": dst}],
+                "destinations": dests,
                 "account_index": acct_idx,
                 "subaddr_indices": [src_index],
                 "priority": args.fee_priority,
@@ -153,8 +185,8 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "idx": idx,
                 "file": str(tx_file),
                 "hash": sha,
-                "dst": scrub_address(dst),
-                "amt": tx["amt"],
+                "dst": mani_dst,
+                "amt": mani_amt,
                 "delay": tx.get("delay", 0),
             })
             created += 1
