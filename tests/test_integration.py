@@ -440,6 +440,103 @@ try:
 finally:
     os.environ.pop("GS_WALLET_PASSWORD", None)
 
+# ===========================================================================
+# E. The MANIFEST is the create->sign trust boundary. Hardening the plan
+#    fingerprint is worthless if the check using it can be skipped, or if the
+#    manifest's own fields are used as filesystem paths unchecked.
+# ===========================================================================
+_E_dir = Path(os.getcwd()) / "stageE"
+(_E_dir).mkdir(exist_ok=True)
+_E_unsigned = _E_dir / "tx_0.unsigned"
+_E_unsigned.write_text("00")
+_E_wallet = Path(os.getcwd()) / "walletE.bin"; _E_wallet.write_bytes(b"w")
+_E_PLAN = [{"src": "A", "src_index": 0, "dst": "B", "amt": "0.1", "delay": 0}]
+_E_OTHER = [{"src": "A", "src_index": 9, "dst": "ATTACKER", "amt": "99"}]
+_E_HASH = hashlib.sha256(b"00").hexdigest()
+_E_FP = airgap._compute_plan_fingerprint(_E_PLAN)
+
+
+def _entry(**kw):
+    base = {"idx": 0, "file": str(_E_unsigned), "hash": _E_HASH,
+            "dst": "B", "amt": "0.1", "delay": 0}
+    base.update(kw)
+    return base
+
+
+def _run_sign(manifest, plan=None):
+    """Drive the REAL phase_sign with a given manifest; return 'SIGNED' or the
+    refusal reason."""
+    (_E_dir / "unsigned_manifest.json").write_text(json.dumps(manifest))
+    real = airgap.subprocess.run
+    try:
+        airgap.subprocess.run = lambda cmd, **kw: (
+            Path(kw["cwd"], "signed_monero_tx").write_bytes(b"sig"),
+            types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1]
+        a = types.SimpleNamespace(outdir=str(_E_dir), wallet_cli="x",
+                                  wallet_file=str(_E_wallet), wallet_password="")
+        airgap.phase_sign(a, plan or _E_PLAN)
+        return "SIGNED"
+    except SystemExit as e:
+        return "REFUSED:" + str(e)
+    finally:
+        airgap.subprocess.run = real
+
+
+check("E: a valid manifest still signs normally",
+      _run_sign({"plan_fingerprint": _E_FP, "entries": [_entry()]}) == "SIGNED")
+
+# The fingerprint must be MANDATORY. The old guard was `if saved_fp and ...`,
+# so deleting one JSON field disabled the only thing tying the manifest to the
+# plan -- a different plan (paying ATTACKER 99) then signed against an honest
+# manifest.
+for label, mani in [
+    ("missing", {"entries": [_entry()]}),
+    ("empty string", {"plan_fingerprint": "", "entries": [_entry()]}),
+    ("null", {"plan_fingerprint": None, "entries": [_entry()]}),
+    ("wrong type", {"plan_fingerprint": 12345, "entries": [_entry()]}),
+]:
+    check(f"E: fingerprint {label} -> REFUSED (check cannot be skipped)",
+          _run_sign(mani).startswith("REFUSED"))
+
+check("E: valid fingerprint but a DIFFERENT plan -> REFUSED",
+      _run_sign({"plan_fingerprint": _E_FP, "entries": [_entry()]},
+                _E_OTHER).startswith("REFUSED"))
+
+# Manifest fields are used as filesystem paths, so they need validating.
+# These must be refused BY VALIDATION, not incidentally. Asserting only
+# "REFUSED" was too weak: with validation removed, a traversing idx still
+# errored (the write target does not exist) and an outside-the-dir file still
+# failed its hash check, so both reached the partial-sign abort and the test
+# passed for the WRONG REASON. Assert the specific validator message so the
+# check actually distinguishes rejection from accidental breakage.
+def _refused_by_validator(manifest, needle):
+    out = _run_sign(manifest)
+    return out.startswith("REFUSED") and needle in out
+
+
+check("E: idx path-traversal ('../../EVIL') rejected BY THE VALIDATOR -- it is "
+      "interpolated into the output filename and escapes the staging dir",
+      _refused_by_validator({"plan_fingerprint": _E_FP,
+                             "entries": [_entry(idx="../../EVIL")]},
+                            "'idx' must be a non-negative int"))
+check("E: negative idx rejected by the validator",
+      _refused_by_validator({"plan_fingerprint": _E_FP,
+                             "entries": [_entry(idx=-1)]},
+                            "'idx' must be a non-negative int"))
+check("E: duplicate idx rejected by the validator (would silently discard one "
+      "signed tx)",
+      _refused_by_validator({"plan_fingerprint": _E_FP,
+                             "entries": [_entry(), _entry()]},
+                            "duplicate idx"))
+check("E: unsigned file OUTSIDE the staging dir rejected by the validator",
+      _refused_by_validator({"plan_fingerprint": _E_FP,
+                             "entries": [_entry(file="/etc/passwd")]},
+                            "outside the staging dir"))
+check("E: malformed hash length rejected by the validator",
+      _refused_by_validator({"plan_fingerprint": _E_FP,
+                             "entries": [_entry(hash="abc")]},
+                            "64-char sha256"))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

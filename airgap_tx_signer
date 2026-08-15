@@ -186,6 +186,64 @@ def _compute_plan_fingerprint(plan: List[dict]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
+def _validate_manifest_entries(entries: List[dict], outdir: Path) -> None:
+    """Validate the manifest's own fields before they are used as filesystem
+    paths. The manifest is the create->sign TRUST BOUNDARY, and its contents
+    were being used unchecked:
+
+      * entry["idx"] is interpolated into the OUTPUT filename
+        (signed_dir / f"tx_{idx}.signed"). A non-integer idx such as
+        "../../../tmp/EVIL" escapes signed_dir entirely -- verified to resolve
+        outside it -- giving a tampered or corrupted manifest a
+        write-where-I-want primitive.
+      * entry["file"] is an arbitrary path read from disk. It must stay inside
+        the staging dir; a stale manifest from another run (or a crafted one)
+        would otherwise make the signer read and sign content from anywhere on
+        the filesystem.
+
+    A legitimate manifest always satisfies both -- phase_create writes idx from
+    enumerate() and file as outdir/tx_N.unsigned -- so this only rejects
+    manifests that were tampered with, corrupted, or carried over from a
+    different run.
+    """
+    try:
+        outdir_res = outdir.resolve()
+    except OSError:
+        sys.exit(f"[!] Cannot resolve output dir {outdir}")
+
+    seen_idx = set()
+    for n, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            sys.exit(f"[!] Manifest entry {n} is not an object")
+
+        idx = entry.get("idx")
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+            sys.exit(f"[!] Manifest entry {n}: 'idx' must be a non-negative int, "
+                     f"got {idx!r}. A non-integer idx is interpolated into the "
+                     f"output filename and can escape the staging directory.")
+        if idx in seen_idx:
+            sys.exit(f"[!] Manifest entry {n}: duplicate idx {idx} -- two entries "
+                     f"would write the same tx_{idx}.signed, silently discarding one.")
+        seen_idx.add(idx)
+
+        raw = entry.get("file")
+        if not isinstance(raw, str) or not raw:
+            sys.exit(f"[!] Manifest entry {n}: 'file' missing or not a string")
+        try:
+            fres = Path(raw).resolve()
+        except OSError:
+            sys.exit(f"[!] Manifest entry {n}: unresolvable path {raw!r}")
+        if fres != outdir_res and outdir_res not in fres.parents:
+            sys.exit(f"[!] Manifest entry {n}: '{raw}' is outside the staging dir "
+                     f"{outdir_res}. Refusing to sign content from an unexpected "
+                     f"location -- regenerate the manifest with --phase create.")
+
+        h = entry.get("hash")
+        if not isinstance(h, str) or len(h) != 64:
+            sys.exit(f"[!] Manifest entry {n}: 'hash' must be a 64-char sha256 hex "
+                     f"digest, got {h!r}")
+
+
 def phase_create(args, plan: List[dict], meta: dict = None):
     """PHASE 1: Create unsigned TXs via monero-wallet-rpc.
 
@@ -346,14 +404,38 @@ def phase_sign(args, plan: List[dict]):
     with open(manifest_path) as f:
         manifest_data = json.load(f)
 
-    saved_fp = manifest_data.get("plan_fingerprint", "")
+    # The fingerprint is MANDATORY. The old guard was
+    #     if saved_fp and saved_fp != current_fp:
+    # so a manifest with the field missing, empty, or null skipped the check
+    # ENTIRELY -- deleting one JSON field disabled the only thing tying this
+    # manifest to the plan being signed, and the signer would happily sign a
+    # completely different plan (verified: a plan paying a different address a
+    # different amount was signed against an honest manifest). Hardening the
+    # hash while the gate using it stayed optional was no protection at all.
+    saved_fp = manifest_data.get("plan_fingerprint")
+    if not isinstance(saved_fp, str) or not saved_fp:
+        integrity_log("signer", "manifest_missing_fingerprint")
+        sys.exit(
+            "[!] Manifest has no usable 'plan_fingerprint'. Refusing to sign:\n"
+            "    nothing would tie this manifest to the plan you passed, so a\n"
+            "    swapped or truncated manifest could not be detected.\n"
+            "    Re-run --phase create to regenerate it."
+        )
     current_fp = _compute_plan_fingerprint(plan)
-    if saved_fp and saved_fp != current_fp:
-        sys.exit("[!] Plan fingerprint mismatch: manifest is from a different plan!")
+    if saved_fp != current_fp:
+        integrity_log("signer", "plan_fingerprint_mismatch")
+        sys.exit(
+            f"[!] Plan fingerprint mismatch: this manifest belongs to a DIFFERENT\n"
+            f"    plan than the one passed on the command line.\n"
+            f"    manifest={saved_fp}  plan={current_fp}\n"
+            f"    (A manifest written by an older build also mismatches -- the\n"
+            f"     covered fields changed. Re-run --phase create.)"
+        )
 
     entries = manifest_data.get("entries", [])
     if not entries:
         sys.exit("[!] No unsigned TX entries in manifest")
+    _validate_manifest_entries(entries, outdir)
 
     wallet_file = args.wallet_file
     if not wallet_file or not Path(wallet_file).exists():
