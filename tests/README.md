@@ -1,0 +1,59 @@
+# Tests
+
+Executable tests for the pure-Python logic of the GhostSpiral toolchain. They
+load the real (extensionless) scripts as modules and exercise the actual
+functions — no reimplementations — with the Monero/Tor dependencies mocked.
+
+```
+python3 tests/test_units.py         # validation, fingerprint, fee parsing, helpers
+python3 tests/test_integration.py   # real phase_create + real broadcast.main()
+python3 tests/test_realfns.py       # real fetch_prices + real wipe_gs_artifacts
+```
+
+Only `requests` and `tenacity` are needed (both already required). The heavy
+deps (`monero`, `stem`, `psutil`) are imported lazily inside functions these
+tests don't call, so the modules import fine without them.
+
+## What IS verified (by execution)
+
+- **Plan schema** — `_validate_plan` accepts both the single-destination (DAG
+  hop) and multi-destination (fan-out) TX shapes and rejects malformed plans;
+  `_compute_plan_fingerprint` is deterministic, format-aware, and tamper-
+  sensitive; `_load_unsigned` handles dict and bare-list bundles.
+- **Fan-out contract** — `phase_create` (real, fake RPC) emits the fan-out as a
+  SINGLE `transfer_split` with N destinations and correct atomic amounts,
+  `subaddr_indices`, `account_index`, priority, and `do_not_relay`; DAG hops are
+  single-destination. This is the fix for the round-1 single-output abort.
+- **Broadcast resume/exit** — `broadcast.main()` (real, fake `_single_post`):
+  full success exits 0; a permanent failure exits nonzero; **resuming when the
+  only unrelayed blob is permanently failed still exits nonzero** (the
+  false-success bug); a transient failure is NOT marked permanent and IS retried
+  on `--resume`; key-image rejections are classified permanent.
+- **Fee estimate** — `fetch_fee_from_daemon` prefers monerod's per-priority
+  `fees[]`, falls back to base×multiplier, then to the constant.
+- **Off-ramp rate** — `fetch_prices` Bisq fallback yields `xmr_usd = xmr_btc ×
+  btc_usd` (≈300), not the old inverted ≈0.
+- **Anti-forensics** — a real (non-dry) `wipe_gs_artifacts` does NOT recreate
+  `integrity_chain.log`; dry mode still logs.
+- **Misc** — `validate_proxy` (socks5h only), the integrity-log SHA-256 chain
+  verifies, `_is_localhost`, `_blob_sort_key`, null-safe route parsing.
+
+## What is NOT verified here (and cannot be without a live Monero stack)
+
+These tests prove the **wiring, contracts, and control flow**. They do NOT and
+cannot prove Monero-protocol acceptance, because the RPC is mocked:
+
+- That monero-wallet-rpc actually accepts a multi-destination `transfer_split`
+  from a single subaddress and returns a usable `unsigned_txset`.
+- That the RPC's hex `unsigned_txset` decodes to a binary file wallet-cli's
+  `sign_transfer` parses, and that its `signed_monero_tx` re-hexes to something
+  `submit_transfer` accepts. (The hex↔binary round-trip is reasoned from Monero
+  source, not observed.)
+- That the confirmation waits and the sender-arrival poll behave against a real,
+  syncing wallet — no real balance ever changed in these tests.
+- The exact error strings monerod/wallet-rpc return: the permanent-vs-transient
+  classification is heuristic and defaults to transient (fail-safe), but the
+  real phrasings are unconfirmed.
+
+Before trusting this toolchain with real funds, run it end-to-end on **testnet**
+with a real monerod + monero-wallet-rpc + monero-wallet-cli.

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Integration tests that drive the REAL phase_create and broadcast.main()
+with mocked RPC/Tor, so the actual code paths (multi-dest RPC contract, and the
+resume/exit logic where the false-success bug lived) truly execute."""
+import sys, os, tempfile, json, hashlib, types, importlib.util, importlib.machinery
+from decimal import Decimal
+from pathlib import Path
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace(".py", ""), os.path.join(REPO, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec); loader.exec_module(mod); return mod
+
+gs = load("gs_common.py"); airgap = load("airgap_tx_signer"); bcast = load("broadcast_signed_xmr")
+os.chdir(tempfile.mkdtemp(prefix="gs_itest_"))
+
+PASS = 0; FAIL = 0; FAILURES = []
+def check(name, cond):
+    global PASS, FAIL
+    if cond: PASS += 1
+    else: FAIL += 1; FAILURES.append(name); print(f"  FAIL: {name}")
+
+# ===========================================================================
+# A. phase_create multi-destination contract (REAL phase_create, fake RPC)
+# ===========================================================================
+class FakeRPC:
+    def __init__(self): self.calls = []
+    def raw_request(self, method, params):
+        self.calls.append((method, params))
+        return {"unsigned_txset": "deadbeef"}  # non-empty hex-ish
+
+airgap.verify_tor = lambda *a, **k: None
+fake = FakeRPC()
+airgap.connect_rpc = lambda *a, **k: fake
+
+plan = [
+    {"src": "ENTRY", "src_index": 7,
+     "destinations": [{"address": "M1", "amount": "0.3"},
+                      {"address": "M2", "amount": "0.3"},
+                      {"address": "M3", "amount": "0.3"}]},              # fan-out
+    {"src": "M1", "src_index": 11, "dst": "M2", "amt": "0.25"},          # dag hop
+]
+args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050",
+                             rpc="http://127.0.0.1:18083",
+                             outdir=os.path.join(os.getcwd(), "staging_A"),
+                             fee_priority=2)
+airgap.phase_create(args, plan, {"account_index": 5})
+
+check("phase_create: issued 2 transfer_split calls", len(fake.calls) == 2)
+fanout_params = fake.calls[0][1]
+check("phase_create: fan-out is ONE call with 3 destinations",
+      len(fanout_params["destinations"]) == 3)
+check("phase_create: fan-out atomic amounts correct",
+      [d["amount"] for d in fanout_params["destinations"]] == [300_000_000_000]*3)
+check("phase_create: fan-out subaddr_indices = [src_index]",
+      fanout_params["subaddr_indices"] == [7])
+check("phase_create: account_index from meta",
+      fanout_params["account_index"] == 5)
+check("phase_create: priority passed through",
+      fanout_params["priority"] == 2)
+check("phase_create: do_not_relay set",
+      fanout_params["do_not_relay"] is True)
+hop_params = fake.calls[1][1]
+check("phase_create: dag hop is single dest atomic",
+      hop_params["destinations"] == [{"amount": 250_000_000_000, "address": "M2"}])
+check("phase_create: dag hop subaddr_indices = [11]",
+      hop_params["subaddr_indices"] == [11])
+# manifest written with per-tx entries
+mani = json.loads((Path(args.outdir) / "unsigned_manifest.json").read_text())
+check("phase_create: manifest has 2 entries", len(mani["entries"]) == 2)
+check("phase_create: multi-dest manifest summarized as _dests",
+      mani["entries"][0]["dst"].endswith("_dests"))
+
+# ===========================================================================
+# B. broadcast resume/exit logic (REAL main(), fake _single_post + Tor)
+# ===========================================================================
+bcast.verify_tor = lambda *a, **k: None
+bcast.newnym = lambda *a, **k: True
+bcast.secure_delay = lambda *a, **k: None
+bcast.tor_recheck = lambda *a, **k: None
+
+def make_blobs(dirname, n):
+    d = Path(os.getcwd()) / dirname; d.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for i in range(n):
+        b = d / f"tx_{i}.signed"; data = f"BLOB{i}".encode()
+        b.write_bytes(data)
+        entries.append({"idx": i, "file": str(b),
+                        "hash": hashlib.sha256(data).hexdigest(),
+                        "dst": f"D{i}", "amt": "1", "delay": 0})
+    (d / "signed_manifest_v1.json").write_text(json.dumps(entries))
+    return d
+
+def run_broadcast(blob_dir, progfile, outcomes):
+    """outcomes: dict hex(blobbytes)->('ok'|'double'|'raise'). Returns exit code
+    (0 if main returned normally, else the SystemExit code)."""
+    def fake_post(url, payload, proxies=None):
+        h = payload["params"]["tx_data_hex"]
+        o = outcomes.get(h, "ok")
+        if o == "raise":
+            raise Exception("simulated transient node error")
+        if o == "double":
+            return {"error": {"message": "Failed to parse tx: double spend detected"}}
+        if o == "keyimage":
+            return {"error": {"message": "Rejected by daemon: key image already spent"}}
+        return {"result": {"tx_hash_list": ["a" * 64]}}
+    bcast._single_post = fake_post
+    sys.argv = ["broadcast_signed_xmr", str(blob_dir),
+                "--tor-proxy", "socks5h://127.0.0.1:9050",
+                "--rpc", "http://127.0.0.1:18083",
+                "--resume", str(progfile), "--rebroadcast", "2"]
+    try:
+        bcast.main(); return 0
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+
+def hx(dirp, i):
+    return (Path(dirp) / f"tx_{i}.signed").read_bytes().hex()
+
+# --- B1: all relay -> exit 0, both in 'relayed' ---
+d = make_blobs("bcast_B1", 2); prog = Path(os.getcwd()) / "progB1.json"
+code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
+p = json.loads(prog.read_text())
+check("B1: full success returns 0", code == 0)
+check("B1: both relayed", sorted(p["relayed"]) == [0, 1])
+check("B1: none failed_perm", p["failed_perm"] == [])
+
+# --- B2: one double-spend -> exit nonzero, idx1 permanent ---
+d = make_blobs("bcast_B2", 2); prog = Path(os.getcwd()) / "progB2.json"
+code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "double"})
+p = json.loads(prog.read_text())
+check("B2: permanent failure exits nonzero", code != 0)
+check("B2: idx0 relayed", p["relayed"] == [0])
+check("B2: idx1 failed_perm", p["failed_perm"] == [1])
+
+# --- B3: THE false-success test. Resume B2 (idx1 permanently failed) with the
+#         node now healthy. idx1 is skipped (permanent), NOT retried, and the
+#         run must STILL exit nonzero because not everything relayed. This is
+#         exactly the bug the reviewer found and I fixed. ---
+code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
+p = json.loads(prog.read_text())
+check("B3: resume of all-permanent-among-unrelayed still exits NONZERO", code != 0)
+check("B3: idx1 stays failed_perm (not retried into relayed)",
+      p["failed_perm"] == [1] and 1 not in p["relayed"])
+
+# --- B4: transient failure is retried on resume ---
+d = make_blobs("bcast_B4", 2); prog = Path(os.getcwd()) / "progB4.json"
+code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "raise"})
+p = json.loads(prog.read_text())
+check("B4: transient failure exits nonzero", code != 0)
+check("B4: transient NOT marked permanent", p["failed_perm"] == [] and p["relayed"] == [0])
+# resume with node healthy -> idx1 retried and relayed -> exit 0
+code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
+p = json.loads(prog.read_text())
+check("B4: resume retries transient and succeeds (exit 0)", code == 0)
+check("B4: both relayed after resume", sorted(p["relayed"]) == [0, 1])
+
+# --- B5: a key-image rejection (no literal 'double spend' phrase) must still
+#         be classified PERMANENT, not retried as transient. ---
+d = make_blobs("bcast_B5", 1); prog = Path(os.getcwd()) / "progB5.json"
+code = run_broadcast(d, prog, {hx(d, 0): "keyimage"})
+p = json.loads(prog.read_text())
+check("B5: key-image error exits nonzero", code != 0)
+check("B5: key-image classified permanent (failed_perm)", p["failed_perm"] == [0])
+check("B5: key-image not retried as transient", p["relayed"] == [])
+
+print(f"\nRESULT: {PASS} passed, {FAIL} failed")
+if FAILURES:
+    print("FAILED:", FAILURES); sys.exit(1)
+print("ALL GREEN")

@@ -408,7 +408,16 @@ def main():
                 emsg = str(err.get("message", "") or res)[:160]
                 emsg_l = emsg.lower()
                 print(f"  Node: {emsg[:80]}")
-                if "double" in emsg_l and "spend" in emsg_l:
+                # Classification is heuristic: submit_transfer returns free-text
+                # error messages, not stable codes, so we can only pattern-match.
+                # ONLY clearly-permanent conditions are marked permanent; every
+                # other error defaults to transient (retried on --resume). That
+                # default is fail-safe -- a misread permanent error just wastes
+                # retries and keeps the exit nonzero, never a false success or a
+                # stranded-but-marked-done TX.
+                is_double = (("double" in emsg_l and "spend" in emsg_l)
+                             or "key image" in emsg_l or "already spent" in emsg_l)
+                if is_double:
                     outcome = "double_spend"
                     integrity_log("broadcast", f"DOUBLE_SPEND:idx={real_idx}")
                     print(f"  [!] TX {real_idx} flagged as double-spend! Skipping.")
