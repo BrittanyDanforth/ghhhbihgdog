@@ -47,10 +47,19 @@ my earlier stdin fix was WRONG:
   for empty AND non-empty passwords (passes the password stage; a wrong first
   line is still rejected).
 
-Also confirmed real: `--password ""` opens the wallet without a hang, and
-wallet-cli `--command` **exits 0 even when signing fails** — so `phase_sign` is
-right to check for the `signed_monero_tx` output file rather than the return
-code, and `--command` ignores stdin lines left over after the command finishes.
+Also confirmed real: `--password ""` opens the wallet without a hang; wallet-cli
+`--command` **exits 0 even when signing fails** — so `phase_sign` is right to
+check for the `signed_monero_tx` output file rather than the return code;
+`--command` ignores stdin lines left over after the command finishes; and the
+pipeline's exact invocation (NO `--offline`, no daemon running — the airgapped
+case) reaches the sign stage in ~4s WITHOUT hanging on a daemon connection.
+
+Caveat — what the sign test did NOT reach: the unsigned blob was invalid
+garbage, so it fails at file-load BEFORE the "Is this okay? (Y/Yes/No)" prompt.
+So the password stage and "reaches signing" are verified; the Y/N confirmation
+itself and a successful `signed_monero_tx` were never observed (they need a
+valid unsigned tx, i.e. funds). The trailing `y\n`*3 is a best-effort cover for
+that unobserved prompt.
 
 ## NOT verified — the funded end-to-end round-trip
 
