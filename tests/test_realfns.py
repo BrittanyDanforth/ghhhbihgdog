@@ -216,6 +216,55 @@ try:
 finally:
     os.umask(_old_umask)
 
+# ---------------------------------------------------------------------------
+# Core dumps must be forbidden. A core file is process memory written to DISK,
+# and these processes hold the wallet password in memory. Started from an
+# explicitly UNLIMITED limit so the check cannot pass just because the host
+# happened to already have dumps off (which would be a vacuous pass).
+# ---------------------------------------------------------------------------
+# Run in SUBPROCESSES: disable_core_dumps sets the HARD limit to 0 as well,
+# which a process can never raise again (that irreversibility is the point --
+# nothing later in the run can re-enable dumps). So each scenario needs a fresh
+# process, and each first RAISES the limit to unlimited so a pass cannot be
+# vacuous on a host that already had dumps off.
+import subprocess as _sp
+
+_CORE_PROBE = r'''
+import resource, sys, importlib.machinery, importlib.util
+def load(n):
+    l = importlib.machinery.SourceFileLoader(n.replace(".py",""), sys.argv[1] + "/" + n)
+    s = importlib.util.spec_from_loader(l.name, l)
+    m = importlib.util.module_from_spec(s); l.exec_module(m); return m
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY,)*2)
+except (ValueError, OSError):
+    print("CANNOT_RAISE"); raise SystemExit(0)
+before = resource.getrlimit(resource.RLIMIT_CORE)[0]
+gs = load("gs_common.py")
+getattr(gs, sys.argv[2])()
+after = resource.getrlimit(resource.RLIMIT_CORE)
+print("BEFORE=%s SOFT=%s HARD=%s" % (before, after[0], after[1]))
+'''
+
+
+def _core_probe(fn_name):
+    r = _sp.run([sys.executable, "-c", _CORE_PROBE, REPO, fn_name],
+                capture_output=True, text=True, timeout=60, cwd=os.getcwd())
+    return r.stdout.strip()
+
+
+for _fn, _label in [("disable_core_dumps", "disable_core_dumps()"),
+                    ("install_signal_handlers", "install_signal_handlers() (startup hook)")]:
+    _out = _core_probe(_fn)
+    if "CANNOT_RAISE" in _out:
+        print(f"  (skipped core-dump check for {_label}: host forbids raising RLIMIT_CORE)")
+        continue
+    check(f"core dumps: precondition - was unlimited before {_label}",
+          "BEFORE=-1" in _out)
+    check(f"core dumps: {_label} sets soft limit to 0", "SOFT=0" in _out)
+    check(f"core dumps: {_label} also drops the HARD limit "
+          "(cannot be re-enabled later)", "HARD=0" in _out)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

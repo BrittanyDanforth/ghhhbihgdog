@@ -40,6 +40,13 @@ exitplan_*.json
 unsigned_monero_tx
 signed_monero_tx
 gs_sign_*/
+# Monero's own logs. Clean at the default level, but monero-wallet-cli.log
+# carries the full wallet address at --log-level 2, and monerod's log is
+# created world-readable (0644).
+monero-wallet-cli.log
+monero-wallet-rpc.log
+monerod.log
+bitmonero.log
 unsigned/
 signed_blobs/
 tx_staging/

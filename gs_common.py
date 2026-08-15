@@ -456,10 +456,35 @@ def _shutdown_handler(signum, frame):
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
 
+def disable_core_dumps() -> bool:
+    """Forbid this process from writing a core file. Returns True if enforced.
+
+    A core dump is a copy of process memory written to DISK. These processes
+    hold the wallet password (and, in the wallet-rpc client path, key material)
+    in memory, so a crash on a machine with the common `ulimit -c unlimited`
+    default would persist that secret to a file nothing here ever wipes.
+    Setting RLIMIT_CORE to 0 is the standard prevention and costs nothing.
+
+    Note this only binds THIS process and children it spawns -- it cannot
+    constrain a separately-launched monerod/monero-wallet-rpc.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    except (ImportError, ValueError, OSError):
+        return False
+
+
 def install_signal_handlers():
-    """Install handlers for SIGINT and SIGTERM for graceful shutdown."""
+    """Install handlers for SIGINT and SIGTERM, and forbid core dumps.
+
+    Core-dump suppression lives here because every script calls this at
+    startup, so it is the one hook that reliably covers them all.
+    """
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
+    disable_core_dumps()
 
 
 def shutdown_requested() -> bool:

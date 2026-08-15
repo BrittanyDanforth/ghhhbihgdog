@@ -291,6 +291,15 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # for a hard kill (SIGKILL) that runs no cleanup at all.
     "*.json.tmp", "*.tmp",
     "unsigned_monero_tx", "signed_monero_tx",
+    # Monero's OWN logs. This pipeline requires monerod + monero-wallet-rpc, so
+    # it causes these files even though it does not write them. At the default
+    # log level they were checked and carry no addresses/keys/txids -- but at
+    # --log-level 2 monero-wallet-cli.log contains the FULL wallet address
+    # (verified), which is a deanonymisation link for a mixing tool. monerod's
+    # log is also created world-readable (0644, verified) and we cannot change
+    # that from here; wiping it is what we can do.
+    "monero-wallet-cli.log", "monero-wallet-rpc.log",
+    "monerod.log", "bitmonero.log",
     "renamethis1",
 ]
 GS_ARTIFACT_DIR_PATTERNS = [
