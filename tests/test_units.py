@@ -309,11 +309,12 @@ check("exitsim: bisq eur != usd (proves not fabricated)",
 # ---------------------------------------------------------------------------
 airgap = load("airgap_tx_signer")
 
-def expect_signer_reject(name, plan):
+def expect_signer_reject(name, plan, phase="create"):
     try:
-        airgap._validate_plan(plan); check(f"src_index: {name} (should reject)", False)
+        airgap._validate_plan(plan, phase)
+        check(f"src_index[{phase}]: {name} (should reject)", False)
     except SystemExit:
-        check(f"src_index: {name} -> rejected", True)
+        check(f"src_index[{phase}]: {name} -> rejected", True)
 
 expect_signer_reject("missing src_index",
                      [{"src": "A", "dst": "B", "amt": "0.4"}])
@@ -337,6 +338,36 @@ try:
     check("src_index = 7 with fan-out accepted", True)
 except SystemExit:
     check("src_index = 7 with fan-out accepted", False)
+
+# PHASE-AWARE: only phase_create consumes src_index (it becomes subaddr_indices).
+# phase_sign signs already-built tx sets where the source is fixed, so requiring
+# it there rejected legitimate sign-only runs for no security benefit.
+try:
+    airgap._validate_plan([{"src": "A", "dst": "B", "amt": "0.4"}], "sign")
+    check("src_index[sign]: absent is ACCEPTED (phase_sign never reads it)", True)
+except SystemExit:
+    check("src_index[sign]: absent is ACCEPTED (phase_sign never reads it)", False)
+# but a present-yet-invalid value is still rejected, in either phase
+expect_signer_reject("present-but-invalid (-1)",
+                     [{"src": "A", "src_index": -1, "dst": "B", "amt": "0.4"}], "sign")
+
+# ---------------------------------------------------------------------------
+# The plan FINGERPRINT must cover src_index. It is the field that decides which
+# output is spent, so two plans differing only in it are NOT the same plan --
+# yet they used to hash identically, leaving the create->sign guard blind to a
+# swapped spend source.
+# ---------------------------------------------------------------------------
+_fp = airgap._compute_plan_fingerprint
+_p7 = [{"src": "A", "src_index": 7, "dst": "B", "amt": "0.4"}]
+_p0 = [{"src": "A", "src_index": 0, "dst": "B", "amt": "0.4"}]
+_pN = [{"src": "A", "dst": "B", "amt": "0.4"}]
+check("fingerprint: differing src_index -> DIFFERENT fingerprint", _fp(_p7) != _fp(_p0))
+check("fingerprint: explicit 0 distinguishable from absent", _fp(_p0) != _fp(_pN))
+check("fingerprint: still deterministic for an identical plan", _fp(_p7) == _fp(_p7))
+check("fingerprint: still sensitive to destination",
+      _fp(_p7) != _fp([{"src": "A", "src_index": 7, "dst": "OTHER", "amt": "0.4"}]))
+check("fingerprint: still sensitive to amount",
+      _fp(_p7) != _fp([{"src": "A", "src_index": 7, "dst": "B", "amt": "0.5"}]))
 
 # ---------------------------------------------------------------------------
 # ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;

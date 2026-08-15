@@ -41,20 +41,23 @@ from gs_common import (
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
 
-def _validate_plan(plan: List[dict]) -> None:
+def _validate_plan(plan: List[dict], phase: str = "create") -> None:
     """Validate each TX. A TX is either single-destination (dst+amt, used by DAG
     hops) or multi-destination (destinations[], used by the one fan-out TX that
     sends ENTRY's single input to many mix subaddresses at once).
 
-    src_index is REQUIRED and non-negative int. This is the actual per-TX spend
-    selector -- transfer_split gets it in subaddr_indices -- and phase_create
-    used to default a missing key to 0 via .get("src_index", 0), silently
-    spending from account 0 / subaddress 0 (the wallet's PRIMARY address, which
-    holds unrelated balance) instead of the mix subaddress the plan names.
-    Reachable only via the signer's standalone documented CLI on a hand-authored
-    plan (GhostSpiral itself always emits src_index), which is exactly the
-    input this validator exists to gate. Fail closed here so phase_create can
-    read the value without a default.
+    src_index handling is PHASE-AWARE, because only phase_create consumes it:
+      * create -- REQUIRED, non-negative int. This is the actual per-TX spend
+        selector (transfer_split receives it as subaddr_indices). phase_create
+        used to default a missing key to 0 via .get("src_index", 0), silently
+        spending from account 0 / subaddress 0 -- the wallet's PRIMARY address,
+        holding unrelated balance -- instead of the mix subaddress the plan
+        names. Fail closed so phase_create can read it without a default.
+      * sign -- type-checked IF PRESENT, but not required: phase_sign never
+        reads src_index (it signs the already-built unsigned tx sets, where the
+        source is fixed at creation time). An earlier version of this fix
+        required it in both phases, which rejected a legitimate sign-only run
+        on an older or hand-authored plan for no security benefit.
     """
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
@@ -62,10 +65,15 @@ def _validate_plan(plan: List[dict]) -> None:
         if not isinstance(tx.get("src"), str):
             sys.exit(f"[!] Schema error at TX {i}: 'src' missing or wrong type")
         si = tx.get("src_index")
-        if not isinstance(si, int) or isinstance(si, bool) or si < 0:
-            sys.exit(f"[!] Schema error at TX {i}: 'src_index' must be a non-negative int "
-                     f"(got {si!r}). Missing/negative would spend from the wallet's "
-                     f"primary address, not the mix subaddress this plan names.")
+        if phase == "create":
+            if not isinstance(si, int) or isinstance(si, bool) or si < 0:
+                sys.exit(
+                    f"[!] Schema error at TX {i}: 'src_index' must be a non-negative "
+                    f"int (got {si!r}). Missing/negative would spend from the wallet's "
+                    f"primary address, not the mix subaddress this plan names.")
+        elif si is not None and (not isinstance(si, int) or isinstance(si, bool) or si < 0):
+            sys.exit(f"[!] Schema error at TX {i}: 'src_index' present but invalid "
+                     f"({si!r}); expected a non-negative int.")
         dests = tx.get("destinations")
         if dests is not None:
             if not isinstance(dests, list) or not dests:
@@ -104,8 +112,25 @@ def _load_unsigned(path: Path) -> tuple:
 
 
 def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    """Identity of a plan, used to detect that phase_sign was handed a manifest
+    belonging to a DIFFERENT plan than the one on disk.
+
+    src_index is part of that identity. It was previously omitted, so two plans
+    that spend from entirely different subaddresses hashed identically and the
+    create->sign guard could not tell them apart -- the check was blind to the
+    single field that decides which output is spent. Destinations and amounts
+    alone do not identify a plan.
+
+    NOTE: including src_index changes the fingerprint for every plan, so a
+    manifest written by an older build will MISMATCH and abort at sign time.
+    That is the intended fail-closed direction: re-run phase create rather than
+    sign against a manifest this build cannot vouch for.
+    """
     h = hashlib.sha256()
     for tx in plan:
+        # "-" when absent so a missing key and an explicit 0 are distinguishable.
+        si = tx.get("src_index")
+        h.update(f"src_index={si if si is not None else '-'}|".encode())
         if tx.get("destinations"):
             for d in tx["destinations"]:
                 h.update(f"{d.get('address','')}:{d.get('amount','')}".encode())
@@ -520,7 +545,7 @@ def main():
         sys.exit(f"[!] File not found: {plan_path}")
 
     plan, meta = _load_unsigned(plan_path)
-    _validate_plan(plan)
+    _validate_plan(plan, args.phase)
 
     if args.phase == "create":
         phase_create(args, plan, meta)
