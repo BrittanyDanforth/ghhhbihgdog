@@ -243,6 +243,18 @@ def verify_tor(proxy: Dict[str, str]) -> None:
     """
     try:
         data = _verify_tor_once(proxy)
+    except requests.exceptions.InvalidSchema as e:
+        # Not a network problem: requests cannot speak SOCKS without PySocks,
+        # so EVERY socks5h:// request dies here. Reporting that as a "network
+        # error" sent operators debugging their Tor daemon when the actual fix
+        # is a missing dependency. Fail closed, but say what is really wrong.
+        integrity_log("tor", "verify_fail:socks_support_missing")
+        sys.exit(
+            f"[!] SOCKS support is missing, so nothing can be routed through Tor:\n"
+            f"    {str(e)[:80]}\n"
+            f"    Fix: pip install PySocks   (or: pip install -r requirements.txt)\n"
+            f"    Aborting rather than risk a clearnet connection."
+        )
     except requests.RequestException as e:
         integrity_log("tor", f"verify_fail:{str(e)[:40]}")
         sys.exit(f"[!] Cannot verify Tor (network error): {str(e)[:80]}. Aborting for safety.")
@@ -306,7 +318,11 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
-    if proxies is None:
+    # `not proxies`, NOT `is None`. requests treats proxies={} exactly like no
+    # proxy at all and connects DIRECTLY, so an empty dict slipped past an
+    # `is None` guard and produced a real clearnet request -- confirmed by
+    # observing one actually reach the target. Any falsy value must abort.
+    if not proxies:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
     r = requests.get(url, timeout=20, proxies=proxies)
     r.raise_for_status()
@@ -315,7 +331,7 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
-    if proxies is None:
+    if not proxies:      # proxies={} means DIRECT in requests -- see safe_get
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=25, proxies=proxies)
     r.raise_for_status()

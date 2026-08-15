@@ -48,7 +48,11 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """
     if _is_localhost(url):
         proxies = None  # never route loopback through Tor
-    elif proxies is None:
+    elif not proxies:
+        # `not proxies`, NOT `is None`: requests treats proxies={} as no proxy
+        # and connects DIRECTLY, so an empty dict used to pass this guard and
+        # relay a transaction over clearnet -- revealing to the receiving node
+        # that this IP submitted it. Any falsy value aborts.
         sys.exit("[!] _single_post to non-localhost without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies)
     r.raise_for_status()

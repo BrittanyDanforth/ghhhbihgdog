@@ -11,6 +11,8 @@ python3 tests/test_realfns.py       # real fetch_prices + real wipe_gs_artifacts
 python3 tests/test_cli_flags.py     # every script: --help, argparse validation,
                                      # required/mutually-exclusive/choice flags,
                                      # pre-network runtime checks
+python3 tests/test_ipleak.py        # IP-LEAK defences: proxy scheme, empty-dict
+                                     # egress guards, localhost spoofing, fail-closed
 python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
                                      # paranoia_mode wipes (OPSEC leak guard)
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
