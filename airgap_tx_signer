@@ -24,8 +24,6 @@ Usage:
       --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
       --outdir unsigned_txs
 
-  # Transfer unsigned_txs/ to air-gapped machine via USB
-
   # On offline machine (full wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase sign \
       --wallet-file /path/to/full_wallet --outdir signed_txs
@@ -297,7 +295,7 @@ def phase_sign(args, plan: List[dict]):
 
     integrity_log("signer", f"sign_done:{signed_count}_signed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
-    print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
+    print(f"  [+] Signed TXs ready in {signed_dir}/ for broadcast.")
 
 
 def main():
@@ -334,12 +332,6 @@ def main():
 
     plan, meta = _load_unsigned(plan_path)
     _validate_plan(plan)
-
-    if meta.get("mock"):
-        sys.exit(
-            "[!] This plan was generated with MOCK balance (no real funds).\n"
-            "    It CANNOT be signed or broadcast. Create a real plan first."
-        )
 
     if args.phase == "create":
         phase_create(args, plan, meta)

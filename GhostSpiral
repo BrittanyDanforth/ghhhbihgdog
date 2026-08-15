@@ -11,7 +11,7 @@ End-to-end pipeline:
   Stage 2: ThorChain BTC->XMR swap
   Stage 3: Build wallets & DAG mixing graph
   Stage 4: Build unsigned TX plan with fee-aware amounts
-  Stage 5: Auto-sign + broadcast (or dump for cold/airgap)
+  Stage 5: Auto-sign + broadcast
 
 OPSEC hardening (v10.5):
   - All traffic forced through Tor with leak checks at every stage
@@ -97,10 +97,6 @@ def main():
                      help=f"Number of mix wallets (min {MIN_WALLETS})")
     cli.add_argument("--deep", type=int, default=2,
                      help=f"Depth multiplier for DAG edges (min {MIN_DEEP})")
-    cli.add_argument("--airgap", action="store_true",
-                     help="Dump unsigned plan and stop (manual sign required)")
-    cli.add_argument("--cold", action="store_true",
-                     help="Dump unsigned plan for cold-wallet signing")
     cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
                      help="Primary monero-wallet-rpc endpoint")
     cli.add_argument("--rpc-alt",
@@ -450,21 +446,12 @@ def main():
         print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
 
     bal = unlocked_bal
-    is_mock_plan = False
     if bal <= DUST_XMR:
-        if args.cold or args.airgap:
-            print("[!] Balance too low - producing dry-run plan with mock 10 XMR")
-            print("[!] DO NOT sign/broadcast this plan without real funds!")
-            bal = Decimal("10.0")
-            is_mock_plan = True
-            integrity_log("stage4", "mock_balance:dry_run_only")
-        else:
-            sys.exit(
-                f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
-                f"    Cannot create a real TX plan without funds.\n"
-                f"    Total balance: {total_bal} XMR (may be locked/unconfirmed).\n"
-                f"    Use --cold or --airgap for dry-run planning."
-            )
+        sys.exit(
+            f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
+            f"    Cannot create a real TX plan without funds.\n"
+            f"    Total balance: {total_bal} XMR (may be locked/unconfirmed)."
+        )
 
     rounds = args.wallets * 2 * args.deep
     per_round_fee = fee_xmr * Decimal("1.5")  # 1 TX/round + 50% safety margin for fee spikes
@@ -554,8 +541,6 @@ def main():
         "total_fees": str(total_fees),
         "account_index": bal_account,
     }
-    if is_mock_plan:
-        meta["mock"] = True
     unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)
@@ -564,17 +549,6 @@ def main():
     atomic_write_json(unsigned, ufile)
     integrity_log("stage4", "unsigned_dump_saved")
     print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
-
-    if args.cold or args.airgap:
-        mode = "cold" if args.cold else "airgap"
-        for stale in ["signer_progress.json", "broadcast_progress.json"]:
-            stale_path = Path(stale)
-            if stale_path.exists():
-                stale_path.unlink()
-                integrity_log("stage4", f"cleaned_stale:{stale}")
-        print(f"  [+] {mode.upper()} mode - transfer {ufile} to signer manually.")
-        integrity_log("stage4", f"{mode}_exit")
-        sys.exit(0)
 
     ###########################################################################
     # Stage 5 - Auto sign + broadcast

@@ -128,8 +128,7 @@ def main():
         sys.exit("[!] No blobs found to broadcast")
     integrity_log("broadcast", f"blobs_found:{len(blobs)}")
 
-    # Load per-TX delays. Primary source: signed manifest (travels with blobs
-    # on USB for air-gap workflow). Fallback: unsigned plan in ./unsigned/.
+    # Load per-TX delays. Primary source: signed manifest. Fallback: unsigned plan in ./unsigned/.
     tx_delays: dict = {}
     delay_source = "none"
 
