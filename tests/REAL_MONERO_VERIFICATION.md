@@ -29,6 +29,29 @@ proved and — honestly — what it could not.
   `fees[priority-1]` indexing matches the real array (priority 4 → `fees[3]` →
   240000000).
 
+## Bug found by actually running wallet-cli: sign_transfer stdin protocol
+
+Running real `monero-wallet-cli 0.18.3.1 --command sign_transfer` (no funds
+needed — a garbage `unsigned_monero_tx` still exercises the prompt path) proved
+my earlier stdin fix was WRONG:
+
+- `sign_transfer` reads the **wallet password from stdin FIRST** (a spend
+  re-confirmation, even with `--password` on the CLI), then the "Is this okay?
+  (Y/Yes/No)" confirmation.
+- Evidence: with an unsigned file present, `input="y\n"` → **"Error: invalid
+  password"** (the `y` was consumed as the password); `input="\n"` (empty
+  password) → got past it to "Failed to sign transaction".
+- So the old `input="y\n"*4` fed `"y"` as the password → **every real sign would
+  have failed with "invalid password"**, producing zero signed TXs. Fixed to
+  `input=f"{wallet_password}\n" + "y\n"*3`, and verified against real wallet-cli
+  for empty AND non-empty passwords (passes the password stage; a wrong first
+  line is still rejected).
+
+Also confirmed real: `--password ""` opens the wallet without a hang, and
+wallet-cli `--command` **exits 0 even when signing fails** — so `phase_sign` is
+right to check for the `signed_monero_tx` output file rather than the return
+code, and `--command` ignores stdin lines left over after the command finishes.
+
 ## NOT verified — the funded end-to-end round-trip
 
 The full flow (multi-dest `transfer_split` producing a real `unsigned_txset` →
