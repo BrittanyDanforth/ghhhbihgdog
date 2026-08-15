@@ -107,6 +107,34 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
     return FALLBACK_FEE_XMR * multiplier
 
 
+def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
+    """Best-effort parse of JoinMarket tumbler stdout for BTC amounts sent to
+    `dest`, returned as BTC Decimals (empty if nothing recognisable).
+
+    JoinMarket's tumbler/sendpayment reports the coins it moves either in BTC
+    ('... 0.12345678 BTC ...') or in satoshi ('sending 12345678 sats to <addr>').
+    We only trust lines that also reference `dest`, so unrelated amounts in the
+    log aren't picked up. FORMAT-DEPENDENT: validate against the JoinMarket
+    version in use -- the caller fails loudly if this returns nothing after a
+    tumble, rather than silently pretending JoinMarket contributed (the old
+    behaviour). Deduplicated, since a summary line may repeat a per-tx amount.
+    """
+    amounts: List[Decimal] = []
+    seen = set()
+    for line in stdout.splitlines():
+        if dest not in line:
+            continue
+        for m in re.findall(r"(\d+\.\d{1,8})\s*BTC", line, re.I):
+            v = Decimal(m)
+            if v > 0 and str(v) not in seen:
+                seen.add(str(v)); amounts.append(v)
+        for m in re.findall(r"(\d{4,})\s*sat", line, re.I):
+            v = (Decimal(m) / Decimal(10 ** 8))
+            if v > 0 and str(v) not in seen:
+                seen.add(str(v)); amounts.append(v)
+    return amounts
+
+
 def main():
     install_signal_handlers()
 
@@ -254,9 +282,25 @@ def main():
                 check=True, capture_output=True, text=True, timeout=3600,
             )
             integrity_log("stage1", "JM_tumble_OK")
-            # TODO: parse actual UTXO amounts from result.stdout
-            # For now return empty - operator must check JM output manually
-            return []
+            # Recover the BTC amounts the tumbler sent to btc_addr and hand them
+            # to Stage 2 as the chunks to swap. If the tumble ran but nothing is
+            # parseable, FAIL LOUDLY -- the old code returned [] here and the
+            # pipeline silently continued as though JoinMarket contributed
+            # nothing, which is worse than stopping.
+            amounts = parse_jm_amounts(result.stdout, btc_addr)
+            if amounts:
+                integrity_log("stage1", f"JM_parsed:{len(amounts)}_outputs")
+                print(f"  [+] JoinMarket sent {len(amounts)} output(s) totaling "
+                      f"{sum(amounts)} BTC to {scrub_address(btc_addr)}")
+                return amounts
+            integrity_log("stage1", "JM_parse_empty")
+            sys.exit(
+                "[!] JoinMarket tumble completed but no output amount could be\n"
+                "    parsed from its result. Refusing to continue as if the tumble\n"
+                "    fed nothing into the pipeline. Inspect tumble.py output; if the\n"
+                "    coins did move, re-run supplying the tumbled total via\n"
+                "    --btc-amount, or update parse_jm_amounts for your JM version."
+            )
         except subprocess.TimeoutExpired:
             integrity_log("stage1", "JM_timeout")
             sys.exit("[!] JoinMarket tumble timed out after 1 hour")

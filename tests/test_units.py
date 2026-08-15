@@ -148,6 +148,23 @@ check("daemon_fee_estimate: non-localhost + no proxy -> {}",
       gs.daemon_fee_estimate("http://1.2.3.4:18081", None) == {})
 
 # ---------------------------------------------------------------------------
+# GhostSpiral.parse_jm_amounts: real JoinMarket-output parser (de-stubbed)
+# ---------------------------------------------------------------------------
+DEST = "bc1qdestaddr000"
+check("jm: parse BTC amount on dest line",
+      ghost.parse_jm_amounts(f"Sending 0.50000000 BTC to {DEST} now", DEST) == [Decimal("0.50000000")])
+check("jm: parse satoshi amount on dest line",
+      ghost.parse_jm_amounts(f"sending 12345678 sats to {DEST}", DEST) == [Decimal("0.12345678")])
+check("jm: ignores lines without dest",
+      ghost.parse_jm_amounts("Sending 9.9 BTC to bc1qOTHER", DEST) == [])
+check("jm: empty when nothing parseable",
+      ghost.parse_jm_amounts(f"tumble complete for {DEST}", DEST) == [])
+check("jm: dedups repeated amount",
+      ghost.parse_jm_amounts(f"0.25 BTC to {DEST}\nsummary: 0.25 BTC to {DEST}", DEST) == [Decimal("0.25")])
+check("jm: multiple distinct outputs",
+      ghost.parse_jm_amounts(f"0.1 BTC to {DEST}\n0.2 BTC to {DEST}", DEST) == [Decimal("0.1"), Decimal("0.2")])
+
+# ---------------------------------------------------------------------------
 # gs_common misc: validate_proxy, scrub_address, secure_hex
 # ---------------------------------------------------------------------------
 check("validate_proxy: socks5h ok",

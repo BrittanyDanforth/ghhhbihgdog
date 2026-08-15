@@ -1,2 +1,4 @@
 *.pyc
 __pycache__/
+tests/dashboard_data.json
+tests/dashboard.html
