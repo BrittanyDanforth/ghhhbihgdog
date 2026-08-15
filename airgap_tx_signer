@@ -117,6 +117,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
         dst = tx["dst"]
         amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
+        src_index = tx.get("src_index", 0)
 
         print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: "
               f"{tx['amt']} XMR -> {scrub_address(dst)}...")
@@ -125,6 +126,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             result = rpc.raw_request("transfer_split", {
                 "destinations": [{"amount": amt_atomic, "address": dst}],
                 "account_index": acct_idx,
+                "subaddr_indices": [src_index],
                 "priority": args.fee_priority,
                 "get_tx_hex": False,
                 "do_not_relay": True,
@@ -249,9 +251,13 @@ def phase_sign(args, plan: List[dict]):
                 "--password", args.wallet_password or "",
                 "--command", "sign_transfer",
             ]
+            # sign_transfer always shows a blocking "Is this okay? (Y/Yes/No)"
+            # confirmation on stdin before it writes signed_monero_tx, even in
+            # --command (non-interactive) mode. Without answering it here, the
+            # subprocess just hangs until the timeout below on every TX.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=120, cwd=work_dir,
+                timeout=120, cwd=work_dir, input="y\n",
             )
 
             # sign_transfer creates signed_monero_tx in the working directory
@@ -293,6 +299,17 @@ def phase_sign(args, plan: List[dict]):
 
     integrity_log("signer", f"sign_done:{signed_count}_signed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
+    if signed_count < len(entries):
+        # A gap in the signed idx sequence (e.g. tx_2 missing) shifts every
+        # subsequent TX's position in the broadcast blob list, which makes
+        # broadcast_signed_xmr apply the WRONG planned per-TX delay to every
+        # TX after the gap -- silently defeating the anti-timing-correlation
+        # protection. Fail loudly here rather than let that happen quietly.
+        integrity_log("signer", f"partial_sign:{signed_count}_of_{len(entries)}")
+        sys.exit(
+            f"[!] Only {signed_count}/{len(entries)} TXs signed. Aborting rather than "
+            f"broadcast a gapped batch (would misalign per-TX timing delays)."
+        )
     print(f"  [+] Signed TXs ready in {signed_dir}/ for broadcast.")
 
 

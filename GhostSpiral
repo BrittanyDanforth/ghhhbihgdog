@@ -49,24 +49,33 @@ NUM_DECOYS = 4
 # Updated periodically; safe to overshoot slightly (operator keeps the change).
 FALLBACK_FEE_XMR = Decimal("0.00005")
 
+# Must match the multiplier table documented in --fee-priority's help text
+# (1=default, 2=x4, 3=x20, 4=x166) and forwarded verbatim to monero-wallet-rpc's
+# transfer_split 'priority' param in Stage 5a. The budget math below has to use
+# the SAME multiplier the RPC will actually charge, or a high --fee-priority
+# run overspends its fee reservation and aborts mid-batch in Stage 5a.
+PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
 
-def fetch_fee_from_rpc(rpc) -> Decimal:
+
+def fetch_fee_from_rpc(rpc, fee_priority: int = 1) -> Decimal:
     """Ask monero-wallet-rpc for current fee estimate (the only reliable source).
-    Returns fee per TX in XMR, assuming ~2kB typical TX weight at default priority."""
+    Returns fee per TX in XMR, assuming ~2kB typical TX weight at the given
+    fee_priority (must match the priority passed to transfer_split later)."""
+    multiplier = Decimal(PRIORITY_FEE_MULTIPLIER.get(fee_priority, 1))
     try:
         resp = rpc.raw_request("get_fee_estimate", {})
         fee_per_byte = resp.get("fee", 0)
         if fee_per_byte > 0:
             # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
             fee_atomic = fee_per_byte * 2000
-            fee_xmr = Decimal(str(fee_atomic)) / Decimal(10 ** 12)
+            fee_xmr = (Decimal(str(fee_atomic)) / Decimal(10 ** 12)) * multiplier
             if fee_xmr > 0:
                 integrity_log("fee", "rpc_fee_estimate_ok")
                 return fee_xmr
     except Exception as e:
         integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
     integrity_log("fee", "using_fallback_fee")
-    return FALLBACK_FEE_XMR
+    return FALLBACK_FEE_XMR * multiplier
 
 
 def main():
@@ -111,12 +120,15 @@ def main():
                      help="Path to Monero wallet file for auto-mode signing")
     cli.add_argument("--wallet-password", default="",
                      help="Password for the wallet file (empty for no password)")
+    cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
+                     help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
     args = cli.parse_args()
 
     # ---- Determine mode ----
     receive_mode = bool(args.receive_wallet)
     receive_entry_addr = None
     receive_account_index = 0
+    receive_subaddress_index = 0
 
     if receive_mode:
         rw_path = Path(args.receive_wallet)
@@ -128,6 +140,7 @@ def main():
             sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
         receive_account_index = rw_data.get("account_index", 0)
+        receive_subaddress_index = rw_data.get("subaddress_index", 0)
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
         integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
@@ -176,7 +189,7 @@ def main():
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
     integrity_log("stage0", f"rpc_sync_ok:height={h1}")
 
-    fee_xmr = fetch_fee_from_rpc(rpc_primary)
+    fee_xmr = fetch_fee_from_rpc(rpc_primary, args.fee_priority)
     integrity_log("stage0", "fee_fetched")
 
     ###########################################################################
@@ -324,17 +337,29 @@ def main():
 
     sub_account = receive_account_index if receive_mode else 0
 
-    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> List[str]:
-        subs = []
-        for i in range(n):
-            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Mix_{i}")
-            subs.append(addr)
-        for d in range(decoys):
-            addr = rpc.new_subaddress(account_index=acct_idx, label=f"Decoy_{d}")
-            subs.append(addr)
-        return subs
+    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
+        """Returns (address_list, {address: subaddress_index}).
 
-    subs = create_subs(rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
+        Uses new_subaddress_indexed (not new_subaddress) so each address's
+        real subaddress index is known. transfer_split needs that index in
+        'subaddr_indices' to actually restrict spending to the one
+        subaddress a plan TX names as 'src' -- without it, monero-wallet-rpc
+        pools funds from every subaddress in the account and the per-hop
+        mixing the DAG plan is built around never happens on-chain.
+        """
+        subs = []
+        addr_index = {}
+        for i in range(n):
+            addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Mix_{i}")
+            subs.append(addr)
+            addr_index[addr] = idx
+        for d in range(decoys):
+            addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Decoy_{d}")
+            subs.append(addr)
+            addr_index[addr] = idx
+        return subs, addr_index
+
+    subs, addr_index = create_subs(rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
     if len(subs) < MIN_WALLETS + 1:
         sys.exit("[!] Failed to create enough subaddresses")
 
@@ -343,6 +368,7 @@ def main():
         if ENTRY in subs:
             subs.remove(ENTRY)
         subs.insert(0, ENTRY)
+        addr_index[ENTRY] = receive_subaddress_index
         integrity_log("stage3", "entry_reused_from_receive_wallet")
         print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
     else:
@@ -465,15 +491,7 @@ def main():
             f"    Usable after fees: {usable} XMR"
         )
 
-    split_amt = usable / Decimal(rounds)
     integrity_log("stage4", "plan_calculated")
-
-    # Guard against rounding dust loss: sum of all TX amounts must not exceed usable
-    quantized_split = split_amt.quantize(Decimal("0.0001"))
-    total_planned = quantized_split * rounds
-    if total_planned > usable:
-        quantized_split -= Decimal("0.0001")
-        integrity_log("stage4", f"rounding_adj:new_split={quantized_split}")
 
     plan = []
 
@@ -496,6 +514,7 @@ def main():
             break
         plan.append({
             "src": ENTRY,
+            "src_index": addr_index.get(ENTRY, 0),
             "dst": mix_targets[fi],
             "amt": str(fanout_amt),
             "delay": _secrets.randbelow(540) + 180,
@@ -505,30 +524,41 @@ def main():
 
     # Phase B: DAG mixing — random hops between mix subaddresses.
     # Recalculate per-round amount from the remaining balance after fan-out.
-    remaining_after_fanout = usable - (fanout_amt * fanout_count) - (per_round_fee * fanout_count)
+    # NOTE: 'usable' already reserves per_round_fee for every planned round
+    # (fanout_count + dag_rounds, via total_fees above) -- do NOT subtract
+    # per_round_fee*fanout_count again here, that would double-charge the
+    # fanout TXs' fees and shrink the DAG mixing budget more than intended.
+    remaining_after_fanout = usable - (fanout_amt * fanout_count)
     dag_rounds = max(rounds - fanout_count, args.wallets)
     if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
         dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
         if dag_split <= DUST_XMR:
-            dag_split = DUST_XMR
-        for r in range(dag_rounds):
-            if shutdown_requested():
-                integrity_log("stage4", f"shutdown_at_round_{r}")
-                break
-            src_idx = _secrets.randbelow(len(mix_targets))
-            s = mix_targets[src_idx]
-            dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
-            if not dst_candidates:
-                continue
-            dst_idx = _secrets.randbelow(len(dst_candidates))
-            d = dst_candidates[dst_idx]
-            plan.append({
-                "src": s,
-                "dst": d,
-                "amt": str(dag_split),
-                "delay": _secrets.randbelow(540) + 180,
-                "extra": secure_hex(16),
-            })
+            # Splitting the remainder across dag_rounds would round to (near)
+            # zero per TX. Do NOT force dag_split up to DUST_XMR here: that
+            # would make dag_split * dag_rounds exceed remaining_after_fanout,
+            # planning to spend more than is actually budgeted. Skip DAG
+            # mixing instead -- the fan-out phase above still ran.
+            integrity_log("stage4", "dag_mixing_skipped:split_below_dust")
+        else:
+            for r in range(dag_rounds):
+                if shutdown_requested():
+                    integrity_log("stage4", f"shutdown_at_round_{r}")
+                    break
+                src_pos = _secrets.randbelow(len(mix_targets))
+                s = mix_targets[src_pos]
+                dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+                if not dst_candidates:
+                    continue
+                dst_pos = _secrets.randbelow(len(dst_candidates))
+                d = dst_candidates[dst_pos]
+                plan.append({
+                    "src": s,
+                    "src_index": addr_index.get(s, 0),
+                    "dst": d,
+                    "amt": str(dag_split),
+                    "delay": _secrets.randbelow(540) + 180,
+                    "extra": secure_hex(16),
+                })
     else:
         integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
 
@@ -597,7 +627,7 @@ def main():
     staging_dir = "tx_staging"
 
     try:  # ensures lock file is cleaned even on error
-        _stage5_run(args, ufile, staging_dir, proxy, bal)
+        _stage5_run(args, ufile, staging_dir, proxy, usable)
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -605,7 +635,7 @@ def main():
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
-def _stage5_run(args, ufile, staging_dir, proxy, bal):
+def _stage5_run(args, ufile, staging_dir, proxy, spendable_amount):
     """Execute the create -> sign -> broadcast -> exit sim pipeline."""
     try:
         print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
@@ -671,7 +701,8 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
         print("  [*] Stage 5c: Broadcasting signed TXs...")
         subprocess.run(
             ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
-             "--tor-proxy", args.tor_proxy],
+             "--tor-proxy", args.tor_proxy,
+             "--rpc", args.rpc_daemon],
             check=True, timeout=7200,
         )
         integrity_log("stage5", "broadcast_ok")
@@ -688,7 +719,7 @@ def _stage5_run(args, ufile, staging_dir, proxy, bal):
     try:
         print("  [*] Stage 5d: Exit strategy simulation...")
         subprocess.run(
-            ["python3", "exit_strategy_simulator", str(bal),
+            ["python3", "exit_strategy_simulator", str(spendable_amount),
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
         )

@@ -140,12 +140,26 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 #  Tor verification
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20))
-def verify_tor(proxy: Dict[str, str]) -> None:
-    """Verify we are exiting through Tor. Aborts on failure."""
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20), reraise=True)
+def _verify_tor_once(proxy: Dict[str, str]) -> dict:
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy)
     r.raise_for_status()
-    data = r.json()
+    return r.json()
+
+
+def verify_tor(proxy: Dict[str, str]) -> None:
+    """Verify we are exiting through Tor. Aborts on failure.
+
+    Network errors are retried up to 4x by _verify_tor_once; reraise=True
+    ensures the real requests exception (not an opaque tenacity RetryError)
+    reaches this try/except once retries are exhausted, so the operator
+    gets the same clear abort message as every other Tor-failure path.
+    """
+    try:
+        data = _verify_tor_once(proxy)
+    except requests.RequestException as e:
+        integrity_log("tor", f"verify_fail:{str(e)[:40]}")
+        sys.exit(f"[!] Cannot verify Tor (network error): {str(e)[:80]}. Aborting for safety.")
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
         sys.exit("[!] Tor leak detected - traffic NOT exiting via Tor. Aborting.")
@@ -204,7 +218,7 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 #  Retry-wrapped HTTP
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     if proxies is None:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
@@ -213,7 +227,7 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     return r.json()
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30))
+@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
     if proxies is None:
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")

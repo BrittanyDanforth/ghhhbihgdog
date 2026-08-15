@@ -41,6 +41,21 @@ MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
 
+def _blob_sort_key(p: Path) -> int:
+    """Extract the TX's real manifest index from tx_N.signed's filename.
+
+    Used both to sort a directory of blobs numerically AND to look up each
+    TX's planned per-TX delay -- the delay must be keyed on this real index,
+    not on a blob's position in the (possibly gapped) broadcast list.
+    """
+    stem = p.stem  # e.g. "tx_15"
+    parts = stem.split("_")
+    try:
+        return int(parts[-1])
+    except (ValueError, IndexError):
+        return 999999
+
+
 def main():
     install_signal_handlers()
 
@@ -90,6 +105,8 @@ def main():
 
     # Gather blobs FIRST (input_path must be defined before delay loading uses it)
     blobs: List[Path] = []
+    tx_delays: dict = {}
+    delay_source = "none"
     input_path = Path(args.path)
     if args.path.endswith(".json"):
         manifest_dir = input_path.parent
@@ -97,29 +114,41 @@ def main():
             entries = json.load(f)
         if isinstance(entries, dict) and "manifest" in entries:
             entries = entries["manifest"]
+        tampered = []
         for e in entries:
             raw_path = Path(e["file"]) if isinstance(e, dict) else Path(e)
             if raw_path.exists():
-                blobs.append(raw_path)
+                resolved = raw_path
             else:
                 # Try resolving by filename in the manifest's directory
                 local = manifest_dir / raw_path.name
-                if local.exists():
-                    blobs.append(local)
-                else:
-                    print(f"  [!] Blob not found: {raw_path} (also tried {local})")
-                    integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
+                resolved = local if local.exists() else None
+            if resolved is None:
+                print(f"  [!] Blob not found: {raw_path} (also tried {manifest_dir / raw_path.name})")
+                integrity_log("broadcast", f"missing_manifest_blob:{raw_path.name}")
+                continue
+            if isinstance(e, dict) and "hash" in e:
+                # The path form (a single .signed file or a bare directory
+                # glob) has no manifest to check against, but this .json
+                # form IS the manifest -- always verify the hash it carries,
+                # the same as directory mode does below.
+                actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+                if actual != e["hash"]:
+                    tampered.append(resolved.name)
+                    continue
+            if isinstance(e, dict) and "delay" in e and "idx" in e:
+                tx_delays[int(e["idx"])] = int(e["delay"])
+            blobs.append(resolved)
+        if tampered:
+            integrity_log("broadcast", f"TAMPER_DETECTED:{len(tampered)}_blobs")
+            for t in tampered:
+                print(f"  [!] TAMPERED: {t}")
+            sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
+        if tx_delays:
+            delay_source = "manifest_direct"
     elif input_path.is_dir():
         # Look for both .signed (new format) and .blob (legacy) files
         raw_blobs = list(input_path.glob("*.signed")) or list(input_path.glob("*.blob"))
-        def _blob_sort_key(p: Path) -> int:
-            """Extract numeric index from tx_N.signed for correct numeric sort."""
-            stem = p.stem  # e.g. "tx_15"
-            parts = stem.split("_")
-            try:
-                return int(parts[-1])
-            except (ValueError, IndexError):
-                return 999999
         blobs = sorted(raw_blobs, key=_blob_sort_key)
     elif input_path.exists():
         blobs = [input_path]
@@ -129,12 +158,11 @@ def main():
     integrity_log("broadcast", f"blobs_found:{len(blobs)}")
 
     # Load per-TX delays. Primary source: signed manifest. Fallback: unsigned plan in ./unsigned/.
-    tx_delays: dict = {}
-    delay_source = "none"
+    # (In .json mode, delays were already loaded above from 'entries' directly.)
 
     # Try manifest first (embedded by signer)
     _manifest_for_delays = input_path / "signed_manifest_v1.json" if input_path.is_dir() else None
-    if _manifest_for_delays and _manifest_for_delays.exists():
+    if not tx_delays and _manifest_for_delays and _manifest_for_delays.exists():
         try:
             with open(_manifest_for_delays) as mf:
                 _mdata = json.load(mf)
@@ -273,11 +301,17 @@ def main():
         # NEWNYM + planned delay before each TX for circuit isolation and
         # timing decorrelation. The delay comes from the unsigned plan and is
         # critical for preventing timing-cluster analysis on the blockchain.
+        # Keyed on the blob's REAL manifest index (from its tx_N filename),
+        # NOT the loop's positional idx -- if any earlier TX was skipped
+        # upstream (a signing failure), the positions no longer line up with
+        # the manifest's idx values and every later TX would get some other
+        # TX's delay (or none) instead of its own.
         if idx > 0:
-            planned_delay = tx_delays.get(idx, 0)
+            real_idx = _blob_sort_key(blob)
+            planned_delay = tx_delays.get(real_idx, 0)
             if planned_delay > 0:
-                print(f"  [*] Waiting {planned_delay}s (planned delay for TX {idx})...")
-                integrity_log("broadcast", f"delay:idx={idx}:secs={planned_delay}")
+                print(f"  [*] Waiting {planned_delay}s (planned delay for TX {real_idx})...")
+                integrity_log("broadcast", f"delay:idx={real_idx}:secs={planned_delay}")
                 # Sleep in chunks so shutdown_requested() can be checked
                 waited = 0
                 while waited < planned_delay:
