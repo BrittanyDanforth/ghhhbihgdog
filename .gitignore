@@ -2,3 +2,20 @@
 __pycache__/
 tests/dashboard_data.json
 tests/dashboard.html
+
+# Runtime artifacts. These carry live operational data -- the integrity chain
+# logs MAC addresses and per-run traces, and the TX/plan files carry deposit
+# addresses, memos, XMR destinations and subaddress indices. Committing any of
+# them would publish exactly what this toolchain exists to keep private.
+integrity_chain.log
+*.unsigned
+*.signed
+unsigned/
+tx_staging/
+signed_manifest_v1.json
+unsigned_manifest.json
+thor_pairs_batch.json*
+exitplan_v1.json
+wallet_*.json
+prog*.json
+.venv/

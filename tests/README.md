@@ -19,6 +19,19 @@ python3 tests/real_dag_subaddr_testnet.py # on-chain proof subaddr_indices
                                           # restricts a hop to ONE subaddress
 python3 tests/real_phase_sign_testnet.py # calls the SHIPPED phase_sign() and
                                           # relays its output to a real daemon
+python3 tests/real_phase_create_testnet.py # SHIPPED phase_create -> phase_sign
+                                          # chain vs a REAL wallet-rpc
+```
+
+`real_phase_create_testnet.py` needs the `monero` package (the others do not).
+Installing it can fail on modern setuptools, because its `varint` dependency
+still uses `use_2to3`, removed in setuptools 58:
+
+```bash
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install "setuptools<58" wheel
+.venv/bin/pip install monero
+.venv/bin/python tests/real_phase_create_testnet.py
 ```
 
 ### Which real tests run the shipped code, and which don't
@@ -31,6 +44,14 @@ This distinction matters and is easy to overstate, so it is spelled out:
   collection and partial-sign abort are what actually execute; the resulting
   blob is then relayed by a real daemon and confirmed on-chain, and a
   hash-mismatched entry is proven to abort without signing.
+- `real_phase_create_testnet.py` **calls the shipped `phase_create` against a
+  real `monero-wallet-rpc`**, then hands the manifest *it* wrote to the shipped
+  `phase_sign`, and relays the result on-chain. `test_integration.py` already
+  drives `phase_create` and `broadcast.main()`, but against a FAKE RPC that
+  returns whatever the test supplies — that proves the request SHAPE is built
+  right, not that a real daemon accepts it. This closes that gap for both TX
+  shapes (single-destination DAG hop and multi-destination fan-out) and proves
+  the `phase_create` → `phase_sign` fingerprint/hash handoff works unmocked.
 - `real_roundtrip_testnet.py`, `real_flags_testnet.py` and
   `real_dag_subaddr_testnet.py` **reimplement the RPC/CLI sequence inline**
   rather than importing the scripts. They prove the Monero-side protocol the

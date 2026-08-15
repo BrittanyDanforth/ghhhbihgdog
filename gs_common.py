@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, signal, sys, time
+import hashlib, json, os, re, secrets, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -508,15 +508,49 @@ def bech32_checksum_ok(addr: str) -> bool:
 
 
 def secure_delete_file(path: Path) -> bool:
-    """Overwrite a file's full extent in place (random then zeros), then unlink.
-    Returns True on success. Same real primitive as paranoia_mode uses -- for
-    callers that must not leave plaintext (e.g. a GPG-encrypted bundle's source).
+    """Overwrite a regular file's full extent in place (random then zeros), then
+    unlink. Returns True on success. The single real wipe primitive -- callers
+    that must not leave plaintext (a GPG bundle's source, paranoia_mode's
+    artifact sweep) all use this one rather than keeping their own copy.
+
+    NEVER follows a symlink. Opening the path directly would overwrite the
+    LINK TARGET -- destroying a file the operator never asked to wipe -- and
+    then unlink only the link, while reporting success. Since wipe callers
+    expand shell globs, a symlink matching e.g. '*.json' would silently zero
+    whatever it pointed at. O_NOFOLLOW makes the open fail atomically on a
+    symlink (no TOCTOU gap), and we unlink the link itself instead: removing a
+    symlink discloses nothing, as the link holds no file content.
+    Non-regular files (fifo, device, socket) are likewise never overwritten.
     """
+    path = Path(path)
     try:
-        path = Path(path)
-        size = path.stat().st_size
+        st = os.lstat(path)
+    except OSError:
+        return False
+
+    if stat_module.S_ISLNK(st.st_mode):
+        try:
+            path.unlink()          # drop the link only; target untouched
+            return True
+        except OSError:
+            return False
+    if not stat_module.S_ISREG(st.st_mode):
+        return False               # refuse fifo/device/socket/dir
+
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        size = os.fstat(fd).st_size
         if size > 0:
-            with open(path, "r+b") as f:
+            # "wb" matches the O_WRONLY fd. It does NOT truncate: truncation is
+            # an open(2) flag (O_TRUNC) that we deliberately never pass, so the
+            # original blocks stay allocated and really are overwritten. ("r+b"
+            # would also work but requests read access the fd doesn't have, so
+            # any future read would raise -- match the fd instead.)
+            with os.fdopen(fd, "wb", closefd=True) as f:
+                fd = -1            # fdopen owns it now
                 for filler in (os.urandom, lambda n: b"\x00" * n):
                     f.seek(0)
                     left = size
@@ -524,7 +558,15 @@ def secure_delete_file(path: Path) -> bool:
                         n = min(left, 1 << 20)
                         f.write(filler(n)); left -= n
                     f.flush(); os.fsync(f.fileno())
+        elif fd >= 0:
+            os.close(fd); fd = -1
         path.unlink()
         return True
-    except (PermissionError, OSError, FileNotFoundError):
+    except (PermissionError, OSError):
         return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass

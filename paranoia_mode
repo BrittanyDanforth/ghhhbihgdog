@@ -23,7 +23,7 @@ from pathlib import Path
 
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
-    shutdown_requested, secure_hex,
+    shutdown_requested, secure_hex, secure_delete_file,
 )
 
 # Paths to wipe
@@ -233,39 +233,23 @@ def wipe_swap_ram(dry: bool):
 
 
 def _secure_delete_file(path: Path) -> bool:
-    """Overwrite the ENTIRE file in place, then unlink. Returns True on success.
+    """Securely delete one file. Returns True on success.
 
-    The previous version was ineffective in two ways this fixes:
-      * It opened "wb", which TRUNCATES the file to zero first -- freeing the
-        original data blocks, so the zeros it then wrote landed on newly
-        allocated blocks and the original bytes were never overwritten. We open
-        "r+b" (no truncate) and seek(0) so the SAME blocks are overwritten.
-      * It capped the overwrite at 64 KB (min(size, 65536)), so anything larger
-        kept almost all its data. We overwrite the whole logical size in 1 MiB
-        chunks, two passes (random then zeros), each fsync'd.
-    Honest caveat: on CoW / journaling / SSD-wear-levelled filesystems the
-    physical blocks can still survive -- no userspace tool can guarantee
-    otherwise. But this now overwrites the file's full logical extent, which the
-    old code did not, so it is a real best-effort rather than theatre.
+    Delegates to gs_common.secure_delete_file rather than keeping a second copy
+    of the overwrite logic: this module and thor_swap_preparer previously each
+    carried their own, so a fix to one silently left the other stale -- which is
+    exactly how the old truncate-then-64KB version survived here. One primitive,
+    one place to audit. It overwrites the file's full logical extent in place
+    (random then zeros, fsync'd), and never follows a symlink.
+
+    Honest caveat, unchanged: on CoW / journaling / SSD-wear-levelled
+    filesystems the physical blocks can still survive -- no userspace tool can
+    guarantee otherwise. This is a real best-effort, not a guarantee.
     """
-    try:
-        size = path.stat().st_size
-        if size > 0:
-            with open(path, "r+b") as f:
-                for filler in (os.urandom, lambda n: b"\x00" * n):
-                    f.seek(0)
-                    remaining = size
-                    while remaining > 0:
-                        chunk = min(remaining, 1 << 20)
-                        f.write(filler(chunk))
-                        remaining -= chunk
-                    f.flush()
-                    os.fsync(f.fileno())
-        path.unlink()
-        return True
-    except (PermissionError, OSError, FileNotFoundError) as e:
-        integrity_log("paranoia", f"secure_delete_fail:{str(e)[:40]}")
-        return False
+    ok = secure_delete_file(path)
+    if not ok:
+        integrity_log("paranoia", f"secure_delete_fail:{str(path)[-40:]}")
+    return ok
 
 
 def _secure_delete_dir(path: Path) -> bool:

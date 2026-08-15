@@ -88,6 +88,36 @@ fb.unlink()
 check("secure_delete: missing file -> False",
       para2._secure_delete_file(Path(os.getcwd()) / "nope_xyz_missing") is False)
 
+# ---------------------------------------------------------------------------
+# A symlink must NEVER be followed. Following it overwrites the LINK TARGET --
+# a file the operator never asked to wipe -- then unlinks only the link while
+# reporting success. wipe_gs_artifacts expands globs, so a symlink matching
+# '*.json' would silently zero whatever it pointed at.
+# ---------------------------------------------------------------------------
+victim = Path(os.getcwd()) / "sd_victim.txt"
+VICTIM_DATA = b"DO-NOT-TOUCH" * 100
+victim.write_bytes(VICTIM_DATA)
+link = Path(os.getcwd()) / "sd_link"
+os.symlink(str(victim), str(link))
+r_link = para2._secure_delete_file(link)
+check("secure_delete: symlink removed", not os.path.lexists(str(link)))
+check("secure_delete: symlink TARGET left intact (no collateral wipe)",
+      victim.exists() and victim.read_bytes() == VICTIM_DATA)
+check("secure_delete: symlink returns True (link itself is gone)", r_link is True)
+victim.unlink()
+
+# Non-regular files (fifo/device/socket) must be refused, not overwritten.
+fifo = Path(os.getcwd()) / "sd_fifo"
+os.mkfifo(str(fifo))
+check("secure_delete: fifo refused", para2._secure_delete_file(fifo) is False)
+check("secure_delete: fifo left in place", os.path.exists(str(fifo)))
+fifo.unlink()
+
+empty = Path(os.getcwd()) / "sd_empty.txt"
+empty.write_bytes(b"")
+check("secure_delete: zero-byte file deleted cleanly",
+      para2._secure_delete_file(empty) is True and not empty.exists())
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)
