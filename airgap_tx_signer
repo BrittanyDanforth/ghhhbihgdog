@@ -19,16 +19,14 @@ pending unsigned TXs, so 40 sequential transfer_split calls won't
 select the same outputs twice.
 
 Usage:
-  # On online machine (view-only wallet):
+  # Phase 1 — create unsigned TXs (online, view-only wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase create \
       --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
-      --outdir unsigned_txs
+      --outdir tx_staging
 
-  # On offline machine (full wallet):
+  # Phase 2 — sign (offline, full wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase sign \
-      --wallet-file /path/to/full_wallet --outdir signed_txs
-
-  # Transfer signed_txs/ back to online machine for broadcast
+      --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
 import argparse, json, subprocess, hashlib, os, sys, time, shutil
@@ -175,7 +173,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     if failed:
         print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
         sys.exit(1)
-    print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
+    print(f"  [+] Unsigned TXs ready in {outdir}/ — run phase sign to continue.")
 
 
 def phase_sign(args, plan: List[dict]):
