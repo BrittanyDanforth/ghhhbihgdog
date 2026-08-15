@@ -184,10 +184,25 @@ def main():
     cli.add_argument("--wallet-file", default="offline.wallet",
                      help="Path to Monero wallet file for auto-mode signing")
     cli.add_argument("--wallet-password", default="",
-                     help="Password for the wallet file (empty for no password)")
+                     help="Password for the wallet file (empty for no password). "
+                          "PREFER GS_WALLET_PASSWORD=... in the environment: an "
+                          "argv password is world-readable via ps and "
+                          "/proc/<pid>/cmdline (mode 444).")
     cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
                      help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
     args = cli.parse_args()
+
+    # Prefer the environment over argv for the wallet password (see the
+    # --wallet-password help and the env handoff in _stage5_run). Same
+    # precedence rule the signer uses, so the two agree.
+    _env_pw = os.environ.get("GS_WALLET_PASSWORD")
+    if _env_pw is not None:
+        args.wallet_password = _env_pw
+    elif args.wallet_password:
+        print("  [!] --wallet-password puts the wallet password on this "
+              "process's argv, where any local user can read it via ps or "
+              "/proc/<pid>/cmdline. Prefer GS_WALLET_PASSWORD=... instead.")
+        integrity_log("main", "warn:password_on_argv")
 
     # ---- Determine mode ----
     receive_mode = bool(args.receive_wallet)
@@ -849,13 +864,19 @@ def _run_round(args, plan_file, staging_dir, label):
 
     try:
         print(f"  [*] {label} 5b: Signing unsigned TXs (offline wallet)...")
+        # Password goes through the ENVIRONMENT, never argv. As argv it sat in
+        # the child's world-readable /proc/<pid>/cmdline (mode 444) for the
+        # whole signing run -- up to the 1800s timeout below -- where any local
+        # user could read it with `ps -eo args`. /proc/<pid>/environ is mode
+        # 400, so only the owner and root can read it.
+        _sign_env = dict(os.environ)
+        _sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
         subprocess.run(
             ["python3", "airgap_tx_signer", str(plan_file),
              "--phase", "sign",
              "--wallet-file", args.wallet_file,
-             "--wallet-password", args.wallet_password,
              "--outdir", staging_dir],
-            check=True, timeout=1800,
+            check=True, timeout=1800, env=_sign_env,
         )
         integrity_log("stage5", f"sign_ok:{label}")
 

@@ -178,6 +178,78 @@ p = json.loads(prog.read_text())
 check("B6: code -40 exits nonzero", code != 0)
 check("B6: code -40 classified permanent", p["failed_perm"] == [0] and p["relayed"] == [])
 
+# ===========================================================================
+# C. phase_sign must NEVER put the wallet password on the child's argv.
+#    An argv secret is readable by every local user via `ps -eo args` and the
+#    world-readable /proc/<pid>/cmdline -- and this is the spend-key password.
+#    Drives the REAL phase_sign with subprocess.run intercepted, so the actual
+#    argv it would have executed is inspected.
+# ===========================================================================
+import subprocess as _subprocess
+
+SECRET_PW = "S3cret-Spend-Pass!"
+
+_sign_dir = Path(os.getcwd()) / "signC"
+_sign_dir.mkdir(parents=True, exist_ok=True)
+_unsigned = _sign_dir / "tx_0.unsigned"
+_unsigned.write_text("00")          # valid hex; content irrelevant, run is faked
+_plan_C = [{"src": "A", "dst": "B", "amt": "0.1", "delay": 0}]
+(_sign_dir / "unsigned_manifest.json").write_text(json.dumps({
+    "plan_fingerprint": airgap._compute_plan_fingerprint(_plan_C),
+    "phase": "unsigned",
+    "entries": [{"idx": 0, "file": str(_unsigned),
+                 "hash": hashlib.sha256(_unsigned.read_text().encode()).hexdigest(),
+                 "dst": "B", "amt": "0.1", "delay": 0}],
+}))
+_fake_wallet = Path(os.getcwd()) / "walletC.bin"
+_fake_wallet.write_bytes(b"wallet")
+
+captured = {}
+_real_run = airgap.subprocess.run
+
+
+def _capture_run(cmd, **kw):
+    captured["cmd"] = list(cmd)
+    captured["stdin"] = kw.get("input", "")
+    # Read the password file back while it still exists, to prove the secret
+    # actually reached wallet-cli by that route (not silently dropped).
+    for i, tok in enumerate(cmd):
+        if tok == "--password-file":
+            pf = Path(cmd[i + 1])
+            captured["pw_path"] = pf
+            captured["pw_content"] = pf.read_text() if pf.exists() else None
+    # Simulate wallet-cli writing the signed output so phase_sign proceeds.
+    Path(kw["cwd"], "signed_monero_tx").write_bytes(b"Monero signed tx set\x00fake")
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+airgap.subprocess.run = _capture_run
+try:
+    _args_C = types.SimpleNamespace(outdir=str(_sign_dir), wallet_cli="monero-wallet-cli",
+                                    wallet_file=str(_fake_wallet), wallet_password=SECRET_PW)
+    airgap.phase_sign(_args_C, _plan_C)
+finally:
+    airgap.subprocess.run = _real_run
+
+_argv = captured.get("cmd", [])
+check("C: phase_sign executed a command", bool(_argv))
+check("C: wallet password NOT anywhere in argv (ps-visible)",
+      not any(SECRET_PW in str(tok) for tok in _argv))
+check("C: no --password flag used at all", "--password" not in _argv)
+check("C: uses --password-file instead", "--password-file" in _argv)
+check("C: the password file actually carried the secret",
+      captured.get("pw_content") == SECRET_PW)
+check("C: password file securely erased after signing",
+      captured.get("pw_path") is not None and not captured["pw_path"].exists())
+# The verified stdin protocol must be unchanged: password first, then y's.
+check("C: stdin still sends password first (protocol unchanged)",
+      captured.get("stdin", "").startswith(SECRET_PW + "\n"))
+check("C: stdin still sends the y confirmations",
+      captured.get("stdin", "").endswith("y\ny\ny\n"))
+# And the signing still succeeded end-to-end through the real code path.
+check("C: signed blob still produced via password-file path",
+      (_sign_dir / "signed" / "tx_0.signed").exists())
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

@@ -276,6 +276,7 @@ def phase_sign(args, plan: List[dict]):
         # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
         import tempfile
         work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        pw_files: list = []      # password files to securely erase in `finally`
         try:
             # phase_create saved the RPC's `unsigned_txset`, which is a HEX
             # string. wallet-cli's sign_transfer reads the BINARY
@@ -300,10 +301,38 @@ def phase_sign(args, plan: List[dict]):
                           f"wallet-cli will likely reject it.")
                     unsigned_in.write_text(_payload)
 
+            # --password-file, NOT --password. An argv password is readable by
+            # EVERY local user for the lifetime of the process, via `ps -eo args`
+            # or the world-readable /proc/<pid>/cmdline -- verified by observing
+            # the literal secret in ps output. This is the wallet's spend-key
+            # password, so that exposure is as bad as it gets on a shared box.
+            #
+            # The file is staged in /dev/shm (tmpfs -> RAM-backed, so the secret
+            # normally never touches a disk at all), falling back to the scratch
+            # dir when /dev/shm is unavailable, and is securely erased in the
+            # finally block below either way.
+            #
+            # Verified against real monero-wallet-cli 0.18.3.1 that this leaves
+            # the STDIN protocol below unchanged (wallet-cli does not prompt at
+            # startup when the password comes from a file) and that an EMPTY
+            # password file works, which is the common default. The stdin-only
+            # alternative (no password flag, password twice on stdin) also
+            # works but was rejected: it changes the exact stdin sequence whose
+            # mismatch caused the original "y taken as the password" bug, for
+            # no gain over a tmpfs-backed file.
+            pw_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else work_dir
+            pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=pw_dir)
+            try:
+                os.fchmod(pw_fd, 0o600)
+                os.write(pw_fd, (args.wallet_password or "").encode())
+            finally:
+                os.close(pw_fd)
+            pw_files.append(pw_path)
+
             cmd = [
                 args.wallet_cli,
                 "--wallet-file", wallet_file,
-                "--password", args.wallet_password or "",
+                "--password-file", pw_path,
                 "--command", "sign_transfer",
             ]
             # STDIN protocol, verified end-to-end against real monero-wallet-cli
@@ -355,6 +384,11 @@ def phase_sign(args, plan: List[dict]):
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
         finally:
+            # The password file first -- it may live in /dev/shm, outside the
+            # scratch tree the rmtree below covers, so it would otherwise
+            # survive the whole run.
+            for _pw in pw_files:
+                secure_delete_file(Path(_pw))
             # SECURE cleanup, not shutil.rmtree. This scratch dir held
             # unsigned_monero_tx AND the wallet-cli-produced signed_monero_tx --
             # a fully signed, relayable transaction. A plain rmtree only unlinks
@@ -410,12 +444,31 @@ def main():
     cli.add_argument("--wallet-file",
                      help="Path to full wallet file (phase=sign only)")
     cli.add_argument("--wallet-password", default="",
-                     help="Wallet password (phase=sign only)")
+                     help="Wallet password (phase=sign only). PREFER the "
+                          "GS_WALLET_PASSWORD environment variable: an argv "
+                          "password is world-readable via ps / "
+                          "/proc/<pid>/cmdline (mode 444), while "
+                          "/proc/<pid>/environ is mode 400 (owner only).")
     cli.add_argument("--outdir", default="tx_staging",
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     args = cli.parse_args()
+
+    # Prefer the environment over argv for the wallet password. /proc/<pid>/
+    # cmdline is mode 444 -- any local user can read an argv password with
+    # `ps -eo args` for the whole run (up to 30 min for a signing batch).
+    # /proc/<pid>/environ is mode 400, readable only by the owner and root
+    # (verified: an unprivileged user is DENIED environ but ALLOWED cmdline).
+    # GhostSpiral passes the password this way when it spawns us.
+    _env_pw = os.environ.get("GS_WALLET_PASSWORD")
+    if _env_pw is not None:
+        args.wallet_password = _env_pw
+    elif args.wallet_password and args.phase == "sign":
+        print("  [!] --wallet-password puts the wallet password on this "
+              "process's argv, where any local user can read it via ps or "
+              "/proc/<pid>/cmdline. Prefer GS_WALLET_PASSWORD=... instead.")
+        integrity_log("signer", "warn:password_on_argv")
 
     plan_path = Path(args.unsigned_json)
     if not plan_path.exists():
