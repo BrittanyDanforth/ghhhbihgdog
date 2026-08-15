@@ -249,6 +249,11 @@ check("C: stdin still sends the y confirmations",
 # And the signing still succeeded end-to-end through the real code path.
 check("C: signed blob still produced via password-file path",
       (_sign_dir / "signed" / "tx_0.signed").exists())
+# The signed blob is a relayable transaction: it must never exist world-readable,
+# not even briefly, so phase_sign creates it 0600 rather than chmod-ing after.
+_blob = _sign_dir / "signed" / "tx_0.signed"
+check("C: signed tx written 0600 (never world-readable)",
+      _blob.exists() and (_blob.stat().st_mode & 0o777) == 0o600)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

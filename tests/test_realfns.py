@@ -160,6 +160,61 @@ check("atomic_write_json: happy path still writes correctly",
       _target.exists() and json.loads(_target.read_text())["ok"] == 1)
 check("atomic_write_json: happy path leaves no .tmp",
       list(_atomic_dir.glob("*.tmp")) == [])
+check("atomic_write_json: final file is 0600", (_target.stat().st_mode & 0o777) == 0o600)
+
+# ---------------------------------------------------------------------------
+# Sensitive files must be 0600 FROM CREATION, not chmod'ed afterwards.
+# write_bytes()+chmod created them 0644 under the default umask and left them
+# 0644 PERMANENTLY if the process died in between -- which applied to
+# tx_*.signed, i.e. a fully signed, relayable transaction.
+# ---------------------------------------------------------------------------
+_perm_dir = Path(os.getcwd()) / "permdir"
+_perm_dir.mkdir(exist_ok=True)
+_old_umask = os.umask(0o022)
+try:
+    _pf = _perm_dir / "tx_0.signed"
+    gs.secure_write_bytes(_pf, b"Monero signed tx set FAKE")
+    check("secure_write_bytes: 0600 under umask 022",
+          (_pf.stat().st_mode & 0o777) == 0o600)
+    check("secure_write_bytes: not world-readable", not (_pf.stat().st_mode & 0o004))
+    check("secure_write_bytes: content intact", _pf.read_bytes() == b"Monero signed tx set FAKE")
+
+    # A permissive umask must not be able to widen it (umask only clears bits).
+    os.umask(0o000)
+    _pf2 = _perm_dir / "tx_1.signed"
+    gs.secure_write_bytes(_pf2, b"x")
+    check("secure_write_bytes: still 0600 under umask 000",
+          (_pf2.stat().st_mode & 0o777) == 0o600)
+
+    # O_CREAT leaves an EXISTING file's mode alone, so it must be narrowed too.
+    _pf3 = _perm_dir / "tx_2.signed"
+    _pf3.write_bytes(b"old"); os.chmod(_pf3, 0o666)
+    gs.secure_write_bytes(_pf3, b"NEW")
+    check("secure_write_bytes: narrows a pre-existing 0666 file",
+          (_pf3.stat().st_mode & 0o777) == 0o600 and _pf3.read_bytes() == b"NEW")
+
+    _pt = _perm_dir / "notes.txt"
+    gs.secure_write_text(_pt, "unsigned-hex")
+    check("secure_write_text: 0600 at creation", (_pt.stat().st_mode & 0o777) == 0o600)
+
+    # THE DISCRIMINATING CHECK. Asserting the final mode is 0600 does NOT catch
+    # the bug: write_bytes()+chmod also ENDS at 0600, so such a check passes on
+    # broken code (verified). What matters is that the mode is right BEFORE any
+    # chmod runs -- that is what survives a crash in the window. Disable the
+    # trailing chmod entirely: os.open(...,0o600) still yields 0600, whereas
+    # write_bytes()+chmod would be left at 0644.
+    _real_perms = gs.secure_file_perms
+    gs.secure_file_perms = lambda *a, **k: None
+    try:
+        _pf4 = _perm_dir / "nochmod.signed"
+        gs.secure_write_bytes(_pf4, b"SIGNED")
+        _m = _pf4.stat().st_mode & 0o777
+        check("secure_write_bytes: 0600 WITHOUT any chmod (survives a crash "
+              f"in the window; got {oct(_m)})", _m == 0o600)
+    finally:
+        gs.secure_file_perms = _real_perms
+finally:
+    os.umask(_old_umask)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

@@ -26,7 +26,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, newnym,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
-    bech32_checksum_ok, secure_delete_file,
+    bech32_checksum_ok, secure_delete_file, secure_write_text,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -248,8 +248,9 @@ def main():
                 f"    leaving you a plaintext file with a false sense of protection."
             )
         gpg_path = Path(str(_out) + ".gpg")
-        gpg_path.write_text(str(enc))
-        os.chmod(gpg_path, 0o600)
+        # 0600 at creation, not chmod'ed after: write_text + chmod left the
+        # bundle 0644 in between, and permanently so if killed in that window.
+        secure_write_text(gpg_path, str(enc))
         if secure_delete_file(_out):
             integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wiped")
             print(f"  [+] GPG bundle -> {gpg_path}  (plaintext {_out.name} securely deleted)")

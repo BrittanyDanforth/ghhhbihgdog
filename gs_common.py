@@ -83,11 +83,49 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
 # ---------------------------------------------------------------------------
 
 def secure_file_perms(path: Path, mode: int = 0o600) -> None:
-    """Set file to owner-read/write only."""
+    """Set file to owner-read/write only.
+
+    Prefer secure_write_bytes/secure_write_text for NEW files: chmod-after-write
+    leaves a window (and, on a crash, a permanent state) where the file is
+    world-readable. Use this only to fix up a file someone else created.
+    """
     try:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+def secure_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """Create a file with owner-only perms FROM THE START, then write it.
+
+    The `write_bytes(...)` + `secure_file_perms(...)` sequence this replaces
+    creates the file at 0644 under the default umask 022 and only narrows it
+    afterwards. That is not merely a short race: if the process is killed
+    between the two calls the file stays 0644 PERMANENTLY -- verified, and it
+    applied to tx_*.unsigned and to tx_*.signed, i.e. a fully signed,
+    relayable transaction left world-readable on disk.
+
+    os.open() applies the mode at creation time, atomically. 0o600 has no
+    group/other bits, so a umask cannot widen it (a umask can only clear bits),
+    which makes this umask-safe as well -- confirmed 0o600 under umask 022.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as f:
+            fd = -1
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    # A pre-existing file keeps its old mode through O_CREAT, so narrow it too.
+    secure_file_perms(path, mode)
+
+
+def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
+    """Text wrapper over secure_write_bytes -- see there for why this exists."""
+    secure_write_bytes(path, data.encode(), mode)
 
 
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
@@ -104,11 +142,11 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        with open(tmp, "w") as f:
-            json.dump(obj, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        secure_file_perms(tmp, perms)
+        # Created 0600 up front, not chmod'ed afterwards: the tmp holds the
+        # same plaintext as the final file, so a world-readable window (or a
+        # crash leaving it 0644 forever) exposes exactly what the rename was
+        # meant to protect.
+        secure_write_bytes(tmp, json.dumps(obj, indent=2).encode(), perms)
         os.replace(tmp, path)
     except BaseException:
         secure_delete_file(tmp)
@@ -124,11 +162,7 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        with open(tmp, "w") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        secure_file_perms(tmp, perms)
+        secure_write_text(tmp, data, perms)   # 0600 at creation, see above
         os.replace(tmp, path)
     except BaseException:
         secure_delete_file(tmp)

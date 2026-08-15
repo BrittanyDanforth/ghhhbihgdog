@@ -38,6 +38,7 @@ from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
+    secure_write_text, secure_write_bytes,
 )
 
 def _validate_plan(plan: List[dict]) -> None:
@@ -177,8 +178,9 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
             # Save the unsigned TX set
             tx_file = outdir / f"tx_{idx}.unsigned"
-            tx_file.write_text(unsigned_txset)
-            secure_file_perms(tx_file)
+            # 0600 at creation -- write_text + chmod left it 0644 in between,
+            # and permanently 0644 if the process died in that window.
+            secure_write_text(tx_file, unsigned_txset)
 
             sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
             manifest.append({
@@ -357,8 +359,10 @@ def phase_sign(args, plan: List[dict]):
             signed_out = Path(work_dir) / "signed_monero_tx"
             if signed_out.exists():
                 signed_data = signed_out.read_bytes()
-                signed_file.write_bytes(signed_data)
-                secure_file_perms(signed_file)
+                # This is a fully signed, relayable transaction. Created 0600
+                # up front rather than chmod'ed after -- a kill in that window
+                # left it world-readable on disk forever.
+                secure_write_bytes(signed_file, signed_data)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
                 signed_manifest.append({
