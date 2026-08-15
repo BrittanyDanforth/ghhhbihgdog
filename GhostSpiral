@@ -49,12 +49,25 @@ NUM_DECOYS = 4
 # Updated periodically; safe to overshoot slightly (operator keeps the change).
 FALLBACK_FEE_XMR = Decimal("0.00005")
 
-# Must match the multiplier table documented in --fee-priority's help text
-# (1=default, 2=x4, 3=x20, 4=x166) and forwarded verbatim to monero-wallet-rpc's
-# transfer_split 'priority' param in Stage 5a. The budget math below has to use
-# the SAME multiplier the RPC will actually charge, or a high --fee-priority
-# run overspends its fee reservation and aborts mid-batch in Stage 5a.
+# Monero's default fee-priority multipliers. monero-wallet-rpc scales the
+# per-byte base fee (returned by get_fee_estimate) by one of these depending on
+# the 'priority' passed to transfer_split. These are the values wired into
+# monero's src (wallet2::get_fee_multipliers / simplewallet's priority table)
+# and have been stable since the 2019 dynamic-fee overhaul (1 / 4 / 20 / 166).
+#
+# The budget math below MUST use the SAME multiplier the RPC will actually
+# charge in Stage 5a, or a high --fee-priority run overspends its fee
+# reservation and aborts mid-batch. If a future Monero hard fork changes these
+# ratios, this table and the RPC move together -- update both, or the estimate
+# silently drifts from the charged fee.
 PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
+
+# Fan-out outputs are spendable only after they confirm and unlock (~10 blocks,
+# roughly 20 min on mainnet). The DAG-mixing round sources FROM those fan-out
+# subaddresses, so it cannot be created until the fan-out has confirmed. These
+# bound how long Stage 5 waits for that before giving up and skipping DAG.
+FANOUT_CONFIRM_TIMEOUT = 3600   # seconds to wait for fan-out to unlock
+FANOUT_CONFIRM_POLL = 30        # seconds between balance polls
 
 
 def fetch_fee_from_rpc(rpc, fee_priority: int = 1) -> Decimal:
@@ -116,6 +129,14 @@ def main():
                      help="JoinMarket wallet file for tumbles")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--dag-mixing", action="store_true",
+                     help="Enable the second-round DAG hop-mixing across mix "
+                          "subaddresses. This REQUIRES waiting for the fan-out "
+                          "round to confirm on-chain (~10 blocks) before the hop "
+                          "TXs can be created, so a run takes ~20+ min longer. "
+                          "Off by default: the default run does the fan-out "
+                          "distribution only (fast, and still spreads funds "
+                          "across fresh subaddresses).")
     cli.add_argument("--wallet-file", default="offline.wallet",
                      help="Path to Monero wallet file for auto-mode signing")
     cli.add_argument("--wallet-password", default="",
@@ -493,13 +514,32 @@ def main():
 
     integrity_log("stage4", "plan_calculated")
 
-    plan = []
+    def _src_index(addr: str) -> int:
+        """Resolve a source address to its real subaddress index, or abort.
 
-    # Phase A: Fan-out — distribute funds from ENTRY into mix subaddresses.
-    # In receiver mode, ALL funds sit on ENTRY. In sender mode, ThorChain
-    # deposits to ENTRY. Either way, we must spread funds outward before
-    # the random DAG mixing can function (otherwise src addresses have no
-    # balance and every TX fails).
+        transfer_split gets this in 'subaddr_indices' to restrict spending to
+        exactly the one subaddress the plan names as 'src'. A silent fallback
+        to 0 here would instead spend from the primary subaddress (which holds
+        the bulk of the funds) -- the OPPOSITE of the intended per-hop mixing,
+        and invisible to the operator. Every source we plan is created in
+        create_subs (or is ENTRY, set explicitly above), so a miss is a real
+        internal bug: fail loudly rather than silently spend the wrong output.
+        """
+        if addr not in addr_index:
+            integrity_log("stage4", "src_index_missing")
+            sys.exit(
+                f"[!] Internal error: no subaddress index recorded for source "
+                f"{scrub_address(addr)}. Refusing to build a TX that could spend "
+                f"from the wrong subaddress."
+            )
+        return addr_index[addr]
+
+    # -- Phase A: Fan-out -------------------------------------------------
+    # Distribute funds from ENTRY into mix subaddresses. In receiver mode ALL
+    # funds sit on ENTRY; in sender mode ThorChain deposits to ENTRY. Either
+    # way funds must spread outward before any hop-mixing can source from a
+    # mix subaddress. Fan-out sources from ENTRY, which is already funded and
+    # confirmed, so this round can always be created in one batch.
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
     fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
@@ -508,77 +548,95 @@ def main():
             f"[!] Usable balance {usable} XMR too small to fan out across "
             f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
         )
+    fanout_plan = []
     for fi in range(fanout_count):
         if shutdown_requested():
             integrity_log("stage4", f"shutdown_at_fanout_{fi}")
             break
-        plan.append({
+        fanout_plan.append({
             "src": ENTRY,
-            "src_index": addr_index.get(ENTRY, 0),
+            "src_index": _src_index(ENTRY),
             "dst": mix_targets[fi],
             "amt": str(fanout_amt),
             "delay": _secrets.randbelow(540) + 180,
             "extra": secure_hex(16),
         })
-    integrity_log("stage4", f"fanout_plan:{fanout_count}_txs:amt_each={fanout_amt}")
+    integrity_log("stage4", f"fanout_plan:{len(fanout_plan)}_txs:amt_each={fanout_amt}")
 
-    # Phase B: DAG mixing — random hops between mix subaddresses.
-    # Recalculate per-round amount from the remaining balance after fan-out.
-    # NOTE: 'usable' already reserves per_round_fee for every planned round
-    # (fanout_count + dag_rounds, via total_fees above) -- do NOT subtract
-    # per_round_fee*fanout_count again here, that would double-charge the
-    # fanout TXs' fees and shrink the DAG mixing budget more than intended.
-    remaining_after_fanout = usable - (fanout_amt * fanout_count)
-    dag_rounds = max(rounds - fanout_count, args.wallets)
-    if remaining_after_fanout > DUST_XMR and dag_rounds > 0:
-        dag_split = (remaining_after_fanout / Decimal(dag_rounds)).quantize(Decimal("0.0001"))
-        if dag_split <= DUST_XMR:
-            # Splitting the remainder across dag_rounds would round to (near)
-            # zero per TX. Do NOT force dag_split up to DUST_XMR here: that
-            # would make dag_split * dag_rounds exceed remaining_after_fanout,
-            # planning to spend more than is actually budgeted. Skip DAG
-            # mixing instead -- the fan-out phase above still ran.
-            integrity_log("stage4", "dag_mixing_skipped:split_below_dust")
+    # Subaddresses that actually received a fan-out output, with the (account,
+    # index) pair Stage 5 polls to confirm they've unlocked before hop-mixing.
+    funded_targets = [tx["dst"] for tx in fanout_plan]
+    fanout_targets_indexed = [(sub_account, _src_index(a)) for a in funded_targets]
+
+    # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------
+    # Each funded mix subaddress hops a chunk of its balance onward to a DAG
+    # neighbour. CRITICAL: after fan-out, a mix subaddress holds exactly ONE
+    # confirmed output. Monero can spend that output only once per confirmation
+    # round, so each subaddress may source AT MOST ONE hop in a single created
+    # batch -- source it twice and every hop after the first fails for "no
+    # unlocked output". We therefore iterate each funded subaddress once (a
+    # permutation), not random-with-replacement. This whole round also cannot
+    # be created until the fan-out confirms on-chain, which is why it runs as a
+    # separate confirmation-gated round in Stage 5 (see _stage5_run).
+    dag_plan = []
+    if args.dag_mixing:
+        # Hop amount comes from each source's OWN fan-out balance (fanout_amt),
+        # not from ENTRY's leftover. Send 85% onward; the 15% headroom covers
+        # the fee (tiny next to fanout_amt) plus change, so amount + fee can
+        # never exceed the single confirmed output the hop spends.
+        dag_hop_amt = (fanout_amt * Decimal("0.85")).quantize(Decimal("0.0001"))
+        if dag_hop_amt <= DUST_XMR:
+            integrity_log("stage4", "dag_mixing_skipped:hop_below_dust")
+            print("  [!] DAG mixing skipped: per-hop amount below dust threshold "
+                  f"({dag_hop_amt} XMR). Fan-out distribution still runs.")
         else:
-            for r in range(dag_rounds):
+            hop_sources = list(funded_targets)
+            _secrets.SystemRandom().shuffle(hop_sources)
+            for s in hop_sources:
                 if shutdown_requested():
-                    integrity_log("stage4", f"shutdown_at_round_{r}")
+                    integrity_log("stage4", "shutdown_during_dag_plan")
                     break
-                src_pos = _secrets.randbelow(len(mix_targets))
-                s = mix_targets[src_pos]
-                dst_candidates = dag.get(s, [t for t in mix_targets if t != s])
+                dst_candidates = [d for d in dag.get(s, mix_targets) if d != s]
                 if not dst_candidates:
                     continue
-                dst_pos = _secrets.randbelow(len(dst_candidates))
-                d = dst_candidates[dst_pos]
-                plan.append({
+                d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
+                dag_plan.append({
                     "src": s,
-                    "src_index": addr_index.get(s, 0),
+                    "src_index": _src_index(s),
                     "dst": d,
-                    "amt": str(dag_split),
+                    "amt": str(dag_hop_amt),
                     "delay": _secrets.randbelow(540) + 180,
                     "extra": secure_hex(16),
                 })
+            integrity_log("stage4", f"dag_plan:{len(dag_plan)}_hops:amt_each={dag_hop_amt}")
     else:
-        integrity_log("stage4", "dag_mixing_skipped:insufficient_remaining")
+        integrity_log("stage4", "dag_mixing_disabled")
+        print("  [*] DAG hop-mixing disabled (default). Run with --dag-mixing to "
+              "add a second confirmation-gated hop round.")
 
     meta = {
         "schema": "unsigned_v1",
         "version": VERSION,
         "created": int(time.time()) // 600 * 600,
-        "rounds": len(plan),
+        "rounds": len(fanout_plan) + len(dag_plan),
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
         "account_index": bal_account,
     }
-    unsigned = {"meta": meta, "txs": plan}
 
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
-    ufile = outdir / f"unsigned_{secure_hex(8)}.json"
-    atomic_write_json(unsigned, ufile)
+    plan_tag = secure_hex(8)
+    fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
+    atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
+    dag_file = None
+    if dag_plan:
+        dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
+        atomic_write_json({"meta": meta, "txs": dag_plan}, dag_file)
     integrity_log("stage4", "unsigned_dump_saved")
-    print(f"  [+] Unsigned plan: {ufile} ({len(plan)} TXs)")
+    print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
+    if dag_file:
+        print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
 
     ###########################################################################
     # Stage 5 - Auto sign + broadcast
@@ -603,13 +661,15 @@ def main():
             integrity_log("stage5", f"cleaned_old_dir:{old_dir}")
 
     # Clean old unsigned plans (OPSEC: contain full destination addresses)
-    # but NOT the current plan that Stage 4 just created
+    # but NOT the current plans that Stage 4 just created (fan-out + optional DAG)
     outdir_path = Path(args.output)
     if outdir_path.is_dir():
-        current_plan_name = ufile.name if hasattr(ufile, 'name') else Path(str(ufile)).name
+        current_names = {fanout_file.name}
+        if dag_file:
+            current_names.add(dag_file.name)
         old_plans = list(outdir_path.glob("unsigned_*.json"))
         for old_plan in old_plans:
-            if old_plan.name != current_plan_name:
+            if old_plan.name not in current_names:
                 old_plan.unlink()
                 integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
 
@@ -627,7 +687,8 @@ def main():
     staging_dir = "tx_staging"
 
     try:  # ensures lock file is cleaned even on error
-        _stage5_run(args, ufile, staging_dir, proxy, usable)
+        _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
+                    staging_dir, proxy, usable)
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -635,83 +696,156 @@ def main():
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
-def _stage5_run(args, ufile, staging_dir, proxy, spendable_amount):
-    """Execute the create -> sign -> broadcast -> exit sim pipeline."""
-    try:
-        print("  [*] Stage 5a: Creating unsigned TXs via wallet-rpc...")
-        create_cmd = [
-            "python3", "airgap_tx_signer", str(ufile),
-            "--phase", "create",
-            "--rpc", args.rpc_primary,
-            "--tor-proxy", args.tor_proxy,
-            "--outdir", staging_dir,
-            f"--fee-priority={args.fee_priority}",
-        ]
-        subprocess.run(create_cmd, check=True, timeout=1800)
-        integrity_log("stage5", "create_unsigned_ok")
+def _run_round(args, plan_file, staging_dir, label):
+    """Create -> sign -> broadcast one plan file. Aborts on any failure.
 
-        # Verify unsigned TXs were actually created before proceeding
+    Each round gets its own staging subdir so its unsigned/signed blobs and
+    manifest never collide with another round's. Returns the number of TXs
+    broadcast for this round.
+    """
+    try:
+        print(f"  [*] {label} 5a: Creating unsigned TXs via wallet-rpc...")
+        subprocess.run(
+            ["python3", "airgap_tx_signer", str(plan_file),
+             "--phase", "create",
+             "--rpc", args.rpc_primary,
+             "--tor-proxy", args.tor_proxy,
+             "--outdir", staging_dir,
+             f"--fee-priority={args.fee_priority}"],
+            check=True, timeout=1800,
+        )
+        integrity_log("stage5", f"create_unsigned_ok:{label}")
+
         unsigned_count = len(list(Path(staging_dir).glob("*.unsigned")))
         if unsigned_count == 0:
-            integrity_log("stage5", "no_unsigned_txs_created")
-            sys.exit("[!] Phase 'create' produced no unsigned TX files. Check RPC and balance.")
-        print(f"  [+] {unsigned_count} unsigned TXs created.")
-
+            integrity_log("stage5", f"no_unsigned_txs_created:{label}")
+            sys.exit(f"[!] {label}: phase 'create' produced no unsigned TX files. "
+                     f"Check RPC and balance.")
+        print(f"  [+] {label}: {unsigned_count} unsigned TXs created.")
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", "create_timeout")
-        sys.exit("[!] Unsigned TX creation timed out after 30 min")
+        integrity_log("stage5", f"create_timeout:{label}")
+        sys.exit(f"[!] {label}: unsigned TX creation timed out after 30 min")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"create_fail:{e.returncode}")
-        sys.exit(f"[!] Unsigned TX creation failed (exit {e.returncode})")
+        integrity_log("stage5", f"create_fail:{label}:{e.returncode}")
+        sys.exit(f"[!] {label}: unsigned TX creation failed (exit {e.returncode})")
 
     newnym()
     secure_delay(3.0, 8.0)
 
     try:
-        print("  [*] Stage 5b: Signing unsigned TXs (offline wallet)...")
-        sign_cmd = [
-            "python3", "airgap_tx_signer", str(ufile),
-            "--phase", "sign",
-            "--wallet-file", args.wallet_file,
-            "--wallet-password", args.wallet_password,
-            "--outdir", staging_dir,
-        ]
-        subprocess.run(sign_cmd, check=True, timeout=1800)
-        integrity_log("stage5", "sign_ok")
+        print(f"  [*] {label} 5b: Signing unsigned TXs (offline wallet)...")
+        subprocess.run(
+            ["python3", "airgap_tx_signer", str(plan_file),
+             "--phase", "sign",
+             "--wallet-file", args.wallet_file,
+             "--wallet-password", args.wallet_password,
+             "--outdir", staging_dir],
+            check=True, timeout=1800,
+        )
+        integrity_log("stage5", f"sign_ok:{label}")
 
-        # Verify signed TXs exist
         signed_dir = Path(staging_dir) / "signed"
         signed_count = len(list(signed_dir.glob("*.signed"))) if signed_dir.is_dir() else 0
         if signed_count == 0:
-            integrity_log("stage5", "no_signed_txs")
-            sys.exit("[!] Phase 'sign' produced no signed TX files. Check wallet file and password.")
-        print(f"  [+] {signed_count} TXs signed.")
-
+            integrity_log("stage5", f"no_signed_txs:{label}")
+            sys.exit(f"[!] {label}: phase 'sign' produced no signed TX files. "
+                     f"Check wallet file and password.")
+        print(f"  [+] {label}: {signed_count} TXs signed.")
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", "sign_timeout")
-        sys.exit("[!] Signing timed out after 30 min")
+        integrity_log("stage5", f"sign_timeout:{label}")
+        sys.exit(f"[!] {label}: signing timed out after 30 min")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"sign_fail:{e.returncode}")
-        sys.exit(f"[!] Signing failed (exit {e.returncode})")
+        integrity_log("stage5", f"sign_fail:{label}:{e.returncode}")
+        sys.exit(f"[!] {label}: signing failed (exit {e.returncode})")
 
     newnym()
     secure_delay(5.0, 15.0)
 
     try:
-        print("  [*] Stage 5c: Broadcasting signed TXs...")
+        print(f"  [*] {label} 5c: Broadcasting signed TXs...")
         subprocess.run(
             ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
              "--tor-proxy", args.tor_proxy,
              "--rpc", args.rpc_daemon],
             check=True, timeout=7200,
         )
-        integrity_log("stage5", "broadcast_ok")
+        integrity_log("stage5", f"broadcast_ok:{label}")
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", "broadcast_timeout")
-        sys.exit("[!] Broadcast timed out after 2 hours")
+        integrity_log("stage5", f"broadcast_timeout:{label}")
+        sys.exit(f"[!] {label}: broadcast timed out after 2 hours")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"broadcast_fail:{e.returncode}")
-        sys.exit(f"[!] Broadcast failed (exit {e.returncode})")
+        integrity_log("stage5", f"broadcast_fail:{label}:{e.returncode}")
+        sys.exit(f"[!] {label}: broadcast failed (exit {e.returncode})")
+
+    return signed_count
+
+
+def _wait_for_fanout_confirm(args, targets, proxy):
+    """Block until the fan-out subaddresses have UNLOCKED balance.
+
+    The DAG hop round spends outputs the fan-out round just created, and Monero
+    outputs are unspendable until they confirm and unlock (~10 blocks). We poll
+    each fan-out target's unlocked balance via wallet-rpc and return True once
+    all of them are unlocked. On timeout we return False so the caller can skip
+    DAG rather than create hops that would fail for 'no unlocked output'.
+    """
+    if not targets:
+        return False
+    try:
+        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    except Exception as e:
+        integrity_log("stage5", f"confirm_rpc_connect_fail:{str(e)[:40]}")
+        print(f"  [!] Could not connect wallet-rpc to await fan-out confirmation: {e}")
+        return False
+
+    print(f"  [*] Waiting for {len(targets)} fan-out output(s) to confirm+unlock "
+          f"(~10 blocks; up to {FANOUT_CONFIRM_TIMEOUT // 60} min)...")
+    waited = 0
+    while waited < FANOUT_CONFIRM_TIMEOUT:
+        if shutdown_requested():
+            integrity_log("stage5", "confirm_wait_interrupted")
+            return False
+        unlocked = 0
+        for acct, sub_idx in targets:
+            try:
+                _total, unlk = rpc.get_subaddress_balance(acct, sub_idx)
+                if unlk and int(unlk) > 0:
+                    unlocked += 1
+            except Exception as e:
+                integrity_log("stage5", f"confirm_poll_err:{str(e)[:30]}")
+        if unlocked >= len(targets):
+            integrity_log("stage5", f"fanout_confirmed:{unlocked}_targets")
+            print(f"  [+] All {unlocked} fan-out output(s) confirmed and unlocked.")
+            return True
+        print(f"  [*] {unlocked}/{len(targets)} confirmed; waiting {FANOUT_CONFIRM_POLL}s...")
+        time.sleep(FANOUT_CONFIRM_POLL)
+        waited += FANOUT_CONFIRM_POLL
+
+    integrity_log("stage5", "fanout_confirm_timeout")
+    print(f"  [!] Timed out after {FANOUT_CONFIRM_TIMEOUT // 60} min waiting for "
+          f"fan-out to unlock. Skipping DAG hop round (fan-out is already broadcast).")
+    return False
+
+
+def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
+                proxy, spendable_amount):
+    """Execute the create -> sign -> broadcast pipeline as confirmation-gated
+    rounds: fan-out first, then (optionally) the DAG hop round once the fan-out
+    outputs have unlocked on-chain, then the exit-strategy simulation."""
+    # -- Round 1: fan-out (always) ----------------------------------------
+    print("  [*] === Round 1: Fan-out distribution ===")
+    _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
+
+    # -- Round 2: DAG hop-mixing (only if planned) ------------------------
+    if dag_file:
+        newnym()
+        secure_delay(5.0, 15.0)
+        if _wait_for_fanout_confirm(args, fanout_targets, proxy):
+            print("  [*] === Round 2: DAG hop-mixing ===")
+            tor_recheck(proxy, "stage5_dag")
+            _run_round(args, dag_file, f"{staging_dir}/dag", "DAG")
+        else:
+            integrity_log("stage5", "dag_round_skipped:unconfirmed")
 
     newnym()
     secure_delay(5.0, 15.0)

@@ -251,13 +251,22 @@ def phase_sign(args, plan: List[dict]):
                 "--password", args.wallet_password or "",
                 "--command", "sign_transfer",
             ]
-            # sign_transfer always shows a blocking "Is this okay? (Y/Yes/No)"
+            # sign_transfer shows a blocking "Is this okay? (Y/Yes/No)"
             # confirmation on stdin before it writes signed_monero_tx, even in
             # --command (non-interactive) mode. Without answering it here, the
             # subprocess just hangs until the timeout below on every TX.
+            #
+            # Depending on wallet/daemon state, wallet-cli can emit an extra
+            # prompt BEFORE the sign confirmation (e.g. a "wallet is not
+            # connected to a daemon / use it anyway?" warning, or a ring-size
+            # confirmation). A single "y" would be consumed by that earlier
+            # prompt, leaving the sign confirmation unanswered and the process
+            # hanging until timeout. Feed several affirmatives so whichever
+            # prompt order occurs, the sign confirmation still gets its "y".
+            # Extra lines on stdin after signing completes are simply ignored.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                timeout=120, cwd=work_dir, input="y\n",
+                timeout=120, cwd=work_dir, input="y\n" * 4,
             )
 
             # sign_transfer creates signed_monero_tx in the working directory
