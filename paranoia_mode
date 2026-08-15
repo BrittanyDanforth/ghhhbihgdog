@@ -268,23 +268,33 @@ def _secure_delete_dir(path: Path) -> bool:
         return False
 
 
+# Module-level so they are a single introspectable source of truth: the
+# repo's .gitignore must cover every one of these, and tests/test_gitignore.py
+# ENFORCES that (a comment asking two lists to stay in sync is a hope, not a
+# guarantee -- they had already drifted once). Anything worth secure-deleting
+# is worth refusing to commit. Add a pattern here and the test tells you if
+# .gitignore is missing it.
+GS_ARTIFACT_FILE_PATTERNS = [
+    "unsigned_*.json", "signer_progress.json",
+    "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
+    "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+    "exitplan_*.json", "exitplan_v1.json",
+    "integrity_chain.log", "integrity.log",
+    "*.blob", "*.signed", "*.unsigned",
+    "signed_manifest_v1.json", "unsigned_manifest.json",
+    ".ghostspiral.lock",
+    "renamethis1",
+]
+GS_ARTIFACT_DIR_PATTERNS = [
+    "signed_blobs", "unsigned", "tx_staging",
+]
+
+
 def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
     common subdirectories, and any --search-dir paths provided."""
-    file_patterns = [
-        "unsigned_*.json", "signer_progress.json",
-        "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
-        "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
-        "exitplan_*.json", "exitplan_v1.json",
-        "integrity_chain.log", "integrity.log",
-        "*.blob", "*.signed", "*.unsigned",
-        "signed_manifest_v1.json", "unsigned_manifest.json",
-        ".ghostspiral.lock",
-        "renamethis1",
-    ]
-    dir_patterns = [
-        "signed_blobs", "unsigned", "tx_staging",
-    ]
+    file_patterns = GS_ARTIFACT_FILE_PATTERNS
+    dir_patterns = GS_ARTIFACT_DIR_PATTERNS
 
     search_roots = list(set([
         Path("."),

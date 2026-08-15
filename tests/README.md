@@ -11,6 +11,8 @@ python3 tests/test_realfns.py       # real fetch_prices + real wipe_gs_artifacts
 python3 tests/test_cli_flags.py     # every script: --help, argparse validation,
                                      # required/mutually-exclusive/choice flags,
                                      # pre-network runtime checks
+python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
+                                     # paranoia_mode wipes (OPSEC leak guard)
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
 python3 tests/real_flags_testnet.py      # real fee-priority 1-4 + multi-dest
@@ -33,6 +35,23 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install monero
 .venv/bin/python tests/real_phase_create_testnet.py
 ```
+
+### Committing an artifact is an OPSEC failure, so it is machine-checked
+
+`paranoia_mode.GS_ARTIFACT_FILE_PATTERNS` / `GS_ARTIFACT_DIR_PATTERNS` list what
+this toolchain treats as sensitive enough to securely delete — deposit
+addresses, memos, XMR destinations, txids, per-run traces. Anything on that
+list must never reach a commit, so `test_gitignore.py` asks the real
+`git check-ignore` whether a concrete filename built from each pattern is
+actually blocked, and fails if not.
+
+This replaced a comment asking the two lists to stay in sync. They had already
+drifted once: `.gitignore` matched only DEFAULT filenames, so an operator's
+`--outfile thor_pairs_myname.json` or a `signer_progress.json` would have been
+committed by `git add -A`. The test is verified to actually fail (exit 1) when
+a wipe pattern is added without a matching ignore rule — a green test that
+cannot go red proves nothing. It also guards the other direction: no tracked
+source file may be shadowed by the widened patterns.
 
 ### Which real tests run the shipped code, and which don't
 
