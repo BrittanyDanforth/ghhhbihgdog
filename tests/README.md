@@ -15,6 +15,8 @@ python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
 python3 tests/real_flags_testnet.py      # real fee-priority 1-4 + multi-dest
                                           # fan-out + password-protected signing
+python3 tests/real_dag_subaddr_testnet.py # on-chain proof subaddr_indices
+                                          # restricts a hop to ONE subaddress
 ```
 
 `real_roundtrip_testnet.py` is the non-mock proof: it funds a wallet on an
@@ -23,6 +25,12 @@ isolated testnet and runs view-only `transfer_split` → `sign_transfer` →
 hex↔binary and stdin logic against real `monerod`/`monero-wallet-rpc`/
 `monero-wallet-cli`. See `REAL_MONERO_VERIFICATION.md`. It needs those binaries
 (`apt-get install monero`) and SKIPs cleanly when they are absent.
+
+`real_dag_subaddr_testnet.py` is the on-chain proof that per-hop mixing is real:
+it funds several subaddresses, spends from exactly one with
+`subaddr_indices=[N]`, and confirms on-chain that only that subaddress's balance
+moved while the others stayed byte-identical — i.e. the DAG hop cannot silently
+pull from co-located funds.
 
 Only `requests` and `tenacity` are needed (both already required). The heavy
 deps (`monero`, `stem`, `psutil`) are imported lazily inside functions these
