@@ -25,7 +25,7 @@ OPSEC hardening (v10.5):
 """
 from __future__ import annotations
 import argparse, json, os, re, sys, time, subprocess
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import List
 
@@ -106,6 +106,30 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
             return fee_xmr
     integrity_log("fee", "using_fallback_fee")
     return FALLBACK_FEE_XMR * multiplier
+
+
+def compute_hop_amount(fanout_amt: Decimal, fee_xmr: Decimal) -> Decimal:
+    """How much a mix subaddress can hop onward, after reserving the fee.
+
+    Extracted from stage 4 so tests drive the REAL formula instead of a copy --
+    a modelled formula in a test cannot catch a regression in the shipped one.
+
+    Reserves the ACTUAL FEE, not a percentage. The old formula was
+    `fanout_amt * 0.85`, and its comment claimed the 15% remainder "covers the
+    fee (tiny next to fanout_amt)". That inverts for small fan-outs: the fee is
+    an ABSOLUTE amount while a percentage reserve shrinks with the hop. With a
+    real daemon fee of ~0.0024 XMR, every fanout_amt below ~0.016 XMR reserved
+    LESS than the fee -- the plan cleared the dust guard, then transfer_split
+    failed "not enough money" AFTER the fan-out had already executed on-chain,
+    leaving funds scattered mid-pipeline.
+
+    Uses the same 1.5x margin as the stage-4 fee budget, and ROUND_DOWN so
+    quantising can never round the hop UP past what the output actually holds.
+    The caller compares the result against DUST_XMR and skips the DAG round
+    when it is not fundable.
+    """
+    reserve = fee_xmr * Decimal("1.5")
+    return (fanout_amt - reserve).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
 
 def parse_swap_route(route: dict) -> tuple:
@@ -741,7 +765,18 @@ def main():
     # confirmed, so this round can always be created in one batch.
     mix_targets = [s for s in subs if s != ENTRY]
     fanout_count = min(len(mix_targets), args.wallets)
-    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(Decimal("0.0001"))
+    if fanout_count <= 0:
+        # Guard the divisor. mix_targets excludes ENTRY, so a degenerate
+        # subaddress set (or a create_subs that returned only ENTRY) would
+        # divide by zero here and crash with a bare ZeroDivisionError after
+        # the wallet work was already done.
+        integrity_log("stage4", "no_mix_targets")
+        sys.exit("[!] No mix subaddresses available to fan out into "
+                 f"(got {len(mix_targets)}). Cannot build a plan.")
+    # ROUND_DOWN: quantising must never round the per-destination amount UP,
+    # which would make N*fanout_amt exceed the 0.9 budget it was derived from.
+    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(
+        Decimal("0.0001"), rounding=ROUND_DOWN)
     if fanout_amt <= DUST_XMR:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
@@ -781,15 +816,28 @@ def main():
     # separate confirmation-gated round in Stage 5 (see _stage5_run).
     dag_plan = []
     if args.dag_mixing:
-        # Hop amount comes from each source's OWN fan-out balance (fanout_amt),
-        # not from ENTRY's leftover. Send 85% onward; the 15% headroom covers
-        # the fee (tiny next to fanout_amt) plus change, so amount + fee can
-        # never exceed the single confirmed output the hop spends.
-        dag_hop_amt = (fanout_amt * Decimal("0.85")).quantize(Decimal("0.0001"))
+        # Hop amount comes from each source's OWN fan-out balance (fanout_amt).
+        # Reserve the ACTUAL FEE, not a percentage. The old formula was
+        # fanout_amt * 0.85, whose comment claimed the 15% "covers the fee
+        # (tiny next to fanout_amt)" -- but the fee is an ABSOLUTE amount while
+        # the reserve scales with the hop, so the claim inverts for small
+        # fan-outs. With a real daemon fee of ~0.0024 XMR, any fanout_amt below
+        # ~0.016 XMR reserved LESS than the fee, and the plan passed every
+        # guard here and then failed "not enough money" inside transfer_split --
+        # after the fan-out had already executed on-chain and spent its fee,
+        # leaving funds scattered mid-pipeline. The dust guard did not catch it:
+        # it only required the hop to exceed 0.0001 XMR.
+        #
+        # Same 1.5x margin used for the fee budget above, and ROUND_DOWN so
+        # quantising can never round the hop UP past what the output holds.
+        _hop_reserve = fee_xmr * Decimal("1.5")
+        dag_hop_amt = compute_hop_amount(fanout_amt, fee_xmr)
         if dag_hop_amt <= DUST_XMR:
-            integrity_log("stage4", "dag_mixing_skipped:hop_below_dust")
-            print("  [!] DAG mixing skipped: per-hop amount below dust threshold "
-                  f"({dag_hop_amt} XMR). Fan-out distribution still runs.")
+            integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
+            print(f"  [!] DAG mixing skipped: each mix subaddress receives "
+                  f"{fanout_amt} XMR, which cannot fund a hop after reserving "
+                  f"{_hop_reserve} XMR for the fee (hop would be {dag_hop_amt} XMR). "
+                  f"Fan-out distribution still runs.")
         else:
             hop_sources = list(funded_targets)
             _secrets.SystemRandom().shuffle(hop_sources)

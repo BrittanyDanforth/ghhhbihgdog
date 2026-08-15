@@ -397,6 +397,54 @@ check("fingerprint: numeric and string amounts normalise identically",
       _fp([{"src_index": 0, "dst": "B", "amt": 0.4}]))
 
 # ---------------------------------------------------------------------------
+# MONEY PATH: the DAG hop must reserve the ACTUAL fee, not a percentage.
+# The old formula was fanout_amt * 0.85, i.e. a 15% reserve -- but the fee is
+# an ABSOLUTE amount, so the reserve shrinks with the hop while the fee does
+# not. With a real daemon fee (~0.0024 XMR) every fanout_amt below ~0.016 XMR
+# reserved LESS than the fee: the plan passed the dust guard and then failed
+# "not enough money" inside transfer_split, AFTER the fan-out had already
+# executed on-chain. Model both formulas and assert the new one is fundable.
+# ---------------------------------------------------------------------------
+from decimal import ROUND_DOWN as _RD
+_REAL_FEE = Decimal(1200000 * 2000) / Decimal(10 ** 12)   # real monerod 0.18.3.1
+_RESERVE = _REAL_FEE * Decimal("1.5")
+_DUST = Decimal("0.0001")
+
+
+def _hop_old(fanout):
+    """The OLD shipped formula, kept only to demonstrate the band it broke."""
+    return (fanout * Decimal("0.85")).quantize(Decimal("0.0001"))
+
+
+def _hop_new(fanout):
+    """Drives the REAL shipped function -- not a model of it. A formula
+    reimplemented in the test cannot catch a regression in the original, which
+    is exactly the vacuous-test pattern this suite keeps producing."""
+    return ghost.compute_hop_amount(fanout, _REAL_FEE)
+
+
+# The band where the OLD formula silently produced an unfundable hop.
+_broken_old = [f for f in ["0.005", "0.01", "0.0141"]
+               if _hop_old(Decimal(f)) > _DUST
+               and (Decimal(f) - _hop_old(Decimal(f))) < _REAL_FEE]
+check(f"money: the OLD 0.85 formula WAS unfundable for small fan-outs "
+      f"(reproduced at {_broken_old})", len(_broken_old) == 3)
+
+for _f in ["0.005", "0.01", "0.0141", "0.016", "0.02", "0.05", "1.0"]:
+    _fan = Decimal(_f)
+    _hop = _hop_new(_fan)
+    if _hop <= _DUST:
+        check(f"money: fanout={_f} -> hop skipped as unfundable (correct)", True)
+    else:
+        check(f"money: fanout={_f} -> hop {_hop} leaves >= the real fee for the TX",
+              (_fan - _hop) >= _REAL_FEE)
+
+check("money: hop never exceeds what the subaddress received",
+      all(_hop_new(Decimal(f)) < Decimal(f) for f in ["0.005", "0.02", "1.0"]))
+check("money: ROUND_DOWN quantise never rounds the hop UP past the output",
+      _hop_new(Decimal("0.019999")) <= Decimal("0.019999") - _RESERVE)
+
+# ---------------------------------------------------------------------------
 # ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;
 # GhostSpiral's BTC_RE-only check was the odd one out.
 # ---------------------------------------------------------------------------
