@@ -24,7 +24,7 @@ import requests
 
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
-    newnym, secure_delay, atomic_write_json,
+    newnym, secure_delay, atomic_write_json, check_daemon_relay_egress,
     install_signal_handlers, shutdown_requested,
 )
 
@@ -99,6 +99,14 @@ def main():
                      help="max rebroadcast attempts per TX")
     cli.add_argument("--timeout-min", type=int, default=30,
                      help="per-TX broadcast timeout in minutes")
+    cli.add_argument("--rpc-daemon",
+                     help="monerod RPC (NOT wallet-rpc, e.g. http://127.0.0.1:18081). "
+                          "When given, the relay egress is VERIFIED by inspecting the "
+                          "daemon's peer connections instead of merely warned about.")
+    cli.add_argument("--allow-clearnet-relay", action="store_true",
+                     help="Proceed even when the daemon is verified to relay to raw-IP "
+                          "peers. This reveals to those peers that the transaction "
+                          "originated from your IP.")
     cli.add_argument("--resume", help="progress file for crash-resume")
     args = cli.parse_args()
 
@@ -119,8 +127,41 @@ def main():
     # (e.g. monerod --tx-proxy tor,127.0.0.1:9050 and wallet-rpc --proxy) or the
     # broadcast egress is clearnet regardless of what this script reports.
     print("  [!] OPSEC: relay egress is controlled by the wallet-rpc/monerod")
-    print("  [!] Tor config (--tx-proxy/--proxy), NOT by this script. Verify it.")
+    print("  [!] Tor config (--tx-proxy/--proxy), NOT by this script.")
     integrity_log("broadcast", "egress_via_walletrpc_daemon_conn")
+
+    # Actually CHECK that egress instead of only telling the operator to. The
+    # transaction leaves the machine via monerod's peer connections, so a
+    # perfectly Tor-proxied pipeline still deanonymises the tx if the daemon
+    # talks to clearnet peers. Requires --rpc-daemon (the daemon, not the
+    # wallet-rpc); without it we can only repeat the warning.
+    if args.rpc_daemon:
+        eg = check_daemon_relay_egress(args.rpc_daemon, proxy)
+        integrity_log("broadcast", f"relay_egress:{eg['verdict']}")
+        if eg["verdict"] == "clearnet":
+            print(f"  [!] RELAY EGRESS IS CLEARNET: {eg['detail']}")
+            if not args.allow_clearnet_relay:
+                sys.exit(
+                    "[!] Refusing to broadcast. monerod is relaying to raw-IP peers,\n"
+                    "    so submitting this transaction would reveal to those peers\n"
+                    "    that it originated from your IP -- defeating the entire\n"
+                    "    mixing pipeline.\n"
+                    "    Fix: restart monerod with --tx-proxy tor,127.0.0.1:9050\n"
+                    "         (and typically --anonymous-inbound / no clearnet peers).\n"
+                    "    Override only if you understand the exposure: "
+                    "--allow-clearnet-relay"
+                )
+            print("  [!] --allow-clearnet-relay given; continuing DESPITE clearnet egress.")
+        elif eg["verdict"] == "tor":
+            print(f"  [+] Relay egress verified anonymous: {eg['detail']}")
+        elif eg["verdict"] == "offline":
+            sys.exit(f"[!] {eg['detail']} — the broadcast would silently go nowhere.")
+        else:
+            print(f"  [!] Could NOT verify relay egress ({eg['detail']}).")
+            print("  [!] Treat the broadcast as clearnet unless you configured Tor.")
+    else:
+        print("  [!] Pass --rpc-daemon to have this script VERIFY the relay egress")
+        print("  [!] instead of trusting it.")
 
     # Build RPC pool. NOTE: a signed tx-set can only be submitted by the
     # wallet-rpc that CREATED it (it holds the matching key images), so

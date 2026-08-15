@@ -128,6 +128,78 @@ def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
     secure_write_bytes(path, data.encode(), mode)
 
 
+def check_daemon_relay_egress(daemon_url: str,
+                              proxies: Optional[Dict[str, str]] = None) -> dict:
+    """Inspect where a monerod would actually BROADCAST a transaction.
+
+    This closes the last hop nobody was checking. Every request this toolchain
+    makes can be perfectly Tor-proxied and the transaction can still be handed
+    to a daemon that relays it to clearnet peers -- which tells those peers
+    which IP originated the transaction, defeating the whole pipeline. The code
+    previously only PRINTED "verify it yourself", which is not verification.
+
+    monerod exposes no RPC reporting its --tx-proxy setting (confirmed against
+    0.18.3.1: get_info has no proxy field, and get_net_stats/get_limit are not
+    even available on a restricted RPC). What IS observable is the peer list
+    from get_connections: a relay peer reached over Tor/I2P has a .onion/.i2p
+    address, while a clearnet peer shows a raw IP. That is a direct observation
+    of where traffic leaves, not an inference from configuration.
+
+    Returns a verdict dict -- deliberately NOT a bare bool, because "cannot
+    tell" is a distinct and honest outcome from "clearnet":
+      verdict: "tor" | "clearnet" | "offline" | "unknown"
+      onion/clear: peer counts;  detail: human-readable reason
+    Never raises: a failed probe reports "unknown" rather than blocking a
+    broadcast on a diagnostic.
+    """
+    out = {"verdict": "unknown", "onion": 0, "clear": 0, "detail": ""}
+    parsed = urlparse(daemon_url)
+    host = (parsed.hostname or "127.0.0.1").lower()
+    use_proxies = None
+    if host not in _LOCALHOST_NAMES:
+        if not proxies:
+            out["detail"] = "remote daemon and no proxy available to query it"
+            return out
+        use_proxies = proxies
+
+    endpoint = daemon_url.rstrip("/") + "/json_rpc"
+    try:
+        info = requests.post(
+            endpoint, json={"jsonrpc": "2.0", "id": "0", "method": "get_info"},
+            timeout=20, proxies=use_proxies).json().get("result") or {}
+        if info.get("offline"):
+            out["verdict"] = "offline"
+            out["detail"] = "daemon is running --offline; it cannot relay at all"
+            return out
+
+        conns = requests.post(
+            endpoint, json={"jsonrpc": "2.0", "id": "0", "method": "get_connections"},
+            timeout=20, proxies=use_proxies).json().get("result") or {}
+        peers = conns.get("connections")
+        if peers is None:
+            out["detail"] = ("daemon did not return a peer list (restricted RPC?) -- "
+                             "cannot observe where it relays")
+            return out
+        for c in peers:
+            addr = str(c.get("address") or c.get("host") or "").lower()
+            if ".onion" in addr or ".i2p" in addr:
+                out["onion"] += 1
+            elif addr:
+                out["clear"] += 1
+        if out["onion"] and not out["clear"]:
+            out["verdict"] = "tor"
+            out["detail"] = f"all {out['onion']} relay peer(s) are .onion/.i2p"
+        elif out["clear"]:
+            out["verdict"] = "clearnet"
+            out["detail"] = (f"{out['clear']} clearnet peer(s) vs {out['onion']} "
+                             f"anonymous -- the tx would be relayed to raw IPs")
+        else:
+            out["detail"] = "daemon has no peer connections yet; nothing to observe"
+    except Exception as e:
+        out["detail"] = f"probe failed: {str(e)[:60]}"
+    return out
+
+
 def secure_mkdir(path: Path, mode: int = 0o700) -> None:
     """Create a directory owner-only, including any parents.
 

@@ -201,6 +201,106 @@ _reqs = open(os.path.join(REPO, "requirements.txt")).read().lower()
 check("requirements.txt declares PySocks (socks5h is unusable without it)",
       "pysocks" in _reqs)
 
+# ---------------------------------------------------------------------------
+# 7. RELAY EGRESS. The last hop nobody was checking: every request can be
+#    perfectly Tor-proxied and the transaction still deanonymised, because it
+#    leaves via monerod's peer connections. monerod exposes no RPC reporting
+#    --tx-proxy (verified against 0.18.3.1), but get_connections shows whether
+#    peers are .onion/.i2p or raw IPs -- a direct observation of egress.
+# ---------------------------------------------------------------------------
+class _Resp:
+    def __init__(self, d): self._d = d
+    def json(self): return self._d
+    def raise_for_status(self): pass
+
+
+def _egress_verdict(info, conns):
+    real = gs.requests.post
+    try:
+        gs.requests.post = lambda url, json=None, **k: _Resp(
+            {"result": info if json.get("method") == "get_info" else conns})
+        return gs.check_daemon_relay_egress("http://127.0.0.1:18081")
+    finally:
+        gs.requests.post = real
+
+
+for name, info, conns, expect in [
+    ("all peers .onion -> tor", {"offline": False},
+     {"connections": [{"address": "abc.onion:18080"}, {"address": "d.onion:18080"}]}, "tor"),
+    ("all peers .i2p -> tor", {"offline": False},
+     {"connections": [{"address": "xyz.b32.i2p:0"}]}, "tor"),
+    ("ANY clearnet peer -> clearnet", {"offline": False},
+     {"connections": [{"address": "abc.onion:18080"}, {"address": "51.75.162.1:18080"}]},
+     "clearnet"),
+    ("all raw IPs -> clearnet", {"offline": False},
+     {"connections": [{"address": "51.75.162.1:18080"}]}, "clearnet"),
+    ("no peers -> unknown (not a false all-clear)", {"offline": False},
+     {"connections": []}, "unknown"),
+    ("restricted rpc -> unknown", {"offline": False}, {}, "unknown"),
+    ("daemon --offline -> offline", {"offline": True}, {}, "offline"),
+]:
+    check(f"relay egress: {name}", _egress_verdict(info, conns)["verdict"] == expect)
+
+# A mixed peer set must NOT be reported as safe: one clearnet peer is enough to
+# expose the originating IP, so "mostly onion" is still clearnet.
+_mixed = _egress_verdict({"offline": False},
+                         {"connections": [{"address": "a.onion:1"}] * 9 +
+                                          [{"address": "51.75.162.1:1"}]})
+check("relay egress: 9 onion + 1 clearnet is still CLEARNET (not majority-vote)",
+      _mixed["verdict"] == "clearnet")
+
+# The probe must never raise -- a diagnostic failure must not block a broadcast.
+_real_post = gs.requests.post
+try:
+    gs.requests.post = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    _v = gs.check_daemon_relay_egress("http://127.0.0.1:18081")
+    check("relay egress: a failed probe returns 'unknown', never raises",
+          _v["verdict"] == "unknown" and "probe failed" in _v["detail"])
+finally:
+    gs.requests.post = _real_post
+
+# A remote daemon with no proxy must not be probed over clearnet.
+check("relay egress: remote daemon without proxy is not probed in the clear",
+      gs.check_daemon_relay_egress("http://example.com:18081", None)["verdict"] == "unknown")
+
+# broadcast must ABORT on a verified-clearnet relay, and only proceed with the
+# explicit override.
+_EGRESS_DETAIL = {
+    "clearnet": "3 clearnet peer(s) vs 0 anonymous",
+    "offline": "daemon is running --offline; it cannot relay at all",
+    "tor": "all 3 relay peer(s) are .onion/.i2p",
+    "unknown": "daemon has no peer connections yet",
+}
+
+
+def _run_broadcast(extra_argv, verdict):
+    b = load("broadcast_signed_xmr")
+    b.verify_tor = lambda *a, **k: None
+    # Detail must match the verdict: an earlier version of this test returned a
+    # clearnet detail for every verdict, so the offline assertion failed on the
+    # MOCK's wording rather than on the code under test.
+    b.check_daemon_relay_egress = lambda *a, **k: {
+        "verdict": verdict, "onion": 0, "clear": 3,
+        "detail": _EGRESS_DETAIL[verdict]}
+    argv = sys.argv[:]
+    sys.argv = ["broadcast_signed_xmr", "/nonexistent_path",
+                "--tor-proxy", "socks5h://127.0.0.1:9050",
+                "--rpc-daemon", "http://127.0.0.1:18081"] + extra_argv
+    try:
+        b.main(); return ""
+    except SystemExit as e:
+        return str(e)
+    finally:
+        sys.argv = argv
+
+
+check("broadcast: REFUSES to relay when egress is verified clearnet",
+      "Refusing to broadcast" in _run_broadcast([], "clearnet"))
+check("broadcast: --allow-clearnet-relay overrides the refusal",
+      "Refusing to broadcast" not in _run_broadcast(["--allow-clearnet-relay"], "clearnet"))
+check("broadcast: aborts when the daemon is offline (broadcast would vanish)",
+      "cannot relay" in _run_broadcast([], "offline"))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)
