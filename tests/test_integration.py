@@ -255,6 +255,103 @@ _blob = _sign_dir / "signed" / "tx_0.signed"
 check("C: signed tx written 0600 (never world-readable)",
       _blob.exists() and (_blob.stat().st_mode & 0o777) == 0o600)
 
+# ===========================================================================
+# D. GhostSpiral orchestration must actually WIRE the safety features through
+#    to its child processes. Building a check and not connecting it to the
+#    main path is the failure mode these assertions exist to prevent.
+# ===========================================================================
+ghost = load("GhostSpiral")
+
+# D1: relay-egress refusal happens at STAGE 0, before any work. Discovering a
+# clearnet daemon at broadcast time would mean refusing only after the fan-out,
+# the on-chain confirmation wait and the signing -- leaving signed transactions
+# on disk for nothing.
+_reached = {"rpc": False}
+
+
+def _boom_connect(*a, **k):
+    _reached["rpc"] = True
+    raise RuntimeError("stage 0 should have aborted before RPC connect")
+
+
+_saved = (ghost.verify_tor, ghost.require_resources,
+          ghost.check_daemon_relay_egress, ghost.connect_rpc)
+try:
+    ghost.verify_tor = lambda *a, **k: None
+    ghost.require_resources = lambda *a, **k: None
+    ghost.connect_rpc = _boom_connect
+    ghost.check_daemon_relay_egress = lambda *a, **k: {
+        "verdict": "clearnet", "onion": 0, "clear": 4, "detail": "4 clearnet peer(s)"}
+    _argv = sys.argv[:]
+    sys.argv = ["GhostSpiral", "--btc-entry",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                "--tor-proxy", "socks5h://127.0.0.1:9050"]
+    _msg = ""
+    try:
+        ghost.main()
+    except SystemExit as e:
+        _msg = str(e)
+    finally:
+        sys.argv = _argv
+    check("D1: GhostSpiral aborts on clearnet relay egress",
+          "Aborting BEFORE any work" in _msg)
+    check("D1: abort happens BEFORE any RPC work is done", _reached["rpc"] is False)
+finally:
+    (ghost.verify_tor, ghost.require_resources,
+     ghost.check_daemon_relay_egress, ghost.connect_rpc) = _saved
+
+# D2: the egress flags must actually REACH the broadcast child. The check was
+# implemented in broadcast first and left unwired here, so the orchestrated
+# path -- the primary one -- silently skipped it.
+_stage = Path(os.getcwd()) / "stageD"
+(_stage / "signed").mkdir(parents=True, exist_ok=True)
+(_stage / "tx_0.unsigned").write_text("00")
+(_stage / "signed" / "tx_0.signed").write_bytes(b"x")
+_planD = Path(os.getcwd()) / "planD.json"
+_planD.write_text("{}")
+
+
+def _child_argv(allow_clearnet):
+    seen = []
+    real_run, real_log = ghost.subprocess.run, ghost.integrity_log
+    try:
+        ghost.subprocess.run = lambda cmd, **kw: (
+            seen.append(list(cmd)), types.SimpleNamespace(returncode=0))[1]
+        ghost.integrity_log = lambda *a, **k: None
+        a = types.SimpleNamespace(
+            tor_proxy="socks5h://127.0.0.1:9050",
+            rpc_primary="http://127.0.0.1:18083",
+            rpc_daemon="http://127.0.0.1:18081",
+            wallet_file="w", wallet_password="SECRET-PW", fee_priority=1,
+            allow_clearnet_relay=allow_clearnet)
+        ghost._run_round(a, _planD, str(_stage), "Fan-out")
+    finally:
+        ghost.subprocess.run, ghost.integrity_log = real_run, real_log
+    return seen
+
+
+_cmds = _child_argv(False)
+_bc = [c for c in _cmds if "broadcast_signed_xmr" in c]
+check("D2: GhostSpiral spawns the broadcast child", len(_bc) == 1)
+check("D2: --rpc-daemon forwarded (so the child VERIFIES egress, not warns)",
+      "--rpc-daemon" in _bc[0])
+check("D2: --allow-clearnet-relay NOT forwarded when not requested",
+      "--allow-clearnet-relay" not in _bc[0])
+
+_bc_allow = [c for c in _child_argv(True) if "broadcast_signed_xmr" in c]
+check("D2: --allow-clearnet-relay IS forwarded when the operator set it "
+      "(otherwise the child would refuse despite the override)",
+      "--allow-clearnet-relay" in _bc_allow[0])
+
+# D3: the signer child must never receive the wallet password on argv, where
+# any local user can read it from /proc/<pid>/cmdline (mode 444).
+_sign = [c for c in _cmds if "airgap_tx_signer" in c and "sign" in c]
+check("D3: GhostSpiral spawns the signer child", len(_sign) == 1)
+check("D3: wallet password NOT on the signer child's argv",
+      not any("SECRET-PW" in str(t) for t in _sign[0]))
+check("D3: --wallet-password flag not used at all",
+      "--wallet-password" not in _sign[0])
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

@@ -35,6 +35,7 @@ from gs_common import (
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
+    check_daemon_relay_egress,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -188,6 +189,10 @@ def main():
                           "PREFER GS_WALLET_PASSWORD=... in the environment: an "
                           "argv password is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444).")
+    cli.add_argument("--allow-clearnet-relay", action="store_true",
+                     help="Proceed even when monerod is verified to relay to raw-IP "
+                          "peers. Every transaction this run creates would then be "
+                          "broadcast from your IP.")
     cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
                      help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
     args = cli.parse_args()
@@ -242,6 +247,36 @@ def main():
     require_resources(min_disk_gb=2.0)
     verify_tor(proxy)
     integrity_log("stage0", "tor_ok")
+
+    # Relay egress is checked HERE, at startup -- not at broadcast time. The
+    # transaction leaves the machine over monerod's peer connections, so a
+    # clearnet-relaying daemon deanonymises the whole run no matter how well
+    # this process is proxied. Discovering that at the broadcast step would mean
+    # refusing AFTER the fan-out, the on-chain confirmation wait (up to an hour)
+    # and the signing -- leaving signed transactions on disk and the operator's
+    # time wasted. Fail before any of that happens.
+    egress = check_daemon_relay_egress(args.rpc_daemon, proxy)
+    integrity_log("stage0", f"relay_egress:{egress['verdict']}")
+    if egress["verdict"] == "clearnet":
+        print(f"  [!] RELAY EGRESS IS CLEARNET: {egress['detail']}")
+        if not args.allow_clearnet_relay:
+            sys.exit(
+                "[!] Aborting BEFORE any work is done. Your monerod is relaying to\n"
+                "    raw-IP peers, so every transaction this run creates would be\n"
+                "    broadcast from your IP — defeating the entire mixing pipeline.\n"
+                "    Fix: restart monerod with --tx-proxy tor,127.0.0.1:9050\n"
+                "    Override only if you understand the exposure: --allow-clearnet-relay"
+            )
+        print("  [!] --allow-clearnet-relay given; proceeding DESPITE clearnet egress.")
+    elif egress["verdict"] == "offline":
+        sys.exit(f"[!] {egress['detail']} — every broadcast this run would silently "
+                 f"go nowhere. Start monerod without --offline.")
+    elif egress["verdict"] == "tor":
+        print(f"  [+] Relay egress verified anonymous: {egress['detail']}")
+    else:
+        print(f"  [!] Could NOT verify relay egress ({egress['detail']}).")
+        print("  [!] Treat the broadcast as clearnet unless you configured "
+              "monerod --tx-proxy.")
 
     # Fee estimation done after RPC is connected (needs the RPC)
     integrity_log("stage0", "env_checks_ok")
@@ -903,13 +938,21 @@ def _run_round(args, plan_file, staging_dir, label):
         # its own progress file under its own staging subdir so the fan-out and
         # DAG rounds -- distinct blob sets -- never trip each other's stale-
         # progress guard (which would abort the second round).
-        subprocess.run(
-            ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
-             "--tor-proxy", args.tor_proxy,
-             "--rpc", args.rpc_primary,
-             "--resume", f"{staging_dir}/bcast_progress.json"],
-            check=True, timeout=7200,
-        )
+        # --rpc-daemon is forwarded so the child VERIFIES relay egress rather
+        # than only warning. Stage 0 already checked it, but peers change over
+        # a long run: a daemon that was Tor-only at startup can pick up
+        # clearnet peers before this broadcast happens, so it is re-checked at
+        # the moment of relay. --allow-clearnet-relay is forwarded too, or the
+        # operator's explicit override at the top level would be silently
+        # dropped and the child would refuse anyway.
+        _bcast_cmd = ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
+                      "--tor-proxy", args.tor_proxy,
+                      "--rpc", args.rpc_primary,
+                      "--rpc-daemon", args.rpc_daemon,
+                      "--resume", f"{staging_dir}/bcast_progress.json"]
+        if args.allow_clearnet_relay:
+            _bcast_cmd.append("--allow-clearnet-relay")
+        subprocess.run(_bcast_cmd, check=True, timeout=7200)
         integrity_log("stage5", f"broadcast_ok:{label}")
     except subprocess.TimeoutExpired:
         integrity_log("stage5", f"broadcast_timeout:{label}")
