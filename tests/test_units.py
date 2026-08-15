@@ -173,6 +173,18 @@ check("bech32: corrupted checksum fails", not gs.bech32_checksum_ok("bc1qw508d6q
 check("bech32: legacy 1-addr fails", not gs.bech32_checksum_ok("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))
 check("bech32: mixed case fails", not gs.bech32_checksum_ok("bc1qw508D6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
 check("bech32: empty fails", not gs.bech32_checksum_ok(""))
+# Witness-structure rules (BIP350). A checksum test ALONE accepted all three of
+# these; Bitcoin Core rejects them and BTC sent to them is unrecoverable.
+check("bech32: v1 taproot (bech32m) passes",
+      gs.bech32_checksum_ok("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"))
+check("bech32: v0 addr with bech32m checksum REJECTED",
+      not gs.bech32_checksum_ok("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh"))
+check("bech32: v1 addr with bech32 checksum REJECTED",
+      not gs.bech32_checksum_ok("bc1p38j9r5y49hruaue7wxjce0updqjuyyx0kh56v8s25huc6995vvpql3jow4"))
+check("bech32: witness program too short REJECTED",
+      not gs.bech32_checksum_ok("bc1pw5dgrnzv"))
+check("bech32: empty witness program REJECTED",
+      not gs.bech32_checksum_ok("bc1gmk9yu"))
 
 # ---------------------------------------------------------------------------
 # gs_common misc: validate_proxy, scrub_address, secure_hex

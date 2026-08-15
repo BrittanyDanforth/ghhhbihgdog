@@ -443,12 +443,22 @@ def _bech32_hrp_expand(hrp: str):
 
 
 def bech32_checksum_ok(addr: str) -> bool:
-    """Verify a BTC bech32/bech32m address's CHECKSUM, not just its charset.
+    """Fully validate a BTC segwit address: checksum AND witness structure.
 
     A format regex accepts a typo'd address as long as the wrong characters stay
     in-charset; for an address we tell someone to send real BTC to, that risks
     irrecoverable funds. This runs the actual BIP173 (v0) / BIP350 (v1+ taproot)
-    polymod and returns True only when the checksum is genuinely valid.
+    polymod AND enforces the witness rules, because a checksum test alone is not
+    enough -- an earlier version of this function accepted three classes of
+    address that Bitcoin Core rejects:
+      * a v0 address carrying a bech32m checksum (and vice-versa). The checksum
+        VARIANT is bound to the witness version: v0 must be bech32 (const 1),
+        v1+ must be bech32m (const 0x2bc830a3). Accepting either constant for
+        either version is exactly BIP350's invalid-vector list.
+      * a witness program of illegal length (e.g. "bc1pw5dgrnzv"): the program
+        must be 2..40 bytes, and for v0 specifically exactly 20 or 32.
+      * an empty data part with no witness version byte at all.
+    Sending to any of those loses the funds, so all three now return False.
     """
     if not addr or any(ord(c) < 33 or ord(c) > 126 for c in addr):
         return False
@@ -464,7 +474,37 @@ def bech32_checksum_ok(addr: str) -> bool:
     except ValueError:
         return False
     const = _bech32_polymod(_bech32_hrp_expand(hrp) + data)
-    return const in (1, 0x2bc830a3)   # bech32 (v0) or bech32m (v1+)
+    if const not in (1, 0x2bc830a3):
+        return False
+
+    payload = data[:-6]          # strip the 6 checksum symbols
+    if not payload:              # no witness version byte at all
+        return False
+    witver = payload[0]
+    if witver > 16:
+        return False
+    # Checksum variant is BOUND to the witness version (BIP350).
+    if witver == 0 and const != 1:
+        return False
+    if witver >= 1 and const != 0x2bc830a3:
+        return False
+
+    # Re-pack the 5-bit groups into bytes to check the program length.
+    acc = bits = 0
+    program = []
+    for v in payload[1:]:
+        acc = (acc << 5) | v
+        bits += 5
+        if bits >= 8:
+            bits -= 8
+            program.append((acc >> bits) & 0xFF)
+    if bits >= 5 or ((acc << (8 - bits)) & 0xFF):
+        return False             # excess padding / non-zero pad bits
+    if not (2 <= len(program) <= 40):
+        return False
+    if witver == 0 and len(program) not in (20, 32):
+        return False
+    return True
 
 
 def secure_delete_file(path: Path) -> bool:

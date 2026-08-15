@@ -17,7 +17,28 @@ python3 tests/real_flags_testnet.py      # real fee-priority 1-4 + multi-dest
                                           # fan-out + password-protected signing
 python3 tests/real_dag_subaddr_testnet.py # on-chain proof subaddr_indices
                                           # restricts a hop to ONE subaddress
+python3 tests/real_phase_sign_testnet.py # calls the SHIPPED phase_sign() and
+                                          # relays its output to a real daemon
 ```
+
+### Which real tests run the shipped code, and which don't
+
+This distinction matters and is easy to overstate, so it is spelled out:
+
+- `real_phase_sign_testnet.py` **imports `airgap_tx_signer` and calls
+  `phase_sign(args, plan)`**. The shipped manifest load, plan-fingerprint check,
+  sha256 verify, hex→binary decode, password-first stdin protocol, signed-file
+  collection and partial-sign abort are what actually execute; the resulting
+  blob is then relayed by a real daemon and confirmed on-chain, and a
+  hash-mismatched entry is proven to abort without signing.
+- `real_roundtrip_testnet.py`, `real_flags_testnet.py` and
+  `real_dag_subaddr_testnet.py` **reimplement the RPC/CLI sequence inline**
+  rather than importing the scripts. They prove the Monero-side protocol the
+  pipeline depends on (hex↔binary tx-sets, `sign_transfer` prompt order,
+  `submit_transfer` relay, per-priority fees, `subaddr_indices` isolation) is
+  what this code assumes. They do **not** prove the shipped functions are free
+  of drift — a copy of the logic cannot catch a regression in the original.
+  Treat them as protocol validation, not product validation.
 
 `real_roundtrip_testnet.py` is the non-mock proof: it funds a wallet on an
 isolated testnet and runs view-only `transfer_split` → `sign_transfer` →
