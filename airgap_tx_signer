@@ -306,17 +306,18 @@ def phase_sign(args, plan: List[dict]):
                 "--password", args.wallet_password or "",
                 "--command", "sign_transfer",
             ]
-            # STDIN protocol, verified empirically against real monero-wallet-cli
-            # 0.18.3.1: sign_transfer FIRST reads the wallet password from stdin
-            # (a spend re-confirmation, even though --password is on the CLI),
-            # and only THEN shows the "Is this okay? (Y/Yes/No)" confirmation
-            # before writing signed_monero_tx. Proof: with an (invalid) unsigned
-            # file present, stdin "y\n" gave "Error: invalid password" (the 'y'
-            # was taken as the password) while stdin "<pw>\n" got past it. So the
-            # first line MUST be the password, then the affirmatives. Feeding
-            # "y" first (the old code) made every real sign fail with "invalid
-            # password". Extra trailing lines are harmless -- once --command
-            # finishes, wallet-cli ignores remaining stdin.
+            # STDIN protocol, verified end-to-end against real monero-wallet-cli
+            # 0.18.3.1 (a full cold-signing round-trip on an isolated testnet --
+            # see tests/real_roundtrip_testnet.py): sign_transfer FIRST reads the
+            # wallet password from stdin (a spend re-confirmation, even though
+            # --password is on the CLI), and THEN shows the real prompt
+            # "...Is this okay?  (Y/Yes/N/No):" before writing signed_monero_tx.
+            # So the first line MUST be the password, then the affirmative. With
+            # a VALID unsigned tx this sequence produced "Transaction successfully
+            # signed to file signed_monero_tx". The old "y" first made every sign
+            # fail with "invalid password" (the 'y' was taken as the password).
+            # Extra trailing lines are harmless -- once --command finishes,
+            # wallet-cli ignores remaining stdin.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, cwd=work_dir,

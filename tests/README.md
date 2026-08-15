@@ -8,7 +8,16 @@ functions — no reimplementations — with the Monero/Tor dependencies mocked.
 python3 tests/test_units.py         # validation, fingerprint, fee parsing, helpers
 python3 tests/test_integration.py   # real phase_create + real broadcast.main()
 python3 tests/test_realfns.py       # real fetch_prices + real wipe_gs_artifacts
+python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
+                                          # monero binaries (SKIPs if not installed)
 ```
+
+`real_roundtrip_testnet.py` is the non-mock proof: it funds a wallet on an
+isolated testnet and runs view-only `transfer_split` → `sign_transfer` →
+`submit_transfer` → on-chain confirmation, exercising the pipeline's actual
+hex↔binary and stdin logic against real `monerod`/`monero-wallet-rpc`/
+`monero-wallet-cli`. See `REAL_MONERO_VERIFICATION.md`. It needs those binaries
+(`apt-get install monero`) and SKIPs cleanly when they are absent.
 
 Only `requests` and `tenacity` are needed (both already required). The heavy
 deps (`monero`, `stem`, `psutil`) are imported lazily inside functions these
