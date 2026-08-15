@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse, json, time, sys, os, hashlib
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 import requests
 
@@ -27,12 +28,28 @@ from gs_common import (
     install_signal_handlers, shutdown_requested,
 )
 
+_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+
+
+def _is_localhost(url: str) -> bool:
+    return (urlparse(url).hostname or "").lower() in _LOCALHOST_HOSTS
+
 
 def _single_post(url: str, payload: dict, proxies=None) -> dict:
     """Single-attempt POST without tenacity retry. Used for broadcast
-    submissions where the outer loop handles retries with NEWNYM rotation."""
-    if proxies is None:
-        sys.exit("[!] _single_post called without proxies — clearnet leak. Aborting.")
+    submissions where the outer loop handles retries with NEWNYM rotation.
+
+    A localhost RPC (wallet-rpc / daemon on 127.0.0.1) is contacted DIRECTLY:
+    Tor's SOCKS port refuses to route to loopback, so proxying a localhost POST
+    would fail on every attempt. Only a NON-localhost target needs the Tor proxy
+    -- and a non-localhost POST with no proxies is a clearnet leak, so it aborts.
+    This mirrors gs_common.MoneroRPC, which likewise skips the proxy for
+    localhost hosts.
+    """
+    if _is_localhost(url):
+        proxies = None  # never route loopback through Tor
+    elif proxies is None:
+        sys.exit("[!] _single_post to non-localhost without proxies — clearnet leak. Aborting.")
     r = requests.post(url, json=payload, timeout=30, proxies=proxies)
     r.raise_for_status()
     return r.json()

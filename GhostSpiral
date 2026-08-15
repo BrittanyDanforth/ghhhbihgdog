@@ -856,6 +856,12 @@ def _wait_for_fanout_confirm(args, targets, proxy):
         if shutdown_requested():
             integrity_log("stage5", "confirm_wait_interrupted")
             return False
+        # Force a sync first: without it a wallet-rpc that isn't auto-refreshing
+        # never sees the just-broadcast fan-out outputs and we'd spin to timeout.
+        try:
+            rpc.raw_request("refresh", {})
+        except Exception:
+            pass
         unlocked = 0
         for acct, sub_idx in targets:
             try:
