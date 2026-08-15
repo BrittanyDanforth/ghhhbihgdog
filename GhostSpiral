@@ -34,7 +34,7 @@ from gs_common import (
     safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
-    scrub_address, bech32_checksum_ok,
+    scrub_address, bech32_checksum_ok, secure_mkdir,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -755,7 +755,7 @@ def main():
     }
 
     outdir = Path(args.output)
-    outdir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing
     plan_tag = secure_hex(8)
     fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
     atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)

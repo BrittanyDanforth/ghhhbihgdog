@@ -128,6 +128,37 @@ def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
     secure_write_bytes(path, data.encode(), mode)
 
 
+def secure_mkdir(path: Path, mode: int = 0o700) -> None:
+    """Create a directory owner-only, including any parents.
+
+    plain mkdir() produces 0755 -- world-readable and traversable. The FILES
+    inside are 0600 so their contents stay private, but the directory listing
+    itself is a real metadata leak for this toolchain: any local user could
+    enumerate a staging dir and learn how many transactions were signed, when,
+    and hence that a Monero cold-signing operation ran at all. Unlinkability is
+    the entire point here, so that is not acceptable even with safe file modes.
+
+    Two details this handles that a bare mkdir(mode=...) does not:
+      * With parents=True, Python applies `mode` only to the FINAL directory;
+        intermediate parents are created with the default 0777 & ~umask. Each
+        level is therefore chmod'ed explicitly.
+      * exist_ok=True silently keeps a pre-existing directory's mode, so an
+        already-0755 staging dir would stay 0755. It is narrowed too.
+    """
+    path = Path(path)
+    created = []
+    for parent in list(path.parents)[::-1]:
+        if not parent.exists():
+            created.append(parent)
+    path.mkdir(mode=mode, parents=True, exist_ok=True)
+    for d in created + [path]:
+        try:
+            if d.is_dir():
+                os.chmod(d, mode)
+        except OSError:
+            pass
+
+
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
     """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
 

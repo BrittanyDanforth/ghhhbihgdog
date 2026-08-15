@@ -24,7 +24,7 @@ from pathlib import Path
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
-    install_signal_handlers, newnym, scrub_address, secure_hex,
+    install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
 )
 
 
@@ -90,7 +90,7 @@ def main():
     }
 
     outdir = Path(args.output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(outdir)          # 0700: owner-only output dir
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 

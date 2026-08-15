@@ -21,6 +21,8 @@ python3 tests/real_dag_subaddr_testnet.py # on-chain proof subaddr_indices
                                           # restricts a hop to ONE subaddress
 python3 tests/real_phase_sign_testnet.py # calls the SHIPPED phase_sign() and
                                           # relays its output to a real daemon
+python3 tests/leak_audit_testnet.py    # RUNS the pipeline, audits everything
+                                          # it leaves on disk (perms + secrets)
 python3 tests/real_phase_create_testnet.py # SHIPPED phase_create -> phase_sign
                                           # chain vs a REAL wallet-rpc
 ```

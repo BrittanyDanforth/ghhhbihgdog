@@ -38,7 +38,7 @@ from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
-    secure_write_text, secure_write_bytes,
+    secure_write_text, secure_write_bytes, secure_mkdir,
 )
 
 def _validate_plan(plan: List[dict]) -> None:
@@ -123,7 +123,9 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     outdir = Path(args.outdir)
     if outdir.is_dir():
         shutil.rmtree(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    # 0700: a 0755 staging dir lets any local user enumerate how many TXs
+    # were signed and when, even though the files inside are 0600.
+    secure_mkdir(outdir)
 
     manifest = []
     created = 0
@@ -225,6 +227,20 @@ def phase_sign(args, plan: List[dict]):
     if not outdir.is_dir():
         sys.exit(f"[!] Output dir not found: {outdir}")
 
+    # Narrow an outdir we did NOT create. phase_create makes it 0700, but this
+    # phase runs on the offline machine and the operator may well have made the
+    # directory by hand (`mkdir tx_staging` -> 0755). We are about to write
+    # signed transactions into it, and a world-listable directory reveals how
+    # many TXs were signed and when even though the files are 0600.
+    try:
+        _dmode = outdir.stat().st_mode & 0o777
+        if _dmode & 0o077:
+            os.chmod(outdir, 0o700)
+            print(f"  [*] Tightened staging dir {outdir} from {oct(_dmode)} to 0o700")
+            integrity_log("signer", f"tightened_outdir:{oct(_dmode)}")
+    except OSError:
+        pass
+
     # Load unsigned manifest
     manifest_path = outdir / "unsigned_manifest.json"
     if not manifest_path.exists():
@@ -248,7 +264,7 @@ def phase_sign(args, plan: List[dict]):
 
     # Create signed output directory
     signed_dir = outdir / "signed"
-    signed_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(signed_dir)      # owner-only; see phase_create's note
 
     signed_manifest = []
     signed_count = 0
