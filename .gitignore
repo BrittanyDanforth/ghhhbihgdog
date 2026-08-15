@@ -4,18 +4,34 @@ tests/dashboard_data.json
 tests/dashboard.html
 
 # Runtime artifacts. These carry live operational data -- the integrity chain
-# logs MAC addresses and per-run traces, and the TX/plan files carry deposit
+# logs MAC addresses and per-run traces; the TX/plan files carry deposit
 # addresses, memos, XMR destinations and subaddress indices. Committing any of
 # them would publish exactly what this toolchain exists to keep private.
+#
+# Kept in lockstep with paranoia_mode.wipe_gs_artifacts file/dir patterns:
+# anything worth secure-deleting is worth gitignoring. If you add a pattern
+# there, add it here too, and vice-versa. An earlier version of this list used
+# narrower patterns (e.g. exitplan_v1.json alone, thor_pairs_batch.json*) and
+# would have leaked any operator-renamed output.
 integrity_chain.log
-*.unsigned
-*.signed
-unsigned/
-tx_staging/
+integrity.log
+unsigned_*.json
 signed_manifest_v1.json
 unsigned_manifest.json
-thor_pairs_batch.json*
-exitplan_v1.json
+signer_progress.json
+broadcast_progress.json
 wallet_*.json
-prog*.json
+thor_pairs_*.json
+thor_pairs_*.json.gpg
+exitplan_*.json
+*.unsigned
+*.signed
+*.blob
+*.wallet
+*.wallet.keys
+*.wallet.address.txt
+.ghostspiral.lock
+unsigned/
+signed_blobs/
+tx_staging/
 .venv/
