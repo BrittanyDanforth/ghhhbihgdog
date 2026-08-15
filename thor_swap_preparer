@@ -28,11 +28,6 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
 )
 
-try:
-    from monero.address import Address as XMRAddress
-except ImportError:
-    sys.exit("[!] python-monero missing - pip install monero")
-
 SWAPKIT_API = "https://api.swapkit.dev"
 CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
@@ -58,6 +53,13 @@ def _validate_xmr_addr(addr: str) -> None:
     """Validate XMR address format and checksum."""
     if not _XMR_RE.match(addr):
         sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
+    # Lazy import: only the actual checksum validation needs python-monero, so
+    # --help / arg parsing still work without the (heavy) dependency installed.
+    try:
+        from monero.address import Address as XMRAddress
+    except ImportError:
+        sys.exit("[!] python-monero missing - pip install monero "
+                 "(required to validate the XMR address checksum)")
     try:
         XMRAddress(addr)
     except Exception:
