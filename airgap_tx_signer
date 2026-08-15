@@ -38,18 +38,34 @@ from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
-    secure_write_text, secure_write_bytes, secure_mkdir,
+    secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
 
 def _validate_plan(plan: List[dict]) -> None:
     """Validate each TX. A TX is either single-destination (dst+amt, used by DAG
     hops) or multi-destination (destinations[], used by the one fan-out TX that
-    sends ENTRY's single input to many mix subaddresses at once)."""
+    sends ENTRY's single input to many mix subaddresses at once).
+
+    src_index is REQUIRED and non-negative int. This is the actual per-TX spend
+    selector -- transfer_split gets it in subaddr_indices -- and phase_create
+    used to default a missing key to 0 via .get("src_index", 0), silently
+    spending from account 0 / subaddress 0 (the wallet's PRIMARY address, which
+    holds unrelated balance) instead of the mix subaddress the plan names.
+    Reachable only via the signer's standalone documented CLI on a hand-authored
+    plan (GhostSpiral itself always emits src_index), which is exactly the
+    input this validator exists to gate. Fail closed here so phase_create can
+    read the value without a default.
+    """
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
         if not isinstance(tx.get("src"), str):
             sys.exit(f"[!] Schema error at TX {i}: 'src' missing or wrong type")
+        si = tx.get("src_index")
+        if not isinstance(si, int) or isinstance(si, bool) or si < 0:
+            sys.exit(f"[!] Schema error at TX {i}: 'src_index' must be a non-negative int "
+                     f"(got {si!r}). Missing/negative would spend from the wallet's "
+                     f"primary address, not the mix subaddress this plan names.")
         dests = tx.get("destinations")
         if dests is not None:
             if not isinstance(dests, list) or not dests:
@@ -122,7 +138,13 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
     outdir = Path(args.outdir)
     if outdir.is_dir():
-        shutil.rmtree(outdir)
+        # SECURE wipe, not shutil.rmtree. Re-running phase create into an
+        # existing --outdir would otherwise merely unlink a previous attempt's
+        # tx_*.unsigned AND signed/tx_*.signed -- a recovered signed blob is a
+        # relayable transaction. Mirrors the finally-block cleanup below.
+        if not secure_delete_tree(outdir):
+            print(f"  [!] Could not securely erase the existing {outdir}; "
+                  f"a previous attempt's signed transactions may remain recoverable.")
     # 0700: a 0755 staging dir lets any local user enumerate how many TXs
     # were signed and when, even though the files inside are 0600.
     secure_mkdir(outdir)
@@ -136,7 +158,10 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] Shutdown at TX {idx}")
             break
 
-        src_index = tx.get("src_index", 0)
+        # _validate_plan has already required src_index to be a non-negative
+        # int; no default -- a silent .get(..., 0) here was the mechanism that
+        # made a missing key spend from the wallet's primary address.
+        src_index = tx["src_index"]
         # Multi-destination (fan-out: one input -> many outputs) or single
         # (DAG hop). transfer_split takes a destinations list either way.
         if tx.get("destinations"):

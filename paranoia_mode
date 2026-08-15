@@ -23,7 +23,7 @@ from pathlib import Path
 
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
-    shutdown_requested, secure_hex, secure_delete_file,
+    shutdown_requested, secure_hex, secure_delete_file, secure_write_bytes,
 )
 
 # Paths to wipe
@@ -92,18 +92,41 @@ def spoof_mac(iface: str, dry: bool):
 
 
 def wipe_shell_histories(dry: bool):
+    """Securely erase shell/history files.
+
+    These are high-value: an operator who ran the pipeline with
+    `--wallet-password ...` on the command line has that password sitting in
+    ~/.bash_history verbatim. The previous implementation called
+    hist.write_bytes(b""), which TRUNCATES -- it frees the old blocks without
+    overwriting them, so every recorded command stayed recoverable. That is the
+    same truncate-instead-of-overwrite defect already fixed in
+    _secure_delete_file itself, left behind in this caller.
+    """
     count = 0
+    failed = 0
     for hist in SHELL_HISTORIES:
-        if hist.exists():
-            if dry:
-                print(f"  [dry] would wipe {hist}")
-            else:
-                try:
-                    hist.write_bytes(b"")
-                    count += 1
-                except (PermissionError, OSError):
-                    pass
-    integrity_log("paranoia", f"histories_wiped:{count}" if not dry else f"histories_dry:{count}")
+        if not hist.exists():
+            continue
+        if dry:
+            print(f"  [dry] would securely wipe {hist}")
+            count += 1
+            continue
+        if _secure_delete_file(hist):
+            # Recreate empty (0600) so the shell does not notice a missing
+            # history file and so the wipe is idempotent.
+            try:
+                secure_write_bytes(hist, b"")
+            except OSError:
+                pass
+            count += 1
+        else:
+            failed += 1
+    tail = f" ({failed} could not be wiped)" if failed else ""
+    integrity_log("paranoia",
+                  f"histories_wiped:{count}:failed={failed}" if not dry
+                  else f"histories_dry:{count}")
+    print(f"  [+] {'Would securely wipe' if dry else 'Securely wiped'} "
+          f"{count} history file(s){tail}")
 
 
 def wipe_pycache(dry: bool):
@@ -132,25 +155,46 @@ def wipe_pycache(dry: bool):
 
 
 def wipe_system_logs(days: int, dry: bool):
+    """Securely erase /var/log/**/*.log entries older than `days`.
+
+    The previous version used `with open(f, "w"): pass`, i.e. truncate to zero.
+    Truncation frees the log's blocks without overwriting them, so the contents
+    stay forensically recoverable -- the same defect paranoia used to have on
+    the ARTIFACT wipe path. Overwrite via _secure_delete_file instead.
+    """
     cutoff = time.time() - days * 86400
     count = 0
+    failed = 0                    # was referenced below without init -> UnboundLocalError on the first failed wipe
     for f in glob.glob("/var/log/**/*.log", recursive=True):
         try:
             if os.path.getmtime(f) < cutoff:
                 if dry:
-                    print(f"  [dry] would truncate {f}")
+                    print(f"  [dry] would securely erase {f}")
+                    count += 1
+                elif _secure_delete_file(Path(f)):
+                    count += 1
                 else:
-                    with open(f, "w"):
-                        pass
-                count += 1
+                    failed += 1
         except (PermissionError, OSError):
-            pass
-    integrity_log("paranoia", f"logs_wiped:{count}" if not dry else f"logs_dry:{count}")
-    print(f"  [+] {'Would truncate' if dry else 'Truncated'} {count} log(s)")
+            failed += 1
+    tail = f" ({failed} could not be erased)" if failed else ""
+    integrity_log("paranoia",
+                  f"logs_wiped:{count}:failed={failed}" if not dry
+                  else f"logs_dry:{count}")
+    print(f"  [+] {'Would securely erase' if dry else 'Securely erased'} "
+          f"{count} log(s){tail}")
 
 
 def clear_journal(dry: bool):
-    """Clear systemd journal if journalctl is available."""
+    """Clear systemd journal if journalctl is available.
+
+    The old handler was `except (FileNotFoundError, CalledProcessError): pass`,
+    which silently no-op'd BOTH: journalctl missing (nothing to do) and a real
+    failure (typically non-root). A non-root run would then print "paranoia_mode
+    complete." with the journal untouched. Distinguish the two: no journalctl
+    is a clean skip, but a real failure is logged and reported honestly, in the
+    same spirit as wipe_swap_ram's no-root handling.
+    """
     if dry:
         print("  [dry] would run journalctl --vacuum-time=1s")
         integrity_log("paranoia", "journal_dry")
@@ -160,8 +204,19 @@ def clear_journal(dry: bool):
                        check=True, capture_output=True, timeout=30)
         integrity_log("paranoia", "journal_cleared")
         print("  [+] Journal cleared")
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+    except FileNotFoundError:
+        integrity_log("paranoia", "journal_skip:journalctl_absent")
+        print("  [*] journalctl not installed; nothing to clear")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode("utf-8", errors="ignore")[:120]
+        integrity_log("paranoia", f"journal_fail:{stderr[:40] or 'unknown'}")
+        needs_root = os.geteuid() != 0
+        print(f"  [!] Journal NOT cleared "
+              f"({'needs root' if needs_root else 'journalctl error'}): "
+              f"{stderr or 'no output'}")
+    except subprocess.TimeoutExpired:
+        integrity_log("paranoia", "journal_fail:timeout")
+        print("  [!] Journal clear timed out after 30s -- journal may be partially wiped")
 
 
 def flush_dns_cache(dry: bool):

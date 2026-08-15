@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, signal, stat as stat_module, sys, time
+import hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -73,8 +73,23 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
     line = f"{ts}|{VERSION}|{stage}|{msg}"
     h = hashlib.sha256((prev + line).encode()).hexdigest()
-    with log_path.open("a") as f:
-        f.write(f"{h} | {line}\n")
+    # O_CREAT with an explicit 0600, NOT open("a") + chmod afterwards. The plain
+    # append-open creates the file 0644 under the default umask, so the very
+    # first log line of a run -- and this file records the wallet label, exact
+    # fan-out amounts, the DAG plan and a stage timeline -- was briefly
+    # world-readable, and stayed 0644 if the process died before the next call.
+    # secure_write_bytes cannot be used here: it passes O_TRUNC, which would
+    # destroy the hash chain this function exists to maintain.
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(fd, "a", closefd=True) as f:
+            fd = -1
+            f.write(f"{h} | {line}\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    # Narrow a log that already existed with wider perms (O_CREAT leaves an
+    # existing file's mode untouched).
     secure_file_perms(log_path)
     return h
 
@@ -126,6 +141,39 @@ def secure_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
 def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
     """Text wrapper over secure_write_bytes -- see there for why this exists."""
     secure_write_bytes(path, data.encode(), mode)
+
+
+def secure_delete_tree(path: Path) -> bool:
+    """Overwrite every file in a directory tree, then remove the tree.
+
+    The canonical "securely delete a directory" primitive. Cleanup code across
+    this toolchain kept reaching for shutil.rmtree, which only unlinks: a prior
+    run's tx_staging/ holds fully signed, RELAYABLE transactions, the unsigned
+    tx sets, and a manifest with unscrubbed destinations and amounts. rmtree
+    leaves every byte of that recoverable, which defeats the point of wiping it
+    at all.
+
+    Symlinks inside the tree are unlinked, never followed (secure_delete_file
+    enforces that), so a symlink planted in a staging dir cannot redirect the
+    overwrite onto an unrelated file.
+
+    Returns True only if every file was securely erased AND the tree was
+    removed, so callers can report honestly instead of assuming success.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    ok = True
+    # Deepest-first so directories are empty by the time we unlink them.
+    for entry in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if entry.is_symlink() or entry.is_file():
+            ok = secure_delete_file(entry) and ok
+    try:
+        shutil.rmtree(path)
+        return ok
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        return False
 
 
 def check_daemon_relay_egress(daemon_url: str,

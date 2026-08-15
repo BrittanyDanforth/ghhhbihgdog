@@ -36,18 +36,29 @@ BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
 
 
-def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal:
-    """Fetch current BTC/XMR rate from CoinGecko."""
+def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal | None:
+    """Fetch current BTC/XMR rate from CoinGecko, or None if the oracle failed.
+
+    The old version silently returned a hard-coded Decimal("0.003") on any
+    failure -- CoinGecko is frequently unreachable over Tor -- and the CALLER
+    then compared each real ThorChain quote against that fabricated baseline in
+    the slippage check. A quote that deviates 30% from a rate we invented is
+    not a slippage warning about the quote; it is nonsense. Fail closed here
+    (return None) and let the caller loudly disable the slippage check for that
+    chunk, the way it already handles an unreadable expected_xmr.
+    """
     try:
         p = safe_get(CG_PRICE, proxy)
         rate = Decimal(str(p["monero"]["btc"]))
         if rate <= 0:
             raise ValueError("Non-positive rate")
+        integrity_log("thor", "price_oracle_ok")
         return rate
     except Exception as e:
         integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
-        print("[!] Price oracle failed; using conservative fallback 0.003 BTC/XMR")
-        return Decimal("0.003")
+        print("  [!] Price oracle unreachable — the slippage cross-check will be "
+              "DISABLED for this batch. Verify each quote manually.")
+        return None
 
 
 def _validate_xmr_addr(addr: str) -> None:
@@ -104,7 +115,10 @@ def main():
         _validate_xmr_addr(d)
 
     btc_per_xmr = _btc_per_xmr(proxy)
-    integrity_log("thor", "oracle_fetched")
+    # _btc_per_xmr already logs price_oracle_ok / price_oracle_fail with the
+    # error string. The old unconditional "oracle_fetched" line above claimed
+    # success right after a failure -- misleading in the very log meant to be
+    # audited later.
 
     pairs: List[dict] = []
 

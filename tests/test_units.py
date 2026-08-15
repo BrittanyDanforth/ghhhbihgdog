@@ -234,20 +234,36 @@ check("blob_sort_key: tx_0", bcast._blob_sort_key(Path("tx_0.signed")) == 0)
 check("blob_sort_key: malformed -> sentinel", bcast._blob_sort_key(Path("garbage.signed")) == 999999)
 
 # ---------------------------------------------------------------------------
-# null-safety pattern (mirrors GhostSpiral stage2 / thor route parsing):
-# present-but-null keys must collapse to safe fallbacks, not crash
-# ---------------------------------------------------------------------------
-def parse_route(route):
-    expected = route.get("expectedOutput") or "0"
-    tx_info = route.get("transaction") or route.get("calldata") or {}
-    dep = tx_info.get("depositAddress") or tx_info.get("to") or ""
-    return expected, dep, Decimal(str(expected))
-check("nullsafe: null transaction no crash",
-      parse_route({"transaction": None, "expectedOutput": None})[1] == "")
-check("nullsafe: null expectedOutput -> 0",
-      parse_route({"transaction": {"to": "X"}, "expectedOutput": None})[2] == Decimal(0))
-check("nullsafe: calldata fallback",
-      parse_route({"transaction": None, "calldata": {"depositAddress": "Y"}, "expectedOutput": "1.2"})[1] == "Y")
+# null-safety pattern: SwapKit routinely returns keys PRESENT-BUT-NULL, so
+# .get("k", default) returns None (not default) and downstream .get() raises
+# AttributeError. Drives the REAL GhostSpiral.parse_swap_route so a regression
+# to `.get(k, {})` there is caught here. The previous version asserted on a
+# local reimplementation of the parser, so reverting the shipped one would not
+# have turned the test red -- exactly the "vacuous test" pattern the audit hit.
+# The parser must NOT crash on null values -- an uncaught AttributeError in
+# stage2 would abort the run after real BTC has already moved. Wrap in a
+# helper that turns any raise into a FAIL, so a regression to
+# `.get("transaction", {})` (which would raise on a null value) reports a
+# clean failure instead of aborting the whole suite mid-run.
+def _try_parse(route):
+    try:
+        return ghost.parse_swap_route(route)
+    except Exception as e:
+        return ("__RAISED__" + type(e).__name__, "", "")
+
+check("nullsafe (real): null transaction returns empty deposit, no crash",
+      _try_parse({"transaction": None, "expectedOutput": None})[0] == "")
+check("nullsafe (real): null expectedOutput -> '0' fallback",
+      _try_parse({"transaction": {"to": "X"}, "expectedOutput": None})[2] == "0")
+check("nullsafe (real): calldata fallback when transaction is null",
+      _try_parse({"transaction": None, "calldata": {"depositAddress": "Y"},
+                  "expectedOutput": "1.2"})[0] == "Y")
+check("nullsafe (real): memo picked up from tx_info",
+      _try_parse({"transaction": {"depositAddress": "A", "memo": "SWAP:XMR"},
+                  "expectedOutput": "1"})[1] == "SWAP:XMR")
+check("nullsafe (real): calldata.data used as memo fallback",
+      _try_parse({"calldata": {"to": "A", "data": "0xdeadbeef"},
+                  "expectedOutput": "1"})[1] == "0xdeadbeef")
 
 # ---------------------------------------------------------------------------
 # exit_strategy_simulator Bisq fallback: EUR must NOT be fabricated from the
@@ -285,6 +301,67 @@ check("exitsim: bisq eur = 0.004*55000 = 220 (real EUR rate, not USD)",
       _with_eur["xmr_eur"] == Decimal("220.00"))
 check("exitsim: bisq eur != usd (proves not fabricated)",
       _with_eur["xmr_eur"] != _with_eur["xmr_usd"])
+
+# ---------------------------------------------------------------------------
+# ITEM 2 (audit-workflow): airgap_tx_signer._validate_plan MUST require
+# src_index. A missing key defaulting to 0 spent from the wallet's primary
+# subaddress instead of the mix subaddress the plan named.
+# ---------------------------------------------------------------------------
+airgap = load("airgap_tx_signer")
+
+def expect_signer_reject(name, plan):
+    try:
+        airgap._validate_plan(plan); check(f"src_index: {name} (should reject)", False)
+    except SystemExit:
+        check(f"src_index: {name} -> rejected", True)
+
+expect_signer_reject("missing src_index",
+                     [{"src": "A", "dst": "B", "amt": "0.4"}])
+expect_signer_reject("src_index = None",
+                     [{"src": "A", "src_index": None, "dst": "B", "amt": "0.4"}])
+expect_signer_reject("src_index = -1",
+                     [{"src": "A", "src_index": -1, "dst": "B", "amt": "0.4"}])
+expect_signer_reject("src_index = 'seven' (string)",
+                     [{"src": "A", "src_index": "seven", "dst": "B", "amt": "0.4"}])
+expect_signer_reject("src_index = True (bool sneak)",
+                     [{"src": "A", "src_index": True, "dst": "B", "amt": "0.4"}])
+# Legitimate plans must still pass.
+try:
+    airgap._validate_plan([{"src": "A", "src_index": 0, "dst": "B", "amt": "0.4"}])
+    check("src_index = 0 accepted (primary is legitimate for ENTRY case)", True)
+except SystemExit:
+    check("src_index = 0 accepted", False)
+try:
+    airgap._validate_plan([{"src": "A", "src_index": 7,
+                            "destinations": [{"address": "X", "amount": "0.1"}]}])
+    check("src_index = 7 with fan-out accepted", True)
+except SystemExit:
+    check("src_index = 7 with fan-out accepted", False)
+
+# ---------------------------------------------------------------------------
+# ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;
+# GhostSpiral's BTC_RE-only check was the odd one out.
+# ---------------------------------------------------------------------------
+# A charset-valid, checksum-broken bech32 (last char flipped).
+_typo = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"
+check("btc-entry regression: format regex STILL matches the typo (proves the "
+      "regex alone is not sufficient)", bool(ghost.BTC_RE.match(_typo)))
+check("btc-entry regression: bech32_checksum_ok REJECTS the same typo",
+      not gs.bech32_checksum_ok(_typo))
+
+# ---------------------------------------------------------------------------
+# ITEM 3b: thor_swap_preparer._btc_per_xmr must fail closed (return None), not
+# silently fabricate 0.003 BTC/XMR as the slippage baseline.
+# ---------------------------------------------------------------------------
+thor = load("thor_swap_preparer")
+_real_safe_get = thor.safe_get
+try:
+    thor.safe_get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("oracle down"))
+    _rate = thor._btc_per_xmr(None)
+    check("thor: oracle failure -> _btc_per_xmr returns None (not fabricated 0.003)",
+          _rate is None)
+finally:
+    thor.safe_get = _real_safe_get
 
 # ---------------------------------------------------------------------------
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

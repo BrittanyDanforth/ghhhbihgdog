@@ -250,10 +250,41 @@ check("C: stdin still sends the y confirmations",
 check("C: signed blob still produced via password-file path",
       (_sign_dir / "signed" / "tx_0.signed").exists())
 # The signed blob is a relayable transaction: it must never exist world-readable,
-# not even briefly, so phase_sign creates it 0600 rather than chmod-ing after.
-_blob = _sign_dir / "signed" / "tx_0.signed"
-check("C: signed tx written 0600 (never world-readable)",
-      _blob.exists() and (_blob.stat().st_mode & 0o777) == 0o600)
+# not even briefly. Original check here was VACUOUS -- it asserted only the
+# FINAL mode == 0o600, which the buggy write_bytes()+chmod pattern ALSO reaches
+# (chmod-after still ends at 0600). Rerun phase_sign with secure_file_perms
+# NEUTRALISED, so the check only passes if the mode was set AT CREATION by
+# secure_write_bytes rather than chmod'ed after.
+_sign_dir2 = Path(os.getcwd()) / "signC2"; _sign_dir2.mkdir(exist_ok=True)
+_u2 = _sign_dir2 / "tx_0.unsigned"; _u2.write_text("00")
+(_sign_dir2 / "unsigned_manifest.json").write_text(json.dumps({
+    "plan_fingerprint": airgap._compute_plan_fingerprint(_plan_C),
+    "phase": "unsigned",
+    "entries": [{"idx": 0, "file": str(_u2),
+                 "hash": hashlib.sha256(_u2.read_text().encode()).hexdigest(),
+                 "dst": "B", "amt": "0.1", "delay": 0}],
+}))
+
+_prev_perms = airgap.secure_file_perms
+def _capture_run2(cmd, **kw):
+    Path(kw["cwd"], "signed_monero_tx").write_bytes(b"Monero signed tx set\x00fake2")
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+airgap.secure_file_perms = lambda *a, **k: None    # neutralised
+_prev_run = airgap.subprocess.run
+airgap.subprocess.run = _capture_run2
+try:
+    _args_C2 = types.SimpleNamespace(outdir=str(_sign_dir2), wallet_cli="monero-wallet-cli",
+                                     wallet_file=str(_fake_wallet), wallet_password=SECRET_PW)
+    airgap.phase_sign(_args_C2, _plan_C)
+finally:
+    airgap.secure_file_perms = _prev_perms
+    airgap.subprocess.run = _prev_run
+
+_blob2 = _sign_dir2 / "signed" / "tx_0.signed"
+check("C: signed tx created 0600 even WITHOUT any chmod (proves it is set at "
+      "open() time, not chmod-after)",
+      _blob2.exists() and (_blob2.stat().st_mode & 0o777) == 0o600)
 
 # ===========================================================================
 # D. GhostSpiral orchestration must actually WIRE the safety features through

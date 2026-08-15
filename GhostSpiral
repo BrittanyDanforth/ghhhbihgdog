@@ -35,7 +35,7 @@ from gs_common import (
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
-    check_daemon_relay_egress,
+    check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -106,6 +106,27 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
             return fee_xmr
     integrity_log("fee", "using_fallback_fee")
     return FALLBACK_FEE_XMR * multiplier
+
+
+def parse_swap_route(route: dict) -> tuple:
+    """Extract (deposit_addr, memo, expected_output_str) from ONE SwapKit route.
+
+    Extracted from the inlined stage2 loop so tests exercise the actual code
+    rather than a copy. The `nullsafe:` block in test_units.py used to assert on
+    a hand-written parse_route(); reverting the real function would not have
+    turned that test red. Same defect appeared in thor_swap_preparer -- both
+    call this now.
+
+    Uses `x or fallback` NOT `dict.get(k, default)` because SwapKit routinely
+    returns these keys PRESENT with a null value: .get("transaction", {}) hands
+    back None (not the default) for a null value, then .get() on None raises
+    AttributeError. `or` collapses missing AND null to the safe fallback.
+    """
+    tx_info = route.get("transaction") or route.get("calldata") or {}
+    deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
+    memo = tx_info.get("memo") or tx_info.get("data") or ""
+    expected = route.get("expectedOutput") or "0"
+    return deposit, memo, expected
 
 
 def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
@@ -224,8 +245,17 @@ def main():
         if rw_data.get("schema") != "gs_receive_wallet_v1":
             sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
         receive_entry_addr = rw_data.get("address")
-        receive_account_index = rw_data.get("account_index", 0)
-        receive_subaddress_index = rw_data.get("subaddress_index", 0)
+        # `.get(k, default)` returns None (not default) when the key is present
+        # with a null value -- the same class of bug that made proxies={} slip
+        # past `if proxies is None`. Coerce present-but-null to the default so
+        # None does not propagate into subaddr_indices/account_index and
+        # silently redirect the spend to subaddress 0 of the primary account.
+        receive_account_index = rw_data.get("account_index") or 0
+        receive_subaddress_index = rw_data.get("subaddress_index") or 0
+        for _k in ("account_index", "subaddress_index"):
+            _v = rw_data.get(_k)
+            if _v is not None and (not isinstance(_v, int) or isinstance(_v, bool) or _v < 0):
+                sys.exit(f"[!] Receive wallet JSON: '{_k}' must be a non-negative int, got {_v!r}")
         if not receive_entry_addr:
             sys.exit("[!] Receive wallet JSON missing 'address' field")
         integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
@@ -233,8 +263,14 @@ def main():
         if args.joinmarket:
             sys.exit("[!] --joinmarket is not applicable in receiver mode (no BTC to tumble)")
     else:
-        if not BTC_RE.match(args.btc_entry):
-            sys.exit("[!] Invalid BTC entry address (expected bech32 bc1.../tb1...)")
+        # BTC_RE + bech32 checksum, matching every other BTC-address consumer
+        # in the codebase (stage2 deposit validation, thor_swap_preparer).
+        # BTC_RE alone accepts a typo'd-but-in-charset address; combined with
+        # bech32_checksum_ok this rejects a single-character flip that would
+        # otherwise reach the JoinMarket tumbler and waste the tumble.
+        if not BTC_RE.match(args.btc_entry) or not bech32_checksum_ok(args.btc_entry):
+            sys.exit("[!] Invalid BTC entry address: failed bech32 checksum "
+                     "(expected bc1.../tb1... with a valid checksum)")
         integrity_log("stage0", "btc_entry_validated")
 
     # ---- Validate inputs early ----
@@ -310,7 +346,7 @@ def main():
     ###########################################################################
     # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
     ###########################################################################
-    newnym()
+    newnym(required=True)   # anonymity gate before stage 1 network ops
 
     def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
         if not args.joinmarket:
@@ -393,7 +429,7 @@ def main():
                 continue
 
             if i > 0:
-                newnym()
+                newnym(required=True)   # per-chunk quote isolation
                 secure_delay(3.0, 10.0)
 
             # SwapKit v3 API uses sellAsset/buyAsset not from/to
@@ -431,11 +467,10 @@ def main():
             # AttributeError; Decimal(str(None)) raises InvalidOperation. `or`
             # collapses both missing AND null to the safe fallback.
             route = routes[0]
-            expected_output = route.get("expectedOutput") or "0"
-            # For THORChain routes the deposit info is in the route's tx object
-            tx_info = route.get("transaction") or route.get("calldata") or {}
-            deposit_addr = tx_info.get("depositAddress") or tx_info.get("to") or ""
-            memo = tx_info.get("memo") or tx_info.get("data") or ""
+            # Single call to the extracted parser -- so a regression in null-
+            # handling here is caught by the test that drives parse_swap_route,
+            # not just documented in a comment. See parse_swap_route above.
+            deposit_addr, memo, expected_output = parse_swap_route(route)
 
             if not deposit_addr:
                 integrity_log("stage2", f"no_deposit_in_route_{i}")
@@ -486,7 +521,7 @@ def main():
     # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
     # the ENTRY receive address exists for ThorChain destination)
     ###########################################################################
-    newnym()
+    newnym(required=True)   # anonymity gate before stage 3
     tor_recheck(proxy, "stage3_pre")
 
     sub_account = receive_account_index if receive_mode else 0
@@ -535,7 +570,7 @@ def main():
     ###########################################################################
     # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
     ###########################################################################
-    newnym()
+    newnym(required=True)   # anonymity gate before ThorChain execution
     tor_recheck(proxy, "stage2_exec")
 
     if receive_mode:
@@ -806,37 +841,10 @@ def main():
     ###########################################################################
     # Stage 5 - Auto sign + broadcast
     ###########################################################################
-    newnym()
+    newnym(required=True)   # anonymity gate before broadcast
     tor_recheck(proxy, "stage5_pre")
 
-    import shutil as _shutil
-
-    # Clean ALL stale artifacts from prior runs to prevent poisoning
-    for stale in ["signer_progress.json", "broadcast_progress.json"]:
-        stale_path = Path(stale)
-        if stale_path.exists():
-            stale_path.unlink()
-            integrity_log("stage5", f"cleaned_stale:{stale}")
-
-    # Clean old signed blobs directory
-    for old_dir in ["signed_blobs", "tx_staging"]:
-        old_path = Path(old_dir)
-        if old_path.is_dir():
-            _shutil.rmtree(old_path)
-            integrity_log("stage5", f"cleaned_old_dir:{old_dir}")
-
-    # Clean old unsigned plans (OPSEC: contain full destination addresses)
-    # but NOT the current plans that Stage 4 just created (fan-out + optional DAG)
-    outdir_path = Path(args.output)
-    if outdir_path.is_dir():
-        current_names = {fanout_file.name}
-        if dag_file:
-            current_names.add(dag_file.name)
-        old_plans = list(outdir_path.glob("unsigned_*.json"))
-        for old_plan in old_plans:
-            if old_plan.name not in current_names:
-                old_plan.unlink()
-                integrity_log("stage5", f"cleaned_old_plan:{old_plan.name}")
+    _stage5_cleanup(Path(args.output), fanout_file, dag_file)
 
     # Lock file to prevent concurrent runs
     lock_path = Path(".ghostspiral.lock")
@@ -859,6 +867,57 @@ def main():
             lock_path.unlink()
 
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
+
+
+def _stage5_cleanup(outdir_path: Path, fanout_file: Path, dag_file):
+    """Securely erase the PREVIOUS run's artifacts before this run starts.
+
+    Extracted from main() so it is directly testable -- the old inline version
+    could only be exercised by running the whole pipeline, which is why it went
+    unaudited while every one of its deletions was insecure.
+
+    Every path here is overwritten, not merely unlinked. What the old
+    unlink/rmtree left recoverable on disk:
+      * tx_staging/ -- the prior run's FULLY SIGNED, RELAYABLE transactions,
+        its unsigned tx sets, and signed_manifest_v1.json with unscrubbed
+        destinations and amounts. This is the worst of the three: a recovered
+        signed blob can simply be broadcast.
+      * unsigned_*.json plans -- the code's own comment already said these
+        "contain full destination addresses"; it then deleted them with a plain
+        unlink, so the whole mix graph (every subaddress, amount and per-TX
+        delay) survived in freed blocks.
+      * *_progress.json -- relayed txids paired with blob paths, i.e. a direct
+        map from this machine to on-chain transactions.
+    """
+    for stale in ["signer_progress.json", "broadcast_progress.json"]:
+        stale_path = Path(stale)
+        if stale_path.exists():
+            ok = secure_delete_file(stale_path)
+            integrity_log("stage5", f"cleaned_stale:{stale}:{'ok' if ok else 'FAILED'}")
+            if not ok:
+                print(f"  [!] Could not securely erase {stale}; remove it manually.")
+
+    for old_dir in ["signed_blobs", "tx_staging"]:
+        old_path = Path(old_dir)
+        if old_path.is_dir():
+            ok = secure_delete_tree(old_path)
+            integrity_log("stage5", f"cleaned_old_dir:{old_dir}:{'ok' if ok else 'FAILED'}")
+            if not ok:
+                print(f"  [!] Could not securely erase {old_dir}/ — it may still hold "
+                      f"a previous run's signed transactions. Remove it manually.")
+
+    # Old unsigned plans, but NOT the ones Stage 4 just created.
+    if outdir_path.is_dir():
+        current_names = {fanout_file.name}
+        if dag_file:
+            current_names.add(dag_file.name)
+        for old_plan in list(outdir_path.glob("unsigned_*.json")):
+            if old_plan.name not in current_names:
+                ok = secure_delete_file(old_plan)
+                integrity_log("stage5",
+                              f"cleaned_old_plan:{old_plan.name}:{'ok' if ok else 'FAILED'}")
+                if not ok:
+                    print(f"  [!] Could not securely erase {old_plan}; remove it manually.")
 
 
 def _run_round(args, plan_file, staging_dir, label):
@@ -1028,7 +1087,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
 
     # -- Round 2: DAG hop-mixing (only if planned) ------------------------
     if dag_file:
-        newnym()
+        newnym(required=True)   # anonymity gate before DAG broadcast round
         secure_delay(5.0, 15.0)
         if _wait_for_fanout_confirm(args, fanout_targets, proxy):
             print("  [*] === Round 2: DAG hop-mixing ===")
