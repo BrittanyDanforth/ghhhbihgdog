@@ -106,6 +106,9 @@ def run_broadcast(blob_dir, progfile, outcomes):
             return {"error": {"message": "Failed to parse tx: double spend detected"}}
         if o == "keyimage":
             return {"error": {"message": "Rejected by daemon: key image already spent"}}
+        if o == "baddata":
+            # REAL wallet-rpc 0.18.3.1 response for a corrupt signed blob.
+            return {"error": {"code": -40, "message": "Failed to parse signed tx data."}}
         return {"result": {"tx_hash_list": ["a" * 64]}}
     bcast._single_post = fake_post
     sys.argv = ["broadcast_signed_xmr", str(blob_dir),
@@ -166,6 +169,14 @@ p = json.loads(prog.read_text())
 check("B5: key-image error exits nonzero", code != 0)
 check("B5: key-image classified permanent (failed_perm)", p["failed_perm"] == [0])
 check("B5: key-image not retried as transient", p["relayed"] == [])
+
+# --- B6: real wallet-rpc code -40 "Failed to parse signed tx data" is
+#         classified PERMANENT (corrupt blob needs re-signing, not retry). ---
+d = make_blobs("bcast_B6", 1); prog = Path(os.getcwd()) / "progB6.json"
+code = run_broadcast(d, prog, {hx(d, 0): "baddata"})
+p = json.loads(prog.read_text())
+check("B6: code -40 exits nonzero", code != 0)
+check("B6: code -40 classified permanent", p["failed_perm"] == [0] and p["relayed"] == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

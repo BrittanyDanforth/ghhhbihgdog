@@ -51,11 +51,15 @@ FALLBACK_FEE_XMR = Decimal("0.00005")
 
 # FALLBACK per-priority fee multipliers, used ONLY when monerod's
 # get_fee_estimate doesn't return an explicit per-priority 'fees' array (older
-# daemons). Modern monerod DOES return that array, and fetch_fee_from_daemon
-# prefers it -- the exact per-priority fee the daemon will charge -- so this
-# table is a best-effort approximation, not authoritative. The 1/4/20/166 set
-# is the classic multiplier table; real ratios can differ by daemon version, so
-# do not treat a match at high priority as guaranteed. At priority 1 it's exact.
+# daemons). Modern monerod DOES return that array and fetch_fee_from_daemon
+# prefers it (the exact per-priority fee the daemon will charge), so this table
+# is a best-effort approximation, not authoritative.
+#
+# Verified against real monerod 0.18.3.1: get_fee_estimate returned
+#   fees = [1200000, 4700000, 19000000, 240000000]  (ratios ~ 1 / 3.9 / 15.8 / 200)
+# i.e. the real priority-4 multiplier is ~200x, NOT the classic 166x below. That
+# is exactly why we prefer the daemon's fees[] and treat this table as a rough
+# fallback for ancient daemons only. At priority 1 it's exact regardless.
 PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
 
 # Fan-out outputs are spendable only after they confirm and unlock (~10 blocks,

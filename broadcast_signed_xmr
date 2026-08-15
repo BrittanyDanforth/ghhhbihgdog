@@ -405,16 +405,28 @@ def main():
                     integrity_log("broadcast", f"relayed:idx={real_idx}")
                     break
 
+                ecode = err.get("code") if isinstance(err, dict) else None
                 emsg = str(err.get("message", "") or res)[:160]
                 emsg_l = emsg.lower()
                 print(f"  Node: {emsg[:80]}")
-                # Classification is heuristic: submit_transfer returns free-text
-                # error messages, not stable codes, so we can only pattern-match.
+                # Classification uses the wallet-rpc error CODE where it's a
+                # stable signal, and falls back to message pattern-matching.
                 # ONLY clearly-permanent conditions are marked permanent; every
                 # other error defaults to transient (retried on --resume). That
                 # default is fail-safe -- a misread permanent error just wastes
                 # retries and keeps the exit nonzero, never a false success or a
                 # stranded-but-marked-done TX.
+                #
+                # Code -40 verified against real monero-wallet-rpc 0.18.3.1:
+                # submit_transfer returns {"code":-40,"message":"Failed to parse
+                # signed tx data."} for a corrupt/wrong-format blob. Retrying
+                # can't fix a bad blob -- it needs re-signing -- so mark permanent.
+                if ecode == -40 or "failed to parse" in emsg_l:
+                    outcome = "bad_data"
+                    integrity_log("broadcast", f"bad_signed_tx_data:idx={real_idx}")
+                    print(f"  [!] TX {real_idx}: signed blob could not be parsed "
+                          f"(corrupt/wrong format) -- needs re-signing. Skipping.")
+                    break
                 is_double = (("double" in emsg_l and "spend" in emsg_l)
                              or "key image" in emsg_l or "already spent" in emsg_l)
                 if is_double:
@@ -443,7 +455,7 @@ def main():
             success_count += 1
             prog["log"].append({"idx": idx, "file": str(blob), "sent": True, "txid": txid})
             relayed.add(idx); _persist()
-        elif outcome in ("double_spend", "low_fee"):
+        elif outcome in ("double_spend", "low_fee", "bad_data"):
             fail_count += 1
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False, "error": outcome})
             failed_perm.add(idx); _persist()   # permanent: skipped, never relayed
