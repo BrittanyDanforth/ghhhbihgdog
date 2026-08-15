@@ -31,6 +31,15 @@ exitplan_*.json
 *.wallet.keys
 *.wallet.address.txt
 .ghostspiral.lock
+# Partial writes from atomic_write_json/_text: same plaintext as the final
+# file, but no '*.json' pattern matches a '.json.tmp' suffix.
+*.json.tmp
+*.tmp
+# monero-wallet-cli's own staging names, and the signer's scratch dir. The
+# signed_monero_tx file is a fully signed, relayable transaction.
+unsigned_monero_tx
+signed_monero_tx
+gs_sign_*/
 unsigned/
 signed_blobs/
 tx_staging/

@@ -283,10 +283,21 @@ GS_ARTIFACT_FILE_PATTERNS = [
     "*.blob", "*.signed", "*.unsigned",
     "signed_manifest_v1.json", "unsigned_manifest.json",
     ".ghostspiral.lock",
+    # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
+    # Ctrl-C in that window leaves the partial file behind holding the SAME
+    # plaintext (deposit addresses, memos, XMR destinations) -- and none of the
+    # patterns above match a '.tmp' suffix, so it survived every wipe.
+    # gs_common now erases its own partial on failure; this is defence in depth
+    # for a hard kill (SIGKILL) that runs no cleanup at all.
+    "*.json.tmp", "*.tmp",
+    "unsigned_monero_tx", "signed_monero_tx",
     "renamethis1",
 ]
 GS_ARTIFACT_DIR_PATTERNS = [
     "signed_blobs", "unsigned", "tx_staging",
+    # airgap_tx_signer's per-TX scratch dir (tempfile.mkdtemp(prefix="gs_sign_")),
+    # which holds unsigned_monero_tx and the signed_monero_tx wallet-cli writes.
+    "gs_sign_*",
 ]
 
 
@@ -344,26 +355,49 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
 
 
 def wipe_tmp_files(dry: bool):
-    """Remove user-owned files from temp directories."""
+    """SECURELY remove user-owned files from temp directories.
+
+    This used plain os.unlink / shutil.rmtree, which only drop directory
+    entries and leave the bytes recoverable -- in a module whose entire purpose
+    is that they are NOT recoverable, and which already had the overwrite
+    primitives right here. /tmp is exactly where the sensitive material lands:
+    airgap_tx_signer stages unsigned_monero_tx and the wallet-cli-produced
+    signed_monero_tx under /tmp/gs_sign_*, so a plain unlink here left a
+    relayable signed transaction on disk. Overwrite, then unlink.
+
+    Uses os.lstat (not entry.stat()) so a symlink in /tmp is judged by its own
+    ownership rather than its target's -- and _secure_delete_file refuses to
+    follow it regardless.
+    """
     uid = os.getuid()
     count = 0
+    failed = 0
     for tmpdir in ["/tmp", "/var/tmp"]:
         if not os.path.isdir(tmpdir):
             continue
         for entry in os.scandir(tmpdir):
             try:
-                if entry.stat().st_uid == uid:
-                    if dry:
-                        print(f"  [dry] would remove {entry.path}")
-                    else:
-                        if entry.is_dir(follow_symlinks=False):
-                            shutil.rmtree(entry.path, ignore_errors=True)
-                        else:
-                            os.unlink(entry.path)
+                if os.lstat(entry.path).st_uid != uid:
+                    continue
+                if dry:
+                    print(f"  [dry] would securely remove {entry.path}")
                     count += 1
+                    continue
+                p = Path(entry.path)
+                ok = (_secure_delete_dir(p)
+                      if entry.is_dir(follow_symlinks=False)
+                      else _secure_delete_file(p))
+                if ok:
+                    count += 1
+                else:
+                    failed += 1
             except (PermissionError, OSError):
-                pass
-    integrity_log("paranoia", f"tmp_wiped:{count}" if not dry else f"tmp_dry:{count}")
+                failed += 1
+    tail = f" ({failed} could not be removed)" if failed else ""
+    print(f"  [+] {'Would securely remove' if dry else 'Securely removed'} "
+          f"{count} temp entr{'y' if count == 1 else 'ies'}{tail}")
+    integrity_log("paranoia", f"tmp_wiped:{count}:failed={failed}"
+                  if not dry else f"tmp_dry:{count}")
 
 
 def wipe_clipboard(dry: bool):

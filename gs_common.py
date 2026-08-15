@@ -91,27 +91,48 @@ def secure_file_perms(path: Path, mode: int = 0o600) -> None:
 
 
 def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
-    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write JSON atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    On ANY failure the partial .tmp is securely erased before the exception
+    propagates. Without that, a Ctrl-C between the write and the rename left
+    e.g. 'thor_pairs_batch.json.tmp' on disk holding the deposit address and
+    memo in plaintext -- and paranoia's wipe pattern 'thor_pairs_*.json' does
+    NOT match a '.json.tmp' suffix, so nothing ever cleaned it up. These
+    scripts install SIGINT handlers, so an interrupted write is a realistic
+    path, not a theoretical one. BaseException (not Exception) because
+    KeyboardInterrupt is exactly the case that leaked.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        secure_file_perms(tmp, perms)
+        os.replace(tmp, path)
+    except BaseException:
+        secure_delete_file(tmp)
+        raise
     with open(path) as f:
         json.load(f)
 
 
 def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
-    """Write text atomically: tmp -> fsync -> rename. Sets secure perms."""
+    """Write text atomically: tmp -> fsync -> rename. Sets secure perms.
+
+    Same partial-.tmp erasure as atomic_write_json -- see there for why.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    secure_file_perms(tmp, perms)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        secure_file_perms(tmp, perms)
+        os.replace(tmp, path)
+    except BaseException:
+        secure_delete_file(tmp)
+        raise
 
 # ---------------------------------------------------------------------------
 #  Proxy validation

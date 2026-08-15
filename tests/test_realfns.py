@@ -2,7 +2,7 @@
 """Test the REAL exit_strategy_simulator.fetch_prices (rate-inversion fix) and
 paranoia_mode.wipe_gs_artifacts (BUG 4: log must not be recreated in a real
 wipe). Delete functions are no-op'd so NOTHING on disk is actually deleted."""
-import sys, os, tempfile, importlib.util, importlib.machinery
+import sys, os, json, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,6 +13,7 @@ def load(name):
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec); loader.exec_module(mod); return mod
 
+gs = load("gs_common.py")
 esim = load("exit_strategy_simulator")
 para = load("paranoia_mode")
 os.chdir(tempfile.mkdtemp(prefix="gs_rf_"))
@@ -117,6 +118,48 @@ empty = Path(os.getcwd()) / "sd_empty.txt"
 empty.write_bytes(b"")
 check("secure_delete: zero-byte file deleted cleanly",
       para2._secure_delete_file(empty) is True and not empty.exists())
+
+# ---------------------------------------------------------------------------
+# atomic_write_* must not leave a plaintext '.tmp' behind when interrupted.
+# A Ctrl-C between the write and the rename used to strand e.g.
+# 'thor_pairs_batch.json.tmp' holding the deposit address and memo, and NO
+# wipe pattern matched a '.json.tmp' suffix, so it was never cleaned up.
+# ---------------------------------------------------------------------------
+_real_replace = os.replace
+_atomic_dir = Path(os.getcwd()) / "atomicdir"
+_atomic_dir.mkdir(exist_ok=True)
+_target = _atomic_dir / "thor_pairs_batch.json"
+os.replace = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt("simulated Ctrl-C"))
+_raised = None
+try:
+    gs.atomic_write_json({"deposit": "bc1qSENSITIVE", "memo": "SECRET"}, _target)
+except BaseException as e:      # KeyboardInterrupt is the case that leaked
+    _raised = type(e).__name__
+finally:
+    os.replace = _real_replace
+check("atomic_write_json: interrupt still propagates", _raised == "KeyboardInterrupt")
+check("atomic_write_json: no partial .tmp left after interrupt",
+      list(_atomic_dir.glob("*.tmp")) == [])
+check("atomic_write_json: no target written on interrupt", not _target.exists())
+
+# Same guarantee for the text variant.
+_target2 = _atomic_dir / "notes.txt"
+os.replace = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt("simulated Ctrl-C"))
+try:
+    gs.atomic_write_text("SENSITIVE-MEMO", _target2)
+except BaseException:
+    pass
+finally:
+    os.replace = _real_replace
+check("atomic_write_text: no partial .tmp left after interrupt",
+      list(_atomic_dir.glob("*.tmp")) == [])
+
+# Sanity: the happy path still works and content round-trips.
+gs.atomic_write_json({"ok": 1}, _target)
+check("atomic_write_json: happy path still writes correctly",
+      _target.exists() and json.loads(_target.read_text())["ok"] == 1)
+check("atomic_write_json: happy path leaves no .tmp",
+      list(_atomic_dir.glob("*.tmp")) == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

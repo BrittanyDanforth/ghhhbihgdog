@@ -37,7 +37,7 @@ from typing import List
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
-    connect_rpc, validate_proxy, verify_tor,
+    connect_rpc, validate_proxy, verify_tor, secure_delete_file,
 )
 
 def _validate_plan(plan: List[dict]) -> None:
@@ -355,6 +355,18 @@ def phase_sign(args, plan: List[dict]):
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
         finally:
+            # SECURE cleanup, not shutil.rmtree. This scratch dir held
+            # unsigned_monero_tx AND the wallet-cli-produced signed_monero_tx --
+            # a fully signed, relayable transaction. A plain rmtree only unlinks
+            # them, leaving the bytes recoverable in /tmp, which defeats the
+            # entire point of an air-gapped signer. Overwrite every file's full
+            # extent first, then remove the directory.
+            try:
+                for _leftover in sorted(Path(work_dir).rglob("*"), reverse=True):
+                    if _leftover.is_file() or _leftover.is_symlink():
+                        secure_delete_file(_leftover)
+            except OSError:
+                pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
     # Write signed manifest
