@@ -21,8 +21,8 @@ python3 tests/real_dag_subaddr_testnet.py # on-chain proof subaddr_indices
                                           # restricts a hop to ONE subaddress
 python3 tests/real_phase_sign_testnet.py # calls the SHIPPED phase_sign() and
                                           # relays its output to a real daemon
-python3 tests/leak_audit_testnet.py    # RUNS the pipeline, audits everything
-                                          # it leaves on disk (perms + secrets)
+python3 tests/leak_audit_testnet.py    # RUNS all 3 stages, audits everything
+                                          # they leave on disk (perms + secrets)
 python3 tests/real_phase_create_testnet.py # SHIPPED phase_create -> phase_sign
                                           # chain vs a REAL wallet-rpc
 ```
@@ -54,6 +54,36 @@ committed by `git add -A`. The test is verified to actually fail (exit 1) when
 a wipe pattern is added without a matching ignore rule — a green test that
 cannot go red proves nothing. It also guards the other direction: no tracked
 source file may be shadowed by the widened patterns.
+
+### The leak audit runs the pipeline and watches what it leaves behind
+
+`leak_audit_testnet.py` drives all three shipped stages against real monero
+binaries — `phase_create` → `phase_sign` → `broadcast_signed_xmr.main()`, with
+the transaction actually relayed — then audits the result from observation
+rather than from reasoning:
+
+- what appeared in `/tmp`, `/dev/shm`, `/var/tmp` and `$HOME`, and what survived;
+- the permissions of every file **and directory** produced;
+- whether any file's *content* contains a real secret (the wallet password,
+  spend key, view key and mnemonic are pulled live from the wallet under test,
+  so a hit is a genuine leak, not a placeholder match);
+- the broadcast progress file, which carries txids and per-TX state.
+
+It found the 0755-directory leak that surface-by-surface review had missed:
+files were correctly 0600, but the directories holding them were world-listable,
+so any local user could learn how many transactions were signed and when.
+
+**The audit distrusts itself, deliberately.** A clean result is meaningless if
+the instruments are blind, and this suite has repeatedly caught checks that
+passed only because nothing ran. So:
+
+- *Detector self-test* — each real secret is planted in a canary file and the
+  scanner must flag every one before any clean result is trusted.
+- *Watch self-test* — a canary is planted in each watched directory and must
+  show up in the snapshot diff, proving the watches actually see.
+- The `/dev/shm` check was separately verified non-vacuous by observing
+  mid-run that the password file really is created there (0600, real content),
+  so it passing means "erased", not "never existed".
 
 ### Which real tests run the shipped code, and which don't
 

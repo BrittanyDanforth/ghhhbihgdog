@@ -40,6 +40,7 @@ def load(name):
 
 
 airgap = load("airgap_tx_signer")
+bcast = load("broadcast_signed_xmr")
 
 BASE = tempfile.mkdtemp(prefix="leak_")
 DR = "http://127.0.0.1:28131"; D = DR + "/json_rpc"
@@ -86,7 +87,10 @@ def step(s):
     print(f"\n=== {s} ===")
 
 
-WATCH_DIRS = ["/tmp", "/dev/shm", "/var/tmp"]
+# Watch every directory the run could plausibly write to. $HOME and the CWD
+# were originally omitted, which meant an artifact dropped there would not have
+# been noticed at all -- the audit can only report on paths it looks at.
+WATCH_DIRS = ["/tmp", "/dev/shm", "/var/tmp", os.path.expanduser("~")]
 
 
 def snapshot(dirs):
@@ -184,9 +188,61 @@ try:
     airgap.phase_sign(
         Args(outdir=staging, wallet_cli=shim,
              wallet_file=os.path.join(BASE, "w", "full"), wallet_password=WALLET_PW), plan)
+
+    # Stage 3: the SHIPPED broadcast, relaying for real through the local
+    # wallet-rpc. Previously unaudited -- it writes a progress file holding
+    # txids and per-TX state, which is exactly the sort of artifact this audit
+    # exists to catch. Tor/NEWNYM are stubbed (the RPC is a real local one).
+    step("RUN: shipped broadcast_signed_xmr.main() against the real wallet-rpc")
+    bcast.verify_tor = lambda *a, **k: None
+    bcast.newnym = lambda *a, **k: True
+    bcast.secure_delay = lambda *a, **k: None
+    bcast.tor_recheck = lambda *a, **k: None
+    bcast.validate_proxy = lambda u: {"http": u, "https": u}
+    prog_file = os.path.join(BASE, "broadcast_progress.json")
+    argv0 = sys.argv[:]
+    sys.argv = ["broadcast_signed_xmr", os.path.join(staging, "signed"),
+                "--tor-proxy", "socks5h://127.0.0.1:9050",
+                "--rpc", f"http://127.0.0.1:{WPORT}",
+                "--resume", prog_file, "--rebroadcast", "2"]
+    broadcast_ok = False
+    try:
+        bcast.main()
+        broadcast_ok = True
+    except SystemExit as e:
+        broadcast_ok = (e.code in (0, None))
+        print(f"    broadcast exited: {e.code}")
+    finally:
+        sys.argv = argv0
+    check("broadcast relayed the signed tx (exit 0)", broadcast_ok)
+
     after = snapshot(WATCH_DIRS)
 
-    step("AUDIT 1: files the run LEFT BEHIND in /tmp, /dev/shm, /var/tmp")
+    step("AUDIT 0: prove the WATCHES themselves work")
+    # A watch that cannot see is worse than no watch: every "nothing left
+    # behind" result below would be vacuously true. Plant a canary in each
+    # watched directory and require the snapshot diff to surface it.
+    watch_canaries = []
+    for d in WATCH_DIRS:
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            cp = os.path.join(d, ".leak_audit_canary")
+            try:
+                with open(cp, "w") as f:
+                    f.write("canary")
+                watch_canaries.append(cp)
+            except OSError:
+                pass
+    _probe = snapshot(WATCH_DIRS)
+    unseen = [c for c in watch_canaries if c not in _probe]
+    check(f"all {len(watch_canaries)} watched dirs are actually scanned "
+          f"(blind to: {unseen})", not unseen)
+    for c in watch_canaries:
+        try:
+            os.unlink(c)
+        except OSError:
+            pass
+
+    step("AUDIT 1: files the run LEFT BEHIND in /tmp, /dev/shm, /var/tmp, $HOME")
     leftovers = sorted(after - before)
     for f in leftovers:
         print(f"    left: {f}")
@@ -286,6 +342,20 @@ try:
         print(f"    !!! {d0} is {m} (listable by others)")
     check("no pipeline directory is group/other accessible", not bad_dirs)
     print(f"    staging dir mode: {oct(os.stat(staging).st_mode & 0o777)}")
+
+    step("AUDIT 3c: the broadcast progress file (txids + per-TX state)")
+    if os.path.exists(prog_file):
+        pm = os.stat(prog_file).st_mode & 0o777
+        check(f"broadcast progress file is 0600 (got {oct(pm)})", pm == 0o600)
+        ptext = open(prog_file, errors="ignore").read()
+        p_secret = [lbl for lbl, v in SECRETS.items() if v and v in ptext]
+        check(f"progress file holds no secrets (found {p_secret})", not p_secret)
+        pj = json.loads(ptext)
+        print(f"    relayed={pj.get('relayed')} failed_perm={pj.get('failed_perm')}")
+        check("progress file recorded the relay as successful",
+              pj.get("relayed") == [0])
+    else:
+        print("    (no progress file written)")
 
     step("AUDIT 4: the signed transaction itself")
     blob_path = os.path.join(staging, "signed", "tx_0.signed")
