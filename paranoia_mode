@@ -506,22 +506,36 @@ def wipe_xdg_traces(dry: bool):
         Path.home() / ".local/share/Trash",
         Path.home() / ".local/share/tracker",
     ]
+    # count = targets ACTUALLY wiped. The previous version incremented on mere
+    # EXISTENCE and discarded the boolean _secure_delete_file/_secure_delete_dir
+    # return, so a permission-denied wipe still reported success -- the same
+    # overstating-the-wipe defect already fixed in wipe_gs_artifacts.
     count = 0
+    failed = 0
     for f in targets:
-        if f.exists():
-            if dry:
-                print(f"  [dry] would wipe {f}")
-            else:
-                _secure_delete_file(f)
+        if not f.exists():
+            continue
+        if dry:
+            print(f"  [dry] would wipe {f}")
             count += 1
+        elif _secure_delete_file(f):
+            count += 1
+        else:
+            failed += 1
     for d in dir_targets:
-        if d.is_dir():
-            if dry:
-                print(f"  [dry] would wipe dir {d}")
-            else:
-                _secure_delete_dir(d)
+        if not d.is_dir():
+            continue
+        if dry:
+            print(f"  [dry] would wipe dir {d}")
             count += 1
-    integrity_log("paranoia", f"xdg_traces:{'dry' if dry else 'wiped'}:{count}")
+        elif _secure_delete_dir(d):
+            count += 1
+        else:
+            failed += 1
+    tail = f" ({failed} could not be wiped)" if failed else ""
+    integrity_log("paranoia",
+                  f"xdg_traces:{'dry' if dry else 'wiped'}:{count}:failed={failed}")
+    print(f"  [+] {'Would wipe' if dry else 'Wiped'} {count} XDG trace(s){tail}")
 
 
 def scrub_env_vars(dry: bool):

@@ -367,10 +367,29 @@ def main():
             skip_count += 1
             continue
 
-        # Periodic Tor re-check
+        # Periodic Tor re-check. Also re-verify the DAEMON's relay egress on the
+        # same cadence: the startup check is a single point-in-time sample, and
+        # a broadcast batch runs for up to --timeout-min per TX with delays
+        # between them. A daemon that was Tor-only when we started can pick up
+        # clearnet peers mid-run (peers churn, Tor circuits drop), and every TX
+        # relayed after that point leaves from the operator's IP. Checking once
+        # at startup and never again is exactly the "verified, then assumed"
+        # pattern this tool keeps getting wrong.
         if proxy and (time.time() - last_tor_check) > TOR_RECHECK_INTERVAL:
             tor_recheck(proxy, f"broadcast_tx_{idx}")
             last_tor_check = time.time()
+            if args.rpc_daemon:
+                _eg = check_daemon_relay_egress(args.rpc_daemon, proxy)
+                if _eg["verdict"] == "clearnet":
+                    integrity_log("broadcast", f"relay_egress_DEGRADED:tx={idx}")
+                    print(f"  [!] Relay egress became CLEARNET mid-broadcast: {_eg['detail']}")
+                    if not args.allow_clearnet_relay:
+                        sys.exit(
+                            f"[!] Stopping after {len(relayed)} relayed TX(s). monerod is now\n"
+                            f"    relaying to raw-IP peers, so every REMAINING transaction would\n"
+                            f"    be broadcast from your IP. Fix monerod (--tx-proxy tor,...)\n"
+                            f"    and resume with --resume {progF} to finish the batch."
+                        )
 
         if not blob.exists():
             # Treat as TRANSIENT (drive not mounted, staging not synced yet):

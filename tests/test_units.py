@@ -369,6 +369,33 @@ check("fingerprint: still sensitive to destination",
 check("fingerprint: still sensitive to amount",
       _fp(_p7) != _fp([{"src": "A", "src_index": 7, "dst": "B", "amt": "0.5"}]))
 
+# COLLISIONS the old raw-concatenation scheme allowed. It hashed
+# f"{dst}:{amt}" per TX into one stream with no record boundaries, so
+# structurally different plans produced identical bytes. Each of these was
+# verified to collide under the old scheme.
+check("fingerprint: 2 single-dest TXs != 1 TX with 2 destinations "
+      "(structurally different on-chain, used to collide)",
+      _fp([{"src_index": 0, "dst": "X", "amt": "1"},
+           {"src_index": 0, "dst": "Y", "amt": "2"}]) !=
+      _fp([{"src_index": 0, "destinations": [{"address": "X", "amount": "1"},
+                                             {"address": "Y", "amount": "2"}]}]))
+check("fingerprint: per-TX broadcast delay is part of identity "
+      "(swapped relay timing is an OPSEC change; used to collide)",
+      _fp([{"src_index": 0, "dst": "B", "amt": "0.4", "delay": 60}]) !=
+      _fp([{"src_index": 0, "dst": "B", "amt": "0.4", "delay": 9999}]))
+check("fingerprint: destination ORDER is significant",
+      _fp([{"src_index": 0, "destinations": [{"address": "X", "amount": "1"},
+                                             {"address": "Y", "amount": "2"}]}]) !=
+      _fp([{"src_index": 0, "destinations": [{"address": "Y", "amount": "2"},
+                                             {"address": "X", "amount": "1"}]}]))
+# Cosmetic fields must NOT invalidate a manifest: 'src' is a label read nowhere,
+# and 'extra' is never forwarded to the RPC.
+check("fingerprint: cosmetic 'src' label change does NOT change identity",
+      _fp(_p7) == _fp([{**_p7[0], "src": "a-different-label"}]))
+check("fingerprint: numeric and string amounts normalise identically",
+      _fp([{"src_index": 0, "dst": "B", "amt": "0.4"}]) ==
+      _fp([{"src_index": 0, "dst": "B", "amt": 0.4}]))
+
 # ---------------------------------------------------------------------------
 # ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;
 # GhostSpiral's BTC_RE-only check was the odd one out.

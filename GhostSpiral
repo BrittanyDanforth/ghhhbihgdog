@@ -366,6 +366,7 @@ def main():
                  "--socks5-port", str(_parsed_proxy.port or 9050),
                  args.joinmarket_wallet, btc_addr, "all"],
                 check=True, capture_output=True, text=True, timeout=3600,
+                env=_child_env(),   # third-party child: password scrubbed
             )
             integrity_log("stage1", "JM_tumble_OK")
             # Recover the BTC amounts the tumbler sent to btc_addr and hand them
@@ -869,6 +870,32 @@ def main():
     print("\n  [+] GhostSpiral v10.5 pipeline complete.")
 
 
+#: Env var carrying the wallet spend-key password to the SIGN child only.
+GS_PW_ENV = "GS_WALLET_PASSWORD"
+
+
+def _child_env(wallet_password: str = None) -> dict:
+    """Environment for a child process, with the wallet password scrubbed unless
+    that child is the one that needs it.
+
+    subprocess.run() with no env= hands the child a COPY OF OUR WHOLE
+    ENVIRONMENT. Once the password is supplied via GS_WALLET_PASSWORD -- which
+    this toolchain now recommends over argv -- every child inherits the Monero
+    spend-key password by default, including JoinMarket's third-party
+    tumble.py, the create-phase signer (which never signs anything), broadcast,
+    and the exit simulator. None of them need it, and a third-party child that
+    logs or dumps its environment would leak it.
+
+    So: pass wallet_password only for the sign child; every other child gets an
+    environment with the variable removed.
+    """
+    env = dict(os.environ)
+    env.pop(GS_PW_ENV, None)
+    if wallet_password is not None:
+        env[GS_PW_ENV] = wallet_password
+    return env
+
+
 def _stage5_cleanup(outdir_path: Path, fanout_file: Path, dag_file):
     """Securely erase the PREVIOUS run's artifacts before this run starts.
 
@@ -937,6 +964,7 @@ def _run_round(args, plan_file, staging_dir, label):
              "--outdir", staging_dir,
              f"--fee-priority={args.fee_priority}"],
             check=True, timeout=1800,
+            env=_child_env(),       # create phase never signs: password scrubbed
         )
         integrity_log("stage5", f"create_unsigned_ok:{label}")
 
@@ -963,8 +991,7 @@ def _run_round(args, plan_file, staging_dir, label):
         # whole signing run -- up to the 1800s timeout below -- where any local
         # user could read it with `ps -eo args`. /proc/<pid>/environ is mode
         # 400, so only the owner and root can read it.
-        _sign_env = dict(os.environ)
-        _sign_env["GS_WALLET_PASSWORD"] = args.wallet_password or ""
+        _sign_env = _child_env(args.wallet_password or "")
         subprocess.run(
             ["python3", "airgap_tx_signer", str(plan_file),
              "--phase", "sign",
@@ -1011,7 +1038,7 @@ def _run_round(args, plan_file, staging_dir, label):
                       "--resume", f"{staging_dir}/bcast_progress.json"]
         if args.allow_clearnet_relay:
             _bcast_cmd.append("--allow-clearnet-relay")
-        subprocess.run(_bcast_cmd, check=True, timeout=7200)
+        subprocess.run(_bcast_cmd, check=True, timeout=7200, env=_child_env())
         integrity_log("stage5", f"broadcast_ok:{label}")
     except subprocess.TimeoutExpired:
         integrity_log("stage5", f"broadcast_timeout:{label}")
@@ -1105,6 +1132,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             ["python3", "exit_strategy_simulator", str(spendable_amount),
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
+            env=_child_env(),       # no password needed
         )
         integrity_log("stage5", "exit_sim_ok")
     except Exception as e:

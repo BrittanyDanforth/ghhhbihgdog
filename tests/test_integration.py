@@ -383,6 +383,63 @@ check("D3: wallet password NOT on the signer child's argv",
 check("D3: --wallet-password flag not used at all",
       "--wallet-password" not in _sign[0])
 
+# D4: the password must reach ONLY the sign child. subprocess.run() with no
+# env= hands a child our whole environment, so once GS_WALLET_PASSWORD is set
+# (the method this toolchain now RECOMMENDS) every child inherits the Monero
+# spend-key password by default -- including JoinMarket's third-party
+# tumble.py. Each child must get an env with the variable scrubbed unless it
+# is the one that signs.
+def _child_envs(pw_in_environ):
+    seen = []
+    real_run, real_log = ghost.subprocess.run, ghost.integrity_log
+    prev = os.environ.get("GS_WALLET_PASSWORD")
+    try:
+        if pw_in_environ:
+            os.environ["GS_WALLET_PASSWORD"] = "SpendKeyPass-99"
+        ghost.subprocess.run = lambda cmd, **kw: (
+            seen.append((list(cmd), kw.get("env"))),
+            types.SimpleNamespace(returncode=0))[1]
+        ghost.integrity_log = lambda *a, **k: None
+        a = types.SimpleNamespace(
+            tor_proxy="socks5h://127.0.0.1:9050",
+            rpc_primary="http://127.0.0.1:18083",
+            rpc_daemon="http://127.0.0.1:18081",
+            wallet_file="w", wallet_password="SpendKeyPass-99", fee_priority=1,
+            allow_clearnet_relay=False)
+        ghost._run_round(a, _planD, str(_stage), "Fan-out")
+    finally:
+        ghost.subprocess.run, ghost.integrity_log = real_run, real_log
+        os.environ.pop("GS_WALLET_PASSWORD", None)
+        if prev is not None:
+            os.environ["GS_WALLET_PASSWORD"] = prev
+    return seen
+
+
+def _sees_pw(env):
+    # env=None means "inherit ours", which leaks when the var is in our environ.
+    return env is None or env.get("GS_WALLET_PASSWORD") is not None
+
+
+_envs = _child_envs(pw_in_environ=True)
+_pw_visible = [(c, e) for c, e in _envs if _sees_pw(e)]
+_sign_children = [c for c, e in _envs if "sign" in c]
+_nonsign = [(c, e) for c, e in _envs if "sign" not in c]
+check("D4: the sign child DOES receive the password via env",
+      any(_sees_pw(e) for c, e in _envs if "sign" in c))
+check("D4: NO non-sign child can see the password "
+      f"(leaking: {[c[1] for c, e in _nonsign if _sees_pw(e)]})",
+      not any(_sees_pw(e) for c, e in _nonsign))
+check("D4: exactly one child sees it", len(_pw_visible) == 1)
+# And _child_env must scrub even when the operator exported it.
+os.environ["GS_WALLET_PASSWORD"] = "leaky"
+try:
+    check("D4: _child_env() scrubs an exported password by default",
+          ghost._child_env().get("GS_WALLET_PASSWORD") is None)
+    check("D4: _child_env(pw) injects it only when asked",
+          ghost._child_env("x").get("GS_WALLET_PASSWORD") == "x")
+finally:
+    os.environ.pop("GS_WALLET_PASSWORD", None)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)
