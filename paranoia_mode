@@ -296,7 +296,14 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
                     count += 1
 
     print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
-    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
+    # Only log in DRY mode. In a real wipe this function has just securely
+    # deleted integrity_chain.log; integrity_log() opens it in append mode and
+    # would RECREATE it with a fresh hash-chained line -- resurrecting the exact
+    # forensic artifact this phase exists to destroy (the file survived every
+    # real run with a single entry documenting its own wipe). main() already
+    # runs this phase last and logs nothing afterward; this keeps that promise.
+    if dry:
+        integrity_log("paranoia", f"gs_artifacts:dry:{count}")
 
 
 def wipe_tmp_files(dry: bool):

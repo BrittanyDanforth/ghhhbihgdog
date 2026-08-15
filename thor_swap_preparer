@@ -129,7 +129,9 @@ def main():
             if proxy:
                 newnym()
             integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
-            raise
+            # Abort cleanly with an OPSEC-safe message instead of re-raising a
+            # raw requests traceback (which every other abort here avoids).
+            sys.exit(f"[!] SwapKit quote failed for pair {i}: {str(e)[:60]}")
 
         routes = quote_resp.get("routes", [])
         if not routes:
@@ -137,11 +139,19 @@ def main():
             integrity_log("thor", f"no_routes_{i}")
             sys.exit(f"[!] No swap routes for pair {i}: {str(error)[:80]}")
 
+        # `or` fallbacks, not .get() defaults: the API frequently returns these
+        # keys PRESENT but null. .get("k", default) hands back None (not the
+        # default) for a null value, so route.get("transaction", {}) -> None ->
+        # None.get(...) AttributeError, and Decimal(str(None)) -> InvalidOperation.
         route = routes[0]
-        tx_info = route.get("transaction", route.get("calldata", {}))
-        deposit = tx_info.get("depositAddress", tx_info.get("to", ""))
-        memo = tx_info.get("memo", tx_info.get("data", ""))
-        expected_xmr = Decimal(str(route.get("expectedOutput", "0")))
+        tx_info = route.get("transaction") or route.get("calldata") or {}
+        deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
+        memo = tx_info.get("memo") or tx_info.get("data") or ""
+        try:
+            expected_xmr = Decimal(str(route.get("expectedOutput") or "0"))
+        except Exception:
+            integrity_log("thor", f"bad_expected_output_{i}")
+            expected_xmr = Decimal(0)
 
         if not deposit:
             integrity_log("thor", f"no_deposit_{i}")

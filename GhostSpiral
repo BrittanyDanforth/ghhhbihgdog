@@ -31,7 +31,7 @@ from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, require_resources,
+    safe_post, connect_rpc, daemon_fee_per_byte, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address,
@@ -69,24 +69,31 @@ PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
 FANOUT_CONFIRM_TIMEOUT = 3600   # seconds to wait for fan-out to unlock
 FANOUT_CONFIRM_POLL = 30        # seconds between balance polls
 
+# In sender mode the XMR from the ThorChain swap lands on ENTRY only AFTER the
+# operator sends BTC and the cross-chain swap settles (minutes to well over an
+# hour). ENTRY is created fresh this run, so its balance starts at zero -- we
+# poll for the funds to arrive rather than checking once and aborting.
+XMR_ARRIVAL_TIMEOUT = 7200      # seconds to wait for swapped XMR to arrive
+XMR_ARRIVAL_POLL = 30           # seconds between arrival polls
 
-def fetch_fee_from_rpc(rpc, fee_priority: int = 1) -> Decimal:
-    """Ask monero-wallet-rpc for current fee estimate (the only reliable source).
-    Returns fee per TX in XMR, assuming ~2kB typical TX weight at the given
-    fee_priority (must match the priority passed to transfer_split later)."""
+
+def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal:
+    """Estimate per-TX fee in XMR from monerod's get_fee_estimate.
+
+    get_fee_estimate is a DAEMON json_rpc method -- the wallet-rpc (:18083) does
+    NOT expose it, so the earlier version that queried rpc_primary for it always
+    threw and silently fell back to the constant on every run. Query the daemon
+    (args.rpc_daemon, :18081) for the base per-byte fee, scale by a ~2kB typical
+    TX size and the priority multiplier (matching what transfer_split charges),
+    and fall back to FALLBACK_FEE_XMR on any failure."""
     multiplier = Decimal(PRIORITY_FEE_MULTIPLIER.get(fee_priority, 1))
-    try:
-        resp = rpc.raw_request("get_fee_estimate", {})
-        fee_per_byte = resp.get("fee", 0)
-        if fee_per_byte > 0:
-            # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
-            fee_atomic = fee_per_byte * 2000
-            fee_xmr = (Decimal(str(fee_atomic)) / Decimal(10 ** 12)) * multiplier
-            if fee_xmr > 0:
-                integrity_log("fee", "rpc_fee_estimate_ok")
-                return fee_xmr
-    except Exception as e:
-        integrity_log("fee", f"rpc_fee_estimate_fail:{str(e)[:40]}")
+    fee_per_byte = daemon_fee_per_byte(daemon_url, proxies)
+    if fee_per_byte > 0:
+        # Typical Monero TX is ~1.5-2kB; use 2000 bytes as conservative estimate
+        fee_xmr = (Decimal(fee_per_byte * 2000) / Decimal(10 ** 12)) * multiplier
+        if fee_xmr > 0:
+            integrity_log("fee", "daemon_fee_estimate_ok")
+            return fee_xmr
     integrity_log("fee", "using_fallback_fee")
     return FALLBACK_FEE_XMR * multiplier
 
@@ -210,7 +217,7 @@ def main():
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
     integrity_log("stage0", f"rpc_sync_ok:height={h1}")
 
-    fee_xmr = fetch_fee_from_rpc(rpc_primary, args.fee_priority)
+    fee_xmr = fetch_fee_from_daemon(args.rpc_daemon, proxy, args.fee_priority)
     integrity_log("stage0", "fee_fetched")
 
     ###########################################################################
@@ -313,20 +320,29 @@ def main():
                     f"    Provider errors: {str(provider_errors)[:120]}"
                 )
 
-            # Use the first (best) route
+            # Use the first (best) route. NOTE: use `or` fallbacks, not dict
+            # .get() defaults: the API often returns these keys PRESENT but
+            # null, and .get("k", default) returns None (not the default) when
+            # the key exists with a null value. `route.get("transaction", {})`
+            # would then hand back None and the next .get() raises
+            # AttributeError; Decimal(str(None)) raises InvalidOperation. `or`
+            # collapses both missing AND null to the safe fallback.
             route = routes[0]
-            expected_output = route.get("expectedOutput", "0")
-            # The actual deposit details come from executing the route
-            # For THORChain routes, the deposit info is in the route's transaction object
-            tx_info = route.get("transaction", route.get("calldata", {}))
-            deposit_addr = tx_info.get("depositAddress", tx_info.get("to", ""))
-            memo = tx_info.get("memo", tx_info.get("data", ""))
+            expected_output = route.get("expectedOutput") or "0"
+            # For THORChain routes the deposit info is in the route's tx object
+            tx_info = route.get("transaction") or route.get("calldata") or {}
+            deposit_addr = tx_info.get("depositAddress") or tx_info.get("to") or ""
+            memo = tx_info.get("memo") or tx_info.get("data") or ""
 
             if not deposit_addr:
                 integrity_log("stage2", f"no_deposit_in_route_{i}")
                 sys.exit(f"[!] Route has no deposit address for chunk {i}")
 
-            expected_dec = Decimal(str(expected_output))
+            try:
+                expected_dec = Decimal(str(expected_output))
+            except Exception:
+                integrity_log("stage2", f"bad_expected_output_{i}")
+                expected_dec = Decimal(0)
 
             deposit_info = {
                 "chunk": i,
@@ -476,17 +492,47 @@ def main():
     ###########################################################################
 
     bal_account = receive_account_index if receive_mode else 0
+    entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
 
     def xmr_balance() -> tuple[Decimal, Decimal]:
-        """Returns (total_balance, unlocked_balance) in XMR."""
-        res = rpc_primary.raw_request(
-            "get_balance", {"account_index": bal_account, "address_indices": []}
-        )
-        total = Decimal(str(res.get("balance", 0))) / Decimal(10 ** 12)
-        unlocked = Decimal(str(res.get("unlocked_balance", 0))) / Decimal(10 ** 12)
+        """Return (total, unlocked) for ENTRY's subaddress in XMR.
+
+        Scoped to ENTRY's subaddress index, NOT the whole account. Fan-out
+        spends only from ENTRY (transfer_split subaddr_indices=[entry_index]),
+        so sizing the plan off an account-wide balance that also counted funds
+        parked on other subaddresses would let fanout_amt exceed what ENTRY can
+        actually spend, and every fan-out TX would fail 'not enough money'.
+        A refresh is forced first so freshly-arrived outputs are reflected.
+        """
+        try:
+            rpc_primary.raw_request("refresh", {})
+        except Exception:
+            pass  # refresh is best-effort; background sync still applies
+        tot_atomic, unlk_atomic = rpc_primary.get_subaddress_balance(bal_account, entry_index)
+        total = Decimal(str(tot_atomic)) / Decimal(10 ** 12)
+        unlocked = Decimal(str(unlk_atomic)) / Decimal(10 ** 12)
         return total, unlocked
 
     total_bal, unlocked_bal = xmr_balance()
+
+    # Sender mode: the swapped XMR lands on ENTRY only AFTER the operator sends
+    # BTC and ThorChain settles (and in manual mode, whenever they send it).
+    # ENTRY is fresh this run so a single check here is always ~0 -> abort.
+    # Poll for arrival instead. Receiver mode already has funds on ENTRY.
+    if not receive_mode and unlocked_bal <= DUST_XMR:
+        print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
+              f"{scrub_address(ENTRY)} (up to {XMR_ARRIVAL_TIMEOUT // 60} min)...")
+        waited = 0
+        while unlocked_bal <= DUST_XMR and waited < XMR_ARRIVAL_TIMEOUT:
+            if shutdown_requested():
+                sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
+            time.sleep(XMR_ARRIVAL_POLL)
+            waited += XMR_ARRIVAL_POLL
+            total_bal, unlocked_bal = xmr_balance()
+            if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
+                print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
+        integrity_log("stage4", f"xmr_arrival_done:unlocked={unlocked_bal}")
+
     integrity_log("stage4", "balance_fetched")
 
     if total_bal > unlocked_bal + DUST_XMR:
@@ -763,10 +809,15 @@ def _run_round(args, plan_file, staging_dir, label):
 
     try:
         print(f"  [*] {label} 5c: Broadcasting signed TXs...")
+        # Relay via wallet-rpc submit_transfer (NOT the daemon). Each round gets
+        # its own progress file under its own staging subdir so the fan-out and
+        # DAG rounds -- distinct blob sets -- never trip each other's stale-
+        # progress guard (which would abort the second round).
         subprocess.run(
             ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
              "--tor-proxy", args.tor_proxy,
-             "--rpc", args.rpc_daemon],
+             "--rpc", args.rpc_primary,
+             "--resume", f"{staging_dir}/bcast_progress.json"],
             check=True, timeout=7200,
         )
         integrity_log("stage5", f"broadcast_ok:{label}")

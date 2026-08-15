@@ -242,8 +242,18 @@ def phase_sign(args, plan: List[dict]):
         import tempfile
         work_dir = tempfile.mkdtemp(prefix="gs_sign_")
         try:
+            # phase_create saved the RPC's `unsigned_txset`, which is a HEX
+            # string. wallet-cli's sign_transfer reads the BINARY
+            # unsigned_monero_tx file, so decode the hex back to bytes here --
+            # writing the hex text verbatim gave wallet-cli an unparseable file
+            # and signing silently produced nothing. Fall back to a raw copy if
+            # the payload isn't hex (e.g. a future base64 encoding).
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
-            unsigned_in.write_text(unsigned_file.read_text())
+            _hex_text = unsigned_file.read_text().strip()
+            try:
+                unsigned_in.write_bytes(bytes.fromhex(_hex_text))
+            except ValueError:
+                unsigned_in.write_text(_hex_text)
 
             cmd = [
                 args.wallet_cli,

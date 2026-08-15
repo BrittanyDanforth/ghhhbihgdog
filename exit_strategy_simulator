@@ -59,11 +59,16 @@ def fetch_prices(proxy):
             code = entry.get("currencyCode", "")
             price = entry.get("price", 0)
             if code == "XMR" and price > 0:
+                # Bisq quotes altcoin markets as BTC-per-unit (BTC per XMR).
                 prices["xmr_btc"] = Decimal(str(price))
             elif code == "USD" and price > 0:
-                prices["btc_usd"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                # Bisq quotes fiat as fiat-per-BTC (USD per BTC). Do NOT invert:
+                # xmr_usd = xmr_btc[BTC/XMR] * btc_usd[USD/BTC] = USD/XMR. The
+                # old 1.0/price made btc_usd = BTC/USD, so the product came out
+                # ~9 orders of magnitude too small and quantized to 0.00.
+                prices["btc_usd"] = Decimal(str(price))
             elif code == "EUR" and price > 0:
-                prices["btc_eur"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                prices["btc_eur"] = Decimal(str(price))
 
         if "xmr_btc" in prices and "btc_usd" in prices:
             xmr_usd = prices["xmr_btc"] * prices["btc_usd"]

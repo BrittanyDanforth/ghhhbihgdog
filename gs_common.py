@@ -325,6 +325,36 @@ def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     """
     return MoneroRPC(url, proxy_url=proxy_url)
 
+
+def daemon_fee_per_byte(daemon_url: str, proxies: Optional[Dict[str, str]] = None) -> int:
+    """Return monerod's base fee-per-byte (atomic units), or 0 on any failure.
+
+    get_fee_estimate is a monerod (DAEMON) json_rpc method; monero-wallet-rpc
+    does NOT expose it, so callers wanting a live fee estimate must query the
+    daemon endpoint (e.g. :18081), not the wallet-rpc (:18083). A localhost
+    daemon is queried directly; a non-localhost daemon is queried through the
+    given Tor proxies, or refused (returns 0) if none were provided, so the
+    query is never leaked to a remote node over clearnet.
+    """
+    parsed = urlparse(daemon_url)
+    host = (parsed.hostname or "127.0.0.1").lower()
+    use_proxies = None
+    if host not in _LOCALHOST_NAMES:
+        if not proxies:
+            return 0
+        use_proxies = proxies
+    try:
+        endpoint = daemon_url.rstrip("/") + "/json_rpc"
+        r = requests.post(
+            endpoint,
+            json={"jsonrpc": "2.0", "id": "0", "method": "get_fee_estimate"},
+            timeout=20, proxies=use_proxies,
+        )
+        r.raise_for_status()
+        return int(r.json().get("result", {}).get("fee", 0) or 0)
+    except Exception:
+        return 0
+
 # ---------------------------------------------------------------------------
 #  Resource sentinel
 # ---------------------------------------------------------------------------

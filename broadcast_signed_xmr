@@ -23,7 +23,7 @@ import requests
 
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
-    safe_post, newnym, secure_delay, atomic_write_json,
+    newnym, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested,
 )
 
@@ -68,9 +68,10 @@ def main():
                           "signed_manifest_v1.json")
     cli.add_argument("--tor-proxy",
                      help="SOCKS5 proxy for all network access")
-    cli.add_argument("--rpc", default="http://127.0.0.1:18081",
-                     help="primary Monero daemon RPC (NOT wallet-rpc; "
-                          "this must be monerod's HTTP endpoint)")
+    cli.add_argument("--rpc", default="http://127.0.0.1:18083",
+                     help="monero-wallet-rpc endpoint (NOT the daemon). Relay "
+                          "uses submit_transfer, a wallet-rpc json_rpc method, "
+                          "which imports+broadcasts each signed tx set.")
     cli.add_argument("--rpc-alt", help="fallback RPC")
     cli.add_argument("--rpc-list",
                      help="file with RPC endpoints, one per line")
@@ -236,7 +237,12 @@ def main():
         "|".join(b.name for b in blobs).encode()
     ).hexdigest()[:32]
 
-    # Progress state
+    # Progress state. 'done' holds indices with a PERMANENT outcome (relayed,
+    # double-spend, or low-fee reject); only those are skipped on resume. A
+    # TRANSIENT failure (node down, timeout) is deliberately NOT added to
+    # 'done', so a --resume re-run retries it -- the old code advanced a
+    # positional 'last' pointer past a transient failure and skipped it forever,
+    # silently leaving those funds un-relayed.
     progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
     if progF.exists():
         with open(progF) as f:
@@ -249,10 +255,16 @@ def main():
                 "    Delete the progress file or use the matching blob set.\n"
                 "    Stale progress would silently skip TXs."
             )
-        last_idx = prog.get("last", -1)
+        done = set(prog.get("done", []))
+        prog.setdefault("log", [])
+        prog["blob_fingerprint"] = blob_fp
     else:
-        prog = {"last": -1, "log": [], "blob_fingerprint": blob_fp}
-        last_idx = -1
+        prog = {"done": [], "log": [], "blob_fingerprint": blob_fp}
+        done = set()
+
+    def _persist():
+        prog["done"] = sorted(done)
+        atomic_write_json(prog, progF)
 
     import secrets as _secrets
     last_tor_check = time.time()
@@ -266,7 +278,7 @@ def main():
             print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progF}")
             break
 
-        if idx <= last_idx:
+        if idx in done:
             skip_count += 1
             continue
 
@@ -280,8 +292,7 @@ def main():
             print(f"  [!] Missing: {blob.name} - skipping")
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
                                 "error": "file_missing"})
-            prog["last"] = idx
-            atomic_write_json(prog, progF)
+            done.add(idx); _persist()   # a missing file will not reappear
             fail_count += 1
             continue
 
@@ -290,139 +301,85 @@ def main():
             integrity_log("broadcast", f"empty_blob:{blob.name}")
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
                                 "error": "empty_blob"})
-            prog["last"] = idx
-            atomic_write_json(prog, progF)
+            done.add(idx); _persist()
             fail_count += 1
             continue
 
-        # Convert to hex for the daemon's send_raw_transaction endpoint
-        raw_hex = raw_data.hex()
+        # The signed blob is a wallet SIGNED-TX-SET (what `sign_transfer`
+        # emits), NOT a raw consensus transaction. It must be RELAYED via
+        # monero-wallet-rpc's submit_transfer, which imports the signed set and
+        # broadcasts it through the wallet's own daemon connection. The old code
+        # hex-posted it to monerod's /sendrawtransaction, which cannot
+        # deserialize a tx-set as a transaction and rejected every TX. So `--rpc`
+        # is the WALLET-rpc endpoint here, and the payload is the tx-set hex.
+        tx_data_hex = raw_data.hex()
 
-        # NEWNYM + planned delay before each TX for circuit isolation and
-        # timing decorrelation. The delay comes from the unsigned plan and is
-        # critical for preventing timing-cluster analysis on the blockchain.
-        # Keyed on the blob's REAL manifest index (from its tx_N filename),
-        # NOT the loop's positional idx -- if any earlier TX was skipped
-        # upstream (a signing failure), the positions no longer line up with
-        # the manifest's idx values and every later TX would get some other
-        # TX's delay (or none) instead of its own.
-        if idx > 0:
-            real_idx = _blob_sort_key(blob)
-            planned_delay = tx_delays.get(real_idx, 0)
-            if planned_delay > 0:
-                print(f"  [*] Waiting {planned_delay}s (planned delay for TX {real_idx})...")
-                integrity_log("broadcast", f"delay:idx={real_idx}:secs={planned_delay}")
-                # Sleep in chunks so shutdown_requested() can be checked
-                waited = 0
-                while waited < planned_delay:
-                    if shutdown_requested():
-                        break
-                    chunk = min(30, planned_delay - waited)
-                    time.sleep(chunk)
-                    waited += chunk
-            newnym(required=True)
-            secure_delay(5.0, 15.0)
+        # NEWNYM + planned delay before EVERY TX (including the first) for
+        # circuit isolation and timing decorrelation. The delay is keyed on the
+        # blob's REAL manifest index (from its tx_N filename), NOT the loop's
+        # positional idx, so an upstream gap can't shift a delay onto the wrong
+        # TX. (The old code skipped the delay+newnym entirely for the first TX.)
+        real_idx = _blob_sort_key(blob)
+        planned_delay = tx_delays.get(real_idx, 0)
+        if planned_delay > 0:
+            print(f"  [*] Waiting {planned_delay}s (planned delay for TX {real_idx})...")
+            integrity_log("broadcast", f"delay:idx={real_idx}:secs={planned_delay}")
+            # Sleep in chunks so shutdown_requested() can be checked
+            waited = 0
+            while waited < planned_delay:
+                if shutdown_requested():
+                    break
+                chunk = min(30, planned_delay - waited)
+                time.sleep(chunk)
+                waited += chunk
+        newnym(required=True)
+        secure_delay(5.0, 15.0)
 
         attempts = args.rebroadcast
-        sent = False
+        outcome = "transient"   # relayed | double_spend | low_fee | transient
+        txid = ""
         start_time = time.time()
 
         while attempts > 0 and (time.time() - start_time) < args.timeout_min * 60:
             rpc_url = rpc_pool[_secrets.randbelow(len(rpc_pool))]
             try:
-                # send_raw_transaction is a daemon /sendrawtransaction endpoint,
-                # NOT a JSON-RPC method. It takes {tx_as_hex, do_not_relay}.
-                submit_url = rpc_url.rstrip("/") + "/sendrawtransaction"
+                # submit_transfer is a WALLET-rpc json_rpc method: it imports the
+                # signed tx set and relays every tx in it via the wallet's daemon.
+                submit_url = rpc_url.rstrip("/") + "/json_rpc"
                 res = _single_post(
                     submit_url,
-                    {"tx_as_hex": raw_hex, "do_not_relay": False},
+                    {"jsonrpc": "2.0", "id": "0", "method": "submit_transfer",
+                     "params": {"tx_data_hex": tx_data_hex}},
                     proxy,
                 )
-
-                status = res.get("status", "")
-                is_double = res.get("double_spend", False)
-                if status == "OK" and not is_double:
-                    txid = res.get("tx_hash", "")
-                    if not txid:
-                        integrity_log("broadcast", f"no_txid:idx={idx}")
-                        print(f"  [!] TX {idx} accepted but no txid returned - cannot track confirmation")
-                        # Still mark as sent since daemon accepted it
-
-                    txid_display = txid[:16] if txid else "no-txid"
-                    print(f"  [+] TX {idx} -> mempool | {txid_display}...")
-                    integrity_log("broadcast", f"sent:idx={idx}")
-
-                    # Wait for mining confirmation (only if we have a real txid)
-                    check_url = rpc_url.rstrip("/") + "/gettransactions"
-                    mine_start = time.time()
-                    confirmed = False
-                    block_height = 0
-                    while txid and (time.time() - mine_start) < args.mine_wait:
-                        if shutdown_requested():
-                            break
-                        try:
-                            q = safe_post(
-                                check_url,
-                                {"txs_hashes": [txid],
-                                 "decode_as_json": False,
-                                 "prune": False},
-                                proxy,
-                            )
-                            txs = q.get("txs", [])
-                            if txs:
-                                in_pool = txs[0].get("in_pool", True)
-                                ht = txs[0].get("block_height", 0)
-                                if not in_pool and ht > 0:
-                                    print(f"  [Mined] TX {idx} at height {ht}")
-                                    integrity_log("broadcast", f"mined:idx={idx}:ht={ht}")
-                                    confirmed = True
-                                    block_height = ht
-                                    break
-                        except Exception:
-                            pass
-                        time.sleep(60)
-
-                    if not confirmed:
-                        integrity_log("broadcast", f"unconfirmed:idx={idx}:txid={txid[:16]}")
-                        print(f"  [!] TX {idx} unconfirmed after {args.mine_wait}s")
-
-                    sent = True
-                    # Save txid in progress so we can check again on resume
-                    prog["log"].append({
-                        "idx": idx, "file": str(blob), "sent": True,
-                        "txid": txid, "confirmed": confirmed,
-                        "block_height": block_height,
-                    })
-                    prog["last"] = idx
-                    atomic_write_json(prog, progF)
-                    success_count += 1
+                result = res.get("result") or {}
+                err = res.get("error") or {}
+                tx_hashes = result.get("tx_hash_list") or []
+                if tx_hashes:
+                    txid = tx_hashes[0]
+                    outcome = "relayed"
+                    print(f"  [+] TX {real_idx} -> relayed | {txid[:16]}...")
+                    integrity_log("broadcast", f"relayed:idx={real_idx}")
                     break
-                else:
-                    err_msg = res.get("reason", res.get("status", str(res)))
-                    if isinstance(err_msg, dict):
-                        err_msg = str(err_msg)
-                    print(f"  Node: {str(err_msg)[:80]}")
 
-                    if res.get("double_spend"):
-                        integrity_log("broadcast", f"DOUBLE_SPEND:idx={idx}")
-                        print(f"  [!] TX {idx} flagged as double-spend! Skipping.")
-                        prog["log"].append({
-                            "idx": idx, "file": str(blob), "sent": False,
-                            "error": "double_spend",
-                        })
-                        prog["last"] = idx
-                        atomic_write_json(prog, progF)
-                        fail_count += 1
-                        sent = False
-                        break
-
-                    if "low_fee" in str(err_msg).lower():
-                        integrity_log("broadcast", f"low_fee_rejected:idx={idx}")
-                        print("  [!] TX rejected: fee too low. Re-sign with higher --fee-priority.")
-                        print("  [!] Monero does NOT support RBF - cannot bump fee on signed TX.")
-                        break
+                emsg = str(err.get("message", "") or res)[:160]
+                emsg_l = emsg.lower()
+                print(f"  Node: {emsg[:80]}")
+                if "double" in emsg_l and "spend" in emsg_l:
+                    outcome = "double_spend"
+                    integrity_log("broadcast", f"DOUBLE_SPEND:idx={real_idx}")
+                    print(f"  [!] TX {real_idx} flagged as double-spend! Skipping.")
+                    break
+                if "fee" in emsg_l and ("low" in emsg_l or "too small" in emsg_l
+                                        or "not enough" in emsg_l):
+                    outcome = "low_fee"
+                    integrity_log("broadcast", f"low_fee_rejected:idx={real_idx}")
+                    print("  [!] TX rejected: fee too low. Re-sign with higher --fee-priority.")
+                    print("  [!] Monero does NOT support RBF - cannot bump fee on a signed TX.")
+                    break
+                # anything else: treat as transient and retry on a new circuit
             except Exception as e:
-                integrity_log("broadcast", f"error:idx={idx}:{str(e)[:40]}")
+                integrity_log("broadcast", f"error:idx={real_idx}:{str(e)[:40]}")
                 print(f"  [!] Error: {str(e)[:80]}")
 
             attempts -= 1
@@ -430,19 +387,36 @@ def main():
                 newnym()
                 secure_delay(5.0, 15.0)
 
-        if not sent and not any(e.get("idx") == idx for e in prog["log"]):
+        if outcome == "relayed":
+            success_count += 1
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": True, "txid": txid})
+            done.add(idx); _persist()
+        elif outcome in ("double_spend", "low_fee"):
             fail_count += 1
-            print(f"  [!] TX {idx} FAILED after {args.rebroadcast} attempts - manual action needed")
-            prog["last"] = idx
-            prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
-                                "error": "exhausted_retries"})
-            atomic_write_json(prog, progF)
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False, "error": outcome})
+            done.add(idx); _persist()   # permanent: never auto-retried
+        else:
+            # Transient: record but DO NOT add to 'done', so --resume retries it.
+            fail_count += 1
+            print(f"  [!] TX {real_idx} FAILED (transient) after {args.rebroadcast} attempts "
+                  f"- will retry on --resume {progF}")
+            prog["log"].append({"idx": idx, "file": str(blob), "sent": False, "error": "transient"})
+            _persist()
 
     integrity_log("broadcast", "done")
-    print(f"\n  [+] Broadcast complete: {success_count} sent, {fail_count} failed, {skip_count} resumed.")
-    if skip_count > 0:
-        print(f"  [!] {skip_count} TX(s) were skipped (already handled in prior run).")
+    print(f"\n  [+] Broadcast complete: {success_count} relayed, {fail_count} failed, "
+          f"{skip_count} already done.")
     print(f"  [+] Progress: {progF}")
+
+    # Exit NONZERO on any failure or an empty run so an orchestrator invoking us
+    # with check=True cannot mistake an all-rejected batch for success.
+    if fail_count > 0:
+        integrity_log("broadcast", f"exit_fail:{fail_count}_failed:{success_count}_relayed")
+        sys.exit(f"[!] Broadcast incomplete: {fail_count} TX(s) failed to relay "
+                 f"({success_count} relayed, {skip_count} already done).")
+    if success_count == 0 and skip_count == 0:
+        integrity_log("broadcast", "exit_fail:nothing_relayed")
+        sys.exit("[!] Broadcast processed no TXs (nothing relayed, nothing resumed).")
 
 
 if __name__ == "__main__":
