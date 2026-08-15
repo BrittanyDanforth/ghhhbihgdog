@@ -54,7 +54,6 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
     r.raise_for_status()
     return r.json()
 
-MAX_MINE_WAIT_SECONDS = 7200
 TOR_RECHECK_INTERVAL = 300  # re-verify Tor every 5 min during broadcast
 
 
@@ -96,8 +95,6 @@ def main():
                      help="max rebroadcast attempts per TX")
     cli.add_argument("--timeout-min", type=int, default=30,
                      help="per-TX broadcast timeout in minutes")
-    cli.add_argument("--mine-wait", type=int, default=MAX_MINE_WAIT_SECONDS,
-                     help="max seconds to wait for mining confirmation")
     cli.add_argument("--resume", help="progress file for crash-resume")
     args = cli.parse_args()
 
@@ -109,7 +106,22 @@ def main():
     proxy = validate_proxy(args.tor_proxy)
     verify_tor(proxy)
 
-    # Build RPC pool
+    # OPSEC boundary warning. Relay goes through wallet-rpc submit_transfer,
+    # which imports the signed set and broadcasts it over the WALLET-RPC's OWN
+    # daemon connection -- NOT over this script's Tor proxy. Our verify_tor /
+    # newnym / tor_recheck only cover the (localhost, direct) submit call and
+    # the delay pacing; they do NOT anonymize where the tx actually leaves the
+    # machine. The operator MUST run monero-wallet-rpc/monerod behind Tor
+    # (e.g. monerod --tx-proxy tor,127.0.0.1:9050 and wallet-rpc --proxy) or the
+    # broadcast egress is clearnet regardless of what this script reports.
+    print("  [!] OPSEC: relay egress is controlled by the wallet-rpc/monerod")
+    print("  [!] Tor config (--tx-proxy/--proxy), NOT by this script. Verify it.")
+    integrity_log("broadcast", "egress_via_walletrpc_daemon_conn")
+
+    # Build RPC pool. NOTE: a signed tx-set can only be submitted by the
+    # wallet-rpc that CREATED it (it holds the matching key images), so
+    # --rpc-alt / --rpc-list of *other* wallet-rpcs will reject the set. They
+    # are only useful as replicas of the same wallet; otherwise leave them out.
     rpc_pool: List[str] = [args.rpc]
     if args.rpc_alt:
         rpc_pool.append(args.rpc_alt)
@@ -119,6 +131,9 @@ def main():
             for line in Path(args.rpc_list).read_text().splitlines()
             if line.strip()
         ]
+    if len(rpc_pool) > 1:
+        print(f"  [!] {len(rpc_pool)} RPC endpoints given; submit_transfer only works "
+              f"against the wallet-rpc that created the set. Others will reject it.")
     integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
 
     # Gather blobs FIRST (input_path must be defined before delay loading uses it)
@@ -254,12 +269,17 @@ def main():
         "|".join(b.name for b in blobs).encode()
     ).hexdigest()[:32]
 
-    # Progress state. 'done' holds indices with a PERMANENT outcome (relayed,
-    # double-spend, or low-fee reject); only those are skipped on resume. A
-    # TRANSIENT failure (node down, timeout) is deliberately NOT added to
-    # 'done', so a --resume re-run retries it -- the old code advanced a
-    # positional 'last' pointer past a transient failure and skipped it forever,
-    # silently leaving those funds un-relayed.
+    # Progress state, split by outcome so resume and success-reporting are both
+    # correct:
+    #   'relayed'     -- successfully broadcast; skipped on resume.
+    #   'failed_perm' -- permanently rejected (double-spend / low-fee); skipped
+    #                    on resume because retrying can't help, but deliberately
+    #                    NOT counted as relayed, so the batch reads incomplete.
+    # A transient failure (node down, timeout) and a missing/empty blob (drive
+    # not mounted yet, momentary zero-length) go into NEITHER set -- only the
+    # log -- so a --resume re-run actually retries them. Success is defined as
+    # "every blob relayed" and checked at exit, so a resume that only re-skips
+    # permanent failures can never be mistaken for success.
     progF = Path(args.resume) if args.resume else Path("broadcast_progress.json")
     if progF.exists():
         with open(progF) as f:
@@ -272,15 +292,18 @@ def main():
                 "    Delete the progress file or use the matching blob set.\n"
                 "    Stale progress would silently skip TXs."
             )
-        done = set(prog.get("done", []))
+        relayed = set(prog.get("relayed", []))
+        failed_perm = set(prog.get("failed_perm", []))
         prog.setdefault("log", [])
         prog["blob_fingerprint"] = blob_fp
     else:
-        prog = {"done": [], "log": [], "blob_fingerprint": blob_fp}
-        done = set()
+        prog = {"relayed": [], "failed_perm": [], "log": [], "blob_fingerprint": blob_fp}
+        relayed = set()
+        failed_perm = set()
 
     def _persist():
-        prog["done"] = sorted(done)
+        prog["relayed"] = sorted(relayed)
+        prog["failed_perm"] = sorted(failed_perm)
         atomic_write_json(prog, progF)
 
     import secrets as _secrets
@@ -295,7 +318,7 @@ def main():
             print(f"  [!] Shutdown at TX {idx}. Resume with --resume {progF}")
             break
 
-        if idx in done:
+        if idx in relayed or idx in failed_perm:
             skip_count += 1
             continue
 
@@ -305,20 +328,23 @@ def main():
             last_tor_check = time.time()
 
         if not blob.exists():
+            # Treat as TRANSIENT (drive not mounted, staging not synced yet):
+            # record but do not mark permanent, so --resume retries it.
             integrity_log("broadcast", f"missing_blob:{blob.name}")
-            print(f"  [!] Missing: {blob.name} - skipping")
+            print(f"  [!] Missing: {blob.name} - will retry on --resume {progF}")
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
                                 "error": "file_missing"})
-            done.add(idx); _persist()   # a missing file will not reappear
+            _persist()
             fail_count += 1
             continue
 
         raw_data = blob.read_bytes()
         if not raw_data:
             integrity_log("broadcast", f"empty_blob:{blob.name}")
+            print(f"  [!] Empty blob {blob.name} - will retry on --resume {progF}")
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False,
                                 "error": "empty_blob"})
-            done.add(idx); _persist()
+            _persist()
             fail_count += 1
             continue
 
@@ -407,13 +433,13 @@ def main():
         if outcome == "relayed":
             success_count += 1
             prog["log"].append({"idx": idx, "file": str(blob), "sent": True, "txid": txid})
-            done.add(idx); _persist()
+            relayed.add(idx); _persist()
         elif outcome in ("double_spend", "low_fee"):
             fail_count += 1
             prog["log"].append({"idx": idx, "file": str(blob), "sent": False, "error": outcome})
-            done.add(idx); _persist()   # permanent: never auto-retried
+            failed_perm.add(idx); _persist()   # permanent: skipped, never relayed
         else:
-            # Transient: record but DO NOT add to 'done', so --resume retries it.
+            # Transient: record but add to NEITHER set, so --resume retries it.
             fail_count += 1
             print(f"  [!] TX {real_idx} FAILED (transient) after {args.rebroadcast} attempts "
                   f"- will retry on --resume {progF}")
@@ -421,19 +447,21 @@ def main():
             _persist()
 
     integrity_log("broadcast", "done")
-    print(f"\n  [+] Broadcast complete: {success_count} relayed, {fail_count} failed, "
-          f"{skip_count} already done.")
+    print(f"\n  [+] Broadcast complete: {success_count} relayed this run, "
+          f"{fail_count} failed, {skip_count} skipped "
+          f"({len(relayed)}/{len(blobs)} relayed total, {len(failed_perm)} permanently failed).")
     print(f"  [+] Progress: {progF}")
 
-    # Exit NONZERO on any failure or an empty run so an orchestrator invoking us
-    # with check=True cannot mistake an all-rejected batch for success.
-    if fail_count > 0:
-        integrity_log("broadcast", f"exit_fail:{fail_count}_failed:{success_count}_relayed")
-        sys.exit(f"[!] Broadcast incomplete: {fail_count} TX(s) failed to relay "
-                 f"({success_count} relayed, {skip_count} already done).")
-    if success_count == 0 and skip_count == 0:
-        integrity_log("broadcast", "exit_fail:nothing_relayed")
-        sys.exit("[!] Broadcast processed no TXs (nothing relayed, nothing resumed).")
+    # Success is defined as EVERY blob relayed (across this run + prior resumes).
+    # Checking len(relayed) rather than this run's fail_count means a --resume
+    # that only re-skips permanent failures cannot be mistaken for success by a
+    # check=True caller, and permanent failures (double-spend/low-fee) keep the
+    # exit nonzero until the operator re-signs and clears them.
+    if len(relayed) < len(blobs):
+        unrelayed = len(blobs) - len(relayed)
+        integrity_log("broadcast", f"exit_fail:{unrelayed}_unrelayed:{len(failed_perm)}_permfail")
+        sys.exit(f"[!] Broadcast incomplete: {unrelayed}/{len(blobs)} TX(s) not relayed "
+                 f"({len(failed_perm)} permanent, rest transient — retry with --resume {progF}).")
 
 
 if __name__ == "__main__":

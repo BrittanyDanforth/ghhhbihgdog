@@ -132,7 +132,10 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 "do_not_relay": True,
             })
 
-            # The RPC returns unsigned_txset (base64-encoded)
+            # The RPC returns unsigned_txset as a HEX string (phase_sign decodes
+            # it back to the binary unsigned_monero_tx that wallet-cli expects).
+            # Do NOT "fix" this to base64-encode -- that would silently break
+            # signing, and short/all-hex payloads could even fromhex wrongly.
             unsigned_txset = result.get("unsigned_txset", "")
             if not unsigned_txset:
                 integrity_log("signer", f"no_unsigned_txset:idx={idx}")
@@ -246,14 +249,24 @@ def phase_sign(args, plan: List[dict]):
             # string. wallet-cli's sign_transfer reads the BINARY
             # unsigned_monero_tx file, so decode the hex back to bytes here --
             # writing the hex text verbatim gave wallet-cli an unparseable file
-            # and signing silently produced nothing. Fall back to a raw copy if
-            # the payload isn't hex (e.g. a future base64 encoding).
+            # and signing silently produced nothing.
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
-            _hex_text = unsigned_file.read_text().strip()
+            _payload = unsigned_file.read_text().strip()
             try:
-                unsigned_in.write_bytes(bytes.fromhex(_hex_text))
+                unsigned_in.write_bytes(bytes.fromhex(_payload))
             except ValueError:
-                unsigned_in.write_text(_hex_text)
+                # Defensive only (current wallet-rpc returns hex): try base64,
+                # and if that also fails, write the raw text but say loudly that
+                # wallet-cli will almost certainly fail to parse it -- do not
+                # pretend a text copy is a working fallback.
+                try:
+                    import base64
+                    unsigned_in.write_bytes(base64.b64decode(_payload, validate=True))
+                except Exception:
+                    integrity_log("signer", f"unsigned_decode_fail:idx={idx}")
+                    print(f"  [!] TX {idx}: unsigned payload is neither hex nor base64; "
+                          f"wallet-cli will likely reject it.")
+                    unsigned_in.write_text(_payload)
 
             cmd = [
                 args.wallet_cli,
