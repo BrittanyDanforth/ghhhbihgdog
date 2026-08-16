@@ -62,6 +62,20 @@ NUM_DECOYS = 4
 # Updated periodically; safe to overshoot slightly (operator keeps the change).
 FALLBACK_FEE_XMR = Decimal("0.00005")
 
+# Per-TX fee above which the daemon's estimate is not believable and is refused
+# rather than used to size a spending plan. A monerod that is FRESH, --offline,
+# or unsynced reports the maximum default base fee (2e9 piconero/byte, observed),
+# which this tool's ~2 kB conversion turns into ~4 XMR PER TRANSACTION -- and at
+# a higher priority, hundreds of XMR. The sibling gs_console already flags this
+# ("fresh or offline chain"); GhostSpiral is the tool that actually SPENDS, so
+# it must not build a plan around that number. Sizing stage 4 with a 4-XMR fee
+# turns a working wallet into "insufficient balance: estimated fees 240 XMR",
+# misdiagnosing a daemon misconfiguration as the operator's balance.
+# The ceiling is set FAR above any real fee (even an extreme-congestion
+# priority-4 mainnet fee is a fraction of an XMR) and far below the fresh-chain
+# value, so it catches the pathological case without ever rejecting a real one.
+FEE_IMPLAUSIBLE_XMR = Decimal("1.0")
+
 # FALLBACK per-priority fee multipliers, used ONLY when monerod's
 # get_fee_estimate doesn't return an explicit per-priority 'fees' array (older
 # daemons). Modern monerod DOES return that array and fetch_fee_from_daemon
@@ -107,6 +121,7 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
     if isinstance(fees, list) and len(fees) >= fee_priority and fees[fee_priority - 1] > 0:
         fee_xmr = Decimal(int(fees[fee_priority - 1]) * 2000) / Decimal(10 ** 12)
         if fee_xmr > 0:
+            _reject_implausible_fee(fee_xmr, daemon_url, "per_priority_array")
             integrity_log("fee", "daemon_fee:per_priority_array")
             return fee_xmr
     # Approximate path: older daemon with only a base 'fee'.
@@ -114,10 +129,34 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
     if base > 0:
         fee_xmr = (Decimal(int(base) * 2000) / Decimal(10 ** 12)) * multiplier
         if fee_xmr > 0:
+            _reject_implausible_fee(fee_xmr, daemon_url, "base_times_multiplier")
             integrity_log("fee", "daemon_fee:base_times_multiplier")
             return fee_xmr
     integrity_log("fee", "using_fallback_fee")
     return FALLBACK_FEE_XMR * multiplier
+
+
+def _reject_implausible_fee(fee_xmr: Decimal, daemon_url, source: str) -> None:
+    """Abort if the daemon's fee is too high to be real (fresh/offline chain).
+
+    Sizing a spending plan around a bogus fee is worse than refusing: it either
+    misreports the operator's balance as insufficient or shrinks every hop to
+    nothing. A daemon reporting a real fee is never near FEE_IMPLAUSIBLE_XMR, so
+    this only fires on a misconfigured daemon -- which the operator must fix,
+    not have papered over."""
+    if fee_xmr <= FEE_IMPLAUSIBLE_XMR:
+        return
+    integrity_log("fee", f"IMPLAUSIBLE_daemon_fee:{source}:{fee_xmr}")
+    sys.exit(
+        f"[!] The daemon reports an impossible fee of {fee_xmr} XMR PER TRANSACTION\n"
+        f"    ({source}). A real Monero fee is a small fraction of an XMR even at the\n"
+        f"    highest priority; a value this large means the daemon at {daemon_url}\n"
+        f"    is FRESH, --offline, or not yet synced and is returning its maximum\n"
+        f"    default fee.\n"
+        f"    Refusing to size a spending plan around it — that would misreport your\n"
+        f"    balance as insufficient. Point --rpc-daemon at a synced monerod\n"
+        f"    (mainnet :18081) and re-run."
+    )
 
 
 def compute_hop_amount(fanout_amt: Decimal, fee_xmr: Decimal) -> Decimal:

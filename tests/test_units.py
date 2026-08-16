@@ -141,6 +141,31 @@ fee = with_estimate({"fee": 1000, "fees": [1000, 4000]})
 check("fee: short fees[] falls through to base",
       fee == (Decimal(1000 * 2000) / Decimal(10**12)) * Decimal(20))
 
+# Implausible fee (fresh/offline daemon) must ABORT, not size a plan. A fresh
+# monerod returns base=2e9 piconero/byte, which this conversion turns into 4 XMR
+# per tx. The sibling console flags it; the spending tool must refuse it.
+def _fee_exits(est, prio=1):
+    ghost.daemon_fee_estimate = lambda *a, **k: est
+    try:
+        ghost.fetch_fee_from_daemon("http://127.0.0.1:18081", None, prio)
+        return False
+    except SystemExit:
+        return True
+check("fee: fresh-chain base fee (2e9/byte -> 4 XMR) is refused",
+      _fee_exits({"fee": 2000000000}))
+check("fee: implausible per-priority fees[] entry is refused",
+      _fee_exits({"fees": [2000000000, 2000000000, 2000000000, 2000000000]}))
+# A real fee -- even a high-priority one worth a fraction of an XMR -- must pass.
+# 100000 piconero/byte * 2000 = 0.0002 XMR; priority 4 real values stay well
+# under the 1-XMR ceiling.
+check("fee: a real sub-XMR fee is NOT rejected",
+      with_estimate({"fees": [100000, 400000, 800000, 2000000]}) < ghost.FEE_IMPLAUSIBLE_XMR)
+check("fee: a real fee just under the ceiling is accepted",
+      _fee_exits({"fee": int(Decimal("0.9") * Decimal(10**12) / 2000)}) is False)
+# The fee that fed the old confusing "insufficient balance: 240 XMR fees" bug.
+check("fee: the 4-XMR fresh-chain value that mis-sized the plan is caught",
+      _fee_exits({"fee": 2000000000}, prio=1))
+
 # ---------------------------------------------------------------------------
 # gs_common daemon_fee_estimate: refuse non-localhost without proxy (no net)
 # ---------------------------------------------------------------------------
