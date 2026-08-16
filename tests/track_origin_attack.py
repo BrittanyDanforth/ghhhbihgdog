@@ -76,12 +76,13 @@ def check(name, cond):
 class Graph:
     """Analyst-visible mix graph for one scenario."""
 
-    def __init__(self, name, mode, primary, entry, wallet_id="W0"):
+    def __init__(self, name, mode, primary, entry, wallet_id="W0", usable=None):
         self.name = name
         self.mode = mode          # send | receive | combo
         self.primary = primary    # wallet subaddr 0
         self.entry = entry        # first spend source (primary on send, receive-sub on receive)
         self.wallet_id = wallet_id
+        self.usable = Decimal(usable) if usable is not None else Decimal("0")
         self.txs = []             # list of {ins, outs: [(addr, amt)], kind}
         self.created_by = {}      # addr -> tx index that created it
         self.spent_in = {}        # addr -> tx index that spent it
@@ -118,7 +119,7 @@ def run_send_fanout(rng, wallets=8, dag=False, usable=Decimal("10"), fee=Decimal
     primary = "PRIMARY"
     entry = primary
     g = Graph(f"send-fanout-w{wallets}-dag{int(dag)}-u{usable}", "send",
-              primary, entry, wallet_id)
+              primary, entry, wallet_id, usable=usable)
     dests, _hops = _fanout_dests(rng, wallets)
     amts = ghost.compute_fanout_amounts(usable, len(dests), fee, dag, rng)
     if not amts:
@@ -136,7 +137,7 @@ def run_send_peel(rng, n=6, dag=False, usable=Decimal("12"), fee=Decimal("0.001"
     primary = "PRIMARY"
     entry = primary
     g = Graph(f"send-peel-n{n}-dag{int(dag)}-u{usable}", "send",
-              primary, entry, wallet_id)
+              primary, entry, wallet_id, usable=usable)
     dests = [f"MIX_{i}_{rng.randrange(1 << 20):05x}" for i in range(n)]
     amts = ghost.compute_fanout_amounts(usable, n, fee, dag, rng)
     if not amts:
@@ -162,7 +163,7 @@ def run_receive_peel(rng, n=6, dag=False, usable=Decimal("9"), fee=Decimal("0.00
     primary = "PRIMARY"
     entry = entry or "RECV_SUB"
     g = Graph(f"recv-peel-n{n}-dag{int(dag)}-u{usable}", "receive",
-              primary, entry, wallet_id)
+              primary, entry, wallet_id, usable=usable)
     dests = [f"MIX_{i}_{rng.randrange(1 << 20):05x}" for i in range(n)]
     amts = ghost.compute_fanout_amounts(usable, n, fee, dag, rng)
     if not amts:
@@ -184,7 +185,7 @@ def run_receive_fanout(rng, wallets=8, dag=False, usable=Decimal("10"),
     primary = "PRIMARY"
     entry = entry or "RECV_SUB"
     g = Graph(f"recv-fanout-w{wallets}-dag{int(dag)}-u{usable}", "receive",
-              primary, entry, wallet_id)
+              primary, entry, wallet_id, usable=usable)
     dests, _hops = _fanout_dests(rng, wallets)
     amts = ghost.compute_fanout_amounts(usable, len(dests), fee, dag, rng)
     if not amts:
@@ -203,8 +204,8 @@ def run_recv_then_send(rng, recv_kind="peel", send_kind="peel", n=5, wallets=6,
     send from the leftover that landed on PRIMARY."""
     primary = "PRIMARY"
     entry = f"RECV_SUB_{wallet_id}"
-    g = Graph(f"combo-{recv_kind}>{send_kind}-n{n}-dag{int(dag)}", "combo",
-              primary, entry, wallet_id)
+    g = Graph(f"combo-{recv_kind}>{send_kind}-n{n}-dag{int(dag)}-u{recv_amt}", "combo",
+              primary, entry, wallet_id, usable=recv_amt)
     fee = Decimal("0.001")
     if recv_kind == "peel":
         dests = [f"RMIX_{i}_{rng.randrange(1 << 20):05x}" for i in range(n)]
@@ -254,7 +255,8 @@ def run_recv_then_send(rng, recv_kind="peel", send_kind="peel", n=5, wallets=6,
     return g
 
 
-def run_two_receives(rng, n=5, dag=False, wallet_id="W0"):
+def run_two_receives(rng, n=5, dag=False, wallet_id="W0",
+                     amt_a=Decimal("8"), amt_b=Decimal("6")):
     """Two inbound payments to two fresh subaddrs of the SAME wallet.
 
     Change of both peels lands on PRIMARY. Intersection of the two change
@@ -263,11 +265,13 @@ def run_two_receives(rng, n=5, dag=False, wallet_id="W0"):
     primary = "PRIMARY"
     a = f"RECV_A_{wallet_id}"
     b = f"RECV_B_{wallet_id}"
-    g = Graph(f"two-recv-n{n}-dag{int(dag)}", "combo", primary, a, wallet_id)
+    total = amt_a + amt_b
+    g = Graph(f"two-recv-n{n}-dag{int(dag)}-u{total}", "combo", primary, a, wallet_id,
+              usable=total)
     fee = Decimal("0.001")
     for entry, idx, usable, tag in (
-        (a, 7, Decimal("8"), "A"),
-        (b, 11, Decimal("6"), "B"),
+        (a, 7, amt_a, "A"),
+        (b, 11, amt_b, "B"),
     ):
         dests = [f"{tag}MIX_{i}_{rng.randrange(1 << 20):05x}" for i in range(n)]
         amts = ghost.compute_fanout_amounts(usable, n, fee, dag, rng)
@@ -541,74 +545,168 @@ def evaluate(g: Graph):
     }
 
 
+# Amount ladder: dust-adjacent up through large. Higher XMR makes leftover /
+# largest-is-change easier (the ~10% remainder is a bigger, more distinct chunk;
+# peel remain stays > dest for more steps). Equal-amount clusters go the other
+# way — 0.0001 quantisation collides more when the pot is small.
+AMOUNT_LADDER = [
+    Decimal("0.5"), Decimal("1"), Decimal("2"), Decimal("5"),
+    Decimal("10"), Decimal("25"), Decimal("50"), Decimal("100"),
+]
+REPEATS_PER_CELL = 4
+
+
+def _dests_for_amount(usable):
+    """Fewer dests at tiny pots so the shipped planner can still fund them."""
+    if usable < Decimal("2"):
+        return 3, 4
+    if usable < Decimal("10"):
+        return 5, 6
+    return 8, 8
+
+
 def _build_many(rng):
     graphs = []
-    # Core matrix: send/receive × fan-out/peel × ±DAG, several sizes.
-    builders = [
-        (lambda r, w=w, d=d, u=u: run_send_fanout(r, w, d, u), n)
-        for w, d, u, n in (
-            (4, False, Decimal("3"), 6),
-            (6, False, Decimal("10"), 8),
-            (8, False, Decimal("25"), 6),
-            (10, True, Decimal("10"), 6),
-            (12, True, Decimal("40"), 4),
-        )
-    ] + [
-        (lambda r, k=k, d=d, u=u: run_send_peel(r, k, d, u), n)
-        for k, d, u, n in (
-            (3, False, Decimal("4"), 8),
-            (5, False, Decimal("12"), 8),
-            (6, False, Decimal("8"), 6),
-            (8, True, Decimal("20"), 6),
-            (10, True, Decimal("30"), 4),
-        )
-    ] + [
-        (lambda r, w=w, d=d, u=u: run_receive_fanout(r, w, d, u), n)
-        for w, d, u, n in (
-            (4, False, Decimal("3"), 6),
-            (6, False, Decimal("10"), 8),
-            (8, False, Decimal("15"), 6),
-            (10, True, Decimal("10"), 6),
-            (12, True, Decimal("35"), 4),
-        )
-    ] + [
-        (lambda r, k=k, d=d, u=u: run_receive_peel(r, k, d, u), n)
-        for k, d, u, n in (
-            (3, False, Decimal("4"), 8),
-            (5, False, Decimal("9"), 8),
-            (6, False, Decimal("7"), 6),
-            (8, True, Decimal("18"), 6),
-            (10, True, Decimal("28"), 4),
-        )
-    ]
-    for b, n in builders:
-        for _ in range(n):
-            g = b(rng)
+    for usable in AMOUNT_LADDER:
+        peel_n, fan_w = _dests_for_amount(usable)
+        for dag in (False, True):
+            for _ in range(REPEATS_PER_CELL):
+                for builder in (
+                    lambda r, u=usable, k=peel_n, d=dag: run_send_peel(r, k, d, u),
+                    lambda r, u=usable, w=fan_w, d=dag: run_send_fanout(r, w, d, u),
+                    lambda r, u=usable, k=peel_n, d=dag: run_receive_peel(r, k, d, u),
+                    lambda r, u=usable, w=fan_w, d=dag: run_receive_fanout(r, w, d, u),
+                ):
+                    g = builder(rng)
+                    if g:
+                        graphs.append(g)
+        # Receive-then-send at this inbound amount (later send spends leftover).
+        send_amt = (usable * Decimal("0.4")).quantize(Decimal("0.0001"))
+        if send_amt < Decimal("0.2"):
+            send_amt = Decimal("0.2")
+        for recv_k, send_k, dag in (
+            ("peel", "peel", False),
+            ("fanout", "fanout", False),
+            ("peel", "fanout", True),
+        ):
+            g = run_recv_then_send(
+                rng, recv_k, send_k, n=peel_n, wallets=fan_w, dag=dag,
+                recv_amt=usable, send_amt=send_amt,
+                wallet_id=f"C{usable}{recv_k[0]}{send_k[0]}{int(dag)}")
             if g:
                 graphs.append(g)
-
-    # Combined receive-then-send (the realistic operator path).
-    for recv_k, send_k, dag, n in (
-        ("peel", "peel", False, 10),
-        ("peel", "fanout", False, 8),
-        ("fanout", "peel", False, 8),
-        ("fanout", "fanout", False, 6),
-        ("peel", "peel", True, 6),
-        ("fanout", "fanout", True, 6),
-    ):
-        for i in range(n):
-            g = run_recv_then_send(rng, recv_k, send_k, n=5, wallets=6, dag=dag,
-                                   wallet_id=f"C{recv_k[0]}{send_k[0]}{int(dag)}{i}")
-            if g:
-                graphs.append(g)
-
-    # Two inbound payments, same wallet — intersection names PRIMARY.
-    for dag, n in ((False, 10), (True, 6)):
-        for i in range(n):
-            g = run_two_receives(rng, n=5, dag=dag, wallet_id=f"T{int(dag)}{i}")
-            if g:
-                graphs.append(g)
+        half = (usable / 2).quantize(Decimal("0.0001"))
+        other = usable - half
+        g = run_two_receives(rng, n=peel_n, dag=False, wallet_id=f"T{usable}",
+                             amt_a=half, amt_b=other)
+        if g:
+            graphs.append(g)
     return graphs
+
+
+def _pct(hits, n):
+    return (100.0 * hits / n) if n else 0.0
+
+
+def _print_scoreboard(evaluated):
+    """% of actual SENDER / RECEIVER uncovered, by amount.
+
+    SENDER   = send-mode graph: first spend is the operator's PRIMARY.
+    RECEIVER inbound = receive/combo: genesis is the published receive sub.
+    RECEIVER main    = receive/combo: deep reveal names PRIMARY anyway.
+    Amount-heuristics (largest / leftover) are the ones that get easier as
+    the pot grows; structural walks do not care about the XMR figure.
+    """
+    print("\n=== SCENARIOS RUN (amount · role · uncovered?) ===")
+    print(f"  {'amount':>10}  {'role':<16}  {'kind':<8}  {'uncovered':<10}  "
+          f"{'named':<10}  via")
+    for g, hits, _rev, guess in evaluated:
+        if g.mode == "send":
+            role = "SENDER"
+            uncovered = hits["deep_reveal_is_primary"]
+        elif g.mode == "receive":
+            role = "RECEIVER"
+            uncovered = hits["deep_reveal_is_primary"]
+        else:
+            role = "RECV+SEND"
+            uncovered = hits["deep_reveal_is_primary"]
+        kind = g.txs[0]["kind"] if g.txs else "?"
+        print(f"  {g.usable.quantize(Decimal('0.0001')):>8} XMR  {role:<16}  {kind:<8}  "
+              f"{'YES' if uncovered else 'NO':<10}  "
+              f"{str(guess['deep'] or '-'):<10}  {guess['deep_reason']}")
+
+    def bucket(rows, pred):
+        n = len(rows)
+        h = sum(1 for r in rows if pred(r))
+        return h, n, _pct(h, n)
+
+    send = [r for r in evaluated if r[0].mode == "send"]
+    recv = [r for r in evaluated if r[0].mode == "receive"]
+    combo = [r for r in evaluated if r[0].mode == "combo"]
+
+    print("\n=== UNCOVER % — actual SENDER vs actual RECEIVER ===")
+    sh, sn, sp = bucket(send, lambda r: r[1]["deep_reveal_is_primary"])
+    print(f"  SENDER   (send-mode PRIMARY / first spend)     "
+          f"{sh}/{sn}  {sp:5.1f}% uncovered")
+    rh, rn, rp = bucket(recv, lambda r: r[1]["genesis_is_entry"])
+    print(f"  RECEIVER inbound sub (published RECV_SUB)      "
+          f"{rh}/{rn}  {rp:5.1f}% found as first spend")
+    rph, rpn, rpp = bucket(recv, lambda r: r[1]["deep_reveal_is_primary"])
+    print(f"  RECEIVER main/first  (PRIMARY behind inbound)  "
+          f"{rph}/{rpn}  {rpp:5.1f}% uncovered")
+    ch, cn, cp = bucket(combo, lambda r: r[1]["deep_reveal_is_primary"])
+    print(f"  RECV+SEND combo      (PRIMARY after inbound)   "
+          f"{ch}/{cn}  {cp:5.1f}% uncovered")
+
+    # By exact amount — this is the table the operator asked for.
+    print("\n=== UNCOVER % by amount (higher XMR → amount-heuristics get easier) ===")
+    hdr = (f"  {'amount':>10}  {'n':>4}  {'sender%':>8}  {'recv_in%':>8}  "
+           f"{'recv_main%':>10}  {'largest%':>9}  {'leftover%':>10}  {'equal%':>7}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    by_amt = defaultdict(list)
+    for row in evaluated:
+        by_amt[row[0].usable].append(row)
+    low_amt_large = None
+    high_amt_large = None
+    low_amt_left = None
+    high_amt_left = None
+    for amt in sorted(by_amt):
+        rows = by_amt[amt]
+        srows = [r for r in rows if r[0].mode == "send"]
+        rrows = [r for r in rows if r[0].mode == "receive"]
+        peels = [r for r in rows if r[0].txs and r[0].txs[0]["kind"] == "peel"]
+        fans = [r for r in rows if r[0].txs and r[0].txs[0]["kind"] == "fanout"]
+        _, _, sender_p = bucket(srows, lambda r: r[1]["deep_reveal_is_primary"])
+        _, _, rin_p = bucket(rrows, lambda r: r[1]["genesis_is_entry"])
+        _, _, rmain_p = bucket(rrows, lambda r: r[1]["deep_reveal_is_primary"])
+        # Amount-heuristics only apply to the shape they fit — don't dilute
+        # leftover% with peels (which have no leftover) or largest% with fan-outs.
+        _, _, lp = bucket(peels, lambda r: r[1]["largest_change_is_primary"])
+        _, _, kp = bucket(fans, lambda r: r[1]["leftover_is_primary"])
+        _, _, ep = bucket(rows, lambda r: r[1]["equal_amount_cluster_exists"])
+        print(f"  {amt.quantize(Decimal('0.0001')):>8} XMR  {len(rows):>4}  "
+              f"{sender_p:7.1f}%  {rin_p:7.1f}%  "
+              f"{rmain_p:9.1f}%  {lp:8.1f}%  {kp:9.1f}%  {ep:6.1f}%")
+        if amt == Decimal("0.5"):
+            low_amt_large, low_amt_left = lp, kp
+        if amt == Decimal("100"):
+            high_amt_large, high_amt_left = lp, kp
+
+    print("\n  largest% = peel graphs only (2-out leftover). leftover% = fan-out graphs only.")
+    print("  sender% / recv_main% = structural (change → subaddr 0); amount does not save you.")
+    print("  equal% = jitter failures; MORE common at small pots (0.0001 quantisation).")
+    return {
+        "sender": (sh, sn, sp),
+        "recv_inbound": (rh, rn, rp),
+        "recv_main": (rph, rpn, rpp),
+        "combo": (ch, cn, cp),
+        "low_largest": low_amt_large,
+        "high_largest": high_amt_large,
+        "low_leftover": low_amt_left,
+        "high_leftover": high_amt_left,
+        "by_amt": by_amt,
+    }
 
 
 def _print_deep_walk(graphs, limit=12):
@@ -650,12 +748,17 @@ def main():
 
     print(f"\n=== built {len(graphs)} mix graphs from SHIPPED planners ===")
     by_mode = defaultdict(list)
+    evaluated = []
     for g in graphs:
         hits, revealed, guess = evaluate(g)
+        row = (g, hits, revealed, guess)
+        evaluated.append(row)
         key = g.mode + ":" + g.txs[0]["kind"]
-        by_mode[key].append((g, hits, revealed, guess))
+        by_mode[key].append(row)
         if revealed:
             REVEALS.append((g.name, guess))
+
+    board = _print_scoreboard(evaluated)
 
     # Honest tallies
     print("\n=== attack results (PRIMARY = wallet subaddr 0) ===")
@@ -761,8 +864,23 @@ def main():
     check("DEEP REVEAL names PRIMARY on every built graph",
           all(h["deep_reveal_is_primary"]
               for rows in by_mode.values() for _, h, _, _ in rows))
+    check("scoreboard ran every amount on the ladder for both send and receive",
+          all(any(r[0].mode == "send" and r[0].usable == a for r in evaluated) and
+              any(r[0].mode == "receive" and r[0].usable == a for r in evaluated)
+              for a in AMOUNT_LADDER))
+    sh, sn, sp = board["sender"]
+    rph, rpn, rpp = board["recv_main"]
+    check(f"SENDER uncover is total, not a sample ({sh}/{sn})",
+          sn > 0 and sh == sn)
+    check(f"RECEIVER main uncover is total, not a sample ({rph}/{rpn})",
+          rpn > 0 and rph == rpn)
+    if board["low_leftover"] is not None and board["high_leftover"] is not None:
+        check("leftover heuristic is at least as easy at 100 XMR as at 0.5 XMR",
+              board["high_leftover"] >= board["low_leftover"])
 
     print(f"\n  graphs: {len(graphs)}  reveals: {len(REVEALS)}/{len(graphs)}")
+    print(f"  SENDER uncovered:        {sp:5.1f}%  ({sh}/{sn})")
+    print(f"  RECEIVER main uncovered: {rpp:5.1f}%  ({rph}/{rpn})")
     print(f"\nRESULT: {PASS} passed, {FAIL} failed")
     if FAILURES:
         print("FAILED:", FAILURES)
