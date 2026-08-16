@@ -871,7 +871,14 @@ def main():
         "delay": _secrets.randbelow(540) + 180,
         "extra": secure_hex(16),
     }]
-    integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests:amt_each={fanout_amt}")
+    # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
+    # amount. integrity_chain.log persists on disk, and the exact fan-out amount
+    # is the single most linkable quantity in the whole pipeline: recovered from
+    # the log it correlates directly against the on-chain outputs and unmixes
+    # what the fan-out exists to mix. exit_strategy_simulator was already cleaned
+    # of this exact pattern; the amount stays in the plan file (0600), off the
+    # persistent hash chain.
+    integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
 
     # Subaddresses that will receive a fan-out output, with the (account, index)
     # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
@@ -931,7 +938,10 @@ def main():
                     "delay": _secrets.randbelow(540) + 180,
                     "extra": secure_hex(16),
                 })
-            integrity_log("stage4", f"dag_plan:{len(dag_plan)}_hops:amt_each={dag_hop_amt}")
+            # Hop COUNT only, never the per-hop amount — same reason as the
+            # fan-out above: the amount on the persistent chain deanonymises the
+            # hop it is meant to hide.
+            integrity_log("stage4", f"dag_plan:{len(dag_plan)}_hops")
     else:
         integrity_log("stage4", "dag_mixing_disabled")
         print("  [*] DAG hop-mixing disabled (default). Run with --dag-mixing to "

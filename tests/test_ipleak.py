@@ -301,6 +301,98 @@ check("broadcast: --allow-clearnet-relay overrides the refusal",
 check("broadcast: aborts when the daemon is offline (broadcast would vanish)",
       "cannot relay" in _run_broadcast([], "offline"))
 
+
+# ---------------------------------------------------------------------------
+# DATA-AT-REST LEAK: the persistent integrity_chain.log must never carry a
+# linkable quantity. It survives on disk, so an exact per-hop XMR amount, a
+# destination address, a memo, a txid or a key recovered from it correlates
+# directly against the on-chain transactions and unmixes the whole pipeline.
+# GhostSpiral's stage-4 planner used to write `amt_each={fanout_amt}` and
+# `amt_each={dag_hop_amt}` -- the single most linkable value there is.
+# This scans every integrity_log() call in every shipped script by AST and
+# fails if any interpolates a secret-looking variable.
+# ---------------------------------------------------------------------------
+import ast
+
+_SECRET_NAMES = ("amt", "amount", "addr", "address", "dest", "deposit", "memo",
+                 "txid", "tx_hash", "privkey", "priv", "seed", "mnemonic",
+                 "viewkey", "spendkey", "password", "secret", "balance", "mac")
+_SHIPPED = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
+            "gs_common.py", "thor_swap_preparer", "create_receive_wallet",
+            "exit_strategy_simulator", "paranoia_mode"]
+
+
+# Functions that mask their argument, so a secret passed THROUGH them is safe
+# on the log (scrub_address -> first/last few chars; _m -> magnitude masked).
+_MASKERS = ("scrub_address", "scrub", "mask", "redact", "_m")
+
+
+def _is_masked_call(node):
+    """True if node is a call to a known masking function, e.g.
+    scrub_address(addr). Everything inside it is considered safe."""
+    if not isinstance(node, ast.Call):
+        return False
+    fn = node.func
+    name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
+    n = (name or "").lower()
+    return any(m == n or n.endswith("_" + m) or m in n for m in _MASKERS)
+
+
+def _fstring_leaks(node):
+    """Names interpolated into an f-string that look like secrets AND are not
+    passed through a masking function like scrub_address()."""
+    leaks = []
+    for v in ast.walk(node):
+        if not isinstance(v, ast.FormattedValue):
+            continue
+        # A masked interpolation ({scrub_address(x)}) is safe as a whole.
+        if _is_masked_call(v.value):
+            continue
+        for n in ast.walk(v.value):
+            if isinstance(n, ast.Name):
+                base = n.id.lower()
+                if any(s == base or base.startswith(s + "_") or base.endswith("_" + s)
+                       for s in _SECRET_NAMES):
+                    leaks.append(n.id)
+    return leaks
+
+
+def _scan_integrity_log_calls(path):
+    tree = ast.parse(open(path).read())
+    hits = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "integrity_log"):
+            for arg in node.args:
+                if isinstance(arg, ast.JoinedStr):        # an f-string arg
+                    for name in _fstring_leaks(arg):
+                        hits.append((getattr(node, "lineno", "?"), name))
+    return hits
+
+
+_total_leaks = []
+for _script in _SHIPPED:
+    _p = os.path.join(REPO, _script)
+    if os.path.exists(_p):
+        for line, name in _scan_integrity_log_calls(_p):
+            _total_leaks.append(f"{_script}:{line} interpolates '{name}'")
+
+check("no integrity_log() call interpolates a secret/linkable value",
+      not _total_leaks)
+if _total_leaks:
+    for _l in _total_leaks:
+        print("   LEAK:", _l)
+
+# Positive control: the scanner actually detects a planted leak, so a green
+# result means "scanned and clean", not "scanner is a no-op".
+_planted = ast.parse('integrity_log("x", f"amt_each={fanout_amt}")')
+check("the leak scanner detects a planted amount interpolation",
+      any("fanout_amt" in n for _, n in
+          [(c.lineno, nm) for c in ast.walk(_planted)
+           if isinstance(c, ast.Call) for nm in
+           (_fstring_leaks(c.args[1]) if len(c.args) > 1
+            and isinstance(c.args[1], ast.JoinedStr) else [])]))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)
