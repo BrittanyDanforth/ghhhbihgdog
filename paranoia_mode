@@ -422,6 +422,11 @@ GS_ARTIFACT_FILE_PATTERNS = [
     "integrity_chain.log", "integrity.log",
     "*.blob", "*.signed", "*.unsigned",
     "signed_manifest_v1.json", "unsigned_manifest.json",
+    # The wallet OUTPUT SET the signer exports so the offline wallet can sign
+    # a spend of an earlier round's output. It maps this wallet's outputs --
+    # exactly the holdings picture a forensic reader wants -- so it must not
+    # survive the wipe. Written 0600, but 0600 is not gone.
+    "outputs_export.hex",
     ".ghostspiral.lock",
     # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
     # Ctrl-C in that window leaves the partial file behind holding the SAME

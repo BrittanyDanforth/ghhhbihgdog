@@ -352,8 +352,10 @@ try:
         check(f"progress file holds no secrets (found {p_secret})", not p_secret)
         pj = json.loads(ptext)
         print(f"    relayed={pj.get('relayed')} failed_perm={pj.get('failed_perm')}")
+        # Progress is keyed on the blob NAME, not the loop index (the fix that
+        # stopped a momentarily-unreadable blob from renumbering every TX).
         check("progress file recorded the relay as successful",
-              pj.get("relayed") == [0])
+              pj.get("relayed") == ["tx_0.signed"])
     else:
         print("    (no progress file written)")
 

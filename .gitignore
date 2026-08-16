@@ -52,3 +52,7 @@ unsigned/
 signed_blobs/
 tx_staging/
 .venv/
+
+# Wallet output-set export written by airgap_tx_signer phase_create so the
+# offline wallet can sign spends of earlier rounds. Maps the wallet holdings.
+outputs_export.hex
