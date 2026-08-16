@@ -875,7 +875,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
 
   <div class="card"><h2>Safety preset</h2>
     <div class="presets" id="presets">
-      <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">8 dests · 1 tx each · slowest</span></button>
+      <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">~12 txs · 1 dest each · slowest</span></button>
       <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">40 wallets · depth 4 · DAG</span></button>
       <button data-p="churn" aria-pressed="false"><span class="pn">Deep churn</span><span class="pd">20 wallets · depth 6 · DAG</span></button>
       <button data-p="max" aria-pressed="false"><span class="pn">High privacy</span><span class="pd">25 wallets · depth 3 · DAG</span></button>
@@ -941,7 +941,7 @@ let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 
 const PRESETS={
  peel:{wallets:8,deep:1,dag_mixing:false,peel:true,fee_priority:2,clearnet:false,
-      note:'PEELING CHAIN. 8 destinations sent ONE TRANSACTION AT A TIME, each spending the previous change, so no outputs are ever co-created in a fan-out an analyst can cluster. STRONGEST graph unlinkability, and by far the SLOWEST — every peel waits ~10 blocks to confirm, so ~8 × 20 min. Use for high-value sends where time is no object.'},
+      note:'PEELING CHAIN. 8 mix destinations PLUS decoys (~12 total) are sent ONE TRANSACTION AT A TIME, each spending the previous change, so no outputs are ever co-created in a fan-out an analyst can cluster. STRONGEST graph unlinkability, and by far the SLOWEST — every peel waits ~10 blocks to confirm, so roughly 12 × 20 min (~4 h). Use for high-value sends where time is no object.'},
  paranoid:{wallets:40,deep:4,dag_mixing:true,fee_priority:3,clearnet:false,
       note:'SAFEST fan-out. 40 subaddresses, depth 4, both mixing rounds, priority 3, and clearnet relay forced OFF. Largest anonymity set. For the strongest GRAPH unlinkability use Peeling chain instead.'},
  churn:{wallets:20,deep:6,dag_mixing:true,fee_priority:2,clearnet:false,

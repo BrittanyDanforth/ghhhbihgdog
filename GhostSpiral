@@ -1494,8 +1494,11 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     outputs across N transactions over time instead of one co-created fan-out.
 
     Returns the number of peels relayed. A peel's create/sign/broadcast aborts
-    the run (fail closed) exactly as any round does; a carrier timeout stops the
-    chain cleanly with the remaining balance intact so a re-run can continue.
+    the run (fail closed) exactly as any round does. If the chain stops partway
+    (shutdown or a carrier timeout), the peels already relayed are on-chain and
+    the UNDISTRIBUTED remainder is safe on the wallet's change subaddress -- but
+    there is NO automatic resume: a fresh run rebuilds a new plan from the entry
+    balance, so the operator finishes a partial chain by hand, not by re-running.
     """
     with open(peel_file) as f:
         pdata = json.load(f)
@@ -1505,12 +1508,24 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     per_round_fee = Decimal(str(meta.get("fee_per_round", "0.01")))
     n = len(peels)
     print(f"  [*] === Peeling chain: {n} confirmation-gated peels ===")
+
+    def _partial(done):
+        # Honest state on an incomplete chain: NOT "re-run to finish" (a re-run
+        # starts a brand-new plan and, in receive mode, would find the entry
+        # address already drained). The remainder is safe, just not distributed.
+        print(f"  [!] Peeling chain stopped at {done}/{n} peels. The {done} relayed "
+              f"peel(s) are on-chain; the remaining ~{n - done} destination(s) were "
+              f"NOT sent.")
+        print(f"  [!] The undistributed balance is safe on this wallet's account "
+              f"{acct}, subaddress {csub} (the change carrier). There is no auto-"
+              f"resume: distribute it manually, or accept the partial distribution. "
+              f"Do NOT simply re-run — that builds a new plan from a now-empty entry.")
+
     relayed = 0
     for i, peel in enumerate(peels):
         if shutdown_requested():
             integrity_log("stage5", f"peel_shutdown_at_{i}")
-            print(f"  [!] Shutdown before peel {i + 1}/{n}. {relayed} peel(s) relayed. "
-                  f"Re-run to continue with the remaining balance.")
+            _partial(relayed)
             break
         # Peels after the first spend the carrier; wait for it to hold this
         # peel's amount + a fee reserve, unlocked, before creating the tx.
@@ -1518,21 +1533,28 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
             need = Decimal(str(peel.get("amt", "0"))) + per_round_fee
             if not _wait_for_carrier(args, acct, csub, need, proxy, f"peel {i + 1}/{n}"):
                 integrity_log("stage5", f"peel_carrier_timeout:{i}")
-                print(f"  [!] Stopping at peel {i + 1}/{n}: carrier not ready. "
-                      f"{relayed}/{n} relayed; re-run to finish.")
+                _partial(relayed)
                 break
         newnym(required=True)
         tor_recheck(proxy, f"stage5_peel_{i}")
         one_path = Path(str(peel_file)[:-5] + f"_peel{i}.json") \
             if str(peel_file).endswith(".json") else Path(str(peel_file) + f".peel{i}")
         atomic_write_json({"meta": meta, "txs": [peel]}, one_path)
+        peel_stage = f"{staging_dir}/peel{i}"
         try:
-            _run_round(args, one_path, f"{staging_dir}/peel{i}", f"Peel {i + 1}/{n}")
+            _run_round(args, one_path, peel_stage, f"Peel {i + 1}/{n}")
             relayed += 1
         finally:
-            # The per-peel plan carries full destination + amount; wipe it, do
-            # not leave it beside the run.
+            # The per-peel plan carries the full destination + amount; wipe it.
             secure_delete_file(one_path)
+            # And securely wipe THIS peel's staging subdir now that it is
+            # broadcast: a peel chain runs for hours, and leaving each peel's
+            # signed (relayable) blob on disk for the whole run is exactly the
+            # exposure secure staging exists to avoid. The tx is already
+            # on-chain, so the blob is spent -- there is nothing to keep.
+            _ps = Path(peel_stage)
+            if _ps.is_dir() and not secure_delete_tree(_ps):
+                print(f"  [!] Could not securely wipe {peel_stage}; remove it manually.")
     integrity_log("stage5", f"peel_chain_done:{relayed}_of_{n}")
     print(f"  [+] Peeling chain: {relayed}/{n} peels relayed.")
     return relayed

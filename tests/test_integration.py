@@ -2,7 +2,7 @@
 """Integration tests that drive the REAL phase_create and broadcast.main()
 with mocked RPC/Tor, so the actual code paths (multi-dest RPC contract, and the
 resume/exit logic where the false-success bug lived) truly execute."""
-import sys, os, tempfile, json, hashlib, types, importlib.util, importlib.machinery
+import sys, os, tempfile, json, hashlib, types, time, importlib.util, importlib.machinery
 from decimal import Decimal
 from pathlib import Path
 
@@ -540,6 +540,113 @@ check("E: malformed hash length rejected by the validator",
       _refused_by_validator({"plan_fingerprint": _E_FP,
                              "entries": [_entry(hash="abc")]},
                             "64-char sha256"))
+
+# ===========================================================================
+# F. PEELING CHAIN orchestration: drive the SHIPPED _run_peel_chain with the
+#    subprocess (signer/broadcast) and wallet-rpc mocked, so the loop, the
+#    per-peel confirmation gating, the ordering, the carrier-timeout stop and
+#    the per-peel staging cleanup are exercised -- the real_peel_testnet proved
+#    the on-chain MECHANISM but reimplemented the loop; this drives the code.
+# ===========================================================================
+ghost2 = load("GhostSpiral")
+_peel_dir = Path(os.getcwd()) / "peelF"
+_peel_dir.mkdir(exist_ok=True)
+_peel_plan = {
+    "meta": {"fee_per_round": "0.01", "account_index": 0},
+    "txs": [
+        {"src": "ENTRY", "src_index": 7, "dst": "MixA", "amt": "1.0", "peel_num": 0},
+        {"src": "CHG", "src_index": 0, "dst": "MixB", "amt": "0.5", "peel_num": 1},
+        {"src": "CHG", "src_index": 0, "dst": "MixC", "amt": "0.7", "peel_num": 2},
+    ],
+}
+_peel_file = _peel_dir / "unsigned_fanout_deadbeef.json"
+_peel_file.write_text(json.dumps(_peel_plan))
+
+
+class _FakeCarrierRPC:
+    """Reports the carrier as ready only after a couple of polls, so the wait
+    loop actually iterates rather than passing on the first check."""
+    def __init__(self, ready_after=1):
+        self.polls = 0; self.ready_after = ready_after
+    def raw_request(self, m, p): return {}
+    def get_subaddress_balance(self, acct, idx):
+        self.polls += 1
+        return (10 ** 13, 10 ** 13 if self.polls >= self.ready_after else 0)
+
+
+def _drive_peel(stop_at_peel=None):
+    """Run the SHIPPED _run_peel_chain; record each _run_round call. If
+    stop_at_peel is set, the carrier never confirms for that peel (timeout)."""
+    calls = []
+    saved = (ghost2._run_round, ghost2.connect_rpc, ghost2.newnym,
+             ghost2.tor_recheck, ghost2.secure_delay, ghost2.integrity_log,
+             ghost2.shutdown_requested, ghost2.time)
+    import types as _t
+
+    def fake_round(a, plan_file, staging, label):
+        # A real round writes signed blobs into `staging`; emulate that so the
+        # cleanup path has something to wipe.
+        sd = Path(staging) / "signed"; sd.mkdir(parents=True, exist_ok=True)
+        (sd / "tx_0.signed").write_bytes(b"signedblob")
+        with open(plan_file) as f:
+            calls.append({"label": label, "staging": staging,
+                          "peel": json.load(f)["txs"][0]})
+
+    class _NeverReady:
+        def raw_request(self, m, p): return {}
+        def get_subaddress_balance(self, acct, idx): return (0, 0)
+
+    def fake_connect(*a, **k):
+        # peel index being awaited = len(calls) (0-based next peel)
+        if stop_at_peel is not None and len(calls) >= stop_at_peel:
+            return _NeverReady()
+        return _FakeCarrierRPC(ready_after=1)
+
+    ghost2._run_round = fake_round
+    ghost2.connect_rpc = fake_connect
+    ghost2.newnym = lambda *a, **k: None
+    ghost2.tor_recheck = lambda *a, **k: None
+    ghost2.secure_delay = lambda *a, **k: None
+    ghost2.integrity_log = lambda *a, **k: None
+    ghost2.shutdown_requested = lambda: False
+    # Make the carrier-wait loop not actually sleep and time out fast.
+    ghost2.time = _t.SimpleNamespace(sleep=lambda s: None, time=time.time)
+    _saved_to = ghost2.FANOUT_CONFIRM_TIMEOUT
+    ghost2.FANOUT_CONFIRM_TIMEOUT = 90 if stop_at_peel is not None else 3600
+    a = _t.SimpleNamespace(rpc_primary="http://127.0.0.1:18083",
+                           tor_proxy="socks5h://127.0.0.1:9050",
+                           wallet_file="w", wallet_password="", fee_priority=2)
+    try:
+        n = ghost2._run_peel_chain(a, _peel_file, "tx_staging_peelF", None, (0, 0))
+    finally:
+        (ghost2._run_round, ghost2.connect_rpc, ghost2.newnym, ghost2.tor_recheck,
+         ghost2.secure_delay, ghost2.integrity_log, ghost2.shutdown_requested,
+         ghost2.time) = saved
+        ghost2.FANOUT_CONFIRM_TIMEOUT = _saved_to
+    return n, calls
+
+
+_n, _calls = _drive_peel()
+check("F: peel chain runs one round per peel", len(_calls) == 3 and _n == 3)
+check("F: peels run IN ORDER (0,1,2)",
+      [c["peel"]["peel_num"] for c in _calls] == [0, 1, 2])
+check("F: each peel targets its own destination",
+      [c["peel"]["dst"] for c in _calls] == ["MixA", "MixB", "MixC"])
+check("F: peel 0 spends ENTRY (src_index 7), the rest spend the carrier (0)",
+      _calls[0]["peel"]["src_index"] == 7 and
+      all(c["peel"]["src_index"] == 0 for c in _calls[1:]))
+check("F: each peel got its OWN staging subdir",
+      len({c["staging"] for c in _calls}) == 3)
+check("F: per-peel plan files are wiped (none left beside the run)",
+      list(_peel_dir.glob("*_peel*.json")) == [])
+check("F: each peel's signed-blob staging subdir is wiped after broadcast",
+      not any(Path(c["staging"]).exists() for c in _calls))
+
+# A carrier that never confirms for peel 2 must STOP cleanly at 1 relayed,
+# not spin forever and not silently continue.
+_n2, _calls2 = _drive_peel(stop_at_peel=1)
+check("F: a carrier timeout stops the chain at the last funded peel",
+      _n2 == 1 and len(_calls2) == 1)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
