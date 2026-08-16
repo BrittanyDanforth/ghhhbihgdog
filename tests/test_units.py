@@ -222,6 +222,26 @@ check("fanout: extra-output count is a RANGE, not a fixed fingerprint",
       ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
 
 # ---------------------------------------------------------------------------
+# peel + DAG COMPOSE (the "Maximum safe" preset): the peeled outputs are
+# exactly the DAG hop sources, and each peeled amount can fund its later hop.
+# This is what makes running --peel AND --dag-mixing a real two-layer mix
+# rather than two unrelated settings.
+# ---------------------------------------------------------------------------
+_cd = ["A", "B", "C", "D"]
+_ca = [Decimal("1.0"), Decimal("0.6"), Decimal("2.1"), Decimal("0.9")]
+_cpeels = ghost.build_peel_plan(9, 0, _cd, _ca)
+_cfd, _chop = ghost.select_fanout_targets(_cd, set(), wallets=4, num_decoys=0)
+check("peel+dag: the peeled destinations ARE the DAG hop sources (same outputs)",
+      sorted(p["dst"] for p in _cpeels) == sorted(_chop))
+_cby = dict(zip(_cd, _ca))
+check("peel+dag: every peeled output can fund its later DAG hop",
+      all(ghost.compute_hop_amount(_cby[d], Decimal("0.01")) > ghost.DUST_XMR
+          for d in _chop))
+check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount",
+      ghost.compute_hop_amount(_cby["C"], Decimal("0.01"))
+      > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
+
+# ---------------------------------------------------------------------------
 # GhostSpiral.build_peel_plan: N single-dest peels, carrier = ENTRY then subaddr 0
 # ---------------------------------------------------------------------------
 _pdests = ["Ma", "Mb", "Mc", "Md"]

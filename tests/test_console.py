@@ -236,6 +236,59 @@ def test_tor_port_autodetect():
     check("there is a /api/detect-tor endpoint", '"/api/detect-tor"' in src)
 
 
+def test_start_tor_launches_only_installed_binary():
+    """Start Tor must (a) reuse a running proxy, (b) launch an installed tor and
+    verify it, (c) NEVER download — a missing binary yields install guidance,
+    not a fetch, and no process is spawned."""
+    c = load_console()
+    spawned = []
+    real_popen, real_sleep = c.subprocess.Popen, c.time.sleep
+    try:
+        # (a) already running -> no launch
+        c.detect_tor_proxy = lambda pref="": {"ok": True, "proxy": "socks5h://127.0.0.1:9150"}
+        r = c.start_tor()
+        check("start_tor reuses an already-running Tor (no duplicate launch)",
+              r["ok"] and r["started"] is False)
+
+        # (b) not running, no binary -> instructions, NO spawn
+        c.detect_tor_proxy = lambda pref="": {"ok": False, "proxy": None}
+        c._find_tor_binary = lambda: None
+
+        def _no_spawn(*a, **k):
+            spawned.append(a)
+            raise AssertionError("must not spawn without a binary")
+        c.subprocess.Popen = _no_spawn
+        r = c.start_tor()
+        check("no tor binary -> no process spawned", spawned == [])
+        check("no tor binary -> actionable install guidance", r["ok"] is False
+              and ("install" in r["detail"].lower() or "Tor Browser" in r["detail"]))
+
+        # (c) binary present -> launches it, then verifies
+        up = {"v": False}
+        c._find_tor_binary = lambda: "/usr/bin/tor"
+        c.detect_tor_proxy = (lambda pref="": {"ok": True, "proxy": "socks5h://127.0.0.1:9050"}
+                              if up["v"] else {"ok": False, "proxy": None})
+
+        class P:
+            def __init__(self, *a, **k): pass
+            def poll(self): return None
+        c.subprocess.Popen = lambda *a, **k: P()
+        c.time.sleep = lambda s: up.__setitem__("v", True)
+        r = c.start_tor()
+        check("an installed tor is launched and then verified",
+              r["ok"] and r["started"] and r["proxy"] == "socks5h://127.0.0.1:9050")
+    finally:
+        c.subprocess.Popen, c.time.sleep = real_popen, real_sleep
+
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("start_tor doc says it never downloads (only launches a found binary)",
+          "never downloads" in c.start_tor.__doc__.lower()
+          or "never downloads" in open(os.path.join(REPO, "gs_console")).read().lower()
+          or "Never downloads" in c._find_tor_binary.__doc__)
+    check("the page has a Start Tor button and endpoint",
+          'id="pfstart"' in src and '"/api/start-tor"' in src)
+
+
 def test_wizard_structure_places_every_action():
     """The page is a 5-step wizard; every action must live in some step's
     data-acts placeholder (or it becomes unreachable), and each action id must
@@ -268,7 +321,16 @@ def test_peel_flag_wires_through_to_argv():
                                 "tor_proxy": "socks5h://127.0.0.1:9050"})
     check("no peel flag -> no --peel", "--peel" not in argv2)
 
+    # The "Maximum safe" preset must COMPOSE both layers — peel AND dag — and
+    # emit both flags, or it isn't the strongest option it claims to be.
+    maxargv, _ = c.pipeline_argv({"mode": "send", "btc_entry": "bc1qxyz",
+                                  "btc_amount": "0.05", "tor_proxy": "socks5h://127.0.0.1:9050",
+                                  "peel": True, "dag_mixing": True})
+    check("Maximum-safe params emit BOTH --peel and --dag-mixing",
+          "--peel" in maxargv and "--dag-mixing" in maxargv)
     src = open(os.path.join(REPO, "gs_console")).read()
+    check("the Maximum-safe preset sets peel:true AND dag_mixing:true",
+          "paranoid:{wallets:10,deep:2,dag_mixing:true,peel:true" in src)
     check("the page has a peel checkbox", 'id="peel"' in src)
     check("collect() reads the peel checkbox", "peel:c('peel')" in src)
     check("there is a Peeling chain preset", 'data-p="peel"' in src and "peel:true" in src)

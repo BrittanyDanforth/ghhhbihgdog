@@ -34,7 +34,7 @@ SAFETY MODEL, because this can spend money:
 Stdlib only, so it runs on the air-gapped machine too.
 """
 from __future__ import annotations
-import argparse, hmac, json, os, re, secrets, shlex, signal, subprocess, sys, threading, time
+import argparse, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -535,6 +535,90 @@ def detect_tor_proxy(preferred: str = "") -> dict:
                        ". Start Tor Browser (9150) or tor.exe (9050) and retry.")}
 
 
+_TOR_PROC = None
+_TOR_LOCK = threading.Lock()
+
+
+def _find_tor_binary():
+    """Locate an ALREADY-INSTALLED tor daemon. Never downloads anything —
+    launching a fetched binary would be a supply-chain risk the operator did
+    not consent to. PATH first, then a few well-known install locations."""
+    b = shutil.which("tor")
+    if b:
+        return b
+    home = os.path.expanduser("~")
+    cands = []
+    if sys.platform == "win32":
+        tb = os.path.join("Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe")
+        cands += [os.path.join(home, "Desktop", tb),
+                  os.path.join(home, "OneDrive", "Desktop", tb),
+                  os.path.join(home, "Downloads", tb),
+                  os.path.join(os.environ.get("PROGRAMFILES", "C:/Program Files"), "Tor", "tor.exe"),
+                  os.path.join(home, "tor", "tor.exe")]
+    else:
+        cands += ["/usr/bin/tor", "/usr/local/bin/tor", "/opt/homebrew/bin/tor",
+                  os.path.join(home, ".local", "bin", "tor")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def start_tor():
+    """Start an installed Tor daemon and return the verified SOCKS proxy.
+
+    Order: (1) if a Tor proxy is already working, use it — never launch a
+    duplicate; (2) if we launched one earlier and it's alive, re-verify it;
+    (3) otherwise find an installed tor binary and launch it (default config =
+    SOCKS on 127.0.0.1:9050), then poll until it bootstraps and verifies as
+    Tor. Only ever runs a binary already on the machine. Never raises.
+    """
+    global _TOR_PROC
+    d = detect_tor_proxy("")
+    if d.get("ok"):
+        return {"ok": True, "proxy": d["proxy"], "started": False,
+                "detail": "Tor was already running: " + d["proxy"]}
+    with _TOR_LOCK:
+        if _TOR_PROC is not None and _TOR_PROC.poll() is None:
+            d = detect_tor_proxy("socks5h://127.0.0.1:9050")
+            if d.get("ok"):
+                return {"ok": True, "proxy": d["proxy"], "started": True,
+                        "detail": "Tor (started here) is up: " + d["proxy"]}
+            return {"ok": False, "proxy": None, "started": True,
+                    "detail": "Tor was launched but has not finished bootstrapping "
+                              "yet — wait a moment and click 'Detect Tor port'."}
+        tor_bin = _find_tor_binary()
+        if not tor_bin:
+            hint = ("Open Tor Browser (then click 'Detect Tor port'), or install "
+                    "the Tor Expert Bundle from torproject.org."
+                    if sys.platform == "win32" else
+                    "Install it: 'sudo apt install tor' / 'brew install tor', or "
+                    "open Tor Browser and click 'Detect Tor port'.")
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": "No installed 'tor' binary found. " + hint}
+        try:
+            _TOR_PROC = subprocess.Popen(
+                [tor_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, cwd=os.path.dirname(tor_bin) or None)
+        except Exception as e:                        # noqa: BLE001
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": f"found tor at {tor_bin} but could not launch it: {str(e)[:100]}"}
+    # Poll (outside the lock) until tor bootstraps and a real Tor check passes.
+    for _ in range(60):
+        time.sleep(1)
+        if _TOR_PROC.poll() is not None:
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": f"tor exited immediately (code {_TOR_PROC.returncode}); "
+                              "it may already be running or its data dir is not writable."}
+        d = detect_tor_proxy("socks5h://127.0.0.1:9050")
+        if d.get("ok"):
+            return {"ok": True, "proxy": d["proxy"], "started": True,
+                    "detail": "Launched Tor and verified the exit: " + d["proxy"]}
+    return {"ok": False, "proxy": None, "started": True,
+            "detail": "Launched tor but it did not verify within 60s (still "
+                      "bootstrapping on a slow link?). Click 'Detect Tor port' shortly."}
+
+
 def mandatory_preflight(params: dict) -> dict:
     """The NON-NEGOTIABLE OPSEC gate the pipeline cannot spend without.
 
@@ -739,6 +823,8 @@ class H(BaseHTTPRequestHandler):
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
                 detect_tor_proxy(c["params"].get("tor_proxy", ""))))
+        if self.path == "/api/start-tor":
+            return self._send(200, json.dumps(start_tor()))
         if self.path.startswith("/run/"):
             aid = self.path[5:]
             act = ACTIONS.get(aid)
@@ -998,8 +1084,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <p class="lead">Pick a preset — it sets everything below. Higher privacy means more transactions,
     higher fees and more waiting.</p>
     <div class="presets" id="presets">
-      <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">~12 txs · 1 dest each · slowest</span></button>
-      <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">40 wallets · depth 4 · DAG</span></button>
+      <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">peel + DAG · two layers · slowest</span></button>
+      <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">peel only · 1 dest per tx</span></button>
       <button data-p="churn" aria-pressed="false"><span class="pn">Deep churn</span><span class="pd">20 wallets · depth 6 · DAG</span></button>
       <button data-p="max" aria-pressed="false"><span class="pn">High privacy</span><span class="pd">25 wallets · depth 3 · DAG</span></button>
       <button data-p="balanced" aria-pressed="true"><span class="pn">Balanced</span><span class="pd">12 wallets · depth 2 · DAG</span></button>
@@ -1038,6 +1124,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <div id="pfstatus" class="pfbox"></div>
     <div class="pfbtns">
       <button id="pfdetect" class="pfre" type="button">Detect Tor port</button>
+      <button id="pfstart" class="pfre" type="button">Start Tor</button>
       <button id="pfre" class="pfre" type="button">re-run preflight now</button>
     </div>
     <p class="lead" style="margin-top:14px">Run the manual checks for detail (they change nothing):</p>
@@ -1080,10 +1167,10 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 
 const PRESETS={
+ paranoid:{wallets:10,deep:2,dag_mixing:true,peel:true,fee_priority:3,clearnet:false,
+      note:'MAXIMUM SAFETY — the two strongest layers COMBINED. First a PEELING CHAIN: ~10 destinations plus a few decoys are each sent as their OWN transaction, spending the previous change, so nothing is ever co-created in a fan-out an analyst could cluster. THEN a DAG hop round mixes those outputs a second time. Clearnet relay forced OFF, highest priority. By far the SLOWEST — every peel AND every hop waits ~10 blocks, so many hours. Use for high-value sends where time is no object.'},
  peel:{wallets:8,deep:1,dag_mixing:false,peel:true,fee_priority:2,clearnet:false,
-      note:'PEELING CHAIN. 8 mix destinations PLUS decoys (~12 total) are sent ONE TRANSACTION AT A TIME, each spending the previous change, so no outputs are ever co-created in a fan-out an analyst can cluster. STRONGEST graph unlinkability, and by far the SLOWEST — every peel waits ~10 blocks to confirm, so roughly 12 × 20 min (~4 h). Use for high-value sends where time is no object.'},
- paranoid:{wallets:40,deep:4,dag_mixing:true,fee_priority:3,clearnet:false,
-      note:'SAFEST fan-out. 40 subaddresses, depth 4, both mixing rounds, priority 3, and clearnet relay forced OFF. Largest anonymity set. For the strongest GRAPH unlinkability use Peeling chain instead.'},
+      note:'PEELING CHAIN ONLY (no second DAG round). ~8 destinations plus decoys are sent ONE TRANSACTION AT A TIME, each spending the previous change — no co-created fan-out. Strong graph unlinkability and faster than Maximum safe (one round, not two), but without the extra hop layer. Every peel waits ~10 blocks (~hours).'},
  churn:{wallets:20,deep:6,dag_mixing:true,fee_priority:2,clearnet:false,
       note:'DEEP CHURN. 20 subaddresses at maximum depth 6 — the longest hop chains, so the funds cross the most intermediate outputs before they settle. Emphasises trail length over breadth; slowest to finish.'},
  max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,clearnet:false,
@@ -1205,6 +1292,20 @@ async function detectTor(silent){
    `<div class="pfhead bad">✕ ${esc((r&&r.detail)||'no Tor proxy found')}</div>`;
  return false;
 }
+// Start an INSTALLED Tor daemon (never downloads). Blocks while tor bootstraps.
+let startBusy=false;
+async function startTor(){
+ if(startBusy) return; startBusy=true;
+ const btn=$('#pfstart'); if(btn){btn.disabled=true;btn.textContent='Starting Tor…';}
+ $('#pfstatus').innerHTML='<div class="pfhead run">⟳ starting Tor (this can take up to a minute while it bootstraps)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/start-tor',{method:'POST',headers:HDR,body:'{}'}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'start request failed: '+e}; }
+ if(btn){btn.disabled=false;btn.textContent='Start Tor';}
+ startBusy=false;
+ if(r&&r.ok&&r.proxy){ $('#tor_proxy').value=r.proxy; await runPreflight(); return; }
+ $('#pfstatus').innerHTML=`<div class="pfhead bad">✕ ${esc((r&&r.detail)||'could not start Tor')}</div>`;
+}
 // Debounce so editing a network field doesn't fire a Tor check per keystroke.
 let pfTimer=null;
 function schedulePreflight(){ preflightOk=false; sync();
@@ -1230,6 +1331,7 @@ $$('input,select').forEach(el=>el.addEventListener('input',()=>{
 }));
 $('#pfre').addEventListener('click',runPreflight);
 $('#pfdetect').addEventListener('click',()=>detectTor(false));
+$('#pfstart').addEventListener('click',startTor);
 $('#arm').addEventListener('input',e=>{armed=e.target.value.trim()===ARM;sync();});
 $('#armword').textContent=ARM;
 $('#pwnote').innerHTML=PWSET
