@@ -42,9 +42,13 @@ from gs_common import (
 )
 
 def _validate_plan(plan: List[dict], phase: str = "create") -> None:
-    """Validate each TX. A TX is either single-destination (dst+amt, used by DAG
-    hops) or multi-destination (destinations[], used by the one fan-out TX that
-    sends ENTRY's single input to many mix subaddresses at once).
+    """Validate each TX. A TX is one of:
+      * multi-destination (destinations[]): the one fan-out TX;
+      * single-destination (dst+amt): a DAG hop or a legacy peel;
+      * a SWEEP forward (sweep=true, dst, no amt): the rotating-carrier fix's
+        zero-change forward that moves a carrier's whole balance to the next
+        fresh carrier. sweep_all sends everything-minus-fee to ONE address, so
+        it carries no 'amt' (the amount is "all of it") and no 'destinations'.
 
     src_index handling is PHASE-AWARE, because only phase_create consumes it:
       * create -- REQUIRED, non-negative int. This is the actual per-TX spend
@@ -58,6 +62,11 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         source is fixed at creation time). An earlier version of this fix
         required it in both phases, which rejected a legitimate sign-only run
         on an older or hand-authored plan for no security benefit.
+
+    account_index (optional per TX) lets the rotating-carrier peel spend from a
+    FRESH ACCOUNT each hop (monerod returns a partial spend's change to its
+    SOURCE account's subaddress 0, so rotating the source account is what keeps
+    the wallet's real main account out of the mix). Validated when present.
     """
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
@@ -74,6 +83,18 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         elif si is not None and (not isinstance(si, int) or isinstance(si, bool) or si < 0):
             sys.exit(f"[!] Schema error at TX {i}: 'src_index' present but invalid "
                      f"({si!r}); expected a non-negative int.")
+        ai = tx.get("account_index")
+        if ai is not None and (not isinstance(ai, int) or isinstance(ai, bool) or ai < 0):
+            sys.exit(f"[!] Schema error at TX {i}: 'account_index' present but invalid "
+                     f"({ai!r}); expected a non-negative int.")
+        if tx.get("sweep"):
+            # A sweep forward: whole-balance move to ONE address, no amt/dests.
+            if not isinstance(tx.get("dst"), str):
+                sys.exit(f"[!] Schema error at TX {i}: sweep TX needs a string 'dst'")
+            if tx.get("destinations") is not None or tx.get("amt") is not None:
+                sys.exit(f"[!] Schema error at TX {i}: a sweep TX carries neither "
+                         f"'amt' nor 'destinations' (sweep_all sends the whole balance)")
+            continue
         dests = tx.get("destinations")
         if dests is not None:
             if not isinstance(dests, list) or not dests:
@@ -144,7 +165,15 @@ def _canonical_plan(plan: List[dict]) -> list:
             "src_index": tx.get("src_index"),
             "delay": tx.get("delay"),
         }
-        if dests:
+        # account_index and sweep change WHAT is spent and HOW, so they are part
+        # of the plan's identity: a rotating-carrier peel spending a different
+        # account, or a sweep vs a partial transfer, is a different plan.
+        if tx.get("account_index") is not None:
+            entry["account_index"] = tx.get("account_index")
+        if tx.get("sweep"):
+            entry["sweep"] = True
+            entry["dst"] = tx.get("dst")
+        elif dests:
             entry["destinations"] = [
                 {"address": d.get("address"), "amount": str(d.get("amount"))}
                 for d in dests
@@ -298,6 +327,53 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         # int; no default -- a silent .get(..., 0) here was the mechanism that
         # made a missing key spend from the wallet's primary address.
         src_index = tx["src_index"]
+        # Per-TX account override: the rotating-carrier peel spends a FRESH
+        # ACCOUNT each hop, so its source account is not the plan-wide default
+        # (which stays account 0 / the receive account for fan-out and DAG).
+        tx_acct = tx.get("account_index", acct_idx)
+
+        if tx.get("sweep"):
+            # ROTATING-CARRIER FORWARD: move this carrier's WHOLE balance to the
+            # next fresh carrier with sweep_all. sweep_all produces NO change
+            # output, so nothing falls back to the account's subaddress 0 -- the
+            # property that keeps the mix off any fixed hub. Verified on real
+            # monerod 0.18 that sweep_all is the only zero-change primitive
+            # (subtract_fee_from_outputs and a custom change address are not
+            # honoured on this build).
+            mani_dst = scrub_address(tx["dst"])
+            mani_amt = "sweep_all"
+            desc = f"sweep_all -> {scrub_address(tx['dst'])} (zero-change carry)"
+            print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: {desc}...")
+            try:
+                result = rpc.raw_request("sweep_all", {
+                    "address": tx["dst"],
+                    "account_index": tx_acct,
+                    "subaddr_indices": [src_index],
+                    "priority": args.fee_priority,
+                    "get_tx_hex": False,
+                    "do_not_relay": True,
+                })
+                unsigned_txset = result.get("unsigned_txset", "")
+                if not unsigned_txset:
+                    integrity_log("signer", f"no_unsigned_txset:idx={idx}")
+                    print(f"  [!] TX {idx}: sweep_all returned no unsigned_txset")
+                    failed += 1
+                    continue
+                tx_file = outdir / f"tx_{idx}.unsigned"
+                secure_write_text(tx_file, unsigned_txset)
+                sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
+                manifest.append({
+                    "idx": idx, "file": str(tx_file), "hash": sha,
+                    "dst": mani_dst, "amt": mani_amt, "delay": tx.get("delay", 0),
+                })
+                created += 1
+                print(f"  [+] TX {idx} -> {tx_file.name}")
+            except Exception as e:                              # noqa: BLE001
+                integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")
+                print(f"  [!] TX {idx} sweep failed: {str(e)[:80]}")
+                failed += 1
+            continue
+
         # Multi-destination (fan-out: one input -> many outputs) or single
         # (DAG hop). transfer_split takes a destinations list either way.
         if tx.get("destinations"):
@@ -321,7 +397,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         try:
             result = rpc.raw_request("transfer_split", {
                 "destinations": dests,
-                "account_index": acct_idx,
+                "account_index": tx_acct,
                 "subaddr_indices": [src_index],
                 "priority": args.fee_priority,
                 "get_tx_hex": False,

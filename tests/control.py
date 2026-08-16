@@ -59,6 +59,7 @@ ACTIONS = {
     "peelcold":    {**suite("real_peel_cold_testnet", "SHIPPED phase_create+phase_sign COLD peel chain"), "group": "Real binaries"},
     "realtrack":   {**suite("real_track_origin_testnet", "origin tracker on a REAL regtest chain: with-keys vs keyless"), "group": "Real binaries"},
     "hardpeel":    {**suite("real_hardened_peel_testnet", "REAL proof: rotating carriers kill the subaddr-0 hub"), "group": "Real binaries"},
+    "rotcold":     {**suite("real_rotating_peel_cold_testnet", "REAL proof: rotating peel is COLD-SIGNABLE through shipped signer"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --
