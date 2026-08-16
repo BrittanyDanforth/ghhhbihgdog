@@ -69,26 +69,60 @@ def rand_mac() -> str:
 
 
 def spoof_mac(iface: str, dry: bool):
+    """Randomise an interface's MAC.
+
+    Two defects fixed here, both verified:
+
+    * THE INTERFACE WAS LEFT DOWN ON FAILURE. The sequence is down → set
+      address → up, and `set address` is exactly the step that fails without
+      root or on a driver that refuses. The exception skipped the `up`, so a
+      failed spoof killed the operator's networking with nothing saying so.
+      Bringing it back up now happens in a `finally`, so it runs on every path.
+
+    * THE NEW MAC WAS WRITTEN TO THE INTEGRITY LOG. `mac_spoof:wlan0->e2:03:...`
+      persisted the very value the spoof exists to make unlinkable — anyone who
+      later reads integrity_chain.log learns the address the machine used for
+      the operation. The log now records only THAT a spoof happened; the MAC
+      itself is printed to the terminal for the operator and never stored.
+    """
     new_mac = rand_mac()
     if dry:
         print(f"  [dry] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_dry:{iface}->{new_mac}")
+        integrity_log("paranoia", f"mac_dry:{iface}")     # value withheld
         return
+
+    lowered = False
     try:
         subprocess.run(["ip", "link", "set", iface, "down"], check=True,
-                       capture_output=True)
+                       capture_output=True, timeout=15)
+        lowered = True
         subprocess.run(["ip", "link", "set", iface, "address", new_mac],
-                       check=True, capture_output=True)
-        subprocess.run(["ip", "link", "set", iface, "up"], check=True,
-                       capture_output=True)
+                       check=True, capture_output=True, timeout=15)
         print(f"  [+] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_spoof:{iface}->{new_mac}")
+        integrity_log("paranoia", f"mac_spoof:{iface}:ok")
     except subprocess.CalledProcessError as e:
-        integrity_log("paranoia", f"mac_fail:{iface}:{e}")
-        print(f"  [!] MAC spoof failed: {e}")
+        detail = (e.stderr or b"").decode("utf-8", errors="ignore").strip()[:80]
+        integrity_log("paranoia", f"mac_fail:{iface}")
+        print(f"  [!] MAC spoof failed ({'needs root' if os.geteuid() != 0 else 'driver refused'})"
+              f"{': ' + detail if detail else ''}")
     except FileNotFoundError:
         integrity_log("paranoia", "mac_fail:ip_not_found")
         print("  [!] 'ip' command not found - cannot spoof MAC")
+    except subprocess.TimeoutExpired:
+        integrity_log("paranoia", f"mac_fail:{iface}:timeout")
+        print(f"  [!] MAC spoof timed out on {iface}")
+    finally:
+        # ALWAYS restore the link. Without this a failed spoof leaves the NIC
+        # administratively down and the operator offline with no explanation.
+        if lowered:
+            try:
+                subprocess.run(["ip", "link", "set", iface, "up"], check=True,
+                               capture_output=True, timeout=15)
+            except (subprocess.CalledProcessError, FileNotFoundError,
+                    subprocess.TimeoutExpired):
+                integrity_log("paranoia", f"mac_iface_still_down:{iface}")
+                print(f"  [!] {iface} could NOT be brought back up — "
+                      f"run: ip link set {iface} up")
 
 
 def wipe_shell_histories(dry: bool):

@@ -12,11 +12,18 @@ a real order-book/depth probe (Bisq/Haveno P2P markets have no queryable book).
 
 OPSEC hardening:
   - Tor verified before any API access
-  - No sensitive amounts or addresses leaked to terminal (redacted)
   - Atomic fsync-rename output with 0600 perms
-  - Integrity hash-chain logging
+  - Integrity hash-chain logging (amounts are NOT written to the chain)
   - KYC risk flagging
   - Heuristic liquidity guidance by trade size (clearly labelled; not a probe)
+  - --redact masks the figures on screen for shoulder-surfing / screen-sharing
+
+TERMINAL OUTPUT IS NOT REDACTED BY DEFAULT, and this header used to claim it
+was ("No sensitive amounts or addresses leaked to terminal (redacted)") while
+printing the exact holding and its exact fiat value. That claim was false: the
+figures ARE the output of an off-ramp planner and the operator needs to read
+them. Use --redact when someone may be looking, which masks the magnitudes on
+screen while the full plan still goes to the 0600 JSON file.
 """
 from __future__ import annotations
 import argparse, sys, time
@@ -131,6 +138,10 @@ def main():
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
+    ap.add_argument("--redact", action="store_true",
+                    help="mask amounts and values on the terminal (the full plan "
+                         "is still written to the 0600 JSON file). Use when "
+                         "screen-sharing or in a shoulder-surfing risk.")
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
@@ -191,14 +202,22 @@ def main():
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
+    def _m(v, unit=""):
+        """Mask a magnitude when --redact is on. Order of magnitude is kept so
+        the operator can still sanity-check the plan; the digits are not."""
+        if not args.redact:
+            return f"{v}{unit}"
+        d = len(str(int(Decimal(str(v)).copy_abs())))
+        return f"{'#' * d}.{'#' * 4}{unit} (redacted, {d}-digit)"
+
     kyc_label = "KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"
     print(f"  Method      : {args.method} ({kyc_label})")
-    print(f"  Gross       : {gross} XMR")
-    print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
-    print(f"  Slippage    : {slip:.4f} XMR")
+    print(f"  Gross       : {_m(gross, ' XMR')}")
+    print(f"  Fees        : {_m(round(fee, 4), ' XMR')} ({cfg['fee_pct'] * 100:.1f}%)")
+    print(f"  Slippage    : {_m(round(slip, 4), ' XMR')}")
     print(f"  ----------------------------------------")
-    print(f"  Net         : {net:.4f} XMR")
-    print(f"  Value       : {fiat_val} {args.currency.upper()}")
+    print(f"  Net         : {_m(round(net, 4), ' XMR')}")
+    print(f"  Value       : {_m(fiat_val, ' ' + args.currency.upper())}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
     print(f"  Liquidity   : {liq_guidance} (heuristic)")
     if cfg["kyc"] and not args.suppress_kyc:

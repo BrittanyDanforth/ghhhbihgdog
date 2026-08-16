@@ -128,7 +128,7 @@ d = make_blobs("bcast_B1", 2); prog = Path(os.getcwd()) / "progB1.json"
 code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
 p = json.loads(prog.read_text())
 check("B1: full success returns 0", code == 0)
-check("B1: both relayed", sorted(p["relayed"]) == [0, 1])
+check("B1: both relayed", sorted(p["relayed"]) == ["tx_0.signed", "tx_1.signed"])
 check("B1: none failed_perm", p["failed_perm"] == [])
 
 # --- B2: one double-spend -> exit nonzero, idx1 permanent ---
@@ -136,8 +136,8 @@ d = make_blobs("bcast_B2", 2); prog = Path(os.getcwd()) / "progB2.json"
 code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "double"})
 p = json.loads(prog.read_text())
 check("B2: permanent failure exits nonzero", code != 0)
-check("B2: idx0 relayed", p["relayed"] == [0])
-check("B2: idx1 failed_perm", p["failed_perm"] == [1])
+check("B2: idx0 relayed", p["relayed"] == ["tx_0.signed"])
+check("B2: idx1 failed_perm", p["failed_perm"] == ["tx_1.signed"])
 
 # --- B3: THE false-success test. Resume B2 (idx1 permanently failed) with the
 #         node now healthy. idx1 is skipped (permanent), NOT retried, and the
@@ -147,19 +147,21 @@ code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
 p = json.loads(prog.read_text())
 check("B3: resume of all-permanent-among-unrelayed still exits NONZERO", code != 0)
 check("B3: idx1 stays failed_perm (not retried into relayed)",
-      p["failed_perm"] == [1] and 1 not in p["relayed"])
+      p["failed_perm"] == ["tx_1.signed"] and "tx_1.signed" not in p["relayed"])
 
 # --- B4: transient failure is retried on resume ---
 d = make_blobs("bcast_B4", 2); prog = Path(os.getcwd()) / "progB4.json"
 code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "raise"})
 p = json.loads(prog.read_text())
 check("B4: transient failure exits nonzero", code != 0)
-check("B4: transient NOT marked permanent", p["failed_perm"] == [] and p["relayed"] == [0])
+check("B4: transient NOT marked permanent",
+      p["failed_perm"] == [] and p["relayed"] == ["tx_0.signed"])
 # resume with node healthy -> idx1 retried and relayed -> exit 0
 code = run_broadcast(d, prog, {hx(d,0): "ok", hx(d,1): "ok"})
 p = json.loads(prog.read_text())
 check("B4: resume retries transient and succeeds (exit 0)", code == 0)
-check("B4: both relayed after resume", sorted(p["relayed"]) == [0, 1])
+check("B4: both relayed after resume",
+      sorted(p["relayed"]) == ["tx_0.signed", "tx_1.signed"])
 
 # --- B5: a key-image rejection (no literal 'double spend' phrase) must still
 #         be classified PERMANENT, not retried as transient. ---
@@ -167,7 +169,8 @@ d = make_blobs("bcast_B5", 1); prog = Path(os.getcwd()) / "progB5.json"
 code = run_broadcast(d, prog, {hx(d, 0): "keyimage"})
 p = json.loads(prog.read_text())
 check("B5: key-image error exits nonzero", code != 0)
-check("B5: key-image classified permanent (failed_perm)", p["failed_perm"] == [0])
+check("B5: key-image classified permanent (failed_perm)",
+      p["failed_perm"] == ["tx_0.signed"])
 check("B5: key-image not retried as transient", p["relayed"] == [])
 
 # --- B6: real wallet-rpc code -40 "Failed to parse signed tx data" is
@@ -176,7 +179,8 @@ d = make_blobs("bcast_B6", 1); prog = Path(os.getcwd()) / "progB6.json"
 code = run_broadcast(d, prog, {hx(d, 0): "baddata"})
 p = json.loads(prog.read_text())
 check("B6: code -40 exits nonzero", code != 0)
-check("B6: code -40 classified permanent", p["failed_perm"] == [0] and p["relayed"] == [])
+check("B6: code -40 classified permanent",
+      p["failed_perm"] == ["tx_0.signed"] and p["relayed"] == [])
 
 # ===========================================================================
 # C. phase_sign must NEVER put the wallet password on the child's argv.

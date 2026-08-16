@@ -41,6 +41,8 @@ ACTIONS = {
     "integration": {**suite("test_integration", "real phase_create/sign/broadcast + orchestration"), "group": "Offline suites"},
     "gitignore":   {**suite("test_gitignore", "enforces .gitignore covers every wiped artifact"), "group": "Offline suites"},
     "ipleak":      {**suite("test_ipleak", "proxy scheme, egress guards, localhost spoofing"), "group": "Offline suites"},
+    "broadcast":   {**suite("test_broadcast", "relay loop: delays, resume, manifest boundary"), "group": "Offline suites"},
+    "gapfixes":    {**suite("test_gapfixes", "MAC-spoof restore/leak, exit-sim --redact"), "group": "Offline suites"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},
@@ -48,6 +50,7 @@ ACTIONS = {
     "dagsub":      {**suite("real_dag_subaddr_testnet", "on-chain proof subaddr_indices isolates a hop", VENV_PY), "group": "Real binaries"},
     "phasesign":   {**suite("real_phase_sign_testnet", "SHIPPED phase_sign relayed + confirmed", VENV_PY), "group": "Real binaries"},
     "phasecreate": {**suite("real_phase_create_testnet", "SHIPPED phase_create -> phase_sign chain", VENV_PY), "group": "Real binaries"},
+    "realbcast":   {**suite("real_broadcast_testnet", "SHIPPED broadcast main() relayed + confirmed"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --

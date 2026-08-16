@@ -15,6 +15,12 @@ python3 tests/test_ipleak.py        # IP-LEAK defences: proxy scheme, empty-dict
                                      # egress guards, localhost spoofing, fail-closed
 python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
                                      # paranoia_mode wipes (OPSEC leak guard)
+python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-delay,
+                                    #   submit-time hash re-verify, resume/progress
+                                    #   migration, manifest trust boundary
+python3 tests/test_gapfixes.py      # paranoia_mode MAC-spoof restore + MAC-not-logged,
+                                    #   exit_strategy_simulator --redact
+
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
 python3 tests/real_flags_testnet.py      # real fee-priority 1-4 + multi-dest
@@ -27,6 +33,11 @@ python3 tests/leak_audit_testnet.py    # RUNS all 3 stages, audits everything
                                           # they leave on disk (perms + secrets)
 python3 tests/real_phase_create_testnet.py # SHIPPED phase_create -> phase_sign
                                           # chain vs a REAL wallet-rpc
+python3 tests/real_broadcast_testnet.py   # calls the SHIPPED broadcast main():
+                                          #   a real daemon witnesses that a shutdown
+                                          #   mid-delay and a swapped blob relay
+                                          #   NOTHING, and that --resume then relays
+                                          #   a tx that confirms on-chain
 ```
 
 `real_phase_create_testnet.py` needs the `monero` package (the others do not).
