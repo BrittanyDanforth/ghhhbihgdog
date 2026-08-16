@@ -444,6 +444,43 @@ check("money: hop never exceeds what the subaddress received",
 check("money: ROUND_DOWN quantise never rounds the hop UP past the output",
       _hop_new(Decimal("0.019999")) <= Decimal("0.019999") - _RESERVE)
 
+# The fee margin must have ONE definition. It was written inline in three
+# places (stage-4 budget, hop reserve, and the message reporting the reserve),
+# so a changed margin would have made the printed number disagree with the
+# arithmetic that actually ran.
+check("money: hop_fee_reserve uses the shared FEE_SAFETY_MARGIN constant",
+      ghost.hop_fee_reserve(_REAL_FEE) == _REAL_FEE * ghost.FEE_SAFETY_MARGIN)
+check("money: the reserve the message reports IS the reserve the hop used",
+      ghost.compute_hop_amount(Decimal("1.0"), _REAL_FEE) ==
+      (Decimal("1.0") - ghost.hop_fee_reserve(_REAL_FEE)).quantize(
+          Decimal("0.0001"), rounding=_RD))
+
+# FAN-OUT must also be able to pay its own fee -- the same question the hop
+# failed. It passes because the stage-4 budget already subtracts total_fees AND
+# only FANOUT_SPEND_FRACTION of what remains is distributed. Driven through the
+# REAL function so a regression in it is caught here.
+_fo_bad = []
+for _bal_s in ["0.05", "0.06", "0.1", "0.3", "1", "10"]:
+    for _w in [3, 5, 10, 25]:
+        for _d in [1, 2]:
+            _bal = Decimal(_bal_s)
+            _usable = _bal - (_REAL_FEE * ghost.FEE_SAFETY_MARGIN * (_w * 2 * _d))
+            if _usable <= Decimal("0.0001"):
+                continue
+            _fa = ghost.compute_fanout_amount(_usable, _w)
+            if _fa <= Decimal("0.0001"):
+                continue
+            if (_bal - _fa * _w) < _REAL_FEE:      # nothing left to pay the fee
+                _fo_bad.append((_bal_s, _w, _d))
+check(f"money: fan-out always leaves enough for its own fee "
+      f"(unfundable combos: {_fo_bad})", not _fo_bad)
+check("money: fan-out total never exceeds the spend fraction it derives from",
+      ghost.compute_fanout_amount(Decimal("1.0"), 7) * 7 <=
+      Decimal("1.0") * ghost.FANOUT_SPEND_FRACTION)
+check("money: compute_fanout_amount rounds DOWN (never up past the budget)",
+      ghost.compute_fanout_amount(Decimal("0.9999999"), 3) * 3 <=
+      Decimal("0.9999999") * ghost.FANOUT_SPEND_FRACTION)
+
 # ---------------------------------------------------------------------------
 # ITEM 5: --btc-entry checksum. bech32_checksum_ok used across the codebase;
 # GhostSpiral's BTC_RE-only check was the odd one out.

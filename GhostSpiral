@@ -39,6 +39,18 @@ from gs_common import (
 )
 
 DUST_XMR = Decimal("0.0001")
+
+# Single source of truth for the fee safety margin. It was written inline as
+# Decimal("1.5") in the stage-4 fee budget, in compute_hop_amount, and in the
+# operator-facing message that reports the reserve -- three copies that could
+# drift, so a changed margin would have made the printed number a lie.
+FEE_SAFETY_MARGIN = Decimal("1.5")
+
+# Fraction of the post-fee balance the fan-out distributes. The remainder stays
+# on ENTRY as headroom for the fan-out transaction's own fee. Verified fundable:
+# across every balance/wallet/depth combination that clears the dust guards the
+# tightest observed remainder was ~0.0245 XMR against a real 0.0024 XMR fee.
+FANOUT_SPEND_FRACTION = Decimal("0.9")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
 
@@ -123,13 +135,39 @@ def compute_hop_amount(fanout_amt: Decimal, fee_xmr: Decimal) -> Decimal:
     failed "not enough money" AFTER the fan-out had already executed on-chain,
     leaving funds scattered mid-pipeline.
 
-    Uses the same 1.5x margin as the stage-4 fee budget, and ROUND_DOWN so
-    quantising can never round the hop UP past what the output actually holds.
-    The caller compares the result against DUST_XMR and skips the DAG round
-    when it is not fundable.
+    Uses FEE_SAFETY_MARGIN (shared with the stage-4 fee budget), and ROUND_DOWN
+    so quantising can never round the hop UP past what the output actually
+    holds. The caller compares the result against DUST_XMR and skips the DAG
+    round when it is not fundable.
     """
-    reserve = fee_xmr * Decimal("1.5")
-    return (fanout_amt - reserve).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    return (fanout_amt - hop_fee_reserve(fee_xmr)).quantize(
+        DUST_XMR, rounding=ROUND_DOWN)
+
+
+def hop_fee_reserve(fee_xmr: Decimal) -> Decimal:
+    """Amount withheld from a hop to pay its transaction fee.
+
+    Exposed so the operator-facing message reports the SAME number the
+    arithmetic actually used, rather than recomputing the margin at the call
+    site where it could drift out of sync.
+    """
+    return fee_xmr * FEE_SAFETY_MARGIN
+
+
+def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
+    """Per-destination fan-out amount.
+
+    Extracted alongside compute_hop_amount so BOTH money formulas are driven by
+    tests against the real function instead of a reimplementation.
+
+    ROUND_DOWN matters: quantising up would make fanout_count * result exceed
+    the FANOUT_SPEND_FRACTION budget it was derived from. The caller guards
+    fanout_count > 0 (mix_targets excludes ENTRY, so a degenerate subaddress
+    set would otherwise divide by zero) and compares the result against
+    DUST_XMR.
+    """
+    return (usable * FANOUT_SPEND_FRACTION / Decimal(fanout_count)).quantize(
+        DUST_XMR, rounding=ROUND_DOWN)
 
 
 def parse_swap_route(route: dict) -> tuple:
@@ -724,7 +762,7 @@ def main():
         )
 
     rounds = args.wallets * 2 * args.deep
-    per_round_fee = fee_xmr * Decimal("1.5")  # 1 TX/round + 50% safety margin for fee spikes
+    per_round_fee = fee_xmr * FEE_SAFETY_MARGIN  # 1 TX/round + safety margin for fee spikes
     total_fees = per_round_fee * rounds
     usable = bal - total_fees
 
@@ -773,10 +811,7 @@ def main():
         integrity_log("stage4", "no_mix_targets")
         sys.exit("[!] No mix subaddresses available to fan out into "
                  f"(got {len(mix_targets)}). Cannot build a plan.")
-    # ROUND_DOWN: quantising must never round the per-destination amount UP,
-    # which would make N*fanout_amt exceed the 0.9 budget it was derived from.
-    fanout_amt = (usable * Decimal("0.9") / Decimal(fanout_count)).quantize(
-        Decimal("0.0001"), rounding=ROUND_DOWN)
+    fanout_amt = compute_fanout_amount(usable, fanout_count)
     if fanout_amt <= DUST_XMR:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
@@ -828,9 +863,9 @@ def main():
         # leaving funds scattered mid-pipeline. The dust guard did not catch it:
         # it only required the hop to exceed 0.0001 XMR.
         #
-        # Same 1.5x margin used for the fee budget above, and ROUND_DOWN so
-        # quantising can never round the hop UP past what the output holds.
-        _hop_reserve = fee_xmr * Decimal("1.5")
+        # Reserve and hop both come from the shared helpers, so the number
+        # printed below is the number the arithmetic actually used.
+        _hop_reserve = hop_fee_reserve(fee_xmr)
         dag_hop_amt = compute_hop_amount(fanout_amt, fee_xmr)
         if dag_hop_amt <= DUST_XMR:
             integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
