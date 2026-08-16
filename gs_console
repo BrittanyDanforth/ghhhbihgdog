@@ -27,13 +27,28 @@ SAFETY MODEL, because this can spend money:
 Stdlib only, so it runs on the air-gapped machine too.
 """
 from __future__ import annotations
-import argparse, json, os, re, shlex, signal, subprocess, sys, threading, time
+import argparse, hmac, json, os, re, secrets, shlex, signal, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 VENV_PY = os.environ.get("GS_VENV_PY", PY)
 ARM_PHRASE = "SPEND"
+
+# ── request authentication ─────────────────────────────────────────────────
+# A localhost server that can spend money is reachable by EVERY page the
+# operator's browser loads. Verified against an earlier build of this file:
+#   * a cross-origin POST with Content-Type: text/plain started a job. That
+#     content type is "simple" per CORS, so an attacker's <form> reaches us
+#     with no preflight and no consent.
+#   * a spoofed Host header was accepted, so a hostile domain resolving to
+#     127.0.0.1 (DNS rebinding) could drive the console.
+#   * nothing required credentials at all.
+# Four independent gates now close that, checked on every request:
+TOKEN = secrets.token_urlsafe(24)          # per-run, printed once at startup
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+MAX_JOBS = 200                             # bound the in-memory job table
+JOB_TIMEOUT_S = 4 * 3600                   # nothing legitimate runs longer
 
 # ── parameter schema. Anything not here cannot reach an argv. ───────────────
 SOCKS_RE = re.compile(r"^socks5h://[A-Za-z0-9._-]+:\d{1,5}$")
@@ -243,6 +258,10 @@ def start(argv, label):
            "started": time.time(), "proc": None, "argv": argv}
     with LOCK:
         JOBS[jid] = job
+        if len(JOBS) > MAX_JOBS:          # bound memory; drop oldest finished
+            for k in [k for k, v in sorted(JOBS.items(), key=lambda kv: kv[1]["started"])
+                      if v["done"]][:len(JOBS) - MAX_JOBS]:
+                JOBS.pop(k, None)
 
     def run():
         try:
@@ -256,7 +275,13 @@ def start(argv, label):
                     job["lines"].append(line.rstrip("\n"))
                     if len(job["lines"]) > 5000:
                         del job["lines"][:1500]
-            p.wait(); job["rc"] = p.returncode
+            try:
+                p.wait(timeout=JOB_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                job["lines"].append(f"[console] killed after {JOB_TIMEOUT_S}s timeout")
+                p.wait()
+            job["rc"] = p.returncode
         except FileNotFoundError as e:
             job["lines"].append(f"[console] not found: {e}"); job["rc"] = 127
         except Exception as e:                                  # noqa: BLE001
@@ -342,22 +367,75 @@ class H(BaseHTTPRequestHandler):
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n > 64 * 1024:                       # nothing legitimate is larger
+            return {}
         try:
             return json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:
             return {}
 
+    # ── gates. Any one failing rejects the request. ────────────────────────
+    def _host_ok(self):
+        """Host must name loopback. Blocks DNS rebinding: an attacker domain
+        that resolves to 127.0.0.1 still sends its own name here."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip()
+        return host in ALLOWED_HOSTS
+
+    def _origin_ok(self):
+        """Reject any cross-origin request. A same-origin fetch from our own
+        page sends either no Origin or our own; a hostile page cannot forge it."""
+        o = self.headers.get("Origin")
+        if not o:
+            return True                          # same-origin fetch / curl
+        return o.rsplit(":", 1)[0].removeprefix("http://").removeprefix("https://") \
+            in ALLOWED_HOSTS
+
+    def _token_ok(self):
+        """Constant-time token check. The token rides in a CUSTOM header, which
+        a cross-origin <form> cannot set -- so this alone defeats the CSRF path
+        even before the content-type gate."""
+        t = self.headers.get("X-GS-Token") or ""
+        if not t:                                # allow ?t= for the initial GET
+            from urllib.parse import urlparse, parse_qs
+            t = (parse_qs(urlparse(self.path).query).get("t") or [""])[0]
+        return hmac.compare_digest(t, TOKEN)
+
+    def _json_ct_ok(self):
+        """POST must be application/json. That content type is NOT CORS-simple,
+        so a cross-origin attempt needs a preflight, which we never answer."""
+        ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ct == "application/json"
+
+    def _guard(self, need_json):
+        if not self._host_ok():
+            self._send(403, json.dumps({"error": "host not loopback"})); return False
+        if not self._origin_ok():
+            self._send(403, json.dumps({"error": "cross-origin request refused"})); return False
+        if need_json and not self._json_ct_ok():
+            self._send(415, json.dumps({"error": "Content-Type must be application/json"})); return False
+        if not self._token_ok():
+            self._send(401, json.dumps({"error": "missing or bad console token"})); return False
+        return True
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        base = self.path.split("?")[0]
+        if base == "/favicon.ico":
+            # The browser probes this automatically with no token; answering
+            # 204 keeps a legitimate load from logging a spurious 401.
+            return self._send(204, b"", "image/x-icon")
+        if not self._guard(need_json=False):
+            return
+        if base in ("/", "/index.html"):
             meta = {k: {"label": v["label"], "desc": v["desc"],
                         "group": v["group"], "risk": v["risk"]}
                     for k, v in ACTIONS.items()}
             page = PAGE.replace("__ACTIONS__", json.dumps(meta)) \
                        .replace("__ARM__", json.dumps(ARM_PHRASE)) \
+                       .replace("__TOKEN__", json.dumps(TOKEN)) \
                        .replace("__PWSET__", json.dumps(bool(os.environ.get("GS_WALLET_PASSWORD"))))
             self._send(200, page, "text/html; charset=utf-8")
-        elif self.path.startswith("/job/"):
-            j = JOBS.get(self.path[5:])
+        elif base.startswith("/job/"):
+            j = JOBS.get(base[5:])
             if not j:
                 return self._send(404, json.dumps({"error": "no such job"}))
             with LOCK:
@@ -369,6 +447,8 @@ class H(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        if not self._guard(need_json=True):
+            return
         if self.path == "/api/preview":
             c = clean(self._body().get("params"))
             argv, why = pipeline_argv(c["params"])
@@ -568,7 +648,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
   <div id="out"><div class="idle">Run a preflight check first — Tor exit, relay egress, then wallet balance.</div></div>
 </div>
 </div></div><script>
-const A=__ACTIONS__, ARM=__ARM__, PWSET=__PWSET__;
+const A=__ACTIONS__, ARM=__ARM__, PWSET=__PWSET__, TOK=__TOKEN__;
+const HDR={'Content-Type':'application/json','X-GS-Token':TOK};
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 
@@ -603,7 +684,7 @@ function renderFees(){
 }
 function setFee(p){feePriority=p;renderFees();}
 async function loadFees(){
- feeData=await fetch('/api/fees',{method:'POST',headers:{'Content-Type':'application/json'},
+ feeData=await fetch('/api/fees',{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect()})}).then(r=>r.json()).catch(()=>null);
  renderFees();
 }
@@ -629,7 +710,7 @@ function collect(){
 }
 
 async function sync(){
- const r=await fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+ const r=await fetch('/api/preview',{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect()})}).then(r=>r.json());
  $('#prev').textContent=r.pretty;
  $('#probs').innerHTML=r.problems.map(p=>`<li>${p.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</li>`).join('');
@@ -670,7 +751,7 @@ async function run(id){
  $('#pt').textContent=A[id].label;
  $('#ppill').style.display='';$('#ppill').className='pill run';$('#ppill').textContent='running';
  $('#out').innerHTML='<pre class="out" id="pre"></pre>';
- const res=await fetch('/run/'+id,{method:'POST',headers:{'Content-Type':'application/json'},
+ const res=await fetch('/run/'+id,{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect(),arm:armed?ARM:''})}).then(r=>r.json());
  if(res.error){
    $('#pre').innerHTML=`<span class="r">${res.error}</span>`;
@@ -682,7 +763,7 @@ async function run(id){
 }
 async function poll(){
  if(!cur) return;
- const j=await fetch('/job/'+cur.jid).then(r=>r.json());
+ const j=await fetch('/job/'+cur.jid,{headers:{'X-GS-Token':TOK}}).then(r=>r.json());
  const pre=$('#pre');
  if(pre){const stick=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-40;
   pre.innerHTML=j.lines.map(colour).join('\n'); if(stick)pre.scrollTop=pre.scrollHeight;}
@@ -694,7 +775,7 @@ async function poll(){
   $('#dot-'+cur.id).className='dot '+(ok?'ok':'err');
   cur=null; $$('.act').forEach(b=>b.disabled=false); sync();}
 }
-$('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST'});});
+$('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST',headers:HDR,body:'{}'});});
 $('#copy').addEventListener('click',()=>{const p=$('#pre');if(p)navigator.clipboard?.writeText(p.innerText);});
 
 applyPreset('balanced'); loadFees(); sync();
@@ -707,7 +788,8 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)      # loopback ONLY
-    print(f"  GhostSpiral console → http://127.0.0.1:{a.port}")
+    print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}")
+    print( "  ^ open THIS url — the token is required, and it changes every run")
     print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'")
     print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}")
     try:
