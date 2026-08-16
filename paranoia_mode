@@ -42,23 +42,34 @@ PYCACHE_GLOBS = [
 ]
 
 
-def dns_check() -> None:
+def dns_check() -> int:
     """Verify basic network connectivity after MAC spoof.
 
     OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
     over clearnet DNS — that links the new MAC address to Tor usage in
     ISP DNS logs. Instead, resolve a benign, high-traffic domain that
     reveals nothing about the operator's intent.
+
+    It used to sys.exit(1) on failure, which ABANDONED THE ENTIRE WIPE: a MAC
+    spoof that dropped the link (the common failure) would make this check fail
+    and kill the process before shell histories, temp files, swap and the
+    GhostSpiral artifacts were ever touched -- leaving exactly the material
+    this tool exists to destroy. None of the wipe phases need the network, so
+    a failed connectivity probe is now a reported warning, not a hard stop.
     """
     try:
         res = socket.getaddrinfo("www.google.com", 443)
         if not res:
             raise RuntimeError("DNS returned empty")
         integrity_log("paranoia", "dns_check_ok")
-    except socket.gaierror as e:
+        print("  [+] Network reachable post-spoof")
+        return 0
+    except (socket.gaierror, OSError, RuntimeError) as e:
         integrity_log("paranoia", f"dns_fail:{e}")
-        print(f"  [!] DNS resolution failed post-spoof: {e}")
-        sys.exit(1)
+        print(f"  [!] DNS/connectivity failed post-spoof: {str(e)[:80]}")
+        print("  [!] The MAC spoof may have dropped the link — the WIPE CONTINUES "
+              "regardless (it needs no network).")
+        return 1
 
 
 def rand_mac() -> str:
@@ -89,15 +100,17 @@ def spoof_mac(iface: str, dry: bool):
     if dry:
         print(f"  [dry] MAC {iface} -> {new_mac}")
         integrity_log("paranoia", f"mac_dry:{iface}")     # value withheld
-        return
+        return 0
 
     lowered = False
+    spoofed = False
     try:
         subprocess.run(["ip", "link", "set", iface, "down"], check=True,
                        capture_output=True, timeout=15)
         lowered = True
         subprocess.run(["ip", "link", "set", iface, "address", new_mac],
                        check=True, capture_output=True, timeout=15)
+        spoofed = True
         print(f"  [+] MAC {iface} -> {new_mac}")
         integrity_log("paranoia", f"mac_spoof:{iface}:ok")
     except subprocess.CalledProcessError as e:
@@ -123,6 +136,9 @@ def spoof_mac(iface: str, dry: bool):
                 integrity_log("paranoia", f"mac_iface_still_down:{iface}")
                 print(f"  [!] {iface} could NOT be brought back up — "
                       f"run: ip link set {iface} up")
+    # A failed spoof is a real failure to surface in the summary -- the MAC the
+    # operation ran under is unchanged and still links this host to it.
+    return 0 if spoofed else 1
 
 
 def wipe_shell_histories(dry: bool):
@@ -161,31 +177,39 @@ def wipe_shell_histories(dry: bool):
                   else f"histories_dry:{count}")
     print(f"  [+] {'Would securely wipe' if dry else 'Securely wiped'} "
           f"{count} history file(s){tail}")
+    return failed
 
 
 def wipe_pycache(dry: bool):
     count = 0
+    failed = 0
     for pattern in PYCACHE_GLOBS:
         for d in glob.glob(pattern, recursive=True):
             if dry:
                 print(f"  [dry] would remove {d}")
+                count += 1
             else:
                 try:
                     shutil.rmtree(d)
                     count += 1
                 except (PermissionError, OSError):
-                    pass
+                    failed += 1
     # Also .pyc in home
     for pyc in Path.home().rglob("*.pyc"):
         if dry:
-            pass
+            count += 1
         else:
             try:
                 pyc.unlink()
                 count += 1
             except (PermissionError, OSError):
-                pass
-    integrity_log("paranoia", f"pycache_wiped:{count}" if not dry else f"pycache_dry")
+                failed += 1
+    tail = f" ({failed} could not be removed)" if failed else ""
+    integrity_log("paranoia",
+                  f"pycache_wiped:{count}:failed={failed}" if not dry else "pycache_dry")
+    print(f"  [+] {'Would remove' if dry else 'Removed'} {count} pycache/pyc entr"
+          f"{'y' if count == 1 else 'ies'}{tail}")
+    return failed
 
 
 def wipe_system_logs(days: int, dry: bool):
@@ -217,6 +241,7 @@ def wipe_system_logs(days: int, dry: bool):
                   else f"logs_dry:{count}")
     print(f"  [+] {'Would securely erase' if dry else 'Securely erased'} "
           f"{count} log(s){tail}")
+    return failed
 
 
 def clear_journal(dry: bool):
@@ -232,15 +257,19 @@ def clear_journal(dry: bool):
     if dry:
         print("  [dry] would run journalctl --vacuum-time=1s")
         integrity_log("paranoia", "journal_dry")
-        return
+        return 0
     try:
         subprocess.run(["journalctl", "--vacuum-time=1s"],
                        check=True, capture_output=True, timeout=30)
         integrity_log("paranoia", "journal_cleared")
         print("  [+] Journal cleared")
+        return 0
     except FileNotFoundError:
+        # journalctl absent is a clean skip (no journal exists to leak), NOT a
+        # failure -- do not inflate the summary's failure count for it.
         integrity_log("paranoia", "journal_skip:journalctl_absent")
         print("  [*] journalctl not installed; nothing to clear")
+        return 0
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or b"").decode("utf-8", errors="ignore")[:120]
         integrity_log("paranoia", f"journal_fail:{stderr[:40] or 'unknown'}")
@@ -248,16 +277,19 @@ def clear_journal(dry: bool):
         print(f"  [!] Journal NOT cleared "
               f"({'needs root' if needs_root else 'journalctl error'}): "
               f"{stderr or 'no output'}")
+        return 1
     except subprocess.TimeoutExpired:
         integrity_log("paranoia", "journal_fail:timeout")
         print("  [!] Journal clear timed out after 30s -- journal may be partially wiped")
+        return 1
 
 
 def flush_dns_cache(dry: bool):
     """Flush DNS resolver cache."""
     if dry:
         print("  [dry] would flush DNS cache")
-        return
+        return 0
+    saw_resolver = False
     for cmd in [
         ["resolvectl", "flush-caches"],
         ["systemd-resolve", "--flush-caches"],
@@ -266,10 +298,24 @@ def flush_dns_cache(dry: bool):
             subprocess.run(cmd, check=True, capture_output=True, timeout=10)
             integrity_log("paranoia", "dns_cache_flushed")
             print("  [+] DNS cache flushed")
-            return
-        except (FileNotFoundError, subprocess.CalledProcessError):
+            return 0
+        except FileNotFoundError:
+            continue                       # this resolver tool is not installed
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # The tool IS present but the flush failed -- a resolver cache may
+            # still hold the .onion / swap-host lookups from the run.
+            saw_resolver = True
             continue
+    if saw_resolver:
+        integrity_log("paranoia", "dns_cache_flush_failed")
+        print("  [!] DNS cache flush FAILED (resolver present but errored) — "
+              "cached lookups may persist.")
+        return 1
+    # No systemd resolver at all: nothing this tool can flush. Not a failure,
+    # but say so rather than silently claiming the cache is clean.
     integrity_log("paranoia", "dns_cache_skip:no_resolver")
+    print("  [*] No systemd resolver found; DNS cache not flushed by this tool.")
+    return 0
 
 
 def wipe_swap_ram(dry: bool):
@@ -281,7 +327,7 @@ def wipe_swap_ram(dry: bool):
     if dry:
         print("  [dry] would deactivate swap (root) + pressure tmpfs; will NOT zero the swap device")
         integrity_log("paranoia", "ram_dry")
-        return
+        return 0
 
     is_root = (os.getuid() == 0)
     swap_done = False
@@ -312,13 +358,18 @@ def wipe_swap_ram(dry: bool):
         integrity_log("paranoia", "ram_partial:no_root")
         print("  [!] Swap NOT wiped — needs root (swapoff). Only a tmpfs scratch "
               f"write {'ran' if shm_done else 'failed'}; freed RAM pages are untouched.")
+        # No root is an EXPECTED limitation, honestly reported and surfaced in
+        # the summary's caveats -- not counted as a hard failure.
+        return 0
     elif swap_done:
         integrity_log("paranoia", "swap_deactivated")
         print(f"  [+] Swap deactivated (slots freed); tmpfs scratch {'ok' if shm_done else 'failed'}. "
               "NOTE: swap device bytes and freed RAM are NOT zeroed.")
+        return 0
     else:
         integrity_log("paranoia", "swap_wipe_failed")
         print("  [!] Swap wipe FAILED (swapoff error) — do not assume swap is clean.")
+        return 1
 
 
 def _secure_delete_file(path: Path) -> bool:
@@ -450,6 +501,7 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     # runs this phase last and logs nothing afterward; this keeps that promise.
     if dry:
         integrity_log("paranoia", f"gs_artifacts:dry:{count}")
+    return failed
 
 
 def wipe_tmp_files(dry: bool):
@@ -496,11 +548,20 @@ def wipe_tmp_files(dry: bool):
           f"{count} temp entr{'y' if count == 1 else 'ies'}{tail}")
     integrity_log("paranoia", f"tmp_wiped:{count}:failed={failed}"
                   if not dry else f"tmp_dry:{count}")
+    return failed
 
 
 def wipe_clipboard(dry: bool):
-    """Clear clipboard contents from all common clipboard managers."""
+    """Clear clipboard contents from all common clipboard managers.
+
+    The clipboard is a real forensic target here: an operator copies an XMR
+    address or a swap memo through it. The old version counted only the tools
+    that ran and swallowed the case where a clipboard tool was PRESENT but
+    errored, so a genuine failure to clear reported nothing. Distinguish a
+    tool that is not installed (a clean skip -- that clipboard backend is not
+    in use) from a tool that ran and failed (a real, surfaced failure)."""
     count = 0
+    tool_errored = 0
     for cmd in [
         ["xclip", "-selection", "clipboard", "-i", "/dev/null"],
         ["xclip", "-selection", "primary", "-i", "/dev/null"],
@@ -515,9 +576,20 @@ def wipe_clipboard(dry: bool):
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=5)
             count += 1
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-    integrity_log("paranoia", f"clipboard:{'dry' if dry else 'wiped'}:{count}")
+        except FileNotFoundError:
+            continue                        # backend not installed -- not in use
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            tool_errored += 1
+    integrity_log("paranoia",
+                  f"clipboard:{'dry' if dry else 'wiped'}:{count}:errored={tool_errored}")
+    if not dry:
+        if tool_errored:
+            print(f"  [!] Clipboard: {count} selection(s) cleared, {tool_errored} tool(s) "
+                  f"errored — clipboard contents may persist.")
+        else:
+            print(f"  [+] Clipboard cleared ({count} selection(s))"
+                  if count else "  [*] No clipboard tool found; nothing to clear.")
+    return 1 if tool_errored else 0
 
 
 def wipe_xdg_traces(dry: bool):
@@ -570,6 +642,7 @@ def wipe_xdg_traces(dry: bool):
     integrity_log("paranoia",
                   f"xdg_traces:{'dry' if dry else 'wiped'}:{count}:failed={failed}")
     print(f"  [+] {'Would wipe' if dry else 'Wiped'} {count} XDG trace(s){tail}")
+    return failed
 
 
 def scrub_env_vars(dry: bool):
@@ -592,6 +665,10 @@ def scrub_env_vars(dry: bool):
                 del os.environ[key]
             count += 1
     integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
+    print(f"  [+] {'Would unset' if dry else 'Unset'} {count} sensitive env var(s) "
+          f"in this process")
+    # del os.environ[...] cannot fail here, so this phase has no failure mode.
+    return 0
 
 
 def main():
@@ -615,53 +692,76 @@ def main():
     require_resources(min_disk_gb=1.0)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
 
-    print("  [*] Phase 1: MAC spoof")
-    spoof_mac(args.iface, args.dry_run)
+    # Each phase returns its FAILURE COUNT (0 = clean). They are collected so
+    # the final line can tell the truth: the old code printed
+    # "paranoia_mode complete." unconditionally, so an operator whose MAC spoof
+    # failed, whose swap was never wiped and whose artifacts were permission-
+    # denied still read "complete" and believed the host was clean. A wipe tool
+    # that reports success it did not achieve is worse than none.
+    #
+    # A phase raising unexpectedly must not abandon the phases after it (the
+    # artifact wipe is LAST and most important), so each is guarded and a crash
+    # counts as that phase failing.
+    failures: dict[str, int] = {}
+
+    def run_phase(n, name, fn, *a):
+        print(f"  [*] Phase {n}: {name}")
+        try:
+            failures[name] = int(fn(*a) or 0)
+        except SystemExit:
+            raise
+        except Exception as e:                      # noqa: BLE001
+            # Cannot integrity_log for the artifact phase safely, but every
+            # other phase is fine; keep it simple and just record + report.
+            print(f"  [!] Phase {n} ({name}) errored: {str(e)[:80]}")
+            failures[name] = 1
+
+    run_phase(1, "MAC spoof", spoof_mac, args.iface, args.dry_run)
 
     print("  [*] Phase 2: DNS check")
     if args.dry_run:
         print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
+        failures["DNS check"] = 0
     else:
-        dns_check()
+        failures["DNS check"] = dns_check()
 
-    print("  [*] Phase 3: DNS cache flush")
-    flush_dns_cache(args.dry_run)
+    run_phase(3, "DNS cache flush", flush_dns_cache, args.dry_run)
+    run_phase(4, "Shell histories", wipe_shell_histories, args.dry_run)
+    run_phase(5, "Python cache", wipe_pycache, args.dry_run)
+    run_phase(6, "Temp files", wipe_tmp_files, args.dry_run)
+    run_phase(7, "System logs", wipe_system_logs, args.wipe_days, args.dry_run)
+    run_phase(8, "Journal", clear_journal, args.dry_run)
+    run_phase(9, "Swap/RAM", wipe_swap_ram, args.dry_run)
+    run_phase(10, "Clipboard", wipe_clipboard, args.dry_run)
+    run_phase(11, "XDG traces (recently-used, thumbnails, Trash, bookmarks)",
+              wipe_xdg_traces, args.dry_run)
+    run_phase(12, "Environment variables", scrub_env_vars, args.dry_run)
 
-    print("  [*] Phase 4: Shell histories")
-    wipe_shell_histories(args.dry_run)
+    # Artifacts MUST run LAST because it wipes integrity_chain.log. Any
+    # integrity_log() call after this point would RECREATE the file, leaving
+    # forensic evidence -- so the honest summary below prints only to the
+    # terminal and never logs.
+    run_phase(13, "GhostSpiral artifacts (runs last — wipes integrity log)",
+              wipe_gs_artifacts, args.dry_run, args.search_dir)
 
-    print("  [*] Phase 5: Python cache")
-    wipe_pycache(args.dry_run)
-
-    print("  [*] Phase 6: Temp files")
-    wipe_tmp_files(args.dry_run)
-
-    print("  [*] Phase 7: System logs")
-    wipe_system_logs(args.wipe_days, args.dry_run)
-
-    print("  [*] Phase 8: Journal")
-    clear_journal(args.dry_run)
-
-    print("  [*] Phase 9: Swap/RAM")
-    wipe_swap_ram(args.dry_run)
-
-    print("  [*] Phase 11: Clipboard")
-    wipe_clipboard(args.dry_run)
-
-    print("  [*] Phase 12: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
-    wipe_xdg_traces(args.dry_run)
-
-    print("  [*] Phase 13: Environment variables")
-    scrub_env_vars(args.dry_run)
-
-    # Phase 14 (GhostSpiral artifacts) MUST run LAST because it wipes
-    # integrity_chain.log. Any integrity_log() calls after this point
-    # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 14: GhostSpiral artifacts (runs last — wipes integrity log)")
-    wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
-
-    # DO NOT call integrity_log() here — it would recreate the wiped log file
-    print("\n  [+] paranoia_mode complete.")
+    # ── honest summary. NO integrity_log() past this point. ────────────────
+    bad = {k: v for k, v in failures.items() if v}
+    total = sum(bad.values())
+    print()
+    if args.dry_run:
+        print("  [+] paranoia_mode DRY RUN complete — nothing was changed. "
+              "Re-run without --dry-run to act.")
+    elif not bad:
+        print("  [+] paranoia_mode complete — every phase reported success.")
+        print("  [i] Best-effort caveats still apply: swap-device bytes and freed")
+        print("      RAM are not zeroed, and CoW/SSD filesystems can retain blocks.")
+    else:
+        print(f"  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT known clean.")
+        for name, n in bad.items():
+            print(f"      - {name}: {n} failure(s)")
+        print(f"  [!] {total} item(s)/phase(s) did not complete. Many phases need root")
+        print(f"      (sudo) — re-run failed steps and verify before assuming clean.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

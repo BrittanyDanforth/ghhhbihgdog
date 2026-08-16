@@ -247,10 +247,136 @@ def test_amounts_never_reach_the_integrity_chain():
     check("the off-ramp method IS recorded", any("bisq" in m for m in logged))
 
 
+# ==========================================================================
+# paranoia_mode: the final summary must reflect what actually happened.
+# The old code printed "paranoia_mode complete." unconditionally, so a wipe
+# where phases failed still read as success.
+# ==========================================================================
+def _run_paranoia_main(phase_returns, dry=False):
+    """Drive the REAL main() with each phase stubbed to a chosen return value.
+    Returns (exit_code, stdout)."""
+    import io
+    p = load("paranoia_mode")
+    p.require_resources = lambda **k: None
+    p.integrity_log = lambda *a, **k: None
+    p.install_signal_handlers = lambda: None
+    stubs = {
+        "spoof_mac": lambda iface, d: phase_returns.get("MAC spoof", 0),
+        "dns_check": lambda: phase_returns.get("DNS check", 0),
+        "flush_dns_cache": lambda d: phase_returns.get("DNS cache flush", 0),
+        "wipe_shell_histories": lambda d: phase_returns.get("Shell histories", 0),
+        "wipe_pycache": lambda d: phase_returns.get("Python cache", 0),
+        "wipe_tmp_files": lambda d: phase_returns.get("Temp files", 0),
+        "wipe_system_logs": lambda days, d: phase_returns.get("System logs", 0),
+        "clear_journal": lambda d: phase_returns.get("Journal", 0),
+        "wipe_swap_ram": lambda d: phase_returns.get("Swap/RAM", 0),
+        "wipe_clipboard": lambda d: phase_returns.get("Clipboard", 0),
+        "wipe_xdg_traces": lambda d: phase_returns.get("XDG", 0),
+        "scrub_env_vars": lambda d: phase_returns.get("Env", 0),
+        "wipe_gs_artifacts": lambda d, extra_dirs=None: phase_returns.get("Artifacts", 0),
+    }
+    for name, fn in stubs.items():
+        setattr(p, name, fn)
+    argv = ["paranoia_mode"] + (["--dry-run"] if dry else [])
+    old_argv = sys.argv
+    sys.argv = argv
+    buf = io.StringIO(); real = sys.stdout; sys.stdout = buf
+    code = 0
+    try:
+        p.main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    finally:
+        sys.stdout = real
+        sys.argv = old_argv
+    return code, buf.getvalue()
+
+
+def test_clean_wipe_reports_success_and_exits_zero():
+    code, out = _run_paranoia_main({})
+    check("a fully-clean wipe exits 0", code == 0)
+    check("a fully-clean wipe says every phase succeeded",
+          "every phase reported success" in out)
+    check("a clean wipe still states the best-effort caveats",
+          "not zeroed" in out)
+
+
+def test_any_failure_makes_the_summary_honest_and_exit_nonzero():
+    code, out = _run_paranoia_main({"MAC spoof": 1, "Shell histories": 2})
+    check("a wipe with failures exits nonzero", code != 0)
+    check("a wipe with failures does NOT claim completion",
+          "complete — every phase" not in out)
+    check("the summary says the host is not known clean",
+          "NOT known clean" in out)
+    check("the failing phases are named with counts",
+          "MAC spoof: 1" in out and "Shell histories: 2" in out)
+    check("a succeeding phase is NOT listed as failed",
+          "Journal:" not in out.split("FINISHED WITH FAILURES")[-1])
+
+
+def test_dry_run_never_claims_a_wipe_happened():
+    code, out = _run_paranoia_main({}, dry=True)
+    check("a dry run exits 0", code == 0)
+    check("a dry run says nothing was changed", "nothing was changed" in out)
+    check("a dry run does not claim phases succeeded",
+          "every phase reported success" not in out)
+
+
+def test_every_phase_returns_a_failure_count():
+    """Regression guard: a phase that returns None silently drops its failures
+    from the summary. Confirm each shipped phase returns an int on the dry path
+    (dry has no real failures, so all must be 0)."""
+    p = load("paranoia_mode")
+    p.integrity_log = lambda *a, **k: None
+    import io
+    real = sys.stdout; sys.stdout = io.StringIO()
+    try:
+        results = {
+            "spoof_mac": p.spoof_mac("nonexistent-iface-zzz", True),
+            "dns_check_dry": 0,  # dns_check has no dry path; skipped in main on dry
+            "flush_dns_cache": p.flush_dns_cache(True),
+            "wipe_shell_histories": p.wipe_shell_histories(True),
+            "wipe_pycache": p.wipe_pycache(True),
+            "wipe_system_logs": p.wipe_system_logs(7, True),
+            "clear_journal": p.clear_journal(True),
+            "wipe_swap_ram": p.wipe_swap_ram(True),
+            "wipe_clipboard": p.wipe_clipboard(True),
+            "scrub_env_vars": p.scrub_env_vars(True),
+        }
+    finally:
+        sys.stdout = real
+    for name, r in results.items():
+        check(f"{name} returns an int failure count (dry)", isinstance(r, int))
+
+
+def test_dns_check_failure_does_not_abort_the_wipe():
+    """dns_check used to sys.exit(1), abandoning every wipe phase after it.
+    The real function must now RETURN a status, not exit."""
+    p = load("paranoia_mode")
+    p.integrity_log = lambda *a, **k: None
+    import io, socket
+    orig = socket.getaddrinfo
+    socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(socket.gaierror("no dns"))
+    real = sys.stdout; sys.stdout = io.StringIO()
+    exited = False
+    try:
+        rc = p.dns_check()
+    except SystemExit:
+        exited = True; rc = None
+    finally:
+        sys.stdout = real
+        socket.getaddrinfo = orig
+    check("dns_check does NOT sys.exit on failure", not exited)
+    check("dns_check reports failure as a return code", rc == 1)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):
-        fn()
+        try:
+            fn()
+        except Exception as e:
+            check(f"{fn.__name__} raised {type(e).__name__}: {str(e)[:60]}", False)
     print(f"\n  gapfixes: {PASS} passed, {FAIL} failed")
     if FAILURES:
         for f in FAILURES:
