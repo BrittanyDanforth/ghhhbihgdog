@@ -314,27 +314,40 @@ check("broadcast: aborts when the daemon is offline (broadcast would vanish)",
 # ---------------------------------------------------------------------------
 import ast
 
+# Names that denote a linkable VALUE (amount / address / key / etc.). This list
+# had blind spots -- it caught "amount" but not "per_chunk" (a BTC amount) or
+# "unlocked_bal" (the swapped XMR amount), both of which were leaking to the
+# persistent integrity log until this scan was widened. Amount-ish fragments
+# now included: bal, chunk, gross, net_xmr, fiat, sats, value, and the btc/xmr
+# magnitude prefixes.
 _SECRET_NAMES = ("amt", "amount", "addr", "address", "dest", "deposit", "memo",
                  "txid", "tx_hash", "privkey", "priv", "seed", "mnemonic",
-                 "viewkey", "spendkey", "password", "secret", "balance", "mac")
+                 "viewkey", "spendkey", "password", "secret", "balance", "mac",
+                 "bal", "chunk", "gross", "fiat", "sats", "value",
+                 "btc", "xmr", "picochunk")
 _SHIPPED = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
             "gs_common.py", "thor_swap_preparer", "create_receive_wallet",
             "exit_strategy_simulator", "paranoia_mode"]
 
 
-# Functions that mask their argument, so a secret passed THROUGH them is safe
-# on the log (scrub_address -> first/last few chars; _m -> magnitude masked).
+# Functions whose RESULT is safe to log even when a secret-named value is
+# passed in: maskers (scrub_address -> first/last chars; _m -> magnitude
+# masked) and COUNT wrappers (len/count -> a cardinality, not the value). A
+# count of amounts is not an amount, so {len(btc_chunks)} must not flag.
 _MASKERS = ("scrub_address", "scrub", "mask", "redact", "_m")
+_COUNT_WRAPPERS = ("len", "count")
 
 
 def _is_masked_call(node):
-    """True if node is a call to a known masking function, e.g.
-    scrub_address(addr). Everything inside it is considered safe."""
+    """True if node is a call to a masking or count-wrapper function, e.g.
+    scrub_address(addr) or len(chunks). Everything inside it is safe."""
     if not isinstance(node, ast.Call):
         return False
     fn = node.func
     name = fn.id if isinstance(fn, ast.Name) else (fn.attr if isinstance(fn, ast.Attribute) else "")
     n = (name or "").lower()
+    if n in _COUNT_WRAPPERS:
+        return True
     return any(m == n or n.endswith("_" + m) or m in n for m in _MASKERS)
 
 
@@ -383,15 +396,28 @@ if _total_leaks:
     for _l in _total_leaks:
         print("   LEAK:", _l)
 
-# Positive control: the scanner actually detects a planted leak, so a green
-# result means "scanned and clean", not "scanner is a no-op".
-_planted = ast.parse('integrity_log("x", f"amt_each={fanout_amt}")')
-check("the leak scanner detects a planted amount interpolation",
-      any("fanout_amt" in n for _, n in
-          [(c.lineno, nm) for c in ast.walk(_planted)
-           if isinstance(c, ast.Call) for nm in
-           (_fstring_leaks(c.args[1]) if len(c.args) > 1
-            and isinstance(c.args[1], ast.JoinedStr) else [])]))
+# Positive control: the scanner actually detects planted leaks, so a green
+# result means "scanned and clean", not "scanner is a no-op". Includes the two
+# real patterns the OLD scanner missed by name (per_chunk, unlocked_bal).
+def _planted_flags(src):
+    t = ast.parse(src)
+    out = []
+    for c in ast.walk(t):
+        if isinstance(c, ast.Call) and len(c.args) > 1 and isinstance(c.args[1], ast.JoinedStr):
+            out += _fstring_leaks(c.args[1])
+    return out
+
+
+check("scanner detects a planted {fanout_amt} interpolation",
+      "fanout_amt" in _planted_flags('integrity_log("x", f"a={fanout_amt}")'))
+check("scanner detects a planted {per_chunk} BTC-amount interpolation",
+      "per_chunk" in _planted_flags('integrity_log("x", f"btc={per_chunk}")'))
+check("scanner detects a planted {unlocked_bal} XMR-amount interpolation",
+      "unlocked_bal" in _planted_flags('integrity_log("x", f"u={unlocked_bal}")'))
+check("scanner does NOT flag a count wrapper len(btc_chunks)",
+      _planted_flags('integrity_log("x", f"n={len(btc_chunks)}")') == [])
+check("scanner does NOT flag a scrubbed address",
+      _planted_flags('integrity_log("x", f"a={scrub_address(addr)}")') == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

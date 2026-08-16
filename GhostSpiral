@@ -146,7 +146,9 @@ def _reject_implausible_fee(fee_xmr: Decimal, daemon_url, source: str) -> None:
     not have papered over."""
     if fee_xmr <= FEE_IMPLAUSIBLE_XMR:
         return
-    integrity_log("fee", f"IMPLAUSIBLE_daemon_fee:{source}:{fee_xmr}")
+    # Record only WHICH path saw it, not the number: keep amounts off the
+    # persistent chain uniformly. The operator sees the value in the abort below.
+    integrity_log("fee", f"IMPLAUSIBLE_daemon_fee:{source}")
     sys.exit(
         f"[!] The daemon reports an impossible fee of {fee_xmr} XMR PER TRANSACTION\n"
         f"    ({source}). A real Monero fee is a small fraction of an XMR even at the\n"
@@ -780,7 +782,11 @@ def main():
             remainder = args.btc_amount - (per_chunk * num_splits)
             if remainder > 0:
                 btc_chunks[0] += remainder
-            integrity_log("stage2", f"btc_split:{num_splits}_chunks:{per_chunk}_each")
+            # COUNT only, never the per-chunk BTC amount: the integrity log
+            # persists, and the exact BTC-per-swap correlates directly with the
+            # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
+            # the fan-out/hop amounts stay off the chain.
+            integrity_log("stage2", f"btc_split:{num_splits}_chunks")
             print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
 
         if btc_chunks:
@@ -874,7 +880,10 @@ def main():
             total_bal, unlocked_bal = xmr_balance()
             if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
                 print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
-        integrity_log("stage4", f"xmr_arrival_done:unlocked={unlocked_bal}")
+        # NOT the balance: unlocked_bal is the exact XMR that arrived from the
+        # swap, the most linkable amount on the receive side. Log only that
+        # arrival completed.
+        integrity_log("stage4", "xmr_arrival_done")
 
     integrity_log("stage4", "balance_fetched")
 
