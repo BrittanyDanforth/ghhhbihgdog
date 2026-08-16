@@ -100,8 +100,9 @@ def test_no_fabricated_fees():
     c2 = load_console()
 
     class Boom:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
         @staticmethod
-        def daemon_fee_estimate(url):
+        def daemon_fee_estimate(url, proxies=None):
             raise RuntimeError("daemon exploded")
     c2._GS_MOD = Boom
     res2 = c2.live_fees("http://127.0.0.1:18081")
@@ -109,8 +110,9 @@ def test_no_fabricated_fees():
     check("a raising daemon lookup is not marked ok", res2["ok"] is False)
 
     class Empty:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
         @staticmethod
-        def daemon_fee_estimate(url):
+        def daemon_fee_estimate(url, proxies=None):
             return {}
     c2._GS_MOD = Empty
     check("an empty estimate yields NO numbers",
@@ -122,8 +124,10 @@ def test_real_fee_estimate_is_used_and_flagged():
     calls = []
 
     class FakeGs:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
         @staticmethod
-        def daemon_fee_estimate(url):
+        def daemon_fee_estimate(url, proxies=None):
             calls.append(url)
             return {"fees": [20000, 80000, 400000, 3320000]}   # piconero/byte
     c._GS_MOD = FakeGs
@@ -133,8 +137,9 @@ def test_real_fee_estimate_is_used_and_flagged():
     check("a plausible fee is not flagged", res["implausible"] is False)
 
     class HugeGs:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
         @staticmethod
-        def daemon_fee_estimate(url):
+        def daemon_fee_estimate(url, proxies=None):
             return {"fees": [2 * 10 ** 9]}     # a fresh offline chain's absurd fee
     c._GS_MOD = HugeGs
     res2 = c.live_fees("http://127.0.0.1:18081")
@@ -142,12 +147,52 @@ def test_real_fee_estimate_is_used_and_flagged():
     check("the implausible warning explains it", "fresh or offline" in res2["warning"])
 
     class ZeroGs:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
         @staticmethod
-        def daemon_fee_estimate(url):
+        def daemon_fee_estimate(url, proxies=None):
             return {"fees": [0]}
     c._GS_MOD = ZeroGs
     check("a zero fee is flagged implausible",
           c.live_fees("http://127.0.0.1:18081")["implausible"] is True)
+
+
+def test_remote_daemon_fee_query_routes_through_tor():
+    """A remote daemon must be queried through the Tor proxy (like the two
+    preflights), and a loopback daemon queried directly. Before this the proxy
+    was never threaded into live_fees, so a remote daemon behind Tor silently
+    returned 'no estimate' — the half-done edge of the fee-estimate fix."""
+    c = load_console()
+    seen = {}
+
+    class FakeGs:
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+        @staticmethod
+        def validate_proxy(p):
+            seen["validated"] = p
+            return {"http": p, "https": p}
+
+        @staticmethod
+        def daemon_fee_estimate(url, proxies=None):
+            seen.setdefault("proxies", []).append(proxies)
+            return {}
+    c._GS_MOD = FakeGs
+
+    c.live_fees("http://198.51.100.9:18081", "socks5h://127.0.0.1:9050")
+    check("a remote daemon fee query validates the proxy", seen.get("validated"))
+    check("a remote daemon fee query routes through the proxy",
+          seen["proxies"][-1] == {"http": "socks5h://127.0.0.1:9050",
+                                  "https": "socks5h://127.0.0.1:9050"})
+
+    seen.clear()
+    c.live_fees("http://127.0.0.1:18081", "socks5h://127.0.0.1:9050")
+    check("a loopback daemon fee query stays direct (no proxy)",
+          seen["proxies"][-1] is None)
+
+    seen.clear()
+    c.live_fees("http://198.51.100.9:18081", "")   # remote, no proxy configured
+    check("a remote daemon with no proxy is not queried directly",
+          seen.get("proxies", [None])[-1] is None)
 
 
 def test_gs_common_is_loaded_once():

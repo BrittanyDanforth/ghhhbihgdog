@@ -433,7 +433,7 @@ def _gs_common():
     return _GS_MOD
 
 
-def live_fees(daemon_url):
+def live_fees(daemon_url, tor_proxy=""):
     """Real per-priority fees from the operator's own daemon, or none at all.
 
     THERE IS NO FALLBACK TABLE. This used to answer an unreachable daemon with
@@ -449,10 +449,21 @@ def live_fees(daemon_url):
     hard-coded 0.003 that the slippage check then compared real quotes
     against. A fee estimate is a number about the operator's own money; if the
     daemon cannot supply it, the honest answer is that there is no estimate.
+
+    A REMOTE daemon is queried through the Tor proxy, exactly like the two
+    preflight checks: without it, gs.daemon_fee_estimate refuses a non-loopback
+    daemon (it will not open a clearnet connection to it) and returns nothing,
+    so an operator with a remote daemon behind Tor silently saw "no estimate".
+    A loopback daemon is queried directly (Tor cannot route to loopback).
     """
     try:
         gs = _gs_common()
-        est = gs.daemon_fee_estimate(daemon_url)
+        from urllib.parse import urlparse as _up
+        host = (_up(daemon_url).hostname or "").lower()
+        proxies = None
+        if host not in gs._LOCALHOST_NAMES and tor_proxy:
+            proxies = gs.validate_proxy(tor_proxy)
+        est = gs.daemon_fee_estimate(daemon_url, proxies)
         fees = est.get("fees")
         if isinstance(fees, list) and fees:
             return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
@@ -579,7 +590,8 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/fees":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
-                live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"))))
+                live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"),
+                          c["params"].get("tor_proxy", ""))))
         if self.path.startswith("/run/"):
             aid = self.path[5:]
             act = ACTIONS.get(aid)
