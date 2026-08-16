@@ -54,6 +54,7 @@ ACTIONS = {
     "phasecreate": {**suite("real_phase_create_testnet", "SHIPPED phase_create -> phase_sign chain", VENV_PY), "group": "Real binaries"},
     "realbcast":   {**suite("real_broadcast_testnet", "SHIPPED broadcast main() relayed + confirmed"), "group": "Real binaries"},
     "realsend":    {**suite("real_send_testnet", "SHIPPED jittered fan-out send: exact unequal amounts land"), "group": "Real binaries"},
+    "realpeel":    {**suite("real_peel_testnet", "SHIPPED peeling chain: N dests via N separate txs"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --

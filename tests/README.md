@@ -49,6 +49,9 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
                                           #   1->N fan-out with UNEQUAL amounts and
                                           #   confirms each subaddress got its exact
                                           #   planned amount on-chain
+python3 tests/real_peel_testnet.py       # SHIPPED peeling chain: N destinations via N
+                                          #   SEPARATE confirmation-gated txs (not one
+                                          #   fan-out), change carrying between peels
 ```
 
 `real_phase_create_testnet.py` needs the `monero` package (the others do not).

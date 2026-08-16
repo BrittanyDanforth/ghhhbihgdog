@@ -195,6 +195,25 @@ def test_remote_daemon_fee_query_routes_through_tor():
           seen.get("proxies", [None])[-1] is None)
 
 
+def test_peel_flag_wires_through_to_argv():
+    """The peeling-chain toggle must reach GhostSpiral's argv, and the peel
+    preset must set it while other presets leave it off."""
+    c = load_console()
+    argv, _ = c.pipeline_argv({"mode": "send", "btc_entry": "bc1qxyz", "btc_amount": "0.05",
+                               "tor_proxy": "socks5h://127.0.0.1:9050", "peel": True})
+    check("peel=True adds --peel to the pipeline argv", "--peel" in argv)
+    argv2, _ = c.pipeline_argv({"mode": "send", "btc_entry": "bc1qxyz", "btc_amount": "0.05",
+                                "tor_proxy": "socks5h://127.0.0.1:9050"})
+    check("no peel flag -> no --peel", "--peel" not in argv2)
+
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("the page has a peel checkbox", 'id="peel"' in src)
+    check("collect() reads the peel checkbox", "peel:c('peel')" in src)
+    check("there is a Peeling chain preset", 'data-p="peel"' in src and "peel:true" in src)
+    check("switching presets clears peel unless the preset sets it",
+          "$('#peel').checked=!!c.peel" in src)
+
+
 def test_gs_common_is_loaded_once():
     """live_fees used to re-exec gs_common and grow sys.path on every poll."""
     c = load_console()

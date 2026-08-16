@@ -223,6 +223,31 @@ check("decoy: NUM_DECOYS constant is positive (feature is on)",
       ghost.NUM_DECOYS > 0)
 
 # ---------------------------------------------------------------------------
+# GhostSpiral.build_peel_plan: N single-dest peels, carrier = ENTRY then subaddr 0
+# ---------------------------------------------------------------------------
+_pdests = ["Ma", "Mb", "Mc", "Md"]
+_pamts = [Decimal("1.1"), Decimal("0.7"), Decimal("2.3"), Decimal("0.4")]
+_peel = ghost.build_peel_plan(entry_index=9, change_index=0, dests=_pdests, amounts=_pamts)
+check("peel: one peel per destination", len(_peel) == 4)
+check("peel: peel 0 spends ENTRY (entry_index)", _peel[0]["src_index"] == 9)
+check("peel: peels 1..N spend the change address (subaddr 0)",
+      all(p["src_index"] == 0 for p in _peel[1:]))
+check("peel: each peel targets ONE destination in order",
+      [p["dst"] for p in _peel] == _pdests)
+check("peel: each peel carries its own (unequal) amount",
+      [p["amt"] for p in _peel] == [str(a) for a in _pamts])
+check("peel: peel_num is sequential 0..N-1",
+      [p["peel_num"] for p in _peel] == [0, 1, 2, 3])
+check("peel: no destination is co-spent (each peel is single-dest, no 'destinations')",
+      all("destinations" not in p for p in _peel))
+check("peel: empty dests -> empty plan", ghost.build_peel_plan(9, 0, [], []) == [])
+check("peel: a receive-mode ENTRY that IS subaddr 0 still peels cleanly",
+      ghost.build_peel_plan(0, 0, ["X"], [Decimal("1")])[0]["src_index"] == 0)
+# Ragged inputs never index out of range: zips to the shorter.
+check("peel: mismatched dests/amounts zips to the shorter length",
+      len(ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")])) == 1)
+
+# ---------------------------------------------------------------------------
 # gs_common daemon_fee_estimate: refuse non-localhost without proxy (no net)
 # ---------------------------------------------------------------------------
 check("daemon_fee_estimate: non-localhost + no proxy -> {}",

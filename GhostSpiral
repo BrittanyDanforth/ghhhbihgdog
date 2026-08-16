@@ -289,6 +289,42 @@ def select_fanout_targets(mix_targets: list, decoy_addrs: set,
     return fanout_dests, hop_sources
 
 
+def build_peel_plan(entry_index: int, change_index: int,
+                    dests: list, amounts: list) -> list:
+    """A PEELING CHAIN: N single-destination transactions instead of one
+    N-output fan-out.
+
+    The fan-out's unavoidable weakness is that its N outputs are created in ONE
+    transaction, so an analyst who spots that transaction sees the whole output
+    set co-created and can follow it as a group. A peeling chain removes that:
+    it sends to ONE mix subaddress per transaction and lets the remainder carry
+    to the next, so the N mix outputs appear in N SEPARATE transactions spread
+    over time, never co-created.
+
+    Peel 0 spends ENTRY. Every later peel spends the change address -- verified
+    against real monerod 0.18: spending from subaddr i returns the change to the
+    account's subaddress 0, so subaddress `change_index` (0) is the carrier for
+    peels 1..N-1. Because each peel spends the previous peel's change, the peels
+    are necessarily SEQUENTIAL and CONFIRMATION-GATED (the change is unspendable
+    until it confirms ~10 blocks later) -- which is exactly what spreads them
+    over time. The caller runs each peel as its own gated round.
+
+    Pure and deterministic (amounts are decided upstream by
+    compute_fanout_amounts); returns core entries the caller decorates with the
+    src address, a per-peel delay and tx 'extra'. Returns [] for no dests.
+    """
+    n = min(len(dests), len(amounts))
+    plan = []
+    for i in range(n):
+        plan.append({
+            "src_index": entry_index if i == 0 else change_index,
+            "dst": dests[i],
+            "amt": str(amounts[i]),
+            "peel_num": i,
+        })
+    return plan
+
+
 def parse_swap_route(route: dict) -> tuple:
     """Extract (deposit_addr, memo, expected_output_str) from ONE SwapKit route.
 
@@ -384,6 +420,16 @@ def main():
                           "Off by default: the default run does the fan-out "
                           "distribution only (fast, and still spreads funds "
                           "across fresh subaddresses).")
+    cli.add_argument("--peel", action="store_true",
+                     help="PEELING CHAIN instead of a single fan-out: distribute "
+                          "to the mix subaddresses ONE PER TRANSACTION, each "
+                          "spending the previous transaction's change, so the "
+                          "outputs are created in N separate transactions spread "
+                          "over time rather than co-created in one fan-out tx an "
+                          "analyst can cluster. MUCH SLOWER: every peel is "
+                          "confirmation-gated (~10 blocks each), so N peels take "
+                          "roughly N * 20 min. Strongest unlinkability; use for "
+                          "high-value sends where time is not a constraint.")
     cli.add_argument("--wallet-file", default="offline.wallet",
                      help="Path to Monero wallet file for auto-mode signing")
     cli.add_argument("--wallet-password", default="",
@@ -975,21 +1021,52 @@ def main():
     # (the change output from TX0 is unconfirmed and unspendable in the batch).
     # Per-destination amount, so each mix subaddress receives its OWN magnitude.
     fanout_by_addr = dict(zip(fanout_dests, fanout_amounts))
-    fanout_plan = [{
-        "src": ENTRY,
-        "src_index": _src_index(ENTRY),
-        "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
-        "delay": _secrets.randbelow(540) + 180,
-        "extra": secure_hex(16),
-    }]
-    # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
-    # amount. integrity_chain.log persists on disk, and the exact fan-out amount
-    # is the single most linkable quantity in the whole pipeline: recovered from
-    # the log it correlates directly against the on-chain outputs and unmixes
-    # what the fan-out exists to mix. exit_strategy_simulator was already cleaned
-    # of this exact pattern; the amount stays in the plan file (0600), off the
-    # persistent hash chain.
-    integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
+
+    distribution_mode = "peel" if args.peel else "fanout"
+    if args.peel:
+        # PEELING CHAIN: one transaction per destination, each spending the
+        # previous peel's change (which Monero returns to the account's
+        # subaddress 0), so the N mix outputs appear in N separate transactions
+        # over time instead of co-created in one fan-out an analyst can cluster.
+        try:
+            _ca = rpc_primary.raw_request(
+                "get_address", {"account_index": bal_account, "address_index": [0]})
+            change_addr = ((_ca or {}).get("addresses") or [{}])[0].get("address") or ENTRY
+        except Exception:
+            change_addr = ENTRY
+        _peel_core = build_peel_plan(
+            entry_index=_src_index(ENTRY), change_index=0,
+            dests=fanout_dests, amounts=[fanout_by_addr[a] for a in fanout_dests])
+        fanout_plan = []
+        for _p in _peel_core:
+            fanout_plan.append({
+                "src": ENTRY if _p["peel_num"] == 0 else change_addr,
+                "src_index": _p["src_index"],
+                "dst": _p["dst"],
+                "amt": _p["amt"],
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+                "peel_num": _p["peel_num"],
+            })
+        integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
+        print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
+              f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
+              f"transaction — no co-created fan-out for an analyst to cluster.")
+    else:
+        fanout_plan = [{
+            "src": ENTRY,
+            "src_index": _src_index(ENTRY),
+            "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
+            "delay": _secrets.randbelow(540) + 180,
+            "extra": secure_hex(16),
+        }]
+        # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
+        # amount. integrity_chain.log persists on disk, and the exact fan-out
+        # amount is the single most linkable quantity in the whole pipeline:
+        # recovered from the log it correlates directly against the on-chain
+        # outputs and unmixes what the fan-out exists to mix. The amount stays
+        # in the plan file (0600), off the persistent hash chain.
+        integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
 
     # Subaddresses that will receive a fan-out output, with the (account, index)
     # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
@@ -1082,6 +1159,7 @@ def main():
         "fee_per_round": str(per_round_fee),
         "total_fees": str(total_fees),
         "account_index": bal_account,
+        "distribution_mode": distribution_mode,
     }
 
     outdir = Path(args.output)
@@ -1121,7 +1199,8 @@ def main():
 
     try:  # ensures lock file is cleaned even on error
         _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
-                    staging_dir, proxy, usable)
+                    staging_dir, proxy, usable, distribution_mode=distribution_mode,
+                    change_target=(bal_account, 0))
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -1362,14 +1441,116 @@ def _wait_for_fanout_confirm(args, targets, proxy):
     return False
 
 
+def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
+    """Block until subaddress `sub_idx` holds at least min_unlocked_xmr UNLOCKED.
+
+    The peeling carrier (the change address) only becomes spendable for the next
+    peel once the previous peel's change has confirmed and unlocked (~10 blocks).
+    Waiting on a >= threshold (not merely > 0) is what makes the peels
+    sequential: a bare > 0 would return on stale unlocked dust and the next
+    peel's create would fail 'not enough money'. Returns False on timeout so the
+    caller can stop cleanly with the remaining balance intact.
+    """
+    try:
+        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    except Exception as e:
+        integrity_log("stage5", f"carrier_rpc_connect_fail:{str(e)[:40]}")
+        print(f"  [!] {label}: cannot connect wallet-rpc to await the carrier: {e}")
+        return False
+    need_atomic = int((Decimal(str(min_unlocked_xmr)) * Decimal(10 ** 12)).to_integral_value())
+    print(f"  [*] {label}: waiting for the carrier (subaddr {sub_idx}) to hold the "
+          f"peeled change, confirmed+unlocked (~10 blocks; up to "
+          f"{FANOUT_CONFIRM_TIMEOUT // 60} min)...")
+    waited = 0
+    while waited < FANOUT_CONFIRM_TIMEOUT:
+        if shutdown_requested():
+            integrity_log("stage5", "carrier_wait_interrupted")
+            return False
+        try:
+            rpc.raw_request("refresh", {})
+            _t, unlk = rpc.get_subaddress_balance(account, sub_idx)
+            if unlk and int(unlk) >= need_atomic:
+                integrity_log("stage5", f"carrier_ready:idx={sub_idx}")
+                print(f"  [+] {label}: carrier funded and unlocked.")
+                return True
+        except Exception as e:
+            integrity_log("stage5", f"carrier_poll_err:{str(e)[:30]}")
+        time.sleep(FANOUT_CONFIRM_POLL)
+        waited += FANOUT_CONFIRM_POLL
+    integrity_log("stage5", "carrier_confirm_timeout")
+    print(f"  [!] {label}: carrier change did not confirm within "
+          f"{FANOUT_CONFIRM_TIMEOUT // 60} min.")
+    return False
+
+
+def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
+    """Run a peeling chain: each peel is its OWN confirmation-gated round.
+
+    peel_file holds N single-destination peels (build_peel_plan). Peel 0 spends
+    ENTRY; each later peel spends the change address (change_target=(account,
+    0)), which only holds the previous peel's change once it confirms and
+    unlocks -- so between peels we WAIT for that subaddress to hold enough
+    unlocked balance to fund the next. That wait is what spreads the N mix
+    outputs across N transactions over time instead of one co-created fan-out.
+
+    Returns the number of peels relayed. A peel's create/sign/broadcast aborts
+    the run (fail closed) exactly as any round does; a carrier timeout stops the
+    chain cleanly with the remaining balance intact so a re-run can continue.
+    """
+    with open(peel_file) as f:
+        pdata = json.load(f)
+    meta = pdata.get("meta", {})
+    peels = pdata.get("txs", [])
+    acct, csub = change_target
+    per_round_fee = Decimal(str(meta.get("fee_per_round", "0.01")))
+    n = len(peels)
+    print(f"  [*] === Peeling chain: {n} confirmation-gated peels ===")
+    relayed = 0
+    for i, peel in enumerate(peels):
+        if shutdown_requested():
+            integrity_log("stage5", f"peel_shutdown_at_{i}")
+            print(f"  [!] Shutdown before peel {i + 1}/{n}. {relayed} peel(s) relayed. "
+                  f"Re-run to continue with the remaining balance.")
+            break
+        # Peels after the first spend the carrier; wait for it to hold this
+        # peel's amount + a fee reserve, unlocked, before creating the tx.
+        if i > 0:
+            need = Decimal(str(peel.get("amt", "0"))) + per_round_fee
+            if not _wait_for_carrier(args, acct, csub, need, proxy, f"peel {i + 1}/{n}"):
+                integrity_log("stage5", f"peel_carrier_timeout:{i}")
+                print(f"  [!] Stopping at peel {i + 1}/{n}: carrier not ready. "
+                      f"{relayed}/{n} relayed; re-run to finish.")
+                break
+        newnym(required=True)
+        tor_recheck(proxy, f"stage5_peel_{i}")
+        one_path = Path(str(peel_file)[:-5] + f"_peel{i}.json") \
+            if str(peel_file).endswith(".json") else Path(str(peel_file) + f".peel{i}")
+        atomic_write_json({"meta": meta, "txs": [peel]}, one_path)
+        try:
+            _run_round(args, one_path, f"{staging_dir}/peel{i}", f"Peel {i + 1}/{n}")
+            relayed += 1
+        finally:
+            # The per-peel plan carries full destination + amount; wipe it, do
+            # not leave it beside the run.
+            secure_delete_file(one_path)
+    integrity_log("stage5", f"peel_chain_done:{relayed}_of_{n}")
+    print(f"  [+] Peeling chain: {relayed}/{n} peels relayed.")
+    return relayed
+
+
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
-                proxy, spendable_amount):
+                proxy, spendable_amount, distribution_mode="fanout",
+                change_target=(0, 0)):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
-    rounds: fan-out first, then (optionally) the DAG hop round once the fan-out
-    outputs have unlocked on-chain, then the exit-strategy simulation."""
-    # -- Round 1: fan-out (always) ----------------------------------------
-    print("  [*] === Round 1: Fan-out distribution ===")
-    _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
+    rounds: the distribution (a one-shot fan-out OR a peeling chain), then
+    (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
+    then the exit-strategy simulation."""
+    # -- Distribution: fan-out (one tx) or peel chain (N gated txs) --------
+    if distribution_mode == "peel":
+        _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
+    else:
+        print("  [*] === Round 1: Fan-out distribution ===")
+        _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
 
     # -- Round 2: DAG hop-mixing (only if planned) ------------------------
     if dag_file:
