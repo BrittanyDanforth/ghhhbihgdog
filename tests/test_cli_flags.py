@@ -69,6 +69,10 @@ check("ghost:dag-mixing accepted", rc != 2 and "invalid btc" in out.lower())
 # GhostSpiral: receive-wallet file missing rejected before network
 rc, out = run("GhostSpiral", ["--receive-wallet", "missing_rw_xyz.json", "--tor-proxy", PROXY])
 check("ghost:missing-receive-wallet", rc != 0 and "not found" in out.lower())
+# GhostSpiral: --max-slippage 0 is refused before any network (same as thor)
+rc, out = run("GhostSpiral", ["--btc-entry", "NOT_A_BTC_ADDR", "--tor-proxy", PROXY,
+                              "--max-slippage", "0"])
+check("ghost:max-slippage-0", rc != 0 and "max-slippage" in out.lower())
 # broadcast: --tor-proxy is enforced as REQUIRED at runtime
 rc, out = run("broadcast_signed_xmr", ["some_dir"])
 check("broadcast:tor-proxy-required", rc != 0 and "tor" in out.lower() and "required" in out.lower())

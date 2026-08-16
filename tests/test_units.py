@@ -873,6 +873,39 @@ try:
 finally:
     thor.safe_get = _real_safe_get
 
+# Shared oracle + deviation math — both swap paths must use these, or
+# GhostSpiral will accept a quote thor_swap_preparer would have refused.
+check("oracle: lives in gs_common", hasattr(gs, "btc_per_xmr_oracle")
+      and hasattr(gs, "quote_deviation"))
+check("oracle: fail-closed on a dead getter (None, not 0.003)",
+      gs.btc_per_xmr_oracle(None, getter=lambda *a, **k: (_ for _ in ()).throw(
+          RuntimeError("down"))) is None)
+check("oracle: a live getter returns the rate",
+      gs.btc_per_xmr_oracle({"http": "x"}, getter=lambda *a, **k: {
+          "monero": {"btc": "0.005"}}) == Decimal("0.005"))
+check("oracle: a non-positive rate is refused",
+      gs.btc_per_xmr_oracle({"http": "x"}, getter=lambda *a, **k: {
+          "monero": {"btc": "0"}}) is None)
+# 0.005 BTC at 0.005 BTC/XMR => 1.0 XMR; quote of 0.2 is 80% off.
+check("deviation: 80% off a 1 XMR oracle",
+      gs.quote_deviation(Decimal("0.2"), Decimal("0.005"), Decimal("0.005"))
+      == Decimal("0.8"))
+check("deviation: missing oracle disables the check (None, not 0)",
+      gs.quote_deviation(Decimal("0.2"), Decimal("0.005"), None) is None)
+check("thor wraps the shared oracle",
+      "btc_per_xmr_oracle" in open(os.path.join(REPO, "thor_swap_preparer")).read())
+check("thor uses shared quote_deviation",
+      "quote_deviation(" in open(os.path.join(REPO, "thor_swap_preparer")).read())
+check("GhostSpiral stage 2 uses the shared oracle",
+      "btc_per_xmr_oracle" in _gs_s)
+check("GhostSpiral stage 2 uses shared quote_deviation",
+      "quote_deviation(" in _gs_s)
+_dev_calls = [n for n in ast.walk(_gs_ast)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "quote_deviation"]
+check("GhostSpiral actually CALLS quote_deviation (not just imports it)",
+      len(_dev_calls) >= 1)
+
 # ---------------------------------------------------------------------------
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

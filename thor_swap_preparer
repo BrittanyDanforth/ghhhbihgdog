@@ -38,38 +38,28 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
     load_receive_bundle, memo_binds_destination,
+    btc_per_xmr_oracle, quote_deviation,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
-CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
 
 
 def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal | None:
-    """Fetch current BTC/XMR rate from CoinGecko, or None if the oracle failed.
+    """Shared oracle (gs_common.btc_per_xmr_oracle), with this tool's warning.
 
-    The old version silently returned a hard-coded Decimal("0.003") on any
-    failure -- CoinGecko is frequently unreachable over Tor -- and the CALLER
-    then compared each real ThorChain quote against that fabricated baseline in
-    the slippage check. A quote that deviates 30% from a rate we invented is
-    not a slippage warning about the quote; it is nonsense. Fail closed here
-    (return None) and let the caller loudly disable the slippage check for that
-    chunk, the way it already handles an unreadable expected_xmr.
+    Was a private copy here; GhostSpiral's stage 2 then had no oracle at all,
+    so one swap path cross-checked its quotes and the other accepted anything.
+    Both use the shared helper now. It still fails CLOSED (None) rather than
+    returning an invented rate, and the caller disables the check out loud.
     """
-    try:
-        p = safe_get(CG_PRICE, proxy)
-        rate = Decimal(str(p["monero"]["btc"]))
-        if rate <= 0:
-            raise ValueError("Non-positive rate")
-        integrity_log("thor", "price_oracle_ok")
-        return rate
-    except Exception as e:
-        integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
+    rate = btc_per_xmr_oracle(proxy, getter=safe_get)
+    if rate is None:
         print("  [!] Price oracle unreachable — the slippage cross-check will be "
               "DISABLED for this batch. Verify each quote manually.")
-        return None
+    return rate
 
 
 def _dest_from_bundle(path: str) -> str:
@@ -287,10 +277,10 @@ def main():
             print(f"  [!] Pair {i}: memo does not name your destination — continuing "
                   f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
 
-        # Slippage check
-        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
-        if oracle_xmr > 0:
-            deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
+        # Slippage check — shared math so GhostSpiral cannot drift
+        deviation = quote_deviation(expected_xmr, amt, btc_per_xmr)
+        if deviation is not None:
+            oracle_xmr = amt / btc_per_xmr
             if deviation > args.max_slippage:
                 integrity_log("thor", f"slippage_ABORT_{i}:dev={deviation:.4f}")
                 sys.exit(

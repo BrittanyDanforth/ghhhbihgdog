@@ -31,12 +31,13 @@ from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, daemon_fee_estimate, require_resources,
+    safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination,
+    btc_per_xmr_oracle, quote_deviation,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -516,6 +517,11 @@ def main():
                           "PREFER GS_WALLET_PASSWORD=... in the environment: an "
                           "argv password is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444).")
+    cli.add_argument("--max-slippage", type=Decimal, default=Decimal("0.25"),
+                     help="refuse a swap quote that deviates more than this fraction "
+                          "from the shared price oracle (default 0.25 = 25%%). Same "
+                          "rule as thor_swap_preparer — this path used to accept any "
+                          "quote. Ignored when the oracle is unreachable.")
     cli.add_argument("--allow-unbound-memo", action="store_true",
                      help="proceed even when a swap quote's memo does not contain your "
                           "XMR destination. ONLY for a genuine aggregator format change "
@@ -528,6 +534,9 @@ def main():
     cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
                      help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
     args = cli.parse_args()
+
+    if args.max_slippage <= 0:
+        sys.exit("[!] --max-slippage must be positive.")
 
     # Prefer the environment over argv for the wallet password (see the
     # --wallet-password help and the env handoff in _stage5_run). Same
@@ -723,6 +732,13 @@ def main():
         Returns list of deposit instructions for the operator.
         The operator must MANUALLY send BTC to each deposit address.
         """
+        # Same oracle + deviation math as thor_swap_preparer. This path used
+        # to print deposit instructions for any quote the API returned.
+        btc_per_xmr = btc_per_xmr_oracle(proxy, getter=safe_get)
+        if btc_per_xmr is None:
+            print("  [!] Price oracle unreachable — the slippage cross-check will be "
+                  "DISABLED for this batch. Verify each quote manually.")
+
         deposits = []
         for i, amt in enumerate(chunks):
             if shutdown_requested():
@@ -788,6 +804,24 @@ def main():
             except Exception:
                 integrity_log("stage2", f"bad_expected_output_{i}")
                 expected_dec = Decimal(0)
+
+            deviation = quote_deviation(expected_dec, amt, btc_per_xmr)
+            if deviation is not None:
+                oracle_xmr = amt / btc_per_xmr
+                if deviation > args.max_slippage:
+                    integrity_log("stage2", f"slippage_ABORT_{i}:dev={deviation:.4f}")
+                    sys.exit(
+                        f"[!] Chunk {i}: the quote is {deviation * 100:.1f}% away from the "
+                        f"price oracle ({expected_dec} XMR quoted vs ~{oracle_xmr:.4f} "
+                        f"expected), past the --max-slippage limit of "
+                        f"{args.max_slippage * 100:.0f}%.\n"
+                        f"    That is either a bad route or a stale/incorrect oracle -- "
+                        f"either way, not something to send BTC against unexamined.\n"
+                        f"    Raise --max-slippage only after checking the rate yourself."
+                    )
+                if deviation > Decimal("0.05"):
+                    print(f"  [!] Chunk {i}: quote deviates {deviation * 100:.1f}% from oracle")
+                    integrity_log("stage2", f"slippage_warn_{i}:dev={deviation:.4f}")
 
             deposit_info = {
                 "chunk": i,

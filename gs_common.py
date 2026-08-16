@@ -735,6 +735,58 @@ def memo_binds_destination(memo: str, dest: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+#  Price oracle + quote deviation — one implementation for both swap paths
+# ---------------------------------------------------------------------------
+# CoinGecko over Tor. Fail CLOSED (None): a fabricated rate makes the
+# slippage check compare a real quote against a number we invented.
+CG_BTC_PER_XMR = (
+    "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
+)
+
+
+def btc_per_xmr_oracle(proxy: Optional[Dict[str, str]], getter=None) -> Optional[Decimal]:
+    """BTC-per-XMR from the shared oracle, or None if it cannot be fetched.
+
+    `getter` is the HTTP function (default safe_get) so a caller can stub its
+    own without the oracle talking to the network. Never invents a rate.
+    """
+    get = getter if getter is not None else safe_get
+    try:
+        p = get(CG_BTC_PER_XMR, proxy)
+        rate = Decimal(str(p["monero"]["btc"]))
+        if rate <= 0:
+            raise ValueError("Non-positive rate")
+        integrity_log("oracle", "price_oracle_ok")
+        return rate
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("oracle", f"price_oracle_fail:{str(e)[:40]}")
+        return None
+
+
+def quote_deviation(quoted_xmr, btc_in, btc_per_xmr) -> Optional[Decimal]:
+    """|quoted - oracle| / oracle, or None when the check cannot run.
+
+    None means disable the check out loud — never treat a missing oracle as
+    zero deviation (that would accept anything) or as infinite (that would
+    refuse everything after a CoinGecko blip).
+    """
+    if not btc_per_xmr:
+        return None
+    try:
+        quoted = Decimal(str(quoted_xmr))
+        amt = Decimal(str(btc_in))
+        rate = Decimal(str(btc_per_xmr))
+    except Exception:                                        # noqa: BLE001
+        return None
+    if rate <= 0 or amt <= 0:
+        return None
+    oracle_xmr = amt / rate
+    if oracle_xmr <= 0:
+        return None
+    return abs(quoted - oracle_xmr) / oracle_xmr
+
+
+# ---------------------------------------------------------------------------
 #  The receive-wallet bundle: ONE loader, used by everything
 # ---------------------------------------------------------------------------
 RECEIVE_SCHEMA = "gs_receive_wallet_v1"
