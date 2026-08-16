@@ -492,6 +492,49 @@ def live_fees(daemon_url, tor_proxy=""):
                             "real fee at signing time.")}
 
 
+#: Where Tor's SOCKS proxy commonly listens: 9050 = the standalone tor daemon /
+#: Tor Expert Bundle / most Linux packages; 9150 = the Tor Browser bundle. The
+#: operator should not have to know which — we probe both and keep whichever
+#: ACTUALLY exits via Tor.
+TOR_SOCKS_PORTS = (9050, 9150)
+
+
+def detect_tor_proxy(preferred: str = "") -> dict:
+    """Find a working Tor SOCKS proxy on localhost by REAL verification.
+
+    A port being open is not enough (a random SOCKS proxy is not Tor), so each
+    candidate is checked with the same tor_recheck used everywhere else: it must
+    confirm the exit is Tor. Tries the operator's current value first, then the
+    well-known ports. Returns {"ok", "proxy", "detail"}. Never raises.
+    """
+    try:
+        gs = _gs_common()
+    except Exception as e:                            # noqa: BLE001
+        return {"ok": False, "proxy": None,
+                "detail": f"cannot load dependencies — {str(e)[:100]}"}
+    cands = []
+    p = (preferred or "").strip()
+    if p:
+        cands.append(p)
+    for port in TOR_SOCKS_PORTS:
+        u = f"socks5h://127.0.0.1:{port}"
+        if u not in cands:
+            cands.append(u)
+    tried = []
+    for u in cands:
+        try:
+            proxy = gs.validate_proxy(u)
+            gs.tor_recheck(proxy, "console_detect")   # single-shot; exits/raises on fail
+            return {"ok": True, "proxy": u, "detail": f"verified Tor exit via {u}"}
+        except SystemExit:
+            tried.append(u.rsplit(":", 1)[-1])
+        except Exception:
+            tried.append(u.rsplit(":", 1)[-1])
+    return {"ok": False, "proxy": None,
+            "detail": ("no working Tor proxy on ports " + ", ".join(tried) +
+                       ". Start Tor Browser (9150) or tor.exe (9050) and retry.")}
+
+
 def mandatory_preflight(params: dict) -> dict:
     """The NON-NEGOTIABLE OPSEC gate the pipeline cannot spend without.
 
@@ -533,11 +576,14 @@ def mandatory_preflight(params: dict) -> dict:
         gs.tor_recheck(proxy, "console_preflight")   # single-shot; SystemExit on fail
         checks["tor"] = {"ok": True, "detail": "traffic verified exiting via Tor"}
     except SystemExit as e:
-        checks["tor"] = {"ok": False,
-                         "detail": (str(e).strip().splitlines() or ["Tor check failed"])[0][:160]}
+        _d = (str(e).strip().splitlines() or ["Tor check failed"])[0][:150]
+        checks["tor"] = {"ok": False, "detail": _d + " — is Tor running? Click "
+                         "'Detect Tor port', or start Tor Browser (port 9150) or "
+                         "tor.exe (port 9050)."}
         return {"ok": False, "checks": checks}
     except Exception as e:                            # noqa: BLE001
-        checks["tor"] = {"ok": False, "detail": f"Tor check error: {str(e)[:120]}"}
+        checks["tor"] = {"ok": False, "detail": f"Tor check error: {str(e)[:120]} — is "
+                         "Tor running? Click 'Detect Tor port'."}
         return {"ok": False, "checks": checks}
 
     from urllib.parse import urlparse as _up
@@ -689,6 +735,10 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/preflight":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(mandatory_preflight(c["params"])))
+        if self.path == "/api/detect-tor":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(
+                detect_tor_proxy(c["params"].get("tor_proxy", ""))))
         if self.path.startswith("/run/"):
             aid = self.path[5:]
             act = ACTIONS.get(aid)
@@ -863,7 +913,9 @@ font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;white-
 .pfrow.ok span:first-child{color:var(--ok)}
 .pfrow.bad span:first-child{color:var(--err);font-weight:600}
 .pfrow .pfd{color:var(--mut);font-size:11px;font-family:ui-monospace,Menlo,monospace;text-align:right;max-width:62%;word-break:break-word}
-.pfre{margin-top:7px;font-size:11.5px;color:var(--acc);background:none;border:0;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
+.pfbtns{display:flex;gap:14px;margin-top:8px}
+.pfre{font-size:11.5px;color:var(--acc);background:none;border:0;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
+.pfre:disabled{color:var(--mut);cursor:default;text-decoration:none}
 .arm{margin-top:11px;padding:11px;border:1px dashed var(--err);border-radius:9px;background:var(--errs)}
 .arm p{margin:0 0 8px;font-size:12px;color:var(--err);line-height:1.45}
 .arm input{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;padding:6px 9px;border-radius:7px;
@@ -984,7 +1036,10 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <div class="f"><label for="wallet_file">Wallet file</label><input id="wallet_file" value="offline.wallet"></div>
     <div id="pwnote" class="warnbox"></div>
     <div id="pfstatus" class="pfbox"></div>
-    <button id="pfre" class="pfre" type="button">re-run preflight now</button>
+    <div class="pfbtns">
+      <button id="pfdetect" class="pfre" type="button">Detect Tor port</button>
+      <button id="pfre" class="pfre" type="button">re-run preflight now</button>
+    </div>
     <p class="lead" style="margin-top:14px">Run the manual checks for detail (they change nothing):</p>
     <div class="stepacts" data-acts="preflight_tor,preflight_egress,preflight_wallet,paranoia_dry"></div>
     <div class="stepnav"><button class="bk" data-go="3">← Back</button><button class="nx" data-go="5">Next →</button></div>
@@ -1128,6 +1183,28 @@ async function runPreflight(){
  if(seq!==pfSeq) return;            // a newer preflight superseded this one
  preflightOk=!!(r&&r.ok); renderPreflight(r); sync();
 }
+// Find the Tor SOCKS port automatically (9050 tor.exe / 9150 Tor Browser) and
+// fill it in, so the operator never has to know which one their Tor uses.
+let detectBusy=false;
+async function detectTor(silent){
+ if(detectBusy) return; detectBusy=true;
+ const btn=$('#pfdetect'); if(btn){btn.disabled=true;btn.textContent='Detecting Tor…';}
+ if(!silent) $('#pfstatus').innerHTML='<div class="pfhead run">⟳ probing Tor ports (9050, 9150)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/detect-tor',{method:'POST',headers:HDR,
+      body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'detect request failed: '+e}; }
+ if(btn){btn.disabled=false;btn.textContent='Detect Tor port';}
+ detectBusy=false;
+ if(r&&r.ok&&r.proxy){
+  $('#tor_proxy').value=r.proxy;      // fill the working proxy
+  await runPreflight();               // and re-verify with it
+  return true;
+ }
+ if(!silent) $('#pfstatus').innerHTML=
+   `<div class="pfhead bad">✕ ${esc((r&&r.detail)||'no Tor proxy found')}</div>`;
+ return false;
+}
 // Debounce so editing a network field doesn't fire a Tor check per keystroke.
 let pfTimer=null;
 function schedulePreflight(){ preflightOk=false; sync();
@@ -1152,6 +1229,7 @@ $$('input,select').forEach(el=>el.addEventListener('input',()=>{
  if(PF_FIELDS.has(el.id)) schedulePreflight(); else sync();
 }));
 $('#pfre').addEventListener('click',runPreflight);
+$('#pfdetect').addEventListener('click',()=>detectTor(false));
 $('#arm').addEventListener('input',e=>{armed=e.target.value.trim()===ARM;sync();});
 $('#armword').textContent=ARM;
 $('#pwnote').innerHTML=PWSET
@@ -1235,7 +1313,10 @@ async function poll(){
 $('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST',headers:HDR,body:'{}'});});
 $('#copy').addEventListener('click',()=>{const p=$('#pre');if(p)navigator.clipboard?.writeText(p.innerText);});
 
-setMode('send'); showStep(1); applyPreset('balanced'); loadFees(); sync(); runPreflight();
+setMode('send'); showStep(1); applyPreset('balanced'); loadFees(); sync();
+// On load, auto-detect the Tor port (silent); detectTor re-runs preflight when
+// it finds one, otherwise fall through to a normal preflight on the default.
+detectTor(true).then(found=>{ if(!found) runPreflight(); });
 $('#rpc_daemon').addEventListener('change',loadFees);
 </script></body></html>"""
 

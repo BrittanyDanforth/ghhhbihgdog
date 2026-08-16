@@ -195,6 +195,47 @@ def test_remote_daemon_fee_query_routes_through_tor():
           seen.get("proxies", [None])[-1] is None)
 
 
+def test_tor_port_autodetect():
+    """The console must find the Tor SOCKS port itself (9050 tor.exe / 9150 Tor
+    Browser) by REAL verification, not by asking the operator to know it."""
+    c = load_console()
+    calls = []
+
+    class Gs:
+        works = "9150"
+        _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+        @staticmethod
+        def validate_proxy(u):
+            return {"http": u, "https": u}
+        @classmethod
+        def tor_recheck(cls, proxy, stage):
+            calls.append(proxy["http"])
+            if cls.works not in proxy["http"]:
+                raise SystemExit("[!] not Tor / refused")
+    c._GS_MOD = Gs
+
+    Gs.works = "9150"
+    r = c.detect_tor_proxy("")
+    check("detect finds the Tor Browser port (9150)",
+          r["ok"] and r["proxy"] == "socks5h://127.0.0.1:9150")
+    Gs.works = "9050"
+    check("detect finds the standalone tor port (9050)",
+          c.detect_tor_proxy("")["proxy"] == "socks5h://127.0.0.1:9050")
+    check("detect only accepts a port that ACTUALLY verifies as Tor",
+          "9050" in "".join(calls) and "9150" in "".join(calls))
+
+    Gs.works = "nope"
+    r = c.detect_tor_proxy("")
+    check("detect reports no proxy when Tor is not running", r["ok"] is False)
+    check("detect's failure message tells the operator how to start Tor",
+          "Tor Browser" in r["detail"] and "tor.exe" in r["detail"])
+
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("the page has a Detect Tor button", 'id="pfdetect"' in src)
+    check("the page auto-detects Tor on load", "detectTor(true)" in src)
+    check("there is a /api/detect-tor endpoint", '"/api/detect-tor"' in src)
+
+
 def test_wizard_structure_places_every_action():
     """The page is a 5-step wizard; every action must live in some step's
     data-acts placeholder (or it becomes unreachable), and each action id must
@@ -464,7 +505,10 @@ def test_page_wires_the_auto_preflight():
     """The page must auto-run the preflight and gate the spend button on it."""
     src = open(os.path.join(REPO, "gs_console")).read()
     check("the page defines an auto preflight runner", "async function runPreflight(" in src)
-    check("the preflight runs on load", "sync(); runPreflight()" in src)
+    # On load the console auto-detects Tor, then runs the preflight (detectTor
+    # re-runs it on success; the fallback runs it when no Tor port is found).
+    check("the preflight runs on load (after Tor auto-detect)",
+          "detectTor(true).then(found=>{ if(!found) runPreflight(); })" in src)
     check("the spend button is gated on preflightOk", "armed&&preflightOk" in src)
     check("network field edits re-trigger the preflight", "schedulePreflight()" in src)
     check("the server has an /api/preflight endpoint",
