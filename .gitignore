@@ -1,6 +1,7 @@
 *.pyc
 __pycache__/
 tests/dashboard_data.json
+tests/status.json
 tests/dashboard.html
 
 # Runtime artifacts. These carry live operational data -- the integrity chain
