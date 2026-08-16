@@ -57,6 +57,7 @@ ACTIONS = {
     "realsend":    {**suite("real_send_testnet", "SHIPPED jittered fan-out send: exact unequal amounts land"), "group": "Real binaries"},
     "realpeel":    {**suite("real_peel_testnet", "SHIPPED peeling chain: N dests via N separate txs"), "group": "Real binaries"},
     "peelcold":    {**suite("real_peel_cold_testnet", "SHIPPED phase_create+phase_sign COLD peel chain"), "group": "Real binaries"},
+    "realtrack":   {**suite("real_track_origin_testnet", "origin tracker on a REAL regtest chain: with-keys vs keyless"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --
