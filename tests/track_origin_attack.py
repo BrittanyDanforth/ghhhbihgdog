@@ -604,6 +604,122 @@ def _build_many(rng):
     return graphs
 
 
+# Maximum safe console preset: peel + DAG, 10 wallets, depth 2, fee prio 3.
+# $15k at the spot we used for the USD tables (~$410/XMR).
+XMR_USD = Decimal("410")
+SAFEST_USD = Decimal("15000")
+SAFEST_XMR = (SAFEST_USD / XMR_USD).quantize(Decimal("0.0001"))
+SAFEST_WALLETS = 10
+SAFEST_FEE = Decimal("0.02")   # ~priority 3 (x20-ish vs a cheap default)
+
+
+def _safest_n(rng):
+    return SAFEST_WALLETS + rng.randint(ghost.DECOY_MIN, ghost.DECOY_MAX)
+
+
+def build_safest_usd(rng, usd=SAFEST_USD, xmr_usd=XMR_USD, repeats=20):
+    """Maximum-safe graphs at a dollar figure: peel chain, then DAG hops."""
+    usable = (Decimal(usd) / Decimal(xmr_usd)).quantize(Decimal("0.0001"))
+    graphs = []
+    for i in range(repeats):
+        n = _safest_n(rng)
+        g = run_send_peel(rng, n=n, dag=True, usable=usable, fee=SAFEST_FEE,
+                          wallet_id=f"S{i}")
+        if g:
+            g.name = f"safest-SEND-peel+dag-n{n}-u{usable}"
+            graphs.append(g)
+        n = _safest_n(rng)
+        g = run_receive_peel(rng, n=n, dag=True, usable=usable, fee=SAFEST_FEE,
+                             wallet_id=f"R{i}")
+        if g:
+            g.name = f"safest-RECV-peel+dag-n{n}-u{usable}"
+            graphs.append(g)
+        n = _safest_n(rng)
+        g = run_recv_then_send(
+            rng, "peel", "peel", n=n, wallets=SAFEST_WALLETS, dag=True,
+            recv_amt=usable, send_amt=(usable * Decimal("0.35")).quantize(Decimal("0.0001")),
+            wallet_id=f"C{i}")
+        if g:
+            g.name = f"safest-COMBO-peel+dag-n{n}-u{usable}"
+            graphs.append(g)
+    return usable, graphs
+
+
+def _print_safest(usd, xmr_usd, usable, graphs):
+    print("\n" + "=" * 72)
+    print(f"  SAFEST OPTION · ${usd} USD  ({usable} XMR @ ${xmr_usd}/XMR)")
+    print("  preset: Maximum safe = peel + DAG · 10 wallets · depth 2 · prio 3")
+    print("=" * 72)
+    rows = []
+    for g in graphs:
+        hits, revealed, guess = evaluate(g)
+        rows.append((g, hits, revealed, guess))
+
+    print(f"\n  {'#':>3}  {'role':<10}  {'peels':>5}  {'hops':>4}  "
+          f"{'amount':>10}  {'uncovered':<10}  via")
+    send = recv = combo = 0
+    send_h = recv_h = combo_h = 0
+    for i, (g, hits, _rev, guess) in enumerate(rows, 1):
+        peels = sum(1 for t in g.txs if t["kind"] == "peel")
+        hops = sum(1 for t in g.txs if t["kind"] == "dag_hop")
+        if g.mode == "send":
+            role, send = "SENDER", send + 1
+            hit = hits["deep_reveal_is_primary"]
+            send_h += int(hit)
+        elif g.mode == "receive":
+            role, recv = "RECEIVER", recv + 1
+            hit = hits["deep_reveal_is_primary"]
+            recv_h += int(hit)
+        else:
+            role, combo = "RECV+SEND", combo + 1
+            hit = hits["deep_reveal_is_primary"]
+            combo_h += int(hit)
+        print(f"  {i:>3}  {role:<10}  {peels:>5}  {hops:>4}  "
+              f"{g.usable:>7} XMR  {'YES' if hit else 'NO':<10}  "
+              f"{guess['deep_reason']}")
+
+    def line(label, h, n):
+        print(f"  {label:<28} {h}/{n}  {_pct(h, n):5.1f}%")
+
+    print(f"\n  --- uncover @ ${usd} / {usable} XMR ---")
+    line("SENDER PRIMARY", send_h, send)
+    line("RECEIVER main (PRIMARY)", recv_h, recv)
+    line("RECV+SEND PRIMARY", combo_h, combo)
+    peel_rows = [r for r in rows if any(t["kind"] == "peel" for t in r[0].txs)]
+    _, _, lp = (lambda rs: (
+        sum(1 for r in rs if r[1]["largest_change_is_primary"]),
+        len(rs),
+        _pct(sum(1 for r in rs if r[1]["largest_change_is_primary"]), len(rs)),
+    ))(peel_rows)
+    walk_h = sum(1 for r in rows if r[1]["peel_change_is_primary"])
+    print(f"  {'peel-change walk':<28} {walk_h}/{len(rows)}  {_pct(walk_h, len(rows)):5.1f}%")
+    print(f"  {'largest-is-change (peels)':<28} "
+          f"{sum(1 for r in peel_rows if r[1]['largest_change_is_primary'])}/"
+          f"{len(peel_rows)}  {lp:5.1f}%")
+
+    # One full walk each role so the $15k path is visible.
+    print("\n  --- example walks ---")
+    seen = set()
+    for g, hits, _rev, guess in rows:
+        if g.mode in seen:
+            continue
+        seen.add(g.mode)
+        named, reason, notes = deep_reveal_main(g)
+        print(f"\n  [{g.mode.upper()}] {g.name}")
+        print(f"    ${usd} = {g.usable} XMR · first spend {attack_genesis(g)} · "
+              f"MAIN={named} via {reason}")
+        for n in notes:
+            print(f"      · {n}")
+        for i, t in enumerate(g.txs[:8]):
+            ins = ",".join(t["ins"])
+            outs = " + ".join(f"{a}:{amt}" for a, amt in t["outs"][:3])
+            extra = "" if len(t["outs"]) <= 3 else f" +{len(t['outs'])-3} more"
+            print(f"      tx{i} {t['kind']:8}  {ins}  ->  {outs}{extra}")
+        if len(g.txs) > 8:
+            print(f"      … {len(g.txs) - 8} more txs (peels/hops)")
+    return rows
+
+
 def _pct(hits, n):
     return (100.0 * hits / n) if n else 0.0
 
@@ -760,6 +876,9 @@ def main():
 
     board = _print_scoreboard(evaluated)
 
+    safest_usable, safest_graphs = build_safest_usd(rng)
+    safest_rows = _print_safest(SAFEST_USD, XMR_USD, safest_usable, safest_graphs)
+
     # Honest tallies
     print("\n=== attack results (PRIMARY = wallet subaddr 0) ===")
     for key, rows in sorted(by_mode.items()):
@@ -877,6 +996,10 @@ def main():
     if board["low_leftover"] is not None and board["high_leftover"] is not None:
         check("leftover heuristic is at least as easy at 100 XMR as at 0.5 XMR",
               board["high_leftover"] >= board["low_leftover"])
+    check(f"SAFEST ${SAFEST_USD} ({safest_usable} XMR): PRIMARY named on every graph",
+          safest_rows and all(h["deep_reveal_is_primary"] for _, h, _, _ in safest_rows))
+    check(f"SAFEST ${SAFEST_USD}: peel-change walk names PRIMARY (the safest tell)",
+          safest_rows and all(h["peel_change_is_primary"] for _, h, _, _ in safest_rows))
 
     print(f"\n  graphs: {len(graphs)}  reveals: {len(REVEALS)}/{len(graphs)}")
     print(f"  SENDER uncovered:        {sp:5.1f}%  ({sh}/{sn})")
