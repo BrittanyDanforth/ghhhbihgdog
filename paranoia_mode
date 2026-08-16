@@ -452,6 +452,11 @@ GS_ARTIFACT_DIR_PATTERNS = [
     # airgap_tx_signer's per-TX scratch dir (tempfile.mkdtemp(prefix="gs_sign_")),
     # which holds unsigned_monero_tx and the signed_monero_tx wallet-cli writes.
     "gs_sign_*",
+    # airgap_tx_signer's multi-round output-import scratch (prefix="gs_impout_"),
+    # which holds the wallet OUTPUT-SET blob. Normally /dev/shm (RAM) and wiped
+    # in a finally, but a SIGKILL before that -- or a host with no /dev/shm, so
+    # it falls back to /tmp -- would leave the holdings map behind.
+    "gs_impout_*",
 ]
 
 

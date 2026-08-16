@@ -494,12 +494,19 @@ def phase_sign(args, plan: List[dict]):
     # covers every TX in this round.
     _outs = outdir / OUTPUTS_EXPORT_NAME
     if _outs.exists():
-        _iw = tempfile.mkdtemp(prefix="gs_impout_")
+        # RAM-backed scratch (tmpfs) so the wallet OUTPUT-SET blob -- a map of
+        # this wallet's holdings -- and the password file never touch disk;
+        # fall back to /tmp only where /dev/shm is unavailable. Matches the
+        # signing loop's /dev/shm handling; the previous version put both in
+        # /tmp, and wrote the holdings blob with umask perms (0644) rather than
+        # 0600.
+        _shm = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        _iw = tempfile.mkdtemp(prefix="gs_impout_", dir=_shm)
         _ipw = None
         try:
             _blob_path = Path(_iw) / "outputs_blob"
             try:
-                _blob_path.write_bytes(bytes.fromhex(_outs.read_text().strip()))
+                secure_write_bytes(_blob_path, bytes.fromhex(_outs.read_text().strip()))
             except ValueError:
                 _blob_path = None
                 print(f"  [!] {OUTPUTS_EXPORT_NAME} is not valid hex; skipping "
