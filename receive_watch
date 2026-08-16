@@ -55,10 +55,10 @@ from pathlib import Path
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     install_signal_handlers, shutdown_requested, scrub_address,
+    load_receive_bundle, RECEIVE_SCHEMA,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
-RECEIVE_SCHEMA = "gs_receive_wallet_v1"
 PAIR_SCHEMA = "thor_pairs_v1"
 
 # Poll cadence. A fixed interval is a heartbeat an observer of a remote RPC can
@@ -79,34 +79,6 @@ def to_xmr(atomic: int) -> Decimal:
     that are not there)."""
     return (Decimal(int(atomic)) / ATOMIC).quantize(Decimal("0.000000000001"),
                                                     rounding=ROUND_DOWN)
-
-
-def load_receive_bundle(path: str) -> dict:
-    """Load and structurally validate a gs_receive_wallet_v1 bundle.
-
-    Everything downstream trusts `address` as "where my money is", so a bundle
-    of the wrong schema, or one missing the index we are about to poll, is
-    rejected here rather than producing a confident watch on the wrong output.
-    """
-    p = Path(path)
-    if not p.is_file():
-        raise FileNotFoundError(f"receive wallet bundle not found: {path}")
-    try:
-        d = json.loads(p.read_text())
-    except Exception as e:                                   # noqa: BLE001
-        raise ValueError(f"receive wallet bundle is not readable JSON: {str(e)[:60]}")
-    if not isinstance(d, dict):
-        raise ValueError("receive wallet bundle must be a JSON object")
-    if d.get("schema") != RECEIVE_SCHEMA:
-        raise ValueError(f"expected schema {RECEIVE_SCHEMA}, got {d.get('schema')!r}")
-    if not d.get("address"):
-        raise ValueError("receive wallet bundle has no address")
-    # A missing index is NOT defaulted to 0. Account 0 / subaddress 0 is the
-    # wallet's own primary+change address, so silently falling back to it would
-    # watch the change carrier and call an unrelated balance "the payment".
-    if d.get("subaddress_index") is None:
-        raise ValueError("receive wallet bundle has no subaddress_index")
-    return d
 
 
 def load_pairs(path: str) -> list:
@@ -411,9 +383,12 @@ def main():
     except Exception as e:                                   # noqa: BLE001
         sys.exit(f"[!] {e}")
 
+    # Direct indexing, not .get(...) or 0: the loader has already guaranteed
+    # both indices are present and non-negative ints, and re-defaulting here
+    # would quietly resurrect the very fallback the loader exists to prevent.
     dest = bundle["address"]
-    account = int(bundle.get("account_index") or 0)
-    sub_idx = int(bundle["subaddress_index"])
+    account = bundle["account_index"]
+    sub_idx = bundle["subaddress_index"]
     rpc_url = args.rpc or bundle.get("rpc_endpoint") or "http://127.0.0.1:18083"
 
     matched = []

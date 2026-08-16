@@ -36,6 +36,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
+    load_receive_bundle,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -479,27 +480,19 @@ def main():
     receive_subaddress_index = 0
 
     if receive_mode:
-        rw_path = Path(args.receive_wallet)
-        if not rw_path.exists():
-            sys.exit(f"[!] Receive wallet file not found: {rw_path}")
-        with open(rw_path) as f:
-            rw_data = json.load(f)
-        if rw_data.get("schema") != "gs_receive_wallet_v1":
-            sys.exit(f"[!] Expected schema gs_receive_wallet_v1, got: {rw_data.get('schema')}")
-        receive_entry_addr = rw_data.get("address")
-        # `.get(k, default)` returns None (not default) when the key is present
-        # with a null value -- the same class of bug that made proxies={} slip
-        # past `if proxies is None`. Coerce present-but-null to the default so
-        # None does not propagate into subaddr_indices/account_index and
-        # silently redirect the spend to subaddress 0 of the primary account.
-        receive_account_index = rw_data.get("account_index") or 0
-        receive_subaddress_index = rw_data.get("subaddress_index") or 0
-        for _k in ("account_index", "subaddress_index"):
-            _v = rw_data.get(_k)
-            if _v is not None and (not isinstance(_v, int) or isinstance(_v, bool) or _v < 0):
-                sys.exit(f"[!] Receive wallet JSON: '{_k}' must be a non-negative int, got {_v!r}")
-        if not receive_entry_addr:
-            sys.exit("[!] Receive wallet JSON missing 'address' field")
+        # ONE strict loader, shared with receive_watch and thor_swap_preparer
+        # (gs_common.load_receive_bundle). The inline parse this replaces did
+        # `rw_data.get("subaddress_index") or 0`, so a bundle missing the index
+        # silently became subaddress 0 -- the account's primary AND change
+        # address -- and the pipeline would have used the change carrier as its
+        # entry without reporting anything wrong.
+        try:
+            rw_data = load_receive_bundle(args.receive_wallet)
+        except ValueError as e:
+            sys.exit(f"[!] {e}")
+        receive_entry_addr = rw_data["address"]
+        receive_account_index = rw_data["account_index"]
+        receive_subaddress_index = rw_data["subaddress_index"]
         integrity_log("stage0", f"receive_mode:entry={scrub_address(receive_entry_addr)}")
         print(f"  [*] RECEIVER MODE: XMR entry address = {scrub_address(receive_entry_addr)}")
         if args.joinmarket:

@@ -222,6 +222,117 @@ check("fanout: extra-output count is a RANGE, not a fixed fingerprint",
       ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
 
 # ---------------------------------------------------------------------------
+# ONE receive-bundle loader. This describes WHERE MONEY LANDS and used to be
+# parsed inline in three places with three different strictnesses; the weakest
+# won. GhostSpiral did `rw_data.get("subaddress_index") or 0`, so a bundle
+# missing the index silently became subaddress 0 -- the account's primary AND
+# change address -- and the pipeline used the change carrier as its entry with
+# no error at all.
+# ---------------------------------------------------------------------------
+import gs_common as _gsc
+import tempfile as _tf, json as _js, os as _os
+
+_bd = _tf.mkdtemp(prefix="gs_bundle_")
+
+
+def _wb(name, obj):
+    p = _os.path.join(_bd, name)
+    with open(p, "w") as fh:
+        _js.dump(obj, fh)
+    return p
+
+
+_DESTA = "8" + "A" + "1" * 93
+
+
+def _bundle_ok(**over):
+    d = {"schema": "gs_receive_wallet_v1", "address": _DESTA,
+         "account_index": 0, "subaddress_index": 7}
+    d.update(over)
+    return d
+
+
+def _refused(obj_or_path):
+    path = obj_or_path if isinstance(obj_or_path, str) else _wb("t.json", obj_or_path)
+    try:
+        _gsc.load_receive_bundle(path)
+        return False
+    except ValueError:
+        return True
+
+
+check("bundle: a well-formed receive bundle loads",
+      _gsc.load_receive_bundle(_wb("g.json", _bundle_ok()))["subaddress_index"] == 7)
+# THE BUG: absence must never become 0.
+check("bundle: a MISSING subaddress_index is refused, never defaulted to 0",
+      _refused({"schema": "gs_receive_wallet_v1", "address": _DESTA, "account_index": 0}))
+check("bundle: a MISSING account_index is refused too",
+      _refused({"schema": "gs_receive_wallet_v1", "address": _DESTA, "subaddress_index": 7}))
+check("bundle: a present-but-null index is refused (not coerced to 0)",
+      _refused(_bundle_ok(subaddress_index=None)))
+# `or 0` also collapsed a legitimate 0 with absence; an explicit 0 must work.
+check("bundle: an EXPLICIT subaddress_index of 0 is still accepted",
+      _gsc.load_receive_bundle(_wb("z.json", _bundle_ok(subaddress_index=0)))
+      ["subaddress_index"] == 0)
+# bool is an int subclass, so True would sneak through a naive isinstance check
+# and become index 1 -- a different subaddress than any bundle intended.
+check("bundle: a boolean index is refused (True is an int, and would mean 1)",
+      _refused(_bundle_ok(subaddress_index=True)))
+check("bundle: a negative index is refused", _refused(_bundle_ok(subaddress_index=-1)))
+check("bundle: a non-integer index is refused", _refused(_bundle_ok(subaddress_index="7")))
+check("bundle: the wrong schema is refused", _refused(_bundle_ok(schema="thor_pairs_v1")))
+check("bundle: no address is refused",
+      _refused({"schema": "gs_receive_wallet_v1", "account_index": 0,
+                "subaddress_index": 7}))
+check("bundle: a non-string address is refused", _refused(_bundle_ok(address=12345)))
+check("bundle: a JSON list is refused", _refused(_wb("l.json", [_DESTA])))
+check("bundle: a missing file is refused", _refused(_os.path.join(_bd, "nope.json")))
+
+# What create_receive_wallet actually writes must satisfy the loader, or the
+# tool that produces bundles and the tools that consume them disagree.
+check("bundle: create_receive_wallet's own output shape loads cleanly",
+      _gsc.load_receive_bundle(_wb("real.json", {
+          "schema": "gs_receive_wallet_v1", "created": 1700000000,
+          "address": _DESTA, "account_index": 0, "subaddress_index": 3,
+          "label": "GhostSpiral_entry",
+          "rpc_endpoint": "http://127.0.0.1:18083"}))["address"] == _DESTA)
+
+# No consumer may keep a private, laxer parse of this format.
+_gs_src = open(os.path.join(REPO, "GhostSpiral")).read()
+_rw_src = open(os.path.join(REPO, "receive_watch")).read()
+_th_src = open(os.path.join(REPO, "thor_swap_preparer")).read()
+def _code_only(src):
+    """Strip comments and docstrings: these files quote the old buggy line in
+    prose to record why it is gone, and a scan that reads prose as code would
+    fail on the very comment documenting the fix."""
+    import io as _io, tokenize as _tok
+    out = []
+    try:
+        for tk in _tok.generate_tokens(_io.StringIO(src).readline):
+            if tk.type in (_tok.COMMENT, _tok.NL):
+                continue
+            if tk.type == _tok.STRING and tk.line.strip().startswith(tk.string[:1] * 3):
+                continue                      # a bare triple-quoted docstring
+            out.append(tk.string)
+    except Exception:                         # noqa: BLE001
+        return src
+    return "\n".join(out)
+
+
+for _n, _s in (("GhostSpiral", _gs_src), ("receive_watch", _rw_src),
+               ("thor_swap_preparer", _th_src)):
+    _code = _code_only(_s)
+    check(f"bundle: {_n} uses the shared loader",
+          "load_receive_bundle" in _code)
+    check(f"bundle: {_n} has no private `or 0` index default in CODE",
+          'get("subaddress_index") or 0' not in _code
+          and 'get("account_index") or 0' not in _code
+          and "get('subaddress_index') or 0" not in _code)
+    check(f"bundle: {_n} does not re-check the schema string itself",
+          '"gs_receive_wallet_v1"' not in _code)
+
+
+# ---------------------------------------------------------------------------
 # peel + DAG COMPOSE (the "Maximum safe" preset): the peeled outputs are
 # exactly the DAG hop sources, and each peeled amount can fund its later hop.
 # This is what makes running --peel AND --dag-mixing a real two-layer mix

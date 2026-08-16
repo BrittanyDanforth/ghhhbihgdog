@@ -37,6 +37,7 @@ from gs_common import (
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
+    load_receive_bundle,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -80,20 +81,11 @@ def _dest_from_bundle(path: str) -> str:
     key, so an unrelated JSON that happens to have one can never become the
     destination of somebody's money.
     """
-    p = Path(path)
-    if not p.is_file():
-        sys.exit(f"[!] Receive-wallet bundle not found: {path}")
     try:
-        d = json.loads(p.read_text())
-    except Exception as e:                                   # noqa: BLE001
-        sys.exit(f"[!] Receive-wallet bundle is not readable JSON: {str(e)[:60]}")
-    if not isinstance(d, dict) or d.get("schema") != "gs_receive_wallet_v1":
-        sys.exit(f"[!] {path} is not a gs_receive_wallet_v1 bundle "
-                 f"(schema={None if not isinstance(d, dict) else d.get('schema')!r}). "
-                 f"Refusing to take a payment destination from it.")
-    addr = d.get("address")
-    if not addr:
-        sys.exit(f"[!] {path} carries no address.")
+        d = load_receive_bundle(path)
+    except ValueError as e:
+        sys.exit(f"[!] {path}: {e}")
+    addr = d["address"]
     integrity_log("thor", f"dest_from_bundle:{scrub_address(addr)}")
     return addr
 

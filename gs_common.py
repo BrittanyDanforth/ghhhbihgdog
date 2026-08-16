@@ -698,6 +698,66 @@ def shutdown_requested() -> bool:
     return _SHUTDOWN_REQUESTED
 
 # ---------------------------------------------------------------------------
+#  The receive-wallet bundle: ONE loader, used by everything
+# ---------------------------------------------------------------------------
+RECEIVE_SCHEMA = "gs_receive_wallet_v1"
+
+
+def load_receive_bundle(path) -> dict:
+    """Load and strictly validate a gs_receive_wallet_v1 bundle.
+
+    This describes WHERE MONEY LANDS, and it used to be parsed in three
+    different places with three different strictnesses -- GhostSpiral inline in
+    main(), receive_watch, and thor_swap_preparer. The weakest of them decided
+    the behaviour, and the weakest did this:
+
+        receive_subaddress_index = rw_data.get("subaddress_index") or 0
+
+    A bundle with no subaddress_index silently became index 0, which is the
+    account's PRIMARY and CHANGE address -- so the entry would have been the
+    change carrier rather than the intended receive output, and the tool would
+    have reported no error at all. `or 0` also collapses a legitimate index 0,
+    a present-but-null value, and a missing key into one indistinguishable
+    case.
+
+    One loader now serves all three callers, so no path can be laxer than
+    another and a future caller cannot reintroduce a weaker parse. Every
+    failure raises ValueError with a reason fit to show an operator; callers
+    decide whether that is a sys.exit or an exception.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError(f"receive wallet bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise ValueError(f"receive wallet bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, dict):
+        raise ValueError("receive wallet bundle must be a JSON object")
+    if d.get("schema") != RECEIVE_SCHEMA:
+        raise ValueError(
+            f"expected schema {RECEIVE_SCHEMA}, got {d.get('schema')!r} — refusing "
+            f"to take a payment destination from a file that is not a receive bundle")
+    addr = d.get("address")
+    if not addr or not isinstance(addr, str):
+        raise ValueError("receive wallet bundle has no usable 'address'")
+    # Absence is fatal; an explicit 0 is fine. These are kept distinct on
+    # purpose -- see the docstring.
+    for k in ("account_index", "subaddress_index"):
+        if k not in d or d.get(k) is None:
+            raise ValueError(
+                f"receive wallet bundle has no '{k}'. It is not defaulted to 0, "
+                f"because account 0 / subaddress 0 is the wallet's own primary and "
+                f"change address — guessing it would point the pipeline at the "
+                f"change carrier instead of the intended receive output.")
+        v = d[k]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"receive wallet bundle: '{k}' must be a "
+                             f"non-negative integer, got {v!r}")
+    return d
+
+
+# ---------------------------------------------------------------------------
 #  Sensitive data scrubbing
 # ---------------------------------------------------------------------------
 
