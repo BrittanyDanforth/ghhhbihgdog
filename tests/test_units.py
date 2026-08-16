@@ -196,31 +196,30 @@ check("fanout: DAG-off sum still within budget",
       sum(_amts_off) <= Decimal("0.01") * ghost.FANOUT_SPEND_FRACTION)
 
 # ---------------------------------------------------------------------------
-# GhostSpiral.select_fanout_targets: decoys are FUNDED dead-ends (fake trails)
+# GhostSpiral.select_fanout_targets: EVERY output hops (Kerckhoffs — no output
+# has a behavioural tell an analyst could use even with the full source).
 # ---------------------------------------------------------------------------
-_mix = ["M0", "M1", "M2", "D0", "D1"]          # 3 real + 2 decoy (pre-shuffled)
+_mix = ["M0", "M1", "M2", "D0", "D1"]          # 3 real + 2 extra (pre-shuffled)
 _decoys = {"D0", "D1"}
 _fd, _hs = ghost.select_fanout_targets(_mix, _decoys, wallets=3, num_decoys=2)
-check("decoy: fan-out funds real AND decoy outputs (padded output count)",
+check("fanout: funds wallets + extra outputs (padded output count)",
       len(_fd) == 5 and all(d in _fd for d in _decoys))
-check("decoy: decoys are FUNDED so they appear on-chain",
-      "D0" in _fd and "D1" in _fd)
-check("decoy: decoys NEVER hop (they dead-end)",
-      not any(d in _hs for d in _decoys))
-check("decoy: every real mix output DOES hop",
-      all(m in _hs for m in ["M0", "M1", "M2"]))
-check("decoy: hop count < fan-out count (analyst can't match outputs to hops)",
-      len(_hs) < len(_fd))
-# The old bug this replaces: capping the fan-out at `wallets` left decoys unfunded.
+check("fanout: EVERY output hops — no dead-end class a public-code analyst can filter",
+      sorted(_hs) == sorted(_fd))
+check("fanout: the extra ('decoy') outputs hop exactly like the rest",
+      all(d in _hs for d in _decoys))
+check("fanout: hop count == fan-out count (no output-vs-hop discrepancy to exploit)",
+      len(_hs) == len(_fd))
+# num_decoys=0 => exactly `wallets` wide.
 _fd_bug, _ = ghost.select_fanout_targets(_mix, _decoys, wallets=3, num_decoys=0)
-check("decoy: with num_decoys=0 the fan-out is exactly `wallets` wide",
+check("fanout: num_decoys=0 gives exactly `wallets` outputs",
       len(_fd_bug) == 3)
-# Never exceeds what actually exists.
+# Never exceeds what actually exists, and those still all hop.
 _fd_cap, _hs_cap = ghost.select_fanout_targets(["M0", "D0"], {"D0"}, wallets=10, num_decoys=4)
-check("decoy: fan-out never exceeds available subaddresses",
-      _fd_cap == ["M0", "D0"] and _hs_cap == ["M0"])
-check("decoy: NUM_DECOYS constant is positive (feature is on)",
-      ghost.NUM_DECOYS > 0)
+check("fanout: never exceeds available subaddresses; all still hop",
+      _fd_cap == ["M0", "D0"] and sorted(_hs_cap) == ["D0", "M0"])
+check("fanout: extra-output count is a RANGE, not a fixed fingerprint",
+      ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
 
 # ---------------------------------------------------------------------------
 # GhostSpiral.build_peel_plan: N single-dest peels, carrier = ENTRY then subaddr 0

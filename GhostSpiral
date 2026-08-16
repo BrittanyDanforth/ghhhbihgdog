@@ -24,7 +24,7 @@ OPSEC hardening (v10.5):
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, os, re, sys, time, subprocess
+import argparse, json, os, re, sys, time, subprocess, secrets
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import List
@@ -56,7 +56,16 @@ SWAPKIT_API = "https://api.swapkit.dev"
 
 MIN_WALLETS = 3
 MIN_DEEP = 1
-NUM_DECOYS = 4
+# Extra mix outputs beyond `wallets`, chosen RANDOMLY per run within this range.
+# A fixed count (the old NUM_DECOYS = 4) makes the total output count a
+# deterministic function of `wallets` -- so with public code, seeing 44 outputs
+# tells the analyst wallets=40 (a named preset). A per-run random count in
+# [DECOY_MIN, DECOY_MAX] breaks that: the output count no longer reveals the
+# setting. These extra outputs are NOT dead-ends -- they hop like every other
+# output (see select_fanout_targets), so they add real, indistinguishable
+# volume rather than a filterable class.
+DECOY_MIN = 2
+DECOY_MAX = 7
 
 # Fallback fee: conservative estimate for typical 2-input/2-output Monero TX.
 # Updated periodically; safe to overshoot slightly (operator keeps the change).
@@ -271,21 +280,27 @@ def select_fanout_targets(mix_targets: list, decoy_addrs: set,
     Returns (fanout_dests, hop_sources). Extracted from stage 4 so a test drives
     the real selection instead of a copy.
 
-    fanout_dests INCLUDES decoys: they are funded so they become real on-chain
-    outputs. hop_sources EXCLUDES decoys: they dead-end. The result is that the
-    fan-out shows wallets+num_decoys outputs, but only the real ones continue on
-    the mixing path -- an analyst reading the transaction graph cannot tell
-    which fan-out outputs are live and which stop. Capping the fan-out at
-    `wallets` (the old behaviour) left the decoys unfunded, so they produced no
-    on-chain output and hid nothing.
+    KERCKHOFFS: this must hold even when the algorithm is fully public. An
+    EARLIER design funded `num_decoys` extra outputs and then had them DEAD-END
+    (excluded from hop_sources). That is self-defeating once the code is known:
+    the rule "decoys never hop" means an analyst who reads it -- or simply
+    waits out the one confirmation-gated hop round (~20 min) -- identifies the
+    decoys as exactly the outputs that never moved, filters them, and follows
+    only the ones that hopped. A behavioural class marker ("this output type
+    never moves") is a trace recipe the moment the algorithm is public.
 
-    mix_targets is expected pre-shuffled by the caller, so decoys are
-    interspersed among the real destinations rather than clustered at the end.
+    So EVERY fan-out output hops: hop_sources == fanout_dests. Decoys are not a
+    distinguishable class; they are simply extra mix outputs indistinguishable
+    from the rest, and knowing there are `num_decoys` of them reveals nothing
+    about WHICH outputs they are or where the funds go. `decoy_addrs` is
+    accepted for signature compatibility but no longer changes behaviour.
+
+    mix_targets is expected pre-shuffled by the caller.
     """
     target_count = wallets + num_decoys
     fanout_count = min(len(mix_targets), target_count)
     fanout_dests = list(mix_targets[:fanout_count])
-    hop_sources = [s for s in fanout_dests if s not in decoy_addrs]
+    hop_sources = list(fanout_dests)     # every output hops -- no dead-end tell
     return fanout_dests, hop_sources
 
 
@@ -786,8 +801,11 @@ def main():
             decoy_addrs.add(addr)
         return subs, addr_index, decoy_addrs
 
+    # Random per-run extra-output count, so the total (wallets + this) is not a
+    # deterministic fingerprint of the `wallets` setting under public code.
+    _num_decoys = secrets.SystemRandom().randint(DECOY_MIN, DECOY_MAX)
     subs, addr_index, decoy_addrs = create_subs(
-        rpc_primary, args.wallets, NUM_DECOYS, acct_idx=sub_account)
+        rpc_primary, args.wallets, _num_decoys, acct_idx=sub_account)
     if len(subs) < MIN_WALLETS + 1:
         sys.exit("[!] Failed to create enough subaddresses")
 
@@ -985,14 +1003,11 @@ def main():
     # mix subaddress. Fan-out sources from ENTRY, which is already funded and
     # confirmed, so this round can always be created in one batch.
     mix_targets = [s for s in subs if s != ENTRY]
-    # Fund the decoys TOO, not just args.wallets of them: the decoys are only
-    # anti-analysis if they are real on-chain outputs the operator's intended
-    # split hides among. Capping at args.wallets left them empty (see
-    # create_subs). The count is the number of outputs an analyst can see, so a
-    # bigger, decoy-padded count is the whole point. hop_sources_real excludes
-    # the decoys, which dead-end.
+    # Fund wallets + a random number of extra outputs; ALL of them hop (no
+    # dead-end tell). hop_sources_real == fanout_dests, so no output is a
+    # distinguishable class under public code.
     fanout_dests, hop_sources_real = select_fanout_targets(
-        mix_targets, decoy_addrs, args.wallets, NUM_DECOYS)
+        mix_targets, decoy_addrs, args.wallets, _num_decoys)
     fanout_count = len(fanout_dests)
     if fanout_count <= 0:
         # Guard the divisor. mix_targets excludes ENTRY, so a degenerate
@@ -1100,14 +1115,10 @@ def main():
         # Reserve and hop both come from the shared helpers, so the number
         # printed below is the number the arithmetic actually used.
         _hop_reserve = hop_fee_reserve(fee_xmr)
-        # Decoys are funded fan-out outputs that DEAD-END: they never hop. So
-        # the fan-out shows args.wallets+NUM_DECOYS outputs, but only the real
-        # mix outputs continue onward -- an analyst cannot tell from the graph
-        # which fan-out outputs are on the live mixing path and which stop.
-        hop_sources = list(hop_sources_real)   # already excludes decoys
-        _decoys_funded = len(funded_targets) - len(hop_sources)
-        if _decoys_funded:
-            print(f"  [*] {_decoys_funded} decoy dead-end output(s) funded; they do NOT hop.")
+        # EVERY fan-out output hops -- no output has a behavioural tell that a
+        # public-code analyst could use to separate "decoy" from "real" (see
+        # select_fanout_targets). hop_sources_real is all of them.
+        hop_sources = list(hop_sources_real)
         _secrets.SystemRandom().shuffle(hop_sources)
         _unfundable = 0
         for s in hop_sources:
