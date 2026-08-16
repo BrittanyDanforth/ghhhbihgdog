@@ -20,6 +20,10 @@ python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-d
                                     #   migration, manifest trust boundary
 python3 tests/test_gapfixes.py      # paranoia_mode MAC-spoof restore + MAC-not-logged,
                                     #   exit_strategy_simulator --redact
+python3 tests/test_swap_receive.py  # MONEY PATH: the swap memo must name your own
+                                    #   XMR address, catastrophic slippage must
+                                    #   abort, and the receive subaddress must be
+                                    #   confirmed by the wallet itself
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)

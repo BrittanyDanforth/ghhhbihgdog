@@ -43,6 +43,7 @@ ACTIONS = {
     "ipleak":      {**suite("test_ipleak", "proxy scheme, egress guards, localhost spoofing"), "group": "Offline suites"},
     "broadcast":   {**suite("test_broadcast", "relay loop: delays, resume, manifest boundary"), "group": "Offline suites"},
     "gapfixes":    {**suite("test_gapfixes", "MAC-spoof restore/leak, exit-sim --redact"), "group": "Offline suites"},
+    "swaprecv":    {**suite("test_swap_receive", "swap memo binding, slippage stop, receive addr"), "group": "Offline suites"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},

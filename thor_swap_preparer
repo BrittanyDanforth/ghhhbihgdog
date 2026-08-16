@@ -7,14 +7,24 @@ can consume later.
 
 OPSEC hardening:
   - Tor verified with retry before any API contact
-  - NEWNYM circuit rotation between each quote request
+  - NEWNYM circuit rotation ENFORCED between each quote request (a silent
+    rotation failure would put every quote on one circuit, which is exactly
+    the correlation the rotation exists to break)
   - Timing jitter between quotes to frustrate correlation
   - XMR destination addresses validated (regex + checksum)
-  - BTC deposit addresses validated (bech32 format check)
-  - Slippage oracle cross-check with 5% deviation warning
+  - BTC deposit addresses validated (full BIP173/BIP350 checksum + witness)
+  - The returned MEMO is checked to actually carry your destination address
+  - Slippage oracle cross-check: warns at 5%, refuses past --max-slippage
   - Atomic fsync-rename on all output files (0600 perms)
   - GPG encryption support with import guard
   - Integrity hash-chain per pair
+
+WHAT THIS TOOL NECESSARILY DISCLOSES: the swap aggregator is told your XMR
+destination address and the BTC amount, and it returns the deposit address the
+sender will pay. That party can therefore link "this BTC deposit" to "this XMR
+address". Tor hides WHO asked; it does not hide the linkage itself. The
+GhostSpiral hops after the swap exist precisely because this first hop is
+known to a third party -- do not treat the swap destination as private.
 """
 from __future__ import annotations
 import argparse, json, os, sys, time, re
@@ -78,6 +88,35 @@ def _validate_xmr_addr(addr: str) -> None:
         sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
 
 
+def _memo_binds_destination(memo: str, dest: str) -> bool:
+    """Does this swap memo actually route the output to `dest`?
+
+    THIS IS THE ONLY THING THAT BINDS THE SWAP TO YOUR ADDRESS. The BTC the
+    sender pays goes to a ThorChain inbound vault, not to you; the memo in that
+    transaction is what tells the network where to deliver the XMR. A memo
+    naming a different address sends the proceeds to whoever that address
+    belongs to, and the payment is irreversible.
+
+    THORChain swap memos carry the destination inline, e.g.
+        =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<fee>
+    (and the long form SWAP:XMR.XMR:<dest>:...), so a memo that does not
+    contain the address we asked for is not a memo for us. Some aggregators
+    return the memo hex-encoded for the OP_RETURN, so the hex form counts too.
+    """
+    if not memo or not dest:
+        return False
+    m = memo.strip()
+    if dest in m:
+        return True
+    # Hex-encoded OP_RETURN payload (with or without an 0x prefix).
+    compact = m[2:] if m[:2].lower() == "0x" else m
+    try:
+        decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
+    except ValueError:
+        return False
+    return dest in decoded
+
+
 def main():
     install_signal_handlers()
 
@@ -93,8 +132,21 @@ def main():
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
                     help="GPG recipient for encrypted output")
+    ap.add_argument("--max-slippage", type=Decimal, default=Decimal("0.25"),
+                    help="refuse a quote deviating more than this fraction from the "
+                         "price oracle (default 0.25 = 25%%). A 5%% deviation still "
+                         "only warns; this is the hard stop. Ignored when the oracle "
+                         "is unreachable, which disables the cross-check entirely.")
+    ap.add_argument("--allow-unbound-memo", action="store_true",
+                    help="proceed even when the returned memo does not contain your "
+                         "XMR destination address. ONLY for a genuine aggregator "
+                         "format change -- normally this means the swap would "
+                         "deliver to someone else's address.")
     ap.add_argument("--outfile", default="thor_pairs_batch.json")
     args = ap.parse_args()
+
+    if args.max_slippage <= 0:
+        sys.exit("[!] --max-slippage must be positive.")
 
     if len(args.amounts) != len(args.dests):
         sys.exit(f"[!] Mismatch: {len(args.amounts)} amounts vs {len(args.dests)} dests")
@@ -127,9 +179,13 @@ def main():
             integrity_log("thor", f"shutdown_at_pair_{i}")
             break
 
-        # Rotate circuit between quotes
+        # Rotate circuit between quotes. required=True: a silently-failed
+        # rotation puts every quote in the batch on ONE circuit, so the
+        # aggregator sees one client asking for N swaps -- the exact
+        # correlation the rotation is here to break. The header claims this
+        # rotation happens, so it must not be best-effort.
         if i > 0 and proxy:
-            newnym()
+            newnym(required=True)
             secure_delay(3.0, 8.0)
 
         # SwapKit v3 API (replaces defunct thorswap aggregator)
@@ -187,10 +243,47 @@ def main():
             sys.exit(f"[!] Deposit address failed bech32 checksum validation: "
                      f"{scrub_address(deposit)} — refusing to instruct a BTC send to it.")
 
+        # THE MEMO IS THE ONLY BINDING between this swap and our address. The
+        # deposit address is a shared ThorChain inbound vault -- paying it with
+        # a memo naming someone else's address delivers the XMR to them, and
+        # the tool would have printed those instructions itself. Checked here,
+        # before the pair is recorded or shown to the sender.
+        if not memo:
+            integrity_log("thor", f"no_memo_{i}")
+            sys.exit(
+                f"[!] Pair {i}: the quote returned NO memo. A BTC->XMR swap is routed\n"
+                f"    entirely by the memo -- BTC sent to the inbound address without\n"
+                f"    one is not routed to you. Refusing to issue sender instructions."
+            )
+        if not _memo_binds_destination(memo, dest):
+            integrity_log("thor", f"memo_dest_mismatch_{i}")
+            if not args.allow_unbound_memo:
+                sys.exit(
+                    f"[!] Pair {i}: the returned memo does NOT contain your XMR\n"
+                    f"    destination {scrub_address(dest)}.\n"
+                    f"    The memo is what tells ThorChain where to deliver the XMR, so\n"
+                    f"    following these instructions could pay someone else and the\n"
+                    f"    payment is irreversible. Refusing.\n"
+                    f"    Override only if you have verified the memo by hand: "
+                    f"--allow-unbound-memo"
+                )
+            print(f"  [!] Pair {i}: memo does not name your destination — continuing "
+                  f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
+
         # Slippage check
         oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
         if oracle_xmr > 0:
             deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
+            if deviation > args.max_slippage:
+                integrity_log("thor", f"slippage_ABORT_{i}:dev={deviation:.4f}")
+                sys.exit(
+                    f"[!] Pair {i}: the quote is {deviation * 100:.1f}% away from the price\n"
+                    f"    oracle ({expected_xmr} XMR quoted vs ~{oracle_xmr:.4f} expected),\n"
+                    f"    past the --max-slippage limit of {args.max_slippage * 100:.0f}%.\n"
+                    f"    That is either a bad route or a stale/incorrect oracle -- either\n"
+                    f"    way, not something to hand a sender unexamined.\n"
+                    f"    Raise --max-slippage only after checking the rate yourself."
+                )
             if deviation > Decimal("0.05"):
                 print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
                 integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
@@ -225,10 +318,11 @@ def main():
         print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
         print(f"  Send exactly: {pair['btc_in']} BTC")
         print(f"  To address:   {pair['deposit']}")
-        if pair.get("memo"):
-            print(f"  With memo:    {pair['memo']}")
-        else:
-            print(f"  Memo:         (none required)")
+        # A pair with no memo never reaches this point -- it aborts at the
+        # quote. The old "(none required)" branch was actively dangerous: for
+        # BTC->XMR the memo is mandatory, so telling a sender none was needed
+        # would have cost them the payment.
+        print(f"  With memo:    {pair['memo']}")
         print(f"  Expected XMR: ~{pair['expected_xmr']}")
     print()
     print("  ============================================================")

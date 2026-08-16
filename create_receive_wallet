@@ -10,12 +10,23 @@ GhostSpiral reaches the funds through the same wallet-rpc endpoint.
 
 OPSEC hardening:
   - Tor leak check before RPC contact
-  - NEWNYM after wallet creation to break timing correlation
-  - Output files written 0600 (owner-only)
-  - Addresses scrubbed in terminal output
+  - NEWNYM after subaddress creation to break timing correlation
+  - Output files written 0600 (owner-only), output dir 0700
+  - Addresses scrubbed in the INTEGRITY LOG (see below re: the terminal)
   - Integrity hash-chain for every wallet event
   - Atomic JSON writes with fsync
   - Resource sentinel
+
+CORRECTNESS: the address this prints is where money will be sent, so it is not
+taken on the RPC's word. After creation the wallet is asked to resolve the
+index back to an address and to validate that address, and the two must agree
+with what new_address returned. A wrong or substituted address here would be
+copied into a swap memo and paid to someone else, irreversibly.
+
+THE FULL ADDRESS IS PRINTED, deliberately -- this header used to claim
+"Addresses scrubbed in terminal output" while printing it in full on the very
+next line. The operator has to read the address to use it, so it is shown; the
+scrubbed form is what goes into the persistent integrity log.
 """
 from __future__ import annotations
 import argparse, sys, time
@@ -26,6 +37,87 @@ from gs_common import (
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
 )
+
+
+def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
+    """Confirm the wallet really owns `addr_str` at account 0 / index `sub_idx`.
+
+    Everything downstream treats this string as "where my money arrives": it is
+    printed for the operator, written into the gs_receive_wallet_v1 bundle, and
+    pasted into a ThorChain swap memo. Until this check existed the string was
+    accepted purely on the RPC's say-so, so a misdirected endpoint, a stale
+    wallet, or a tampered response would have been copied straight into a swap
+    the operator could not reverse.
+
+    Two independent confirmations, both from the wallet itself:
+      * get_address(account_index=0, address_index=[sub_idx]) must resolve the
+        index back to the SAME address -- proving the wallet holds it there.
+      * validate_address must call it a valid, non-integrated SUBADDRESS on
+        this wallet's own network -- catching a mainnet/testnet mix-up and an
+        address that is well-formed but of the wrong kind.
+    """
+    try:
+        res = wallet_rpc.raw_request("get_address", {
+            "account_index": 0, "address_index": [int(sub_idx)],
+        })
+        entries = (res or {}).get("addresses") or []
+    except Exception as e:
+        integrity_log("wallet", "addr_readback_failed")
+        sys.exit(
+            f"[!] Could not read the new subaddress back from the wallet ({str(e)[:60]}).\n"
+            f"    Refusing to hand you an address the wallet has not confirmed it owns."
+        )
+
+    match = [e for e in entries if e.get("address_index") == int(sub_idx)]
+    if not match:
+        integrity_log("wallet", "addr_readback_missing_index")
+        sys.exit(
+            f"[!] The wallet does not report a subaddress at index {sub_idx}.\n"
+            f"    Refusing to use an address the wallet cannot confirm."
+        )
+    if match[0].get("address") != addr_str:
+        integrity_log("wallet", "ADDR_READBACK_MISMATCH")
+        sys.exit(
+            f"[!] ADDRESS MISMATCH. new_address returned\n"
+            f"      {scrub_address(addr_str)}\n"
+            f"    but the wallet reports index {sub_idx} as\n"
+            f"      {scrub_address(match[0].get('address'))}\n"
+            f"    Do NOT use either. The wallet-rpc endpoint may be wrong or tampered\n"
+            f"    with; money sent to an unverified address cannot be recovered."
+        )
+
+    try:
+        v = wallet_rpc.raw_request("validate_address", {
+            "address": addr_str, "any_net_type": False, "allow_openalias": False,
+        }) or {}
+    except Exception as e:
+        integrity_log("wallet", "addr_validate_unavailable")
+        # Older wallet-rpc builds lack validate_address. The read-back above
+        # already proved ownership, so this is a downgrade in assurance, not a
+        # failure -- say exactly that rather than implying a full check ran.
+        print(f"  [!] validate_address unavailable ({str(e)[:50]}); the address was "
+              f"confirmed by index read-back only.")
+        return
+
+    if not v.get("valid"):
+        integrity_log("wallet", "addr_invalid")
+        sys.exit(f"[!] The wallet rejects its own new address as invalid. Refusing.")
+    if v.get("integrated"):
+        integrity_log("wallet", "addr_integrated_unexpected")
+        sys.exit(
+            "[!] The new address is an INTEGRATED address, not a plain subaddress.\n"
+            "    GhostSpiral's receive mode expects a subaddress; refusing."
+        )
+    if not v.get("subaddress"):
+        integrity_log("wallet", "addr_not_subaddress")
+        sys.exit(
+            "[!] The wallet says this is not a subaddress. It is probably the\n"
+            "    wallet's primary address, which would defeat the per-hop isolation\n"
+            "    the receive flow depends on. Refusing."
+        )
+    integrity_log("wallet", f"addr_verified:idx={sub_idx}:{v.get('nettype', '?')}")
+    print(f"  [+] Address verified against the wallet "
+          f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
 
 
 def main():
@@ -77,6 +169,8 @@ def main():
         account_index=0, label=args.label,
     )
 
+    verify_receive_address(wallet_rpc, addr_str, sub_idx)
+
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
     out = {
@@ -95,14 +189,15 @@ def main():
     atomic_write_json(out, fname)
 
     print(f"  [+] Receive subaddress bundle saved -> {fname}")
-    print(f"  [+] Address (full): {addr_str}")
+    print(f"  [+] Address: {addr_str}")
     print(f"  [+] Subaddress index: {sub_idx} (account 0)")
-    print(f"  [+] Address (scrubbed): {scrub_address(addr_str)}")
 
     integrity_log("wallet", f"saved:{fname.name}")
 
-    if proxy:
-        newnym()
+    # required=True: the header claims this rotation happens, and a silent
+    # failure leaves the subaddress creation on the same circuit as whatever
+    # follows it -- which is the correlation the rotation exists to break.
+    newnym(required=True)
 
     print(f"  [+] Integrity chain updated.")
     print()
