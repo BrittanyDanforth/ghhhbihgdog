@@ -658,6 +658,8 @@ def test_receive_is_btc_to_monero():
           "sender pays Bitcoin" in seg)
     check("the receive step warns the XMR address is NOT what the sender gets",
           "not the address you give the sender" in seg)
+    check("step 1 receive card is BTC→XMR, not leftover XMR-in",
+          "Receive · BTC → XMR" in src and "Receive · XMR in" not in src)
 
 
 def test_daemon_detection_fixes_no_estimate():

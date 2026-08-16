@@ -1155,8 +1155,8 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         <span class="ct">Send · BTC → XMR</span>
         <span class="cd">Swap your BTC to Monero through ThorChain, then mix it across fresh subaddresses.</span></button>
       <button class="choice" data-m="receive" aria-pressed="false">
-        <span class="ct">Receive · XMR in</span>
-        <span class="cd">Make a fresh receive address for a sender, then mix the Monero once it arrives.</span></button>
+        <span class="ct">Receive · BTC → XMR</span>
+        <span class="cd">A sender pays Bitcoin. You get a deposit address and memo, then mix the Monero once it arrives.</span></button>
     </div>
     <div class="stepnav"><span></span><button class="nx" data-go="2">Next →</button></div>
   </section>
