@@ -511,7 +511,18 @@ def mandatory_preflight(params: dict) -> dict:
     same things at its own Stage 0 — this is a deliberate second, independent
     gate at the console layer, not a replacement for it.
     """
-    gs = _gs_common()
+    try:
+        gs = _gs_common()
+    except Exception as e:                              # noqa: BLE001
+        # gs_common pulls in tenacity / stem / requests / PySocks. If a
+        # dependency is not installed, say so clearly and BLOCK the spend
+        # (ok=False) rather than throw a raw 500 the operator cannot read.
+        missing = str(e)
+        hint = ("install the requirements: pip install -r requirements.txt"
+                if "No module named" in missing else missing[:120])
+        return {"ok": False, "checks": {"deps": {
+            "ok": False,
+            "detail": f"console cannot load its dependencies — {hint}"}}}
     checks: dict = {}
     tor = (params.get("tor_proxy") or "").strip()
     if not tor:
