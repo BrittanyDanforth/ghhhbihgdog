@@ -30,6 +30,10 @@ class FakeRPC:
     def __init__(self): self.calls = []
     def raw_request(self, method, params):
         self.calls.append((method, params))
+        if method == "export_outputs":
+            # phase_create exports the wallet output set so the OFFLINE wallet
+            # can later sign a spend of an output an earlier round created.
+            return {"outputs_data_hex": "aabbcc"}
         return {"unsigned_txset": "deadbeef"}  # non-empty hex-ish
 
 airgap.verify_tor = lambda *a, **k: None
@@ -49,8 +53,15 @@ args = types.SimpleNamespace(tor_proxy="socks5h://127.0.0.1:9050",
                              fee_priority=2)
 airgap.phase_create(args, plan, {"account_index": 5})
 
-check("phase_create: issued 2 transfer_split calls", len(fake.calls) == 2)
-fanout_params = fake.calls[0][1]
+_splits = [c for c in fake.calls if c[0] == "transfer_split"]
+check("phase_create: issued 2 transfer_split calls", len(_splits) == 2)
+# The multi-round cold-signing fix: without this export the offline wallet
+# cannot sign a DAG hop / peel that spends an output an earlier round made.
+check("phase_create: also exports the wallet outputs for offline signing",
+      any(c[0] == "export_outputs" for c in fake.calls))
+check("phase_create: writes the outputs export into the staging dir",
+      (Path(args.outdir) / airgap.OUTPUTS_EXPORT_NAME).exists())
+fanout_params = _splits[0][1]
 check("phase_create: fan-out is ONE call with 3 destinations",
       len(fanout_params["destinations"]) == 3)
 check("phase_create: fan-out atomic amounts correct",
@@ -63,7 +74,7 @@ check("phase_create: priority passed through",
       fanout_params["priority"] == 2)
 check("phase_create: do_not_relay set",
       fanout_params["do_not_relay"] is True)
-hop_params = fake.calls[1][1]
+hop_params = _splits[1][1]
 check("phase_create: dag hop is single dest atomic",
       hop_params["destinations"] == [{"amount": 250_000_000_000, "address": "M2"}])
 check("phase_create: dag hop subaddr_indices = [11]",

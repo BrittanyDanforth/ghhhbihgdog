@@ -29,7 +29,7 @@ Usage:
       --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, sys, time, shutil
+import argparse, json, subprocess, hashlib, os, sys, time, shutil, tempfile
 from pathlib import Path
 from decimal import Decimal
 from typing import List
@@ -114,6 +114,12 @@ def _load_unsigned(path: Path) -> tuple:
 #: Bump when the fingerprint's covered fields or encoding change, so a stale
 #: manifest fails the comparison loudly instead of colliding by accident.
 PLAN_FP_VERSION = "gs-planfp-v2"
+
+#: Wallet output set exported by phase_create and imported by phase_sign, so the
+#: OFFLINE wallet can sign a spend of an output an earlier round created (a DAG
+#: hop's fan-out output, a peel's change). Without it those signatures fail with
+#: "Imported outputs omit more outputs that we know of".
+OUTPUTS_EXPORT_NAME = "outputs_export.hex"
 
 
 def _canonical_plan(plan: List[dict]) -> list:
@@ -356,6 +362,40 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] TX {idx} failed: {str(e)[:80]}")
             failed += 1
 
+    # ---- Output export for MULTI-ROUND cold signing -----------------------
+    # The offline wallet can only sign a spend of an output it KNOWS. It last
+    # synced before it went offline, so it has no record of any output created
+    # by an earlier round of this run -- the fan-out outputs a DAG hop spends,
+    # or the change a peel spends. Signing one of those fails with
+    #   "Failed to sign transaction: Imported outputs omit more outputs that we
+    #    know of. Try using export_outputs all."
+    # verified against real monero-wallet-cli 0.18. That made the DAG round --
+    # and the peel chain -- unsignable in the cold configuration this tool is
+    # built around: the failure lands AFTER the previous round already spent
+    # real fees on-chain.
+    #
+    # So export the online wallet's full output set here; phase_sign imports it
+    # into the offline wallet before signing. Verified end-to-end: with the
+    # import the round-2 signature succeeds and relays.
+    try:
+        _exp = rpc.raw_request("export_outputs", {"all": True}) or {}
+        _blob = _exp.get("outputs_data_hex", "")
+        if _blob:
+            secure_write_text(outdir / OUTPUTS_EXPORT_NAME, _blob)
+            integrity_log("signer", "outputs_exported")
+            print(f"  [+] Exported wallet outputs for offline signing "
+                  f"({OUTPUTS_EXPORT_NAME})")
+        else:
+            integrity_log("signer", "outputs_export_empty")
+            print("  [!] export_outputs returned nothing. Signing a round that spends "
+                  "an output created by an EARLIER round will fail on the offline "
+                  "wallet.")
+    except Exception as e:                                  # noqa: BLE001
+        integrity_log("signer", f"outputs_export_fail:{str(e)[:40]}")
+        print(f"  [!] Could not export wallet outputs ({str(e)[:60]}). A first-round "
+              f"sign still works, but a DAG/peel round that spends this round's "
+              f"outputs will fail offline.")
+
     # Write manifest
     manifest_path = outdir / "unsigned_manifest.json"
     atomic_write_json({
@@ -445,6 +485,72 @@ def phase_sign(args, plan: List[dict]):
     signed_dir = outdir / "signed"
     secure_mkdir(signed_dir)      # owner-only; see phase_create's note
 
+    # ---- Teach the OFFLINE wallet about outputs created by earlier rounds ---
+    # See OUTPUTS_EXPORT_NAME. Without this, signing any round that spends an
+    # output an earlier round created (a DAG hop spending a fan-out output, a
+    # peel spending the previous peel's change) fails on real wallet-cli with
+    # "Imported outputs omit more outputs that we know of". import_outputs
+    # persists to the wallet cache, so one invocation before the signing loop
+    # covers every TX in this round.
+    _outs = outdir / OUTPUTS_EXPORT_NAME
+    if _outs.exists():
+        _iw = tempfile.mkdtemp(prefix="gs_impout_")
+        _ipw = None
+        try:
+            _blob_path = Path(_iw) / "outputs_blob"
+            try:
+                _blob_path.write_bytes(bytes.fromhex(_outs.read_text().strip()))
+            except ValueError:
+                _blob_path = None
+                print(f"  [!] {OUTPUTS_EXPORT_NAME} is not valid hex; skipping "
+                      f"output import. A round spending an earlier round's "
+                      f"outputs will fail to sign.")
+            if _blob_path is not None:
+                _pfd, _ipw = tempfile.mkstemp(prefix=".gs_pw_", dir=_iw)
+                try:
+                    os.fchmod(_pfd, 0o600)
+                    os.write(_pfd, (args.wallet_password or "").encode())
+                finally:
+                    os.close(_pfd)
+                _r = subprocess.run(
+                    [args.wallet_cli, "--wallet-file", wallet_file,
+                     "--password-file", _ipw,
+                     "--command", "import_outputs", str(_blob_path)],
+                    capture_output=True, text=True, timeout=300, cwd=_iw,
+                    input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
+                )
+                _txt = (_r.stdout or "") + (_r.stderr or "")
+                if "outputs imported" in _txt:
+                    n = _txt.split("outputs imported")[0].strip().split()[-1]
+                    integrity_log("signer", "outputs_imported")
+                    print(f"  [+] Imported {n} wallet outputs into the offline wallet "
+                          f"(needed to sign spends of earlier rounds' outputs).")
+                else:
+                    integrity_log("signer", "outputs_import_unconfirmed")
+                    print(f"  [!] import_outputs did not confirm success. If this round "
+                          f"spends an output an earlier round created, signing will "
+                          f"fail. Last output: {_txt.strip()[-160:]}")
+        except subprocess.TimeoutExpired:
+            integrity_log("signer", "outputs_import_timeout")
+            print("  [!] import_outputs timed out.")
+        except Exception as e:                              # noqa: BLE001
+            integrity_log("signer", f"outputs_import_fail:{str(e)[:40]}")
+            print(f"  [!] import_outputs failed: {str(e)[:80]}")
+        finally:
+            if _ipw:
+                secure_delete_file(Path(_ipw))
+            try:
+                for _lf in sorted(Path(_iw).rglob("*"), reverse=True):
+                    if _lf.is_file() or _lf.is_symlink():
+                        secure_delete_file(_lf)
+            except OSError:
+                pass
+            shutil.rmtree(_iw, ignore_errors=True)
+    else:
+        print(f"  [*] No {OUTPUTS_EXPORT_NAME} in the staging dir. Fine for a first "
+              f"round; a DAG/peel round that spends an earlier round's outputs "
+              f"needs it (phase_create writes it).")
+
     signed_manifest = []
     signed_count = 0
 
@@ -471,7 +577,9 @@ def phase_sign(args, plan: List[dict]):
 
         # Write unsigned data to a temp location wallet-cli can find
         # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
-        import tempfile
+        # (tempfile is imported at module scope -- a function-local `import
+        # tempfile` here made the name local to the WHOLE function, so the
+        # output-import block above raised UnboundLocalError.)
         work_dir = tempfile.mkdtemp(prefix="gs_sign_")
         pw_files: list = []      # password files to securely erase in `finally`
         try:

@@ -1198,14 +1198,29 @@ def main():
     staging_dir = "tx_staging"
 
     try:  # ensures lock file is cleaned even on error
-        _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
-                    staging_dir, proxy, usable, distribution_mode=distribution_mode,
-                    change_target=(bal_account, 0))
+        incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
+                                 staging_dir, proxy, usable,
+                                 distribution_mode=distribution_mode,
+                                 change_target=(bal_account, 0))
     finally:
         if lock_path.exists():
             lock_path.unlink()
 
-    print("\n  [+] GhostSpiral v10.5 pipeline complete.")
+    # Honest completion. This used to print "pipeline complete." unconditionally,
+    # so a peel chain that stopped partway or a DAG round that was skipped still
+    # read as a finished mix -- the same fake-success pattern already removed
+    # from paranoia_mode. Say what actually happened.
+    print()
+    if incomplete:
+        integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
+        print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
+        for _w in incomplete:
+            print(f"      - {_w}")
+        print("  [!] Funds are safe in the wallet, but do NOT assume the full "
+              "mixing depth was applied.")
+        sys.exit(1)
+    integrity_log("main", "pipeline_complete")
+    print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.
@@ -1568,8 +1583,16 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
     then the exit-strategy simulation."""
     # -- Distribution: fan-out (one tx) or peel chain (N gated txs) --------
+    incomplete = []
     if distribution_mode == "peel":
-        _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
+        try:
+            with open(fanout_file) as _pf:
+                _total_peels = len(json.load(_pf).get("txs", []))
+        except Exception:
+            _total_peels = 0
+        _relayed = _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
+        if _total_peels and _relayed < _total_peels:
+            incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
@@ -1584,6 +1607,9 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             _run_round(args, dag_file, f"{staging_dir}/dag", "DAG")
         else:
             integrity_log("stage5", "dag_round_skipped:unconfirmed")
+            incomplete.append("DAG hop round was SKIPPED (the distribution outputs "
+                              "did not confirm in time) — the second mixing round "
+                              "did not happen")
 
     newnym()
     secure_delay(5.0, 15.0)
@@ -1601,7 +1627,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
         print(f"  [!] Exit simulation failed (non-fatal): {e}")
 
-    integrity_log("stage5", "full_pipeline_complete")
+    integrity_log("stage5", f"stage5_done:incomplete={len(incomplete)}")
+    return incomplete
 
 
 if __name__ == "__main__":
