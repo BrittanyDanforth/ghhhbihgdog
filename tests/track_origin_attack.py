@@ -565,6 +565,107 @@ def _dests_for_amount(usable):
     return 8, 8
 
 
+def build_hardened_peel(rng, mode, n=6, usable=Decimal("12"), fee=Decimal("0.001"),
+                        wallet_id="H"):
+    """Model the ROTATING-CARRIER fix (build_peel_plan carriers=...).
+
+    Funds move ONCE off the entry (the wallet's MAIN for send, a fresh receive
+    sub for receive) onto a chain of fresh one-time carrier accounts; each peel
+    spends a carrier and its change is swept forward to the next. PRIMARY
+    (subaddr 0 / the main address) is never a carrier, a change sink, or a
+    repeated spender -- so the hub heuristics can no longer name it.
+    """
+    primary = "PRIMARY"
+    entry = primary if mode == "send" else f"RECV_SUB_{wallet_id}"
+    g = Graph(f"HARD-{mode}-peel-n{n}-u{usable}", mode, primary, entry,
+              wallet_id, usable=usable)
+    dests = [f"MIX_{i}_{rng.randrange(1 << 20):05x}" for i in range(n)]
+    amts = ghost.compute_fanout_amounts(usable, n, fee, False, rng)
+    if not amts:
+        return None
+    carriers = [f"CARRIER_{wallet_id}_{k}" for k in range(n)]
+    # The single, irreducible origin move: entry -> first carrier. For send this
+    # spends MAIN exactly once (and never again); for receive it spends the
+    # throwaway receive sub. sweep_all => no change.
+    g.add_tx([entry], [(carriers[0], usable)], "move")
+    # Drive the SHIPPED planner in rotating mode.
+    plan = ghost.build_peel_plan(entry_index=carriers[0], change_index=0,
+                                 dests=dests, amounts=amts, carriers=carriers[1:])
+    remain = usable
+    for step in plan:
+        if step.get("kind") == "peel":
+            amt = Decimal(step["amt"])
+            remain -= amt
+            g.add_tx([step["src_index"]],
+                     [(step["dst"], amt), (step["src_index"], remain)], "peel")
+        elif step.get("kind") == "forward":
+            # sweep_all src -> fresh carrier: one destination, zero change.
+            g.add_tx([step["src_index"]], [(step["carry_to"], remain)], "forward")
+    return g
+
+
+def _print_hardening_comparison(rng):
+    """Quantify the fix: legacy single-hub design vs the rotating-carrier fix,
+    % of graphs where each heuristic names the wallet's MAIN address (PRIMARY).
+    """
+    print("\n" + "=" * 72)
+    print("  THE FIX: legacy single-hub peel  vs  rotating-carrier peel")
+    print("  (% of graphs where the heuristic names the wallet's MAIN address)")
+    print("=" * 72)
+    N = 40
+    rows = []
+    for mode in ("send", "receive"):
+        legacy = []
+        hardened = []
+        for _ in range(N):
+            u = random.choice(AMOUNT_LADDER)
+            if mode == "send":
+                lg = run_send_peel(rng, n=6, dag=False, usable=u)
+            else:
+                lg = run_receive_peel(rng, n=6, dag=False, usable=u)
+            if lg:
+                legacy.append(evaluate(lg))
+            hg = build_hardened_peel(rng, mode, n=6, usable=u,
+                                     wallet_id=f"{mode[0]}{_}")
+            if hg:
+                hardened.append(evaluate(hg))
+
+        def pct(rowset, field):
+            return (100.0 * sum(1 for h, _, _ in rowset if h[field]) / len(rowset)) if rowset else 0.0
+
+        for label, field in (
+            ("genesis / first spend  -> MAIN", "genesis_is_primary"),
+            ("repeated spender        -> MAIN", "repeated_spender_is_primary"),
+            ("peel-change walk        -> MAIN", "peel_change_is_primary"),
+            ("DEEP reveal names        MAIN", "deep_reveal_is_primary"),
+        ):
+            rows.append((mode, label, pct(legacy, field), pct(hardened, field)))
+
+    print(f"\n  {'mode':<8} {'heuristic':<34} {'legacy':>8} {'fixed':>8}")
+    print("  " + "-" * 60)
+    for mode, label, leg, hard in rows:
+        print(f"  {mode:<8} {label:<34} {leg:7.0f}% {hard:7.0f}%")
+
+    # The claims, as regression-proof checks.
+    send_hard = {label: hard for m, label, leg, hard in rows if m == "send"}
+    recv_hard = {label: hard for m, label, leg, hard in rows if m == "receive"}
+    check("FIX: rotating carriers drop 'repeated spender -> MAIN' to 0% (send)",
+          send_hard["repeated spender        -> MAIN"] == 0.0)
+    check("FIX: rotating carriers drop 'peel-change walk -> MAIN' to 0% (send)",
+          send_hard["peel-change walk        -> MAIN"] == 0.0)
+    check("FIX: rotating carriers drop 'DEEP reveal names MAIN' to 0% (send)",
+          send_hard["DEEP reveal names        MAIN"] == 0.0)
+    check("FIX: receive mode never exposes MAIN at all under rotating carriers "
+          "(every heuristic 0%)",
+          all(v == 0.0 for v in recv_hard.values()))
+    print("\n  Honest limit: SEND still shows the ONE-TIME ORIGIN move off MAIN "
+          f"(genesis {send_hard['genesis / first spend  -> MAIN']:.0f}%). That is")
+    print("  irreducible with the wallet's own keys -- funds demonstrably STARTED")
+    print("  on MAIN. What the fix removes is the persistent HUB: MAIN is no longer")
+    print("  the change sink or the repeated spender, so the chain no longer")
+    print("  collapses onto the main address.")
+
+
 def _build_many(rng):
     graphs = []
     for usable in AMOUNT_LADDER:
@@ -1004,6 +1105,9 @@ def main():
     print(f"\n  graphs: {len(graphs)}  reveals: {len(REVEALS)}/{len(graphs)}")
     print(f"  SENDER uncovered:        {sp:5.1f}%  ({sh}/{sn})")
     print(f"  RECEIVER main uncovered: {rpp:5.1f}%  ({rph}/{rpn})")
+
+    _print_hardening_comparison(rng)
+
     print(f"\nRESULT: {PASS} passed, {FAIL} failed")
     if FAILURES:
         print("FAILED:", FAILURES)
