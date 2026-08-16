@@ -69,6 +69,7 @@ SCHEMA = {
     "btc_entry":    ("re", BTC_RE),
     "receive_wallet": ("re", PATH_RE),
     "pairs_file":   ("re", PATH_RE),
+    "swap_btc":     ("re", DEC_RE),
     "btc_amount":   ("re", DEC_RE),
     "split":        ("int", (1, 20)),
     "wallets":      ("int", (3, 60)),
@@ -191,6 +192,17 @@ ACTIONS = {
                                             "--rpc", p.get("rpc_primary", "http://127.0.0.1:18083"),
                                             "--tor-proxy", p.get("tor_proxy", ""),
                                             "--label", p.get("label", "GhostSpiral_entry")]},
+    # THE step that makes "receive" mean BTC -> Monero. Without it the address
+    # handed to the sender is a Monero one, so the sender must already hold XMR
+    # and the swap that the whole receive flow exists for never happens.
+    # Destination comes from the receive bundle, never a retyped address.
+    "swap_quote":      {"group": "Receive", "label": "Get the BTC deposit address", "risk": "safe",
+                        "desc": "BTC→XMR quote: the address + memo you give the sender",
+                        "build": lambda p: [PY, "thor_swap_preparer",
+                                            "--amounts", p.get("swap_btc", ""),
+                                            "--dest-from-receive-wallet", p.get("receive_wallet", ""),
+                                            "--tor-proxy", p.get("tor_proxy", ""),
+                                            "--outfile", p.get("pairs_file") or "thor_pairs.json"]},
     # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
     # never spends, so it stays a `safe` action even though it is the step
     # that decides a mix is about to happen.
@@ -502,6 +514,76 @@ def live_fees(daemon_url, tor_proxy=""):
                 "warning": ("The fee estimate could not be produced, so none is "
                             "shown. Priority still applies; the wallet computes the "
                             "real fee at signing time.")}
+
+
+#: Where monerod's RPC commonly listens. 18081 is the mainnet default; 18089 is
+#: the conventional "restricted/public" port that remote-node operators expose
+#: and that many wallets are pointed at; 28081/38081 are testnet/stagenet. An
+#: operator whose node is on any of these should not have to discover that the
+#: fee panel wanted a different number.
+DAEMON_PORTS = (18081, 18089, 28081, 38081)
+
+
+def detect_daemon(preferred: str = "", tor_proxy: str = "") -> dict:
+    """Find a monerod that will actually answer a fee estimate.
+
+    "Cannot get estimates" is almost never a broken console -- it is that no
+    daemon is listening where the field points. Rather than leaving the
+    operator to guess the port, probe the likely ones and keep whichever really
+    returns fee data, the same way the Tor proxy is detected.
+
+    Only the CONFIGURED endpoint may be remote (queried through Tor, exactly as
+    live_fees does). The probe list is loopback-only on purpose: sweeping ports
+    on anything but this machine would be scanning someone else's host.
+    """
+    try:
+        _gs_common()
+    except Exception as e:                            # noqa: BLE001
+        return {"ok": False, "daemon": None,
+                "detail": f"cannot load dependencies — {str(e)[:100]}"}
+    cands = []
+    p = (preferred or "").strip()
+    if p:
+        cands.append(p)
+    for port in DAEMON_PORTS:
+        u = f"http://127.0.0.1:{port}"
+        if u not in cands:
+            cands.append(u)
+    tried = []
+    doubtful = None
+    for url in cands:
+        try:
+            r = live_fees(url, tor_proxy)
+        except Exception:                             # noqa: BLE001
+            tried.append(url); continue
+        if r.get("ok") and r.get("xmr"):
+            # A daemon that answers is not automatically the right one. A fresh
+            # or offline chain quotes fees orders of magnitude above mainnet, and
+            # picking it just because it replied first would hand the operator
+            # invented-looking costs while a real node sat on the next port.
+            # Prefer a believable one; keep an implausible one only as a
+            # last resort, and say so rather than presenting it as found.
+            if not r.get("implausible"):
+                return {"ok": True, "daemon": url,
+                        "detail": f"monerod answering fee estimates at {url}"}
+            if doubtful is None:
+                doubtful = (url, max(r.get("xmr") or [0]))
+        tried.append(url)
+    if doubtful:
+        url, top = doubtful
+        return {"ok": True, "daemon": url,
+                "detail": (f"Only {url} answered, and it quotes up to {top} XMR per "
+                           f"~2 kB transaction — far above a real mainnet fee, so it "
+                           f"is almost certainly a fresh, offline or test chain. "
+                           f"Selected it because nothing else replied; do NOT treat "
+                           f"these numbers as real costs.")}
+    return {"ok": False, "daemon": None,
+            "detail": ("No monerod answered a fee estimate on " + ", ".join(tried) +
+                       ". Start your node (monerod), or point the daemon field at the "
+                       "remote node your wallet already uses — a remote one is queried "
+                       "through Tor, not clearnet. Fees are still charged correctly "
+                       "without an estimate; the wallet computes the real fee when it "
+                       "signs, so this only costs you the preview.")}
 
 
 #: Where Tor's SOCKS proxy commonly listens: 9050 = the standalone tor daemon /
@@ -837,6 +919,10 @@ class H(BaseHTTPRequestHandler):
                 detect_tor_proxy(c["params"].get("tor_proxy", ""))))
         if self.path == "/api/start-tor":
             return self._send(200, json.dumps(start_tor()))
+        if self.path == "/api/detect-daemon":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(detect_daemon(
+                c["params"].get("rpc_daemon", ""), c["params"].get("tor_proxy", ""))))
         if self.path.startswith("/run/"):
             aid = self.path[5:]
             act = ACTIONS.get(aid)
@@ -1035,6 +1121,11 @@ background:transparent;border:1px solid var(--line2);color:var(--ink2)}
 pre.out{margin:0;background:var(--term);color:var(--ti);padding:13px 15px;overflow:auto;
 max-height:min(70vh,760px);font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
 pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.out .d{color:#6B7A88}
+.rstep{display:flex;gap:12px;padding:14px 0;border-top:1px solid #1E2A36}
+.rstep:first-of-type{border-top:0}
+.rstep>div{flex:1;min-width:0}
+.rn{flex:0 0 26px;height:26px;border-radius:50%;background:#1E2A36;color:#8FA6BC;
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
 .idle{padding:44px 20px;text-align:center;color:var(--mut);font-size:13px}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .warnbox{font-size:11.5px;color:var(--warn);background:var(--warns);padding:8px 10px;border-radius:7px;margin-top:9px;line-height:1.45}
@@ -1081,21 +1172,41 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
     </div>
     <div id="recv-fields" hidden>
-      <p class="lead">First create a fresh receive address — hand the address it prints to the sender,
-      then paste the wallet JSON filename it saves below.</p>
-      <div class="stepacts" data-acts="make_receive"></div>
-      <div class="f" style="margin-top:12px"><label for="receive_wallet">Wallet JSON</label>
-        <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
-      <p class="lead" style="margin-top:16px">If the sender is paying in <b>Bitcoin</b>, the swap
-      quote holds the BTC deposit address and memo to give them. Paste that file to wait for the
-      exact quoted amount; leave it empty to stop as soon as any balance lands.</p>
-      <div class="f"><label for="pairs_file">Swap quote JSON <span class="d">optional</span></label>
-        <input id="pairs_file" placeholder="thor_pairs.json"></div>
-      <p class="lead" style="margin-top:12px">Then wait for it. This polls <b>your own wallet</b>
-      only — no block explorer is ever asked about the Bitcoin address, so no new party learns
-      it is being watched. It reads only and spends nothing; when the money lands it asks what
-      you want to do with it.</p>
-      <div class="stepacts" data-acts="watch_receive"></div>
+      <p class="lead"><b>The sender pays Bitcoin. You receive Monero.</b> Three steps, in order —
+      each one needs the file the step before it wrote.</p>
+
+      <div class="rstep"><span class="rn">1</span><div>
+        <b>Make the Monero destination.</b> A fresh subaddress on your wallet, where the
+        swapped XMR will land. <b>This is not the address you give the sender</b> — it never
+        leaves your machine.
+        <div class="stepacts" data-acts="make_receive"></div>
+        <div class="f" style="margin-top:10px"><label for="receive_wallet">Wallet JSON <span class="d">from step 1</span></label>
+          <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
+      </div></div>
+
+      <div class="rstep"><span class="rn">2</span><div>
+        <b>Get the Bitcoin deposit address.</b> This quotes a BTC→XMR swap and prints the BTC
+        address <i>and memo</i> to hand the sender. The destination is read from the wallet JSON
+        above, so the 95-character Monero address is never retyped — the one field where a typo
+        is irreversible. The memo is checked to actually name your address before any
+        instructions are printed.
+        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
+          <input id="swap_btc" placeholder="0.05"></div>
+        <div class="f"><label for="pairs_file">Save quote to</label>
+          <input id="pairs_file" placeholder="thor_pairs.json"></div>
+        <div class="stepacts" data-acts="swap_quote"></div>
+        <p class="lead" style="margin-top:8px">The swap provider necessarily learns
+        "this BTC deposit → this XMR address". Tor hides who asked, not the link itself —
+        that is exactly why the mix afterwards is not optional.</p>
+      </div></div>
+
+      <div class="rstep"><span class="rn">3</span><div>
+        <b>Wait for the payment.</b> Polls <b>your own wallet</b> only — no block explorer is
+        ever asked about that Bitcoin address, so no new party learns it is being watched.
+        Reads only, spends nothing; when the money lands it asks what you want to do with it.
+        With a quote file it waits for the quoted amount, otherwise for any balance at all.
+        <div class="stepacts" data-acts="watch_receive"></div>
+      </div></div>
     </div>
     <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>
   </section>
@@ -1233,7 +1344,22 @@ function renderFees(){
  $$('.fee').forEach(b=>b.addEventListener('click',()=>{setFee(+b.dataset.p);sync();}));
  if(!feeData){$('#fsrc').textContent='loading…';return;}
  $('#fsrc').innerHTML=(vals?'estimate per ~2 kB tx · ':'')+esc(feeData.source)
-   +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'');
+   +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'')
+   +(vals?'':`<div style="margin-top:7px"><button id="dfind" class="pfre" type="button">Find my daemon</button></div>`);
+ const df=$('#dfind'); if(df) df.addEventListener('click',detectDaemon);
+}
+// "No estimate" almost always means the daemon field points somewhere nothing
+// is listening. Probe the usual loopback ports instead of making the operator
+// guess which one their node uses.
+async function detectDaemon(){
+ const b=$('#dfind'); if(b){b.disabled=true;b.textContent='looking…';}
+ let r=null;
+ try{ r=await fetch('/api/detect-daemon',{method:'POST',headers:HDR,
+   body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'lookup failed: '+e}; }
+ if(r&&r.ok&&r.daemon){ $('#rpc_daemon').value=r.daemon; await loadFees(); return; }
+ if(b){b.disabled=false;b.textContent='Find my daemon';}
+ $('#fsrc').innerHTML=esc((r&&r.detail)||'no daemon found');
 }
 function setFee(p){feePriority=p;renderFees();}
 async function loadFees(){
@@ -1257,7 +1383,8 @@ function collect(){
  const v=id=>$('#'+id)?.value.trim()||'';
  const c=id=>!!$('#'+id)?.checked;
  return {mode, btc_entry:v('btc_entry'), btc_amount:v('btc_amount'),
-  receive_wallet:v('receive_wallet'), pairs_file:v('pairs_file'), split:+v('split')||1,
+  receive_wallet:v('receive_wallet'), pairs_file:v('pairs_file'),
+  swap_btc:v('swap_btc'), split:+v('split')||1,
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),

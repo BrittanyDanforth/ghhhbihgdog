@@ -288,6 +288,52 @@ def test_missing_validate_address_degrades_honestly():
     check("the reduced assurance is stated", "read-back only" in text)
 
 
+def test_dest_from_receive_bundle():
+    """The swap destination decides where the money lands, irreversibly. Taking
+    it from the bundle the wallet already verified beats retyping 95 characters
+    -- but only if the bundle itself is checked, or an unrelated JSON with an
+    'address' key could become someone's payment destination."""
+    import json as _json
+    d = tempfile.mkdtemp(prefix="gs_bundle_")
+
+    def w(name, obj):
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            _json.dump(obj, fh)
+        return p
+
+    good = w("good.json", {"schema": "gs_receive_wallet_v1", "address": DEST,
+                           "account_index": 0, "subaddress_index": 3})
+    check("the destination is read out of a valid receive bundle",
+          thor._dest_from_bundle(good) == DEST)
+
+    def refuses(path):
+        try:
+            thor._dest_from_bundle(path)
+            return False
+        except SystemExit:
+            return True
+
+    # An unrelated JSON that happens to carry an address must NOT be usable as
+    # a payment destination just because the key name matches.
+    check("a JSON with an address but no schema is refused",
+          refuses(w("nos.json", {"address": DEST})))
+    check("a JSON with the WRONG schema is refused",
+          refuses(w("bad.json", {"schema": "thor_pairs_v1", "address": DEST})))
+    check("a bundle with no address is refused",
+          refuses(w("noa.json", {"schema": "gs_receive_wallet_v1"})))
+    check("a non-object bundle is refused", refuses(w("lst.json", [DEST])))
+    check("a missing file is refused", refuses(os.path.join(d, "nope.json")))
+
+    # The address must be scrubbed in the persistent chain, not written whole.
+    src = open(os.path.join(REPO, "thor_swap_preparer")).read()
+    check("the bundle destination is scrubbed in the integrity log",
+          "dest_from_bundle:{scrub_address(addr)}" in src)
+    # Ambiguity about where money goes must be refused, never silently resolved.
+    check("--dests and --dest-from-receive-wallet together are refused",
+          "not both" in src)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

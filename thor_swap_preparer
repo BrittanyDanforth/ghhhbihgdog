@@ -71,6 +71,33 @@ def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal | None:
         return None
 
 
+def _dest_from_bundle(path: str) -> str:
+    """Read the XMR destination out of a gs_receive_wallet_v1 bundle.
+
+    Validated strictly rather than trusted: this address becomes the swap memo,
+    and a swap delivering to the wrong address cannot be undone. A file of the
+    wrong schema is refused outright instead of being probed for an "address"
+    key, so an unrelated JSON that happens to have one can never become the
+    destination of somebody's money.
+    """
+    p = Path(path)
+    if not p.is_file():
+        sys.exit(f"[!] Receive-wallet bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] Receive-wallet bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, dict) or d.get("schema") != "gs_receive_wallet_v1":
+        sys.exit(f"[!] {path} is not a gs_receive_wallet_v1 bundle "
+                 f"(schema={None if not isinstance(d, dict) else d.get('schema')!r}). "
+                 f"Refusing to take a payment destination from it.")
+    addr = d.get("address")
+    if not addr:
+        sys.exit(f"[!] {path} carries no address.")
+    integrity_log("thor", f"dest_from_bundle:{scrub_address(addr)}")
+    return addr
+
+
 def _validate_xmr_addr(addr: str) -> None:
     """Validate XMR address format and checksum."""
     if not _XMR_RE.match(addr):
@@ -126,8 +153,14 @@ def main():
     )
     ap.add_argument("--amounts", nargs="+", required=True, type=Decimal,
                     help="BTC amounts to swap")
-    ap.add_argument("--dests", nargs="+", required=True,
+    ap.add_argument("--dests", nargs="+",
                     help="XMR destination addresses (one per amount)")
+    ap.add_argument("--dest-from-receive-wallet",
+                    help="take the XMR destination from a gs_receive_wallet_v1 bundle "
+                         "written by create_receive_wallet, instead of --dests. The "
+                         "address in that bundle was already read back and validated "
+                         "by the wallet itself, so this avoids retyping a 95-character "
+                         "address into the one field where a typo is irreversible.")
     ap.add_argument("--tor-proxy",
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
@@ -147,6 +180,20 @@ def main():
 
     if args.max_slippage <= 0:
         sys.exit("[!] --max-slippage must be positive.")
+
+    # The destination is the single most dangerous field in this tool: whatever
+    # ends up here is written into the swap memo and the XMR is delivered to it
+    # irreversibly. Reading it from the bundle the wallet already verified beats
+    # retyping it, so that path is offered -- but never BOTH at once, because
+    # then it is ambiguous which address the money actually goes to.
+    if args.dest_from_receive_wallet and args.dests:
+        sys.exit("[!] Give either --dests or --dest-from-receive-wallet, not both — "
+                 "with both set it is ambiguous which address the XMR is sent to.")
+    if args.dest_from_receive_wallet:
+        args.dests = [_dest_from_bundle(args.dest_from_receive_wallet)] * len(args.amounts)
+    if not args.dests:
+        sys.exit("[!] No XMR destination. Pass --dests, or --dest-from-receive-wallet "
+                 "with the JSON create_receive_wallet wrote.")
 
     if len(args.amounts) != len(args.dests):
         sys.exit(f"[!] Mismatch: {len(args.amounts)} amounts vs {len(args.dests)} dests")

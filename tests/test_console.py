@@ -614,6 +614,114 @@ def test_page_escapes_untrusted_text():
     check("the fee renderer tolerates a null estimate", "Array.isArray(feeData.xmr)" in src)
 
 
+def test_receive_is_btc_to_monero():
+    """The whole point of receive mode is BTC in, Monero out. Without the swap
+    action the address handed to the sender is a MONERO one, so the sender must
+    already hold XMR and no swap ever happens -- receive silently becomes
+    XMR->XMR, which defeats the purpose of the tool."""
+    c = load_console()
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("a BTC->XMR swap-quote action exists in the console",
+          '"swap_quote"' in src)
+    a = c.ACTIONS.get("swap_quote")
+    check("the swap action is registered and grouped under Receive",
+          a is not None and a["group"] == "Receive")
+    argv = a["build"]({"swap_btc": "0.05", "receive_wallet": "w.json",
+                       "tor_proxy": "socks5h://127.0.0.1:9050",
+                       "pairs_file": "thor_pairs.json"})
+    check("the swap action really invokes thor_swap_preparer",
+          "thor_swap_preparer" in argv)
+    check("the BTC amount the sender pays is passed through",
+          argv[argv.index("--amounts") + 1] == "0.05")
+    # The destination must come from the verified bundle, never a retyped
+    # 95-char address -- a typo there is irreversible.
+    check("the XMR destination is taken from the receive bundle, not retyped",
+          "--dest-from-receive-wallet" in argv
+          and argv[argv.index("--dest-from-receive-wallet") + 1] == "w.json")
+    check("the quote is saved where the watcher will look for it",
+          argv[argv.index("--outfile") + 1] == "thor_pairs.json")
+    check("the swap quote is forced through Tor",
+          argv[argv.index("--tor-proxy") + 1].startswith("socks5h://"))
+    check("with no filename given the quote still has a default destination",
+          a["build"]({"swap_btc": "0.05", "receive_wallet": "w.json",
+                      "tor_proxy": "socks5h://127.0.0.1:9050"})[-1].endswith(".json"))
+    check("swap_btc is in the parameter schema (unlisted keys are dropped)",
+          "swap_btc" in c.SCHEMA and c.clean({"swap_btc": "0.05"})["params"]
+          .get("swap_btc") == "0.05")
+    check("a non-numeric BTC amount is rejected by the schema",
+          c.clean({"swap_btc": "0.05; rm -rf /"})["params"].get("swap_btc") is None)
+    # The receive step must present all three stages, in order.
+    seg = src[src.index('id="recv-fields"'):src.index('id="recv-fields"') + 3000]
+    for act in ("make_receive", "swap_quote", "watch_receive"):
+        check(f"the receive step exposes {act}", f'data-acts="{act}"' in seg)
+    check("the receive step says the sender pays Bitcoin",
+          "sender pays Bitcoin" in seg)
+    check("the receive step warns the XMR address is NOT what the sender gets",
+          "not the address you give the sender" in seg)
+
+
+def test_daemon_detection_fixes_no_estimate():
+    """'Cannot get estimates' is nearly always 'nothing is listening where the
+    daemon field points'. The console must be able to go find it."""
+    c = load_console()
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("a daemon-detect endpoint exists", '"/api/detect-daemon"' in src)
+    check("the client offers to find the daemon when there is no estimate",
+          "detectDaemon" in src and "Find my daemon" in src)
+    check("the probe covers the mainnet default and the common restricted port",
+          18081 in c.DAEMON_PORTS and 18089 in c.DAEMON_PORTS)
+    # Only the operator's configured endpoint may be remote; sweeping ports on
+    # anything but this machine would be scanning someone else's host.
+    def _probe_urls(preferred):
+        seen = []
+        real = c.live_fees
+        try:
+            c.live_fees = lambda u, p="": (seen.append(u),
+                                           {"ok": False, "xmr": None})[1]
+            c.detect_daemon(preferred, "")
+        finally:
+            c.live_fees = real
+        return seen
+    urls = _probe_urls("")
+    check("every auto-probed daemon endpoint is loopback",
+          all("127.0.0.1" in u for u in urls))
+    check("the operator's own endpoint is tried first",
+          _probe_urls("http://10.1.2.3:18081")[0] == "http://10.1.2.3:18081")
+
+    # A fresh/offline chain quotes absurd fees. Detection must not present that
+    # as a found daemon without saying so.
+    real = c.live_fees
+    try:
+        c.live_fees = lambda u, p="": (
+            {"ok": True, "xmr": [4.0, 16.0, 80.0, 664.0], "implausible": True}
+            if u.endswith("28081") else {"ok": False, "xmr": None})
+        r = c.detect_daemon("", "")
+        check("an implausible-fee daemon is flagged, not silently accepted",
+              r["ok"] and "do NOT treat these numbers as real" in r["detail"])
+        # ... and a believable node must win over the implausible one.
+        c.live_fees = lambda u, p="": (
+            {"ok": True, "xmr": [0.00004, 0.0001, 0.0005, 0.004], "implausible": False}
+            if u.endswith("18089") else
+            {"ok": True, "xmr": [664.0], "implausible": True} if u.endswith("18081")
+            else {"ok": False, "xmr": None})
+        r = c.detect_daemon("", "")
+        check("a plausible daemon is preferred over an implausible one",
+              r["ok"] and r["daemon"].endswith("18089"))
+    finally:
+        c.live_fees = real
+
+    # And with nothing anywhere, it must still refuse to invent numbers.
+    try:
+        c.live_fees = lambda u, p="": {"ok": False, "xmr": None}
+        r = c.detect_daemon("", "")
+        check("with no daemon at all it reports failure, inventing nothing",
+              r["ok"] is False and r["daemon"] is None)
+        check("the failure explains a remote node is queried over Tor",
+              "through Tor" in r["detail"])
+    finally:
+        c.live_fees = real
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):
