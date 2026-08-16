@@ -68,6 +68,7 @@ SCHEMA = {
     "mode":         ("choice", ["send", "receive"]),
     "btc_entry":    ("re", BTC_RE),
     "receive_wallet": ("re", PATH_RE),
+    "pairs_file":   ("re", PATH_RE),
     "btc_amount":   ("re", DEC_RE),
     "split":        ("int", (1, 20)),
     "wallets":      ("int", (3, 60)),
@@ -190,6 +191,16 @@ ACTIONS = {
                                             "--rpc", p.get("rpc_primary", "http://127.0.0.1:18083"),
                                             "--tor-proxy", p.get("tor_proxy", ""),
                                             "--label", p.get("label", "GhostSpiral_entry")]},
+    # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
+    # never spends, so it stays a `safe` action even though it is the step
+    # that decides a mix is about to happen.
+    "watch_receive":   {"group": "Receive", "label": "Wait for the payment", "risk": "safe",
+                        "desc": "watch the receive subaddress until the swapped XMR arrives",
+                        "build": lambda p: [PY, "receive_watch",
+                                            "--receive-wallet", p.get("receive_wallet", ""),
+                                            "--tor-proxy", p.get("tor_proxy", "")]
+                                           + (["--pairs", p["pairs_file"]] if p.get("pairs_file")
+                                              else ["--any"])},
 
     # the pipeline itself — this one moves money
     "run_pipeline":    {"group": "Pipeline", "label": "Run pipeline", "risk": "spends",
@@ -213,7 +224,8 @@ ACTIONS = {
                     "build": lambda p: [PY, "-m", "py_compile", "gs_common.py", "GhostSpiral",
                                         "airgap_tx_signer", "broadcast_signed_xmr",
                                         "create_receive_wallet", "exit_strategy_simulator",
-                                        "paranoia_mode", "thor_swap_preparer"]},
+                                        "paranoia_mode", "thor_swap_preparer",
+                                        "receive_watch"]},
 }
 
 PREFLIGHT_TOR = """
@@ -1074,6 +1086,16 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <div class="stepacts" data-acts="make_receive"></div>
       <div class="f" style="margin-top:12px"><label for="receive_wallet">Wallet JSON</label>
         <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
+      <p class="lead" style="margin-top:16px">If the sender is paying in <b>Bitcoin</b>, the swap
+      quote holds the BTC deposit address and memo to give them. Paste that file to wait for the
+      exact quoted amount; leave it empty to stop as soon as any balance lands.</p>
+      <div class="f"><label for="pairs_file">Swap quote JSON <span class="d">optional</span></label>
+        <input id="pairs_file" placeholder="thor_pairs.json"></div>
+      <p class="lead" style="margin-top:12px">Then wait for it. This polls <b>your own wallet</b>
+      only — no block explorer is ever asked about the Bitcoin address, so no new party learns
+      it is being watched. It reads only and spends nothing; when the money lands it asks what
+      you want to do with it.</p>
+      <div class="stepacts" data-acts="watch_receive"></div>
     </div>
     <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>
   </section>
@@ -1235,7 +1257,7 @@ function collect(){
  const v=id=>$('#'+id)?.value.trim()||'';
  const c=id=>!!$('#'+id)?.checked;
  return {mode, btc_entry:v('btc_entry'), btc_amount:v('btc_amount'),
-  receive_wallet:v('receive_wallet'), split:+v('split')||1,
+  receive_wallet:v('receive_wallet'), pairs_file:v('pairs_file'), split:+v('split')||1,
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),

@@ -24,6 +24,10 @@ python3 tests/test_swap_receive.py  # MONEY PATH: the swap memo must name your o
                                     #   XMR address, catastrophic slippage must
                                     #   abort, and the receive subaddress must be
                                     #   confirmed by the wallet itself
+python3 tests/test_receive_watch.py # RECEIVE: the payment watcher — right
+                                    #   subaddress, confirm/unlock gate, swap
+                                    #   shortfall vs still-confirming, and that
+                                    #   it asks NO block explorer anything
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
@@ -52,6 +56,11 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
 python3 tests/real_peel_testnet.py       # SHIPPED peeling chain: N destinations via N
                                           #   SEPARATE confirmation-gated txs (not one
                                           #   fan-out), change carrying between peels
+python3 tests/real_receive_watch_testnet.py # SHIPPED watch loop vs a real wallet-rpc:
+                                          #   proves get_subaddress_balance is really
+                                          #   PER-SUBADDRESS (account funded heavily,
+                                          #   watched subaddress paid 3 XMR -> reports 3)
+                                          #   and that locked funds are not "paid" yet
 ```
 
 `real_phase_create_testnet.py` needs the `monero` package (the others do not).

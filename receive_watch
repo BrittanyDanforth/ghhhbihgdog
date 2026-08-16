@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""
+receive_watch - GhostSpiral companion: watch a receive address until paid
+=========================================================================
+Closes the one manual gap in the receiver flow. create_receive_wallet prints
+"3. Wait for sender's BTC to arrive and ThorChain to convert to XMR" and then
+leaves the operator refreshing something by hand. This waits for them, tells
+them when the money is really theirs, and then asks what to do with it.
+
+    receive_watch --receive-wallet wallet_ab12.json --pairs thor_pairs.json \
+                  --tor-proxy socks5h://127.0.0.1:9050
+
+WHAT IT WATCHES, AND WHY THAT SIDE
+----------------------------------
+The sender pays BITCOIN, so the obvious design is to watch the BTC deposit
+address. This tool deliberately does NOT, and will not be extended to:
+
+  * Asking mempool.space / blockstream / any explorer "has this address been
+    paid?" tells a party that did not previously know it that SOMEONE cares
+    about that address, at that moment, repeatedly, for as long as you wait.
+    Tor hides who is asking; it does not un-ask the question. The polling
+    pattern itself then times the arrival for that party.
+  * The BTC leg is not the event that matters anyway. BTC landing in a
+    ThorChain vault is not money you control -- the swap can still fail, be
+    refunded, or under-deliver. The event worth waiting for is XMR arriving,
+    confirmed and unlocked, on YOUR subaddress.
+
+So the watch runs entirely against YOUR OWN monero-wallet-rpc: the balance of
+one subaddress of a wallet you already hold. On the normal localhost setup
+that is a loopback socket and reaches no third party at all; the daemon behind
+it syncs over Tor exactly as it already did. Watching therefore adds ZERO new
+disclosure to anyone -- which is the only reason it is safe to poll for hours.
+
+The swap provider is a different case: it already created the BTC-deposit ->
+XMR-destination binding and cannot un-know it, so asking it about your own
+swap discloses nothing new. That is still not done here, because it is not
+needed -- the XMR side answers the question authoritatively.
+
+OPSEC hardening:
+  - Tor verified ONCE at start, never per poll (a check.torproject.org request
+    on every tick would be a far louder pattern than the thing being watched)
+  - Poll interval JITTERED, so a remote/observed RPC sees no fixed heartbeat
+  - Amounts never enter the integrity log (they are the most linkable value in
+    the whole pipeline); only state transitions are chained
+  - Addresses scrubbed in the log; printed in full to the terminal, because
+    the operator has to read them to use them
+  - Spends NOTHING, ever. It reports and prints the command it would suggest;
+    arming and running a spend stays where the rest of the toolchain puts it.
+"""
+from __future__ import annotations
+import argparse, json, secrets, sys, time
+from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
+
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, connect_rpc,
+    install_signal_handlers, shutdown_requested, scrub_address,
+)
+
+ATOMIC = Decimal("1000000000000")          # piconero per XMR
+RECEIVE_SCHEMA = "gs_receive_wallet_v1"
+PAIR_SCHEMA = "thor_pairs_v1"
+
+# Poll cadence. A fixed interval is a heartbeat an observer of a remote RPC can
+# lock onto, so the wait is jittered inside this band rather than ticking.
+POLL_MIN_S = 45
+POLL_MAX_S = 90
+
+# How long the balance may sit unchanged, AFTER something has arrived, before
+# we stop assuming more is coming. A swap that under-delivers (slippage, a
+# partial fill, a fee taken off the top) otherwise leaves the operator waiting
+# forever for a number that is never going to arrive.
+STALL_MINUTES_DEFAULT = 30
+
+
+def to_xmr(atomic: int) -> Decimal:
+    """Atomic units -> XMR, truncated at 12dp (never rounded up: this number is
+    shown as 'you have', and rounding money up is how a plan is built on funds
+    that are not there)."""
+    return (Decimal(int(atomic)) / ATOMIC).quantize(Decimal("0.000000000001"),
+                                                    rounding=ROUND_DOWN)
+
+
+def load_receive_bundle(path: str) -> dict:
+    """Load and structurally validate a gs_receive_wallet_v1 bundle.
+
+    Everything downstream trusts `address` as "where my money is", so a bundle
+    of the wrong schema, or one missing the index we are about to poll, is
+    rejected here rather than producing a confident watch on the wrong output.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"receive wallet bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise ValueError(f"receive wallet bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, dict):
+        raise ValueError("receive wallet bundle must be a JSON object")
+    if d.get("schema") != RECEIVE_SCHEMA:
+        raise ValueError(f"expected schema {RECEIVE_SCHEMA}, got {d.get('schema')!r}")
+    if not d.get("address"):
+        raise ValueError("receive wallet bundle has no address")
+    # A missing index is NOT defaulted to 0. Account 0 / subaddress 0 is the
+    # wallet's own primary+change address, so silently falling back to it would
+    # watch the change carrier and call an unrelated balance "the payment".
+    if d.get("subaddress_index") is None:
+        raise ValueError("receive wallet bundle has no subaddress_index")
+    return d
+
+
+def load_pairs(path: str) -> list:
+    """Load a thor_pairs_v1 bundle (the list thor_swap_preparer writes)."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"pairs bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise ValueError(f"pairs bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, list) or not d:
+        raise ValueError("pairs bundle must be a non-empty JSON list")
+    for entry in d:
+        if not isinstance(entry, dict) or entry.get("schema") != PAIR_SCHEMA:
+            raise ValueError(f"every pair must carry schema {PAIR_SCHEMA}")
+    return d
+
+
+def pairs_for_dest(pairs: list, dest_addr: str) -> list:
+    """Only the pairs actually routed to THIS receive address.
+
+    A pairs file can hold several swaps to several destinations. Summing all of
+    them would set a target this subaddress is never going to reach, and the
+    watch would run until timeout on a payment that already completed.
+    """
+    return [p for p in pairs if p.get("dest_xmr") == dest_addr]
+
+
+def expected_total(pairs: list) -> Decimal:
+    """Sum of quoted XMR output across pairs. Unreadable/absent quotes count 0,
+    matching thor_swap_preparer, which already warned about them at quote time."""
+    tot = Decimal(0)
+    for p in pairs:
+        try:
+            v = Decimal(str(p.get("expected_xmr") or "0"))
+        except Exception:                                    # noqa: BLE001
+            v = Decimal(0)
+        if v > 0:
+            tot += v
+    return tot
+
+
+def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
+    """The amount at which we call the payment complete.
+
+    A swap essentially never delivers its quote to the digit -- the rate moves
+    between quote and execution and the network takes its cut. Waiting for the
+    exact quoted figure is waiting for something that will not happen, so the
+    gate sits a tolerance below it and the shortfall is shown honestly.
+    """
+    if target <= 0:
+        return Decimal(0)
+    if not (Decimal(0) <= tolerance < Decimal(1)):
+        raise ValueError("tolerance must be >= 0 and < 1")
+    return (target * (Decimal(1) - tolerance)).quantize(
+        Decimal("0.000000000001"), rounding=ROUND_DOWN)
+
+
+def poll_seconds(rng=None) -> int:
+    """A jittered poll interval inside [POLL_MIN_S, POLL_MAX_S]."""
+    r = rng or secrets.SystemRandom()
+    return r.randint(POLL_MIN_S, POLL_MAX_S)
+
+
+def fmt(x: Decimal) -> str:
+    """Render an XMR amount for a human.
+
+    str(Decimal) uses scientific notation for a quantized zero -- a balance of
+    nothing printed as "0E-12 XMR", which reads as a malfunction to someone
+    watching a payment they are anxious about. Fixed-point always, and trailing
+    zeros trimmed so 3.000000000000 shows as 3.
+    """
+    s = f"{x:f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def progress_line(unlocked: Decimal, total: Decimal, floor_: Decimal) -> str:
+    """One human line: what has landed, what is still locked, how far to go."""
+    pending = total - unlocked
+    if pending < 0:
+        pending = Decimal(0)
+    bits = [f"unlocked {fmt(unlocked)} XMR"]
+    if pending > 0:
+        bits.append(f"{fmt(pending)} still confirming")
+    if floor_ > 0:
+        remain = floor_ - unlocked
+        if remain > 0:
+            pct = (unlocked / floor_ * 100) if floor_ > 0 else Decimal(0)
+            bits.append(f"{fmt(remain)} to go ({pct.quantize(Decimal('0.1'))}%)")
+        else:
+            bits.append("target reached")
+    return " · ".join(bits)
+
+
+# ── what to do with it, once it is there ───────────────────────────────────
+# Kept in the same shape as the console's PRESETS, and asserted equal to them
+# by the test suite, so the menu can never drift into recommending a mix the
+# console would not actually run.
+CHOICES = [
+    {"key": "1", "id": "paranoid", "name": "Maximum safe (peel + DAG)",
+     "flags": {"wallets": 10, "deep": 2, "dag_mixing": True, "peel": True,
+               "fee_priority": 3},
+     "blurb": "Peeling chain first (one tx per destination, nothing co-created), "
+              "then a DAG hop round over those outputs. Strongest, slowest — hours."},
+    {"key": "2", "id": "peel", "name": "Peeling chain only",
+     "flags": {"wallets": 8, "deep": 1, "dag_mixing": False, "peel": True,
+               "fee_priority": 2},
+     "blurb": "One transaction per destination, each spending the previous "
+              "change. Strong graph unlinkability, one round instead of two."},
+    {"key": "3", "id": "balanced", "name": "Balanced",
+     "flags": {"wallets": 12, "deep": 2, "dag_mixing": True, "peel": False,
+               "fee_priority": 2},
+     "blurb": "12 subaddresses, depth 2, DAG hops on. Sensible for most amounts."},
+    {"key": "4", "id": "hold", "name": "Nothing yet — just leave it",
+     "flags": None,
+     "blurb": "The funds stay on the receive subaddress. Nothing is spent and "
+              "nothing is broadcast. Decide later."},
+]
+
+
+def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str) -> list:
+    """The exact argv for a chosen mix. Returns [] for the do-nothing choice.
+
+    Built as a list, never a string: it is printed for the operator to run, and
+    a quoted-string command is how a path with a space becomes two arguments.
+    """
+    f = choice.get("flags")
+    if not f:
+        return []
+    argv = [sys.executable, "GhostSpiral",
+            "--receive-wallet", receive_wallet,
+            "--tor-proxy", tor_proxy,
+            "--wallets", str(f["wallets"]),
+            "--deep", str(f["deep"]),
+            "--fee-priority", str(f["fee_priority"])]
+    if f.get("dag_mixing"):
+        argv.append("--dag-mixing")
+    if f.get("peel"):
+        argv.append("--peel")
+    return argv
+
+
+def render_choices() -> str:
+    out = ["", "  === THE MONEY IS YOURS. WHAT DO YOU WANT TO DO WITH IT? ===", ""]
+    for c in CHOICES:
+        out.append(f"  [{c['key']}] {c['name']}")
+        out.append(f"      {c['blurb']}")
+    return "\n".join(out)
+
+
+def choice_by_key(key: str):
+    for c in CHOICES:
+        if c["key"] == str(key).strip() or c["id"] == str(key).strip().lower():
+            return c
+    return None
+
+
+def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
+          timeout_s: int, stall_s: int, sleep_fn=time.sleep,
+          clock=time.monotonic, rng=None, echo=print) -> dict:
+    """Poll one subaddress until it holds `floor_` unlocked XMR.
+
+    Returns a result dict rather than exiting, so the caller (and the tests)
+    can drive every outcome. Never raises on a transient RPC hiccup: a wallet
+    that is momentarily busy or resyncing is normal over a multi-hour wait, and
+    aborting the watch would lose the operator's place for no reason.
+
+    Outcomes: 'funded' (>= floor, unlocked), 'stalled' (money arrived, stopped
+    growing, still short), 'timeout', 'interrupted'.
+    """
+    started = clock()
+    seen_any = False
+    last_total = Decimal(-1)
+    last_unlocked = to_xmr(0)
+    last_change = started
+    ticks = 0
+    while True:
+        if shutdown_requested():
+            return {"state": "interrupted", "unlocked": last_unlocked,
+                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    "ticks": ticks}
+        try:
+            bal_atomic, unl_atomic = rpc.get_subaddress_balance(
+                account_index=account, address_index=sub_idx)
+        except Exception as e:                               # noqa: BLE001
+            # Transient by assumption: log the FACT, not the error text, and
+            # keep the place in the queue.
+            integrity_log("recv", "poll_error")
+            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:50]}); retrying.")
+            bal_atomic, unl_atomic = None, None
+
+        if bal_atomic is not None:
+            total = to_xmr(bal_atomic)
+            unlocked = to_xmr(unl_atomic)
+            last_unlocked = unlocked
+            ticks += 1
+            if total != last_total:
+                if total > 0 and not seen_any:
+                    seen_any = True
+                    integrity_log("recv", "first_funds_seen")
+                    echo("  [+] Something arrived. Waiting for it to confirm and unlock.")
+                last_change = clock()
+                last_total = total
+            echo(f"  [*] {progress_line(unlocked, total, floor_)}")
+
+            if floor_ > 0 and unlocked >= floor_:
+                integrity_log("recv", "funded")
+                return {"state": "funded", "unlocked": unlocked,
+                        "total": total, "ticks": ticks}
+            if floor_ <= 0 and unlocked > 0:
+                # --any mode: any unlocked balance is the event.
+                integrity_log("recv", "funded_any")
+                return {"state": "funded", "unlocked": unlocked,
+                        "total": total, "ticks": ticks}
+            # "Stalled" means no MORE money is coming -- not that we are still
+            # waiting for what arrived to confirm. While unlocked < total there
+            # is balance in the confirmation pipeline (a Monero output takes ~10
+            # blocks to unlock, which is longer than a short stall window), so
+            # calling that a shortfall would abandon a payment mid-confirmation.
+            still_confirming = total > unlocked
+            if (seen_any and not still_confirming
+                    and (clock() - last_change) >= stall_s):
+                integrity_log("recv", "stalled_short")
+                return {"state": "stalled", "unlocked": unlocked,
+                        "total": total, "ticks": ticks}
+
+        if (clock() - started) >= timeout_s:
+            integrity_log("recv", "timeout")
+            return {"state": "timeout",
+                    "unlocked": last_unlocked if seen_any else to_xmr(0),
+                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    "ticks": ticks}
+        sleep_fn(poll_seconds(rng))
+
+
+def _print_sender_instructions(matched: list, echo=print) -> None:
+    """Re-print the BTC side: this is the 'receive address' the sender pays."""
+    if not matched:
+        return
+    echo("")
+    echo("  ============================================================")
+    echo("  GIVE THIS TO THE BTC SENDER (this is the receive address):")
+    echo("  ============================================================")
+    for i, p in enumerate(matched):
+        echo(f"\n  --- Payment {i + 1} of {len(matched)} ---")
+        echo(f"  Send exactly: {p.get('btc_in')} BTC")
+        echo(f"  To address:   {p.get('deposit')}")
+        echo(f"  With memo:    {p.get('memo')}")
+        echo(f"  Expected XMR: ~{p.get('expected_xmr')}")
+    echo("")
+    echo("  The memo goes in the BTC transaction's OP_RETURN. Without it the")
+    echo("  swap is not routed to you. Quotes expire — the sender should pay")
+    echo("  promptly, or re-quote.")
+    echo("  ============================================================")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "receive_watch",
+        description="Watch a GhostSpiral receive subaddress until the payment "
+                    "lands, then choose what to do with it.")
+    ap.add_argument("--receive-wallet", required=True,
+                    help="gs_receive_wallet_v1 JSON from create_receive_wallet")
+    ap.add_argument("--pairs",
+                    help="thor_pairs_v1 JSON from thor_swap_preparer. Supplies the "
+                         "expected amount AND the BTC deposit address/memo to hand "
+                         "the sender.")
+    ap.add_argument("--expect-xmr", type=Decimal,
+                    help="target XMR to wait for; overrides the total from --pairs")
+    ap.add_argument("--any", action="store_true",
+                    help="stop as soon as ANY unlocked balance appears, with no "
+                         "target amount")
+    ap.add_argument("--tolerance", type=Decimal, default=Decimal("0.10"),
+                    help="fraction under the target that still counts as paid, "
+                         "absorbing swap slippage (default 0.10 = accept 90%%)")
+    ap.add_argument("--timeout-min", type=int, default=1440,
+                    help="give up after this many minutes (default 1440 = 24h)")
+    ap.add_argument("--stall-min", type=int, default=STALL_MINUTES_DEFAULT,
+                    help="after funds arrive, how long the balance may sit "
+                         f"unchanged before reporting a shortfall (default {STALL_MINUTES_DEFAULT})")
+    ap.add_argument("--tor-proxy", required=True,
+                    help="socks5h://host:port — required, as everywhere else")
+    ap.add_argument("--rpc",
+                    help="monero-wallet-rpc endpoint (default: the one recorded "
+                         "in the receive bundle)")
+    ap.add_argument("--choice",
+                    help="answer the 'what now' question non-interactively "
+                         "(1-4, or paranoid/peel/balanced/hold). Still spends "
+                         "nothing — it prints the command.")
+    args = ap.parse_args()
+
+    if args.tolerance < 0 or args.tolerance >= 1:
+        sys.exit("[!] --tolerance must be >= 0 and < 1.")
+
+    try:
+        bundle = load_receive_bundle(args.receive_wallet)
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {e}")
+
+    dest = bundle["address"]
+    account = int(bundle.get("account_index") or 0)
+    sub_idx = int(bundle["subaddress_index"])
+    rpc_url = args.rpc or bundle.get("rpc_endpoint") or "http://127.0.0.1:18083"
+
+    matched = []
+    target = Decimal(0)
+    if args.pairs:
+        try:
+            allp = load_pairs(args.pairs)
+        except Exception as e:                               # noqa: BLE001
+            sys.exit(f"[!] {e}")
+        matched = pairs_for_dest(allp, dest)
+        if not matched:
+            sys.exit(
+                f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
+                f"    this receive address ({scrub_address(dest)}).\n"
+                f"    Watching it would wait for a payment that is going somewhere else.")
+        target = expected_total(matched)
+    if args.expect_xmr is not None:
+        target = args.expect_xmr
+    if args.any:
+        target = Decimal(0)
+
+    if target <= 0 and not args.any:
+        sys.exit(
+            "[!] No target amount. Pass --pairs (to take it from the swap quote),\n"
+            "    --expect-xmr, or --any to stop on any balance at all.")
+
+    floor_ = accept_floor(target, args.tolerance) if target > 0 else Decimal(0)
+
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)          # ONCE. Not per poll — see the module docstring.
+
+    try:
+        rpc = connect_rpc(rpc_url, proxy_url=args.tor_proxy)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("recv", "rpc_connect_fail")
+        sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {str(e)[:80]}")
+
+    # The bundle says the wallet owns this address at this index. Confirm it
+    # still does before waiting hours on it -- a bundle from a different wallet
+    # would otherwise watch an index that exists here but holds someone else's
+    # (or no) payment, and report "nothing arrived" forever.
+    try:
+        res = rpc.raw_request("get_address",
+                              {"account_index": account, "address_index": [sub_idx]})
+        entries = (res or {}).get("addresses") or []
+        match = [e for e in entries if e.get("address_index") == sub_idx]
+        if not match or match[0].get("address") != dest:
+            integrity_log("recv", "addr_readback_mismatch")
+            sys.exit(
+                f"[!] This wallet does not report {scrub_address(dest)} at account "
+                f"{account} / index {sub_idx}.\n"
+                f"    The bundle and the open wallet disagree — refusing to watch an\n"
+                f"    address the wallet has not confirmed it owns.")
+    except SystemExit:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("recv", "addr_readback_unavailable")
+        print(f"  [!] Could not read the address back from the wallet ({str(e)[:50]}). "
+              f"Continuing, but verify the wallet is the right one.")
+
+    integrity_log("recv", f"watch_start:{scrub_address(dest)}:idx={sub_idx}")
+
+    print(f"  [*] Watching {dest}")
+    print(f"      account {account} · subaddress {sub_idx} · via {rpc_url}")
+    if target > 0:
+        print(f"  [*] Target {fmt(target)} XMR; counting it paid at {fmt(floor_)} XMR "
+              f"(tolerance {args.tolerance * 100:.0f}% for swap slippage).")
+    else:
+        print("  [*] --any: stopping as soon as any unlocked balance appears.")
+    print(f"  [*] Polling your OWN wallet-rpc only — no explorer, no third party "
+          f"is told this address is being watched.")
+    print(f"  [*] Timeout {args.timeout_min} min. Ctrl-C is safe: nothing is "
+          f"pending, this only reads.")
+
+    _print_sender_instructions(matched)
+
+    r = watch(rpc, account, sub_idx, floor_,
+              timeout_s=args.timeout_min * 60,
+              stall_s=args.stall_min * 60)
+
+    state = r["state"]
+    if state == "interrupted":
+        print("\n  [!] Stopped. Nothing was spent; re-run to keep waiting.")
+        return 130
+    if state == "timeout":
+        print(f"\n  [!] Timed out after {args.timeout_min} min with "
+              f"{fmt(r['unlocked'])} XMR unlocked.")
+        print("  [!] The funds (if any) are safe on the receive subaddress. Re-run to "
+              "keep waiting, or check the swap with the provider.")
+        return 1
+    if state == "stalled":
+        short = floor_ - r["unlocked"]
+        print(f"\n  [!] {fmt(r['unlocked'])} XMR arrived and stopped growing for "
+              f"{args.stall_min} min — {fmt(short)} short of the {fmt(floor_)} XMR target.")
+        print("  [!] That usually means the swap under-delivered (rate moved, or a "
+              "partial fill). The money that DID arrive is yours and safe.")
+        print("  [!] Re-run with --any to accept it, or --expect-xmr to set a lower "
+              "target, once you have decided it is all that is coming.")
+        return 1
+
+    print(f"\n  [+] PAID: {fmt(r['unlocked'])} XMR unlocked on the receive subaddress.")
+    integrity_log("recv", "watch_complete")
+
+    print(render_choices())
+    pick = args.choice
+    if pick is None and sys.stdin.isatty():
+        try:
+            pick = input("\n  Choose [1-4]: ")
+        except (EOFError, KeyboardInterrupt):
+            pick = None
+    c = choice_by_key(pick) if pick is not None else None
+    if c is None:
+        print("\n  No choice made. The funds stay put — nothing was spent.")
+        print("  Re-run with --choice 1 (or 2/3) to see the exact mix command.")
+        return 0
+
+    if not c.get("flags"):
+        print(f"\n  [+] {c['name']}. Nothing spent; the funds stay on the receive "
+              f"subaddress.")
+        return 0
+
+    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy)
+    print(f"\n  [+] {c['name']} — run this to start the mix:\n")
+    print("      " + " ".join(argv))
+    print("\n  This tool does not spend. Nothing moves until you run that command,")
+    print("  or arm and launch the same preset from the console.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

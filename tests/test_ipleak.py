@@ -327,7 +327,7 @@ _SECRET_NAMES = ("amt", "amount", "addr", "address", "dest", "deposit", "memo",
                  "btc", "xmr", "picochunk")
 _SHIPPED = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
             "gs_common.py", "thor_swap_preparer", "create_receive_wallet",
-            "exit_strategy_simulator", "paranoia_mode"]
+            "exit_strategy_simulator", "paranoia_mode", "receive_watch"]
 
 
 # Functions whose RESULT is safe to log even when a secret-named value is
