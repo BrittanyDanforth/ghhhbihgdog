@@ -698,6 +698,43 @@ def shutdown_requested() -> bool:
     return _SHUTDOWN_REQUESTED
 
 # ---------------------------------------------------------------------------
+#  Swap-memo binding: the ONLY thing tying a BTC deposit to your XMR address
+# ---------------------------------------------------------------------------
+
+def memo_binds_destination(memo: str, dest: str) -> bool:
+    """Does this swap memo actually route the output to `dest`?
+
+    THE BTC A SENDER PAYS GOES TO A SHARED THORCHAIN INBOUND VAULT, NOT TO YOU.
+    The memo in that transaction is the only thing telling the network where to
+    deliver the XMR, so a memo naming a different address pays whoever owns it,
+    irreversibly, and the tool would have printed those instructions itself.
+
+    This lived only in thor_swap_preparer. GhostSpiral's own built-in swap
+    stage fetched quotes from the same API and printed "send N BTC to <addr>
+    with memo <memo>" having checked the deposit address but never the memo --
+    so the one path that refuses to misdirect money and the one that would
+    happily instruct it sat in the same repo. It is shared now so that cannot
+    diverge again.
+
+    THORChain memos carry the destination inline, e.g.
+        =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<fee>
+    (and the long form SWAP:XMR.XMR:<dest>:...). Some aggregators return the
+    memo hex-encoded for the OP_RETURN, so the hex form counts too.
+    """
+    if not memo or not dest:
+        return False
+    m = str(memo).strip()
+    if dest in m:
+        return True
+    compact = m[2:] if m[:2].lower() == "0x" else m
+    try:
+        decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
+    except ValueError:
+        return False
+    return dest in decoded
+
+
+# ---------------------------------------------------------------------------
 #  The receive-wallet bundle: ONE loader, used by everything
 # ---------------------------------------------------------------------------
 RECEIVE_SCHEMA = "gs_receive_wallet_v1"

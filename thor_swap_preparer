@@ -37,7 +37,7 @@ from gs_common import (
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
-    load_receive_bundle,
+    load_receive_bundle, memo_binds_destination,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -107,33 +107,11 @@ def _validate_xmr_addr(addr: str) -> None:
         sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
 
 
-def _memo_binds_destination(memo: str, dest: str) -> bool:
-    """Does this swap memo actually route the output to `dest`?
-
-    THIS IS THE ONLY THING THAT BINDS THE SWAP TO YOUR ADDRESS. The BTC the
-    sender pays goes to a ThorChain inbound vault, not to you; the memo in that
-    transaction is what tells the network where to deliver the XMR. A memo
-    naming a different address sends the proceeds to whoever that address
-    belongs to, and the payment is irreversible.
-
-    THORChain swap memos carry the destination inline, e.g.
-        =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<fee>
-    (and the long form SWAP:XMR.XMR:<dest>:...), so a memo that does not
-    contain the address we asked for is not a memo for us. Some aggregators
-    return the memo hex-encoded for the OP_RETURN, so the hex form counts too.
-    """
-    if not memo or not dest:
-        return False
-    m = memo.strip()
-    if dest in m:
-        return True
-    # Hex-encoded OP_RETURN payload (with or without an 0x prefix).
-    compact = m[2:] if m[:2].lower() == "0x" else m
-    try:
-        decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
-    except ValueError:
-        return False
-    return dest in decoded
+#: The memo check now lives in gs_common so GhostSpiral's own swap stage
+#: enforces the identical rule -- it previously had no memo check at all and
+#: would print deposit instructions for a memo naming someone else's address.
+#: Kept as a module-level name because it is part of this file's tested surface.
+_memo_binds_destination = memo_binds_destination
 
 
 def main():

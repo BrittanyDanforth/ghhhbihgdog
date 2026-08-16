@@ -36,7 +36,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
-    load_receive_bundle,
+    load_receive_bundle, memo_binds_destination,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -362,6 +362,69 @@ def parse_swap_route(route: dict) -> tuple:
     return deposit, memo, expected
 
 
+def validate_swap_route(deposit_addr, memo, xmr_dest: str, idx: int,
+                        allow_unbound_memo: bool = False) -> None:
+    """Refuse a swap quote that would send the operator's BTC into a black hole.
+
+    Every check here guards an IRREVERSIBLE payment, and this whole function is
+    the fix for a real defect: GhostSpiral's stage 2 validated the deposit
+    address and then printed "Send N BTC to <addr> with memo <memo>" without
+    ever checking the memo -- while thor_swap_preparer, fetching the same
+    quotes from the same API, refused to print exactly those instructions
+    unless the memo named the operator's own address. The safe path and the
+    unsafe path were the same operation in one repo.
+
+    Three ways a quote can cost the operator everything:
+      * no deposit address, or one that is not a real BTC address -- the funds
+        go nowhere recoverable;
+      * NO memo at all -- a BTC->XMR swap is routed entirely by the memo, so
+        BTC paid into the shared inbound vault without one is not routed to
+        anybody, least of all you;
+      * a memo naming a DIFFERENT address -- the vault is shared, so the swap
+        delivers your sender's money to whoever that address belongs to.
+
+    Raises SystemExit with an operator-readable reason; never returns on
+    failure. Amounts and the full address stay out of the integrity log.
+    """
+    if not deposit_addr:
+        integrity_log("stage2", f"no_deposit_in_route_{idx}")
+        sys.exit(f"[!] Chunk {idx}: the route carries no deposit address.")
+    dep = str(deposit_addr)
+    # A typo'd-but-in-charset address passes the regex alone, so the checksum
+    # is verified too: this string is about to be handed to somebody as "send
+    # real bitcoin here".
+    if not BTC_RE.match(dep) or not bech32_checksum_ok(dep):
+        integrity_log("stage2", f"bad_deposit_format_{idx}")
+        sys.exit(
+            f"[!] Chunk {idx}: the deposit address failed bech32 checksum\n"
+            f"    validation: {scrub_address(dep)}\n"
+            f"    The API response shape may have changed. Refusing to tell you to\n"
+            f"    send BTC to an address this tool could not verify."
+        )
+    if not memo:
+        integrity_log("stage2", f"no_memo_{idx}")
+        sys.exit(
+            f"[!] Chunk {idx}: the quote returned NO memo. A BTC->XMR swap is\n"
+            f"    routed entirely by the memo -- BTC sent to the inbound vault\n"
+            f"    without one is not routed to you and cannot be recovered.\n"
+            f"    Refusing to issue deposit instructions."
+        )
+    if not memo_binds_destination(memo, xmr_dest):
+        integrity_log("stage2", f"memo_dest_mismatch_{idx}")
+        if not allow_unbound_memo:
+            sys.exit(
+                f"[!] Chunk {idx}: the returned memo does NOT contain your XMR\n"
+                f"    destination {scrub_address(xmr_dest)}.\n"
+                f"    The memo is what tells ThorChain where to deliver the XMR, and\n"
+                f"    the deposit address is a SHARED inbound vault -- following these\n"
+                f"    instructions could pay someone else, irreversibly. Refusing.\n"
+                f"    Override only if you have verified the memo by hand:\n"
+                f"    --allow-unbound-memo"
+            )
+        print(f"  [!] Chunk {idx}: memo does not name your destination — continuing "
+              f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
+
+
 def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
     """Best-effort parse of JoinMarket tumbler stdout for BTC amounts sent to
     `dest`, returned as BTC Decimals (empty if nothing recognisable).
@@ -453,6 +516,11 @@ def main():
                           "PREFER GS_WALLET_PASSWORD=... in the environment: an "
                           "argv password is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444).")
+    cli.add_argument("--allow-unbound-memo", action="store_true",
+                     help="proceed even when a swap quote's memo does not contain your "
+                          "XMR destination. ONLY for a genuine aggregator format change "
+                          "-- normally it means the swap would deliver to someone else's "
+                          "address, irreversibly.")
     cli.add_argument("--allow-clearnet-relay", action="store_true",
                      help="Proceed even when monerod is verified to relay to raw-IP "
                           "peers. Every transaction this run creates would then be "
@@ -708,23 +776,12 @@ def main():
             # not just documented in a comment. See parse_swap_route above.
             deposit_addr, memo, expected_output = parse_swap_route(route)
 
-            if not deposit_addr:
-                integrity_log("stage2", f"no_deposit_in_route_{i}")
-                sys.exit(f"[!] Route has no deposit address for chunk {i}")
-            # SAFETY: the SwapKit v3 route field names here are best-effort (the
-            # live API could not be reached to confirm the exact shape). NEVER
-            # instruct the operator to send BTC to a 'deposit address' we have
-            # not confirmed is a real BTC address -- a wrong-field parse must
-            # ABORT, not silently route real funds to a garbage string.
-            if not BTC_RE.match(str(deposit_addr)) or not bech32_checksum_ok(str(deposit_addr)):
-                integrity_log("stage2", f"bad_deposit_format_{i}")
-                sys.exit(
-                    f"[!] SwapKit route deposit address for chunk {i} failed bech32\n"
-                    f"    checksum validation: {scrub_address(str(deposit_addr))}\n"
-                    f"    The API response shape may have changed. Refusing to tell you\n"
-                    f"    to send BTC to an unverified address; fix the route parsing in\n"
-                    f"    stage2_get_swap_quotes against the current SwapKit v3 schema."
-                )
+            # ONE gate for every way this quote can cost the operator their
+            # money -- missing/garbage deposit address, no memo, or a memo
+            # naming somebody else's address. Shared shape with
+            # thor_swap_preparer so the two swap paths cannot diverge again.
+            validate_swap_route(deposit_addr, memo, xmr_dest, i,
+                                allow_unbound_memo=args.allow_unbound_memo)
 
             try:
                 expected_dec = Decimal(str(expected_output))
@@ -744,8 +801,9 @@ def main():
 
             print(f"  [*] Chunk {i}/{len(chunks)-1}:")
             print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
-            if memo:
-                print(f"      With memo: {str(memo)[:40]}...")
+            # validate_swap_route has already refused an absent or unbound memo,
+            # so this always prints and always names the operator's own address.
+            print(f"      With memo: {str(memo)[:40]}...")
             print(f"      Expected: ~{expected_dec} XMR")
             integrity_log("stage2", f"quote_ready:{i}")
 

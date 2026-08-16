@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Executable tests for the pure-Python (non-Monero-stack) logic I changed.
 Loads the real extensionless scripts as modules and asserts real behavior."""
+import ast
 import sys, os, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 
@@ -220,6 +221,85 @@ check("fanout: never exceeds available subaddresses; all still hop",
       _fd_cap == ["M0", "D0"] and sorted(_hs_cap) == ["D0", "M0"])
 check("fanout: extra-output count is a RANGE, not a fixed fingerprint",
       ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
+
+# ---------------------------------------------------------------------------
+# THE SWAP MEMO IS THE ONLY THING BINDING A BTC DEPOSIT TO YOUR XMR ADDRESS.
+# The BTC a sender pays goes to a SHARED ThorChain inbound vault, so a memo
+# naming a different address delivers the money to whoever owns it.
+# thor_swap_preparer refused to print such instructions. GhostSpiral's own
+# stage 2, fetching the same quotes from the same API, checked the deposit
+# address and then printed "Send N BTC to <addr> with memo <memo>" having never
+# looked at the memo at all -- and did not abort on an EMPTY memo either.
+# ---------------------------------------------------------------------------
+_MDEST = "8" + "A" + "1" * 93
+_MOTHER = "8" + "B" + "2" * 93
+# A real mainnet bech32 address (valid BIP173 checksum).
+_MDEP = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+
+
+def _route_rejected(deposit, memo, dest=_MDEST, allow=False):
+    try:
+        ghost.validate_swap_route(deposit, memo, dest, 0, allow_unbound_memo=allow)
+        return False
+    except SystemExit:
+        return True
+
+
+check("swap: a memo naming YOUR address is accepted",
+      not _route_rejected(_MDEP, f"=:XMR.XMR:{_MDEST}:0/1/0"))
+# The bug, stated as a test: this exact quote used to reach the operator as
+# "send real bitcoin to this address with this memo".
+check("swap: a memo naming SOMEONE ELSE'S address is REFUSED",
+      _route_rejected(_MDEP, f"=:XMR.XMR:{_MOTHER}:0/1/0"))
+check("swap: an EMPTY memo is refused (a swap is routed entirely by the memo)",
+      _route_rejected(_MDEP, ""))
+check("swap: a None memo is refused", _route_rejected(_MDEP, None))
+check("swap: a missing deposit address is refused", _route_rejected("", f"=:XMR.XMR:{_MDEST}"))
+check("swap: a deposit address failing bech32 checksum is refused",
+      _route_rejected("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
+                      f"=:XMR.XMR:{_MDEST}"))
+check("swap: a non-BTC deposit string is refused",
+      _route_rejected("not-an-address", f"=:XMR.XMR:{_MDEST}"))
+# Aggregators may hex-encode the memo for the OP_RETURN; that must still bind.
+check("swap: a HEX-encoded memo binding your address is accepted",
+      not _route_rejected(_MDEP, f"=:XMR.XMR:{_MDEST}".encode().hex()))
+check("swap: a hex-encoded memo naming someone else is still refused",
+      _route_rejected(_MDEP, f"=:XMR.XMR:{_MOTHER}".encode().hex()))
+# The override exists, but must be explicit and must not weaken the others.
+check("swap: --allow-unbound-memo lets an unbound memo through deliberately",
+      not _route_rejected(_MDEP, f"=:XMR.XMR:{_MOTHER}", allow=True))
+check("swap: --allow-unbound-memo does NOT excuse a missing memo",
+      _route_rejected(_MDEP, "", allow=True))
+check("swap: --allow-unbound-memo does NOT excuse a bad deposit address",
+      _route_rejected("not-an-address", f"=:XMR.XMR:{_MDEST}", allow=True))
+
+# Both swap paths must enforce the identical rule from one implementation.
+import gs_common as _gsc0
+check("swap: the memo check lives in gs_common (shared, audited once)",
+      hasattr(_gsc0, "memo_binds_destination"))
+_th_s = open(os.path.join(REPO, "thor_swap_preparer")).read()
+_gs_s = open(os.path.join(REPO, "GhostSpiral")).read()
+check("swap: thor_swap_preparer uses the shared memo check",
+      "memo_binds_destination" in _th_s and "import" in _th_s)
+check("swap: GhostSpiral's own stage 2 now validates the route",
+      "validate_swap_route(" in _gs_s)
+# Structural, not textual: find the stage-2 quote loop and prove the guard is
+# actually CALLED there, before any deposit instruction is built.
+_gs_ast = ast.parse(_gs_s)
+_calls_guard = [n for n in ast.walk(_gs_ast)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "validate_swap_route"]
+check("swap: GhostSpiral actually CALLS the route guard (not just defines it)",
+      len(_calls_guard) == 1)
+check("swap: the guard is called with the operator's own xmr_dest",
+      _calls_guard and any(isinstance(a, ast.Name) and a.id == "xmr_dest"
+                           for a in _calls_guard[0].args))
+# thor and GhostSpiral must agree on every case, not merely both have a check.
+for _m, _d in ((f"=:XMR.XMR:{_MDEST}", True), (f"=:XMR.XMR:{_MOTHER}", False),
+               ("", False), (f"=:XMR.XMR:{_MDEST}".encode().hex(), True)):
+    check(f"swap: both paths agree on memo {_m[:24]!r}",
+          _gsc0.memo_binds_destination(_m, _MDEST) is _d)
+
 
 # ---------------------------------------------------------------------------
 # ONE receive-bundle loader. This describes WHERE MONEY LANDS and used to be
