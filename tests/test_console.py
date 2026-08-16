@@ -195,6 +195,27 @@ def test_remote_daemon_fee_query_routes_through_tor():
           seen.get("proxies", [None])[-1] is None)
 
 
+def test_wizard_structure_places_every_action():
+    """The page is a 5-step wizard; every action must live in some step's
+    data-acts placeholder (or it becomes unreachable), and each action id must
+    appear at most once (duplicate data-id -> duplicate dot-<id> element)."""
+    import re as _re
+    src = open(os.path.join(REPO, "gs_console")).read()
+    for s in range(1, 6):
+        check(f"step {s} section exists", f'data-step="{s}"' in src)
+    check("the wizard has a step navigation runner", "function showStep(" in src)
+    check("steps advance via .nx/.bk buttons", "data-go=" in src)
+
+    placed = []
+    for m in _re.findall(r'data-acts="([^"]*)"', src):
+        placed += [x.strip() for x in m.split(",") if x.strip()]
+    c = load_console()
+    for aid in c.ACTIONS:
+        check(f"action '{aid}' is placed in a wizard step", aid in placed)
+    check("no action is placed twice (would duplicate dot-<id>)",
+          len(placed) == len(set(placed)))
+
+
 def test_peel_flag_wires_through_to_argv():
     """The peeling-chain toggle must reach GhostSpiral's argv, and the peel
     preset must set it while other presets leave it off."""

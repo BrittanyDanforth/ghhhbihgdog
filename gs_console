@@ -748,6 +748,38 @@ h1{margin:0;font-size:21px;font-weight:650;letter-spacing:-.02em}
 .cols{display:grid;grid-template-columns:minmax(320px,410px) 1fr;gap:20px;align-items:start}
 @media(max-width:1000px){.cols{grid-template-columns:1fr}}
 .card{background:var(--sf);border:1px solid var(--line);border-radius:11px;padding:15px 16px;margin-bottom:14px}
+/* ── wizard ───────────────────────────────────────────────────────────── */
+.stepbar{list-style:none;display:flex;gap:6px;margin:0 0 16px;padding:0;flex-wrap:wrap}
+.stepbar li{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mut);cursor:pointer;
+padding:6px 10px;border-radius:8px;border:1px solid transparent;user-select:none}
+.stepbar li .sn{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;font-size:11px;
+font-weight:600;background:var(--sf2);color:var(--mut);border:1px solid var(--line2)}
+.stepbar li.on{color:var(--ink);border-color:var(--acc);background:var(--accs)}
+.stepbar li.on .sn{background:var(--acc);color:var(--sf);border-color:var(--acc)}
+.stepbar li.done{color:var(--ink2)}
+.stepbar li.done .sn{background:var(--ok);color:var(--sf);border-color:var(--ok)}
+.stepbar li.done .sn::after{content:"✓"}
+.stepbar li.done .sn{font-size:0}
+.stepbar li.done .sn::after{font-size:12px}
+.step{background:var(--sf);border:1px solid var(--line);border-radius:11px;padding:18px 18px 16px;margin-bottom:14px}
+.step[hidden]{display:none}
+.step>h2{color:var(--ink);font-size:15px;letter-spacing:-.01em;text-transform:none;font-family:inherit;margin:0 0 14px}
+.lead{color:var(--mut);font-size:12.5px;line-height:1.5;margin:0 0 14px}
+.choices{display:grid;gap:10px}
+.choice{text-align:left;cursor:pointer;background:var(--bg);border:1px solid var(--line2);border-radius:10px;
+padding:14px 15px;color:var(--ink);font:inherit;display:flex;flex-direction:column;gap:4px}
+.choice:hover{border-color:var(--acc)}
+.choice[aria-pressed=true]{border-color:var(--acc);background:var(--accs);box-shadow:0 0 0 1px var(--acc)}
+.choice .ct{font-size:15px;font-weight:650}
+.choice .cd{font-size:12px;color:var(--mut);line-height:1.45}
+.stepnav{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:18px}
+.stepnav button{font:inherit;font-size:13px;font-weight:600;padding:9px 16px;border-radius:9px;cursor:pointer;border:1px solid var(--line2);background:var(--bg);color:var(--ink)}
+.stepnav .nx{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.stepnav .nx:hover{background:var(--acc);border-color:var(--acc)}
+.stepnav .bk:hover{border-color:var(--acc)}
+.adv{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+.adv summary{cursor:pointer;font-size:12px;color:var(--mut);user-select:none}
+.adv summary:hover{color:var(--acc)}
 h2{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;
 color:var(--mut);font-weight:600;margin:0 0 12px}
 .seg{display:flex;gap:0;border:1px solid var(--line2);border-radius:9px;overflow:hidden;margin-bottom:13px}
@@ -854,11 +886,32 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
 <span class="hint">127.0.0.1 · argv composed server-side · funds need arming</span></header>
 <div class="cols">
 <div>
-  <div class="card"><h2>Direction</h2>
-    <div class="seg" id="mode">
-      <button data-m="send" aria-pressed="true">Send · BTC → XMR</button>
-      <button data-m="receive" aria-pressed="false">Receive · XMR in</button>
+  <!-- progress rail: one row, current step highlighted -->
+  <ol class="stepbar" id="stepbar">
+    <li data-s="1"><span class="sn">1</span>Action</li>
+    <li data-s="2"><span class="sn">2</span><span id="lbl2">Details</span></li>
+    <li data-s="3"><span class="sn">3</span>Privacy</li>
+    <li data-s="4"><span class="sn">4</span>Network</li>
+    <li data-s="5"><span class="sn">5</span>Run</li>
+  </ol>
+
+  <!-- STEP 1 — what are you doing -->
+  <section class="step" data-step="1">
+    <h2>Step 1 · What do you want to do?</h2>
+    <div class="choices" id="mode">
+      <button class="choice" data-m="send" aria-pressed="true">
+        <span class="ct">Send · BTC → XMR</span>
+        <span class="cd">Swap your BTC to Monero through ThorChain, then mix it across fresh subaddresses.</span></button>
+      <button class="choice" data-m="receive" aria-pressed="false">
+        <span class="ct">Receive · XMR in</span>
+        <span class="cd">Make a fresh receive address for a sender, then mix the Monero once it arrives.</span></button>
     </div>
+    <div class="stepnav"><span></span><button class="nx" data-go="2">Next →</button></div>
+  </section>
+
+  <!-- STEP 2 — details (send) / receive -->
+  <section class="step" data-step="2" hidden>
+    <h2 id="h2-2">Step 2 · Payment</h2>
     <div id="send-fields">
       <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" placeholder="bc1q…"></div>
       <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05"></div>
@@ -866,14 +919,21 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <label class="chk"><input type="checkbox" id="joinmarket">
         <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
     </div>
-    <div id="recv-fields" style="display:none">
-      <div class="f"><label for="receive_wallet">Wallet JSON</label><input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
-      <p style="font-size:12px;color:var(--mut);margin:4px 0 0;line-height:1.5">
-        Produced by <strong>Create receive address</strong> below. Hand the address to the sender.</p>
+    <div id="recv-fields" hidden>
+      <p class="lead">First create a fresh receive address — hand the address it prints to the sender,
+      then paste the wallet JSON filename it saves below.</p>
+      <div class="stepacts" data-acts="make_receive"></div>
+      <div class="f" style="margin-top:12px"><label for="receive_wallet">Wallet JSON</label>
+        <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
     </div>
-  </div>
+    <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>
+  </section>
 
-  <div class="card"><h2>Safety preset</h2>
+  <!-- STEP 3 — privacy -->
+  <section class="step" data-step="3" hidden>
+    <h2>Step 3 · Privacy level</h2>
+    <p class="lead">Pick a preset — it sets everything below. Higher privacy means more transactions,
+    higher fees and more waiting.</p>
     <div class="presets" id="presets">
       <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">~12 txs · 1 dest each · slowest</span></button>
       <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">40 wallets · depth 4 · DAG</span></button>
@@ -884,53 +944,67 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <button data-p="fast" aria-pressed="false"><span class="pn">Fast</span><span class="pd">3 wallets · depth 1 · no DAG</span></button>
     </div>
     <div id="preset-note" class="warnbox"></div>
-    <div class="row2" style="margin-top:12px">
-      <div class="f" style="grid-template-columns:76px 1fr"><label for="wallets">Wallets</label><input id="wallets" type="number" min="3" max="60" value="10"></div>
-      <div class="f" style="grid-template-columns:56px 1fr"><label for="deep">Depth</label><input id="deep" type="number" min="1" max="6" value="2"></div>
-    </div>
-    <label class="chk"><input type="checkbox" id="dag_mixing" checked>
-      <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
-    <label class="chk"><input type="checkbox" id="peel">
-      <span>Peeling chain<span class="d">distribute ONE tx per destination (each spends the last one's change) instead of one fan-out — outputs are never co-created. MUCH slower: ~20 min per destination.</span></span></label>
-    <label class="chk"><input type="checkbox" id="allow_clearnet_relay">
-      <span style="color:var(--err)">Allow clearnet relay<span class="d">proceed even when monerod would broadcast to raw-IP peers — reveals your IP</span></span></label>
+    <details class="adv"><summary>Fine-tune (advanced)</summary>
+      <div class="row2" style="margin-top:10px">
+        <div class="f" style="grid-template-columns:76px 1fr"><label for="wallets">Wallets</label><input id="wallets" type="number" min="3" max="60" value="10"></div>
+        <div class="f" style="grid-template-columns:56px 1fr"><label for="deep">Depth</label><input id="deep" type="number" min="1" max="6" value="2"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="dag_mixing" checked>
+        <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
+      <label class="chk"><input type="checkbox" id="peel">
+        <span>Peeling chain<span class="d">distribute ONE tx per destination (each spends the last one's change) instead of one fan-out — outputs are never co-created. MUCH slower: ~20 min per destination.</span></span></label>
+      <label class="chk"><input type="checkbox" id="allow_clearnet_relay">
+        <span style="color:var(--err)">Allow clearnet relay<span class="d">proceed even when monerod would broadcast to raw-IP peers — reveals your IP</span></span></label>
+    </details>
     <div class="subsec">
       <div class="subhead"><span>Fee priority</span><span class="mut-s">live from your daemon</span></div>
       <div class="fees" id="fees"></div>
       <div class="fsrc" id="fsrc">loading…</div>
     </div>
-  </div>
+    <div class="stepnav"><button class="bk" data-go="2">← Back</button><button class="nx" data-go="4">Next →</button></div>
+  </section>
 
-  <div class="card"><h2>Network</h2>
+  <!-- STEP 4 — network + preflight -->
+  <section class="step" data-step="4" hidden>
+    <h2>Step 4 · Network &amp; preflight</h2>
     <div class="f"><label for="tor_proxy">Tor proxy</label><input id="tor_proxy" value="socks5h://127.0.0.1:9050"></div>
     <div class="f"><label for="rpc_primary">Wallet RPC</label><input id="rpc_primary" value="http://127.0.0.1:18083"></div>
     <div class="f"><label for="rpc_daemon">Daemon RPC</label><input id="rpc_daemon" value="http://127.0.0.1:18081"></div>
     <div class="f"><label for="wallet_file">Wallet file</label><input id="wallet_file" value="offline.wallet"></div>
     <div id="pwnote" class="warnbox"></div>
-  </div>
-
-  <div class="card"><h2>Command that will run</h2>
-    <pre class="prev" id="prev">…</pre>
-    <ul class="probs" id="probs"></ul>
     <div id="pfstatus" class="pfbox"></div>
     <button id="pfre" class="pfre" type="button">re-run preflight now</button>
+    <p class="lead" style="margin-top:14px">Run the manual checks for detail (they change nothing):</p>
+    <div class="stepacts" data-acts="preflight_tor,preflight_egress,preflight_wallet,paranoia_dry"></div>
+    <div class="stepnav"><button class="bk" data-go="3">← Back</button><button class="nx" data-go="5">Next →</button></div>
+  </section>
+
+  <!-- STEP 5 — review + run -->
+  <section class="step" data-step="5" hidden>
+    <h2>Step 5 · Review &amp; run</h2>
+    <div class="subhead"><span>Command that will run</span><span class="mut-s">composed on the server</span></div>
+    <pre class="prev" id="prev">…</pre>
+    <ul class="probs" id="probs"></ul>
     <div class="arm" id="armbox" style="display:none">
-      <p><strong>This moves funds.</strong> It fans out, signs and broadcasts real transactions.
-      The OPSEC preflight above must pass first — it is re-verified on the server
-      when you run, so it cannot be skipped. Type <strong id="armword"></strong> to arm.</p>
+      <p><strong>This moves funds.</strong> It signs and broadcasts real transactions. The OPSEC
+      preflight (step 4) must pass — it is re-verified on the server when you run, so it cannot be
+      skipped. Type <strong id="armword"></strong> to arm.</p>
       <input id="arm" placeholder="type to arm" autocomplete="off">
     </div>
-  </div>
-
+    <div class="stepacts" data-acts="run_pipeline" style="margin-top:12px"></div>
+    <details class="adv"><summary>Developer tools (tests &amp; wipe preview)</summary>
+      <div class="stepacts" data-acts="units,integration,ipleak,leakaudit,compile" style="margin-top:10px"></div>
+    </details>
+    <div class="stepnav"><button class="bk" data-go="4">← Back</button><span></span></div>
+  </section>
 </div>
 
 <div class="rightcol">
-  <div class="card"><h2>Operations</h2><div class="ops" id="actions"></div></div>
   <div class="panel">
     <div class="pbar"><span class="pt" id="pt">Nothing running</span>
       <span class="pill" id="ppill" style="display:none"></span><span class="pm" id="pm"></span>
       <span class="pacts"><button id="stop" class="stop">Stop</button><button id="copy">Copy</button></span></div>
-    <div id="out"><div class="idle">Run a preflight check first — Tor exit, relay egress, then wallet balance.</div></div>
+    <div id="out"><div class="idle">Follow the steps on the left. Output from any action shows here.</div></div>
   </div>
 </div>
 </div></div><script>
@@ -993,13 +1067,16 @@ async function loadFees(){
  renderFees();
 }
 
-$$('#mode button').forEach(b=>b.addEventListener('click',()=>{
- mode=b.dataset.m;
- $$('#mode button').forEach(o=>o.setAttribute('aria-pressed',String(o===b)));
- $('#send-fields').style.display=mode==='send'?'':'none';
- $('#recv-fields').style.display=mode==='receive'?'':'none';
+function setMode(m){
+ mode=m;
+ $$('#mode button').forEach(o=>o.setAttribute('aria-pressed',String(o.dataset.m===m)));
+ $('#send-fields').hidden = mode!=='send';
+ $('#recv-fields').hidden = mode!=='receive';
+ $('#lbl2').textContent = mode==='send' ? 'Payment' : 'Receive';
+ $('#h2-2').textContent = mode==='send' ? 'Step 2 · Payment' : 'Step 2 · Receive';
  sync();
-}));
+}
+$$('#mode button').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.m)));
 
 function collect(){
  const v=id=>$('#'+id)?.value.trim()||'';
@@ -1072,17 +1149,37 @@ $('#pwnote').innerHTML=PWSET
 
 // One grouped GRID, not a card per group. Group order is fixed so the board
 // reads Preflight -> Receive -> Pipeline -> Verify regardless of dict order.
-const groups={};
-for(const [id,a] of Object.entries(A)) (groups[a.group] ||= []).push([id,a]);
-const GORDER=['Preflight','Receive','Pipeline','Verify'];
-const gkeys=[...GORDER.filter(g=>groups[g]), ...Object.keys(groups).filter(g=>!GORDER.includes(g))];
-$('#actions').innerHTML=gkeys.map(g=>
- `<div class="opgroup">${esc(g)}</div>`+groups[g].map(([id,a])=>
-  `<button class="act ${a.risk}" data-id="${id}" ${a.risk==='spends'?'disabled':''}>
-    <span class="top"><span class="dot" id="dot-${id}"></span><span class="nm">${esc(a.label)}</span>
-     <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></span>
-    <span class="ds">${esc(a.desc)}</span></button>`).join('')).join('');
+// Render each action into the wizard step that declares it via data-acts, so
+// buttons live in context (make receive in step 2, checks in step 4, run in
+// step 5) instead of one long grid. Server-composed argv + gates are unchanged.
+function actButton(id){
+ const a=A[id]; if(!a) return '';
+ return `<button class="act ${a.risk}" data-id="${id}" ${a.risk==='spends'?'disabled':''}>
+   <span class="top"><span class="dot" id="dot-${id}"></span><span class="nm">${esc(a.label)}</span>
+    <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></span>
+   <span class="ds">${esc(a.desc)}</span></button>`;
+}
+$$('.stepacts').forEach(box=>{
+ box.classList.add('ops');
+ const ids=(box.dataset.acts||'').split(',').map(s=>s.trim()).filter(Boolean);
+ box.innerHTML=ids.map(actButton).join('');
+});
 $$('.act').forEach(b=>b.addEventListener('click',()=>run(b.dataset.id)));
+
+// ── step navigation ────────────────────────────────────────────────────────
+let step=1;
+function showStep(n){
+ step=Math.max(1,Math.min(5,n));
+ $$('.step').forEach(s=>{s.hidden = +s.dataset.step!==step;});
+ $$('#stepbar li').forEach(li=>{
+  const s=+li.dataset.s;
+  li.classList.toggle('on', s===step);
+  li.classList.toggle('done', s<step);
+ });
+ window.scrollTo({top:0,behavior:'smooth'});
+}
+$$('.nx,.bk').forEach(b=>b.addEventListener('click',()=>showStep(+b.dataset.go)));
+$$('#stepbar li').forEach(li=>li.addEventListener('click',()=>showStep(+li.dataset.s)));
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function colour(l){
@@ -1127,7 +1224,7 @@ async function poll(){
 $('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST',headers:HDR,body:'{}'});});
 $('#copy').addEventListener('click',()=>{const p=$('#pre');if(p)navigator.clipboard?.writeText(p.innerText);});
 
-applyPreset('balanced'); loadFees(); sync(); runPreflight();
+setMode('send'); showStep(1); applyPreset('balanced'); loadFees(); sync(); runPreflight();
 $('#rpc_daemon').addEventListener('change',loadFees);
 </script></body></html>"""
 
