@@ -873,8 +873,10 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
   <div class="card"><h2>Safety preset</h2>
     <div class="presets" id="presets">
       <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">40 wallets · depth 4 · DAG</span></button>
+      <button data-p="churn" aria-pressed="false"><span class="pn">Deep churn</span><span class="pd">20 wallets · depth 6 · DAG</span></button>
       <button data-p="max" aria-pressed="false"><span class="pn">High privacy</span><span class="pd">25 wallets · depth 3 · DAG</span></button>
-      <button data-p="balanced" aria-pressed="true"><span class="pn">Balanced</span><span class="pd">10 wallets · depth 2 · DAG</span></button>
+      <button data-p="balanced" aria-pressed="true"><span class="pn">Balanced</span><span class="pd">12 wallets · depth 2 · DAG</span></button>
+      <button data-p="lowfee" aria-pressed="false"><span class="pn">Low fee</span><span class="pd">8 wallets · depth 2 · DAG · p1</span></button>
       <button data-p="fast" aria-pressed="false"><span class="pn">Fast</span><span class="pd">3 wallets · depth 1 · no DAG</span></button>
     </div>
     <div id="preset-note" class="warnbox"></div>
@@ -934,10 +936,14 @@ let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 const PRESETS={
  paranoid:{wallets:40,deep:4,dag_mixing:true,fee_priority:3,clearnet:false,
       note:'SAFEST. 40 subaddresses, depth 4, both mixing rounds, priority 3, and clearnet relay forced OFF. Largest anonymity set — slowest and highest fees. Use for large amounts or when unlinkability matters most.'},
+ churn:{wallets:20,deep:6,dag_mixing:true,fee_priority:2,clearnet:false,
+      note:'DEEP CHURN. 20 subaddresses at maximum depth 6 — the longest hop chains, so the funds cross the most intermediate outputs before they settle. Emphasises trail length over breadth; slowest to finish.'},
  max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,clearnet:false,
       note:'25 subaddresses, depth 3, DAG hops on, priority 3, clearnet relay off. Wide anonymity set.'},
- balanced:{wallets:10,deep:2,dag_mixing:true,fee_priority:2,clearnet:false,
-      note:'10 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts.'},
+ balanced:{wallets:12,deep:2,dag_mixing:true,fee_priority:2,clearnet:false,
+      note:'12 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts.'},
+ lowfee:{wallets:8,deep:2,dag_mixing:true,fee_priority:1,clearnet:false,
+      note:'8 subaddresses, depth 2, DAG hops on, priority 1 (cheapest fees). Real mixing on a budget — fewer hops means lower total fees, worth it for smaller amounts where fees would otherwise eat the balance.'},
  fast:{wallets:3,deep:1,dag_mixing:false,fee_priority:1,clearnet:false,
       note:'3 subaddresses, depth 1, no DAG round, priority 1. Fan-out only — least mixing, cheapest, no confirmation wait. Weakest privacy.'}};
 

@@ -167,6 +167,35 @@ check("fee: the 4-XMR fresh-chain value that mis-sized the plan is caught",
       _fee_exits({"fee": 2000000000}, prio=1))
 
 # ---------------------------------------------------------------------------
+# GhostSpiral.compute_fanout_amounts: UNEQUAL jittered fan-out (anti-clustering)
+# ---------------------------------------------------------------------------
+import random as _rnd
+_fee = Decimal("0.0005")
+_bud = Decimal("10") * ghost.FANOUT_SPEND_FRACTION
+_amts = ghost.compute_fanout_amounts(Decimal("10"), 8, _fee, True, _rnd.Random(1))
+check("fanout: returns one amount per destination", len(_amts) == 8)
+check("fanout: amounts are UNEQUAL (defeats equal-value clustering)",
+      len(set(_amts)) == 8)
+check("fanout: sum never exceeds the spend budget",
+      sum(_amts) <= _bud)
+check("fanout: every amount reserves its own hop fee (DAG on)",
+      min(_amts) >= ghost.hop_fee_reserve(_fee))
+check("fanout: a seeded rng is deterministic (same seed -> same split)",
+      ghost.compute_fanout_amounts(Decimal("10"), 8, _fee, True, _rnd.Random(1)) == _amts)
+check("fanout: a different seed gives a different split",
+      ghost.compute_fanout_amounts(Decimal("10"), 8, _fee, True, _rnd.Random(2)) != _amts)
+check("fanout: an unfundable budget returns [] (caller aborts, no bad plan)",
+      ghost.compute_fanout_amounts(Decimal("0.001"), 8, _fee, True, _rnd.Random(1)) == [])
+check("fanout: zero/negative count returns []",
+      ghost.compute_fanout_amounts(Decimal("10"), 0, _fee, True, _rnd.Random(1)) == [])
+# DAG off needs only a dust margin, so a smaller balance can still fan out.
+_amts_off = ghost.compute_fanout_amounts(Decimal("0.01"), 5, _fee, False, _rnd.Random(3))
+check("fanout: DAG-off floor is only a dust margin (funds smaller balances)",
+      len(_amts_off) == 5 and all(a >= Decimal("0.0002") for a in _amts_off))
+check("fanout: DAG-off sum still within budget",
+      sum(_amts_off) <= Decimal("0.01") * ghost.FANOUT_SPEND_FRACTION)
+
+# ---------------------------------------------------------------------------
 # gs_common daemon_fee_estimate: refuse non-localhost without proxy (no net)
 # ---------------------------------------------------------------------------
 check("daemon_fee_estimate: non-localhost + no proxy -> {}",

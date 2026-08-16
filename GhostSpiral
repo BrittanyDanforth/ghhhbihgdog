@@ -25,7 +25,7 @@ OPSEC hardening (v10.5):
 """
 from __future__ import annotations
 import argparse, json, os, re, sys, time, subprocess
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import List
 
@@ -207,6 +207,59 @@ def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
     """
     return (usable * FANOUT_SPEND_FRACTION / Decimal(fanout_count)).quantize(
         DUST_XMR, rounding=ROUND_DOWN)
+
+
+def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
+                           dag_enabled: bool, rng=None) -> list:
+    """Per-destination fan-out amounts that are DELIBERATELY UNEQUAL.
+
+    Think like a chain analyst. Splitting the balance into N identical outputs
+    makes those N outputs, and every hop that later spends them, share one
+    value and one transaction shape -- a cluster you can pick out and follow
+    even when Monero hides the amounts on-chain (the fee, the input/output
+    count, and the timing are all still observable, and a future break in
+    amount-hiding would expose the equality directly). Uneven amounts give each
+    trail its own magnitude, so the fan-out looks like N unrelated payments
+    rather than one split.
+
+    Guarantees, so the plan is always fundable and never over-budget:
+      * every amount >= min_each, where min_each reserves this output's own hop
+        fee when DAG mixing is on (so no hop later fails "not enough money"
+        AFTER the fan-out already executed on-chain), or a dust margin when it
+        is off;
+      * the sum never exceeds usable * FANOUT_SPEND_FRACTION (each share is
+        ROUND_DOWN, and the fixed min_each floor is reserved before the random
+        remainder is distributed);
+      * returns [] when the budget cannot fund `fanout_count` viable outputs,
+        so the caller can reduce the count or abort rather than emit a plan
+        that dies mid-flight.
+
+    rng is injected for deterministic tests; production passes a SystemRandom.
+    Uses only rng.random() (uniform 0..1), so any stdlib Random works.
+    """
+    if fanout_count <= 0:
+        return []
+    if rng is None:
+        import secrets as _s
+        rng = _s.SystemRandom()
+    budget = usable * FANOUT_SPEND_FRACTION
+    min_each = (hop_fee_reserve(fee_xmr) + DUST_XMR) if dag_enabled else (DUST_XMR * 2)
+    # Round the floor UP so every output is genuinely at least min_each after
+    # quantisation -- rounding it down could leave an output a tick short of
+    # funding its hop.
+    min_each = min_each.quantize(DUST_XMR, rounding=ROUND_UP)
+    floor_total = min_each * Decimal(fanout_count)
+    if budget < floor_total:
+        return []                       # cannot fund this many viable outputs
+    remainder = budget - floor_total
+    weights = [rng.random() for _ in range(fanout_count)]
+    wsum = sum(weights) or 1.0
+    amounts = []
+    for w in weights:
+        share = (remainder * (Decimal(str(w)) / Decimal(str(wsum)))).quantize(
+            DUST_XMR, rounding=ROUND_DOWN)
+        amounts.append(min_each + share)
+    return amounts
 
 
 def parse_swap_route(route: dict) -> tuple:
@@ -850,11 +903,15 @@ def main():
         integrity_log("stage4", "no_mix_targets")
         sys.exit("[!] No mix subaddresses available to fan out into "
                  f"(got {len(mix_targets)}). Cannot build a plan.")
-    fanout_amt = compute_fanout_amount(usable, fanout_count)
-    if fanout_amt <= DUST_XMR:
+    # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
+    # give a chain analyst one value and one shape to cluster and follow.
+    fanout_amounts = compute_fanout_amounts(
+        usable, fanout_count, fee_xmr, args.dag_mixing, _secrets.SystemRandom())
+    if not fanout_amounts:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
-            f"{fanout_count} subaddresses (each would get {fanout_amt} XMR)."
+            f"{fanout_count} subaddresses with the fee reserve each output needs. "
+            f"Use fewer wallets, disable --dag-mixing, or fund the wallet more."
         )
     # Fan-out is ONE transaction: a single transfer_split from ENTRY's single
     # confirmed output to all fanout_count mix subaddresses at once (one input
@@ -864,10 +921,12 @@ def main():
     # the 2nd..Nth separate TX would fail 'no unlocked output' and abort the run
     # (the change output from TX0 is unconfirmed and unspendable in the batch).
     fanout_dests = list(mix_targets[:fanout_count])
+    # Per-destination amount, so each mix subaddress receives its OWN magnitude.
+    fanout_by_addr = dict(zip(fanout_dests, fanout_amounts))
     fanout_plan = [{
         "src": ENTRY,
         "src_index": _src_index(ENTRY),
-        "destinations": [{"address": a, "amount": str(fanout_amt)} for a in fanout_dests],
+        "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
         "delay": _secrets.randbelow(540) + 180,
         "extra": secure_hex(16),
     }]
@@ -912,32 +971,41 @@ def main():
         # Reserve and hop both come from the shared helpers, so the number
         # printed below is the number the arithmetic actually used.
         _hop_reserve = hop_fee_reserve(fee_xmr)
-        dag_hop_amt = compute_hop_amount(fanout_amt, fee_xmr)
-        if dag_hop_amt <= DUST_XMR:
+        hop_sources = list(funded_targets)
+        _secrets.SystemRandom().shuffle(hop_sources)
+        _unfundable = 0
+        for s in hop_sources:
+            if shutdown_requested():
+                integrity_log("stage4", "shutdown_during_dag_plan")
+                break
+            # Each source hops onward from its OWN fan-out balance, so the hop
+            # amounts stay as unequal as the fan-out that funded them -- no
+            # single hop value for an analyst to cluster on.
+            src_hop_amt = compute_hop_amount(fanout_by_addr[s], fee_xmr)
+            if src_hop_amt <= DUST_XMR:
+                _unfundable += 1
+                continue
+            dst_candidates = [d for d in dag.get(s, mix_targets) if d != s]
+            if not dst_candidates:
+                continue
+            d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
+            dag_plan.append({
+                "src": s,
+                "src_index": _src_index(s),
+                "dst": d,
+                "amt": str(src_hop_amt),
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+            })
+        if not dag_plan:
             integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
-            print(f"  [!] DAG mixing skipped: each mix subaddress receives "
-                  f"{fanout_amt} XMR, which cannot fund a hop after reserving "
-                  f"{_hop_reserve} XMR for the fee (hop would be {dag_hop_amt} XMR). "
+            print(f"  [!] DAG mixing skipped: no mix subaddress holds enough to "
+                  f"fund a hop after reserving ~{_hop_reserve} XMR for its fee. "
                   f"Fan-out distribution still runs.")
         else:
-            hop_sources = list(funded_targets)
-            _secrets.SystemRandom().shuffle(hop_sources)
-            for s in hop_sources:
-                if shutdown_requested():
-                    integrity_log("stage4", "shutdown_during_dag_plan")
-                    break
-                dst_candidates = [d for d in dag.get(s, mix_targets) if d != s]
-                if not dst_candidates:
-                    continue
-                d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
-                dag_plan.append({
-                    "src": s,
-                    "src_index": _src_index(s),
-                    "dst": d,
-                    "amt": str(dag_hop_amt),
-                    "delay": _secrets.randbelow(540) + 180,
-                    "extra": secure_hex(16),
-                })
+            if _unfundable:
+                print(f"  [!] {_unfundable} mix subaddress(es) too small to hop; "
+                      f"they keep their fan-out output. {len(dag_plan)} hop(s) planned.")
             # Hop COUNT only, never the per-hop amount — same reason as the
             # fan-out above: the amount on the persistent chain deanonymises the
             # hop it is meant to hide.

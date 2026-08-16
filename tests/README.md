@@ -45,6 +45,10 @@ python3 tests/real_broadcast_testnet.py   # calls the SHIPPED broadcast main():
                                           #   mid-delay and a swapped blob relay
                                           #   NOTHING, and that --resume then relays
                                           #   a tx that confirms on-chain
+python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-signs a
+                                          #   1->N fan-out with UNEQUAL amounts and
+                                          #   confirms each subaddress got its exact
+                                          #   planned amount on-chain
 ```
 
 `real_phase_create_testnet.py` needs the `monero` package (the others do not).
