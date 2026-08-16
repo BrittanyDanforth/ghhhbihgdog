@@ -24,6 +24,9 @@ python3 tests/test_swap_receive.py  # MONEY PATH: the swap memo must name your o
                                     #   XMR address, catastrophic slippage must
                                     #   abort, and the receive subaddress must be
                                     #   confirmed by the wallet itself
+python3 tests/test_console.py       # gs_console: wallet-password scope, no
+                                    #   invented fee numbers, preflight egress
+                                    #   rule, HTTP gates over a real socket
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)

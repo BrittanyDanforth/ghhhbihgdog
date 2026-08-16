@@ -19,10 +19,17 @@ SAFETY MODEL, because this can spend money:
     the exact arm phrase, which the UI only sends after you type it.
   * shell=False everywhere. No shell metacharacter can matter.
   * The wallet password is taken from the GS_WALLET_PASSWORD environment of
-    the console process and forwarded ONLY to the pipeline child. It is never
-    accepted over HTTP, never rendered, and never written to the command
-    preview — the preview shows the real argv, which by design has no
-    password on it.
+    the console process and forwarded ONLY to the pipeline child (see
+    PASSWORD_ACTIONS / _child_env — every other child has it stripped from its
+    environment). It is never accepted over HTTP, never rendered, and never
+    written to the command preview — the preview shows the real argv, which by
+    design has no password on it.
+  * Fee estimates come from your own daemon or are not shown at all. There is
+    no built-in fee table to fall back on; a number about your money is never
+    invented to fill the space.
+  * Every network check obeys the same egress rule as the rest of the
+    toolchain: loopback direct, remote only through the Tor proxy, refuse
+    rather than connect when there is no proxy.
 
 Stdlib only, so it runs on the air-gapped machine too.
 """
@@ -161,10 +168,14 @@ ACTIONS = {
                         "build": lambda p: [PY, "-c", PREFLIGHT_TOR, p.get("tor_proxy", "")]},
     "preflight_egress": {"group": "Preflight", "label": "Check relay egress", "risk": "safe",
                          "desc": "inspect monerod's peers — would a broadcast leave over clearnet?",
-                         "build": lambda p: [PY, "-c", PREFLIGHT_EGRESS, p.get("rpc_daemon", "")]},
+                         "build": lambda p: [PY, "-c", PREFLIGHT_EGRESS,
+                                             p.get("rpc_daemon", ""),
+                                             p.get("tor_proxy", "")]},
     "preflight_wallet": {"group": "Preflight", "label": "Wallet + balance", "risk": "safe",
                          "desc": "reach the wallet-rpc and read the unlocked balance",
-                         "build": lambda p: [PY, "-c", PREFLIGHT_WALLET, p.get("rpc_primary", "")]},
+                         "build": lambda p: [PY, "-c", PREFLIGHT_WALLET,
+                                             p.get("rpc_primary", ""),
+                                             p.get("tor_proxy", "")]},
     "paranoia_dry":    {"group": "Preflight", "label": "Wipe preview", "risk": "safe",
                         "desc": "what paranoia_mode WOULD erase — deletes nothing",
                         "build": lambda p: [PY, "paranoia_mode", "--dry-run"]},
@@ -218,8 +229,14 @@ import sys, json, importlib.machinery, importlib.util
 l=importlib.machinery.SourceFileLoader('gs','gs_common.py')
 s=importlib.util.spec_from_loader('gs',l); gs=importlib.util.module_from_spec(s); l.exec_module(gs)
 d=sys.argv[1] if len(sys.argv)>1 else 'http://127.0.0.1:18081'
+tor=sys.argv[2] if len(sys.argv)>2 else ''
+# Pass the proxy through so a REMOTE daemon can actually be inspected. Without
+# it check_daemon_relay_egress refuses to query a non-loopback daemon (rightly
+# -- it will not open a clearnet connection to do so) and can only answer
+# "unknown", which reads like a broken check rather than a missing proxy.
+prox=gs.validate_proxy(tor) if tor else None
 print('[*] inspecting relay egress at', d)
-v=gs.check_daemon_relay_egress(d)
+v=gs.check_daemon_relay_egress(d, prox)
 print(json.dumps(v, indent=2))
 verdict=v['verdict']
 print({'tor':'[+] Relay egress is anonymous.',
@@ -229,17 +246,48 @@ print({'tor':'[+] Relay egress is anonymous.',
 raise SystemExit(0 if verdict=='tor' else 1)
 """
 
+# argv: [rpc_url, tor_proxy]
+#
+# This used to be a hand-rolled urllib.request with no egress guard at all,
+# while the parameter schema happily accepts ANY http(s) host. Pointing the
+# console at a remote wallet-rpc therefore opened a direct clearnet connection
+# from the operator's real IP -- verified by aiming it at an unroutable
+# TEST-NET address and watching it spend 20s trying to connect. Every other
+# network path in this toolchain goes through the same rule, so this one does
+# too: loopback direct, remote only through the Tor proxy, and refuse rather
+# than connect when there is no proxy to use.
 PREFLIGHT_WALLET = """
-import sys, json, urllib.request
-u=(sys.argv[1] if len(sys.argv)>1 else 'http://127.0.0.1:18083').rstrip('/')+'/json_rpc'
+import sys, json, importlib.machinery, importlib.util
+from urllib.parse import urlparse
+l=importlib.machinery.SourceFileLoader('gs','gs_common.py')
+s=importlib.util.spec_from_loader('gs',l); gs=importlib.util.module_from_spec(s); l.exec_module(gs)
+import requests
+
+url=(sys.argv[1] if len(sys.argv)>1 else 'http://127.0.0.1:18083').rstrip('/')
+tor=sys.argv[2] if len(sys.argv)>2 else ''
+host=(urlparse(url).hostname or '').lower()
+proxies=None
+if host not in gs._LOCALHOST_NAMES:
+    if not tor:
+        print('[!] %s is not loopback and no Tor proxy is configured.' % host)
+        print('[!] Connecting directly would send your IP to that wallet-rpc.')
+        print('[!] Set the Tor proxy in the console, or point --rpc-primary at 127.0.0.1.')
+        raise SystemExit(2)
+    proxies=gs.validate_proxy(tor)
+    print('[*] remote wallet-rpc -> routing this check through', tor)
+else:
+    print('[*] loopback wallet-rpc -> direct (Tor cannot route to loopback)')
+
+u=url+'/json_rpc'
 def rpc(m,p=None):
-    b=json.dumps({'jsonrpc':'2.0','id':'0','method':m,**({'params':p} if p else {})}).encode()
-    r=urllib.request.Request(u,b,{'Content-Type':'application/json'})
-    return json.loads(urllib.request.urlopen(r,timeout=20).read())
+    b={'jsonrpc':'2.0','id':'0','method':m}
+    if p: b['params']=p
+    r=requests.post(u,json=b,timeout=25,proxies=proxies)
+    r.raise_for_status(); return r.json()
 print('[*] contacting wallet-rpc at', u)
 try:
     v=rpc('get_version'); print('    version:', v.get('result',{}).get('version','?'))
-    rpc('refresh')
+    rpc('refresh')     # updates the wallet's view of the chain; spends nothing
     b=rpc('get_balance',{'account_index':0}).get('result',{})
     tot=b.get('balance',0)/1e12; unl=b.get('unlocked_balance',0)/1e12
     print(f'[+] balance {tot:.6f} XMR   unlocked {unl:.6f} XMR')
@@ -252,8 +300,37 @@ JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
 
 
-def start(argv, label):
-    jid = f"j{int(time.time()*1000)}"
+#: Actions allowed to see GS_WALLET_PASSWORD. Only the pipeline needs it (it
+#: forwards the password to the signer); every other action is a check, a test
+#: suite or a third-party script that has no business holding the spend
+#: password of a funded wallet.
+PASSWORD_ACTIONS = {"run_pipeline"}
+_JOB_SEQ = [0]
+
+
+def _child_env(action_id):
+    """Environment for a child process.
+
+    The module header promises the wallet password is "forwarded ONLY to the
+    pipeline child". It was not: every action inherited os.environ verbatim, so
+    a funded wallet's spend password was handed to the unit suites, to
+    paranoia_mode, to py_compile and to anything else a click could start.
+    Verified by running a non-pipeline child and printing the variable.
+    """
+    env = dict(os.environ)
+    if action_id not in PASSWORD_ACTIONS:
+        env.pop("GS_WALLET_PASSWORD", None)
+    return env
+
+
+def start(argv, label, action_id=None):
+    with LOCK:
+        _JOB_SEQ[0] += 1
+        seq = _JOB_SEQ[0]
+    # Sequence-suffixed: two jobs started inside the same millisecond used to
+    # get the same id, so one silently replaced the other in JOBS and the UI
+    # polled the wrong process's output.
+    jid = f"j{int(time.time()*1000)}_{seq}"
     job = {"id": jid, "label": label, "lines": [], "done": False, "rc": None,
            "started": time.time(), "proc": None, "argv": argv}
     with LOCK:
@@ -265,7 +342,7 @@ def start(argv, label):
 
     def run():
         try:
-            env = dict(os.environ)          # carries GS_WALLET_PASSWORD if set
+            env = _child_env(action_id)     # password only for PASSWORD_ACTIONS
             p = subprocess.Popen(argv, cwd=REPO, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  start_new_session=True, env=env)   # shell=False
@@ -332,14 +409,49 @@ def _flag_fees(res):
     return res
 
 
+_GS_MOD = None
+_GS_LOCK = threading.Lock()
+
+
+def _gs_common():
+    """Load gs_common.py once and cache it.
+
+    live_fees() used to re-exec the whole module on every poll AND push another
+    copy of REPO onto sys.path each time, so an open console grew sys.path
+    without bound and re-ran gs_common's import-time work on a timer.
+    """
+    global _GS_MOD
+    with _GS_LOCK:
+        if _GS_MOD is None:
+            import importlib.machinery, importlib.util
+            l = importlib.machinery.SourceFileLoader(
+                "gs_common_console", os.path.join(REPO, "gs_common.py"))
+            s = importlib.util.spec_from_loader(l.name, l)
+            m = importlib.util.module_from_spec(s)
+            l.exec_module(m)
+            _GS_MOD = m
+    return _GS_MOD
+
+
 def live_fees(daemon_url):
-    """Real per-priority fees from the operator's own daemon."""
+    """Real per-priority fees from the operator's own daemon, or none at all.
+
+    THERE IS NO FALLBACK TABLE. This used to answer an unreachable daemon with
+    a hard-coded 0.00005-XMR-per-priority ladder, labelled "built-in fallback"
+    in a `source` string most of the page never showed, and -- because
+    _flag_fees was not applied to that branch -- with the implausibility
+    warning suppressed. The operator was then choosing a fee priority against
+    invented numbers.
+
+    That is the same defect this repo already removed twice: from
+    exit_strategy_simulator, which now aborts rather than serve a made-up
+    price, and from thor_swap_preparer's _btc_per_xmr, which returned a
+    hard-coded 0.003 that the slippage check then compared real quotes
+    against. A fee estimate is a number about the operator's own money; if the
+    daemon cannot supply it, the honest answer is that there is no estimate.
+    """
     try:
-        sys.path.insert(0, REPO)
-        import importlib.machinery, importlib.util
-        l = importlib.machinery.SourceFileLoader("gsx", os.path.join(REPO, "gs_common.py"))
-        s = importlib.util.spec_from_loader("gsx", l)
-        gs = importlib.util.module_from_spec(s); l.exec_module(gs)
+        gs = _gs_common()
         est = gs.daemon_fee_estimate(daemon_url)
         fees = est.get("fees")
         if isinstance(fees, list) and fees:
@@ -350,11 +462,20 @@ def live_fees(daemon_url):
             mult = [1, 4, 20, 166]
             return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
                                "xmr": [round(int(base) * 2000 * m / 1e12, 6) for m in mult]})
-        return {"ok": False, "source": "daemon unreachable — showing the built-in fallback",
-                "xmr": [round(0.00005 * m, 6) for m in (1, 4, 20, 166)]}
+        return {"ok": False, "xmr": None, "implausible": False,
+                "source": "no estimate — the daemon returned no fee data",
+                "warning": ("Could not reach a daemon at "
+                            f"{daemon_url} for a fee estimate. No numbers are shown "
+                            "because inventing them would be worse than showing none: "
+                            "point --rpc-daemon at your monerod (usually "
+                            "http://127.0.0.1:18081). Priority still applies — the "
+                            "wallet computes the real fee at signing time.")}
     except Exception as e:
-        return {"ok": False, "source": f"unavailable ({str(e)[:40]})",
-                "xmr": [round(0.00005 * m, 6) for m in (1, 4, 20, 166)]}
+        return {"ok": False, "xmr": None, "implausible": False,
+                "source": f"no estimate — {str(e)[:60]}",
+                "warning": ("The fee estimate could not be produced, so none is "
+                            "shown. Priority still applies; the wallet computes the "
+                            "real fee at signing time.")}
 
 
 class H(BaseHTTPRequestHandler):
@@ -475,8 +596,16 @@ class H(BaseHTTPRequestHandler):
                 if c["errors"] or why:
                     return self._send(400, json.dumps({"error": "; ".join(c["errors"] + why)}))
             else:
+                # Validation errors were previously ignored for `safe` actions.
+                # clean() DROPS a parameter it cannot validate, so a malformed
+                # Tor proxy or RPC URL silently became an empty argument and
+                # the action ran with different settings than the page showed.
+                # Refuse instead, and say which field is wrong.
+                if c["errors"]:
+                    return self._send(400, json.dumps({"error": "; ".join(c["errors"])}))
                 argv = act["build"](c["params"])
-            return self._send(200, json.dumps({"jid": start(argv, act["label"])}))
+            return self._send(200, json.dumps(
+                {"jid": start(argv, act["label"], action_id=aid)}))
         if self.path.startswith("/stop/"):
             return self._send(200, json.dumps({"stopped": stop(self.path[6:])}))
         self._send(404, json.dumps({"error": "not found"}))
@@ -526,6 +655,9 @@ border:1px solid var(--line2);background:var(--bg);color:var(--ink2)}
 .presets button:hover{border-color:var(--acc);color:var(--ink)}
 .presets button[aria-pressed=true]{background:var(--accs);border-color:var(--acc);color:var(--acc);font-weight:600}
 .fees{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}
+.fee.imp{border-color:var(--warn)}
+.fee.imp .v{color:var(--warn)}
+.noest{color:var(--mut);font-style:italic;font-size:11.5px}
 .fee{border:1px solid var(--line2);border-radius:8px;padding:7px 6px;text-align:center;cursor:pointer;background:var(--bg)}
 .fee[aria-pressed=true]{border-color:var(--acc);background:var(--accs)}
 .fee .p{font-size:10px;font-family:ui-monospace,Menlo,monospace;color:var(--mut);letter-spacing:.06em}
@@ -674,13 +806,17 @@ $$('#presets button').forEach(b=>b.addEventListener('click',()=>applyPreset(b.da
 let feePriority=2, feeData=null;
 function renderFees(){
  const names=['1 · default','2 · elevated','3 · priority','4 · flash'];
- $('#fees').innerHTML=names.map((n,i)=>`<button class="fee" data-p="${i+1}" aria-pressed="${feePriority===i+1}">
-   <div class="p">${n}</div><div class="v">${feeData?feeData.xmr[i]+' XMR':'—'}</div></button>`).join('');
+ // feeData.xmr is null whenever the daemon could not supply an estimate --
+ // the console shows no number rather than a made-up one, so this must not
+ // assume an array. Indexing it blindly used to throw and kill the panel.
+ const vals=(feeData && Array.isArray(feeData.xmr))?feeData.xmr:null;
+ const imp=!!(feeData&&feeData.implausible);
+ $('#fees').innerHTML=names.map((n,i)=>`<button class="fee${imp?' imp':''}" data-p="${i+1}" aria-pressed="${feePriority===i+1}">
+   <div class="p">${esc(n)}</div><div class="v">${vals?esc(vals[i])+' XMR':'<span class="noest">no estimate</span>'}</div></button>`).join('');
  $$('.fee').forEach(b=>b.addEventListener('click',()=>{setFee(+b.dataset.p);sync();}));
- $('#fsrc').innerHTML=feeData
-   ?('estimate per ~2 kB tx · '+feeData.source)
-    +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${feeData.warning}</div>`:'')
-   :'loading…';
+ if(!feeData){$('#fsrc').textContent='loading…';return;}
+ $('#fsrc').innerHTML=(vals?'estimate per ~2 kB tx · ':'')+esc(feeData.source)
+   +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'');
 }
 function setFee(p){feePriority=p;renderFees();}
 async function loadFees(){
@@ -713,7 +849,7 @@ async function sync(){
  const r=await fetch('/api/preview',{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect()})}).then(r=>r.json());
  $('#prev').textContent=r.pretty;
- $('#probs').innerHTML=r.problems.map(p=>`<li>${p.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</li>`).join('');
+ $('#probs').innerHTML=r.problems.map(p=>`<li>${esc(p)}</li>`).join('');
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
  const btn=document.querySelector('.act[data-id="run_pipeline"]');
@@ -736,8 +872,9 @@ $('#actions').innerHTML=Object.entries(groups).map(([g,items])=>
     <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></button>`).join('')+`</div>`).join('');
 $$('.act').forEach(b=>b.addEventListener('click',()=>run(b.dataset.id)));
 
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function colour(l){
- const e=l.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+ const e=esc(l);
  if(/FAIL|LEAK |\bERROR\b|Traceback|CLEARNET|\[!\].*(?:leak|refus|abort)/i.test(l)) return `<span class="r">${e}</span>`;
  if(/RESULT:|ALL GREEN|SUCCESS|NO LEAKS|\[\+\]/.test(l)) return `<span class="g">${e}</span>`;
  if(/\[!\]|WARN|SKIP/.test(l)) return `<span class="y">${e}</span>`;
@@ -754,7 +891,7 @@ async function run(id){
  const res=await fetch('/run/'+id,{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect(),arm:armed?ARM:''})}).then(r=>r.json());
  if(res.error){
-   $('#pre').innerHTML=`<span class="r">${res.error}</span>`;
+   $('#pre').innerHTML=`<span class="r">${esc(res.error)}</span>`;
    $('#ppill').className='pill err';$('#ppill').textContent='refused';
    $('#dot-'+id).className='dot err';
    $$('.act').forEach(b=>b.disabled=false); sync(); return;
