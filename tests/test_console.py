@@ -244,9 +244,41 @@ def test_egress_preflight_accepts_the_proxy():
 # ==========================================================================
 # 4. HTTP surface: gates, validation, and job identity — over a real socket.
 # ==========================================================================
+class FakePreflightGs:
+    """Stub gs_common so mandatory_preflight is deterministic and offline."""
+    _LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+    tor_ok = True
+    egress_verdict = "tor"
+
+    @staticmethod
+    def validate_proxy(p):
+        if not p.startswith("socks5h://"):
+            raise SystemExit("bad proxy")
+        return {"http": p, "https": p}
+
+    @classmethod
+    def tor_recheck(cls, proxy, stage):
+        if not cls.tor_ok:
+            raise SystemExit("[!] Tor leak detected - traffic NOT exiting via Tor.")
+
+    @classmethod
+    def check_daemon_relay_egress(cls, d, prox):
+        return {"verdict": cls.egress_verdict, "detail": f"{cls.egress_verdict} peers"}
+
+    @staticmethod
+    def integrity_log(*a, **k):
+        pass
+
+    @staticmethod
+    def daemon_fee_estimate(url, proxies=None):
+        return {}
+
+
 class Server:
-    def __init__(self):
+    def __init__(self, preflight_stub=False):
         self.c = load_console()
+        if preflight_stub:
+            self.c._GS_MOD = FakePreflightGs
         s = socket.socket(); s.bind(("127.0.0.1", 0)); self.port = s.getsockname()[1]; s.close()
         from http.server import ThreadingHTTPServer
         self.srv = ThreadingHTTPServer(("127.0.0.1", self.port), self.c.H)
@@ -290,6 +322,113 @@ def test_http_gates():
         check("a spending action without the arm phrase is refused", st == 403)
     finally:
         s.close()
+
+
+# ==========================================================================
+# 5. NON-NEGOTIABLE preflight: the pipeline cannot spend unless the OPSEC
+#    preflight passes, enforced SERVER-SIDE so a crafted request can't skip it.
+# ==========================================================================
+_SPEND_PARAMS = {
+    "mode": "send", "btc_entry": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "btc_amount": "0.05", "tor_proxy": "socks5h://127.0.0.1:9050",
+    "rpc_primary": "http://127.0.0.1:18083", "rpc_daemon": "http://127.0.0.1:18081",
+    "wallet_file": "w.wallet", "wallets": 10, "deep": 2, "fee_priority": 2,
+    "dag_mixing": True}
+
+
+def test_spend_blocked_server_side_when_tor_fails():
+    s = Server(preflight_stub=True)
+    FakePreflightGs.tor_ok = False
+    FakePreflightGs.egress_verdict = "tor"
+    try:
+        st, body = s.req("POST", "/api/preflight", {"params": _SPEND_PARAMS}, headers=s.auth())
+        pf = json.loads(body)
+        check("preflight reports failure when Tor is down", pf["ok"] is False)
+        check("preflight names Tor as the failing check", pf["checks"]["tor"]["ok"] is False)
+
+        st, body = s.req("POST", "/run/run_pipeline",
+                         {"params": _SPEND_PARAMS, "arm": "SPEND"}, headers=s.auth())
+        d = json.loads(body)
+        check("a spend with a valid token+arm is STILL refused when Tor fails", st == 403)
+        check("the refusal cites the preflight", "Preflight FAILED" in d.get("error", ""))
+        check("no job is started for a blocked spend", "jid" not in d)
+    finally:
+        FakePreflightGs.tor_ok = True
+        s.close()
+
+
+def test_spend_allowed_only_after_preflight_passes():
+    s = Server(preflight_stub=True)
+    FakePreflightGs.tor_ok = True
+    FakePreflightGs.egress_verdict = "tor"
+    try:
+        st, body = s.req("POST", "/api/preflight", {"params": _SPEND_PARAMS}, headers=s.auth())
+        check("preflight passes when Tor + egress are clean", json.loads(body)["ok"] is True)
+        st, body = s.req("POST", "/run/run_pipeline",
+                         {"params": _SPEND_PARAMS, "arm": "SPEND"}, headers=s.auth())
+        d = json.loads(body)
+        check("a spend launches once preflight passes", st == 200 and "jid" in d)
+    finally:
+        s.close()
+
+
+def test_clearnet_egress_blocks_spend_unless_overridden():
+    s = Server(preflight_stub=True)
+    FakePreflightGs.tor_ok = True
+    FakePreflightGs.egress_verdict = "clearnet"
+    try:
+        st, body = s.req("POST", "/run/run_pipeline",
+                         {"params": _SPEND_PARAMS, "arm": "SPEND"}, headers=s.auth())
+        check("a clearnet-egress spend is blocked", st == 403)
+        check("the block cites egress",
+              "egress" in json.loads(body).get("error", "").lower())
+
+        over = {**_SPEND_PARAMS, "allow_clearnet_relay": True}
+        st, body = s.req("POST", "/run/run_pipeline",
+                         {"params": over, "arm": "SPEND"}, headers=s.auth())
+        check("--allow-clearnet-relay lets the operator override the egress block",
+              st == 200 and "jid" in json.loads(body))
+    finally:
+        FakePreflightGs.egress_verdict = "tor"
+        s.close()
+
+
+def test_offline_daemon_blocks_spend():
+    s = Server(preflight_stub=True)
+    FakePreflightGs.tor_ok = True
+    FakePreflightGs.egress_verdict = "offline"
+    try:
+        st, body = s.req("POST", "/run/run_pipeline",
+                         {"params": _SPEND_PARAMS, "arm": "SPEND"}, headers=s.auth())
+        check("an offline daemon blocks the spend (broadcast would vanish)", st == 403)
+    finally:
+        FakePreflightGs.egress_verdict = "tor"
+        s.close()
+
+
+def test_preflight_does_not_gate_safe_actions():
+    """The preflight gate is for spends only; a safe check must still run even
+    when the (real) preflight would fail — otherwise you could never diagnose
+    a broken Tor setup from the console."""
+    s = Server(preflight_stub=True)
+    FakePreflightGs.tor_ok = False
+    try:
+        st, body = s.req("POST", "/run/units", {"params": {}}, headers=s.auth())
+        check("a safe action runs regardless of preflight state", st == 200)
+    finally:
+        FakePreflightGs.tor_ok = True
+        s.close()
+
+
+def test_page_wires_the_auto_preflight():
+    """The page must auto-run the preflight and gate the spend button on it."""
+    src = open(os.path.join(REPO, "gs_console")).read()
+    check("the page defines an auto preflight runner", "async function runPreflight(" in src)
+    check("the preflight runs on load", "sync(); runPreflight()" in src)
+    check("the spend button is gated on preflightOk", "armed&&preflightOk" in src)
+    check("network field edits re-trigger the preflight", "schedulePreflight()" in src)
+    check("the server has an /api/preflight endpoint",
+          '"/api/preflight"' in src and "mandatory_preflight" in src)
 
 
 def test_safe_action_rejects_bad_parameters():

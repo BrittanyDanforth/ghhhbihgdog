@@ -489,12 +489,92 @@ def live_fees(daemon_url, tor_proxy=""):
                             "real fee at signing time.")}
 
 
+def mandatory_preflight(params: dict) -> dict:
+    """The NON-NEGOTIABLE OPSEC gate the pipeline cannot spend without.
+
+    Two leak-critical facts, verified live against the operator's own
+    machine every time, not offered as optional buttons:
+      * traffic really exits through Tor (verify against check.torproject.org),
+      * the daemon would not relay the transaction to raw-IP peers.
+
+    Returns {"ok": bool, "checks": {name: {ok, detail, ...}}}. Never raises:
+    validate_proxy / tor_recheck abort via SystemExit, which is caught here so
+    a FAILED check BLOCKS the spend rather than killing the console. A spend
+    is allowed only when every check is ok; the caller refuses otherwise.
+
+    This runs at BOTH /api/preflight (so the page can show status and gate its
+    own button) AND inside /run/run_pipeline (so a crafted request that skips
+    the page still cannot spend without passing). GhostSpiral re-checks the
+    same things at its own Stage 0 — this is a deliberate second, independent
+    gate at the console layer, not a replacement for it.
+    """
+    gs = _gs_common()
+    checks: dict = {}
+    tor = (params.get("tor_proxy") or "").strip()
+    if not tor:
+        checks["tor"] = {"ok": False, "detail": "no Tor proxy configured"}
+        return {"ok": False, "checks": checks}
+    try:
+        proxy = gs.validate_proxy(tor)
+        gs.tor_recheck(proxy, "console_preflight")   # single-shot; SystemExit on fail
+        checks["tor"] = {"ok": True, "detail": "traffic verified exiting via Tor"}
+    except SystemExit as e:
+        checks["tor"] = {"ok": False,
+                         "detail": (str(e).strip().splitlines() or ["Tor check failed"])[0][:160]}
+        return {"ok": False, "checks": checks}
+    except Exception as e:                            # noqa: BLE001
+        checks["tor"] = {"ok": False, "detail": f"Tor check error: {str(e)[:120]}"}
+        return {"ok": False, "checks": checks}
+
+    from urllib.parse import urlparse as _up
+    daemon = (params.get("rpc_daemon") or "http://127.0.0.1:18081")
+    host = (_up(daemon).hostname or "").lower()
+    proxies = proxy if host not in gs._LOCALHOST_NAMES else None
+    allow_clear = bool(params.get("allow_clearnet_relay"))
+    try:
+        eg = gs.check_daemon_relay_egress(daemon, proxies)
+    except Exception as e:                            # noqa: BLE001
+        eg = {"verdict": "unknown", "detail": f"egress probe error: {str(e)[:100]}"}
+    verdict = eg.get("verdict", "unknown")
+    if verdict == "clearnet":
+        eok = allow_clear
+        detail = eg.get("detail", "relays to raw-IP peers")
+        if allow_clear:
+            detail += " — overridden by 'Allow clearnet relay'"
+    elif verdict == "offline":
+        eok = False
+        detail = eg.get("detail", "daemon is --offline; the broadcast would go nowhere")
+    else:  # tor / unknown -> allowed (unknown matches GhostSpiral: proceed, flagged)
+        eok = True
+        detail = eg.get("detail", verdict)
+    checks["egress"] = {"ok": eok, "verdict": verdict, "detail": detail}
+
+    return {"ok": all(c["ok"] for c in checks.values()), "checks": checks}
+
+
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
         b = body.encode() if isinstance(body, str) else body
         self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
-        self.send_header("Cache-Control", "no-store"); self.end_headers()
+        self.send_header("Cache-Control", "no-store")
+        # Defense in depth for the token, which rides in the page URL (?t=...):
+        #  * no-referrer   -> the tokened URL is never sent as a Referer, so
+        #                     even a future edit that pulls in an external
+        #                     resource cannot leak the token off-box.
+        #  * CSP default-src 'self' + connect-src 'self' -> the page can only
+        #    ever talk back to this loopback origin; no script it might acquire
+        #    can exfiltrate output, tokens, or the composed argv to a remote host.
+        #  * frame-ancestors 'none' -> cannot be framed (clickjacking / rebinding
+        #    dressed up as an iframe).
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'unsafe-inline' 'self'; "
+                         "style-src 'unsafe-inline' 'self'; connect-src 'self'; "
+                         "img-src 'self' data:; base-uri 'none'; form-action 'none'; "
+                         "frame-ancestors 'none'")
+        self.end_headers()
         self.wfile.write(b)
 
     def _body(self):
@@ -592,6 +672,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(
                 live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"),
                           c["params"].get("tor_proxy", ""))))
+        if self.path == "/api/preflight":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(mandatory_preflight(c["params"])))
         if self.path.startswith("/run/"):
             aid = self.path[5:]
             act = ACTIONS.get(aid)
@@ -607,6 +690,21 @@ class H(BaseHTTPRequestHandler):
                 argv, why = pipeline_argv(c["params"])
                 if c["errors"] or why:
                     return self._send(400, json.dumps({"error": "; ".join(c["errors"] + why)}))
+                # NON-NEGOTIABLE: run the OPSEC preflight server-side and refuse
+                # to launch if Tor is not verified or the daemon would relay to
+                # clearnet. This is enforced HERE, not just in the page, so a
+                # request that bypasses the UI still cannot spend without it.
+                pf = mandatory_preflight(c["params"])
+                if not pf["ok"]:
+                    bad = "; ".join(f"{k}: {v.get('detail', 'failed')}"
+                                    for k, v in pf["checks"].items() if not v["ok"])
+                    try:
+                        _gs_common().integrity_log("console", "run_pipeline_BLOCKED_preflight")
+                    except Exception:
+                        pass
+                    return self._send(403, json.dumps(
+                        {"error": f"Preflight FAILED — refusing to spend. {bad}",
+                         "preflight": pf}))
             else:
                 # Validation errors were previously ignored for `safe` actions.
                 # clean() DROPS a parameter it cannot validate, so a malformed
@@ -661,11 +759,17 @@ border:1px solid var(--line2);background:var(--bg);color:var(--ink);font-family:
 .chk{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;cursor:pointer;font-size:12.5px}
 .chk input{margin-top:2px}
 .chk .d{color:var(--mut);font-size:11.5px;display:block;line-height:1.35}
-.presets{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:4px}
-.presets button{font:inherit;font-size:12px;padding:6px 11px;border-radius:99px;cursor:pointer;
-border:1px solid var(--line2);background:var(--bg);color:var(--ink2)}
+.presets{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-bottom:10px}
+.presets button{font:inherit;font-size:12.5px;padding:9px 11px;border-radius:9px;cursor:pointer;text-align:left;
+border:1px solid var(--line2);background:var(--bg);color:var(--ink2);display:flex;flex-direction:column;gap:1px}
+.presets button .pn{font-weight:600}
+.presets button .pd{font-size:10.5px;color:var(--mut);font-family:ui-monospace,Menlo,monospace}
 .presets button:hover{border-color:var(--acc);color:var(--ink)}
-.presets button[aria-pressed=true]{background:var(--accs);border-color:var(--acc);color:var(--acc);font-weight:600}
+.presets button[aria-pressed=true]{background:var(--accs);border-color:var(--acc);color:var(--acc)}
+.presets button[data-p=paranoid]{border-color:var(--ok)}
+.presets button[data-p=paranoid][aria-pressed=true]{background:var(--oks);border-color:var(--ok);color:var(--ok)}
+.presets button[data-p=paranoid] .pn::after{content:"✓ safest";float:right;font-size:9.5px;font-weight:600;
+letter-spacing:.06em;text-transform:uppercase;color:var(--ok);background:var(--oks);padding:1px 6px;border-radius:99px}
 .fees{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}
 .fee.imp{border-color:var(--warn)}
 .fee.imp .v{color:var(--warn)}
@@ -676,14 +780,23 @@ border:1px solid var(--line2);background:var(--bg);color:var(--ink2)}
 .fee .v{font-size:12px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums}
 .fee[aria-pressed=true] .v{color:var(--acc)}
 .fsrc{font-size:11px;color:var(--mut);margin-top:7px;font-family:ui-monospace,Menlo,monospace}
-.act{display:flex;gap:9px;align-items:center;width:100%;text-align:left;cursor:pointer;background:var(--bg);
-border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-bottom:6px;color:var(--ink);font:inherit}
+/* Operations as a compact GRID of tiles instead of stacked full-width rows,
+   so the four groups read as one dense board rather than list-after-list. */
+.ops{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:8px}
+.opgroup{grid-column:1/-1;font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;
+text-transform:uppercase;color:var(--mut);font-weight:600;margin:9px 0 -1px;display:flex;gap:7px;align-items:center}
+.opgroup:first-child{margin-top:0}
+.opgroup::after{content:"";flex:1;height:1px;background:var(--line)}
+.act{display:flex;flex-direction:column;gap:5px;text-align:left;cursor:pointer;background:var(--bg);
+border:1px solid var(--line);border-radius:9px;padding:10px 11px;color:var(--ink);font:inherit;min-height:80px}
 .act:hover{border-color:var(--acc)}
 .act:disabled{opacity:.5;cursor:not-allowed}
-.act .nm{font-size:13px;font-weight:600}
-.act .ds{font-size:11.5px;color:var(--mut);margin-top:2px;line-height:1.35}
-.act .go{margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:9.5px;letter-spacing:.09em;
-text-transform:uppercase;padding:4px 8px;border-radius:5px;white-space:nowrap;background:var(--accs);color:var(--acc)}
+.act .top{display:flex;gap:7px;align-items:center}
+.act .nm{font-size:12.5px;font-weight:600}
+.act .ds{font-size:11px;color:var(--mut);line-height:1.32}
+.act .go{margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:9px;letter-spacing:.08em;
+text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--accs);color:var(--acc)}
+.act.spends{border-color:var(--err);grid-column:1/-1}
 .act.spends .go{background:var(--errs);color:var(--err)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--line2);flex:none}
 .dot.run{background:var(--warn);box-shadow:0 0 0 3px var(--warns);animation:p 1s infinite}
@@ -695,11 +808,22 @@ pre.prev{margin:0;background:var(--term);color:var(--ti);padding:11px 13px;borde
 font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto}
 .probs{margin:9px 0 0;padding:0;list-style:none}
 .probs li{font-size:12px;color:var(--err);background:var(--errs);padding:6px 9px;border-radius:6px;margin-bottom:4px}
+.pfbox{margin-top:11px;border:1px solid var(--line);border-radius:9px;overflow:hidden;font-size:12px}
+.pfhead{padding:8px 11px;font-weight:600;font-size:12px}
+.pfhead.ok{background:var(--oks);color:var(--ok)}
+.pfhead.bad{background:var(--errs);color:var(--err)}
+.pfhead.run{background:var(--warns);color:var(--warn)}
+.pfrow{display:flex;justify-content:space-between;gap:10px;padding:6px 11px;border-top:1px solid var(--line);align-items:baseline}
+.pfrow.ok span:first-child{color:var(--ok)}
+.pfrow.bad span:first-child{color:var(--err);font-weight:600}
+.pfrow .pfd{color:var(--mut);font-size:11px;font-family:ui-monospace,Menlo,monospace;text-align:right;max-width:62%;word-break:break-word}
+.pfre{margin-top:7px;font-size:11.5px;color:var(--acc);background:none;border:0;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
 .arm{margin-top:11px;padding:11px;border:1px dashed var(--err);border-radius:9px;background:var(--errs)}
 .arm p{margin:0 0 8px;font-size:12px;color:var(--err);line-height:1.45}
 .arm input{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;padding:6px 9px;border-radius:7px;
 border:1px solid var(--err);background:var(--bg);color:var(--ink);width:100%}
-.panel{background:var(--sf);border:1px solid var(--line);border-radius:11px;overflow:hidden;position:sticky;top:16px}
+.rightcol{display:flex;flex-direction:column;gap:14px;position:sticky;top:16px}
+.panel{background:var(--sf);border:1px solid var(--line);border-radius:11px;overflow:hidden}
 .pbar{display:flex;gap:11px;align-items:center;padding:10px 13px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 .pt{font-size:13px;font-weight:650}
 .pm{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--mut)}
@@ -718,6 +842,10 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
 .idle{padding:44px 20px;text-align:center;color:var(--mut);font-size:13px}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .warnbox{font-size:11.5px;color:var(--warn);background:var(--warns);padding:8px 10px;border-radius:7px;margin-top:9px;line-height:1.45}
+.subsec{margin-top:13px;border-top:1px solid var(--line);padding-top:12px}
+.subhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px}
+.subhead span:first-child{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);font-weight:600}
+.mut-s{font-size:10.5px;color:var(--mut)}
 </style></head><body><div class="wrap">
 <header><span class="eb">Console</span><h1>GhostSpiral</h1>
 <span class="hint">127.0.0.1 · argv composed server-side · funds need arming</span></header>
@@ -744,9 +872,10 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
 
   <div class="card"><h2>Safety preset</h2>
     <div class="presets" id="presets">
-      <button data-p="max" aria-pressed="false">Maximum privacy</button>
-      <button data-p="balanced" aria-pressed="true">Balanced</button>
-      <button data-p="fast" aria-pressed="false">Fast</button>
+      <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">40 wallets · depth 4 · DAG</span></button>
+      <button data-p="max" aria-pressed="false"><span class="pn">High privacy</span><span class="pd">25 wallets · depth 3 · DAG</span></button>
+      <button data-p="balanced" aria-pressed="true"><span class="pn">Balanced</span><span class="pd">10 wallets · depth 2 · DAG</span></button>
+      <button data-p="fast" aria-pressed="false"><span class="pn">Fast</span><span class="pd">3 wallets · depth 1 · no DAG</span></button>
     </div>
     <div id="preset-note" class="warnbox"></div>
     <div class="row2" style="margin-top:12px">
@@ -757,11 +886,11 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
     <label class="chk"><input type="checkbox" id="allow_clearnet_relay">
       <span style="color:var(--err)">Allow clearnet relay<span class="d">proceed even when monerod would broadcast to raw-IP peers — reveals your IP</span></span></label>
-  </div>
-
-  <div class="card"><h2>Fee priority · live from your daemon</h2>
-    <div class="fees" id="fees"></div>
-    <div class="fsrc" id="fsrc">loading…</div>
+    <div class="subsec">
+      <div class="subhead"><span>Fee priority</span><span class="mut-s">live from your daemon</span></div>
+      <div class="fees" id="fees"></div>
+      <div class="fsrc" id="fsrc">loading…</div>
+    </div>
   </div>
 
   <div class="card"><h2>Network</h2>
@@ -775,21 +904,26 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
   <div class="card"><h2>Command that will run</h2>
     <pre class="prev" id="prev">…</pre>
     <ul class="probs" id="probs"></ul>
+    <div id="pfstatus" class="pfbox"></div>
+    <button id="pfre" class="pfre" type="button">re-run preflight now</button>
     <div class="arm" id="armbox" style="display:none">
       <p><strong>This moves funds.</strong> It fans out, signs and broadcasts real transactions.
-      Type <strong id="armword"></strong> to unlock the run button.</p>
+      The OPSEC preflight above must pass first — it is re-verified on the server
+      when you run, so it cannot be skipped. Type <strong id="armword"></strong> to arm.</p>
       <input id="arm" placeholder="type to arm" autocomplete="off">
     </div>
   </div>
 
-  <div id="actions"></div>
 </div>
 
-<div class="panel">
-  <div class="pbar"><span class="pt" id="pt">Nothing running</span>
-    <span class="pill" id="ppill" style="display:none"></span><span class="pm" id="pm"></span>
-    <span class="pacts"><button id="stop" class="stop">Stop</button><button id="copy">Copy</button></span></div>
-  <div id="out"><div class="idle">Run a preflight check first — Tor exit, relay egress, then wallet balance.</div></div>
+<div class="rightcol">
+  <div class="card"><h2>Operations</h2><div class="ops" id="actions"></div></div>
+  <div class="panel">
+    <div class="pbar"><span class="pt" id="pt">Nothing running</span>
+      <span class="pill" id="ppill" style="display:none"></span><span class="pm" id="pm"></span>
+      <span class="pacts"><button id="stop" class="stop">Stop</button><button id="copy">Copy</button></span></div>
+    <div id="out"><div class="idle">Run a preflight check first — Tor exit, relay egress, then wallet balance.</div></div>
+  </div>
 </div>
 </div></div><script>
 const A=__ACTIONS__, ARM=__ARM__, PWSET=__PWSET__, TOK=__TOKEN__;
@@ -798,17 +932,22 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 
 const PRESETS={
- max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,
-      note:'25 subaddresses, depth 3, DAG hops on, priority 3. Widest anonymity set — slowest and highest fees.'},
- balanced:{wallets:10,deep:2,dag_mixing:true,fee_priority:2,
-      note:'10 subaddresses, depth 2, DAG hops on, priority 2. Sensible default for most amounts.'},
- fast:{wallets:3,deep:1,dag_mixing:false,fee_priority:1,
-      note:'3 subaddresses, depth 1, no DAG round, priority 1. Fan-out only — least mixing, cheapest, no confirmation wait.'}};
+ paranoid:{wallets:40,deep:4,dag_mixing:true,fee_priority:3,clearnet:false,
+      note:'SAFEST. 40 subaddresses, depth 4, both mixing rounds, priority 3, and clearnet relay forced OFF. Largest anonymity set — slowest and highest fees. Use for large amounts or when unlinkability matters most.'},
+ max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,clearnet:false,
+      note:'25 subaddresses, depth 3, DAG hops on, priority 3, clearnet relay off. Wide anonymity set.'},
+ balanced:{wallets:10,deep:2,dag_mixing:true,fee_priority:2,clearnet:false,
+      note:'10 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts.'},
+ fast:{wallets:3,deep:1,dag_mixing:false,fee_priority:1,clearnet:false,
+      note:'3 subaddresses, depth 1, no DAG round, priority 1. Fan-out only — least mixing, cheapest, no confirmation wait. Weakest privacy.'}};
 
 function applyPreset(p){
  preset=p; const c=PRESETS[p];
  $('#wallets').value=c.wallets; $('#deep').value=c.deep;
  $('#dag_mixing').checked=c.dag_mixing; setFee(c.fee_priority);
+ // Every preset leaves clearnet relay OFF — a preset should never quietly
+ // widen the IP exposure, and turning it on is a deliberate per-run override.
+ if('clearnet' in c) $('#allow_clearnet_relay').checked=c.clearnet;
  $('#preset-note').textContent=c.note;
  $$('#presets button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.p===p)));
  sync();
@@ -857,6 +996,38 @@ function collect(){
   wallet_file:v('wallet_file'), label:'GhostSpiral_entry'};
 }
 
+// ── NON-NEGOTIABLE OPSEC preflight ─────────────────────────────────────────
+// Auto-runs on load and whenever the network config changes; the spend button
+// is disabled until it passes, and the SERVER re-verifies it on run so a
+// crafted request cannot skip it. Tor exit + relay egress are the leak-critical
+// facts, verified live rather than trusted.
+let preflightOk=false, pfBusy=false, pfSeq=0;
+function renderPreflight(r){
+ const c=(r&&r.checks)||{};
+ const head=r&&r.ok
+  ? `<div class="pfhead ok">✓ OPSEC preflight passed — spend permitted</div>`
+  : `<div class="pfhead bad">✕ OPSEC preflight FAILED — spend blocked until fixed</div>`;
+ const row=(k,label)=>{const v=c[k]; if(!v) return '';
+  return `<div class="pfrow ${v.ok?'ok':'bad'}"><span>${v.ok?'✓':'✕'} ${esc(label)}</span>`
+    +`<span class="pfd">${esc(v.detail||'')}</span></div>`;};
+ $('#pfstatus').innerHTML=head+row('tor','Traffic exits via Tor')+row('egress','Relay egress not clearnet');
+}
+async function runPreflight(){
+ if(pfBusy) return; pfBusy=true; const seq=++pfSeq;
+ $('#pfstatus').innerHTML='<div class="pfhead run">⟳ running OPSEC preflight (verifying Tor + relay egress)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/preflight',{method:'POST',headers:HDR,
+      body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,checks:{tor:{ok:false,detail:'preflight request failed: '+e}}}; }
+ pfBusy=false;
+ if(seq!==pfSeq) return;            // a newer preflight superseded this one
+ preflightOk=!!(r&&r.ok); renderPreflight(r); sync();
+}
+// Debounce so editing a network field doesn't fire a Tor check per keystroke.
+let pfTimer=null;
+function schedulePreflight(){ preflightOk=false; sync();
+ clearTimeout(pfTimer); pfTimer=setTimeout(runPreflight,600); }
+
 async function sync(){
  const r=await fetch('/api/preview',{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect()})}).then(r=>r.json());
@@ -865,23 +1036,35 @@ async function sync(){
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
  const btn=document.querySelector('.act[data-id="run_pipeline"]');
- if(btn) btn.disabled=!(ok&&armed)||!!cur;
+ // Spend requires: valid params, armed, AND a passing preflight. Any one
+ // missing keeps it disabled. The server enforces the preflight again on run.
+ if(btn) btn.disabled=!(ok&&armed&&preflightOk)||!!cur;
 }
-$$('input,select').forEach(el=>el.addEventListener('input',()=>{ if(el.id!=='arm') sync(); }));
+// Network/OPSEC fields re-trigger the preflight; everything else just re-syncs.
+const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
+$$('input,select').forEach(el=>el.addEventListener('input',()=>{
+ if(el.id==='arm') return;
+ if(PF_FIELDS.has(el.id)) schedulePreflight(); else sync();
+}));
+$('#pfre').addEventListener('click',runPreflight);
 $('#arm').addEventListener('input',e=>{armed=e.target.value.trim()===ARM;sync();});
 $('#armword').textContent=ARM;
 $('#pwnote').innerHTML=PWSET
  ? 'Wallet password found in <code>GS_WALLET_PASSWORD</code> — forwarded only to the signing child, never shown here.'
  : 'No <code>GS_WALLET_PASSWORD</code> set. If your wallet has a password, restart the console with it exported — it is never accepted through this page.';
 
+// One grouped GRID, not a card per group. Group order is fixed so the board
+// reads Preflight -> Receive -> Pipeline -> Verify regardless of dict order.
 const groups={};
 for(const [id,a] of Object.entries(A)) (groups[a.group] ||= []).push([id,a]);
-$('#actions').innerHTML=Object.entries(groups).map(([g,items])=>
- `<div class="card"><h2>${g}</h2>`+items.map(([id,a])=>
+const GORDER=['Preflight','Receive','Pipeline','Verify'];
+const gkeys=[...GORDER.filter(g=>groups[g]), ...Object.keys(groups).filter(g=>!GORDER.includes(g))];
+$('#actions').innerHTML=gkeys.map(g=>
+ `<div class="opgroup">${esc(g)}</div>`+groups[g].map(([id,a])=>
   `<button class="act ${a.risk}" data-id="${id}" ${a.risk==='spends'?'disabled':''}>
-    <span class="dot" id="dot-${id}"></span>
-    <span><span class="nm">${a.label}</span><div class="ds">${a.desc}</div></span>
-    <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></button>`).join('')+`</div>`).join('');
+    <span class="top"><span class="dot" id="dot-${id}"></span><span class="nm">${esc(a.label)}</span>
+     <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></span>
+    <span class="ds">${esc(a.desc)}</span></button>`).join('')).join('');
 $$('.act').forEach(b=>b.addEventListener('click',()=>run(b.dataset.id)));
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -927,7 +1110,7 @@ async function poll(){
 $('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST',headers:HDR,body:'{}'});});
 $('#copy').addEventListener('click',()=>{const p=$('#pre');if(p)navigator.clipboard?.writeText(p.innerText);});
 
-applyPreset('balanced'); loadFees(); sync();
+applyPreset('balanced'); loadFees(); sync(); runPreflight();
 $('#rpc_daemon').addEventListener('change',loadFees);
 </script></body></html>"""
 
