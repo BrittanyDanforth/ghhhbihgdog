@@ -48,9 +48,22 @@ def secure_hex(n_bytes: int) -> str:
 
 
 def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
-    """Sleep a CSPRNG-uniform duration to decorrelate timing."""
-    delay = lo + (secrets.randbelow(int((hi - lo) * 1000)) / 1000.0)
-    time.sleep(delay)
+    """Sleep a CSPRNG-uniform duration to decorrelate timing.
+
+    secrets.randbelow() raises ValueError("Upper bound must be positive") for
+    an argument <= 0, so the old body crashed outright whenever hi == lo or
+    hi < lo -- verified. Every current caller passes a valid widening range, so
+    this was latent, but a crash in timing decorrelation would abort a run
+    mid-pipeline for a purely cosmetic parameter. Normalise instead: swap an
+    inverted range, and treat a zero-width one as a fixed sleep.
+    """
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    span_ms = int((hi - lo) * 1000)
+    delay = lo if span_ms <= 0 else lo + secrets.randbelow(span_ms) / 1000.0
+    if delay > 0:
+        time.sleep(delay)
 
 # ---------------------------------------------------------------------------
 #  Integrity hash-chain logger
@@ -597,16 +610,43 @@ def daemon_fee_estimate(daemon_url: str, proxies: Optional[Dict[str, str]] = Non
 # ---------------------------------------------------------------------------
 
 def resource_check(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> bool:
-    """Return True if resources are OK. False if system is stressed."""
-    import psutil
+    """Return True if resources are OK. False if the system is stressed.
+
+    Raises ResourceCheckUnavailable when psutil is not installed, rather than
+    letting a bare ModuleNotFoundError traceback escape from every script's
+    first line. The caller decides what an un-runnable sentinel means; this
+    function will not answer "fine" for a check it never performed.
+    """
+    try:
+        import psutil
+    except ImportError as e:
+        raise ResourceCheckUnavailable(str(e)) from e
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage(".")
     return mem.percent < max_ram_pct and disk.free > min_disk_gb * 1024 ** 3
 
 
+class ResourceCheckUnavailable(RuntimeError):
+    """psutil is missing, so the resource sentinel could not run at all."""
+
+
 def require_resources(min_disk_gb: float = 2.0, max_ram_pct: float = 90.0) -> None:
-    """Abort if resources are below threshold."""
-    if not resource_check(min_disk_gb, max_ram_pct):
+    """Abort if resources are below threshold.
+
+    A missing psutil no longer crashes with a raw traceback from the first line
+    of every script. It is reported as what it is -- the sentinel DID NOT RUN --
+    and the run continues, because low disk is an operational risk rather than
+    a security property. Saying nothing here would be the fake-success pattern:
+    the header advertises a resource sentinel, so if it cannot run, say so.
+    """
+    try:
+        ok = resource_check(min_disk_gb, max_ram_pct)
+    except ResourceCheckUnavailable:
+        integrity_log("env", "resource_sentinel_unavailable:psutil_missing")
+        print("  [!] Resource sentinel DISABLED — psutil is not installed, so free "
+              "disk and RAM were NOT checked (pip install psutil). Continuing.")
+        return
+    if not ok:
         sys.exit(f"[!] Resources low (disk<{min_disk_gb}GB or RAM>{max_ram_pct}%) - aborting.")
 
 # ---------------------------------------------------------------------------
@@ -662,9 +702,31 @@ def shutdown_requested() -> bool:
 # ---------------------------------------------------------------------------
 
 def scrub_address(addr: str, visible: int = 8) -> str:
-    """Truncate an address for safe terminal display."""
-    if len(addr) <= visible * 2:
+    """Mask an address for terminal display. NEVER returns the full value.
+
+    The old guard was `if len(addr) <= visible*2: return addr`, which handed
+    back the WHOLE string for anything 16 characters or shorter -- the exact
+    opposite of scrubbing, and a fail-open in a function whose entire job is
+    to withhold. Every caller passes it to print()/integrity_log() precisely
+    because it is supposed to be safe there, so a short or malformed value
+    (a truncated address, an error string, a label) was echoed verbatim.
+
+    Now a short value is masked proportionally instead of exposed: nothing
+    reaches the caller un-elided except a value too short to identify anything
+    (<= 4 chars, e.g. "" or "n/a"), which is returned as-is because masking it
+    would only produce a longer, equally uninformative string.
+    """
+    if addr is None:
+        return "(none)"
+    addr = str(addr)
+    n = len(addr)
+    if n <= 4:
         return addr
+    if n <= visible * 2:
+        # Too short for head+tail without revealing everything: show at most a
+        # quarter from each end, and never more than half the string.
+        keep = max(1, n // 4)
+        return f"{addr[:keep]}...{addr[-keep:]}"
     return f"{addr[:visible]}...{addr[-visible:]}"
 
 

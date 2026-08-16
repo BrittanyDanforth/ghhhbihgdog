@@ -197,7 +197,12 @@ expect_exit("validate_proxy: socks5 (no h) rejected",
 expect_exit("validate_proxy: garbage rejected",
             lambda: gs.validate_proxy("http://x"))
 check("scrub_address: truncates", gs.scrub_address("A" * 95).count(".") == 3)
-check("scrub_address: short passthrough", gs.scrub_address("short") == "short")
+# This assertion used to read `scrub_address("short") == "short"`, i.e. it
+# LOCKED IN the fail-open: a value <=16 chars was returned whole by the one
+# function callers rely on to withhold. The test was codifying the bug, so
+# fixing the bug turned it red -- exactly as it should have from the start.
+check("scrub_address: a 5-char value is masked, not passed through",
+      gs.scrub_address("short") != "short")
 check("secure_hex: length", len(gs.secure_hex(16)) == 32)
 
 # ---------------------------------------------------------------------------
@@ -443,6 +448,52 @@ check("money: hop never exceeds what the subaddress received",
       all(_hop_new(Decimal(f)) < Decimal(f) for f in ["0.005", "0.02", "1.0"]))
 check("money: ROUND_DOWN quantise never rounds the hop UP past the output",
       _hop_new(Decimal("0.019999")) <= Decimal("0.019999") - _RESERVE)
+
+# ---------------------------------------------------------------------------
+# scrub_address exists to WITHHOLD. The old guard returned the whole string
+# for anything <= 16 chars, i.e. it failed open in the one function every
+# caller trusts to be safe in print()/integrity_log().
+# ---------------------------------------------------------------------------
+for _v in ["short", "sixteen_chars_16", "a" * 17, "4AdUnd" + "X" * 89]:
+    check(f"scrub_address: len {len(_v)} is NOT returned verbatim",
+          gs.scrub_address(_v) != _v)
+check("scrub_address: masks a short value proportionally rather than exposing it",
+      gs.scrub_address("sixteen_chars_16").count(".") == 3)
+check("scrub_address: long address keeps head+tail only",
+      gs.scrub_address("4AdUnd" + "X" * 89) == "4AdUndXX...XXXXXXXX")
+check("scrub_address: values too short to identify anything pass through",
+      gs.scrub_address("n/a") == "n/a")
+check("scrub_address: None does not crash", gs.scrub_address(None) == "(none)")
+
+# ---------------------------------------------------------------------------
+# secure_delay: secrets.randbelow() raises on a non-positive bound, so the old
+# body crashed whenever hi == lo or hi < lo. Callers pass valid ranges today,
+# so this was a latent abort in the middle of a pipeline run.
+# ---------------------------------------------------------------------------
+for _lo, _hi in [(0, 0), (0.001, 0.001), (0.002, 0.001)]:
+    try:
+        gs.secure_delay(_lo, _hi)
+        check(f"secure_delay({_lo},{_hi}) does not raise", True)
+    except Exception as _e:
+        check(f"secure_delay({_lo},{_hi}) does not raise ({type(_e).__name__})", False)
+
+# ---------------------------------------------------------------------------
+# The resource sentinel must not answer "fine" for a check it never ran.
+# ---------------------------------------------------------------------------
+check("resource_check raises a named error when psutil is missing (never "
+      "silently returns True)",
+      hasattr(gs, "ResourceCheckUnavailable") and
+      issubclass(gs.ResourceCheckUnavailable, RuntimeError))
+_real_rc = gs.resource_check
+try:
+    gs.resource_check = lambda *a, **k: (_ for _ in ()).throw(
+        gs.ResourceCheckUnavailable("no psutil"))
+    gs.require_resources()          # must warn and continue, not crash or exit
+    check("require_resources survives a missing psutil (warns, continues)", True)
+except BaseException as _e:
+    check(f"require_resources survives a missing psutil ({type(_e).__name__})", False)
+finally:
+    gs.resource_check = _real_rc
 
 # The fee margin must have ONE definition. It was written inline in three
 # places (stage-4 budget, hop reserve, and the message reporting the reserve),
