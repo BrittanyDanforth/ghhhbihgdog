@@ -39,8 +39,9 @@ from gs_common import (
 )
 
 
-def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
-    """Confirm the wallet really owns `addr_str` at account 0 / index `sub_idx`.
+def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int,
+                           acct_idx: int = 0) -> None:
+    """Confirm the wallet really owns `addr_str` at `acct_idx` / `sub_idx`.
 
     Everything downstream treats this string as "where my money arrives": it is
     printed for the operator, written into the gs_receive_wallet_v1 bundle, and
@@ -50,7 +51,7 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
     the operator could not reverse.
 
     Two independent confirmations, both from the wallet itself:
-      * get_address(account_index=0, address_index=[sub_idx]) must resolve the
+      * get_address(account_index=acct_idx, address_index=[sub_idx]) must resolve the
         index back to the SAME address -- proving the wallet holds it there.
       * validate_address must call it a valid, non-integrated SUBADDRESS on
         this wallet's own network -- catching a mainnet/testnet mix-up and an
@@ -58,7 +59,7 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
     """
     try:
         res = wallet_rpc.raw_request("get_address", {
-            "account_index": 0, "address_index": [int(sub_idx)],
+            "account_index": int(acct_idx), "address_index": [int(sub_idx)],
         })
         entries = (res or {}).get("addresses") or []
     except Exception as e:
@@ -72,7 +73,8 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
     if not match:
         integrity_log("wallet", "addr_readback_missing_index")
         sys.exit(
-            f"[!] The wallet does not report a subaddress at index {sub_idx}.\n"
+            f"[!] The wallet does not report a subaddress at account {acct_idx} "
+            f"index {sub_idx}.\n"
             f"    Refusing to use an address the wallet cannot confirm."
         )
     if match[0].get("address") != addr_str:
@@ -115,7 +117,7 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int) -> None:
             "    wallet's primary address, which would defeat the per-hop isolation\n"
             "    the receive flow depends on. Refusing."
         )
-    integrity_log("wallet", f"addr_verified:idx={sub_idx}:{v.get('nettype', '?')}")
+    integrity_log("wallet", f"addr_verified:acct={acct_idx}:idx={sub_idx}:{v.get('nettype', '?')}")
     print(f"  [+] Address verified against the wallet "
           f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
 
@@ -133,6 +135,11 @@ def main():
                     help="socks5h://host:port if routing via Tor")
     ap.add_argument("--label", default="GhostSpiral_entry",
                     help="label for the new subaddress")
+    ap.add_argument("--account", type=int, default=None,
+                    help="use this existing account instead of creating a fresh one. "
+                         "Only for an existing wallet layout — a fresh account per "
+                         "receive is what keeps the mix's change off the wallet's "
+                         "primary address.")
     ap.add_argument("--output-dir", default=".",
                     help="directory for wallet JSON output")
     args = ap.parse_args()
@@ -165,11 +172,46 @@ def main():
         integrity_log("wallet", "no_open_wallet")
         sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
                  f"Open/create a wallet in wallet-rpc first, then re-run.")
+    # A FRESH ACCOUNT PER RECEIVE, not just a fresh subaddress in account 0.
+    #
+    # Verified against real monerod 0.18: change is returned to the SPENDING
+    # ACCOUNT's subaddress 0. Everything the mix later leaves over -- the
+    # fan-out's unallocated remainder, the dust from every DAG hop -- therefore
+    # comes to rest on the subaddress 0 of whichever account the receive
+    # landed in. Issuing receives into account 0 makes that the wallet's own
+    # primary address, shared by every receive ever taken, so two receives are
+    # trivially the same wallet and that one address accumulates a slice of
+    # every mix.
+    #
+    # An account of its own gives this receive a change sink used for nothing
+    # else, and leaves the wallet's primary address untouched by the pipeline.
+    # --account lets an operator override for an existing layout.
+    if args.account is not None:
+        acct_idx = int(args.account)
+    else:
+        try:
+            acct = wallet_rpc.raw_request("create_account", {"label": args.label})
+            acct_idx = int((acct or {}).get("account_index", 0))
+        except Exception as e:                                   # noqa: BLE001
+            integrity_log("wallet", "account_create_FAILED")
+            sys.exit(
+                f"[!] Could not create a fresh account for this receive "
+                f"({str(e)[:60]}).\n"
+                f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
+                f"    wallet's primary address, and every leftover from mixing this\n"
+                f"    receive would come to rest there. Use --account N to choose an\n"
+                f"    account deliberately if that is what you want.")
+    if acct_idx == 0:
+        print("  [!] This receive is in account 0, whose subaddress 0 is the "
+              "wallet's PRIMARY address. Every leftover from mixing it will "
+              "come to rest there, on the same address as every other receive.")
+    integrity_log("wallet", f"receive_account:{acct_idx}")
+
     addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
-        account_index=0, label=args.label,
+        account_index=acct_idx, label=args.label,
     )
 
-    verify_receive_address(wallet_rpc, addr_str, sub_idx)
+    verify_receive_address(wallet_rpc, addr_str, sub_idx, acct_idx)
 
     integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
 
@@ -177,7 +219,7 @@ def main():
         "schema": "gs_receive_wallet_v1",
         "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         "address": addr_str,
-        "account_index": 0,
+        "account_index": acct_idx,
         "subaddress_index": sub_idx,
         "label": args.label,
         "rpc_endpoint": args.rpc,
@@ -190,7 +232,7 @@ def main():
 
     print(f"  [+] Receive subaddress bundle saved -> {fname}")
     print(f"  [+] Address: {addr_str}")
-    print(f"  [+] Subaddress index: {sub_idx} (account 0)")
+    print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
 
     integrity_log("wallet", f"saved:{fname.name}")
 

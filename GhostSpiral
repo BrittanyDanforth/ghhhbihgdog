@@ -59,6 +59,16 @@ FEE_SAFETY_MARGIN = Decimal("1.5")
 # across every balance/wallet/depth combination that clears the dust guards the
 # tightest observed remainder was ~0.0245 XMR against a real 0.0024 XMR fee.
 FANOUT_SPEND_FRACTION = Decimal("0.9")
+
+# How many fee-widths the fan-out holds back for the real fee. Anything the
+# fan-out does not allocate becomes monerod's change, and monerod's change goes
+# to the account's subaddress 0 -- the wallet's identity address -- so this
+# buffer is the ONLY thing that lands there and it must be sized against the
+# fee, not against the balance. Kept tighter than the peel chain's carrier
+# reserve on purpose: a fan-out is one transaction, so an under-sized buffer
+# fails before anything moves, while an under-sized peel reserve strands funds
+# mid-chain.
+FANOUT_FEE_BUFFER_MULT = Decimal("3")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
 
@@ -229,7 +239,8 @@ def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
 
 
 def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
-                           dag_enabled: bool, rng=None) -> list:
+                           dag_enabled: bool, rng=None,
+                           spend_fraction: Decimal = None) -> list:
     """Per-destination fan-out amounts that are DELIBERATELY UNEQUAL.
 
     Think like a chain analyst. Splitting the balance into N identical outputs
@@ -261,7 +272,13 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     if rng is None:
         import secrets as _s
         rng = _s.SystemRandom()
-    budget = usable * FANOUT_SPEND_FRACTION
+    # spend_fraction=1 means "the caller already held back an ABSOLUTE fee
+    # buffer, so distribute the rest". See FANOUT_FEE_BUFFER_MULT: whatever is
+    # not distributed becomes monerod's change, and monerod's change goes to
+    # the account's subaddress 0 -- so an unallocated percentage is not a
+    # safety margin, it is a deposit into the wallet's identity address.
+    budget = usable * (FANOUT_SPEND_FRACTION if spend_fraction is None
+                       else spend_fraction)
     min_each = (hop_fee_reserve(fee_xmr) + DUST_XMR) if dag_enabled else (DUST_XMR * 2)
     # Round the floor UP so every output is genuinely at least min_each after
     # quantisation -- rounding it down could leave an output a tick short of
@@ -1070,6 +1087,53 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
     return bal - total_fees, total_fees, rounds
 
 
+def resolve_mix_account(args, rpc_primary, receive_mode: bool,
+                        receive_account_index: int) -> int:
+    """Pick the account the mix runs in — i.e. where its change comes to rest."""
+    # WHICH ACCOUNT THE MIX RUNS IN. This decides where every leftover in the
+    # run comes to rest.
+    #
+    # Verified against real monerod 0.18: change is returned to the SPENDING
+    # ACCOUNT's subaddress 0 -- not to the wallet's account 0. That one fact is
+    # what makes this fixable. Running the mix in account 0 sends the fan-out's
+    # unallocated remainder, and the dust left by every DAG hop, to account 0 /
+    # subaddress 0: the wallet's own primary address, the same address on every
+    # run. Two runs then share a change sink, so they are trivially the same
+    # wallet, and the address that identifies the wallet slowly accumulates a
+    # slice of everything that was ever mixed.
+    #
+    # A FRESH ACCOUNT per run moves that sink to an address created for this
+    # run and used for nothing else. The wallet's real primary address is not
+    # touched by the mix at all, and two runs no longer share a change address.
+    #
+    # In RECEIVE mode the account is fixed by the bundle -- the money is
+    # already sitting in it -- so rotation there belongs to
+    # create_receive_wallet, which now issues a fresh account per receive.
+    if receive_mode:
+        sub_account = receive_account_index
+    else:
+        try:
+            _acct = rpc_primary.raw_request("create_account", {"label": ""})
+            sub_account = int((_acct or {}).get("account_index", 0))
+            integrity_log("stage3", f"mix_account_rotated:{sub_account}")
+            print(f"  [*] Mix runs in a fresh account ({sub_account}); the run's "
+                  f"change stays off the wallet's primary address.")
+        except Exception as e:                       # noqa: BLE001
+            # Fail closed. Silently falling back to account 0 would put the
+            # run's change on the wallet's identity address while the operator
+            # believed it had been rotated away -- worse than not offering the
+            # feature, because the belief is what they act on.
+            integrity_log("stage3", "mix_account_rotate_FAILED")
+            sys.exit(
+                f"[!] Could not create a fresh account for this mix "
+                f"({str(e)[:60]}).\n"
+                f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
+                f"    wallet's primary address, and every leftover in this run would\n"
+                f"    come to rest there — on that address, on every run.\n"
+                f"    Check monero-wallet-rpc has a writable open wallet, then re-run.")
+    return sub_account
+
+
 def main():
     install_signal_handlers()
 
@@ -1112,7 +1176,8 @@ def main():
     newnym(required=True)   # anonymity gate before stage 3
     tor_recheck(proxy, "stage3_pre")
 
-    sub_account = receive_account_index if receive_mode else 0
+    sub_account = resolve_mix_account(args, rpc_primary, receive_mode,
+                                     receive_account_index)
 
     # Random per-run extra-output count, so the total (wallets + this) is not a
     # deterministic fingerprint of the `wallets` setting under public code.
@@ -1290,6 +1355,27 @@ def main():
                  f"(got {len(mix_targets)}). Cannot build a plan.")
     # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
     # give a chain analyst one value and one shape to cluster and follow.
+    # NOTE ON THE 10% THAT DOES NOT GET ALLOCATED.
+    #
+    # FANOUT_SPEND_FRACTION leaves ~10% of usable unallocated, and whatever a
+    # transaction does not allocate becomes monerod's change. That is a real
+    # leak -- see the account-rotation comment below for what is done about
+    # WHERE it lands -- and the obvious fix is to allocate nearly all of it,
+    # holding back only a fee-sized buffer the way compute_hop_amount does.
+    #
+    # That fix was written, and then NOT shipped, because it could not be
+    # verified. On an isolated testnet a 12-output fan-out spending ~90-99% of
+    # a single input fails "transaction was not constructed" repeatedly (6/6 at
+    # 0.90), while the same shape at 0.80-0.88 succeeds intermittently. The
+    # behaviour is not a clean threshold, so it may be an artifact of a
+    # fixed-difficulty offline chain rather than a real wallet constraint --
+    # but "may be an artifact" is not good enough to justify raising the
+    # allocation of a live pipeline to ~100%. If the constraint is real on
+    # mainnet, that change makes the fan-out unconstructible and the run dies
+    # before it starts.
+    #
+    # So the fraction stays, and the leak is addressed where it can be fixed
+    # with certainty: the DESTINATION of the change, not its size.
     fanout_amounts = compute_fanout_amounts(
         usable, fanout_count, fee_xmr, args.dag_mixing, _secrets.SystemRandom())
     if not fanout_amounts:

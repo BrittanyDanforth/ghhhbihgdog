@@ -538,6 +538,60 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
+# WHICH ACCOUNT THE MIX RUNS IN decides where every leftover comes to rest.
+#
+# Verified against real monerod 0.18 (tests/real_fanout_change_testnet.py):
+# change is returned to the SPENDING ACCOUNT's subaddress 0, not to the
+# wallet's account 0. Running the mix in account 0 therefore sends the
+# fan-out's unallocated remainder AND the dust from every DAG hop to the
+# wallet's own primary address -- the same address on every run, so two runs
+# share a change sink and are trivially the same wallet.
+# ---------------------------------------------------------------------------
+class _RpcAcct:
+    def __init__(self, idx=7, boom=False):
+        self.idx = idx; self.boom = boom; self.calls = []
+
+    def raw_request(self, method, params):
+        self.calls.append(method)
+        if self.boom:
+            raise RuntimeError("wallet is read-only")
+        return {"account_index": self.idx}
+
+
+_ra = _RpcAcct(idx=7)
+check("mix account: SEND mode creates a FRESH account for the run",
+      ghost.resolve_mix_account(_A(), _ra, False, 0) == 7
+      and "create_account" in _ra.calls)
+# Receive mode must NOT rotate: the money is already sitting in the bundle's
+# account, so a new account here would point the pipeline at an empty one.
+_rb = _RpcAcct(idx=7)
+check("mix account: RECEIVE mode uses the bundle's account, unchanged",
+      ghost.resolve_mix_account(_A(), _rb, True, 3) == 3)
+check("mix account: RECEIVE mode does not create an account at all",
+      "create_account" not in _rb.calls)
+# FAIL CLOSED. Falling back to account 0 would put the run's change on the
+# wallet's identity address while the operator believed it had been rotated
+# away -- worse than not having the feature, because the belief is acted on.
+try:
+    ghost.resolve_mix_account(_A(), _RpcAcct(boom=True), False, 0)
+    _rot_ok = False
+except SystemExit as e:
+    _rot_ok = "account 0" in str(e)
+check("mix account: a failed rotation ABORTS, never silently uses account 0",
+      _rot_ok)
+
+_crw_src = open(os.path.join(REPO, "create_receive_wallet")).read()
+check("mix account: create_receive_wallet issues a fresh account per receive",
+      'raw_request("create_account"' in _crw_src)
+check("mix account: it verifies the address in the account it actually used",
+      "acct_idx" in _crw_src and "int(acct_idx), \"address_index\"" in _crw_src)
+check("mix account: the bundle records the real account, not a hard-coded 0",
+      '"account_index": acct_idx,' in _crw_src)
+check("mix account: an operator forced into account 0 is warned",
+      "wallet's PRIMARY address" in _crw_src)
+
+
+# ---------------------------------------------------------------------------
 # build_peel_plan: ROTATING CARRIERS.
 #
 # The previous design let monerod's change land where it always lands -- the

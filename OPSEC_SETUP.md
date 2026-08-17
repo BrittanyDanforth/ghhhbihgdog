@@ -157,6 +157,23 @@ Debian or whatever you already run. Disk encrypted.
   Cost: when a job is running, Mullvad sees two Tor clients in one
   tunnel. The ISP still only sees Mullvad.
 
+**Wallet — accounts, not just subaddresses**
+
+Monero returns a transaction's change to the **spending account's subaddress
+0**. So whatever a mix does not allocate — the fan-out remainder, the dust
+from every hop — comes to rest on the subaddress 0 of whichever account the
+run used. If that is account 0, it is the wallet's own primary address, on
+every run, and two runs sharing a change address are trivially the same
+wallet.
+
+So: `create_receive_wallet` issues a **fresh account per receive**, and a send
+runs the mix in a **fresh account** too. The wallet's primary address is not a
+participant in the pipeline. Verified on-chain by
+`tests/real_fanout_change_testnet.py`.
+
+Do not point the pipeline at account 0 with `--account 0` unless you have a
+reason; it warns, and the warning is the whole story above.
+
 **Wallet**
 - `monero-wallet-rpc` with a **view-only** wallet (create it from the
   spend wallet on an offline machine, then copy the view-only files).

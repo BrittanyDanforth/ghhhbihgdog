@@ -57,6 +57,10 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
                                           #   1->N fan-out with UNEQUAL amounts and
                                           #   confirms each subaddress got its exact
                                           #   planned amount on-chain
+python3 tests/real_fanout_change_testnet.py # WHERE the fan-out's change lands: proves
+                                          #   monerod returns change to the SPENDING
+                                          #   ACCOUNT's subaddr 0, so a rotated mix
+                                          #   account keeps it off the wallet PRIMARY
 python3 tests/real_peel_testnet.py       # SHIPPED peeling chain: N destinations via N
                                           #   SEPARATE confirmation-gated txs (not one
                                           #   fan-out), change carrying between peels
