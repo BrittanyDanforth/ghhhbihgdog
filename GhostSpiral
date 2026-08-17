@@ -42,6 +42,12 @@ from gs_common import (
 
 DUST_XMR = Decimal("0.0001")
 
+# How many fee-widths to hold back per remaining peel when sizing what a peel
+# forwards to the next rotating carrier. See the reserve comment in the peel
+# planner: under-reserving strands funds mid-chain, over-reserving only
+# shrinks the final distribution slightly.
+PEEL_CARRIER_RESERVE_MULT = Decimal("4")
+
 # Single source of truth for the fee safety margin. It was written inline as
 # Decimal("1.5") in the stage-4 fee budget, in compute_hop_amount, and in the
 # operator-facing message that reports the reserve -- three copies that could
@@ -307,7 +313,8 @@ def select_fanout_targets(mix_targets: list, decoy_addrs: set,
 
 
 def build_peel_plan(entry_index: int, change_index: int,
-                    dests: list, amounts: list) -> list:
+                    dests: list, amounts: list,
+                    carriers: list = None, remainders: list = None) -> list:
     """A PEELING CHAIN: N single-destination transactions instead of one
     N-output fan-out.
 
@@ -318,27 +325,91 @@ def build_peel_plan(entry_index: int, change_index: int,
     to the next, so the N mix outputs appear in N SEPARATE transactions spread
     over time, never co-created.
 
-    Peel 0 spends ENTRY. Every later peel spends the change address -- verified
-    against real monerod 0.18: spending from subaddr i returns the change to the
-    account's subaddress 0, so subaddress `change_index` (0) is the carrier for
-    peels 1..N-1. Because each peel spends the previous peel's change, the peels
-    are necessarily SEQUENTIAL and CONFIRMATION-GATED (the change is unspendable
-    until it confirms ~10 blocks later) -- which is exactly what spreads them
-    over time. The caller runs each peel as its own gated round.
+    ROTATING CARRIERS. Peel 0 spends ENTRY; every later peel spends a FRESH
+    carrier subaddress that the previous peel paid explicitly.
 
-    Pure and deterministic (amounts are decided upstream by
-    compute_fanout_amounts); returns core entries the caller decorates with the
-    src address, a per-peel delay and tx 'extra'. Returns [] for no dests.
+    The obvious implementation -- and the one this replaces -- let the change
+    fall where monerod puts it and spent that. Verified against real monerod
+    0.18, spending from subaddr i returns the change to the ACCOUNT'S
+    SUBADDRESS 0, so "spend the previous peel's change" means every peel after
+    the first spends subaddress 0. For an 8-destination chain that is subaddr 0
+    spent 7 times: one address, spent over and over, with each spend consuming
+    the output the previous one created.
+
+    That is a hub, and against anyone holding the view key it is not a
+    probabilistic weakness, it is a walk. Spot any peel, follow its change
+    input backwards, and every hop lands on the same address until you reach
+    the origin -- recovering the whole chain and the entry. A repeated spender
+    is also the single most reliable change heuristic there is, so the same
+    address is simultaneously labelled "this wallet's change" for free. The
+    peel mode existed to beat fan-out clustering, and it did, while building a
+    cleaner signal in its place.
+
+    So the remainder is now paid FORWARD as an explicit destination to a fresh
+    carrier instead of being left to become change:
+
+        peel i:  spend carrier[i-1]  ->  [ dests[i], carrier[i] ]
+
+    Each carrier is spent exactly once, no address is spent more than twice,
+    and subaddress 0 is never spent at all. The chain still walks -- an output
+    still funds the next transaction -- but it walks across N distinct
+    one-time addresses instead of collapsing onto one, so there is no repeated
+    spender to anchor on and no single address that names the wallet.
+
+    HONEST LIMIT: monerod still creates its own change output for whatever the
+    real fee leaves over, and that dust still lands on subaddress 0. It is
+    never spent here, so it cannot be walked, but an analyst with the view key
+    does see several small outputs arriving at one address. That is a
+    common-receiver correlation, weaker than a spend-walk and not zero. Only
+    sweep_all is genuinely zero-change, and sweep_all cannot also pay a
+    destination.
+
+    Because each peel spends an output the previous peel created, the peels are
+    necessarily SEQUENTIAL and CONFIRMATION-GATED (unspendable until ~10 blocks
+    later) -- which is what spreads them over time. The caller runs each peel
+    as its own gated round.
+
+    `carriers` is a list of (address, subaddress_index) for the fresh carriers,
+    one per peel; the last peel needs none and any extra is ignored.
+    `remainders[i]` is what peel i forwards to carrier i. Pure and
+    deterministic; returns core entries the caller decorates with the src
+    address, a per-peel delay and tx 'extra'. Returns [] for no dests.
     """
     n = min(len(dests), len(amounts))
+    if n <= 0:
+        return []
+    carriers = list(carriers or [])
+    remainders = list(remainders or [])
     plan = []
     for i in range(n):
-        plan.append({
-            "src_index": entry_index if i == 0 else change_index,
+        if i == 0:
+            src_idx = entry_index
+        elif i - 1 < len(carriers):
+            src_idx = carriers[i - 1][1]
+        else:
+            # No carrier was provisioned for this hop. Falling back to
+            # change_index would silently rebuild the exact hub this function
+            # exists to remove, so refuse instead.
+            raise ValueError(
+                f"peel {i} has no carrier to spend: {len(carriers)} carrier(s) "
+                f"provided for {n} peels (need at least {n - 1}). Refusing to "
+                f"fall back to subaddress 0, which would rebuild the hub.")
+        entry = {
+            "src_index": src_idx,
             "dst": dests[i],
             "amt": str(amounts[i]),
             "peel_num": i,
-        })
+        }
+        # Every peel but the last carries the remainder forward explicitly.
+        if i < n - 1 and i < len(carriers) and i < len(remainders) \
+                and remainders[i] is not None and Decimal(str(remainders[i])) > 0:
+            entry["destinations"] = [
+                {"address": dests[i], "amount": str(amounts[i])},
+                {"address": carriers[i][0], "amount": str(remainders[i])},
+            ]
+            entry["carrier"] = carriers[i][0]
+            entry["carrier_index"] = carriers[i][1]
+        plan.append(entry)
     return plan
 
 
@@ -1243,26 +1314,57 @@ def main():
         # previous peel's change (which Monero returns to the account's
         # subaddress 0), so the N mix outputs appear in N separate transactions
         # over time instead of co-created in one fan-out an analyst can cluster.
-        try:
-            _ca = rpc_primary.raw_request(
-                "get_address", {"account_index": bal_account, "address_index": [0]})
-            change_addr = ((_ca or {}).get("addresses") or [{}])[0].get("address") or ENTRY
-        except Exception:
-            change_addr = ENTRY
+        # ROTATING CARRIERS. One fresh subaddress per hop, so no address is
+        # ever spent twice and subaddress 0 is never spent at all. Provisioned
+        # here, before the plan is built, because build_peel_plan REFUSES to
+        # fall back to subaddress 0 rather than quietly rebuild the hub.
+        _peel_amts = [fanout_by_addr[a] for a in fanout_dests]
+        _n_peels = len(fanout_dests)
+        _carriers = []
+        for _c in range(max(0, _n_peels - 1)):
+            _addr, _idx = rpc_primary.new_subaddress_indexed(
+                account_index=bal_account, label=f"Carrier_{_c}")
+            _carriers.append((_addr, _idx))
+            addr_index[_addr] = _idx
+        # What each peel forwards: everything still to be distributed after
+        # this hop's own destination, less a fee reserve per remaining hop.
+        # The carrier reserve is deliberately generous. Each hop's fee comes
+        # out of the amount the previous hop forwarded, and monerod also needs
+        # its own change output to clear dust, so a reserve sized at exactly
+        # one fee per hop leaves nothing for fee variance across a chain that
+        # runs for hours. The asymmetry decides it: over-reserving costs a
+        # slightly smaller final distribution, while under-reserving stops the
+        # chain part-way with "not enough money" and strands the remainder on
+        # a carrier -- and this pipeline has no auto-resume, so that is a
+        # manual recovery. Found on a real chain, where a one-fee-per-hop
+        # reserve failed on the second peel.
+        _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
+        _remainders = []
+        for _i in range(max(0, _n_peels - 1)):
+            _left = sum(_peel_amts[_i + 1:], Decimal(0))
+            _left += _hop_fee * (_n_peels - _i - 1)
+            _remainders.append(_left)
         _peel_core = build_peel_plan(
             entry_index=_src_index(addr_index, ENTRY), change_index=0,
-            dests=fanout_dests, amounts=[fanout_by_addr[a] for a in fanout_dests])
+            dests=fanout_dests, amounts=_peel_amts,
+            carriers=_carriers, remainders=_remainders)
         fanout_plan = []
         for _p in _peel_core:
-            fanout_plan.append({
-                "src": ENTRY if _p["peel_num"] == 0 else change_addr,
+            _src_addr = ENTRY if _p["peel_num"] == 0 else _carriers[_p["peel_num"] - 1][0]
+            _entry = {
+                "src": _src_addr,
                 "src_index": _p["src_index"],
                 "dst": _p["dst"],
                 "amt": _p["amt"],
                 "delay": _secrets.randbelow(540) + 180,
                 "extra": secure_hex(16),
                 "peel_num": _p["peel_num"],
-            })
+            }
+            if _p.get("destinations"):
+                _entry["destinations"] = _p["destinations"]
+                _entry["carrier"] = _p["carrier"]
+                _entry["carrier_index"] = _p["carrier_index"]
+            fanout_plan.append(_entry)
         integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
         print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
               f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
@@ -1743,8 +1845,10 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
         print(f"  [!] Peeling chain stopped at {done}/{n} peels. The {done} relayed "
               f"peel(s) are on-chain; the remaining ~{n - done} destination(s) were "
               f"NOT sent.")
+        _stuck = peels[done].get("src_index", csub) if done < n else csub
         print(f"  [!] The undistributed balance is safe on this wallet's account "
-              f"{acct}, subaddress {csub} (the change carrier). There is no auto-"
+              f"{acct}, subaddress {_stuck} (the carrier this peel would have "
+              f"spent). There is no auto-"
               f"resume: distribute it manually, or accept the partial distribution. "
               f"Do NOT simply re-run — that builds a new plan from a now-empty entry.")
 
@@ -1754,11 +1858,37 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
             integrity_log("stage5", f"peel_shutdown_at_{i}")
             _partial(relayed)
             break
-        # Peels after the first spend the carrier; wait for it to hold this
-        # peel's amount + a fee reserve, unlocked, before creating the tx.
+        # Peels after the first spend a ROTATING carrier: the fresh subaddress
+        # the previous peel paid its remainder to. Wait for THAT subaddress to
+        # hold this peel's amount + a fee reserve, unlocked.
+        #
+        # The index comes from the plan (src_index), not from change_target.
+        # Waiting on subaddress 0 while the funds are on a rotating carrier
+        # would block forever; worse, if the wait were satisfied by unrelated
+        # change sitting on subaddr 0, the peel would spend the hub after all
+        # and undo the rotation.
         if i > 0:
-            need = Decimal(str(peel.get("amt", "0"))) + per_round_fee
-            if not _wait_for_carrier(args, acct, csub, need, proxy, f"peel {i + 1}/{n}"):
+            # The peel spends its destination AND forwards the remainder to
+            # the next carrier, so the carrier must hold BOTH plus a fee.
+            # Sizing this on "amt" alone (which is only the mix destination)
+            # let the wait succeed on a carrier that could not fund the
+            # transaction, and monerod then answered "not enough money" --
+            # found by the real-chain test, not by the unit suite.
+            if peel.get("destinations"):
+                need = sum((Decimal(str(d["amount"])) for d in peel["destinations"]),
+                           Decimal(0)) + per_round_fee
+            else:
+                need = Decimal(str(peel.get("amt", "0"))) + per_round_fee
+            wait_sub = peel.get("src_index")
+            if wait_sub is None:
+                integrity_log("stage5", f"peel_no_src_index:{i}")
+                print(f"  [!] peel {i + 1}/{n}: the plan carries no src_index, so the "
+                      f"carrier to wait on is unknown. Refusing to guess subaddress 0 "
+                      f"— that is the hub the rotation exists to avoid.")
+                _partial(relayed)
+                break
+            if not _wait_for_carrier(args, acct, wait_sub, need, proxy,
+                                     f"peel {i + 1}/{n}"):
                 integrity_log("stage5", f"peel_carrier_timeout:{i}")
                 _partial(relayed)
                 break

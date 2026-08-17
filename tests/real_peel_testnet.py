@@ -127,29 +127,67 @@ try:
     midx = [m["address_index"] for m in mix]
     amounts = ghost.compute_fanout_amounts(Decimal("4"), N, Decimal("0.01"), False,
                                            random.Random(99))
-    plan = ghost.build_peel_plan(entry_index=E, change_index=0,
-                                 dests=[m["address"] for m in mix], amounts=amounts)
-    check("shipped build_peel_plan produced N peels", len(plan) == N)
-    check("peel 0 spends ENTRY, later peels spend subaddr 0 (the carrier)",
-          plan[0]["src_index"] == E and all(p["src_index"] == 0 for p in plan[1:]))
+    # ROTATING CARRIERS: one fresh subaddress per hop, so no address is spent
+    # twice and subaddress 0 (MAIN) is never spent at all.
+    carriers = [wj("create_address", {"account_index": 0})["result"]
+                for _ in range(N - 1)]
+    carrier_pairs = [(c["address"], c["address_index"]) for c in carriers]
     planned = [int((a * ATOMIC).to_integral_value()) for a in amounts]
+    FEE_RESERVE = int(ATOMIC // 20)
+    # What each peel forwards to the next carrier: everything still to be
+    # distributed after this hop, plus a fee reserve per remaining hop.
+    remainders = []
+    for i in range(N - 1):
+        # Same reserve rule the shipped planner uses, from the shipped
+        # constant, so the test cannot pass on a cushion production
+        # would not have given itself.
+        _hop = Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN
+        left = sum(amounts[i + 1:]) + _hop * (N - i - 1)
+        remainders.append(left)
+
+    plan = ghost.build_peel_plan(entry_index=E, change_index=0,
+                                 dests=[m["address"] for m in mix],
+                                 amounts=amounts,
+                                 carriers=carrier_pairs, remainders=remainders)
+    check("shipped build_peel_plan produced N peels", len(plan) == N)
+    check("peel 0 spends ENTRY", plan[0]["src_index"] == E)
+    check("no peel spends subaddr 0 (MAIN) -- the hub is gone",
+          all(p["src_index"] != 0 for p in plan))
+    check("each peel spends a DISTINCT address (no repeated spender)",
+          len({p["src_index"] for p in plan}) == N)
     print("peel amounts (XMR):", [str(a) for a in amounts])
 
     sub0_before = subbal(0)[0]
     txids = []
+    spent_indices = []
     for i, p in enumerate(plan):
-        # Confirmation-gate: the carrier must hold the previous change, unlocked.
+        # Confirmation-gate on the ROTATING carrier this peel actually spends,
+        # not on subaddr 0.
+        src = p["src_index"]
         if i > 0:
-            need = planned[i] + int(ATOMIC // 20)
+            # Must cover the mix destination AND the forward to the next
+            # carrier, not just the destination.
+            if p.get("destinations"):
+                from decimal import Decimal as _D
+                need = sum(int((_D(d["amount"]) * ATOMIC).to_integral_value())
+                           for d in p["destinations"]) + FEE_RESERVE
+            else:
+                need = planned[i] + FEE_RESERVE
             for _ in range(60):
                 wj("refresh")
-                if subbal(0)[1] >= need:
+                if subbal(src)[1] >= need:
                     break
                 h = dj("get_info")["result"]["height"]; mine(primary, h + 2)
-            check(f"peel {i}: carrier (subaddr 0) confirmed+unlocked before spending",
-                  subbal(0)[1] >= need)
-        r = wj("transfer_split", {"destinations": [{"amount": planned[i], "address": p["dst"]}],
-                                  "account_index": 0, "subaddr_indices": [p["src_index"]],
+            check(f"peel {i}: rotating carrier (subaddr {src}) confirmed+unlocked",
+                  subbal(src)[1] >= need)
+        # Build the real destination set: mix destination + next carrier.
+        if p.get("destinations"):
+            dests_rpc = [{"amount": int((Decimal(d["amount"]) * ATOMIC).to_integral_value()),
+                          "address": d["address"]} for d in p["destinations"]]
+        else:
+            dests_rpc = [{"amount": planned[i], "address": p["dst"]}]
+        r = wj("transfer_split", {"destinations": dests_rpc,
+                                  "account_index": 0, "subaddr_indices": [src],
                                   "priority": 1})
         ths = r.get("result", {}).get("tx_hash_list", [])
         if not ths:
@@ -157,6 +195,7 @@ try:
         check(f"peel {i + 1}/{N} relayed as its own transaction", bool(ths))
         assert ths
         txids.append(ths[0])
+        spent_indices.append(src)
         h = dj("get_info")["result"]["height"]; mine(primary, h + 12); wj("refresh")
 
     # THE PAYOFF.
@@ -168,10 +207,26 @@ try:
         print(f"    mix subaddr {midx[k]}: planned {planned[k] / 1e12:.4f}  "
               f"got {got[midx[k]] / 1e12:.4f}  {'OK' if got[midx[k]] == planned[k] else 'MISMATCH'}")
     check("each mix subaddress received its own peeled amount on-chain", ok)
-    check("peel 0's change reached the carrier (subaddr 0 grew)",
-          subbal(0)[0] > sub0_before)
     check("ENTRY was drained by peel 0 (its output was fully peeled)",
           subbal(E)[0] < int(ATOMIC // 2))
+
+    # THE OPSEC MEASUREMENT, on a real chain: how often was each address spent?
+    from collections import Counter as _C
+    spent = _C(spent_indices)
+    print("\n  ON-CHAIN SPEND COUNTS (the hub measurement):")
+    for idx, cnt in sorted(spent.items()):
+        print(f"    subaddr {idx}: spent {cnt}x" + ("   <-- MAIN" if idx == 0 else ""))
+    check("ON-CHAIN: MAIN (subaddr 0) was spent ZERO times",
+          spent.get(0, 0) == 0)
+    check("ON-CHAIN: no address was spent more than twice",
+          max(spent.values()) <= 2)
+    check("ON-CHAIN: there is no repeated spender to walk the chain back on",
+          len(spent) == N)
+    # Dust change may still land on subaddr 0 -- that is the documented honest
+    # limit. What matters is that it is never SPENT, so it cannot be walked.
+    print(f"    subaddr 0 balance moved {sub0_before / 1e12:.6f} -> "
+          f"{subbal(0)[0] / 1e12:.6f} XMR (change dust; never spent)")
+
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
     for p in procs:

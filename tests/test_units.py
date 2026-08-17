@@ -523,7 +523,9 @@ for _n, _s in (("GhostSpiral", _gs_src), ("receive_watch", _rw_src),
 # ---------------------------------------------------------------------------
 _cd = ["A", "B", "C", "D"]
 _ca = [Decimal("1.0"), Decimal("0.6"), Decimal("2.1"), Decimal("0.9")]
-_cpeels = ghost.build_peel_plan(9, 0, _cd, _ca)
+_ccar = [(f"CarrierAddr{i}", 200 + i) for i in range(len(_cd) - 1)]
+_crem = [Decimal("3.6"), Decimal("3.0"), Decimal("0.9")]
+_cpeels = ghost.build_peel_plan(9, 0, _cd, _ca, carriers=_ccar, remainders=_crem)
 _cfd, _chop = ghost.select_fanout_targets(_cd, set(), wallets=4, num_decoys=0)
 check("peel+dag: the peeled destinations ARE the DAG hop sources (same outputs)",
       sorted(p["dst"] for p in _cpeels) == sorted(_chop))
@@ -536,29 +538,93 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
-# GhostSpiral.build_peel_plan: N single-dest peels, carrier = ENTRY then subaddr 0
+# build_peel_plan: ROTATING CARRIERS.
+#
+# The previous design let monerod's change land where it always lands -- the
+# account's subaddress 0 -- and spent THAT for every peel after the first. For
+# an 8-destination chain that is subaddress 0 spent 7 times. Against anyone
+# holding the view key that is not a probabilistic weakness but a walk: follow
+# any peel's change input backwards and every hop lands on the same address
+# until you reach the entry. A repeated spender is also the most reliable
+# change heuristic there is, so the same address was labelled "this wallet's
+# change" for free. The peel mode existed to beat fan-out clustering, and it
+# did -- while building a cleaner signal in its place.
 # ---------------------------------------------------------------------------
 _pdests = ["Ma", "Mb", "Mc", "Md"]
 _pamts = [Decimal("1.1"), Decimal("0.7"), Decimal("2.3"), Decimal("0.4")]
-_peel = ghost.build_peel_plan(entry_index=9, change_index=0, dests=_pdests, amounts=_pamts)
+_pcar = [(f"Carrier{i}", 300 + i) for i in range(3)]
+_prem = [Decimal("3.4"), Decimal("2.7"), Decimal("0.4")]
+_peel = ghost.build_peel_plan(entry_index=9, change_index=0, dests=_pdests,
+                              amounts=_pamts, carriers=_pcar, remainders=_prem)
 check("peel: one peel per destination", len(_peel) == 4)
 check("peel: peel 0 spends ENTRY (entry_index)", _peel[0]["src_index"] == 9)
-check("peel: peels 1..N spend the change address (subaddr 0)",
-      all(p["src_index"] == 0 for p in _peel[1:]))
-check("peel: each peel targets ONE destination in order",
+
+from collections import Counter as _Ctr
+_spent = _Ctr(p["src_index"] for p in _peel)
+# The three properties the rotation exists to create.
+check("peel: MAIN (subaddress 0) is spent ZERO times",
+      _spent.get(0, 0) == 0)
+check("peel: no address is spent more than twice",
+      max(_spent.values()) <= 2)
+check("peel: every peel spends a DISTINCT address (no repeated spender)",
+      len(_spent) == len(_peel))
+check("peel: peels 1..N spend the fresh carrier the previous peel paid",
+      [p["src_index"] for p in _peel[1:]] == [c[1] for c in _pcar])
+# The remainder is carried FORWARD as an explicit output, not left as change.
+check("peel: every peel but the last pays its remainder to the next carrier",
+      all("destinations" in p for p in _peel[:-1]))
+check("peel: the last peel has no carrier output (nothing left to carry)",
+      "destinations" not in _peel[-1])
+check("peel: a carrier output names the next carrier's address",
+      all(_peel[i]["destinations"][1]["address"] == _pcar[i][0] for i in range(3)))
+check("peel: the carrier output carries the planned remainder",
+      all(_peel[i]["destinations"][1]["amount"] == str(_prem[i]) for i in range(3)))
+check("peel: the mix destination is still paid in the same tx",
+      all(_peel[i]["destinations"][0]["address"] == _pdests[i] for i in range(3)))
+
+check("peel: each peel targets ONE mix destination in order",
       [p["dst"] for p in _peel] == _pdests)
 check("peel: each peel carries its own (unequal) amount",
       [p["amt"] for p in _peel] == [str(a) for a in _pamts])
 check("peel: peel_num is sequential 0..N-1",
       [p["peel_num"] for p in _peel] == [0, 1, 2, 3])
-check("peel: no destination is co-spent (each peel is single-dest, no 'destinations')",
-      all("destinations" not in p for p in _peel))
 check("peel: empty dests -> empty plan", ghost.build_peel_plan(9, 0, [], []) == [])
-check("peel: a receive-mode ENTRY that IS subaddr 0 still peels cleanly",
-      ghost.build_peel_plan(0, 0, ["X"], [Decimal("1")])[0]["src_index"] == 0)
+
+# A single-destination chain needs no carrier at all.
+check("peel: a 1-peel chain needs no carrier and spends only ENTRY",
+      ghost.build_peel_plan(9, 0, ["X"], [Decimal("1")])[0]["src_index"] == 9)
+
+# THE REGRESSION GUARD. Falling back to subaddress 0 when carriers run out
+# would silently rebuild the exact hub this design removes, and it would look
+# like a working plan. It must raise instead.
+def _no_carrier_raises(nc):
+    try:
+        ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")] * 3,
+                              carriers=[(f"C{i}", 400 + i) for i in range(nc)],
+                              remainders=[Decimal("1")] * nc)
+        return False
+    except ValueError as e:
+        return "hub" in str(e)
+
+
+check("peel: NO carriers -> refuses, never falls back to subaddr 0",
+      _no_carrier_raises(0))
+check("peel: too FEW carriers -> refuses rather than reuse one",
+      _no_carrier_raises(1))
+check("peel: exactly enough carriers is accepted", not _no_carrier_raises(2))
+
 # Ragged inputs never index out of range: zips to the shorter.
 check("peel: mismatched dests/amounts zips to the shorter length",
       len(ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")])) == 1)
+
+# The whole-chain property, at the size the presets actually use.
+_bigd = [f"d{i}" for i in range(10)]
+_bigc = [(f"c{i}", 500 + i) for i in range(9)]
+_big = ghost.build_peel_plan(7, 0, _bigd, [Decimal("1")] * 10,
+                             carriers=_bigc, remainders=[Decimal("5")] * 9)
+_bs = _Ctr(p["src_index"] for p in _big)
+check("peel: a 10-peel chain still spends MAIN zero times", _bs.get(0, 0) == 0)
+check("peel: a 10-peel chain has 10 distinct spenders", len(_bs) == 10)
 
 # ---------------------------------------------------------------------------
 # gs_common daemon_fee_estimate: refuse non-localhost without proxy (no net)

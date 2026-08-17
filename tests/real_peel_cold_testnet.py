@@ -128,7 +128,22 @@ try:
     mix = [wj("create_address", {"account_index": 0})["result"] for _ in range(N)]
     midx = [m["address_index"] for m in mix]
     amounts = ghost.compute_fanout_amounts(Decimal("4"), N, Decimal("0.01"), False, random.Random(7))
-    plan = ghost.build_peel_plan(E, 0, [m["address"] for m in mix], amounts)
+    # ROTATING CARRIERS, through the COLD path: each peel spends a fresh
+    # carrier the previous peel paid, so subaddress 0 is never spent. This
+    # test's value is proving the rotation survives the air-gapped round trip
+    # -- the offline signer must sign a spend of a carrier output it only
+    # learns about via the outputs export.
+    carriers = [wj("create_address", {"account_index": 0})["result"] for _ in range(N - 1)]
+    carrier_pairs = [(c["address"], c["address_index"]) for c in carriers]
+    _hop = (Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT
+            / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN)
+    remainders = [sum(amounts[i + 1:]) + _hop * (N - i - 1) for i in range(N - 1)]
+    plan = ghost.build_peel_plan(E, 0, [m["address"] for m in mix], amounts,
+                                 carriers=carrier_pairs, remainders=remainders)
+    check("cold: no peel spends subaddr 0 (MAIN)",
+          all(p["src_index"] != 0 for p in plan))
+    check("cold: every peel spends a distinct address",
+          len({p["src_index"] for p in plan}) == len(plan))
     planned = [int((a * ATOMIC).to_integral_value()) for a in amounts]
     print("peel amounts:", [str(a) for a in amounts])
 
@@ -165,15 +180,29 @@ try:
     txids = []
     for i, p in enumerate(plan):
         if i > 0:
-            need = planned[i] + int(ATOMIC // 20)
+            # Wait on the ROTATING carrier this peel spends, not subaddr 0 --
+            # and for the FULL outgoing amount (destination + the forward to
+            # the next carrier), not just the destination.
+            src = p["src_index"]
+            if p.get("destinations"):
+                need = sum(int((Decimal(d["amount"]) * ATOMIC).to_integral_value())
+                           for d in p["destinations"]) + int(ATOMIC // 20)
+            else:
+                need = planned[i] + int(ATOMIC // 20)
             for _ in range(80):
-                if subbal(0)[1] >= need:
+                if subbal(src)[1] >= need:
                     break
                 h = dj("get_info")["result"]["height"]; mine(primary, h + 2)
-            check(f"peel {i}: view-only sees the carrier change unlocked", subbal(0)[1] >= need)
+            check(f"peel {i}: view-only sees rotating carrier {src} unlocked",
+                  subbal(src)[1] >= need)
 
+        # Carry the carrier output through to the signer. Without it the cold
+        # path would forward nothing and the next peel would have no carrier
+        # to spend -- the rotation would silently degrade back to the hub.
         one = [{"src": "ENTRY" if i == 0 else "CARRIER", "src_index": p["src_index"],
                 "dst": p["dst"], "amt": p["amt"], "delay": 0}]
+        if p.get("destinations"):
+            one[0]["destinations"] = p["destinations"]
         stage = os.path.join(BASE, f"stage{i}")
 
         # SHIPPED phase_create (online, view-only) -> unsigned + outputs_export
