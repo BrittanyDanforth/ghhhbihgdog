@@ -458,6 +458,35 @@ check("peel: mismatched dests/amounts zips to the shorter length",
       len(ghost.build_peel_plan(9, 0, ["a", "b", "c"], [Decimal("1")])) == 1)
 
 # ---------------------------------------------------------------------------
+# GhostSpiral.build_peel_plan ROTATING CARRIERS: the fix for the subaddr-0 hub.
+# When carriers=[...] is given, each peel's remainder is forwarded to a FRESH
+# carrier with a zero-change sweep and the next peel spends THAT carrier, so no
+# single address (least of all subaddr 0) is the change sink or repeated spender.
+# ---------------------------------------------------------------------------
+_rc = ["C0", "C1", "C2", "C3"]           # fresh carriers; peel 0 spends entry_index
+from collections import Counter as _Counter
+_rot = ghost.build_peel_plan(entry_index="E", change_index=0,
+                             dests=_pdests, amounts=_pamts, carriers=_rc[1:])
+_rot_peels = [s for s in _rot if s.get("kind") == "peel"]
+_rot_fwds = [s for s in _rot if s.get("kind") == "forward"]
+check("peel-rotate: one peel step per destination", len(_rot_peels) == 4)
+check("peel-rotate: N-1 forward (sweep) steps interleave the peels", len(_rot_fwds) == 3)
+check("peel-rotate: peel 0 spends the entry, NOT subaddr 0",
+      _rot_peels[0]["src_index"] == "E")
+check("peel-rotate: NO peel ever spends subaddr 0 (the old hub)",
+      all(p["src_index"] != 0 for p in _rot_peels))
+check("peel-rotate: each later peel spends the PREVIOUS fresh carrier, never a fixed hub",
+      [p["src_index"] for p in _rot_peels[1:]] == _rc[1:])
+check("peel-rotate: every forward carries onto a DISTINCT fresh carrier",
+      [f["carry_to"] for f in _rot_fwds] == _rc[1:])
+check("peel-rotate: no single address is spent more than twice (peel + its forward)",
+      max(_Counter(s["src_index"] for s in _rot).values()) <= 2)
+check("peel-rotate: subaddr 0 appears nowhere in the rotating plan",
+      all(0 not in (s.get("src_index"), s.get("carry_to")) for s in _rot))
+check("peel-rotate: empty dests still -> empty plan",
+      ghost.build_peel_plan("E", 0, [], [], carriers=[]) == [])
+
+# ---------------------------------------------------------------------------
 # gs_common daemon_fee_estimate: refuse non-localhost without proxy (no net)
 # ---------------------------------------------------------------------------
 check("daemon_fee_estimate: non-localhost + no proxy -> {}",

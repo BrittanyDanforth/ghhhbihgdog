@@ -307,7 +307,7 @@ def select_fanout_targets(mix_targets: list, decoy_addrs: set,
 
 
 def build_peel_plan(entry_index: int, change_index: int,
-                    dests: list, amounts: list) -> list:
+                    dests: list, amounts: list, carriers: list = None) -> list:
     """A PEELING CHAIN: N single-destination transactions instead of one
     N-output fan-out.
 
@@ -318,27 +318,75 @@ def build_peel_plan(entry_index: int, change_index: int,
     to the next, so the N mix outputs appear in N SEPARATE transactions spread
     over time, never co-created.
 
-    Peel 0 spends ENTRY. Every later peel spends the change address -- verified
-    against real monerod 0.18: spending from subaddr i returns the change to the
-    account's subaddress 0, so subaddress `change_index` (0) is the carrier for
-    peels 1..N-1. Because each peel spends the previous peel's change, the peels
-    are necessarily SEQUENTIAL and CONFIRMATION-GATED (the change is unspendable
-    until it confirms ~10 blocks later) -- which is exactly what spreads them
-    over time. The caller runs each peel as its own gated round.
+    TWO carry modes:
 
-    Pure and deterministic (amounts are decided upstream by
-    compute_fanout_amounts); returns core entries the caller decorates with the
-    src address, a per-peel delay and tx 'extra'. Returns [] for no dests.
+    LEGACY (carriers=None) -- the change of every peel falls to the account's
+    subaddress 0 (monerod returns a partial spend's change there) and the next
+    peel spends subaddress 0. This is simple, but it makes subaddress 0 the
+    SINGLE HUB the whole chain routes through: it is the first spend, the change
+    of every peel, and the input of every later peel. An analyst (or the wallet
+    owner's own recovered keys) reads that one address as the account's main,
+    and a peel-change walk / repeated-spender heuristic recovers it every time.
+    The origin-tracker suite demonstrates this collapse at 100%.
+
+    ROTATING (carriers=[c0, c1, ...]) -- the FIX. Each peel's remainder is
+    forwarded to a FRESH carrier (a one-time subaddress in its own account) with
+    a zero-change `sweep_all`, and the next peel spends THAT fresh carrier, so:
+      * the wallet's real main address (account 0, subaddress 0) is NEVER a
+        carrier, a change sink, or a repeated spender -- it stays out of the mix
+        graph entirely;
+      * no single address is spent more than twice (once to peel, once to
+        forward) and then abandoned, so a repeated-spender heuristic finds no
+        dominant hub;
+      * a peel-change walk follows a chain of distinct one-time carriers rather
+        than collapsing onto one main address.
+    monerod forces a partial spend's change to its source account's subaddress
+    0, so rotation MUST move between fresh accounts (not just subaddresses) and
+    forward with sweep_all -- verified against real monerod 0.18: sweep_all is
+    the only primitive that moves a balance with no change output, and
+    subtract_fee_from_outputs is NOT honoured on this build. Each rotating peel
+    is therefore two confirmation-gated transactions (peel, then forward).
+
+    `carriers` is the list of fresh carrier accounts for peels 1..N-1 (peel 0
+    spends `entry_index`). Pure and deterministic; returns step dicts the caller
+    turns into the real transfer_split / sweep_all calls. Returns [] for no
+    dests.
     """
     n = min(len(dests), len(amounts))
-    plan = []
-    for i in range(n):
-        plan.append({
+    if n == 0:
+        return []
+
+    if carriers is None:
+        # LEGACY single-hub behaviour (kept for callers not yet migrated).
+        return [{
             "src_index": entry_index if i == 0 else change_index,
             "dst": dests[i],
             "amt": str(amounts[i]),
             "peel_num": i,
+        } for i in range(n)]
+
+    # ROTATING carriers: peel i spends the previous carrier, then forwards its
+    # remainder to a fresh carrier so no single address is the hub.
+    plan = []
+    for i in range(n):
+        src = entry_index if i == 0 else carriers[i - 1]
+        plan.append({
+            "kind": "peel",
+            "src_index": src,
+            "dst": dests[i],
+            "amt": str(amounts[i]),
+            "peel_num": i,
         })
+        if i < n - 1:
+            # Forward the change off `src` to a FRESH carrier with a zero-change
+            # sweep, so `src` is spent exactly twice and then abandoned and the
+            # change never rests on -- or is re-spent from -- a fixed hub.
+            plan.append({
+                "kind": "forward",
+                "src_index": src,
+                "carry_to": carriers[i],
+                "peel_num": i,
+            })
     return plan
 
 

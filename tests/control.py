@@ -45,6 +45,7 @@ ACTIONS = {
     "gapfixes":    {**suite("test_gapfixes", "MAC-spoof restore/leak, exit-sim --redact"), "group": "Offline suites"},
     "swaprecv":    {**suite("test_swap_receive", "swap memo binding, slippage stop, receive addr"), "group": "Offline suites"},
     "console":     {**suite("test_console", "password scope, no invented fees, egress, HTTP gates"), "group": "Offline suites"},
+    "tracker":     {**suite("track_origin_attack", "analyst: recover PRIMARY from send/receive graphs"), "group": "Offline suites"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},
@@ -56,6 +57,9 @@ ACTIONS = {
     "realsend":    {**suite("real_send_testnet", "SHIPPED jittered fan-out send: exact unequal amounts land"), "group": "Real binaries"},
     "realpeel":    {**suite("real_peel_testnet", "SHIPPED peeling chain: N dests via N separate txs"), "group": "Real binaries"},
     "peelcold":    {**suite("real_peel_cold_testnet", "SHIPPED phase_create+phase_sign COLD peel chain"), "group": "Real binaries"},
+    "realtrack":   {**suite("real_track_origin_testnet", "origin tracker on a REAL regtest chain: with-keys vs keyless"), "group": "Real binaries"},
+    "hardpeel":    {**suite("real_hardened_peel_testnet", "REAL proof: rotating carriers kill the subaddr-0 hub"), "group": "Real binaries"},
+    "rotcold":     {**suite("real_rotating_peel_cold_testnet", "REAL proof: rotating peel is COLD-SIGNABLE through shipped signer"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --
