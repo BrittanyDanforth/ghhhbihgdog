@@ -1630,11 +1630,36 @@ def main():
 
     staging_dir = "tx_staging"
 
+    # A destination for whatever change the distribution leaves behind.
+    # Provisioned before the spend, because it must exist when the sweep runs.
+    #
+    # BOTH modes need it. The fan-out cannot allocate its input exactly, so
+    # ~10% returns as change. The peel chain forwards its remainder explicitly,
+    # which removed the SPEND hub -- but each peel still leaves its
+    # (carrier reserve - real fee) as change, so an N-peel chain makes N
+    # deposits onto the same subaddress 0. Rotating the carriers stopped that
+    # address being SPENT; it did not stop it being a convergence point, and
+    # the balance sitting there is unmixed either way.
+    change_sweep_target = None
+    if True:
+        try:
+            _csa, _csi = rpc_primary.new_subaddress_indexed(
+                account_index=bal_account, label="ChangeSweep")
+            change_sweep_target = (_csa, _csi)
+            addr_index[_csa] = _csi
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("stage4", "change_sweep_target_FAILED")
+            print(f"  [!] Could not create a destination for the fan-out's change "
+                  f"({str(e)[:60]}). The change will stay on the mix account's "
+                  f"subaddress 0 — UNMIXED, and the only fan-out output that "
+                  f"never moves.")
+
     try:  # ensures lock file is cleaned even on error
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
-                                 change_target=(bal_account, 0))
+                                 change_target=(bal_account, 0),
+                                 change_sweep_target=change_sweep_target)
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -2036,9 +2061,76 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     return relayed
 
 
+def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
+                      staging_dir, proxy, meta):
+    """Sweep the distribution's change output into the mix, leaving nothing behind.
+
+    A fan-out cannot allocate its input exactly: the fee is not known when the
+    amounts are chosen, so FANOUT_SPEND_FRACTION holds ~10% back and monerod
+    returns that remainder as change to the mix account's subaddress 0. Two
+    separate problems follow, and both are fixed here.
+
+    OPSEC: the remainder sits on one address for the whole run and is never
+    mixed. It is the only output of the fan-out that does not move, which is a
+    behavioural tell of exactly the kind this pipeline removed elsewhere (the
+    decoy dead-end, the peel hub) -- and it is the run's change address, so the
+    tell points at the one output whose identity matters most.
+
+    CORRECTNESS, and arguably the bigger one: that ~10% is the operator's
+    money, and leaving it parked means a tenth of the balance was never mixed
+    at all while the run reported success. An operator reading "pipeline
+    complete" has no reason to suspect a tenth of it stayed behind.
+
+    So the change is swept -- sweep_all, whole balance, ZERO change of its own
+    (proven on-chain in tests/real_hop_sweep_testnet.py) -- into a fresh mix
+    subaddress, which then hops with everything else.
+
+    This SPENDS the mix account's subaddress 0, exactly once. That is safe here
+    and would not have been before the account rotation: it is a per-run
+    account, so this is not the wallet's identity address, and one spend is not
+    a repeated-spender hub. The wallet's real primary address is still spent
+    zero times by the pipeline.
+
+    Returns True if the change was swept (or there was nothing to sweep).
+    """
+    # Wait for the change to actually exist and unlock -- it is an output of
+    # the distribution transaction, so it is locked for the usual ~10 blocks.
+    if not _wait_for_carrier(args, account, change_index, DUST_XMR, proxy,
+                             "change sweep"):
+        integrity_log("stage5", "change_sweep_skipped:not_confirmed")
+        print("  [!] The distribution's change did not confirm in time, so it was "
+              "NOT swept into the mix. It is safe on the mix account's subaddress "
+              f"{change_index} — but it is UNMIXED, and it is the one output of "
+              "the fan-out that never moved. Sweep it by hand.")
+        return False
+
+    sweep_tx = {
+        "src": f"change(acct {account}/sub {change_index})",
+        "src_index": change_index,
+        "dst": dest_addr,
+        "sweep": True,
+        "delay": secrets.SystemRandom().randbelow(540) + 180,
+        "extra": secure_hex(16),
+    }
+    path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
+    atomic_write_json({"meta": meta, "txs": [sweep_tx]}, path)
+    stage = f"{staging_dir}/changesweep"
+    try:
+        _run_round(args, path, stage, "Change sweep")
+        integrity_log("stage5", "change_swept_into_mix")
+        print("  [+] The distribution's change was swept into the mix; nothing is "
+              "parked on the change address.")
+        return True
+    finally:
+        secure_delete_file(path)
+        _cs = Path(stage)
+        if _cs.is_dir() and not secure_delete_tree(_cs):
+            print(f"  [!] Could not securely wipe {stage}; remove it manually.")
+
+
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
-                change_target=(0, 0)):
+                change_target=(0, 0), change_sweep_target=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -2054,9 +2146,42 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         _relayed = _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
         if _total_peels and _relayed < _total_peels:
             incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
+        # Every peel left (carrier reserve - real fee) as change on the same
+        # subaddress. Rotating carriers stopped that address being SPENT; this
+        # stops it being a place value accumulates unmixed. One sweep at the
+        # end collects all N deposits at once.
+        if change_sweep_target and _relayed:
+            _cs_addr, _cs_idx = change_sweep_target
+            _cs_acct, _cs_change = change_target
+            try:
+                with open(fanout_file) as _mf:
+                    _cs_meta = json.load(_mf).get("meta", {})
+            except Exception:                                # noqa: BLE001
+                _cs_meta = {}
+            if not _run_change_sweep(args, _cs_acct, _cs_change, _cs_addr,
+                                     _cs_idx, staging_dir, proxy, _cs_meta):
+                incomplete.append("the peel chain's accumulated change was NOT "
+                                  "swept into the mix — it is unmixed on the "
+                                  "change address")
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
+        # The fan-out could not allocate its input exactly, so ~10% came back
+        # as change. Sweep it into the mix rather than leaving a tenth of the
+        # balance parked, unmixed, on the one output that never moves.
+        if change_sweep_target:
+            _cs_addr, _cs_idx = change_sweep_target
+            _cs_acct, _cs_change = change_target
+            try:
+                with open(fanout_file) as _mf:
+                    _cs_meta = json.load(_mf).get("meta", {})
+            except Exception:                                # noqa: BLE001
+                _cs_meta = {}
+            if not _run_change_sweep(args, _cs_acct, _cs_change, _cs_addr,
+                                     _cs_idx, staging_dir, proxy, _cs_meta):
+                incomplete.append("the fan-out's change was NOT swept into the mix "
+                                  "— roughly a tenth of the balance is unmixed on "
+                                  "the change address")
 
     # -- Round 2: DAG hop-mixing (only if planned) ------------------------
     if dag_file:

@@ -174,6 +174,15 @@ participant in the pipeline. Verified on-chain by
 Do not point the pipeline at account 0 with `--account 0` unless you have a
 reason; it warns, and the warning is the whole story above.
 
+**Nothing is left parked.** A distribution cannot allocate its input exactly
+— the fee is not known when the amounts are chosen — so a remainder always
+comes back as change. Rotating the account moved that off your primary
+address, but the value still sat there: unmixed, and the one fan-out output
+that never moved. It is now **swept into the mix** (`sweep_all`, zero change
+of its own) after the distribution, in both fan-out and peel modes. That is a
+correctness fix as much as an OPSEC one — roughly a tenth of the balance was
+previously never mixed at all while the run reported success.
+
 The same rule bites per hop, not just once. A DAG hop that sent a *fixed
 amount* had to pick that amount before the fee was known, so it always left a
 remainder — 40 hops at `wallets=10 deep=2`, each dropping dust on that one

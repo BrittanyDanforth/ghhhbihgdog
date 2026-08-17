@@ -538,6 +538,69 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
+# THE CHANGE SWEEP. A distribution cannot allocate its input exactly, so a
+# remainder always comes back as change on the mix account's subaddress 0.
+# Rotating the account moved that off the wallet's primary address, and
+# rotating the peel carriers stopped it being SPENT -- but the value was still
+# parked there: unmixed, and the one output of the fan-out that never moves.
+#
+# Two problems, not one. The OPSEC problem is the tell. The correctness
+# problem is that roughly a tenth of the operator's balance was never mixed at
+# all while the run reported success.
+# ---------------------------------------------------------------------------
+_gs_src2 = open(os.path.join(REPO, "GhostSpiral")).read()
+check("changesweep: a _run_change_sweep helper exists",
+      "def _run_change_sweep(" in _gs_src2)
+_cs_fn = _gs_src2[_gs_src2.index("def _run_change_sweep("):
+                  _gs_src2.index("def _stage5_run(")]
+check("changesweep: it issues a SWEEP (whole balance, zero change of its own)",
+      '"sweep": True' in _cs_fn)
+check("changesweep: it carries no amount (a sweep has none)",
+      '"amt"' not in _cs_fn)
+check("changesweep: it spends the CHANGE index, not a guessed 0",
+      '"src_index": change_index' in _cs_fn)
+check("changesweep: it waits for the change to confirm before spending it",
+      "_wait_for_carrier(" in _cs_fn)
+check("changesweep: a timeout is reported honestly, not silently swallowed",
+      "NOT swept" in _cs_fn and "UNMIXED" in _cs_fn)
+check("changesweep: the plan file is wiped after the round",
+      "secure_delete_file(path)" in _cs_fn)
+
+# The entry it builds must satisfy the signer's own validator.
+_cs_entry = {"src": "change", "src_index": 0, "dst": "D", "sweep": True,
+             "delay": 300, "extra": "ab" * 8}
+try:
+    airgap._validate_plan([_cs_entry]); _cs_ok = True
+except SystemExit:
+    _cs_ok = False
+check("changesweep: the entry it builds passes the shipped signer's validator",
+      _cs_ok)
+
+# BOTH distribution modes must sweep. The peel chain forwards its remainder at
+# every hop, which removed the spend hub -- but each peel still leaves
+# (carrier reserve - real fee) as change, so an N-peel chain makes N deposits
+# on the same address. Rotation stopped it being spent, not being a sink.
+_s5 = _gs_src2[_gs_src2.index("def _stage5_run("):]
+_s5 = _s5[:_s5.index("\ndef ")] if "\ndef " in _s5[10:] else _s5
+check("changesweep: the FAN-OUT path sweeps its change",
+      _s5.count("_run_change_sweep(") >= 1)
+check("changesweep: the PEEL path sweeps its accumulated change too",
+      _s5.count("_run_change_sweep(") == 2)
+check("changesweep: a failed sweep is reported in the run's incomplete list",
+      _s5.count("incomplete.append") >= 3 and "unmixed" in _s5)
+check("changesweep: stage 5 takes the sweep destination as a parameter",
+      "change_sweep_target=None" in _gs_src2)
+# The destination must be provisioned BEFORE the spend, or the sweep has
+# nowhere to go at the moment it is needed.
+_prov = _gs_src2[_gs_src2.index("change_sweep_target = None"):
+                 _gs_src2.index("incomplete = _stage5_run(")]
+check("changesweep: the destination is created before the distribution runs",
+      "new_subaddress_indexed(" in _prov)
+check("changesweep: failing to create it warns that the change stays unmixed",
+      "UNMIXED" in _prov)
+
+
+# ---------------------------------------------------------------------------
 # DAG HOPS ARE SWEEPS. A hop means "move everything from this subaddress to
 # that one", and sweep_all is exactly that -- and, unlike transfer_split, it
 # produces NO CHANGE OUTPUT. transfer_split has to choose the amount before

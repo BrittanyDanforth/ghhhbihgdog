@@ -206,6 +206,50 @@ try:
     check("ON-CHAIN: every rotated mix subaddress was funded",
           all(abal(ACC, i) == per for i in m2idx))
 
+    # ---- THE CHANGE SWEEP: does subaddr 0 actually end up EMPTY? ----------
+    # Rotating the account moved the change off the wallet's primary address,
+    # but a tenth of the balance was still parked there, unmixed, on the only
+    # fan-out output that never moves. _run_change_sweep sweeps it into the
+    # mix. Here we drive the same sweep_all the shipped code issues and prove
+    # the change address is emptied and the value lands in the mix.
+    parked = abal(ACC, 0)
+    print(f"\n  change parked on acct{ACC}/sub0 before the sweep: {parked/1e12} XMR")
+    check("there IS change parked on the change address (the leak being fixed)",
+          parked > 0)
+
+    dest = wj("create_address", {"account_index": ACC, "label": "ChangeSweep"})["result"]
+    DI = dest["address_index"]
+    # Wait for it to unlock, exactly as _wait_for_carrier does.
+    for _ in range(60):
+        wj("refresh")
+        if abal(ACC, 0) > 0 and wj("get_balance", {"account_index": ACC,
+                "address_indices": [0]})["result"]["per_subaddress"][0]["unlocked_balance"] > 0:
+            break
+        h = dj("get_info")["result"]["height"]; mine(primary, h + 2)
+
+    sr = wj("sweep_all", {"address": dest["address"], "account_index": ACC,
+                          "subaddr_indices": [0], "priority": 1})
+    sh = (sr.get("result") or {}).get("tx_hash_list", [])
+    if not sh:
+        print("  sweep error:", str(sr.get("error") or sr)[:160])
+    check("the change sweep relayed", bool(sh))
+    assert sh
+    h = dj("get_info")["result"]["height"]; mine(primary, h + 12); wj("refresh")
+
+    after = abal(ACC, 0)
+    landed = abal(ACC, DI)
+    print(f"  after the sweep: acct{ACC}/sub0 = {after/1e12} XMR, "
+          f"swept into sub{DI} = {landed/1e12} XMR")
+    check("ON-CHAIN: the change address is EMPTY after the sweep", after == 0)
+    check("ON-CHAIN: the parked value reached the mix (nothing left unmixed)",
+          landed > 0 and landed >= parked - int(Decimal("0.05") * ATOMIC))
+    # And the sweep itself must leave no new change, or it just moved the leak.
+    tr2 = wj("get_transfer_by_txid", {"txid": sh[0], "account_index": ACC})
+    back0 = [t for t in (tr2.get("result", {}).get("transfers") or [])
+             if t.get("type") == "in" and t.get("subaddr_index", {}).get("minor") == 0]
+    check("ON-CHAIN: the sweep created NO new change on subaddr 0",
+          not back0)
+
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
     for p in procs:
