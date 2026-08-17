@@ -174,6 +174,14 @@ participant in the pipeline. Verified on-chain by
 Do not point the pipeline at account 0 with `--account 0` unless you have a
 reason; it warns, and the warning is the whole story above.
 
+The same rule bites per hop, not just once. A DAG hop that sent a *fixed
+amount* had to pick that amount before the fee was known, so it always left a
+remainder — 40 hops at `wallets=10 deep=2`, each dropping dust on that one
+address. Hops are now **sweeps** (`sweep_all`: move the whole subaddress
+balance, minus fee), which produce **no change output at all**. Verified
+end-to-end through the cold path by `tests/real_hop_sweep_testnet.py`: every
+hop returned nothing to the account.
+
 **Wallet**
 - `monero-wallet-rpc` with a **view-only** wallet (create it from the
   spend wallet on an offline machine, then copy the view-only files).

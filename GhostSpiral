@@ -1134,6 +1134,100 @@ def resolve_mix_account(args, rpc_primary, receive_mode: bool,
     return sub_account
 
 
+def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
+                   mix_targets, addr_index, _secrets) -> list:
+    """Plan the DAG hop round: one SWEEP per fan-out output.
+
+    Returns the hop plan (empty when DAG mixing is off or nothing can fund
+    a hop). Extracted from stage 4 so the hop shape -- which is where the
+    per-hop change leak lived -- can be read and tested on its own.
+    """
+    dag_plan = []
+    if args.dag_mixing:
+        # Hop amount comes from each source's OWN fan-out balance (fanout_amt).
+        # Reserve the ACTUAL FEE, not a percentage. The old formula was
+        # fanout_amt * 0.85, whose comment claimed the 15% "covers the fee
+        # (tiny next to fanout_amt)" -- but the fee is an ABSOLUTE amount while
+        # the reserve scales with the hop, so the claim inverts for small
+        # fan-outs. With a real daemon fee of ~0.0024 XMR, any fanout_amt below
+        # ~0.016 XMR reserved LESS than the fee, and the plan passed every
+        # guard here and then failed "not enough money" inside transfer_split --
+        # after the fan-out had already executed on-chain and spent its fee,
+        # leaving funds scattered mid-pipeline. The dust guard did not catch it:
+        # it only required the hop to exceed 0.0001 XMR.
+        #
+        # Reserve and hop both come from the shared helpers, so the number
+        # printed below is the number the arithmetic actually used.
+        _hop_reserve = hop_fee_reserve(fee_xmr)
+        # EVERY fan-out output hops -- no output has a behavioural tell that a
+        # public-code analyst could use to separate "decoy" from "real" (see
+        # select_fanout_targets). hop_sources_real is all of them.
+        hop_sources = list(hop_sources_real)
+        _secrets.SystemRandom().shuffle(hop_sources)
+        _unfundable = 0
+        for s in hop_sources:
+            if shutdown_requested():
+                integrity_log("stage4", "shutdown_during_dag_plan")
+                break
+            # Each source hops onward from its OWN fan-out balance, so the hop
+            # amounts stay as unequal as the fan-out that funded them -- no
+            # single hop value for an analyst to cluster on.
+            src_hop_amt = compute_hop_amount(fanout_by_addr[s], fee_xmr)
+            if src_hop_amt <= DUST_XMR:
+                _unfundable += 1
+                continue
+            dst_candidates = [d for d in dag.get(s, mix_targets) if d != s]
+            if not dst_candidates:
+                continue
+            d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
+            # SWEEP, not a fixed amount. A hop means "move everything from
+            # this subaddress to that one", and sweep_all expresses exactly
+            # that -- sending the whole balance minus the fee, with NO CHANGE
+            # OUTPUT AT ALL. Verified on a real chain through the full
+            # cold-signing path: a 3.0 XMR source swept 2.998 with a 0.002 fee
+            # and returned nothing to the account.
+            #
+            # transfer_split cannot do this. The amount has to be chosen before
+            # the fee is known, so it always leaves a remainder, and monerod
+            # returns that remainder to the account's subaddress 0. At
+            # wallets=10 deep=2 that is 40 hops each depositing dust on ONE
+            # address -- the run's own convergence point, and the thing that
+            # made every hop traceable to a single sink even after the account
+            # rotation moved that sink off the wallet's primary address.
+            #
+            # src_hop_amt is still computed above: it is the fundability check
+            # (can this output cover a fee at all?) and it decides whether the
+            # hop is planned. It is deliberately NOT carried into the entry --
+            # a sweep has no amount, and one sitting here would look
+            # authoritative while being ignored.
+            dag_plan.append({
+                "src": s,
+                "src_index": _src_index(addr_index, s),
+                "dst": d,
+                "sweep": True,
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+            })
+        if not dag_plan:
+            integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
+            print(f"  [!] DAG mixing skipped: no mix subaddress holds enough to "
+                  f"fund a hop after reserving ~{_hop_reserve} XMR for its fee. "
+                  f"Fan-out distribution still runs.")
+        else:
+            if _unfundable:
+                print(f"  [!] {_unfundable} mix subaddress(es) too small to hop; "
+                      f"they keep their fan-out output. {len(dag_plan)} hop(s) planned.")
+            # Hop COUNT only, never the per-hop amount — same reason as the
+            # fan-out above: the amount on the persistent chain deanonymises the
+            # hop it is meant to hide.
+            integrity_log("stage4", f"dag_plan:{len(dag_plan)}_hops")
+    else:
+        integrity_log("stage4", "dag_mixing_disabled")
+        print("  [*] DAG hop-mixing disabled (default). Run with --dag-mixing to "
+              "add a second confirmation-gated hop round.")
+    return dag_plan
+
+
 def main():
     install_signal_handlers()
 
@@ -1487,69 +1581,8 @@ def main():
     # permutation), not random-with-replacement. This whole round also cannot
     # be created until the fan-out confirms on-chain, which is why it runs as a
     # separate confirmation-gated round in Stage 5 (see _stage5_run).
-    dag_plan = []
-    if args.dag_mixing:
-        # Hop amount comes from each source's OWN fan-out balance (fanout_amt).
-        # Reserve the ACTUAL FEE, not a percentage. The old formula was
-        # fanout_amt * 0.85, whose comment claimed the 15% "covers the fee
-        # (tiny next to fanout_amt)" -- but the fee is an ABSOLUTE amount while
-        # the reserve scales with the hop, so the claim inverts for small
-        # fan-outs. With a real daemon fee of ~0.0024 XMR, any fanout_amt below
-        # ~0.016 XMR reserved LESS than the fee, and the plan passed every
-        # guard here and then failed "not enough money" inside transfer_split --
-        # after the fan-out had already executed on-chain and spent its fee,
-        # leaving funds scattered mid-pipeline. The dust guard did not catch it:
-        # it only required the hop to exceed 0.0001 XMR.
-        #
-        # Reserve and hop both come from the shared helpers, so the number
-        # printed below is the number the arithmetic actually used.
-        _hop_reserve = hop_fee_reserve(fee_xmr)
-        # EVERY fan-out output hops -- no output has a behavioural tell that a
-        # public-code analyst could use to separate "decoy" from "real" (see
-        # select_fanout_targets). hop_sources_real is all of them.
-        hop_sources = list(hop_sources_real)
-        _secrets.SystemRandom().shuffle(hop_sources)
-        _unfundable = 0
-        for s in hop_sources:
-            if shutdown_requested():
-                integrity_log("stage4", "shutdown_during_dag_plan")
-                break
-            # Each source hops onward from its OWN fan-out balance, so the hop
-            # amounts stay as unequal as the fan-out that funded them -- no
-            # single hop value for an analyst to cluster on.
-            src_hop_amt = compute_hop_amount(fanout_by_addr[s], fee_xmr)
-            if src_hop_amt <= DUST_XMR:
-                _unfundable += 1
-                continue
-            dst_candidates = [d for d in dag.get(s, mix_targets) if d != s]
-            if not dst_candidates:
-                continue
-            d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
-            dag_plan.append({
-                "src": s,
-                "src_index": _src_index(addr_index, s),
-                "dst": d,
-                "amt": str(src_hop_amt),
-                "delay": _secrets.randbelow(540) + 180,
-                "extra": secure_hex(16),
-            })
-        if not dag_plan:
-            integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
-            print(f"  [!] DAG mixing skipped: no mix subaddress holds enough to "
-                  f"fund a hop after reserving ~{_hop_reserve} XMR for its fee. "
-                  f"Fan-out distribution still runs.")
-        else:
-            if _unfundable:
-                print(f"  [!] {_unfundable} mix subaddress(es) too small to hop; "
-                      f"they keep their fan-out output. {len(dag_plan)} hop(s) planned.")
-            # Hop COUNT only, never the per-hop amount — same reason as the
-            # fan-out above: the amount on the persistent chain deanonymises the
-            # hop it is meant to hide.
-            integrity_log("stage4", f"dag_plan:{len(dag_plan)}_hops")
-    else:
-        integrity_log("stage4", "dag_mixing_disabled")
-        print("  [*] DAG hop-mixing disabled (default). Run with --dag-mixing to "
-              "add a second confirmation-gated hop round.")
+    dag_plan = build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,
+                              dag, mix_targets, addr_index, _secrets)
 
     meta = {
         "schema": "unsigned_v1",

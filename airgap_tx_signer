@@ -74,6 +74,21 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         elif si is not None and (not isinstance(si, int) or isinstance(si, bool) or si < 0):
             sys.exit(f"[!] Schema error at TX {i}: 'src_index' present but invalid "
                      f"({si!r}); expected a non-negative int.")
+        # A SWEEP carries no amount by design: sweep_all sends the whole
+        # subaddress balance minus the fee, which is exactly why it leaves no
+        # change. Requiring 'amt' here would reject the one plan shape that
+        # cannot produce a change output.
+        if tx.get("sweep"):
+            if not isinstance(tx.get("dst"), str) or not tx["dst"]:
+                sys.exit(f"[!] Schema error at TX {i}: a sweep needs a 'dst' address")
+            if tx.get("destinations"):
+                sys.exit(f"[!] Schema error at TX {i}: a sweep has ONE destination; "
+                         f"'destinations' and 'sweep' are mutually exclusive.")
+            if tx.get("amt") is not None:
+                sys.exit(f"[!] Schema error at TX {i}: a sweep must not carry 'amt' -- "
+                         f"it sends the whole subaddress balance, and an amount here "
+                         f"would be silently ignored while looking authoritative.")
+            continue
         dests = tx.get("destinations")
         if dests is not None:
             if not isinstance(dests, list) or not dests:
@@ -136,6 +151,11 @@ def _canonical_plan(plan: List[dict]) -> list:
       delay        -- per-TX broadcast delay; broadcast reads it from the
                       manifest, so a swapped delay changes relay timing, which
                       is an OPSEC property worth detecting
+      sweep        -- whether this entry sends the WHOLE subaddress balance.
+                      It must be covered: flipping it turns a fixed-amount hop
+                      into "send everything", which is a completely different
+                      spend from the same src_index and dst, and the manifest
+                      would otherwise still verify.
     """
     out = []
     for tx in plan:
@@ -143,8 +163,12 @@ def _canonical_plan(plan: List[dict]) -> list:
         entry = {
             "src_index": tx.get("src_index"),
             "delay": tx.get("delay"),
+            "sweep": bool(tx.get("sweep")),
         }
-        if dests:
+        if tx.get("sweep"):
+            # No amount exists to cover -- sweep_all sends the balance.
+            entry["dst"] = tx.get("dst")
+        elif dests:
             entry["destinations"] = [
                 {"address": d.get("address"), "amount": str(d.get("amount"))}
                 for d in dests
@@ -300,7 +324,19 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         src_index = tx["src_index"]
         # Multi-destination (fan-out: one input -> many outputs) or single
         # (DAG hop). transfer_split takes a destinations list either way.
-        if tx.get("destinations"):
+        # A SWEEP entry moves an ENTIRE subaddress balance to one destination.
+        # It is the correct primitive for a DAG hop and, unlike transfer_split,
+        # it produces NO CHANGE OUTPUT at all -- verified on a real chain: a
+        # 3.0 XMR source swept 2.998 with a 0.002 fee and returned nothing to
+        # the account. transfer_split cannot do that, because the fee is not
+        # known when the amount is chosen, so it always leaves a remainder that
+        # monerod returns to the account's subaddress 0.
+        if tx.get("sweep"):
+            dests = None
+            mani_dst = scrub_address(tx["dst"])
+            mani_amt = "sweep"
+            desc = f"SWEEP all of subaddr {tx['src_index']} -> {scrub_address(tx['dst'])}"
+        elif tx.get("destinations"):
             dests = [
                 {"amount": int(Decimal(str(d["amount"])) * Decimal(10 ** 12)),
                  "address": d["address"]}
@@ -319,14 +355,27 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: {desc}...")
 
         try:
-            result = rpc.raw_request("transfer_split", {
-                "destinations": dests,
-                "account_index": acct_idx,
-                "subaddr_indices": [src_index],
-                "priority": args.fee_priority,
-                "get_tx_hex": False,
-                "do_not_relay": True,
-            })
+            if tx.get("sweep"):
+                # sweep_all takes ONE address and no amount: it sends whatever
+                # the subaddress holds, minus the fee. That is what makes it
+                # zero-change, and it is why a sweep entry carries no "amt".
+                result = rpc.raw_request("sweep_all", {
+                    "address": tx["dst"],
+                    "account_index": acct_idx,
+                    "subaddr_indices": [src_index],
+                    "priority": args.fee_priority,
+                    "get_tx_hex": False,
+                    "do_not_relay": True,
+                })
+            else:
+                result = rpc.raw_request("transfer_split", {
+                    "destinations": dests,
+                    "account_index": acct_idx,
+                    "subaddr_indices": [src_index],
+                    "priority": args.fee_priority,
+                    "get_tx_hex": False,
+                    "do_not_relay": True,
+                })
 
             # The RPC returns unsigned_txset as a HEX string (phase_sign decodes
             # it back to the binary unsigned_monero_tx that wallet-cli expects).

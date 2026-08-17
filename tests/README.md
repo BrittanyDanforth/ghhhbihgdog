@@ -57,6 +57,10 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
                                           #   1->N fan-out with UNEQUAL amounts and
                                           #   confirms each subaddress got its exact
                                           #   planned amount on-chain
+python3 tests/real_hop_sweep_testnet.py  # DAG hops are SWEEPS: drives the SHIPPED
+                                          #   phase_create/phase_sign on a view-only
+                                          #   wallet and proves a cold-signed hop
+                                          #   returns ZERO change to the account
 python3 tests/real_fanout_change_testnet.py # WHERE the fan-out's change lands: proves
                                           #   monerod returns change to the SPENDING
                                           #   ACCOUNT's subaddr 0, so a rotated mix

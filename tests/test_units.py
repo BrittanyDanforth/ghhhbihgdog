@@ -538,6 +538,98 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
+# DAG HOPS ARE SWEEPS. A hop means "move everything from this subaddress to
+# that one", and sweep_all is exactly that -- and, unlike transfer_split, it
+# produces NO CHANGE OUTPUT. transfer_split has to choose the amount before
+# the fee is known, so it always leaves a remainder that monerod returns to
+# the account's subaddress 0: at wallets=10 deep=2 that was 40 hops each
+# depositing dust on ONE address, the run's own convergence point.
+# ---------------------------------------------------------------------------
+_sweep = {"src": "A", "src_index": 4, "dst": "B", "sweep": True}
+try:
+    airgap._validate_plan([_sweep]); _sw_ok = True
+except SystemExit:
+    _sw_ok = False
+check("sweep: a sweep entry validates without an amount", _sw_ok)
+
+
+def _sweep_rejected(tx):
+    try:
+        airgap._validate_plan([tx]); return False
+    except SystemExit:
+        return True
+
+
+# An amount on a sweep would be silently ignored while looking authoritative.
+check("sweep: a sweep carrying 'amt' is REJECTED, not silently ignored",
+      _sweep_rejected({"src": "A", "src_index": 4, "dst": "B", "sweep": True,
+                       "amt": "1.0"}))
+check("sweep: a sweep with 'destinations' is rejected (it has ONE destination)",
+      _sweep_rejected({"src": "A", "src_index": 4, "dst": "B", "sweep": True,
+                       "destinations": [{"address": "C", "amount": "1"}]}))
+check("sweep: a sweep with no dst is rejected",
+      _sweep_rejected({"src": "A", "src_index": 4, "sweep": True}))
+check("sweep: a NON-sweep still requires dst+amt (the old rule is intact)",
+      _sweep_rejected({"src": "A", "src_index": 4, "dst": "B"}))
+
+# THE TAMPER CASE. Flipping `sweep` turns a fixed-amount hop into "send
+# everything" from the same src_index to the same dst. If the fingerprint did
+# not cover it, that manifest would still verify and the offline signer would
+# authorise a completely different spend.
+_fixed = {"src": "A", "src_index": 4, "dst": "B", "amt": "1.0", "delay": 5}
+_swept = {"src": "A", "src_index": 4, "dst": "B", "sweep": True, "delay": 5}
+check("sweep: flipping 'sweep' CHANGES the plan fingerprint (tamper detected)",
+      airgap._compute_plan_fingerprint([_fixed])
+      != airgap._compute_plan_fingerprint([_swept]))
+check("sweep: the fingerprint is still deterministic for a sweep",
+      airgap._compute_plan_fingerprint([_swept])
+      == airgap._compute_plan_fingerprint([_swept]))
+check("sweep: two sweeps to DIFFERENT destinations differ",
+      airgap._compute_plan_fingerprint([_swept])
+      != airgap._compute_plan_fingerprint(
+          [{"src": "A", "src_index": 4, "dst": "Z", "sweep": True, "delay": 5}]))
+
+# phase_create must actually call sweep_all, not transfer_split, for a sweep.
+_ag_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
+check("sweep: phase_create calls sweep_all for a sweep entry",
+      'raw_request("sweep_all"' in _ag_src)
+check("sweep: sweep_all is called with no amount (it sends the balance)",
+      "sweep_all" in _ag_src and '"address": tx["dst"]' in _ag_src)
+
+# build_dag_plan must emit sweeps, and must NOT carry an amount on them.
+_hops = ghost.build_dag_plan(
+    _A(dag_mixing=True), Decimal("0.0024"), ["s1", "s2"],
+    {"s1": Decimal("5"), "s2": Decimal("5")},
+    {"s1": ["t1"], "s2": ["t2"]}, ["t1", "t2"],
+    {"s1": 11, "s2": 12, "t1": 13, "t2": 14}, __import__("secrets"))
+check("sweep: the DAG round plans one hop per fundable source", len(_hops) == 2)
+check("sweep: every DAG hop is a sweep", all(h.get("sweep") is True for h in _hops))
+check("sweep: no DAG hop carries an amount", all("amt" not in h for h in _hops))
+check("sweep: each hop still names its own source index",
+      sorted(h["src_index"] for h in _hops) == [11, 12])
+check("sweep: a hop never targets its own source",
+      all(h["dst"] != h["src"] for h in _hops))
+# Every planned hop must survive the validator the signer will run on it.
+try:
+    airgap._validate_plan(_hops); _hops_ok = True
+except SystemExit:
+    _hops_ok = False
+check("sweep: the shipped DAG plan passes the shipped signer's validator",
+      _hops_ok)
+# Dust sources are still filtered out rather than planned and failing later.
+_dust = ghost.build_dag_plan(
+    _A(dag_mixing=True), Decimal("0.0024"), ["s1"],
+    {"s1": Decimal("0.00001")}, {"s1": ["t1"]}, ["t1"],
+    {"s1": 11, "t1": 12}, __import__("secrets"))
+check("sweep: a source too small to cover its own fee is not planned",
+      _dust == [])
+check("sweep: DAG mixing off plans nothing",
+      ghost.build_dag_plan(_A(dag_mixing=False), Decimal("0.0024"), ["s1"],
+                           {"s1": Decimal("5")}, {"s1": ["t1"]}, ["t1"],
+                           {"s1": 11, "t1": 12}, __import__("secrets")) == [])
+
+
+# ---------------------------------------------------------------------------
 # WHICH ACCOUNT THE MIX RUNS IN decides where every leftover comes to rest.
 #
 # Verified against real monerod 0.18 (tests/real_fanout_change_testnet.py):
