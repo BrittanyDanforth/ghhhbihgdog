@@ -35,13 +35,6 @@ python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
-python3 tests/track_origin_attack.py # ORIGIN TRACE: name1 (sender PRIMARY)
-                                     #   and name2 (receiver PRIMARY). Drives
-                                     #   the shipped planners, then tries every
-                                     #   public heuristic to name them. LEGACY
-                                     #   graphs (change on PRIMARY) reveal both;
-                                     #   CURRENT (rotated account, carriers,
-                                     #   sweep hops, change-sweep) must not.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
@@ -64,6 +57,11 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
                                           #   1->N fan-out with UNEQUAL amounts and
                                           #   confirms each subaddress got its exact
                                           #   planned amount on-chain
+python3 tests/real_spend_account_testnet.py # SEND spends from the ROTATED account:
+                                          #   proves the mix account owns ENTRY, that
+                                          #   account 0 at that index is a DIFFERENT
+                                          #   address, and by conservation of value
+                                          #   that nothing reaches the wallet PRIMARY
 python3 tests/real_hop_sweep_testnet.py  # DAG hops are SWEEPS: drives the SHIPPED
                                           #   phase_create/phase_sign on a view-only
                                           #   wallet and proves a cold-signed hop

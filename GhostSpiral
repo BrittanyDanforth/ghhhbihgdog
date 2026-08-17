@@ -1130,23 +1130,50 @@ def resolve_mix_account(args, rpc_primary, receive_mode: bool,
                 f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
                 f"    wallet's primary address, and every leftover in this run would\n"
                 f"    come to rest there — on that address, on every run.\n"
-                f"                Check monero-wallet-rpc has a writable open wallet, then re-run.")
+                f"    Check monero-wallet-rpc has a writable open wallet, then re-run.")
     return sub_account
 
 
-def resolve_spend_account(mix_account: int) -> int:
-    """Account that owns the mix spends and therefore receives every leftover.
+def verify_spend_source(rpc_primary, account: int, index: int,
+                        expect_addr: str) -> None:
+    """Confirm the wallet really holds `expect_addr` at (account, index).
 
-    This MUST be the account `resolve_mix_account` just picked. Send mode used
-    to hard-code 0 here after creating a fresh mix account for the
-    subaddresses: ThorChain still paid the fresh ENTRY, but balance polling,
-    peel carriers, the plan's account_index, and the change-sweep source all
-    used account 0 / subaddress 0 -- the wallet PRIMARY. The rotation was
-    theatre. An origin-tracker that labels that address name1 (sender) or
-    name2 (receiver) recovers it on every send graph the moment this function
-    is bypassed.
+    Every spend in the run names this account and this index. If they point
+    somewhere else the pipeline does not crash -- it plans against a different
+    subaddress's balance and moves money out of a different account, with the
+    change coming to rest wherever that account's subaddress 0 happens to be.
+    That is precisely how the spend account silently stayed 0 after the mix
+    account was rotated: nothing failed, and the wallet's primary address quietly
+    became the run's change sink again.
+
+    So the pair is verified against the wallet itself before anything is
+    planned, the same way create_receive_wallet verifies the address it hands
+    out. Fail closed: an unverifiable source is not a source to spend from.
     """
-    return int(mix_account)
+    try:
+        res = rpc_primary.raw_request("get_address", {
+            "account_index": int(account), "address_index": [int(index)]})
+        entries = (res or {}).get("addresses") or []
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("stage4", "spend_source_readback_failed")
+        sys.exit(
+            f"[!] Could not read the spend source back from the wallet "
+            f"({str(e)[:60]}).\n"
+            f"    Refusing to spend from an account/index pair the wallet has not\n"
+            f"    confirmed.")
+    match = [e for e in entries if e.get("address_index") == int(index)]
+    if not match or match[0].get("address") != expect_addr:
+        got = match[0].get("address") if match else None
+        integrity_log("stage4", "SPEND_SOURCE_MISMATCH")
+        sys.exit(
+            f"[!] SPEND SOURCE MISMATCH. The plan plans to spend from account "
+            f"{account} / subaddress {index},\n"
+            f"    but the wallet reports that as {scrub_address(got)}\n"
+            f"    while ENTRY is         {scrub_address(expect_addr)}.\n"
+            f"    Spending would move funds from the wrong account, and this run's\n"
+            f"    change would come to rest on THAT account's subaddress 0.\n"
+            f"    Refusing.")
+    integrity_log("stage4", f"spend_source_ok:acct={account}:idx={index}")
 
 
 def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
@@ -1391,12 +1418,43 @@ def main():
     # Stage 4 - Balance, amounts, plan
     ###########################################################################
 
-    # The spend/change account is the mix account. Send mode used to hard-code
-    # 0 here, which put every leftover -- and the change-sweep source -- on
-    # the wallet PRIMARY after resolve_mix_account had already created a
-    # fresh account for the mix subaddresses.
-    bal_account = resolve_spend_account(sub_account)
+    # THE SPEND ACCOUNT IS THE MIX ACCOUNT. Not "0 unless receiving".
+    #
+    # This line used to read `receive_account_index if receive_mode else 0`,
+    # written before the mix account was rotated and never revisited when it
+    # was. resolve_mix_account creates a fresh account and create_subs puts
+    # ENTRY and every mix subaddress in it -- and then send mode came back
+    # here and hard-coded 0, which is used for:
+    #   * the balance poll (xmr_balance),
+    #   * the peel carriers,
+    #   * the PLAN's account_index, i.e. which account every spend comes from,
+    #   * the change-sweep destination, and
+    #   * change_target -- so change went to account 0 / subaddress 0.
+    #
+    # Two failures, and the second is the one that matters.
+    #
+    # FUNCTIONAL: the balance was polled from account 0 at ENTRY's index. That
+    # is a DIFFERENT subaddress -- account 0's subaddress at that number -- so
+    # send mode sized its plan from an unrelated balance, or from nothing.
+    #
+    # OPSEC: every spend named account 0, so the run's change came to rest on
+    # account 0 / subaddress 0 -- the wallet PRIMARY -- and the change sweep
+    # then SPENT it. The account rotation was theatre in send mode: the fresh
+    # account held the subaddresses while the wallet's identity address did all
+    # the work. An analyst labelling that address recovers it from every send
+    # graph, which is exactly what rotation was added to prevent.
+    #
+    # In receive mode resolve_mix_account already returns the bundle's account,
+    # so one assignment is correct for both paths.
+    bal_account = sub_account
     entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
+
+    # And PROVE it, rather than trusting the assignment. A one-line mistake
+    # here is invisible: the pipeline runs, the plan looks sane, and the only
+    # symptom is that the money moves from the wrong account. The wallet is
+    # asked to resolve (account, index) back to an address and it must be
+    # ENTRY.
+    verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)
 
     total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
 

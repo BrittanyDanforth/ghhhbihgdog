@@ -291,9 +291,36 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
     rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
 
-    # Account index from the plan metadata (set by GhostSpiral based on
-    # receive wallet). Defaults to 0 for sender mode.
-    acct_idx = meta.get("account_index", 0)
+    # WHICH ACCOUNT EVERY SPEND COMES FROM. Required, never defaulted.
+    #
+    # This read `meta.get("account_index", 0)`, with a comment saying it
+    # "defaults to 0 for sender mode" -- true before the mix account was
+    # rotated, stale after. It is also the identical pattern this file already
+    # refuses for src_index a few hundred lines below, and for the same reason:
+    # a silent .get(..., 0) turns a missing key into a spend from account 0,
+    # whose subaddress 0 is the wallet's PRIMARY address. Nothing fails; the
+    # money simply moves from the wrong account and the change comes to rest on
+    # the operator's identity address.
+    #
+    # GhostSpiral always writes it. A plan without it is an old plan, a
+    # truncated write or a hand-authored one -- none of which is a reason to
+    # guess, and guessing wrong is unrecoverable.
+    acct_idx = meta.get("account_index")
+    if acct_idx is None:
+        integrity_log("signer", "missing_account_index")
+        sys.exit(
+            "[!] The plan carries no meta.account_index, so which account to "
+            "spend from is unknown.\n"
+            "    Refusing to assume 0: account 0's subaddress 0 is the wallet's "
+            "PRIMARY address,\n"
+            "    and spending from the wrong account would move funds that are "
+            "not part of this\n"
+            "    plan and leave its change on your identity address. Re-run "
+            "--phase create.")
+    if isinstance(acct_idx, bool) or not isinstance(acct_idx, int) or acct_idx < 0:
+        integrity_log("signer", "bad_account_index")
+        sys.exit(f"[!] meta.account_index must be a non-negative int, got "
+                 f"{acct_idx!r}.")
     integrity_log("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)

@@ -805,12 +805,41 @@ def main():
               any(r[0].party == NAME2 and r[0].usable == a for r in evaluated)
               for a in AMOUNT_LADDER))
 
-    # The wiring fix itself: resolve_spend_account must not be a no-op that
-    # still returns 0 for a non-zero mix account.
-    check("resolve_spend_account(7) is 7 (the mix account, not PRIMARY)",
-          ghost.resolve_spend_account(7) == 7)
-    check("resolve_spend_account does not collapse every account to 0",
-          ghost.resolve_spend_account(3) == 3)
+    # The updated tree: spend account IS the mix account, and the wallet
+    # must confirm (account, index) is ENTRY before anything is planned.
+    # Hard-coding 0 here is how name1 (sender PRIMARY) reappears.
+    _gs_src = open(os.path.join(REPO, "GhostSpiral")).read()
+    check("spend account is the mix account (bal_account = sub_account)",
+          "bal_account = sub_account" in _gs_src)
+    check("SEND no longer hard-codes account 0 after rotating the mix",
+          "bal_account = receive_account_index if receive_mode else 0" not in _gs_src)
+    check("stage 4 verifies the spend source before the balance poll",
+          "verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)" in _gs_src)
+
+    class _RpcAddr:
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def raw_request(self, method, params):
+            a, i = params["account_index"], params["address_index"][0]
+            addr = self.mapping.get((a, i))
+            return {"addresses": ([{"address_index": i, "address": addr}]
+                                  if addr else [])}
+
+    _ok = _RpcAddr({(7, 3): "ENTRY_ADDR", (0, 3): "PRIMARY_LOOKALIKE"})
+    try:
+        ghost.verify_spend_source(_ok, 7, 3, "ENTRY_ADDR")
+        _vs_ok = True
+    except SystemExit:
+        _vs_ok = False
+    check("verify_spend_source accepts the rotated mix account for ENTRY", _vs_ok)
+    try:
+        ghost.verify_spend_source(_ok, 0, 3, "ENTRY_ADDR")
+        _vs_bad = True
+    except SystemExit:
+        _vs_bad = False
+    check("verify_spend_source refuses account 0 at ENTRY's index (name1 leak)",
+          not _vs_bad)
 
     _print_combo(rng)
     _print_two_receives(rng)
