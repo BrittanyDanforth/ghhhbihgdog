@@ -144,12 +144,13 @@ def run_legacy_send_peel(rng, n=6, dag=False, usable=Decimal("12"),
     amts = ghost.compute_fanout_amounts(usable, n, fee, dag, rng)
     if not amts:
         return None
-    plan = ghost.build_peel_plan(entry_index=0, change_index=0,
-                                 dests=dests, amounts=amts)
+    # Amounts come from the shipped planner. The HUB shape does not: current
+    # build_peel_plan refuses to emit it (no carriers → ValueError). This is
+    # the pre-rotation design an analyst names name1 from.
     remain = usable
-    for p, amt in zip(plan, amts):
+    for dst, amt in zip(dests, amts):
         remain = remain - amt
-        g.add_tx([primary], [(p["dst"], amt), (primary, remain)], "peel")
+        g.add_tx([primary], [(dst, amt), (primary, remain)], "peel")
     _maybe_dag(g, dests, amts, dag, fee, change_sink=primary, sweep=False)
     return g
 
@@ -180,13 +181,13 @@ def run_legacy_recv_peel(rng, n=6, dag=False, usable=Decimal("9"),
     amts = ghost.compute_fanout_amounts(usable, n, fee, dag, rng)
     if not amts:
         return None
-    plan = ghost.build_peel_plan(entry_index=7, change_index=0,
-                                 dests=dests, amounts=amts)
+    # Peel 0 spends the one-shot receive sub; every later peel spends name2.
+    # Same reason as send: the shipped planner will not emit this hub.
     remain = usable
-    for p, amt in zip(plan, amts):
-        src = entry if p["src_index"] == 7 else primary
+    for i, (dst, amt) in enumerate(zip(dests, amts)):
+        src = entry if i == 0 else primary
         remain = remain - amt
-        g.add_tx([src], [(p["dst"], amt), (primary, remain)], "peel")
+        g.add_tx([src], [(dst, amt), (primary, remain)], "peel")
     _maybe_dag(g, dests, amts, dag, fee, change_sink=primary, sweep=False)
     return g
 
