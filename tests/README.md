@@ -35,6 +35,13 @@ python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
+python3 tests/track_origin_attack.py # ORIGIN TRACE: name1 (sender PRIMARY)
+                                     #   and name2 (receiver PRIMARY). Drives
+                                     #   the shipped planners, then tries every
+                                     #   public heuristic to name them. LEGACY
+                                     #   graphs (change on PRIMARY) reveal both;
+                                     #   CURRENT (rotated account, carriers,
+                                     #   sweep hops, change-sweep) must not.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)

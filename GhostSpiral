@@ -1130,8 +1130,23 @@ def resolve_mix_account(args, rpc_primary, receive_mode: bool,
                 f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
                 f"    wallet's primary address, and every leftover in this run would\n"
                 f"    come to rest there — on that address, on every run.\n"
-                f"    Check monero-wallet-rpc has a writable open wallet, then re-run.")
+                f"                Check monero-wallet-rpc has a writable open wallet, then re-run.")
     return sub_account
+
+
+def resolve_spend_account(mix_account: int) -> int:
+    """Account that owns the mix spends and therefore receives every leftover.
+
+    This MUST be the account `resolve_mix_account` just picked. Send mode used
+    to hard-code 0 here after creating a fresh mix account for the
+    subaddresses: ThorChain still paid the fresh ENTRY, but balance polling,
+    peel carriers, the plan's account_index, and the change-sweep source all
+    used account 0 / subaddress 0 -- the wallet PRIMARY. The rotation was
+    theatre. An origin-tracker that labels that address name1 (sender) or
+    name2 (receiver) recovers it on every send graph the moment this function
+    is bypassed.
+    """
+    return int(mix_account)
 
 
 def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
@@ -1376,7 +1391,11 @@ def main():
     # Stage 4 - Balance, amounts, plan
     ###########################################################################
 
-    bal_account = receive_account_index if receive_mode else 0
+    # The spend/change account is the mix account. Send mode used to hard-code
+    # 0 here, which put every leftover -- and the change-sweep source -- on
+    # the wallet PRIMARY after resolve_mix_account had already created a
+    # fresh account for the mix subaddresses.
+    bal_account = resolve_spend_account(sub_account)
     entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
 
     total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)

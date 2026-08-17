@@ -745,6 +745,19 @@ check("mix account: the bundle records the real account, not a hard-coded 0",
 check("mix account: an operator forced into account 0 is warned",
       "wallet's PRIMARY address" in _crw_src)
 
+# The rotation is worthless if the spend/change account is then hard-coded
+# back to 0. That is how an origin tracker names name1 (sender PRIMARY) on
+# every send graph: leftover + change-sweep both hit account 0 / sub 0.
+check("spend account: SEND uses the rotated mix account, not hard-coded 0",
+      ghost.resolve_spend_account(7) == 7)
+check("spend account: RECEIVE uses the bundle account too",
+      ghost.resolve_spend_account(3) == 3)
+_gs_src = open(os.path.join(REPO, "GhostSpiral")).read()
+check("spend account: main() assigns bal_account from the mix account",
+      "bal_account = resolve_spend_account(sub_account)" in _gs_src)
+check("spend account: SEND no longer hard-codes account 0 after rotating",
+      "bal_account = receive_account_index if receive_mode else 0" not in _gs_src)
+
 
 # ---------------------------------------------------------------------------
 # build_peel_plan: ROTATING CARRIERS.
