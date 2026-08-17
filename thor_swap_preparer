@@ -38,6 +38,7 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
     load_receive_bundle, memo_binds_destination,
+    btc_per_xmr_oracle, quote_deviation,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -47,39 +48,38 @@ BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 _XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
 
 
-def _btc_per_xmr(proxy: Dict[str, str] | None) -> Decimal | None:
-    """Fetch current BTC/XMR rate from CoinGecko, or None if the oracle failed.
+def _btc_per_xmr(proxy):
+    """Shared oracle (gs_common.btc_per_xmr_oracle), with this tool's warning.
 
-    The old version silently returned a hard-coded Decimal("0.003") on any
-    failure -- CoinGecko is frequently unreachable over Tor -- and the CALLER
-    then compared each real ThorChain quote against that fabricated baseline in
-    the slippage check. A quote that deviates 30% from a rate we invented is
-    not a slippage warning about the quote; it is nonsense. Fail closed here
-    (return None) and let the caller loudly disable the slippage check for that
-    chunk, the way it already handles an unreadable expected_xmr.
+    Was a private copy here; GhostSpiral's stage 2 then had no oracle at all,
+    so one swap path cross-checked its quotes and the other accepted anything.
+    Both use the shared helper now. It still fails CLOSED (None) rather than
+    returning an invented rate, and the caller disables the check out loud.
     """
-    try:
-        p = safe_get(CG_PRICE, proxy)
-        rate = Decimal(str(p["monero"]["btc"]))
-        if rate <= 0:
-            raise ValueError("Non-positive rate")
-        integrity_log("thor", "price_oracle_ok")
-        return rate
-    except Exception as e:
-        integrity_log("thor", f"price_oracle_fail:{str(e)[:40]}")
+    # getter=safe_get resolves from THIS module at call time, so the
+    # suites that stub thor's safe_get still intercept the fetch.
+    rate = btc_per_xmr_oracle(proxy, getter=safe_get)
+    if rate is None:
         print("  [!] Price oracle unreachable — the slippage cross-check will be "
               "DISABLED for this batch. Verify each quote manually.")
-        return None
+    return rate
+
+
+#: The memo check now lives in gs_common so GhostSpiral's own swap stage
+#: enforces the identical rule -- it previously had no memo check at all and
+#: would print deposit instructions for a memo naming someone else's address.
+#: Kept as a module-level name because it is part of this file's tested surface.
+_memo_binds_destination = memo_binds_destination
 
 
 def _dest_from_bundle(path: str) -> str:
     """Read the XMR destination out of a gs_receive_wallet_v1 bundle.
 
     Validated strictly rather than trusted: this address becomes the swap memo,
-    and a swap delivering to the wrong address cannot be undone. A file of the
-    wrong schema is refused outright instead of being probed for an "address"
-    key, so an unrelated JSON that happens to have one can never become the
-    destination of somebody's money.
+    and a swap delivering to the wrong address cannot be undone. The shared
+    loader refuses a file of the wrong schema outright instead of probing it
+    for an "address" key, so an unrelated JSON that happens to have one can
+    never become the destination of somebody's money.
     """
     try:
         d = load_receive_bundle(path)
@@ -105,13 +105,6 @@ def _validate_xmr_addr(addr: str) -> None:
         XMRAddress(addr)
     except Exception:
         sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
-
-
-#: The memo check now lives in gs_common so GhostSpiral's own swap stage
-#: enforces the identical rule -- it previously had no memo check at all and
-#: would print deposit instructions for a memo naming someone else's address.
-#: Kept as a module-level name because it is part of this file's tested surface.
-_memo_binds_destination = memo_binds_destination
 
 
 def main():
@@ -288,9 +281,9 @@ def main():
                   f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
 
         # Slippage check
-        oracle_xmr = (amt / btc_per_xmr) if btc_per_xmr else Decimal("0")
-        if oracle_xmr > 0:
-            deviation = abs(expected_xmr - oracle_xmr) / oracle_xmr
+        deviation = quote_deviation(expected_xmr, amt, btc_per_xmr)
+        if deviation is not None:
+            oracle_xmr = amt / btc_per_xmr
             if deviation > args.max_slippage:
                 integrity_log("thor", f"slippage_ABORT_{i}:dev={deviation:.4f}")
                 sys.exit(

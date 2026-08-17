@@ -31,12 +31,13 @@ from typing import List
 
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
-    safe_post, connect_rpc, daemon_fee_estimate, require_resources,
+    safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination,
+    btc_per_xmr_oracle, quote_deviation,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -516,6 +517,11 @@ def main():
                           "PREFER GS_WALLET_PASSWORD=... in the environment: an "
                           "argv password is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444).")
+    cli.add_argument("--max-slippage", type=Decimal, default=Decimal("0.25"),
+                     help="refuse a swap quote deviating more than this fraction from "
+                          "an independent price oracle (default 0.25 = 25%%). 5%% still "
+                          "only warns; this is the hard stop. When the oracle is "
+                          "unreachable the cross-check is disabled and said so loudly.")
     cli.add_argument("--allow-unbound-memo", action="store_true",
                      help="proceed even when a swap quote's memo does not contain your "
                           "XMR destination. ONLY for a genuine aggregator format change "
@@ -723,6 +729,13 @@ def main():
         Returns list of deposit instructions for the operator.
         The operator must MANUALLY send BTC to each deposit address.
         """
+        # One oracle fetch for the batch. None = unreachable, which DISABLES
+        # the cross-check loudly rather than measuring against an invented rate.
+        btc_per_xmr = btc_per_xmr_oracle(proxy, getter=safe_get)
+        if btc_per_xmr is None:
+            print("  [!] Price oracle unreachable — the slippage cross-check is "
+                  "DISABLED for this batch. Verify each quote by hand.")
+
         deposits = []
         for i, amt in enumerate(chunks):
             if shutdown_requested():
@@ -785,9 +798,37 @@ def main():
 
             try:
                 expected_dec = Decimal(str(expected_output))
-            except Exception:
-                integrity_log("stage2", f"bad_expected_output_{i}")
+            except Exception:                                 # noqa: BLE001
                 expected_dec = Decimal(0)
+            if expected_dec <= 0:
+                # A silent 0 here defeats the slippage cross-check below AND
+                # prints "Expected: ~0 XMR" in the deposit instructions. Say so;
+                # it usually means the route field name changed.
+                integrity_log("stage2", f"expected_output_unreadable_{i}")
+                print(f"  [!] Chunk {i}: could not read the expected XMR from the "
+                      f"quote (the route field name may have changed) — the "
+                      f"slippage check is DISABLED for it.")
+
+            # Same cross-check thor_swap_preparer applies, from the same shared
+            # helper: a quote wildly off the market rate is either a bad route
+            # or a stale oracle, and neither should be handed to a sender
+            # unexamined. Deviation is a ratio, never the amounts themselves,
+            # so nothing linkable reaches the integrity chain.
+            dev = quote_deviation(expected_dec, amt, btc_per_xmr)
+            if dev is not None:
+                if dev > args.max_slippage:
+                    integrity_log("stage2", f"slippage_ABORT_{i}:dev={dev:.4f}")
+                    sys.exit(
+                        f"[!] Chunk {i}: the quote is {dev * 100:.1f}% away from the\n"
+                        f"    price oracle, past the --max-slippage limit of\n"
+                        f"    {args.max_slippage * 100:.0f}%. That is either a bad route\n"
+                        f"    or a stale oracle — either way, not something to hand a\n"
+                        f"    sender unexamined. Raise --max-slippage only after\n"
+                        f"    checking the rate yourself."
+                    )
+                if dev > Decimal("0.05"):
+                    integrity_log("stage2", f"slippage_warn_{i}:dev={dev:.4f}")
+                    print(f"  [!] Chunk {i}: quote deviates {dev * 100:.1f}% from the oracle.")
 
             deposit_info = {
                 "chunk": i,

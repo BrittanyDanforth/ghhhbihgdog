@@ -698,6 +698,67 @@ def shutdown_requested() -> bool:
     return _SHUTDOWN_REQUESTED
 
 # ---------------------------------------------------------------------------
+#  Swap quote sanity: is this rate anywhere near reality?
+# ---------------------------------------------------------------------------
+CG_PRICE_URL = ("https://api.coingecko.com/api/v3/simple/price"
+                "?ids=monero,bitcoin&vs_currencies=btc")
+
+
+def btc_per_xmr_oracle(proxies: Optional[Dict[str, str]] = None, getter=None):
+    """Current BTC/XMR rate from an independent oracle, or None if unreachable.
+
+    Returns None rather than a hard-coded rate ON PURPOSE. An earlier build
+    returned Decimal("0.003") on any failure -- CoinGecko is frequently
+    unreachable over Tor -- and the caller then measured real quotes against
+    that invented baseline. A quote deviating 30% from a number we made up is
+    not a slippage warning; it is noise that either hides a bad quote or
+    condemns a good one. None means "no cross-check available", and callers
+    must say so out loud rather than pretend the check ran.
+
+    `getter` lets a caller pass its OWN safe_get. That keeps each tool's
+    network call on the seam its tests already stub -- moving the fetch in here
+    unconditionally would have made this reach the real network from inside
+    suites that believed they had stubbed it out.
+    """
+    fetch = getter or safe_get
+    try:
+        p = fetch(CG_PRICE_URL, proxies)
+        rate = Decimal(str(p["monero"]["btc"]))
+        if rate <= 0:
+            raise ValueError("non-positive rate")
+        integrity_log("swap", "price_oracle_ok")
+        return rate
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("swap", f"price_oracle_fail:{str(e)[:40]}")
+        return None
+
+
+def quote_deviation(expected_out, amount_in, rate_in_per_out):
+    """How far a swap quote sits from the oracle, as a fraction (0.10 = 10%).
+
+    Returns None when the comparison cannot be made honestly -- no oracle, a
+    non-positive rate, or an unreadable quote -- so a caller can never mistake
+    "could not check" for "checked and fine". Deliberately pure: no network, no
+    logging of the values themselves (a quote amount is among the most
+    linkable numbers in the pipeline).
+    """
+    if rate_in_per_out is None:
+        return None
+    try:
+        exp = Decimal(str(expected_out))
+        amt = Decimal(str(amount_in))
+        rate = Decimal(str(rate_in_per_out))
+    except Exception:                                        # noqa: BLE001
+        return None
+    if rate <= 0 or amt <= 0 or exp <= 0:
+        return None
+    oracle_out = amt / rate
+    if oracle_out <= 0:
+        return None
+    return abs(exp - oracle_out) / oracle_out
+
+
+# ---------------------------------------------------------------------------
 #  Swap-memo binding: the ONLY thing tying a BTC deposit to your XMR address
 # ---------------------------------------------------------------------------
 
