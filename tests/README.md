@@ -28,6 +28,10 @@ python3 tests/test_receive_watch.py # RECEIVE: the payment watcher — right
                                     #   subaddress, confirm/unlock gate, swap
                                     #   shortfall vs still-confirming, and that
                                     #   it asks NO block explorer anything
+python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
+                                    #   asserted against the real source: loopback
+                                    #   bind, fail-closed Tor, 0600 slips, the
+                                    #   view-only path never spends, no Telegram
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
