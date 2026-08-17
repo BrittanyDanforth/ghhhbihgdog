@@ -57,6 +57,11 @@ python3 tests/real_send_testnet.py       # SHIPPED jittered fan-out send: cold-s
                                           #   1->N fan-out with UNEQUAL amounts and
                                           #   confirms each subaddress got its exact
                                           #   planned amount on-chain
+python3 tests/real_spend_account_testnet.py # SEND spends from the ROTATED account:
+                                          #   proves the mix account owns ENTRY, that
+                                          #   account 0 at that index is a DIFFERENT
+                                          #   address, and by conservation of value
+                                          #   that nothing reaches the wallet PRIMARY
 python3 tests/real_hop_sweep_testnet.py  # DAG hops are SWEEPS: drives the SHIPPED
                                           #   phase_create/phase_sign on a view-only
                                           #   wallet and proves a cold-signed hop

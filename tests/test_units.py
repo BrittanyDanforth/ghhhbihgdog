@@ -538,6 +538,80 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
+# THE SPEND ACCOUNT MUST BE THE MIX ACCOUNT.
+#
+# resolve_mix_account creates a fresh account and create_subs puts ENTRY and
+# every mix subaddress in it -- and then stage 4 said
+# `bal_account = receive_account_index if receive_mode else 0`, hard-coding 0
+# for send. That one variable drives the balance poll, the peel carriers, the
+# PLAN's account_index, the change-sweep destination, and change_target.
+#
+# So in send mode the rotation was theatre: the fresh account held the
+# subaddresses while account 0 / subaddress 0 -- the wallet PRIMARY -- did
+# every spend and received all the change, which the sweep then SPENT. It was
+# also functionally wrong: the balance was polled from account 0 at ENTRY's
+# index, a different subaddress entirely.
+#
+# Nothing failed. That is why it needs a test AND a runtime guard.
+# ---------------------------------------------------------------------------
+_gs_src3 = open(os.path.join(REPO, "GhostSpiral")).read()
+check("spend account: send mode no longer hard-codes account 0",
+      "bal_account = receive_account_index if receive_mode else 0" not in _gs_src3)
+check("spend account: the spend account IS the mix account",
+      "bal_account = sub_account" in _gs_src3)
+# The mix subaddresses and the spends must name the SAME account, or the plan
+# spends from one place and the confirmation-wait watches another.
+check("spend account: create_subs and the spend account agree",
+      "acct_idx=sub_account" in _gs_src3
+      and "fanout_targets_indexed = [(sub_account" in _gs_src3)
+
+# The runtime guard, driven directly.
+class _RpcAddr:
+    def __init__(self, mapping): self.mapping = mapping
+    def raw_request(self, method, params):
+        a, i = params["account_index"], params["address_index"][0]
+        addr = self.mapping.get((a, i))
+        return {"addresses": ([{"address_index": i, "address": addr}] if addr else [])}
+
+
+_ok_rpc = _RpcAddr({(7, 3): "ENTRY_ADDR", (0, 3): "SOMEONE_ELSES_SUBADDR"})
+try:
+    ghost.verify_spend_source(_ok_rpc, 7, 3, "ENTRY_ADDR"); _vs_ok = True
+except SystemExit:
+    _vs_ok = False
+check("spend guard: the correct (account, index) for ENTRY is accepted", _vs_ok)
+
+
+def _vs_rejects(acct, idx, expect, rpc=_ok_rpc):
+    try:
+        ghost.verify_spend_source(rpc, acct, idx, expect); return False
+    except SystemExit:
+        return True
+
+
+# THE EXACT BUG: the mix is in account 7, the spend says account 0. Account 0
+# has a subaddress at that index too -- it is simply the wrong one.
+check("spend guard: account 0 at ENTRY's index is REJECTED (the shipped bug)",
+      _vs_rejects(0, 3, "ENTRY_ADDR"))
+check("spend guard: an index the account does not have is rejected",
+      _vs_rejects(7, 99, "ENTRY_ADDR"))
+
+
+class _BoomRpc:
+    def raw_request(self, *a, **k): raise RuntimeError("rpc down")
+
+
+check("spend guard: an unverifiable source fails CLOSED, never assumed",
+      _vs_rejects(7, 3, "ENTRY_ADDR", rpc=_BoomRpc()))
+check("spend guard: stage 4 actually calls it before planning",
+      "verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)" in _gs_src3)
+# It must run BEFORE the balance is read, or a wrong account still sizes a plan.
+check("spend guard: it runs before the balance poll",
+      _gs_src3.index("verify_spend_source(rpc_primary, bal_account")
+      < _gs_src3.index("total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account"))
+
+
+# ---------------------------------------------------------------------------
 # THE CHANGE SWEEP. A distribution cannot allocate its input exactly, so a
 # remainder always comes back as change on the mix account's subaddress 0.
 # Rotating the account moved that off the wallet's primary address, and
