@@ -412,31 +412,21 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     print(f"  [+] Unsigned TXs ready in {outdir}/ — run phase sign to continue.")
 
 
-def phase_sign(args, plan: List[dict]):
-    """PHASE 2: Sign unsigned TXs on offline machine with wallet-cli.
+def _load_signing_manifest(outdir, plan: list) -> list:
+    """Load the unsigned manifest and prove it still describes THIS plan.
 
-    Uses monero-wallet-cli's sign_transfer command which reads unsigned
-    TX sets and produces signed TX sets using the spend key.
+    The fingerprint check is the whole point of the phase split. The plan
+    travels to the offline machine on removable media, and the signer is
+    the last place anything is checked before a spend key is applied to it.
+    If the manifest and the plan disagree, something edited one of them
+    between phases -- a corrupted copy, the wrong batch, or an actual
+    tamper -- and signing would authorise transactions the operator never
+    planned. Refuse rather than reconcile: there is no safe way to guess
+    which side is right.
+
+    Returns the validated entries. Pulled out of phase_sign so this check
+    can be driven directly instead of only through a full signing run.
     """
-    outdir = Path(args.outdir)
-    if not outdir.is_dir():
-        sys.exit(f"[!] Output dir not found: {outdir}")
-
-    # Narrow an outdir we did NOT create. phase_create makes it 0700, but this
-    # phase runs on the offline machine and the operator may well have made the
-    # directory by hand (`mkdir tx_staging` -> 0755). We are about to write
-    # signed transactions into it, and a world-listable directory reveals how
-    # many TXs were signed and when even though the files are 0600.
-    try:
-        _dmode = outdir.stat().st_mode & 0o777
-        if _dmode & 0o077:
-            os.chmod(outdir, 0o700)
-            print(f"  [*] Tightened staging dir {outdir} from {oct(_dmode)} to 0o700")
-            integrity_log("signer", f"tightened_outdir:{oct(_dmode)}")
-    except OSError:
-        pass
-
-    # Load unsigned manifest
     manifest_path = outdir / "unsigned_manifest.json"
     if not manifest_path.exists():
         sys.exit("[!] unsigned_manifest.json not found in output dir")
@@ -476,22 +466,28 @@ def phase_sign(args, plan: List[dict]):
     if not entries:
         sys.exit("[!] No unsigned TX entries in manifest")
     _validate_manifest_entries(entries, outdir)
+    return entries
 
-    wallet_file = args.wallet_file
-    if not wallet_file or not Path(wallet_file).exists():
-        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
 
-    # Create signed output directory
-    signed_dir = outdir / "signed"
-    secure_mkdir(signed_dir)      # owner-only; see phase_create's note
+def _import_view_outputs(outdir, wallet_file: str, args) -> None:
+    """Teach the OFFLINE wallet about outputs it has never seen on-chain.
 
-    # ---- Teach the OFFLINE wallet about outputs created by earlier rounds ---
-    # See OUTPUTS_EXPORT_NAME. Without this, signing any round that spends an
-    # output an earlier round created (a DAG hop spending a fan-out output, a
-    # peel spending the previous peel's change) fails on real wallet-cli with
-    # "Imported outputs omit more outputs that we know of". import_outputs
-    # persists to the wallet cache, so one invocation before the signing loop
-    # covers every TX in this round.
+    This is what makes a MULTI-ROUND cold-signing pipeline work at all. The
+    offline wallet is air-gapped, so it never syncs: it knows only the
+    outputs it knew when it was created. A peeling chain or a DAG round
+    spends change created by an EARLIER round of the same run -- outputs
+    that exist on-chain and in the view-only wallet, but are invisible to
+    the signer. Without importing them, round 2 fails to sign and the
+    operator is left with funds mid-chain and no obvious cause.
+
+    The blob is written by phase_create from the view-only wallet's
+    export_outputs. It carries no spend key -- it is output metadata, not
+    secrets -- but it does describe the operator's outputs, so it is
+    handled like everything else here: RAM-backed scratch where /dev/shm
+    exists, 0600, and removed after use rather than left in /tmp.
+
+    Absent file is not an error: a single-round plan has nothing to import.
+    """
     _outs = outdir / OUTPUTS_EXPORT_NAME
     if _outs.exists():
         # RAM-backed scratch (tmpfs) so the wallet OUTPUT-SET blob -- a map of
@@ -557,6 +553,51 @@ def phase_sign(args, plan: List[dict]):
         print(f"  [*] No {OUTPUTS_EXPORT_NAME} in the staging dir. Fine for a first "
               f"round; a DAG/peel round that spends an earlier round's outputs "
               f"needs it (phase_create writes it).")
+
+
+def phase_sign(args, plan: List[dict]):
+    """PHASE 2: Sign unsigned TXs on offline machine with wallet-cli.
+
+    Uses monero-wallet-cli's sign_transfer command which reads unsigned
+    TX sets and produces signed TX sets using the spend key.
+    """
+    outdir = Path(args.outdir)
+    if not outdir.is_dir():
+        sys.exit(f"[!] Output dir not found: {outdir}")
+
+    # Narrow an outdir we did NOT create. phase_create makes it 0700, but this
+    # phase runs on the offline machine and the operator may well have made the
+    # directory by hand (`mkdir tx_staging` -> 0755). We are about to write
+    # signed transactions into it, and a world-listable directory reveals how
+    # many TXs were signed and when even though the files are 0600.
+    try:
+        _dmode = outdir.stat().st_mode & 0o777
+        if _dmode & 0o077:
+            os.chmod(outdir, 0o700)
+            print(f"  [*] Tightened staging dir {outdir} from {oct(_dmode)} to 0o700")
+            integrity_log("signer", f"tightened_outdir:{oct(_dmode)}")
+    except OSError:
+        pass
+
+    # Load unsigned manifest
+    entries = _load_signing_manifest(outdir, plan)
+
+    wallet_file = args.wallet_file
+    if not wallet_file or not Path(wallet_file).exists():
+        sys.exit(f"[!] Wallet file required for signing: {wallet_file}")
+
+    # Create signed output directory
+    signed_dir = outdir / "signed"
+    secure_mkdir(signed_dir)      # owner-only; see phase_create's note
+
+    # ---- Teach the OFFLINE wallet about outputs created by earlier rounds ---
+    # See OUTPUTS_EXPORT_NAME. Without this, signing any round that spends an
+    # output an earlier round created (a DAG hop spending a fan-out output, a
+    # peel spending the previous peel's change) fails on real wallet-cli with
+    # "Imported outputs omit more outputs that we know of". import_outputs
+    # persists to the wallet cache, so one invocation before the signing loop
+    # covers every TX in this round.
+    _import_view_outputs(outdir, wallet_file, args)
 
     signed_manifest = []
     signed_count = 0
