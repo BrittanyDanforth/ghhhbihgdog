@@ -223,6 +223,109 @@ check("fanout: extra-output count is a RANGE, not a fixed fingerprint",
       ghost.DECOY_MIN >= 1 and ghost.DECOY_MAX > ghost.DECOY_MIN)
 
 # ---------------------------------------------------------------------------
+# main() DECOMPOSITION. It was 869 lines with five closures inside it, so its
+# stages could not be called, inspected or tested except by running a whole
+# money pipeline -- which is exactly how a swap path with no memo check stayed
+# invisible. These are the extracted pieces, driven directly.
+# ---------------------------------------------------------------------------
+_cli = ghost.build_cli()
+_opts = {a.option_strings[0]: a for a in _cli._actions if a.option_strings}
+
+check("cli: build_cli returns a real parser", hasattr(_cli, "parse_args"))
+check("cli: --tor-proxy is REQUIRED (fail closed, never optional)",
+      _opts["--tor-proxy"].required is True)
+# The two entry modes are mutually exclusive AND one is mandatory: a run with
+# neither has no source of funds, a run with both is ambiguous about which.
+_groups = [g for g in _cli._mutually_exclusive_groups]
+check("cli: exactly one mutually exclusive entry-mode group exists", len(_groups) == 1)
+check("cli: the entry-mode group is required", _groups[0].required is True)
+check("cli: that group is --btc-entry vs --receive-wallet",
+      sorted(a.option_strings[0] for a in _groups[0]._group_actions)
+      == ["--btc-entry", "--receive-wallet"])
+check("cli: --max-slippage defaults to the same 0.25 as thor_swap_preparer",
+      _opts["--max-slippage"].default == Decimal("0.25"))
+# Every "allow" flag widens exposure, so each must default OFF. A preset or a
+# stray default flipping one of these on is a silent downgrade.
+for _f in ("--allow-clearnet-relay", "--allow-unbound-memo"):
+    check(f"cli: {_f} defaults OFF (widening exposure is always explicit)",
+          _opts[_f].default is False)
+check("cli: --peel and --dag-mixing both default OFF",
+      _opts["--peel"].default is False and _opts["--dag-mixing"].default is False)
+_p = _cli.parse_args(["--receive-wallet", "w.json", "--tor-proxy",
+                      "socks5h://127.0.0.1:9050"])
+check("cli: a minimal receive invocation parses", _p.receive_wallet == "w.json")
+check("cli: --fee-priority is constrained to 1-4",
+      _opts["--fee-priority"].choices == [1, 2, 3, 4])
+
+
+class _A:                                   # a stand-in for parsed args
+    def __init__(self, **kw):
+        self.wallet_password = ""
+        self.__dict__.update(kw)
+
+
+# resolve_wallet_password: env beats argv, and argv warns.
+_a = _A(wallet_password="from-argv")
+os.environ["GS_WALLET_PASSWORD"] = "from-env"
+ghost.resolve_wallet_password(_a)
+check("password: the environment wins over argv", _a.wallet_password == "from-env")
+os.environ.pop("GS_WALLET_PASSWORD", None)
+_a2 = _A(wallet_password="from-argv")
+ghost.resolve_wallet_password(_a2)
+check("password: argv is still honoured when no env var is set",
+      _a2.wallet_password == "from-argv")
+# An empty env var is a DELIBERATE empty password (an unencrypted wallet), not
+# "unset" -- collapsing the two would silently fall back to the argv value.
+os.environ["GS_WALLET_PASSWORD"] = ""
+_a3 = _A(wallet_password="from-argv")
+ghost.resolve_wallet_password(_a3)
+check("password: an EMPTY env var means empty, not 'fall back to argv'",
+      _a3.wallet_password == "")
+os.environ.pop("GS_WALLET_PASSWORD", None)
+
+
+# compute_fee_budget: pure money math, now callable without a pipeline.
+_u, _tf, _r = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10, 2)
+check("budget: rounds = wallets * 2 * deep", _r == 40)
+check("budget: the fee reserve carries the safety margin",
+      _tf == Decimal("0.001") * ghost.FEE_SAFETY_MARGIN * 40)
+check("budget: usable is the balance minus the whole reserve",
+      _u == Decimal("10") - _tf)
+# The reserve must scale with the work, or a deep run under-reserves and dies
+# on its LAST hop, after the funds are already scattered across subaddresses.
+_u2, _tf2, _r2 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10, 6)
+check("budget: a deeper run reserves strictly more", _tf2 > _tf and _r2 > _r)
+check("budget: usable shrinks as depth grows", _u2 < _u)
+# It must report an unaffordable plan rather than abort: "cannot afford this"
+# is an answer the caller acts on, not an error.
+_u3, _, _ = ghost.compute_fee_budget(Decimal("0.0001"), Decimal("1"), 10, 2)
+check("budget: an unaffordable plan returns a non-positive usable, not an exit",
+      _u3 <= 0)
+check("budget: it never returns more than the balance",
+      all(ghost.compute_fee_budget(Decimal(b), Decimal("0.001"), w, d)[0] <= Decimal(b)
+          for b in ("1", "10", "100") for w in (3, 10, 40) for d in (1, 3, 6)))
+
+
+# The five extracted stage helpers must be module-level and callable.
+for _fn in ("stage1_joinmarket", "stage2_get_swap_quotes", "create_subs",
+            "xmr_balance", "_src_index", "stage0_preflight", "build_cli",
+            "resolve_entry_mode", "resolve_wallet_password", "compute_fee_budget"):
+    check(f"decomp: {_fn} is a module-level function, not a closure",
+          callable(getattr(ghost, _fn, None)))
+_main = [n for n in ast.walk(ast.parse(open(os.path.join(REPO, "GhostSpiral")).read()))
+         if isinstance(n, ast.FunctionDef) and n.name == "main"][0]
+check("decomp: main() has NO nested function definitions left",
+      not [c for c in _main.body if isinstance(c, ast.FunctionDef)])
+check("decomp: main() is under 500 lines (was 869)",
+      _main.end_lineno - _main.lineno < 500)
+
+# The stale docstring that WAS the trace recipe must stay gone.
+_cs_doc = ghost.create_subs.__doc__ or ""
+check("decomp: create_subs no longer claims decoys 'never hop' (that was the filter)",
+      "never hop" not in _cs_doc or "used to say" in _cs_doc)
+
+
+# ---------------------------------------------------------------------------
 # THE SWAP MEMO IS THE ONLY THING BINDING A BTC DEPOSIT TO YOUR XMR ADDRESS.
 # The BTC a sender pays goes to a SHARED ThorChain inbound vault, so a memo
 # naming a different address delivers the money to whoever owns it.

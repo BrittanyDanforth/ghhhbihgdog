@@ -454,9 +454,284 @@ def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
     return amounts
 
 
-def main():
-    install_signal_handlers()
+def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
+    """Returns (address_list, {address: subaddress_index}, decoy_address_set).
 
+    Uses new_subaddress_indexed (not new_subaddress) so each address's
+    real subaddress index is known. transfer_split needs that index in
+    'subaddr_indices' to actually restrict spending to the one
+    subaddress a plan TX names as 'src' -- without it, monero-wallet-rpc
+    pools funds from every subaddress in the account and the per-hop
+    mixing the DAG plan is built around never happens on-chain.
+
+    The Mix_/Decoy_ labels are LOCAL ONLY -- on-chain every subaddress is an
+    indistinguishable one-time key, and nothing derived from the label reaches
+    a transaction.
+
+    The extra outputs are FUNDED real fan-out outputs, and (since the Kerckhoffs
+    pass) they HOP like every other output rather than dead-ending. This
+    docstring used to say they "DEAD-END (they never hop)", which was both stale
+    and the trace recipe itself: if extra outputs never hop, an analyst who has
+    read this file filters the fan-out by "did it move again?" and recovers the
+    real mixing path exactly. select_fanout_targets now returns every output as
+    a hop source, so that filter selects nothing.
+    """
+    subs = []
+    addr_index = {}
+    decoy_addrs = set()
+    for i in range(n):
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Mix_{i}")
+        subs.append(addr)
+        addr_index[addr] = idx
+    for d in range(decoys):
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Decoy_{d}")
+        subs.append(addr)
+        addr_index[addr] = idx
+        decoy_addrs.add(addr)
+    return subs, addr_index, decoy_addrs
+
+
+def _src_index(addr_index: dict, addr: str) -> int:
+    """Resolve a source address to its real subaddress index, or abort.
+
+    transfer_split gets this in 'subaddr_indices' to restrict spending to
+    exactly the one subaddress the plan names as 'src'. A silent fallback
+    to 0 here would instead spend from the primary subaddress (which holds
+    the bulk of the funds) -- the OPPOSITE of the intended per-hop mixing,
+    and invisible to the operator. Every source we plan is created in
+    create_subs (or is ENTRY, set explicitly above), so a miss is a real
+    internal bug: fail loudly rather than silently spend the wrong output.
+    """
+    if addr not in addr_index:
+        integrity_log("stage4", "src_index_missing")
+        sys.exit(
+            f"[!] Internal error: no subaddress index recorded for source "
+            f"{scrub_address(addr)}. Refusing to build a TX that could spend "
+            f"from the wrong subaddress."
+        )
+    return addr_index[addr]
+
+
+def xmr_balance(rpc_primary, bal_account: int,
+                entry_index: int) -> tuple[Decimal, Decimal]:
+    """Return (total, unlocked) for ENTRY's subaddress in XMR.
+
+    Scoped to ENTRY's subaddress index, NOT the whole account. Fan-out
+    spends only from ENTRY (transfer_split subaddr_indices=[entry_index]),
+    so sizing the plan off an account-wide balance that also counted funds
+    parked on other subaddresses would let fanout_amt exceed what ENTRY can
+    actually spend, and every fan-out TX would fail 'not enough money'.
+    A refresh is forced first so freshly-arrived outputs are reflected.
+    """
+    try:
+        rpc_primary.raw_request("refresh", {})
+    except Exception:
+        pass  # refresh is best-effort; background sync still applies
+    tot_atomic, unlk_atomic = rpc_primary.get_subaddress_balance(bal_account, entry_index)
+    total = Decimal(str(tot_atomic)) / Decimal(10 ** 12)
+    unlocked = Decimal(str(unlk_atomic)) / Decimal(10 ** 12)
+    return total, unlocked
+
+
+def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
+    if not args.joinmarket:
+        integrity_log("stage1", "JM_skipped")
+        return []
+    if not args.joinmarket_wallet:
+        sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
+    try:
+        # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
+        # --socks5-host/port to be explicit (JM >= 0.9 supports this).
+        # Without this, JM may resolve maker addresses over clearnet.
+        from urllib.parse import urlparse as _urlparse
+        _parsed_proxy = _urlparse(args.tor_proxy)
+        result = subprocess.run(
+            ["python3", "tumble.py",
+             "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
+             "--socks5-port", str(_parsed_proxy.port or 9050),
+             args.joinmarket_wallet, btc_addr, "all"],
+            check=True, capture_output=True, text=True, timeout=3600,
+            env=_child_env(),   # third-party child: password scrubbed
+        )
+        integrity_log("stage1", "JM_tumble_OK")
+        # Recover the BTC amounts the tumbler sent to btc_addr and hand them
+        # to Stage 2 as the chunks to swap. If the tumble ran but nothing is
+        # parseable, FAIL LOUDLY -- the old code returned [] here and the
+        # pipeline silently continued as though JoinMarket contributed
+        # nothing, which is worse than stopping.
+        amounts = parse_jm_amounts(result.stdout, btc_addr)
+        if amounts:
+            integrity_log("stage1", f"JM_parsed:{len(amounts)}_outputs")
+            print(f"  [+] JoinMarket sent {len(amounts)} output(s) totaling "
+                  f"{sum(amounts)} BTC to {scrub_address(btc_addr)}")
+            return amounts
+        integrity_log("stage1", "JM_parse_empty")
+        sys.exit(
+            "[!] JoinMarket tumble completed but no output amount could be\n"
+            "    parsed from its result. Refusing to continue as if the tumble\n"
+            "    fed nothing into the pipeline. Inspect tumble.py output; if the\n"
+            "    coins did move, re-run supplying the tumbled total via\n"
+            "    --btc-amount, or update parse_jm_amounts for your JM version."
+        )
+    except subprocess.TimeoutExpired:
+        integrity_log("stage1", "JM_timeout")
+        sys.exit("[!] JoinMarket tumble timed out after 1 hour")
+    except FileNotFoundError:
+        integrity_log("stage1", "JM_not_found")
+        sys.exit("[!] tumble.py not found - JoinMarket not installed?")
+    except subprocess.CalledProcessError as e:
+        integrity_log("stage1", f"JM_fail:{e.returncode}")
+        sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
+
+
+def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
+                           xmr_dest: str) -> List[dict]:
+    """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
+
+    Uses the REAL SwapKit v3 API (https://docs.swapkit.dev):
+      POST /v3/quote
+      Body: {sellAsset, buyAsset, sellAmount, destinationAddress}
+      Response: {quoteId, routes: [{..., expectedOutput, depositAddress, memo}]}
+
+    Returns list of deposit instructions for the operator.
+    The operator must MANUALLY send BTC to each deposit address.
+    """
+    # One oracle fetch for the batch. None = unreachable, which DISABLES
+    # the cross-check loudly rather than measuring against an invented rate.
+    btc_per_xmr = btc_per_xmr_oracle(proxy, getter=safe_get)
+    if btc_per_xmr is None:
+        print("  [!] Price oracle unreachable — the slippage cross-check is "
+              "DISABLED for this batch. Verify each quote by hand.")
+
+    deposits = []
+    for i, amt in enumerate(chunks):
+        if shutdown_requested():
+            integrity_log("stage2", f"shutdown_at_chunk_{i}")
+            sys.exit("[!] Shutdown requested during quote fetch.")
+
+        if amt <= Decimal(0):
+            continue
+
+        if i > 0:
+            newnym(required=True)   # per-chunk quote isolation
+            secure_delay(3.0, 10.0)
+
+        # SwapKit v3 API uses sellAsset/buyAsset not from/to
+        payload = {
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": xmr_dest,
+        }
+
+        try:
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+        except Exception as e:
+            newnym()
+            integrity_log("stage2", f"quote_api_error:{i}")
+            sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
+
+        # Parse the routes from the response
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            error = quote_resp.get("error", "unknown")
+            provider_errors = quote_resp.get("providerErrors", [])
+            integrity_log("stage2", f"no_routes_chunk_{i}")
+            sys.exit(
+                f"[!] No swap routes available for chunk {i}.\n"
+                f"    Error: {str(error)[:80]}\n"
+                f"    Provider errors: {str(provider_errors)[:120]}"
+            )
+
+        # Use the first (best) route. NOTE: use `or` fallbacks, not dict
+        # .get() defaults: the API often returns these keys PRESENT but
+        # null, and .get("k", default) returns None (not the default) when
+        # the key exists with a null value. `route.get("transaction", {})`
+        # would then hand back None and the next .get() raises
+        # AttributeError; Decimal(str(None)) raises InvalidOperation. `or`
+        # collapses both missing AND null to the safe fallback.
+        route = routes[0]
+        # Single call to the extracted parser -- so a regression in null-
+        # handling here is caught by the test that drives parse_swap_route,
+        # not just documented in a comment. See parse_swap_route above.
+        deposit_addr, memo, expected_output = parse_swap_route(route)
+
+        # ONE gate for every way this quote can cost the operator their
+        # money -- missing/garbage deposit address, no memo, or a memo
+        # naming somebody else's address. Shared shape with
+        # thor_swap_preparer so the two swap paths cannot diverge again.
+        validate_swap_route(deposit_addr, memo, xmr_dest, i,
+                            allow_unbound_memo=args.allow_unbound_memo)
+
+        try:
+            expected_dec = Decimal(str(expected_output))
+        except Exception:                                 # noqa: BLE001
+            expected_dec = Decimal(0)
+        if expected_dec <= 0:
+            # A silent 0 here defeats the slippage cross-check below AND
+            # prints "Expected: ~0 XMR" in the deposit instructions. Say so;
+            # it usually means the route field name changed.
+            integrity_log("stage2", f"expected_output_unreadable_{i}")
+            print(f"  [!] Chunk {i}: could not read the expected XMR from the "
+                  f"quote (the route field name may have changed) — the "
+                  f"slippage check is DISABLED for it.")
+
+        # Same cross-check thor_swap_preparer applies, from the same shared
+        # helper: a quote wildly off the market rate is either a bad route
+        # or a stale oracle, and neither should be handed to a sender
+        # unexamined. Deviation is a ratio, never the amounts themselves,
+        # so nothing linkable reaches the integrity chain.
+        dev = quote_deviation(expected_dec, amt, btc_per_xmr)
+        if dev is not None:
+            if dev > args.max_slippage:
+                integrity_log("stage2", f"slippage_ABORT_{i}:dev={dev:.4f}")
+                sys.exit(
+                    f"[!] Chunk {i}: the quote is {dev * 100:.1f}% away from the\n"
+                    f"    price oracle, past the --max-slippage limit of\n"
+                    f"    {args.max_slippage * 100:.0f}%. That is either a bad route\n"
+                    f"    or a stale oracle — either way, not something to hand a\n"
+                    f"    sender unexamined. Raise --max-slippage only after\n"
+                    f"    checking the rate yourself."
+                )
+            if dev > Decimal("0.05"):
+                integrity_log("stage2", f"slippage_warn_{i}:dev={dev:.4f}")
+                print(f"  [!] Chunk {i}: quote deviates {dev * 100:.1f}% from the oracle.")
+
+        deposit_info = {
+            "chunk": i,
+            "btc_amount": str(amt),
+            "deposit_address": deposit_addr,
+            "memo": str(memo),
+            "expected_xmr": str(expected_dec),
+            "quote_id": quote_resp.get("quoteId", ""),
+        }
+        deposits.append(deposit_info)
+
+        print(f"  [*] Chunk {i}/{len(chunks)-1}:")
+        print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
+        # validate_swap_route has already refused an absent or unbound memo,
+        # so this always prints and always names the operator's own address.
+        print(f"      With memo: {str(memo)[:40]}...")
+        print(f"      Expected: ~{expected_dec} XMR")
+        integrity_log("stage2", f"quote_ready:{i}")
+
+        secure_delay(5.0, 15.0)
+
+    return deposits
+
+
+def build_cli() -> argparse.ArgumentParser:
+    """Every command-line option GhostSpiral accepts, in one place.
+
+    Pulled out of main() so the flag surface can be read, diffed and tested
+    on its own. It was 75 lines wedged between install_signal_handlers() and
+    the password handling -- which is how --max-slippage and
+    --allow-unbound-memo could sit beside --allow-clearnet-relay while the
+    swap path behind them had no memo check at all.
+
+    Returns the parser, not parsed args, so tests can inspect defaults and
+    mutual exclusivity without driving a pipeline run.
+    """
     cli = argparse.ArgumentParser(
         "GhostSpiral v10.5",
         description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
@@ -533,8 +808,20 @@ def main():
                           "broadcast from your IP.")
     cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
                      help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
-    args = cli.parse_args()
+    return cli
 
+
+def resolve_wallet_password(args) -> None:
+    """Take the wallet password from the environment, never from argv.
+
+    argv is world-readable: any local user can read /proc/<pid>/cmdline or run
+    ps. The environment is not a secret store either, but it is not published
+    to every process on the box the way a command line is. Env wins over argv,
+    matching airgap_tx_signer, and using argv warns loudly rather than silently
+    accepting a password that has already leaked to every user on the machine.
+
+    Mutates args in place, the way the pipeline already expects.
+    """
     # Prefer the environment over argv for the wallet password (see the
     # --wallet-password help and the env handoff in _stage5_run). Same
     # precedence rule the signer uses, so the two agree.
@@ -546,7 +833,22 @@ def main():
               "process's argv, where any local user can read it via ps or "
               "/proc/<pid>/cmdline. Prefer GS_WALLET_PASSWORD=... instead.")
         integrity_log("main", "warn:password_on_argv")
+    return None
 
+
+def resolve_entry_mode(args) -> tuple:
+    """Decide where this run's money comes IN, and validate that source.
+
+    Two mutually exclusive entries: a receive bundle (XMR is already on a
+    subaddress we own) or a BTC address to tumble and swap. Returns
+    (receive_mode, entry_addr, account_index, subaddress_index) -- for the BTC
+    path the last three are None/0 and ENTRY is created later in stage 3.
+
+    Both branches fail closed. The bundle goes through the one shared strict
+    loader; the BTC address is checked with a real bech32 checksum, not just
+    the charset regex, because a single flipped character is in-charset and
+    would send a tumble somewhere unrecoverable.
+    """
     # ---- Determine mode ----
     receive_mode = bool(args.receive_wallet)
     receive_entry_addr = None
@@ -581,13 +883,34 @@ def main():
             sys.exit("[!] Invalid BTC entry address: failed bech32 checksum "
                      "(expected bc1.../tb1... with a valid checksum)")
         integrity_log("stage0", "btc_entry_validated")
+    return (receive_mode, receive_entry_addr, receive_account_index,
+            receive_subaddress_index)
 
-    # ---- Validate inputs early ----
-    args.wallets = max(args.wallets, MIN_WALLETS)
-    args.deep = max(args.deep, MIN_DEEP)
 
-    proxy = validate_proxy(args.tor_proxy)
+def stage0_preflight(args, proxy) -> tuple:
+    """Every gate that must hold BEFORE this run is allowed to touch money.
 
+    These checks were spread through 60 lines of main(), interleaved with
+    wallet setup, so "what does GhostSpiral actually verify before it spends?"
+    could only be answered by reading the whole function. Collected here so an
+    auditor -- or the operator following OPSEC_SETUP.md -- can read the gate
+    stack in one place and see that nothing skips it.
+
+    In order:
+      * free disk and RAM, so a plan is not written half-way onto a full disk;
+      * Tor verified as a REAL Tor exit, not merely a reachable SOCKS port;
+      * monerod relay egress -- the transaction leaves over monerod's peer
+        connections, so a Tor-routed wallet-rpc in front of a clearnet-relaying
+        daemon still broadcasts from the operator's IP. Checked at startup,
+        not at broadcast time, because by then the plan exists and the
+        temptation is to send it anyway;
+      * wallet-rpc reachable AND synced, so balances are real;
+      * a live fee estimate, which refuses an implausible one rather than
+        sizing a spend off a fresh/offline chain's numbers.
+
+    Returns (rpc_primary, rpc_alt, fee_xmr). Any failure exits; nothing here
+    returns a degraded value that a later stage could mistake for success.
+    """
     # ---- Stage 0: Environment checks ----
     require_resources(min_disk_gb=2.0)
     verify_tor(proxy)
@@ -651,206 +974,65 @@ def main():
 
     fee_xmr = fetch_fee_from_daemon(args.rpc_daemon, proxy, args.fee_priority)
     integrity_log("stage0", "fee_fetched")
+    return rpc_primary, rpc_alt, fee_xmr
+
+
+def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
+                       deep: int) -> tuple:
+    """How much of `bal` is actually spendable once every round's fee is held back.
+
+    Returns (usable, total_fees, rounds). PURE -- no RPC, no logging, no exit --
+    so the arithmetic that decides whether a spend is affordable can be tested
+    directly instead of only through a live pipeline. The caller decides what an
+    unaffordable result means; this function never aborts, because "the budget
+    does not work out" is a legitimate answer, not an error.
+
+    Every round is one transaction, so the reserve is per-round fee times
+    rounds, with FEE_SAFETY_MARGIN on top: the estimate is taken once at
+    startup and the mempool can move under a multi-hour run. Under-reserving
+    does not fail early or cheaply -- it fails on the LAST hop with "not enough
+    money", after the funds have already been split across subaddresses.
+    """
+    rounds = wallets * 2 * deep
+    per_round_fee = fee_xmr * FEE_SAFETY_MARGIN
+    total_fees = per_round_fee * rounds
+    return bal - total_fees, total_fees, rounds
+
+
+def main():
+    install_signal_handlers()
+
+    cli = build_cli()
+    args = cli.parse_args()
+
+    resolve_wallet_password(args)
+
+    (receive_mode, receive_entry_addr, receive_account_index,
+     receive_subaddress_index) = resolve_entry_mode(args)
+
+    # ---- Validate inputs early ----
+    args.wallets = max(args.wallets, MIN_WALLETS)
+    args.deep = max(args.deep, MIN_DEEP)
+
+    proxy = validate_proxy(args.tor_proxy)
+
+    rpc_primary, rpc_alt, fee_xmr = stage0_preflight(args, proxy)
 
     ###########################################################################
     # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
     ###########################################################################
     newnym(required=True)   # anonymity gate before stage 1 network ops
 
-    def stage1_joinmarket(btc_addr: str) -> List[Decimal]:
-        if not args.joinmarket:
-            integrity_log("stage1", "JM_skipped")
-            return []
-        if not args.joinmarket_wallet:
-            sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
-        try:
-            # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
-            # --socks5-host/port to be explicit (JM >= 0.9 supports this).
-            # Without this, JM may resolve maker addresses over clearnet.
-            from urllib.parse import urlparse as _urlparse
-            _parsed_proxy = _urlparse(args.tor_proxy)
-            result = subprocess.run(
-                ["python3", "tumble.py",
-                 "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
-                 "--socks5-port", str(_parsed_proxy.port or 9050),
-                 args.joinmarket_wallet, btc_addr, "all"],
-                check=True, capture_output=True, text=True, timeout=3600,
-                env=_child_env(),   # third-party child: password scrubbed
-            )
-            integrity_log("stage1", "JM_tumble_OK")
-            # Recover the BTC amounts the tumbler sent to btc_addr and hand them
-            # to Stage 2 as the chunks to swap. If the tumble ran but nothing is
-            # parseable, FAIL LOUDLY -- the old code returned [] here and the
-            # pipeline silently continued as though JoinMarket contributed
-            # nothing, which is worse than stopping.
-            amounts = parse_jm_amounts(result.stdout, btc_addr)
-            if amounts:
-                integrity_log("stage1", f"JM_parsed:{len(amounts)}_outputs")
-                print(f"  [+] JoinMarket sent {len(amounts)} output(s) totaling "
-                      f"{sum(amounts)} BTC to {scrub_address(btc_addr)}")
-                return amounts
-            integrity_log("stage1", "JM_parse_empty")
-            sys.exit(
-                "[!] JoinMarket tumble completed but no output amount could be\n"
-                "    parsed from its result. Refusing to continue as if the tumble\n"
-                "    fed nothing into the pipeline. Inspect tumble.py output; if the\n"
-                "    coins did move, re-run supplying the tumbled total via\n"
-                "    --btc-amount, or update parse_jm_amounts for your JM version."
-            )
-        except subprocess.TimeoutExpired:
-            integrity_log("stage1", "JM_timeout")
-            sys.exit("[!] JoinMarket tumble timed out after 1 hour")
-        except FileNotFoundError:
-            integrity_log("stage1", "JM_not_found")
-            sys.exit("[!] tumble.py not found - JoinMarket not installed?")
-        except subprocess.CalledProcessError as e:
-            integrity_log("stage1", f"JM_fail:{e.returncode}")
-            sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
-
     if receive_mode:
         jm_utxos = []
         integrity_log("stage1", "skipped:receive_mode")
     else:
-        jm_utxos = stage1_joinmarket(args.btc_entry)
+        jm_utxos = stage1_joinmarket(args, args.btc_entry)
     integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
 
     ###########################################################################
     # Stage 2 - ThorChain swap definition
     ###########################################################################
-
-    def stage2_get_swap_quotes(chunks: List[Decimal], xmr_dest: str) -> List[dict]:
-        """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
-
-        Uses the REAL SwapKit v3 API (https://docs.swapkit.dev):
-          POST /v3/quote
-          Body: {sellAsset, buyAsset, sellAmount, destinationAddress}
-          Response: {quoteId, routes: [{..., expectedOutput, depositAddress, memo}]}
-
-        Returns list of deposit instructions for the operator.
-        The operator must MANUALLY send BTC to each deposit address.
-        """
-        # One oracle fetch for the batch. None = unreachable, which DISABLES
-        # the cross-check loudly rather than measuring against an invented rate.
-        btc_per_xmr = btc_per_xmr_oracle(proxy, getter=safe_get)
-        if btc_per_xmr is None:
-            print("  [!] Price oracle unreachable — the slippage cross-check is "
-                  "DISABLED for this batch. Verify each quote by hand.")
-
-        deposits = []
-        for i, amt in enumerate(chunks):
-            if shutdown_requested():
-                integrity_log("stage2", f"shutdown_at_chunk_{i}")
-                sys.exit("[!] Shutdown requested during quote fetch.")
-
-            if amt <= Decimal(0):
-                continue
-
-            if i > 0:
-                newnym(required=True)   # per-chunk quote isolation
-                secure_delay(3.0, 10.0)
-
-            # SwapKit v3 API uses sellAsset/buyAsset not from/to
-            payload = {
-                "sellAsset": "BTC.BTC",
-                "buyAsset": "XMR.XMR",
-                "sellAmount": str(amt),
-                "destinationAddress": xmr_dest,
-            }
-
-            try:
-                quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
-            except Exception as e:
-                newnym()
-                integrity_log("stage2", f"quote_api_error:{i}")
-                sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
-
-            # Parse the routes from the response
-            routes = quote_resp.get("routes", [])
-            if not routes:
-                error = quote_resp.get("error", "unknown")
-                provider_errors = quote_resp.get("providerErrors", [])
-                integrity_log("stage2", f"no_routes_chunk_{i}")
-                sys.exit(
-                    f"[!] No swap routes available for chunk {i}.\n"
-                    f"    Error: {str(error)[:80]}\n"
-                    f"    Provider errors: {str(provider_errors)[:120]}"
-                )
-
-            # Use the first (best) route. NOTE: use `or` fallbacks, not dict
-            # .get() defaults: the API often returns these keys PRESENT but
-            # null, and .get("k", default) returns None (not the default) when
-            # the key exists with a null value. `route.get("transaction", {})`
-            # would then hand back None and the next .get() raises
-            # AttributeError; Decimal(str(None)) raises InvalidOperation. `or`
-            # collapses both missing AND null to the safe fallback.
-            route = routes[0]
-            # Single call to the extracted parser -- so a regression in null-
-            # handling here is caught by the test that drives parse_swap_route,
-            # not just documented in a comment. See parse_swap_route above.
-            deposit_addr, memo, expected_output = parse_swap_route(route)
-
-            # ONE gate for every way this quote can cost the operator their
-            # money -- missing/garbage deposit address, no memo, or a memo
-            # naming somebody else's address. Shared shape with
-            # thor_swap_preparer so the two swap paths cannot diverge again.
-            validate_swap_route(deposit_addr, memo, xmr_dest, i,
-                                allow_unbound_memo=args.allow_unbound_memo)
-
-            try:
-                expected_dec = Decimal(str(expected_output))
-            except Exception:                                 # noqa: BLE001
-                expected_dec = Decimal(0)
-            if expected_dec <= 0:
-                # A silent 0 here defeats the slippage cross-check below AND
-                # prints "Expected: ~0 XMR" in the deposit instructions. Say so;
-                # it usually means the route field name changed.
-                integrity_log("stage2", f"expected_output_unreadable_{i}")
-                print(f"  [!] Chunk {i}: could not read the expected XMR from the "
-                      f"quote (the route field name may have changed) — the "
-                      f"slippage check is DISABLED for it.")
-
-            # Same cross-check thor_swap_preparer applies, from the same shared
-            # helper: a quote wildly off the market rate is either a bad route
-            # or a stale oracle, and neither should be handed to a sender
-            # unexamined. Deviation is a ratio, never the amounts themselves,
-            # so nothing linkable reaches the integrity chain.
-            dev = quote_deviation(expected_dec, amt, btc_per_xmr)
-            if dev is not None:
-                if dev > args.max_slippage:
-                    integrity_log("stage2", f"slippage_ABORT_{i}:dev={dev:.4f}")
-                    sys.exit(
-                        f"[!] Chunk {i}: the quote is {dev * 100:.1f}% away from the\n"
-                        f"    price oracle, past the --max-slippage limit of\n"
-                        f"    {args.max_slippage * 100:.0f}%. That is either a bad route\n"
-                        f"    or a stale oracle — either way, not something to hand a\n"
-                        f"    sender unexamined. Raise --max-slippage only after\n"
-                        f"    checking the rate yourself."
-                    )
-                if dev > Decimal("0.05"):
-                    integrity_log("stage2", f"slippage_warn_{i}:dev={dev:.4f}")
-                    print(f"  [!] Chunk {i}: quote deviates {dev * 100:.1f}% from the oracle.")
-
-            deposit_info = {
-                "chunk": i,
-                "btc_amount": str(amt),
-                "deposit_address": deposit_addr,
-                "memo": str(memo),
-                "expected_xmr": str(expected_dec),
-                "quote_id": quote_resp.get("quoteId", ""),
-            }
-            deposits.append(deposit_info)
-
-            print(f"  [*] Chunk {i}/{len(chunks)-1}:")
-            print(f"      Send {amt} BTC to: {scrub_address(deposit_addr)}")
-            # validate_swap_route has already refused an absent or unbound memo,
-            # so this always prints and always names the operator's own address.
-            print(f"      With memo: {str(memo)[:40]}...")
-            print(f"      Expected: ~{expected_dec} XMR")
-            integrity_log("stage2", f"quote_ready:{i}")
-
-            secure_delay(5.0, 15.0)
-
-        return deposits
 
     ###########################################################################
     # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
@@ -860,38 +1042,6 @@ def main():
     tor_recheck(proxy, "stage3_pre")
 
     sub_account = receive_account_index if receive_mode else 0
-
-    def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
-        """Returns (address_list, {address: subaddress_index}, decoy_address_set).
-
-        Uses new_subaddress_indexed (not new_subaddress) so each address's
-        real subaddress index is known. transfer_split needs that index in
-        'subaddr_indices' to actually restrict spending to the one
-        subaddress a plan TX names as 'src' -- without it, monero-wallet-rpc
-        pools funds from every subaddress in the account and the per-hop
-        mixing the DAG plan is built around never happens on-chain.
-
-        The Mix_/Decoy_ labels are LOCAL ONLY -- on-chain every subaddress is
-        an indistinguishable one-time key. The decoys matter because they are
-        FUNDED real fan-out outputs that then DEAD-END (they never hop), so an
-        analyst watching the fan-out sees n+decoys outputs and cannot tell which
-        ones lie on the real mixing path and which are dead ends. (They used to
-        be created and then never funded -- fanout_count was capped at n -- so
-        they produced no on-chain output at all and hid nothing.)
-        """
-        subs = []
-        addr_index = {}
-        decoy_addrs = set()
-        for i in range(n):
-            addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Mix_{i}")
-            subs.append(addr)
-            addr_index[addr] = idx
-        for d in range(decoys):
-            addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Decoy_{d}")
-            subs.append(addr)
-            addr_index[addr] = idx
-            decoy_addrs.add(addr)
-        return subs, addr_index, decoy_addrs
 
     # Random per-run extra-output count, so the total (wallets + this) is not a
     # deterministic fingerprint of the `wallets` setting under public code.
@@ -946,7 +1096,7 @@ def main():
             print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
 
         if btc_chunks:
-            swap_deposits = stage2_get_swap_quotes(btc_chunks, ENTRY)
+            swap_deposits = stage2_get_swap_quotes(args, proxy, btc_chunks, ENTRY)
             integrity_log("stage2", "swap_quotes_generated")
             total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
             print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
@@ -999,26 +1149,7 @@ def main():
     bal_account = receive_account_index if receive_mode else 0
     entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
 
-    def xmr_balance() -> tuple[Decimal, Decimal]:
-        """Return (total, unlocked) for ENTRY's subaddress in XMR.
-
-        Scoped to ENTRY's subaddress index, NOT the whole account. Fan-out
-        spends only from ENTRY (transfer_split subaddr_indices=[entry_index]),
-        so sizing the plan off an account-wide balance that also counted funds
-        parked on other subaddresses would let fanout_amt exceed what ENTRY can
-        actually spend, and every fan-out TX would fail 'not enough money'.
-        A refresh is forced first so freshly-arrived outputs are reflected.
-        """
-        try:
-            rpc_primary.raw_request("refresh", {})
-        except Exception:
-            pass  # refresh is best-effort; background sync still applies
-        tot_atomic, unlk_atomic = rpc_primary.get_subaddress_balance(bal_account, entry_index)
-        total = Decimal(str(tot_atomic)) / Decimal(10 ** 12)
-        unlocked = Decimal(str(unlk_atomic)) / Decimal(10 ** 12)
-        return total, unlocked
-
-    total_bal, unlocked_bal = xmr_balance()
+    total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
 
     # Sender mode: the swapped XMR lands on ENTRY only AFTER the operator sends
     # BTC and ThorChain settles (and in manual mode, whenever they send it).
@@ -1033,7 +1164,7 @@ def main():
                 sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
             time.sleep(XMR_ARRIVAL_POLL)
             waited += XMR_ARRIVAL_POLL
-            total_bal, unlocked_bal = xmr_balance()
+            total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
             if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
                 print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
         # NOT the balance: unlocked_bal is the exact XMR that arrived from the
@@ -1054,11 +1185,8 @@ def main():
             f"    Total balance: {total_bal} XMR (may be locked/unconfirmed)."
         )
 
-    rounds = args.wallets * 2 * args.deep
-    per_round_fee = fee_xmr * FEE_SAFETY_MARGIN  # 1 TX/round + safety margin for fee spikes
-    total_fees = per_round_fee * rounds
-    usable = bal - total_fees
-
+    usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
+                                                    args.deep)
     if usable <= DUST_XMR:
         sys.exit(
             f"[!] Balance {bal} XMR insufficient.\n"
@@ -1067,26 +1195,6 @@ def main():
         )
 
     integrity_log("stage4", "plan_calculated")
-
-    def _src_index(addr: str) -> int:
-        """Resolve a source address to its real subaddress index, or abort.
-
-        transfer_split gets this in 'subaddr_indices' to restrict spending to
-        exactly the one subaddress the plan names as 'src'. A silent fallback
-        to 0 here would instead spend from the primary subaddress (which holds
-        the bulk of the funds) -- the OPPOSITE of the intended per-hop mixing,
-        and invisible to the operator. Every source we plan is created in
-        create_subs (or is ENTRY, set explicitly above), so a miss is a real
-        internal bug: fail loudly rather than silently spend the wrong output.
-        """
-        if addr not in addr_index:
-            integrity_log("stage4", "src_index_missing")
-            sys.exit(
-                f"[!] Internal error: no subaddress index recorded for source "
-                f"{scrub_address(addr)}. Refusing to build a TX that could spend "
-                f"from the wrong subaddress."
-            )
-        return addr_index[addr]
 
     # -- Phase A: Fan-out -------------------------------------------------
     # Distribute funds from ENTRY into mix subaddresses. In receiver mode ALL
@@ -1142,7 +1250,7 @@ def main():
         except Exception:
             change_addr = ENTRY
         _peel_core = build_peel_plan(
-            entry_index=_src_index(ENTRY), change_index=0,
+            entry_index=_src_index(addr_index, ENTRY), change_index=0,
             dests=fanout_dests, amounts=[fanout_by_addr[a] for a in fanout_dests])
         fanout_plan = []
         for _p in _peel_core:
@@ -1162,7 +1270,7 @@ def main():
     else:
         fanout_plan = [{
             "src": ENTRY,
-            "src_index": _src_index(ENTRY),
+            "src_index": _src_index(addr_index, ENTRY),
             "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
             "delay": _secrets.randbelow(540) + 180,
             "extra": secure_hex(16),
@@ -1178,7 +1286,8 @@ def main():
     # Subaddresses that will receive a fan-out output, with the (account, index)
     # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
     funded_targets = list(fanout_dests)
-    fanout_targets_indexed = [(sub_account, _src_index(a)) for a in funded_targets]
+    fanout_targets_indexed = [(sub_account, _src_index(addr_index, a))
+                              for a in funded_targets]
 
     # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------
     # Each funded mix subaddress hops a chunk of its balance onward to a DAG
@@ -1230,7 +1339,7 @@ def main():
             d = dst_candidates[_secrets.randbelow(len(dst_candidates))]
             dag_plan.append({
                 "src": s,
-                "src_index": _src_index(s),
+                "src_index": _src_index(addr_index, s),
                 "dst": d,
                 "amt": str(src_hop_amt),
                 "delay": _secrets.randbelow(540) + 180,
