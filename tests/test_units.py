@@ -2550,6 +2550,50 @@ check("hop delay: no caller passes SystemRandom().randbelow anywhere",
       "SystemRandom().randbelow" not in _gs_code)
 
 
+# ---------------------------------------------------------------------------
+# _stage5_cleanup erases the PREVIOUS run's plans and must not touch THIS
+# run's. It took (fanout_file, dag_file) by name, so the entry veil -- a third
+# plan file -- was securely deleted between stage 4 writing it and stage 5
+# running it. Variadic now, and driven here rather than read.
+# ---------------------------------------------------------------------------
+_cl = tempfile.mkdtemp(prefix="gs_clean_")
+_keep = [Path(_cl) / n for n in ("unsigned_fanout_a.json", "unsigned_dag_a.json",
+                                 "unsigned_veil_a.json")]
+_stale = [Path(_cl) / n for n in ("unsigned_fanout_OLD.json",
+                                  "unsigned_veil_OLD.json")]
+for _f in _keep + _stale:
+    _f.write_text("{}")
+_cwd0 = os.getcwd()
+try:
+    os.chdir(_cl)
+    ghost._stage5_cleanup(Path(_cl), *_keep)
+finally:
+    os.chdir(_cwd0)
+check("cleanup: this run's plan files all survive",
+      all(f.exists() for f in _keep))
+check("cleanup: ...including the entry veil, which a named-parameter version "
+      "erased before stage 5 could run it",
+      (Path(_cl) / "unsigned_veil_a.json").exists())
+check("cleanup: the previous run's plans are gone",
+      not any(f.exists() for f in _stale))
+
+# A None (no DAG round planned) must not become a KeyError or keep everything.
+for _f in _stale:
+    _f.write_text("{}")
+_cwd0 = os.getcwd()
+try:
+    os.chdir(_cl)
+    ghost._stage5_cleanup(Path(_cl), _keep[0], None, _keep[2])
+finally:
+    os.chdir(_cwd0)
+check("cleanup: a skipped round passed as None is simply dropped",
+      _keep[0].exists() and _keep[2].exists()
+      and not any(f.exists() for f in _stale))
+check("cleanup: ...and a file NOT named as current is still erased",
+      not _keep[1].exists())
+shutil.rmtree(_cl, ignore_errors=True)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

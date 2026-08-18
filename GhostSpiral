@@ -2457,7 +2457,7 @@ def main():
         newnym(required=True)   # anonymity gate before broadcast
         tor_recheck(proxy, "stage5_pre")
 
-        _stage5_cleanup(Path(args.output), fanout_file, dag_file)
+        _stage5_cleanup(Path(args.output), fanout_file, dag_file, veil_file)
 
         staging_dir = "tx_staging"
         # ONE SWEEP DESTINATION PER CHANGE LOCATION, and one sweep each.
@@ -2533,7 +2533,7 @@ def _child_env(wallet_password: str = None) -> dict:
     return env
 
 
-def _stage5_cleanup(outdir_path: Path, fanout_file: Path, dag_file):
+def _stage5_cleanup(outdir_path: Path, *current_files):
     """Securely erase the PREVIOUS run's artifacts before this run starts.
 
     Extracted from main() so it is directly testable -- the old inline version
@@ -2571,10 +2571,14 @@ def _stage5_cleanup(outdir_path: Path, fanout_file: Path, dag_file):
                       f"a previous run's signed transactions. Remove it manually.")
 
     # Old unsigned plans, but NOT the ones Stage 4 just created.
+    #
+    # `current_files` is variadic and Nones are dropped, so a round added later
+    # is kept by passing its file rather than by remembering to extend a pair
+    # of named parameters. The entry veil was added as a third plan file and
+    # this loop, which securely erases every unsigned_*.json it is not told
+    # about, deleted it between stage 4 writing it and stage 5 running it.
     if outdir_path.is_dir():
-        current_names = {fanout_file.name}
-        if dag_file:
-            current_names.add(dag_file.name)
+        current_names = {f.name for f in current_files if f}
         for old_plan in list(outdir_path.glob("unsigned_*.json")):
             if old_plan.name not in current_names:
                 ok = secure_delete_file(old_plan)
