@@ -2,7 +2,7 @@
 """CLI/flag tests for every script: --help works, argparse rejects bad flags
 (invalid choices, missing required args, mutual exclusion), valid flags are
 accepted, and the early runtime validations fire BEFORE any network I/O."""
-import subprocess, os, sys
+import os, subprocess, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
@@ -11,9 +11,12 @@ SCRIPTS = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
 PROXY = "socks5h://127.0.0.1:9050"
 
 PASS = 0; FAIL = 0; FAILS = []
-def run(script, args, timeout=30, stdin=""):
+def run(script, args, timeout=30, stdin="", env_extra=None):
+    env = None
+    if env_extra:
+        env = {**os.environ, **env_extra}
     p = subprocess.run([sys.executable, script] + args, capture_output=True,
-                       text=True, timeout=timeout, input=stdin, cwd=REPO)
+                       text=True, timeout=timeout, input=stdin, cwd=REPO, env=env)
     return p.returncode, (p.stdout + p.stderr)
 def check(name, cond):
     global PASS, FAIL
@@ -39,7 +42,19 @@ arg_reject("ghost:no-mode",              "GhostSpiral", ["--tor-proxy", PROXY])
 arg_reject("ghost:both-modes",           "GhostSpiral", ["--btc-entry", "bc1qxyz", "--receive-wallet", "f.json", "--tor-proxy", PROXY])
 arg_reject("ghost:missing-tor-proxy",    "GhostSpiral", ["--btc-entry", "bc1qxyz"])
 arg_reject("ghost:fee-priority-9",       "GhostSpiral", ["--btc-entry", "bc1qxyz", "--tor-proxy", PROXY, "--fee-priority", "9"])
-arg_reject("exit:no-amount",             "exit_strategy_simulator", ["--method", "bisq"])
+# Not an argparse rejection any more: the amount is now OPTIONAL on argv so the
+# pipeline can pass it in the environment instead (/proc/<pid>/cmdline is
+# world-readable at 0444, /proc/<pid>/environ is 0400). The CONTRACT is
+# unchanged -- it must refuse to run without an amount -- so assert the
+# contract, not the exit code argparse happens to use.
+_rc, _out = run("exit_strategy_simulator", ["--method", "bisq"])
+check("exit:no-amount refuses to run", _rc != 0)
+check("exit:no-amount says how to supply it", "GS_EXIT_AMOUNT" in _out)
+# And the environment path must actually be honoured, not just documented.
+_rc2, _out2 = run("exit_strategy_simulator", ["--method", "bisq"],
+                  env_extra={"GS_EXIT_AMOUNT": "5"})
+check("exit:env amount is accepted (it gets past the amount check)",
+      "No amount" not in _out2)
 arg_reject("exit:bad-method",            "exit_strategy_simulator", ["10", "--method", "bogus"])
 arg_reject("exit:bad-currency",          "exit_strategy_simulator", ["10", "--currency", "yen"])
 arg_reject("thor:no-required",           "thor_swap_preparer", [])

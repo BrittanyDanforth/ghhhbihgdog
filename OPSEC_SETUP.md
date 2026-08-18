@@ -198,6 +198,21 @@ hop returned nothing to the account.
   `gs_console` all point at that RPC.
 - Console binds `127.0.0.1` only. Do not punch it out.
 
+**What the wallet file gives away**
+
+`paranoia_mode` wipes the pipeline's artifacts and **never touches the wallet
+file** — that file is your money. So the wallet survives every wipe, holding
+the balances, the transaction history and every subaddress a run created:
+the whole mix graph. Section 6's "door kick, they take the ThinkPad → partly"
+is exactly this.
+
+Subaddresses are therefore created with **no label**. They used to be tagged
+`Mix_0`, `Decoy_3`, `Carrier_2`, `ChangeSweep`, `GhostSpiral_entry` — local
+only, invisible on-chain, and a complete annotated map to anyone who opens the
+wallet. Every on-chain heuristic this tool defeats was bypassed by reading a
+string. Protecting the wallet is disk encryption and where the keys live, not
+the wipe.
+
 **Spend USB**
 - Only plugged in to mix / cold-sign (`airgap_tx_signer`).
 - Auto-job user on the ThinkPad must **not** be allowed to mount

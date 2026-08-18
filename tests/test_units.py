@@ -538,6 +538,91 @@ check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount"
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
 
 # ---------------------------------------------------------------------------
+# WHAT SURVIVES THE WIPE, AND WHAT A COMMAND LINE PUBLISHES.
+#
+# Audit of exit_strategy_simulator and paranoia_mode, hunting the operator
+# rather than the transaction graph.
+# ---------------------------------------------------------------------------
+_exit_src = open(os.path.join(REPO, "exit_strategy_simulator")).read()
+_par_src = open(os.path.join(REPO, "paranoia_mode")).read()
+_gs_a = open(os.path.join(REPO, "GhostSpiral")).read()
+_crw_a = open(os.path.join(REPO, "create_receive_wallet")).read()
+_bc_a = open(os.path.join(REPO, "broadcast_signed_xmr")).read()
+
+# 1. THE AMOUNT ON ARGV. /proc/<pid>/cmdline is mode 0444 -- world-readable by
+#    every account on the host -- while /proc/<pid>/environ is 0400. The
+#    pipeline passed the off-ramp total as a positional argument, so any local
+#    user could read the size of the holding off `ps`. This repo already
+#    refuses argv for the wallet password, and strips amounts from the
+#    integrity chain, for exactly that reason.
+check("exit: the pipeline no longer puts the amount on the child's argv",
+      '"exit_strategy_simulator", str(spendable_amount)' not in _gs_a)
+check("exit: the amount is handed over in the environment instead",
+      'GS_EXIT_AMOUNT' in _gs_a and 'GS_EXIT_AMOUNT' in _exit_src)
+check("exit: the positional amount is optional, so argv need never carry it",
+      'nargs="?"' in _exit_src)
+check("exit: an argv amount still WARNS rather than passing silently",
+      "warn:amount_on_argv" in _exit_src)
+check("exit: with neither source it refuses instead of guessing",
+      "No amount. Set GS_EXIT_AMOUNT" in _exit_src)
+
+# 2. WALLET-FILE LABELS. paranoia_mode deliberately never deletes the wallet,
+#    so anything written into it survives every wipe. Labels naming each
+#    address's ROLE hand a reader the answer with no analysis: which outputs
+#    are decoys, which are carriers and in what order, which is the change
+#    sweep -- and "GhostSpiral_entry" names the tool. Every on-chain heuristic
+#    this pipeline defeats is bypassed by reading a string.
+for _bad in ('label=f"Mix_', 'label=f"Decoy_', 'label=f"Carrier_',
+             'label="ChangeSweep"'):
+    check(f"labels: the wallet no longer records {_bad.split('=')[1][:14]}…",
+          _bad not in _gs_a)
+check("labels: subaddresses are created with an EMPTY label",
+      _gs_a.count('label=""') >= 4)
+check("labels: create_receive_wallet no longer defaults to a tool-naming label",
+      'default="GhostSpiral_entry"' not in _crw_a)
+check("labels: and it says why the default is empty",
+      "never deletes" in _crw_a and "names the tool" in _crw_a)
+# Nothing may start depending on a label, or the fix regresses into a bug.
+check("labels: no code reads a label back (they were write-only decoration)",
+      '.get("label")' not in _gs_a and '["label"]' not in _gs_a)
+
+# 3. BLOCK HEIGHT vs the log's own timestamp coarsening. integrity_log buckets
+#    its timestamp to 600s specifically to widen the correlation window against
+#    blockchain timestamps -- and one line then wrote an exact height, which
+#    pins the run to a single ~2-minute block and defeats the bucketing 5x.
+check("chain: the sync height is coarsened, not exact",
+      'rpc_sync_ok:height={h1}' not in _gs_a
+      and "height~" in _gs_a)
+
+# 4. THE RELAY SCHEDULE. The per-TX delays are the mechanism that stops a batch
+#    relaying as one timing cluster. Writing their LENGTHS into a persistent,
+#    index-keyed file hands a reader the exact schedule -- the correlation the
+#    delays exist to destroy.
+check("chain: the delay LENGTH is not written to the integrity chain",
+      'delay:idx={real_idx}:secs={item.delay}' not in _bc_a)
+check("chain: that a delay happened is still chained",
+      'f"delay:idx={real_idx}"' in _bc_a)
+
+# 5. WHAT paranoia_mode CANNOT DO. "Every phase reported success" reads as
+#    "this host is clean of the run". The wallet is untouched by design -- it
+#    is the money -- and it holds the balances, the history and every
+#    subaddress the run created. Silence about that is a false-hope leak.
+check("paranoia: the summary states the wallet survives the wipe",
+      "THE WALLET IS STILL HERE" in _par_src)
+check("paranoia: it explains the wallet holds the whole mix graph",
+      "mix graph" in _par_src)
+check("paranoia: it points at the real mitigation instead of implying none",
+      "OPSEC_SETUP.md" in _par_src)
+# It must not have quietly started deleting the wallet to make that true.
+check("paranoia: it still does NOT delete wallet keys (that is the money)",
+      "*.keys" not in _par_src)
+# And the artifacts it DOES claim must really be covered.
+for _pat in ("exitplan_*.json", "monero-wallet-rpc.log", "outputs_export.hex",
+             "integrity_chain.log"):
+    check(f"paranoia: {_pat} is in the wipe patterns", _pat in _par_src)
+
+
+# ---------------------------------------------------------------------------
 # THE SPEND ACCOUNT MUST BE THE MIX ACCOUNT.
 #
 # resolve_mix_account creates a fresh account and create_subs puts ENTRY and

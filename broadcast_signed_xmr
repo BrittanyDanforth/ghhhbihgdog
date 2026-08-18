@@ -689,7 +689,13 @@ def main():
         # delay existed to avoid.
         if item.delay > 0:
             print(f"  [*] Waiting {item.delay}s (planned delay for TX {real_idx})...")
-            integrity_log("broadcast", f"delay:idx={real_idx}:secs={item.delay}")
+            # The delay LENGTH is not written to the chain. The per-TX delays
+            # are the mechanism that stops this batch relaying as one timing
+            # cluster; recording them in a persistent file hands a reader the
+            # exact relay schedule -- the very correlation the delays exist to
+            # destroy -- and pairs it with the tx index. That the delay
+            # HAPPENED is worth chaining; how long it was is not.
+            integrity_log("broadcast", f"delay:idx={real_idx}")
             if not _sleep_interruptible(item.delay):
                 integrity_log("broadcast", f"shutdown_during_delay:idx={real_idx}")
                 print(f"  [!] Shutdown during the planned delay for TX {real_idx}: NOT "

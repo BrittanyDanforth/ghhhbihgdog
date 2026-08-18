@@ -133,8 +133,13 @@ def main():
                     help="monero-wallet-rpc endpoint")
     ap.add_argument("--tor-proxy",
                     help="socks5h://host:port if routing via Tor")
-    ap.add_argument("--label", default="GhostSpiral_entry",
-                    help="label for the new subaddress")
+    ap.add_argument("--label", default="",
+                    help="label for the new subaddress. Empty by default and best "
+                         "left that way: labels live in the WALLET FILE, which is "
+                         "the one artifact paranoia_mode never deletes, so a "
+                         "seized or auto-unlocking wallet hands a reader the "
+                         "role of every address -- and a label naming the tool "
+                         "names the tool.")
     ap.add_argument("--account", type=int, default=None,
                     help="use this existing account instead of creating a fresh one. "
                          "Only for an existing wallet layout — a fresh account per "

@@ -765,6 +765,25 @@ def main():
         print("  [+] paranoia_mode complete — every phase reported success.")
         print("  [i] Best-effort caveats still apply: swap-device bytes and freed")
         print("      RAM are not zeroed, and CoW/SSD filesystems can retain blocks.")
+        # THE BIGGEST THING THIS TOOL DOES NOT DO, said out loud.
+        #
+        # "Every phase reported success" reads like "the host is clean of the
+        # mix". It is not, and the gap is not a caveat about block remanence --
+        # it is the wallet, sitting in plain sight. This tool deletes the
+        # pipeline's ARTIFACTS; it deliberately never touches the wallet file,
+        # because that is the operator's money. A wallet holds the balances,
+        # the transaction history, and every subaddress the run created, which
+        # is the entire mix graph. An operator who reads "complete" and infers
+        # "nothing here connects me to the run" has been misled by silence.
+        print()
+        print("  [!] THE WALLET IS STILL HERE, and it is not an oversight: this tool")
+        print("      wipes the pipeline's artifacts, never the wallet file, because")
+        print("      that file is your money. It holds the balances, the transaction")
+        print("      history and every subaddress the run created — i.e. the whole")
+        print("      mix graph. Anyone who opens that wallet, or holds its view key,")
+        print("      sees the run regardless of how clean this host now looks.")
+        print("      Protecting it is disk encryption and where the keys live")
+        print("      (see OPSEC_SETUP.md), not this wipe.")
     else:
         print(f"  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT known clean.")
         for name, n in bad.items():

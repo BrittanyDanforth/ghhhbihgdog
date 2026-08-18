@@ -17,6 +17,9 @@ OPSEC hardening:
   - KYC risk flagging
   - Heuristic liquidity guidance by trade size (clearly labelled; not a probe)
   - --redact masks the figures on screen for shoulder-surfing / screen-sharing
+  - The amount comes from GS_EXIT_AMOUNT, NOT argv: /proc/<pid>/cmdline is
+    world-readable (0444) while /proc/<pid>/environ is owner-only (0400), so a
+    command-line amount tells every local account the size of the holding
 
 TERMINAL OUTPUT IS NOT REDACTED BY DEFAULT, and this header used to claim it
 was ("No sensitive amounts or addresses leaked to terminal (redacted)") while
@@ -26,7 +29,7 @@ them. Use --redact when someone may be looking, which masks the magnitudes on
 screen while the full plan still goes to the 0600 JSON file.
 """
 from __future__ import annotations
-import argparse, sys, time
+import argparse, os, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict
@@ -133,7 +136,25 @@ def main():
         "exit_strategy_simulator v10.0",
         description="Plan XMR off-ramp with liquidity analysis",
     )
-    ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
+    # The amount is read from GS_EXIT_AMOUNT by preference, and the positional
+    # is OPTIONAL so the pipeline never has to put it on a command line.
+    #
+    # /proc/<pid>/cmdline is mode 0444 -- world-readable by every account on
+    # the host, for the lifetime of the process. /proc/<pid>/environ is 0400,
+    # owner only. Both measured, not assumed.
+    #
+    # GhostSpiral invoked this as `exit_strategy_simulator <amount> ...`, so a
+    # second local user running `ps` learned the exact size of the holding
+    # being off-ramped. This repo already refuses argv for the wallet password
+    # for precisely that reason, and it strips amounts out of the integrity
+    # chain because "the amount deanonymises the hop it is meant to hide" --
+    # and then published the total on a command line. The environment is not a
+    # secret store either, but it is not broadcast to every process the way a
+    # command line is.
+    ap.add_argument("amount", type=Decimal, nargs="?", default=None,
+                    help="XMR amount to off-ramp. Prefer GS_EXIT_AMOUNT=... : an "
+                         "argv amount is world-readable via ps and "
+                         "/proc/<pid>/cmdline (mode 444).")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
     ap.add_argument("--tor-proxy")
@@ -145,6 +166,22 @@ def main():
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
+    # Environment wins over argv, matching GhostSpiral's and the signer's rule
+    # for the wallet password, so the two agree.
+    _env_amt = os.environ.get("GS_EXIT_AMOUNT")
+    if _env_amt is not None:
+        try:
+            args.amount = Decimal(_env_amt)
+        except Exception:                                    # noqa: BLE001
+            sys.exit("[!] GS_EXIT_AMOUNT is not a number.")
+    elif args.amount is not None:
+        print("  [!] The amount was passed on argv, where any local user can read "
+              "it via ps or /proc/<pid>/cmdline. Prefer GS_EXIT_AMOUNT=... .")
+        integrity_log("exit", "warn:amount_on_argv")
+
+    if args.amount is None:
+        sys.exit("[!] No amount. Set GS_EXIT_AMOUNT=<xmr> (preferred) or pass it "
+                 "as the positional argument.")
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")
 

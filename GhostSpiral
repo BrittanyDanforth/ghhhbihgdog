@@ -552,9 +552,25 @@ def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
     pools funds from every subaddress in the account and the per-hop
     mixing the DAG plan is built around never happens on-chain.
 
-    The Mix_/Decoy_ labels are LOCAL ONLY -- on-chain every subaddress is an
-    indistinguishable one-time key, and nothing derived from the label reaches
-    a transaction.
+    SUBADDRESSES ARE CREATED WITH NO LABEL, and that is a security decision.
+
+    They used to be labelled Mix_0..Mix_N and Decoy_0..Decoy_D, defended as
+    "LOCAL ONLY -- on-chain every subaddress is an indistinguishable one-time
+    key". The on-chain half of that is true and the reassurance is the wrong
+    one, because labels are written into the WALLET FILE, and the wallet file
+    is the one artifact paranoia_mode deliberately never deletes (it holds the
+    money). OPSEC_SETUP.md's accepted worst case is "door kick, they take the
+    ThinkPad -- view-only if auto-unlock", i.e. an adversary reading that
+    wallet.
+
+    At that point labels hand them the entire answer with no analysis at all:
+    which outputs are decoys, which are real mix targets, which are peel
+    carriers and in what order, which is the change sweep, and -- via
+    "GhostSpiral_entry" -- the name of the tool. Every heuristic this pipeline
+    defeats on-chain is bypassed by reading a string.
+
+    Nothing in the toolchain ever reads a label back; they were decoration.
+    The plan file carries the roles, and the plan file IS wiped.
 
     The extra outputs are FUNDED real fan-out outputs, and (since the Kerckhoffs
     pass) they HOP like every other output rather than dead-ending. This
@@ -568,11 +584,11 @@ def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
     addr_index = {}
     decoy_addrs = set()
     for i in range(n):
-        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Mix_{i}")
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label="")
         subs.append(addr)
         addr_index[addr] = idx
     for d in range(decoys):
-        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label=f"Decoy_{d}")
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label="")
         subs.append(addr)
         addr_index[addr] = idx
         decoy_addrs.add(addr)
@@ -1058,7 +1074,14 @@ def stage0_preflight(args, proxy) -> tuple:
         time.sleep(10)
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
-    integrity_log("stage0", f"rpc_sync_ok:height={h1}")
+    # Height coarsened to the SAME granularity integrity_log coarsens its own
+    # timestamp to. That function buckets time to 600s specifically "to reduce
+    # the correlation window between the log and blockchain timestamps" -- and
+    # then this line wrote an exact block height, which pins the run to a
+    # single ~2-minute block and defeats the bucketing by a factor of five.
+    # Five blocks is the same ~10 minutes, so the diagnostic value survives and
+    # the precision does not.
+    integrity_log("stage0", f"rpc_sync_ok:height~{int(h1) // 5 * 5}")
 
     fee_xmr = fetch_fee_from_daemon(args.rpc_daemon, proxy, args.fee_priority)
     integrity_log("stage0", "fee_fetched")
@@ -1580,7 +1603,7 @@ def main():
         _carriers = []
         for _c in range(max(0, _n_peels - 1)):
             _addr, _idx = rpc_primary.new_subaddress_indexed(
-                account_index=bal_account, label=f"Carrier_{_c}")
+                account_index=bal_account, label="")
             _carriers.append((_addr, _idx))
             addr_index[_addr] = _idx
         # What each peel forwards: everything still to be distributed after
@@ -1721,7 +1744,7 @@ def main():
     if True:
         try:
             _csa, _csi = rpc_primary.new_subaddress_indexed(
-                account_index=bal_account, label="ChangeSweep")
+                account_index=bal_account, label="")
             change_sweep_target = (_csa, _csi)
             addr_index[_csa] = _csi
         except Exception as e:                               # noqa: BLE001
@@ -2279,11 +2302,19 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
 
     try:
         print("  [*] Stage 5d: Exit strategy simulation...")
+        # The amount goes in the ENVIRONMENT, never on argv. A command line is
+        # world-readable through /proc/<pid>/cmdline (0444); the environment is
+        # owner-only (0400). Putting the total on a command line told every
+        # local account the size of the holding being off-ramped -- the same
+        # exposure this pipeline refuses for the wallet password, and the same
+        # value it deliberately keeps out of the integrity chain.
+        _exit_env = _child_env()
+        _exit_env["GS_EXIT_AMOUNT"] = str(spendable_amount)
         subprocess.run(
-            ["python3", "exit_strategy_simulator", str(spendable_amount),
+            ["python3", "exit_strategy_simulator",
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
-            env=_child_env(),       # no password needed
+            env=_exit_env,          # no password needed; amount passed here
         )
         integrity_log("stage5", "exit_sim_ok")
     except Exception as e:
