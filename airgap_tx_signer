@@ -29,7 +29,7 @@ Usage:
       --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, sys, time, shutil, tempfile
+import argparse, json, subprocess, hashlib, os, re, sys, time, shutil, tempfile
 from pathlib import Path
 from decimal import Decimal
 from typing import List
@@ -155,6 +155,10 @@ PLAN_FP_VERSION = "gs-planfp-v2"
 #: hop's fan-out output, a peel's change). Without it those signatures fail with
 #: "Imported outputs omit more outputs that we know of".
 OUTPUTS_EXPORT_NAME = "outputs_export.hex"
+#: How many accounts the ONLINE wallet has, recorded beside the output export.
+#: The offline wallet must have at least this many before it can import them --
+#: see _ensure_offline_accounts.
+ACCOUNTS_COUNT_NAME = "accounts_count.txt"
 
 
 def _canonical_plan(plan: List[dict]) -> list:
@@ -509,6 +513,32 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print("  [!] export_outputs returned nothing. Signing a round that spends "
                   "an output created by an EARLIER round will fail on the offline "
                   "wallet.")
+        # HOW MANY ACCOUNTS the online wallet has. The offline wallet derives
+        # subaddresses for a fixed lookahead of accounts (50 by default, set
+        # when it was CREATED and not changeable afterwards -- wallet-cli
+        # rejects --subaddress-lookahead alongside --wallet-file). GhostSpiral
+        # puts every output in its own account, so the online wallet passes 50
+        # accounts during the second run, and from then on the offline wallet
+        # cannot derive the keys for the exported outputs: import_outputs dies
+        # with "Failed to generate key image" and sign_transfer then produces
+        # nothing while still printing "Loaded 1 transactions". Measured.
+        #
+        # This is the count the OFFLINE side has to reach, and it is a property
+        # of the whole wallet, not of this plan: the export covers every output
+        # the online wallet holds, so a plan spending account 3 still fails if
+        # the wallet has an output in account 120.
+        try:
+            _accts = rpc.raw_request("get_accounts", {}) or {}
+            _n = len(_accts.get("subaddress_accounts", []) or [])
+            if _n:
+                secure_write_text(outdir / ACCOUNTS_COUNT_NAME, str(_n))
+                integrity_log("signer", f"accounts_count:{_n}")
+        except Exception as e:                              # noqa: BLE001
+            integrity_log("signer", f"accounts_count_fail:{str(e)[:40]}")
+            print(f"  [!] Could not read the wallet's account count "
+                  f"({str(e)[:60]}). If the offline wallet has fewer accounts "
+                  f"than this one, import_outputs will fail to generate key "
+                  f"images and the round will not sign.")
     except Exception as e:                                  # noqa: BLE001
         integrity_log("signer", f"outputs_export_fail:{str(e)[:40]}")
         print(f"  [!] Could not export wallet outputs ({str(e)[:60]}). A first-round "
@@ -642,6 +672,115 @@ def _load_signing_manifest(outdir, plan: list) -> list:
     return entries
 
 
+def _offline_account_count(wallet_file: str, args) -> int:
+    """How many accounts the OFFLINE wallet has, via wallet-cli's `account`.
+
+    Returns 0 when it cannot be determined, which the caller treats as "top up
+    anyway" rather than "assume it is fine".
+    """
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_")
+    try:
+        os.fchmod(pw_fd, 0o600)
+        os.write(pw_fd, (args.wallet_password or "").encode())
+    finally:
+        os.close(pw_fd)
+    try:
+        r = subprocess.run(
+            [args.wallet_cli, "--wallet-file", wallet_file,
+             "--password-file", pw_path, "--command", "account"],
+            capture_output=True, text=True, timeout=300,
+            input=f"{args.wallet_password or ''}\n" + "y\n" * 3)
+        txt = (r.stdout or "") + (r.stderr or "")
+        # "        1 8Bmvo7        0.000000000000 ..." -- index then a
+        # truncated address. The primary row is marked with a leading '*'.
+        idx = [int(m) for m in
+               re.findall(r"^\s*\*?\s*(\d+)\s+\S{5,}\s+\d", txt, re.M)]
+        return (max(idx) + 1) if idx else 0
+    except Exception:                                        # noqa: BLE001
+        return 0
+    finally:
+        secure_delete_file(Path(pw_path))
+
+
+def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
+    """Give the offline wallet as many accounts as the online one, or the
+    outputs it is about to import cannot have their key images generated.
+
+    A wallet derives subaddresses for a bounded lookahead of accounts -- 50 by
+    default -- fixed when the wallet was CREATED. wallet-cli refuses
+    --subaddress-lookahead alongside --wallet-file, so an existing offline
+    wallet cannot simply be told a bigger number.
+
+    GhostSpiral gives every output its own account (that is what stops one
+    transaction merging the mix), which adds roughly twenty accounts per run.
+    The online wallet therefore passes 50 accounts during the SECOND run, and
+    from then on `import_outputs` fails with "Failed to generate key image" and
+    `sign_transfer` prints "Loaded 1 transactions" and writes nothing. The
+    money is not lost, but the round cannot be signed.
+
+    Creating the accounts explicitly fixes it: measured, an offline wallet at
+    the default lookahead could not sign a spend from account 120, and after
+    122 x `account new` the same import reported "147 outputs imported" and the
+    signature succeeded. It costs about half a second per account, once --
+    accounts persist -- so a wallet that is already large enough pays only the
+    cost of asking.
+
+    A wallet CREATED with `--subaddress-lookahead 400:50` never needs this at
+    all; OPSEC_SETUP.md says so. This exists for the wallets that already
+    exist.
+    """
+    marker = outdir / ACCOUNTS_COUNT_NAME
+    if not marker.exists():
+        return
+    try:
+        needed = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return
+    if needed <= 0:
+        return
+    have = _offline_account_count(wallet_file, args)
+    if have >= needed:
+        return
+    missing = needed - have
+    print(f"  [*] The offline wallet has {have or 'an unknown number of'} "
+          f"account(s); this run's wallet has {needed}. Creating {missing} so "
+          f"the outputs can be imported (~{missing // 2}s, once)...")
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_")
+    try:
+        os.fchmod(pw_fd, 0o600)
+        os.write(pw_fd, (args.wallet_password or "").encode())
+    finally:
+        os.close(pw_fd)
+    try:
+        subprocess.run(
+            [args.wallet_cli, "--wallet-file", wallet_file,
+             "--password-file", pw_path],
+            capture_output=True, text=True,
+            timeout=max(600, missing * 5),
+            input=f"{args.wallet_password or ''}\n"
+                  + "account new\n" * missing + "exit\n")
+        after = _offline_account_count(wallet_file, args)
+        if after >= needed:
+            integrity_log("signer", f"offline_accounts_topped_up:{after}")
+            print(f"  [+] Offline wallet now has {after} accounts.")
+        else:
+            integrity_log("signer", "offline_accounts_topup_short")
+            print(f"  [!] The offline wallet still has {after} account(s), "
+                  f"short of {needed}. import_outputs will fail to generate "
+                  f"key images and this round will NOT sign. Recreate the "
+                  f"offline wallet from its seed with "
+                  f"--subaddress-lookahead {needed + 200}:50.")
+    except subprocess.TimeoutExpired:
+        integrity_log("signer", "offline_accounts_topup_timeout")
+        print("  [!] Timed out creating accounts on the offline wallet.")
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("signer", f"offline_accounts_topup_fail:{str(e)[:40]}")
+        print(f"  [!] Could not create accounts on the offline wallet "
+              f"({str(e)[:60]}).")
+    finally:
+        secure_delete_file(Path(pw_path))
+
+
 def _import_view_outputs(outdir, wallet_file: str, args) -> None:
     """Teach the OFFLINE wallet about outputs it has never seen on-chain.
 
@@ -663,6 +802,9 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
     """
     _outs = outdir / OUTPUTS_EXPORT_NAME
     if _outs.exists():
+        # The offline wallet must be able to DERIVE the subaddresses of every
+        # output in the blob before it can import them.
+        _ensure_offline_accounts(outdir, wallet_file, args)
         # RAM-backed scratch (tmpfs) so the wallet OUTPUT-SET blob -- a map of
         # this wallet's holdings -- and the password file never touch disk;
         # fall back to /tmp only where /dev/shm is unavailable. Matches the

@@ -212,6 +212,32 @@ tells that exchange they are yours. That is a custodial link, not a chain
 link, and no on-chain structure can remove it — it is what the off-ramp
 planner's split-across-venues guidance is for.
 
+**Create the offline spend wallet with a large subaddress lookahead.** A
+Monero wallet only derives subaddresses for a bounded number of accounts — 50
+by default — and that bound is fixed when the wallet is **created**:
+`monero-wallet-cli` refuses `--subaddress-lookahead` alongside `--wallet-file`,
+so an existing wallet cannot be told a bigger number.
+
+Isolating every output costs roughly twenty accounts per run, so the online
+view-only wallet passes 50 accounts during your **second** run. After that the
+offline wallet cannot derive the keys for the exported outputs:
+`import_outputs` fails with *"Failed to generate key image"* and
+`sign_transfer` prints *"Loaded 1 transactions"* and writes nothing. Nothing is
+lost, but the round will not sign.
+
+So restore the offline wallet from its seed with room to grow:
+
+```
+monero-wallet-cli --restore-deterministic-wallet     --generate-new-wallet /path/to/offline-wallet     --subaddress-lookahead 400:50
+```
+
+If your offline wallet already exists, you do **not** have to recreate it:
+`phase_create` records how many accounts the online wallet has and
+`phase_sign` creates the missing ones on the offline wallet before importing
+(about half a second each, once — accounts persist). The lookahead above just
+makes that unnecessary. `tests/real_cold_lookahead_testnet.py` pins both
+halves, including a negative control that fails without the fix.
+
 **How far apart the hops land is yours to choose, and the default is not the
 strong setting.** A peel hop cannot be built until the previous hop's output
 has confirmed and unlocked — about 10 blocks — and `--hop-delay` is added on
