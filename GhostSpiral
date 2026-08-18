@@ -490,11 +490,11 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
-def build_peel_stage_plan(rpc, addr_index: dict, account_index: int,
-                          entry_addr: str, entry_index: int,
-                          dests: list, amount_by_addr: dict,
-                          hop_fee: Decimal) -> list:
-    """Provision rotating carriers and turn a peel plan into stage-5 entries.
+def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
+                          entry_index: int, dests: list,
+                          amount_by_addr: dict, hop_fee: Decimal):
+    """Provision the peel chain's carriers and turn a peel plan into stage-5
+    entries. Returns (plan, change_accounts).
 
     PEELING CHAIN: one transaction per destination, each spending what the
     previous peel forwarded, so the N mix outputs appear in N separate
@@ -505,24 +505,59 @@ def build_peel_stage_plan(rpc, addr_index: dict, account_index: int,
     spent twice and subaddress 0 is never spent at all. They are provisioned
     BEFORE the plan is built, because build_peel_plan refuses to fall back to
     subaddress 0 rather than quietly rebuild the very hub the peel exists to
-    avoid. Each new index is recorded in addr_index so stage 5 can resolve it.
+    avoid.
+
+    ONE ACCOUNT PER HOP, which is the part that is not obvious. Monero sends a
+    transaction's change to the SPENDING ACCOUNT's subaddress 0 -- that is not
+    selectable. Run every hop in one account and all N peels deposit their
+    change onto one subaddress 0, and then the sweep that collects it is a
+    single N-INPUT transaction.
+
+    That transaction is the whole peel chain undone. Spending N outputs
+    together is public, permanent proof that those N outputs share one owner,
+    and it needs no ring analysis to read -- the input count is right there in
+    the transaction. Those N outputs are the change of the N peels, so the
+    sweep announces that all N peels were one entity, which is exactly the
+    fact the chain spent N transactions and several hours hiding. Measured on
+    a chain running current consensus: six peels produced a six-input sweep,
+    while sweeping the same six outputs separately produced six 1-in/2-out
+    transactions -- the most common shape on the network -- for about 0.005
+    XMR more in fees at a 0.0024 XMR estimate.
+
+    Giving each hop its own account puts each hop's change on a DIFFERENT
+    subaddress 0, so every one of them can be swept alone. Accounts are free
+    (they are only a subaddress derivation domain) and invisible on-chain;
+    this buys the sweep structure, nothing else.
+
+    The returned change_accounts are the accounts whose subaddress 0 will hold
+    change once the chain runs, in hop order, so the caller can provision one
+    sweep destination each.
     """
     amounts = [amount_by_addr[a] for a in dests]
     carriers = []
+    hop_accounts = []
     for _ in range(max(0, len(dests) - 1)):
-        addr, idx = rpc.new_subaddress_indexed(account_index=account_index,
-                                               label="")
+        # A fresh account per carrier. create_fresh_account fails closed: a
+        # wallet that answers without a usable index aborts the run here,
+        # before any money moves, rather than silently handing back account 0
+        # and putting a hop's change on the operator's PRIMARY address.
+        acct = create_fresh_account(rpc, label="")
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
+        hop_accounts.append(acct)
         carriers.append((addr, idx))
-        addr_index[addr] = idx
     core = build_peel_plan(
         entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
         carriers=carriers,
         remainders=peel_forward_amounts(amounts, hop_fee))
     plan = []
     for p in core:
+        # Peel 0 spends ENTRY, which lives in the mix account. Peel i>0 spends
+        # carrier i-1, which lives in that carrier's own account.
+        hop_acct = entry_account if p["peel_num"] == 0 else hop_accounts[p["peel_num"] - 1]
         entry = {
             "src": entry_addr if p["peel_num"] == 0 else carriers[p["peel_num"] - 1][0],
             "src_index": p["src_index"],
+            "account_index": hop_acct,
             "dst": p["dst"],
             "amt": p["amt"],
             "delay": secrets.randbelow(540) + 180,
@@ -534,7 +569,8 @@ def build_peel_stage_plan(rpc, addr_index: dict, account_index: int,
             entry["carrier"] = p["carrier"]
             entry["carrier_index"] = p["carrier_index"]
         plan.append(entry)
-    return plan
+    # Every hop leaves change on its own account's subaddress 0.
+    return plan, [entry_account] + hop_accounts
 
 
 def build_peel_plan(entry_index: int, change_index: int,
@@ -1919,8 +1955,8 @@ def main():
         # has no auto-resume. Found on a real chain, where a one-fee-per-hop
         # reserve failed on the second peel.
         _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
-        fanout_plan = build_peel_stage_plan(
-            rpc_primary, addr_index, bal_account, ENTRY,
+        fanout_plan, change_accounts = build_peel_stage_plan(
+            rpc_primary, bal_account, ENTRY,
             _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
             _hop_fee)
         integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
@@ -1942,6 +1978,9 @@ def main():
         # outputs and unmixes what the fan-out exists to mix. The amount stays
         # in the plan file (0600), off the persistent hash chain.
         integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
+        # A fan-out is one transaction, so it leaves change in exactly one
+        # place: the spending account's subaddress 0.
+        change_accounts = [bal_account]
 
     # Subaddresses that will receive a fan-out output, with the (account, index)
     # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
@@ -2027,24 +2066,41 @@ def main():
     # loser also left an orphan subaddress behind. Locking before the read is
     # the point of locking at all.
     with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
-        change_sweep_target = None
-        try:
-            _csa, _csi = rpc_primary.new_subaddress_indexed(
-                account_index=bal_account, label="")
-            change_sweep_target = (_csa, _csi)
+        # ONE SWEEP DESTINATION PER CHANGE LOCATION, and one sweep each.
+        #
+        # A fan-out leaves change in one place, so this is one job. A peel
+        # chain leaves change on every hop's account (see
+        # build_peel_stage_plan) and gets one job per hop -- because the whole
+        # point of splitting the hops across accounts is that each change
+        # output can then be swept ALONE. Collecting them in one sweep would
+        # be an N-input transaction, which is public proof that all N peels
+        # share an owner.
+        #
+        # The destinations are distinct too. Sweeping N outputs into ONE
+        # subaddress does not link them today (stealth addresses make each
+        # arrival a separate one-time key), but it stacks N outputs on one
+        # address, and whoever spends that address later merges them and
+        # proves the same fact one hop downstream.
+        change_sweep_jobs = []
+        for _acct in change_accounts:
+            try:
+                _csa, _csi = rpc_primary.new_subaddress_indexed(
+                    account_index=bal_account, label="")
+            except Exception as e:                           # noqa: BLE001
+                integrity_log("stage4", f"change_sweep_target_FAILED:{_acct}")
+                print(f"  [!] Could not create a destination for the change on "
+                      f"account {_acct} ({str(e)[:60]}). That change will stay "
+                      f"on account {_acct}, subaddress 0 — UNMIXED, and it is "
+                      f"an output that never moves.")
+                continue
             addr_index[_csa] = _csi
-        except Exception as e:                               # noqa: BLE001
-            integrity_log("stage4", "change_sweep_target_FAILED")
-            print(f"  [!] Could not create a destination for the fan-out's change "
-                  f"({str(e)[:60]}). The change will stay on the mix account's "
-                  f"subaddress 0 — UNMIXED, and the only fan-out output that "
-                  f"never moves.")
+            change_sweep_jobs.append((_acct, 0, _csa, _csi))
 
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
-                                 change_sweep_target=change_sweep_target)
+                                 change_sweep_jobs=change_sweep_jobs)
 
     # Honest completion. This used to print "pipeline complete." unconditionally,
     # so a peel chain that stopped partway or a DAG round that was skipped still
@@ -2341,12 +2397,17 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
 def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     """Run a peeling chain: each peel is its OWN confirmation-gated round.
 
-    peel_file holds N single-destination peels (build_peel_plan). Peel 0 spends
-    ENTRY; each later peel spends the change address (change_target=(account,
-    0)), which only holds the previous peel's change once it confirms and
-    unlocks -- so between peels we WAIT for that subaddress to hold enough
-    unlocked balance to fund the next. That wait is what spreads the N mix
-    outputs across N transactions over time instead of one co-created fan-out.
+    peel_file holds N peels (build_peel_stage_plan). Peel 0 spends ENTRY; each
+    later peel spends a fresh ROTATING CARRIER that the previous peel paid
+    explicitly, which only holds the funds once that peel confirms and unlocks
+    -- so between peels we WAIT for that carrier to hold enough unlocked
+    balance to fund the next. That wait is what spreads the N mix outputs
+    across N transactions over time instead of one co-created fan-out.
+
+    Both the carrier's subaddress AND its account come from the plan entry.
+    Each hop lives in its own account so that its change lands on a distinct
+    subaddress 0 and can be swept alone; `change_target` is only the fallback
+    for a plan that names no account.
 
     Returns the number of peels relayed. A peel's create/sign/broadcast aborts
     the run (fail closed) exactly as any round does. If the chain stops partway
@@ -2372,9 +2433,10 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
               f"peel(s) are on-chain; the remaining ~{n - done} destination(s) were "
               f"NOT sent.")
         _stuck = peels[done].get("src_index", csub) if done < n else csub
+        _stuck_acct = peels[done].get("account_index", acct) if done < n else acct
         print(f"  [!] The undistributed balance is safe on this wallet's account "
-              f"{acct}, subaddress {_stuck} (the carrier this peel would have "
-              f"spent). There is no auto-"
+              f"{_stuck_acct}, subaddress {_stuck} (the carrier this peel would "
+              f"have spent). There is no auto-"
               f"resume: distribute it manually, or accept the partial distribution. "
               f"Do NOT simply re-run — that builds a new plan from a now-empty entry.")
 
@@ -2413,7 +2475,12 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
                       f"— that is the hub the rotation exists to avoid.")
                 _partial(relayed)
                 break
-            if not _wait_for_carrier(args, acct, wait_sub, need, proxy,
+            # ...and in WHICH account. Each hop runs in its own account so its
+            # change lands on its own subaddress 0 (see build_peel_stage_plan),
+            # so polling `acct` for every hop would watch an account the funds
+            # never reach and block until the timeout on peel 2 of every run.
+            wait_acct = peel.get("account_index", acct)
+            if not _wait_for_carrier(args, wait_acct, wait_sub, need, proxy,
                                      f"peel {i + 1}/{n}"):
                 integrity_log("stage5", f"peel_carrier_timeout:{i}")
                 _partial(relayed)
@@ -2507,14 +2574,50 @@ def _change_residue(args, account, sub_idx):
         return None
 
 
-def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
-                      staging_dir, proxy, meta):
-    """Sweep the distribution's change output into the mix, leaving nothing behind.
+def _run_change_sweeps(args, jobs, staging_dir, proxy, meta) -> int:
+    """Sweep each change location in its OWN transaction. Returns how many failed.
 
-    A fan-out cannot allocate its input exactly: the fee is not known when the
-    amounts are chosen, so FANOUT_SPEND_FRACTION holds ~10% back and monerod
-    returns that remainder as change to the mix account's subaddress 0. Two
-    separate problems follow, and both are fixed here.
+    Deliberately a loop of single sweeps rather than one collecting sweep. The
+    inputs of a transaction are public: spending N outputs together proves,
+    permanently and without any ring analysis, that those N outputs have one
+    owner. In a peel chain those N outputs are the change of the N peels, so
+    one tidy sweep would publish the very fact the chain spent N transactions
+    and several hours concealing.
+
+    Measured on a chain running current consensus: six change outputs swept
+    together produced ONE 6-input transaction; swept separately they produced
+    six 1-in/2-out transactions -- the most common shape on the network -- for
+    about 0.005 XMR more in total fees against a 0.0024 XMR fee estimate. The
+    fee difference is the entire cost of not announcing the link.
+
+    A failure is reported and the remaining sweeps still run: change stranded
+    on one hop is bad, but skipping the rest would strand the others too.
+    """
+    failed = 0
+    for n, (account, change_index, dest_addr, dest_index) in enumerate(jobs, 1):
+        label = f"change sweep {n}/{len(jobs)}"
+        if not _run_change_sweep(args, account, change_index, dest_addr,
+                                 dest_index, staging_dir, proxy, meta,
+                                 label=label, seq=n):
+            failed += 1
+    if len(jobs) > 1:
+        integrity_log("stage5", f"change_sweeps:{len(jobs) - failed}_of_{len(jobs)}")
+        print(f"  [+] Change swept in {len(jobs) - failed}/{len(jobs)} SEPARATE "
+              f"transactions — no single transaction spends more than one of "
+              f"them, so none of them are publicly linked to each other.")
+    return failed
+
+
+def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
+                      staging_dir, proxy, meta, label="change sweep", seq=0):
+    """Sweep ONE change location into the mix, leaving nothing behind.
+
+    Neither distribution can allocate its input exactly, because the fee is not
+    known when the amounts are chosen. A fan-out holds ~FANOUT_SPEND_FRACTION
+    back and monerod returns the remainder as change to the spending account's
+    subaddress 0; a peel chain does the same at every hop, which is why each
+    hop runs in its own account and each gets its own call here. Two separate
+    problems follow from leaving that change alone, and both are fixed here.
 
     OPSEC: the remainder sits on one address for the whole run and is never
     mixed. It is the only output of the fan-out that does not move, which is a
@@ -2531,28 +2634,34 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     (proven on-chain in tests/real_hop_sweep_testnet.py) -- into a fresh mix
     subaddress, which then hops with everything else.
 
-    This SPENDS the mix account's subaddress 0, exactly once. That is safe here
-    and would not have been before the account rotation: it is a per-run
-    account, so this is not the wallet's identity address, and one spend is not
-    a repeated-spender hub. The wallet's real primary address is still spent
-    zero times by the pipeline.
+    This SPENDS one account's subaddress 0, exactly once. That is safe here and
+    would not have been before the account rotation: these are per-run
+    accounts, so none of them is the wallet's identity address, and one spend
+    is not a repeated-spender hub. The wallet's real primary address is still
+    spent zero times by the pipeline.
+
+    ONE LOCATION ONLY. This deliberately does not accept several accounts and
+    collect them: see _run_change_sweeps for why a collecting sweep is the one
+    transaction that would undo a peel chain.
 
     Returns True if the change was swept (or there was nothing to sweep).
     """
     # Wait for the change to actually exist and unlock -- it is an output of
     # the distribution transaction, so it is locked for the usual ~10 blocks.
-    if not _wait_for_change_settled(args, account, change_index, proxy,
-                                    "change sweep")[0]:
-        integrity_log("stage5", "change_sweep_skipped:not_confirmed")
-        print("  [!] The distribution's change did not confirm in time, so it was "
-              "NOT swept into the mix. It is safe on the mix account's subaddress "
-              f"{change_index} — but it is UNMIXED, and it is the one output of "
-              "the fan-out that never moved. Sweep it by hand.")
+    if not _wait_for_change_settled(args, account, change_index, proxy, label)[0]:
+        integrity_log("stage5", f"change_sweep_skipped:not_confirmed:{account}")
+        print(f"  [!] The change on account {account} did not confirm in time, so "
+              f"it was NOT swept into the mix. It is safe on account {account}, "
+              f"subaddress {change_index} — but it is UNMIXED, and it is an "
+              f"output that never moved. Sweep it by hand.")
         return False
 
     sweep_tx = {
         "src": f"change(acct {account}/sub {change_index})",
         "src_index": change_index,
+        # Each sweep names its OWN account: with a peel chain these are all
+        # different, and meta carries only the mix account.
+        "account_index": account,
         "dst": dest_addr,
         "sweep": True,
         "delay": secrets.SystemRandom().randbelow(540) + 180,
@@ -2560,9 +2669,9 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     }
     path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
     atomic_write_json({"meta": meta, "txs": [sweep_tx]}, path)
-    stage = f"{staging_dir}/changesweep"
+    stage = f"{staging_dir}/changesweep{seq}" if seq else f"{staging_dir}/changesweep"
     try:
-        _run_round(args, path, stage, "Change sweep")
+        _run_round(args, path, stage, label.capitalize())
         # VERIFY, do not assert. This printed "nothing is parked on the change
         # address" unconditionally -- a claim the code never checked, and one
         # that was false whenever the sweep ran while some change was still
@@ -2571,12 +2680,12 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         # of the distribution that never moves.
         _left = _change_residue(args, account, change_index)
         if _left is None:
-            integrity_log("stage5", "change_swept_unverified")
+            integrity_log("stage5", f"change_swept_unverified:{account}")
             print("  [+] The change sweep was relayed, but the balance could not "
                   "be re-read to confirm the address is now empty. Check "
                   f"account {account} / subaddr {change_index} yourself.")
         elif _left > 0:
-            integrity_log("stage5", "change_sweep_residual")
+            integrity_log("stage5", f"change_sweep_residual:{account}")
             print(f"  [!] The change sweep relayed, but "
                   f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on account "
                   f"{account} / subaddr {change_index} — change that had not "
@@ -2584,9 +2693,9 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                   f"take it. It is safe, but it is UNMIXED and it is the one "
                   f"output that never moves. Sweep it by hand once it unlocks.")
         else:
-            integrity_log("stage5", "change_swept_into_mix")
-            print("  [+] The distribution's change was swept into the mix; "
-                  "verified nothing is parked on the change address.")
+            integrity_log("stage5", f"change_swept_into_mix:{account}")
+            print(f"  [+] The change on account {account} was swept into the mix; "
+                  f"verified nothing is parked on that change address.")
         return True
     finally:
         secure_delete_file(path)
@@ -2597,7 +2706,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
 
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
-                change_target=(0, 0), change_sweep_target=None):
+                change_target=(0, 0), change_sweep_jobs=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -2613,39 +2722,42 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         _relayed = _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
         if _total_peels and _relayed < _total_peels:
             incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
-        # Every peel left (carrier reserve - real fee) as change on the same
-        # subaddress. Rotating carriers stopped that address being SPENT; this
-        # stops it being a place value accumulates unmixed. One sweep at the
-        # end collects all N deposits at once.
-        if change_sweep_target and _relayed:
-            _cs_addr, _cs_idx = change_sweep_target
-            _cs_acct, _cs_change = change_target
+        # Every peel left (carrier reserve - real fee) as change on its OWN
+        # account's subaddress 0. Rotating carriers stopped any address being
+        # spent twice; running each hop in its own account is what lets each
+        # of those change outputs be swept SEPARATELY.
+        #
+        # They must not be collected in one transaction. N inputs in one tx is
+        # public, permanent proof that those N outputs share an owner, and
+        # they are the change of the N peels -- so a single tidy sweep would
+        # announce that the whole chain was one entity. One sweep each.
+        if change_sweep_jobs and _relayed:
             try:
                 with open(fanout_file) as _mf:
                     _cs_meta = json.load(_mf).get("meta", {})
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
-            if not _run_change_sweep(args, _cs_acct, _cs_change, _cs_addr,
-                                     _cs_idx, staging_dir, proxy, _cs_meta):
-                incomplete.append("the peel chain's accumulated change was NOT "
-                                  "swept into the mix — it is unmixed on the "
-                                  "change address")
+            _missed = _run_change_sweeps(args, change_sweep_jobs, staging_dir,
+                                         proxy, _cs_meta)
+            if _missed:
+                incomplete.append(
+                    f"{_missed} of {len(change_sweep_jobs)} peel change output(s) "
+                    f"were NOT swept into the mix — they are unmixed on their "
+                    f"hop's change address")
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
         # The fan-out could not allocate its input exactly, so ~10% came back
         # as change. Sweep it into the mix rather than leaving a tenth of the
         # balance parked, unmixed, on the one output that never moves.
-        if change_sweep_target:
-            _cs_addr, _cs_idx = change_sweep_target
-            _cs_acct, _cs_change = change_target
+        if change_sweep_jobs:
             try:
                 with open(fanout_file) as _mf:
                     _cs_meta = json.load(_mf).get("meta", {})
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
-            if not _run_change_sweep(args, _cs_acct, _cs_change, _cs_addr,
-                                     _cs_idx, staging_dir, proxy, _cs_meta):
+            if _run_change_sweeps(args, change_sweep_jobs, staging_dir,
+                                  proxy, _cs_meta):
                 incomplete.append("the fan-out's change was NOT swept into the mix "
                                   "— roughly a tenth of the balance is unmixed on "
                                   "the change address")

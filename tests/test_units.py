@@ -904,26 +904,70 @@ check("changesweep: the entry it builds passes the shipped signer's validator",
 
 # BOTH distribution modes must sweep. The peel chain forwards its remainder at
 # every hop, which removed the spend hub -- but each peel still leaves
-# (carrier reserve - real fee) as change, so an N-peel chain makes N deposits
-# on the same address. Rotation stopped it being spent, not being a sink.
-_s5 = _gs_src2[_gs_src2.index("def _stage5_run("):]
+# (carrier reserve - real fee) as change, so an N-peel chain makes N deposits.
+# Rotation stopped an address being spent, not being a sink.
+_s5 = _gs_code[_gs_code.index("def _stage5_run("):]
 _s5 = _s5[:_s5.index("\ndef ")] if "\ndef " in _s5[10:] else _s5
 check("changesweep: the FAN-OUT path sweeps its change",
-      _s5.count("_run_change_sweep(") >= 1)
-check("changesweep: the PEEL path sweeps its accumulated change too",
-      _s5.count("_run_change_sweep(") == 2)
+      _s5.count("_run_change_sweeps(") >= 1)
+check("changesweep: the PEEL path sweeps its change too",
+      _s5.count("_run_change_sweeps(") == 2)
 check("changesweep: a failed sweep is reported in the run's incomplete list",
       _s5.count("incomplete.append") >= 3 and "unmixed" in _s5)
-check("changesweep: stage 5 takes the sweep destination as a parameter",
-      "change_sweep_target=None" in _gs_src2)
-# The destination must be provisioned BEFORE the spend, or the sweep has
+check("changesweep: stage 5 takes the sweep jobs as a parameter",
+      "change_sweep_jobs=None" in _gs_code)
+# The destinations must be provisioned BEFORE the spend, or a sweep has
 # nowhere to go at the moment it is needed.
-_prov = _gs_src2[_gs_src2.index("change_sweep_target = None"):
-                 _gs_src2.index("incomplete = _stage5_run(")]
-check("changesweep: the destination is created before the distribution runs",
+_prov = _gs_code[_gs_code.index("change_sweep_jobs = []"):
+                 _gs_code.index("incomplete = _stage5_run(")]
+check("changesweep: the destinations are created before the distribution runs",
       "new_subaddress_indexed(" in _prov)
-check("changesweep: failing to create it warns that the change stays unmixed",
+check("changesweep: failing to create one warns that the change stays unmixed",
       "UNMIXED" in _prov)
+check("changesweep: one destination is created per change location",
+      "for _acct in change_accounts" in _prov)
+
+# THE POINT OF THE SPLIT. N change outputs must be swept in N transactions,
+# never collected into one: a transaction's inputs are public, so spending N
+# outputs together is permanent proof that all N share an owner -- and in a
+# peel chain those N outputs are the change of the N peels, so one tidy sweep
+# publishes exactly the link the chain spent hours hiding. Measured on a chain
+# running current consensus: six change outputs swept together produced ONE
+# 6-input transaction; swept separately, six 1-in/2-out transactions.
+#
+# DRIVE it. A source grep would have passed on a loop that swept the same
+# account N times, or on one that stopped after the first failure.
+import io as _io, contextlib as _ctx
+_swept = []
+_real_cs = ghost._run_change_sweep
+try:
+    ghost._run_change_sweep = (lambda args, account, change_index, dest_addr,
+                               dest_index, staging_dir, proxy, meta,
+                               label="change sweep", seq=0:
+                               _swept.append((account, change_index, dest_addr,
+                                              seq)) or account != 99)
+    _jobs = [(5, 0, "DST5", 50), (6, 0, "DST6", 60), (99, 0, "DSTX", 70),
+             (8, 0, "DST8", 80)]
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _failed = ghost._run_change_sweeps(None, _jobs, "stg", None, {})
+    check("changesweep: one sweep per change location, never one collecting sweep",
+          len(_swept) == len(_jobs))
+    check("changesweep: each sweep names a DIFFERENT account",
+          len({a for a, _, _, _ in _swept}) == len(_jobs))
+    check("changesweep: each sweep goes to a DIFFERENT destination",
+          len({d for _, _, d, _ in _swept}) == len(_jobs))
+    check("changesweep: each sweep gets its own staging sequence number",
+          len({q for _, _, _, q in _swept}) == len(_jobs))
+    check("changesweep: a failing sweep is counted, not swallowed", _failed == 1)
+    check("changesweep: ...and the remaining locations are still swept, "
+          "not abandoned",
+          [a for a, _, _, _ in _swept] == [5, 6, 99, 8])
+    check("changesweep: the operator is told the sweeps were kept separate",
+          "SEPARATE" in _buf.getvalue())
+finally:
+    ghost._run_change_sweep = _real_cs
+
 
 
 # ---------------------------------------------------------------------------
@@ -1987,21 +2031,25 @@ class _FakeSubRpc:
         return (f"SUB{self.next}", self.next)
 
 _fr = _FakeSubRpc()
-_ai = {"ENTRYADDR": 7}
 _dests = [f"MIX{i}" for i in range(5)]
 _by = {a: Decimal("1.0") for a in _dests}
-_plan = ghost.build_peel_stage_plan(_fr, _ai, 3, "ENTRYADDR", 7, _dests, _by, _HR)
+_real_cfa0 = ghost.create_fresh_account
+try:
+    _seq0 = iter(range(11, 99))
+    ghost.create_fresh_account = lambda rpc, label="": next(_seq0)
+    _plan, _chg0 = ghost.build_peel_stage_plan(
+        _fr, 3, "ENTRYADDR", 7, _dests, _by, _HR)
+finally:
+    ghost.create_fresh_account = _real_cfa0
 check("build_peel_stage_plan: one peel per destination", len(_plan) == len(_dests))
 check("build_peel_stage_plan: peel 0 spends ENTRY",
       _plan[0]["src"] == "ENTRYADDR" and _plan[0]["src_index"] == 7)
 check("build_peel_stage_plan: provisions one carrier per hop, not per destination",
       len(_fr.calls) == len(_dests) - 1)
-check("build_peel_stage_plan: carriers are created in the spending account",
-      all(a == 3 for a, _ in _fr.calls))
+check("build_peel_stage_plan: each carrier is created in its OWN fresh account",
+      len({a for a, _ in _fr.calls}) == len(_dests) - 1)
 check("build_peel_stage_plan: carriers are created UNLABELLED",
       all(l == "" for _, l in _fr.calls))
-check("build_peel_stage_plan: every carrier index is recorded in addr_index",
-      all(_ai.get(f"SUB{40 + i}") == 40 + i for i in range(1, len(_dests))))
 check("build_peel_stage_plan: no hop ever spends subaddress 0",
       all(p["src_index"] != 0 for p in _plan))
 check("build_peel_stage_plan: each later peel spends the previous carrier",
@@ -2016,6 +2064,33 @@ check("build_peel_stage_plan: peels are numbered in order",
       [p["peel_num"] for p in _plan] == list(range(len(_dests))))
 check("build_peel_stage_plan: the destinations are the mix addresses, in order",
       [p["dst"] for p in _plan] == _dests)
+
+# A peel plan must therefore name a DIFFERENT account per hop, or the change
+# all lands on one subaddress 0 and no amount of separate sweeping helps.
+_fr2 = _FakeSubRpc()
+_real_cfa = ghost.create_fresh_account
+try:
+    _acct_seq = iter(range(11, 99))
+    ghost.create_fresh_account = lambda rpc, label="": next(_acct_seq)
+    _plan2, _chg = ghost.build_peel_stage_plan(
+        _fr2, 3, "ENTRYADDR", 7, [f"M{i}" for i in range(5)],
+        {f"M{i}": Decimal("1.0") for i in range(5)}, _HR)
+finally:
+    ghost.create_fresh_account = _real_cfa
+check("peel accounts: every hop names an account",
+      all(isinstance(p.get("account_index"), int) for p in _plan2))
+check("peel accounts: every hop runs in a DIFFERENT account",
+      len({p["account_index"] for p in _plan2}) == len(_plan2))
+check("peel accounts: peel 0 spends the mix account, not a fresh one",
+      _plan2[0]["account_index"] == 3)
+check("peel accounts: no hop runs in account 0 (its subaddr 0 is the PRIMARY)",
+      all(p["account_index"] != 0 for p in _plan2))
+check("peel accounts: one change location reported per hop",
+      len(_chg) == len(_plan2))
+check("peel accounts: the change locations are exactly the hops' accounts",
+      sorted(_chg) == sorted(p["account_index"] for p in _plan2))
+check("peel accounts: the signer's validator accepts a per-hop account",
+      (lambda: (airgap._validate_plan(_plan2), True)[1])())
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

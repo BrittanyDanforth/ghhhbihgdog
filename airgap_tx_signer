@@ -75,6 +75,25 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
         elif si is not None and (not isinstance(si, int) or isinstance(si, bool) or si < 0):
             sys.exit(f"[!] Schema error at TX {i}: 'src_index' present but invalid "
                      f"({si!r}); expected a non-negative int.")
+        # OPTIONAL per-TX account override. A peel chain runs every hop in its
+        # OWN account so each hop's change lands on a different subaddress 0 --
+        # see the peel planner. Without this every hop would share
+        # meta.account_index, all N change outputs would pile onto one
+        # subaddress 0, and the sweep that collects them would be a single
+        # N-input transaction: a public proof that all N peels are one owner,
+        # which is precisely what the peel chain exists to avoid.
+        #
+        # Validated exactly as strictly as meta.account_index, and NEVER
+        # defaulted to 0 -- account 0's subaddress 0 is the wallet's PRIMARY
+        # address, so a malformed value must stop the run, not silently spend
+        # the operator's identity.
+        ai = tx.get("account_index")
+        if ai is not None and (not isinstance(ai, int) or isinstance(ai, bool)
+                               or ai < 0):
+            sys.exit(f"[!] Schema error at TX {i}: 'account_index' present but "
+                     f"invalid ({ai!r}); expected a non-negative int. Refusing "
+                     f"to fall back to meta.account_index for a plan that "
+                     f"explicitly names an account.")
         # A SWEEP carries no amount by design: sweep_all sends the whole
         # subaddress balance minus the fee, which is exactly why it leaves no
         # change. Requiring 'amt' here would reject the one plan shape that
@@ -163,6 +182,7 @@ def _canonical_plan(plan: List[dict]) -> list:
         dests = tx.get("destinations")
         entry = {
             "src_index": tx.get("src_index"),
+            "account_index": tx.get("account_index"),
             "delay": tx.get("delay"),
             "sweep": bool(tx.get("sweep")),
         }
@@ -350,6 +370,12 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         # int; no default -- a silent .get(..., 0) here was the mechanism that
         # made a missing key spend from the wallet's primary address.
         src_index = tx["src_index"]
+        # Which account this ONE spend comes from. _validate_plan has already
+        # rejected a malformed override, so a present value is trustworthy and
+        # an absent one means "the plan's single account".
+        tx_acct = tx.get("account_index")
+        if tx_acct is None:
+            tx_acct = acct_idx
         # Multi-destination (fan-out: one input -> many outputs) or single
         # (DAG hop). transfer_split takes a destinations list either way.
         # A SWEEP entry moves an ENTIRE subaddress balance to one destination.
@@ -389,7 +415,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 # zero-change, and it is why a sweep entry carries no "amt".
                 result = rpc.raw_request("sweep_all", {
                     "address": tx["dst"],
-                    "account_index": acct_idx,
+                    "account_index": tx_acct,
                     "subaddr_indices": [src_index],
                     "priority": args.fee_priority,
                     "get_tx_hex": False,
@@ -398,7 +424,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             else:
                 result = rpc.raw_request("transfer_split", {
                     "destinations": dests,
-                    "account_index": acct_idx,
+                    "account_index": tx_acct,
                     "subaddr_indices": [src_index],
                     "priority": args.fee_priority,
                     "get_tx_hex": False,
