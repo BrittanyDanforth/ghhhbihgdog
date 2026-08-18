@@ -22,7 +22,7 @@ Outsider corpus:
 If either PRIMARY string appears in that corpus, the hidden user is
 uncovered. Isolated testnet. SKIPs if monero binaries are absent.
 """
-import subprocess, time, os, shutil, tempfile, sys, json, random, traceback
+import subprocess, time, os, shutil, tempfile, sys, json, random, traceback, re
 import importlib.machinery, importlib.util
 from decimal import Decimal
 import requests
@@ -311,6 +311,21 @@ try:
     check("OUTSIDER does not find name1 PRIMARY in chain + disk", not hit1)
     check("OUTSIDER does not find name2 PRIMARY in chain + disk", not hit2)
 
+    # Every address-like string the outsider can actually read.
+    mix_addrs = {m["address"] for m in mix}
+    pub_addrs = sorted(set(re.findall(
+        r"[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{95}",
+        corpus)))
+    print(f"  address-like strings outsider can read: {len(pub_addrs)}")
+    for a in pub_addrs:
+        tag = ("ENTRY" if a == ENTRY else
+               "MIX dest" if a in mix_addrs else
+               "PRIMARY" if a in (name1, name2) else "OTHER")
+        print(f"    ...{a[-8:]}  {tag}")
+    check("public addresses are ENTRY/mix dests only (never PRIMARY)",
+          pub_addrs and all(a == ENTRY or a in mix_addrs for a in pub_addrs)
+          and name1 not in pub_addrs and name2 not in pub_addrs)
+
     # What they DO find.
     check("OUTSIDER does find ENTRY (memo / bundle / plan dest)",
           ENTRY in corpus)
@@ -347,6 +362,11 @@ try:
     open(os.path.join(PUBLIC, "decoded_shape.json"), "w").write(json.dumps(vin_vout, indent=2)[:20000])
     print(f"  decoded {len(vin_vout)} tx shape(s); first vout type: "
           f"{type((vin_vout[0] or {}).get('vout')).__name__ if vin_vout else 'n/a'}")
+    rct_any = any(v.get("rct") for v in vin_vout)
+    print(f"  chain RCT signatures present: {rct_any}")
+    print("  (isolated genesis is often pre-RCT so amounts leak; that is not an identity)")
+    check("plaintext amounts still do not name either PRIMARY",
+          not hit1 and not hit2)
 
     # Guess: is ENTRY the hidden user? No — we know it is not.
     check("ENTRY is not name1 PRIMARY", ENTRY != name1)
