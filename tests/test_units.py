@@ -2594,6 +2594,96 @@ check("cleanup: ...and a file NOT named as current is still erased",
 shutil.rmtree(_cl, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# The veil's STAGE-5 wiring, driven. Source assertions are what let
+# `secrets.SystemRandom().randbelow(540)` sit in the change sweep from the day
+# it was written: reading a call site does not run it.
+# ---------------------------------------------------------------------------
+_seq5 = []
+_r_rr, _r_wc, _r_rpc2 = ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain
+_r_nn, _r_tr, _r_cs = ghost.newnym, ghost.tor_recheck, ghost._run_change_sweeps
+try:
+    ghost._run_round = lambda a, f, sd, label: _seq5.append(("round", label))
+    ghost._wait_for_carrier = lambda a, acct, idx, need, p, label: (
+        _seq5.append(("wait", acct, idx, str(need))) or True)
+    ghost._run_peel_chain = lambda *a, **k: (_seq5.append(("peels",)) or 3)
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost.newnym = lambda **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    _pf = Path(_scratch) / "plan.json"
+    _pf.write_text(json.dumps({"meta": {"account_index": 1},
+                               "txs": [{}, {}, {}]}))
+    _vf = Path(_scratch) / "veil.json"
+    _vf.write_text(json.dumps({"meta": {}, "txs": [{}]}))
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg", None,
+                          Decimal("9"), distribution_mode="peel",
+                          change_target=(4, 0), change_sweep_jobs=[],
+                          veil_file=_vf, veil_target=(7, 2),
+                          veil_need=Decimal("8.5"))
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost.newnym, ghost.tor_recheck, ghost._run_change_sweeps) = (
+        _r_rr, _r_wc, _r_rpc2, _r_nn, _r_tr, _r_cs)
+
+check("veil wiring: the veil round runs, and runs FIRST",
+      _seq5 and _seq5[0] == ("round", "Entry veil"))
+check("veil wiring: it waits for the veil carrier before distributing",
+      _seq5[1][0] == "wait" and _seq5[1][1:3] == (7, 2))
+check("veil wiring: it waits on the CARRIER's account, not the entry's",
+      _seq5[1][1] == 7)
+check("veil wiring: it waits for the amount the distribution needs",
+      _seq5[1][3] == "8.5")
+check("veil wiring: only then does the distribution run",
+      ("peels",) in _seq5 and _seq5.index(("peels",)) > 1)
+
+# A veil that never confirms must STOP, not distribute from an entry the plan
+# no longer describes.
+_seq6 = []
+try:
+    ghost._run_round = lambda a, f, sd, label: _seq6.append(("round", label))
+    ghost._wait_for_carrier = lambda *a, **k: False
+    ghost._run_peel_chain = lambda *a, **k: (_seq6.append(("peels",)) or 3)
+    ghost.newnym = lambda **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _inc = ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg",
+                                 None, Decimal("9"), distribution_mode="peel",
+                                 change_target=(4, 0), change_sweep_jobs=[],
+                                 veil_file=_vf, veil_target=(7, 2),
+                                 veil_need=Decimal("8.5"))
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost.newnym, ghost.tor_recheck, ghost._run_change_sweeps) = (
+        _r_rr, _r_wc, _r_rpc2, _r_nn, _r_tr, _r_cs)
+check("veil wiring: a veil that never confirms does NOT distribute",
+      ("peels",) not in _seq6)
+check("veil wiring: ...and the run reports why rather than claiming success",
+      _inc and "nothing was distributed" in _inc[0])
+
+# With the veil off there is no round 0 at all.
+_seq7 = []
+try:
+    ghost._run_round = lambda a, f, sd, label: _seq7.append(("round", label))
+    ghost._wait_for_carrier = lambda *a, **k: True
+    ghost._run_peel_chain = lambda *a, **k: (_seq7.append(("peels",)) or 3)
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost.newnym = lambda **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg", None,
+                          Decimal("9"), distribution_mode="peel",
+                          change_target=(4, 0), change_sweep_jobs=[],
+                          veil_file=None)
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost.newnym, ghost.tor_recheck, ghost._run_change_sweeps) = (
+        _r_rr, _r_wc, _r_rpc2, _r_nn, _r_tr, _r_cs)
+check("veil wiring: --no-entry-veil skips round 0 entirely",
+      not any(x[0] == "round" and x[1] == "Entry veil" for x in _seq7)
+      and ("peels",) in _seq7)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
