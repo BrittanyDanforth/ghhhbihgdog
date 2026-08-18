@@ -483,6 +483,13 @@ def main():
                     "    mixing pipeline.\n"
                     "    Fix: restart monerod with --tx-proxy tor,127.0.0.1:9050\n"
                     "         (and typically --anonymous-inbound / no clearnet peers).\n"
+                    "    WHAT THIS DID AND DID NOT OBSERVE: monerod exposes no RPC that\n"
+                    "    reports its --tx-proxy setting (checked on 0.18.3.1), so this\n"
+                    "    reads the P2P PEER LIST instead. If you HAVE set --tx-proxy, your\n"
+                    "    tx relay may already be anonymous while block sync legitimately\n"
+                    "    keeps clearnet peers — and this check cannot tell those apart. In\n"
+                    "    that case the override below is the right answer; otherwise it is\n"
+                    "    not.\n"
                     "    Override only if you understand the exposure: "
                     "--allow-clearnet-relay"
                 )

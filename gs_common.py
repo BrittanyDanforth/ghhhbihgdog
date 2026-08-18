@@ -288,7 +288,8 @@ def check_daemon_relay_egress(daemon_url: str,
     Never raises: a failed probe reports "unknown" rather than blocking a
     broadcast on a diagnostic.
     """
-    out = {"verdict": "unknown", "onion": 0, "clear": 0, "detail": ""}
+    out = {"verdict": "unknown", "onion": 0, "clear": 0, "local": 0,
+           "detail": ""}
     parsed = urlparse(daemon_url)
     host = (parsed.hostname or "127.0.0.1").lower()
     use_proxies = None
@@ -316,19 +317,50 @@ def check_daemon_relay_egress(daemon_url: str,
             out["detail"] = ("daemon did not return a peer list (restricted RPC?) -- "
                              "cannot observe where it relays")
             return out
+        # CLASSIFY BY monerod's OWN address_type, not by string-matching the
+        # address. Observed on real monerod 0.18.3.1: every get_connections
+        # entry carries address_type (epee's enum -- 1 ipv4, 2 ipv6, 3 i2p,
+        # 4 tor), alongside address/host/ip/localhost/local_ip. Matching
+        # ".onion" in a string was a guess at a format; this is the daemon
+        # stating which network the connection is on. The string check stays as
+        # a fallback for anything that does not report the field.
+        out["local"] = 0
         for c in peers:
             addr = str(c.get("address") or c.get("host") or "").lower()
-            if ".onion" in addr or ".i2p" in addr:
+            atype = c.get("address_type")
+            anon = (atype in (3, 4)) if isinstance(atype, int) else (
+                ".onion" in addr or ".i2p" in addr)
+            if anon:
                 out["onion"] += 1
+                continue
+            # LOOPBACK IS NOT A CLEARNET EXPOSURE, AND IT IS NOT SAFE EITHER.
+            #
+            # A peer on 127.0.0.1 is another daemon on this same machine, so
+            # nothing left the host by reaching it -- but that daemon has its
+            # own peers, and its egress is not observable from here. Counting
+            # it as "clearnet" is a false alarm; counting it as "tor" would be
+            # a lie. It is genuinely unknown, and saying so is the only honest
+            # option. This mattered because every false alarm pushes the
+            # operator toward --allow-clearnet-relay, which switches the check
+            # off for the case it exists to catch.
+            if c.get("localhost") is True or addr.startswith(("127.", "[::1]", "::1")):
+                out["local"] += 1
             elif addr:
                 out["clear"] += 1
-        if out["onion"] and not out["clear"]:
-            out["verdict"] = "tor"
-            out["detail"] = f"all {out['onion']} relay peer(s) are .onion/.i2p"
-        elif out["clear"]:
+        if out["clear"]:
             out["verdict"] = "clearnet"
             out["detail"] = (f"{out['clear']} clearnet peer(s) vs {out['onion']} "
                              f"anonymous -- the tx would be relayed to raw IPs")
+        elif out["onion"]:
+            out["verdict"] = "tor"
+            out["detail"] = (f"all {out['onion']} non-local relay peer(s) are "
+                             f"Tor/I2P"
+                             + (f" ({out['local']} loopback peer(s) ignored)"
+                                if out["local"] else ""))
+        elif out["local"]:
+            out["detail"] = (f"only loopback peer(s) ({out['local']}): this daemon "
+                             f"relays to another daemon on this machine, whose own "
+                             f"egress cannot be observed from here")
         else:
             out["detail"] = "daemon has no peer connections yet; nothing to observe"
     except Exception as e:

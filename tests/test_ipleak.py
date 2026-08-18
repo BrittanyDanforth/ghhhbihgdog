@@ -462,6 +462,89 @@ check("...and JSONRPCWallet is constructed with proxy_url",
       "proxy_url" in _ctor_kwargs)
 
 
+# ---------------------------------------------------------------------------
+# RELAY EGRESS: classify by monerod's OWN address_type, and do not raise a
+# false alarm on loopback.
+#
+# Observed on real monerod 0.18.3.1 (two peered testnet daemons): every
+# get_connections entry carries address_type -- epee's enum, 1 ipv4, 2 ipv6,
+# 3 i2p, 4 tor -- alongside address/host/ip/localhost/local_ip. Matching
+# ".onion" in the address string was a guess at a format; address_type is the
+# daemon stating which network the connection is on.
+#
+# The loopback case matters for a different reason. A 127.0.0.1 peer was
+# counted as clearnet, which is a false alarm -- and every false alarm pushes
+# the operator toward --allow-clearnet-relay, which switches the check off for
+# the case it exists to catch. It is not "tor" either: that daemon has its own
+# peers and its egress is not observable from here. Unknown is the honest
+# answer, and the code now says which.
+# ---------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, payload): self._p = payload
+    def json(self): return self._p
+
+
+def _egress_with(peers, offline=False):
+    """Drive the real check with a scripted get_info/get_connections pair."""
+    calls = {"n": 0}
+
+    def fake_post(url, json=None, timeout=None, proxies=None):
+        calls["n"] += 1
+        if json.get("method") == "get_info":
+            return _FakeResp({"result": {"offline": offline}})
+        return _FakeResp({"result": {"connections": peers}})
+
+    real = gs.requests.post
+    gs.requests.post = fake_post
+    try:
+        return gs.check_daemon_relay_egress("http://127.0.0.1:18081")
+    finally:
+        gs.requests.post = real
+
+
+_tor_peer = {"address": "abcd.onion:18080", "host": "abcd.onion", "address_type": 4}
+_ip_peer = {"address": "8.8.8.8:18080", "host": "8.8.8.8", "address_type": 1}
+_loop_peer = {"address": "127.0.0.1:18080", "host": "127.0.0.1",
+              "address_type": 1, "localhost": True}
+# a Tor peer whose ADDRESS STRING does not say .onion -- the case the old
+# substring match would have mis-filed as clearnet
+_tor_odd = {"address": "10.0.0.1:18080", "host": "10.0.0.1", "address_type": 4}
+
+check("egress: all-Tor peers verify as anonymous",
+      _egress_with([_tor_peer, _tor_peer])["verdict"] == "tor")
+check("egress: a single clearnet peer is enough to refuse",
+      _egress_with([_tor_peer, _ip_peer])["verdict"] == "clearnet")
+check("egress: address_type 4 is trusted over the address STRING",
+      _egress_with([_tor_odd])["verdict"] == "tor")
+check("egress: a loopback peer is NOT reported as clearnet",
+      _egress_with([_loop_peer])["verdict"] != "clearnet")
+check("egress: ...it is reported as unknown, not as verified-anonymous",
+      _egress_with([_loop_peer])["verdict"] == "unknown")
+check("egress: ...and says why (the other daemon's egress is unobservable)",
+      "cannot be observed" in _egress_with([_loop_peer])["detail"])
+check("egress: loopback does not mask a real clearnet peer",
+      _egress_with([_loop_peer, _ip_peer])["verdict"] == "clearnet")
+check("egress: loopback alongside Tor peers still verifies anonymous",
+      _egress_with([_loop_peer, _tor_peer])["verdict"] == "tor")
+check("egress: an --offline daemon is called out separately",
+      _egress_with([], offline=True)["verdict"] == "offline")
+check("egress: no peers at all is unknown, not tor",
+      _egress_with([])["verdict"] == "unknown")
+# older daemons that do not report address_type must still work
+check("egress: falls back to the address string when address_type is absent",
+      _egress_with([{"address": "xyz.onion:18080"}])["verdict"] == "tor")
+
+# The refusal must say what it could NOT see, or a correctly-configured
+# operator (--tx-proxy set, clearnet block-sync peers) is refused with no
+# explanation and reaches for --allow-clearnet-relay reflexively.
+for _f in ("GhostSpiral", "broadcast_signed_xmr"):
+    _txt = open(os.path.join(REPO, _f)).read()
+    check(f"{_f}: the clearnet refusal admits it cannot see --tx-proxy",
+          "reports its --tx-proxy setting" in _txt)
+    check(f"{_f}: ...and says it read the P2P peer list instead",
+          "P2P PEER LIST" in _txt or "P2P\n" in _txt or "PEER LIST" in _txt)
+
+
 _total_leaks = []
 for _script in _SHIPPED:
     _p = os.path.join(REPO, _script)

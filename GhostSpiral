@@ -1112,7 +1112,12 @@ def stage0_preflight(args, proxy) -> tuple:
                 "    raw-IP peers, so every transaction this run creates would be\n"
                 "    broadcast from your IP — defeating the entire mixing pipeline.\n"
                 "    Fix: restart monerod with --tx-proxy tor,127.0.0.1:9050\n"
-                "    Override only if you understand the exposure: --allow-clearnet-relay"
+                "    WHAT THIS DID AND DID NOT OBSERVE: monerod exposes no RPC that\n"
+                "    reports its --tx-proxy setting (checked on 0.18.3.1), so this reads\n"
+                "    the P2P PEER LIST instead. If you HAVE set --tx-proxy, your tx relay\n"
+                "    may already be anonymous while block sync legitimately keeps clearnet\n"
+                "    peers — and this check cannot tell those apart. In that case the\n"
+                "    override below is the right answer; otherwise it is not.\n"                "    Override only if you understand the exposure: --allow-clearnet-relay"
             )
         print("  [!] --allow-clearnet-relay given; proceeding DESPITE clearnet egress.")
     elif egress["verdict"] == "offline":
