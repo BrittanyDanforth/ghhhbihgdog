@@ -1815,6 +1815,104 @@ def resolve_entry_account(rpc, addr_index: dict, entry_addr: str,
     return account, index
 
 
+def report_holdings(rpc, accounts) -> list:
+    """Tell the operator WHERE their money is, and how to spend it without
+    undoing the run. Returns the funded (account, balance_atomic) pairs.
+
+    This is the necessary other half of putting every output in its own
+    account. Isolation is what stops one transaction merging the mix, but it
+    also means the run no longer ends with "the mix account" holding
+    everything: it ends with a dozen accounts holding a slice each. An
+    operator who does not know that has been handed a privacy win in exchange
+    for forgotten money, and that trade is worse than the leak.
+
+    NOTHING IS WRITTEN TO DISK, and the first version of this did write a
+    holdings file "because a terminal scrollback is not a record". That was
+    wrong, and wrong in a way this codebase had already ruled on: create_subs
+    stopped labelling subaddresses because labels live in the WALLET FILE and
+    hand an adversary who reads it the run's whole structure with no analysis.
+    A file listing exactly which accounts belong to one run is that same
+    disclosure under a different name -- and the grouping is the only part an
+    adversary could not already read, since the wallet shows every account and
+    balance regardless.
+
+    The operator does not need the list preserved. They need the RULE, and the
+    wallet already shows which accounts hold money. So: say it, once, and
+    leave no artifact.
+
+    Amounts reach the terminal but never the integrity chain: that file
+    persists, and per-account amounts are the one quantity that correlates
+    directly against the on-chain outputs.
+    """
+    funded = []
+    for acct in sorted(set(accounts)):
+        try:
+            bal = rpc.raw_request("get_balance", {"account_index": int(acct)}) or {}
+        except Exception:                                    # noqa: BLE001
+            continue
+        total = int(bal.get("balance", 0) or 0)
+        if total > 0:
+            funded.append((int(acct), total))
+    if not funded:
+        return funded
+
+    _tot = sum(b for _, b in funded)
+    print()
+    print(f"  [*] THIS RUN'S FUNDS ARE IN {len(funded)} SEPARATE ACCOUNTS:")
+    for acct, total in funded:
+        print(f"        account {acct:>4}   {Decimal(total) / Decimal(10 ** 12)} XMR")
+    print(f"      total {Decimal(_tot) / Decimal(10 ** 12)} XMR")
+    print()
+    print("      SPEND THEM ONE ACCOUNT AT A TIME. They are in separate")
+    print("      accounts on purpose: a transaction's inputs are public, so")
+    print("      spending several of these outputs together is permanent proof")
+    print("      that they share an owner — which is exactly what this run")
+    print("      spent hours separating. A Monero transaction cannot reach")
+    print("      across accounts, so the wallet will refuse to merge them; do")
+    print("      not defeat that by consolidating them by hand first.")
+    print("      Sending them all to ONE exchange deposit address tells that")
+    print("      exchange they are yours. That link is not on-chain and no")
+    print("      structure here can remove it — split across venues and time.")
+
+    print("      Not written to disk: a file naming this run's accounts would")
+    print("      hand anyone who reads the machine the grouping, which is the")
+    print("      one thing the wallet does not already show. Note the account")
+    print("      numbers now if you want them.")
+    # Count only. The account NUMBERS would let anyone reading the persistent
+    # chain reconstruct the grouping the print above deliberately leaves on
+    # the screen and nowhere else.
+    integrity_log("main", f"holdings:{len(funded)}_accounts")
+    return funded
+
+
+def report_completion(rpc, incomplete, accounts) -> None:
+    """Say what actually happened, then say where the money is. Exits non-zero
+    on an incomplete run.
+
+    This used to print "pipeline complete." unconditionally, so a peel chain
+    that stopped partway or a DAG round that was skipped still read as a
+    finished mix -- the same fake-success pattern already removed from
+    paranoia_mode.
+
+    The holdings report runs only on a COMPLETE run. On an incomplete one the
+    accounts are mid-flight: value is sitting on carriers that were meant to
+    forward it, and listing balances then would read as "here is your result"
+    when the result is a half-executed chain.
+    """
+    print()
+    if incomplete:
+        integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
+        print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
+        for w in incomplete:
+            print(f"      - {w}")
+        print("  [!] Funds are safe in the wallet, but do NOT assume the full "
+              "mixing depth was applied.")
+        sys.exit(1)
+    report_holdings(rpc, accounts)
+    integrity_log("main", "pipeline_complete")
+    print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
+
+
 def main():
     install_signal_handlers()
 
@@ -2292,21 +2390,9 @@ def main():
                                  change_target=(bal_account, 0),
                                  change_sweep_jobs=change_sweep_jobs)
 
-        # Honest completion. This used to print "pipeline complete." unconditionally,
-        # so a peel chain that stopped partway or a DAG round that was skipped still
-        # read as a finished mix -- the same fake-success pattern already removed
-        # from paranoia_mode. Say what actually happened.
-        print()
-        if incomplete:
-            integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
-            print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
-            for _w in incomplete:
-                print(f"      - {_w}")
-            print("  [!] Funds are safe in the wallet, but do NOT assume the full "
-                  "mixing depth was applied.")
-            sys.exit(1)
-        integrity_log("main", "pipeline_complete")
-        print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
+        report_completion(rpc_primary, incomplete,
+                          [a for a, _ in addr_index.values()]
+                          + list(change_accounts))
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.

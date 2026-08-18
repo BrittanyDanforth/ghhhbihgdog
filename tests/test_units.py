@@ -2308,6 +2308,104 @@ check("hop delay: the window reaches every peel in the plan",
       all(p["delay"] == 9000 for p in _p3))
 
 
+# ---------------------------------------------------------------------------
+# THE HOLDINGS REPORT. The other half of isolating every output.
+#
+# Isolation stops one transaction merging the mix, but it also means the run no
+# longer ends with "the mix account" holding everything -- it ends with a dozen
+# accounts holding a slice each. An operator who does not know that has traded
+# a privacy win for forgotten money, which is the worse outcome.
+# ---------------------------------------------------------------------------
+class _BalRpc:
+    def __init__(self, balances): self.balances = balances; self.asked = []
+    def raw_request(self, method, params=None):
+        assert method == "get_balance"
+        a = params["account_index"]
+        self.asked.append(a)
+        return {"balance": self.balances.get(a, 0)}
+
+_br = _BalRpc({4: 1_400_000_000_000, 5: 0, 6: 2_100_000_000_000, 7: 0})
+_buf2 = _io.StringIO()
+with _ctx.redirect_stdout(_buf2):
+    _funded = ghost.report_holdings(_br, [4, 5, 6, 7, 6])
+_out2 = _buf2.getvalue()
+check("holdings: only accounts that actually hold money are listed",
+      _funded == [(4, 1_400_000_000_000), (6, 2_100_000_000_000)])
+check("holdings: a repeated account is asked about once, not twice",
+      sorted(_br.asked) == [4, 5, 6, 7])
+check("holdings: the operator is told how many accounts hold the run",
+      "2 SEPARATE ACCOUNTS" in _out2)
+check("holdings: each account number and balance is shown",
+      "account    4" in _out2 and "1.4" in _out2
+      and "account    6" in _out2 and "2.1" in _out2)
+check("holdings: the total is shown, so nothing looks missing",
+      "3.5" in _out2)
+check("holdings: the RULE is stated, not just the list",
+      "ONE ACCOUNT AT A TIME" in _out2)
+check("holdings: it explains WHY (inputs are public), not just what to do",
+      "inputs are public" in _out2)
+check("holdings: the exchange-side link is named as unfixable here",
+      "exchange" in _out2 and "not on-chain" in _out2)
+
+# NOTHING ON DISK. create_subs stopped labelling subaddresses because labels
+# live in the wallet file and hand a reader the run's structure; a file naming
+# this run's accounts is the same disclosure renamed. The grouping is the only
+# part the wallet does not already show.
+_before = set(os.listdir("."))
+_buf3 = _io.StringIO()
+with _ctx.redirect_stdout(_buf3):
+    ghost.report_holdings(_BalRpc({9: 5_000_000_000_000}), [9])
+check("holdings: writes no file -- the grouping is what an adversary lacks",
+      set(os.listdir(".")) == _before)
+check("holdings: and says so, so the absence reads as deliberate",
+      "Not written to disk" in _buf3.getvalue())
+
+# The integrity chain may record that a report happened, never WHICH accounts:
+# that file persists and the account numbers are the grouping.
+_hl = []
+_real_il2 = ghost.integrity_log
+try:
+    ghost.integrity_log = lambda st, msg: _hl.append(msg)
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost.report_holdings(_BalRpc({11: 1, 12: 2}), [11, 12])
+finally:
+    ghost.integrity_log = _real_il2
+check("holdings: the integrity chain records a COUNT, not the account numbers",
+      _hl == ["holdings:2_accounts"])
+
+# An empty run reports nothing rather than an empty banner.
+_buf4 = _io.StringIO()
+with _ctx.redirect_stdout(_buf4):
+    _none = ghost.report_holdings(_BalRpc({}), [1, 2])
+check("holdings: no funded accounts means no report at all",
+      _none == [] and _buf4.getvalue().strip() == "")
+
+# An unreadable account must not abort the report -- the other balances are
+# still the operator's only map to their own money.
+class _FlakyBal(_BalRpc):
+    def raw_request(self, method, params=None):
+        if params["account_index"] == 5:
+            raise RuntimeError("rpc blew up")
+        return super().raw_request(method, params)
+with _ctx.redirect_stdout(_io.StringIO()):
+    _f2 = ghost.report_holdings(_FlakyBal({4: 7, 5: 9, 6: 8}), [4, 5, 6])
+check("holdings: one unreadable account does not lose the whole report",
+      _f2 == [(4, 7), (6, 8)])
+
+# report_completion must not print holdings for a half-executed run: the value
+# is mid-flight on carriers, and a balance table would read as the result.
+_buf5 = _io.StringIO()
+try:
+    with _ctx.redirect_stdout(_buf5):
+        ghost.report_completion(_BalRpc({4: 1}), ["peel chain relayed 2/6"], [4])
+    check("holdings: an incomplete run exits non-zero", False)
+except SystemExit as _se:
+    check("holdings: an incomplete run exits non-zero", _se.code == 1)
+check("holdings: an incomplete run reports the shortfall, not a balance table",
+      "NOT what was planned" in _buf5.getvalue()
+      and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
