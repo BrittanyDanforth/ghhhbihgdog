@@ -47,7 +47,47 @@ DUST_XMR = Decimal("0.0001")
 # forwards to the next rotating carrier. See the reserve comment in the peel
 # planner: under-reserving strands funds mid-chain, over-reserving only
 # shrinks the final distribution slightly.
-PEEL_CARRIER_RESERVE_MULT = Decimal("4")
+#: Per-hop headroom a peel carrier must keep, as a multiple of the daemon's
+#: priority-1 fee estimate. MEASURED against monerod/monero-wallet-rpc 0.18.3.1
+#: on a chain running CURRENT consensus, not guessed.
+#:
+#: What a peel actually needs left over is its own real fee, and the real fee
+#: grows with the number of INPUTS being spent. With get_fee_estimate reporting
+#: 0.0024 XMR, a 2-destination transfer_split measured:
+#:
+#:     inputs   real fee      x estimate   minimum headroom
+#:        1     0.0026328        1.10          1.1x
+#:        2     0.0034236        1.43          1.5x
+#:        4     0.0050052        2.09          2.5x
+#:        8     0.0082176        3.42          4x
+#:       16     0.0147360        6.14         10x
+#:
+#: A peel carrier is paid by exactly one previous peel, so it holds ONE output
+#: and lands in the top row: ~1.25x. 8 (x FEE_SAFETY_MARGIN = 12x the estimate)
+#: clears even the 16-input row, which only the first hop out of ENTRY could
+#: ever approach, and leaves room for the fee drifting upward between the
+#: single estimate taken at stage 0 and a peel relayed hours later.
+#:
+#: TRAP, and the reason this constant has been wrong twice: measure it on a
+#: chain that is actually running current consensus. `monerod --regtest` is
+#: hard fork v16 (RingCT, ring 16, current fee rules) from height 1.
+#: `monerod --testnet --offline` is NOT -- a fresh chain there sits at hard
+#: fork v1, PRE-RingCT, where the next fork is height 624634 and outputs are
+#: digit-denominated into powers of ten. Under those rules the same 2-
+#: destination peel appears to need ~82x the estimate as an ABSOLUTE reserve
+#: (~0.16-0.20 XMR regardless of input size). That number is an artifact of
+#: denomination bloat and does not exist on mainnet; it is what previously
+#: pushed this constant to 100, i.e. ~90x more than needed. Over-reserving is
+#: not free: it inflates peel_entry_requirement, which forces the stage-4
+#: shrink-to-fit loop to cut the distribution and leave the difference sitting
+#: unmixed on ENTRY.
+#:
+#: (It was also 1 and then 4 at earlier points, both from treating a stranded
+#: chain as a fee shortfall. 1 was in fact adequate under real consensus --
+#: 1 x 1.5 = 1.5x clears the 1-input requirement -- so those "fixes" were
+#: chasing a testnet ghost too.)
+PEEL_CARRIER_RESERVE_MULT = Decimal("8")
+
 
 # Single source of truth for the fee safety margin. It was written inline as
 # Decimal("1.5") in the stage-4 fee budget, in compute_hop_amount, and in the
@@ -328,6 +368,173 @@ def select_fanout_targets(mix_targets: list, decoy_addrs: set,
     fanout_dests = list(mix_targets[:fanout_count])
     hop_sources = list(fanout_dests)     # every output hops -- no dead-end tell
     return fanout_dests, hop_sources
+
+
+def peel_carrier_reserves(amounts: list, hop_headroom: Decimal) -> list:
+    """How much each carrier must keep so the NEXT peel is CONSTRUCTIBLE.
+
+    Returns n-1 reserves, one per carrier. PURE, so the arithmetic that decides
+    whether a peel chain can run at all is testable directly instead of only by
+    stranding funds on a real chain.
+
+    Every hop needs the SAME headroom, because every hop is the same shape: a
+    carrier holding one output, spending it to one or two destinations. That
+    headroom is the hop's own fee (see PEEL_CARRIER_RESERVE_MULT for the
+    measurements), and it does not depend on how much the hop is carrying --
+    an input of 2.6 XMR and an input of 10 XMR need the identical amount left
+    over.
+
+    With carrier i-1 holding sum(amounts[i:]) + reserve_{i-1} and peel i
+    spending sum(amounts[i:]) + reserve_i, the surplus is exactly
+    reserve_{i-1} - reserve_i, so each reserve must exceed the next by one
+    headroom:
+
+        reserve_i = (n - 1 - i) * headroom
+
+    which is the shape the code already had; only the constant was ever wrong.
+
+    (An earlier attempt at this modelled the limit as a FRACTION of the input,
+    on the hypothesis that a wallet refuses to spend more than ~98% of an
+    output. Measuring killed that: the requirement is a fixed amount per hop,
+    not a ratio. The function is kept because the arithmetic decides whether a
+    chain can run at all and deserves a name and a direct test, rather than
+    being discovered by stranding real funds mid-chain.)
+    """
+    n = len(amounts)
+    if n <= 1:
+        return []
+    return [hop_headroom * Decimal(n - 1 - i) for i in range(n - 1)]
+
+
+def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
+    """What peel 0 must be able to spend from ENTRY: everything plus reserve 0.
+
+    Separate from the reserves so the caller can compare it against the real
+    balance and shrink the distribution before building a plan that cannot run.
+    """
+    if not amounts:
+        return Decimal(0)
+    return sum(amounts, Decimal(0)) + (reserves[0] if reserves else Decimal(0))
+
+
+def peel_forward_amounts(amounts: list, hop_headroom: Decimal) -> list:
+    """What each peel hands to the NEXT carrier: the undistributed remainder
+    plus that carrier's reserve. Returns n-1 values, one per carrier.
+
+    Kept beside peel_carrier_reserves because the two only make sense together:
+    carrier i receives sum(amounts[i+1:]) + reserve_i, then peel i+1 spends
+    amounts[i+1] of it and forwards the rest, and the difference between
+    consecutive reserves is exactly the headroom that lets peel i+1 be built.
+    Getting this wrong does not raise -- it strands funds on a carrier
+    part-way down a chain that has no auto-resume.
+    """
+    n = len(amounts)
+    if n <= 1:
+        return []
+    reserves = peel_carrier_reserves(amounts, hop_headroom)
+    return [sum(amounts[i + 1:], Decimal(0)) + reserves[i] for i in range(n - 1)]
+
+
+#: Fractions of `usable` the peel planner will try, in order, when the default
+#: distribution does not leave every hop its headroom. None means "whatever
+#: compute_fanout_amounts already produced".
+PEEL_BUDGET_FRACTIONS = (None, Decimal("0.80"), Decimal("0.70"),
+                         Decimal("0.60"), Decimal("0.50"), Decimal("0.40"))
+
+
+class PeelBudgetError(Exception):
+    """No distribution leaves every hop the headroom it needs to be built."""
+
+    def __init__(self, hop_headroom: Decimal, hops: int):
+        self.hop_headroom = hop_headroom
+        self.hops = hops
+        super().__init__(f"peel chain of {hops} hops needs "
+                         f"{hop_headroom * hops} XMR of headroom")
+
+
+def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
+                          fanout_count: int, fee_xmr: Decimal,
+                          dag_enabled: bool, rng, hop_headroom: Decimal):
+    """Shrink the distribution until peel 0 is affordable. Returns (amounts, frac).
+
+    A PEEL CHAIN CANNOT DISTRIBUTE AS MUCH AS A FAN-OUT, and the planner has to
+    know that BEFORE it builds a plan that cannot run.
+
+    A fan-out is ONE transaction: it spends one input, once. A peel chain is N
+    SEQUENTIAL transactions, each spending nearly all of what the previous one
+    forwarded -- and each has to leave its own fee behind (measured; see
+    PEEL_CARRIER_RESERVE_MULT). N hops cost N headrooms out of the same
+    balance, so a peel chain distributes slightly less than an equal fan-out.
+
+    Left unchecked this failed on peel 2 with "not enough money" and stranded
+    the entire remaining balance on a carrier subaddress, which this pipeline
+    has no auto-resume for. Reproduced end to end before this existed.
+
+    `frac` is None when the default distribution already fit, otherwise the
+    fraction that did -- the caller reports it rather than this deciding how to
+    talk to the operator. Raises PeelBudgetError when nothing fits, so the
+    caller fails BEFORE any money moves.
+    """
+    # Peel 0 spends from ENTRY and needs the same per-hop headroom as every
+    # later hop, so it comes off the balance before anything is distributed.
+    cap = bal - hop_headroom
+    for frac in PEEL_BUDGET_FRACTIONS:
+        trial = (amounts if frac is None else compute_fanout_amounts(
+            usable, fanout_count, fee_xmr, dag_enabled, rng,
+            spend_fraction=frac))
+        if not trial:
+            continue
+        reserves = peel_carrier_reserves(trial, hop_headroom)
+        if peel_entry_requirement(trial, reserves) <= cap:
+            return trial, frac
+    raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
+
+
+def build_peel_stage_plan(rpc, addr_index: dict, account_index: int,
+                          entry_addr: str, entry_index: int,
+                          dests: list, amount_by_addr: dict,
+                          hop_fee: Decimal) -> list:
+    """Provision rotating carriers and turn a peel plan into stage-5 entries.
+
+    PEELING CHAIN: one transaction per destination, each spending what the
+    previous peel forwarded, so the N mix outputs appear in N separate
+    transactions over time instead of co-created in one fan-out an analyst can
+    cluster.
+
+    ROTATING CARRIERS: one fresh subaddress per hop, so no address is ever
+    spent twice and subaddress 0 is never spent at all. They are provisioned
+    BEFORE the plan is built, because build_peel_plan refuses to fall back to
+    subaddress 0 rather than quietly rebuild the very hub the peel exists to
+    avoid. Each new index is recorded in addr_index so stage 5 can resolve it.
+    """
+    amounts = [amount_by_addr[a] for a in dests]
+    carriers = []
+    for _ in range(max(0, len(dests) - 1)):
+        addr, idx = rpc.new_subaddress_indexed(account_index=account_index,
+                                               label="")
+        carriers.append((addr, idx))
+        addr_index[addr] = idx
+    core = build_peel_plan(
+        entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
+        carriers=carriers,
+        remainders=peel_forward_amounts(amounts, hop_fee))
+    plan = []
+    for p in core:
+        entry = {
+            "src": entry_addr if p["peel_num"] == 0 else carriers[p["peel_num"] - 1][0],
+            "src_index": p["src_index"],
+            "dst": p["dst"],
+            "amt": p["amt"],
+            "delay": secrets.randbelow(540) + 180,
+            "extra": secure_hex(16),
+            "peel_num": p["peel_num"],
+        }
+        if p.get("destinations"):
+            entry["destinations"] = p["destinations"]
+            entry["carrier"] = p["carrier"]
+            entry["carrier_index"] = p["carrier_index"]
+        plan.append(entry)
+    return plan
 
 
 def build_peel_plan(entry_index: int, change_index: int,
@@ -1659,6 +1866,36 @@ def main():
     # with certainty: the DESTINATION of the change, not its size.
     fanout_amounts = compute_fanout_amounts(
         usable, fanout_count, fee_xmr, args.dag_mixing, _secrets.SystemRandom())
+
+    # A peel chain has to leave every hop its own fee, so it can distribute
+    # less than an equal fan-out. Size that here -- discovering it mid-chain
+    # means real money has already moved and is stranded on a carrier.
+    if args.peel and fanout_amounts:
+        _hf = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
+        try:
+            fanout_amounts, _frac = fit_peel_distribution(
+                fanout_amounts, bal, usable, fanout_count, fee_xmr,
+                args.dag_mixing, _secrets.SystemRandom(), _hf)
+        except PeelBudgetError as exc:
+            integrity_log("stage4", "peel_budget_impossible")
+            sys.exit(
+                f"[!] A {fanout_count}-hop peel chain cannot be funded from "
+                f"{bal} XMR.\n"
+                f"    Each hop spends nearly all of what the previous one "
+                f"forwarded, and every hop\n"
+                f"    needs {exc.hop_headroom} XMR of headroom for the wallet "
+                f"to build it at all — {exc.hops} hops\n"
+                f"    is {exc.hop_headroom * exc.hops} XMR before anything is "
+                f"distributed. Use fewer --wallets,\n"
+                f"    drop --peel for a one-shot fan-out, or fund the wallet "
+                f"more.")
+        if _frac is not None:
+            integrity_log("stage4", f"peel_budget_reduced:{_frac}")
+            print(f"  [*] Peel chain: reduced the distribution to "
+                  f"{_frac * 100:.0f}% of usable so every hop keeps the "
+                  f"headroom a wallet needs to build the next one "
+                  f"({_hf} XMR per hop, {fanout_count - 1} hops).")
+
     if not fanout_amounts:
         sys.exit(
             f"[!] Usable balance {usable} XMR too small to fan out across "
@@ -1677,61 +1914,15 @@ def main():
 
     distribution_mode = "peel" if args.peel else "fanout"
     if args.peel:
-        # PEELING CHAIN: one transaction per destination, each spending the
-        # previous peel's change (which Monero returns to the account's
-        # subaddress 0), so the N mix outputs appear in N separate transactions
-        # over time instead of co-created in one fan-out an analyst can cluster.
-        # ROTATING CARRIERS. One fresh subaddress per hop, so no address is
-        # ever spent twice and subaddress 0 is never spent at all. Provisioned
-        # here, before the plan is built, because build_peel_plan REFUSES to
-        # fall back to subaddress 0 rather than quietly rebuild the hub.
-        _peel_amts = [fanout_by_addr[a] for a in fanout_dests]
-        _n_peels = len(fanout_dests)
-        _carriers = []
-        for _c in range(max(0, _n_peels - 1)):
-            _addr, _idx = rpc_primary.new_subaddress_indexed(
-                account_index=bal_account, label="")
-            _carriers.append((_addr, _idx))
-            addr_index[_addr] = _idx
-        # What each peel forwards: everything still to be distributed after
-        # this hop's own destination, less a fee reserve per remaining hop.
-        # The carrier reserve is deliberately generous. Each hop's fee comes
-        # out of the amount the previous hop forwarded, and monerod also needs
-        # its own change output to clear dust, so a reserve sized at exactly
-        # one fee per hop leaves nothing for fee variance across a chain that
-        # runs for hours. The asymmetry decides it: over-reserving costs a
-        # slightly smaller final distribution, while under-reserving stops the
-        # chain part-way with "not enough money" and strands the remainder on
-        # a carrier -- and this pipeline has no auto-resume, so that is a
-        # manual recovery. Found on a real chain, where a one-fee-per-hop
+        # A peel chain has to leave every hop the headroom to be built at all;
+        # under-reserving strands the remainder on a carrier and this pipeline
+        # has no auto-resume. Found on a real chain, where a one-fee-per-hop
         # reserve failed on the second peel.
         _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
-        _remainders = []
-        for _i in range(max(0, _n_peels - 1)):
-            _left = sum(_peel_amts[_i + 1:], Decimal(0))
-            _left += _hop_fee * (_n_peels - _i - 1)
-            _remainders.append(_left)
-        _peel_core = build_peel_plan(
-            entry_index=_src_index(addr_index, ENTRY), change_index=0,
-            dests=fanout_dests, amounts=_peel_amts,
-            carriers=_carriers, remainders=_remainders)
-        fanout_plan = []
-        for _p in _peel_core:
-            _src_addr = ENTRY if _p["peel_num"] == 0 else _carriers[_p["peel_num"] - 1][0]
-            _entry = {
-                "src": _src_addr,
-                "src_index": _p["src_index"],
-                "dst": _p["dst"],
-                "amt": _p["amt"],
-                "delay": _secrets.randbelow(540) + 180,
-                "extra": secure_hex(16),
-                "peel_num": _p["peel_num"],
-            }
-            if _p.get("destinations"):
-                _entry["destinations"] = _p["destinations"]
-                _entry["carrier"] = _p["carrier"]
-                _entry["carrier_index"] = _p["carrier_index"]
-            fanout_plan.append(_entry)
+        fanout_plan = build_peel_stage_plan(
+            rpc_primary, addr_index, bal_account, ENTRY,
+            _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
+            _hop_fee)
         integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
         print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
               f"(~{len(fanout_plan) * 20} min). Each output is created in its own "

@@ -1864,6 +1864,160 @@ finally:
     os.environ.pop("GS_TEST_BOTH", None)
 
 
+# ---------------------------------------------------------------------------
+# Peel-chain solvency arithmetic.
+#
+# The failure these exist for is not a crash: a peel chain that under-reserves
+# runs several hops successfully, then fails "not enough money" with the whole
+# remaining balance sitting on a carrier subaddress and no auto-resume. It was
+# only ever caught by executing a chain on a real daemon, so the arithmetic
+# that decides it is asserted directly here.
+# ---------------------------------------------------------------------------
+_HR = Decimal("0.0036")          # one hop's headroom
+_AMTS = [Decimal(x) for x in ("1.5", "2.25", "0.8", "3.1", "1.05", "0.6")]
+
+_res = ghost.peel_carrier_reserves(_AMTS, _HR)
+check("peel_carrier_reserves: one reserve per carrier (n-1)",
+      len(_res) == len(_AMTS) - 1)
+check("peel_carrier_reserves: strictly decreasing down the chain",
+      all(_res[i] > _res[i + 1] for i in range(len(_res) - 1)))
+check("peel_carrier_reserves: last carrier still keeps a full headroom",
+      _res[-1] == _HR)
+check("peel_carrier_reserves: consecutive reserves differ by exactly one headroom",
+      all(_res[i] - _res[i + 1] == _HR for i in range(len(_res) - 1)))
+check("peel_carrier_reserves: no carriers for a single destination",
+      ghost.peel_carrier_reserves([Decimal("1")], _HR) == [])
+check("peel_carrier_reserves: empty plan is empty, not an IndexError",
+      ghost.peel_carrier_reserves([], _HR) == [])
+check("peel_entry_requirement: everything distributed plus carrier 0's reserve",
+      ghost.peel_entry_requirement(_AMTS, _res) == sum(_AMTS, Decimal(0)) + _res[0])
+check("peel_entry_requirement: empty plan needs nothing",
+      ghost.peel_entry_requirement([], []) == Decimal(0))
+check("peel_entry_requirement: a lone destination needs only itself",
+      ghost.peel_entry_requirement([Decimal("2")], []) == Decimal("2"))
+
+# THE INVARIANT. Walk the chain the way the daemon will and assert every hop
+# is constructible: each carrier must receive at least what its peel spends
+# PLUS one headroom, or that peel cannot be built and the funds stop there.
+_fwd = ghost.peel_forward_amounts(_AMTS, _HR)
+check("peel_forward_amounts: one forward per carrier",
+      len(_fwd) == len(_AMTS) - 1)
+_leftovers = []
+for _i in range(len(_AMTS) - 1):
+    _spend = _AMTS[_i + 1] + (_fwd[_i + 1] if _i + 1 < len(_fwd) else Decimal(0))
+    _leftovers.append(_fwd[_i] - _spend)
+check("peel chain: every hop keeps a full headroom after paying its way",
+      all(x >= _HR for x in _leftovers))
+# Tighter than solvency: the reserve schedule should leave each hop EXACTLY
+# its own fee, so nothing accumulates on a carrier and nothing is over-held.
+# The final hop is included -- it keeps one headroom, which is its fee, not a
+# stranded remainder.
+check("peel chain: every hop keeps exactly one headroom, no more and no less",
+      all(x == _HR for x in _leftovers))
+
+# A one-fee-per-hop reserve -- what shipped, and what died on peel 2 -- must
+# FAIL this same invariant, or the test proves nothing.
+_flat = [sum(_AMTS[i + 1:], Decimal(0)) + _HR for i in range(len(_AMTS) - 1)]
+_flat_ok = True
+for _i in range(len(_AMTS) - 1):
+    _spend = _AMTS[_i + 1] + (_flat[_i + 1] if _i + 1 < len(_flat) else Decimal(0))
+    if _flat[_i] - _spend < _HR:
+        _flat_ok = False
+check("peel chain: a flat one-headroom-per-carrier reserve is caught as insolvent",
+      not _flat_ok)
+
+# fit_peel_distribution
+class _R:
+    """Deterministic stand-in for SystemRandom in compute_fanout_amounts."""
+    def randbelow(self, n): return n // 2
+    def random(self): return 0.5
+    def shuffle(self, seq): pass
+    def randint(self, a, b): return (a + b) // 2
+
+_usable = Decimal("9.5")
+_base = ghost.compute_fanout_amounts(_usable, 6, Decimal("0.0024"), False, _R())
+_fit, _frac = ghost.fit_peel_distribution(
+    _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _HR)
+check("fit_peel_distribution: a fundable chain is left at the default fraction",
+      _frac is None and _fit == _base)
+check("fit_peel_distribution: ...and the result really is affordable",
+      ghost.peel_entry_requirement(_fit, ghost.peel_carrier_reserves(_fit, _HR))
+      <= Decimal("10") - _HR)
+
+# A headroom large enough to make the default distribution unaffordable must
+# shrink it rather than hand back a plan that strands funds.
+_big = Decimal("0.4")
+_fit2, _frac2 = ghost.fit_peel_distribution(
+    _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _big)
+check("fit_peel_distribution: an expensive chain is shrunk, not accepted",
+      _frac2 is not None and sum(_fit2, Decimal(0)) < sum(_base, Decimal(0)))
+check("fit_peel_distribution: ...and the shrunk plan is affordable",
+      ghost.peel_entry_requirement(_fit2, ghost.peel_carrier_reserves(_fit2, _big))
+      <= Decimal("10") - _big)
+check("fit_peel_distribution: the fraction it reports is one it actually offers",
+      _frac2 in ghost.PEEL_BUDGET_FRACTIONS)
+
+try:
+    ghost.fit_peel_distribution(_base, Decimal("10"), _usable, 6,
+                                Decimal("0.0024"), False, _R(), Decimal("5"))
+    check("fit_peel_distribution: an unfundable chain raises before money moves",
+          False)
+except ghost.PeelBudgetError as _e:
+    check("fit_peel_distribution: an unfundable chain raises before money moves",
+          _e.hops == 5 and _e.hop_headroom == Decimal("5"))
+
+# The reserve multiplier is a MEASURED quantity; a change to it should be a
+# deliberate re-measurement, not a drive-by nudge. Guard the band it was
+# measured into rather than the exact value.
+check("PEEL_CARRIER_RESERVE_MULT covers the worst measured input count",
+      ghost.PEEL_CARRIER_RESERVE_MULT * ghost.FEE_SAFETY_MARGIN >= Decimal("10"))
+check("PEEL_CARRIER_RESERVE_MULT is not the pre-RingCT artifact value",
+      ghost.PEEL_CARRIER_RESERVE_MULT < Decimal("50"))
+
+
+# build_peel_stage_plan is the only peel code that touches the wallet, so it
+# is the piece a pure-arithmetic test cannot reach. It shipped once with a
+# NameError on a module-vs-local alias that every other test passed straight
+# through, so DRIVE it against a fake wallet rather than reading the source.
+class _FakeSubRpc:
+    def __init__(self): self.next = 40; self.calls = []
+    def new_subaddress_indexed(self, account_index, label=""):
+        self.next += 1
+        self.calls.append((account_index, label))
+        return (f"SUB{self.next}", self.next)
+
+_fr = _FakeSubRpc()
+_ai = {"ENTRYADDR": 7}
+_dests = [f"MIX{i}" for i in range(5)]
+_by = {a: Decimal("1.0") for a in _dests}
+_plan = ghost.build_peel_stage_plan(_fr, _ai, 3, "ENTRYADDR", 7, _dests, _by, _HR)
+check("build_peel_stage_plan: one peel per destination", len(_plan) == len(_dests))
+check("build_peel_stage_plan: peel 0 spends ENTRY",
+      _plan[0]["src"] == "ENTRYADDR" and _plan[0]["src_index"] == 7)
+check("build_peel_stage_plan: provisions one carrier per hop, not per destination",
+      len(_fr.calls) == len(_dests) - 1)
+check("build_peel_stage_plan: carriers are created in the spending account",
+      all(a == 3 for a, _ in _fr.calls))
+check("build_peel_stage_plan: carriers are created UNLABELLED",
+      all(l == "" for _, l in _fr.calls))
+check("build_peel_stage_plan: every carrier index is recorded in addr_index",
+      all(_ai.get(f"SUB{40 + i}") == 40 + i for i in range(1, len(_dests))))
+check("build_peel_stage_plan: no hop ever spends subaddress 0",
+      all(p["src_index"] != 0 for p in _plan))
+check("build_peel_stage_plan: each later peel spends the previous carrier",
+      all(_plan[i]["src"] == f"SUB{40 + i}" for i in range(1, len(_plan))))
+check("build_peel_stage_plan: every peel but the last also pays a carrier",
+      all(len(p.get("destinations") or []) == 2 for p in _plan[:-1]))
+check("build_peel_stage_plan: the last peel pays only its destination",
+      not _plan[-1].get("destinations") or len(_plan[-1]["destinations"]) == 1)
+check("build_peel_stage_plan: every peel carries an inter-hop delay",
+      all(isinstance(p["delay"], int) and p["delay"] >= 180 for p in _plan))
+check("build_peel_stage_plan: peels are numbered in order",
+      [p["peel_num"] for p in _plan] == list(range(len(_dests))))
+check("build_peel_stage_plan: the destinations are the mix addresses, in order",
+      [p["dst"] for p in _plan] == _dests)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
