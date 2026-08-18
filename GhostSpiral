@@ -885,8 +885,38 @@ def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
     return amounts
 
 
-def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
-    """Returns (address_list, {address: subaddress_index}, decoy_address_set).
+def create_subs(rpc, n: int, decoys: int) -> tuple:
+    """Returns (address_list, {address: (account_index, subaddress_index)},
+    decoy_address_set).
+
+    ONE ACCOUNT PER OUTPUT, and this is the pipeline's exit defence.
+
+    These subaddresses are where the mix comes to REST: after the run they are
+    what the operator holds and will eventually spend. They all used to live in
+    one account, and that made the operator's next action the thing that undid
+    the entire mix. Measured on a chain running current consensus, six mix
+    outputs in one account:
+
+        "empty this account"   -> ONE transaction, 6 inputs
+        "send 5 XMR"           -> ONE transaction, 4 inputs
+
+    A transaction's inputs are public. Spending six outputs together is
+    permanent proof that all six have one owner -- no ring analysis needed,
+    the input count is right there -- and those six outputs are exactly what
+    the peel chain spent six transactions and several hours separating. The
+    off-ramp planner does not help: it plans WHERE to sell, not how to spend.
+
+    Giving each output its own account makes the merge IMPOSSIBLE rather than
+    merely discouraged, because a Monero transaction cannot spend across
+    accounts. Verified: an account holding 1.4 XMR asked for 5 answers "not
+    enough money" while a sibling account holds the rest. The same six outputs
+    then leave as six 1-in transactions, for about 0.005 XMR more in fees at a
+    0.0024 XMR estimate.
+
+    Decoys get their own accounts too. They are FUNDED fan-out outputs -- subs
+    is shuffled before the fan-out picks its targets, so a decoy is as likely
+    to hold money as any other -- and an output that cannot be merged is the
+    point regardless of which list it came from.
 
     Uses new_subaddress_indexed (not new_subaddress) so each address's
     real subaddress index is known. transfer_split needs that index in
@@ -926,15 +956,13 @@ def create_subs(rpc, n: int, decoys: int, acct_idx: int = 0) -> tuple:
     subs = []
     addr_index = {}
     decoy_addrs = set()
-    for i in range(n):
-        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label="")
+    for i in range(n + decoys):
+        acct = create_fresh_account(rpc, label="")
+        addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
         subs.append(addr)
-        addr_index[addr] = idx
-    for d in range(decoys):
-        addr, idx = rpc.new_subaddress_indexed(account_index=acct_idx, label="")
-        subs.append(addr)
-        addr_index[addr] = idx
-        decoy_addrs.add(addr)
+        addr_index[addr] = (acct, idx)
+        if i >= n:
+            decoy_addrs.add(addr)
     return subs, addr_index, decoy_addrs
 
 
@@ -956,7 +984,20 @@ def _src_index(addr_index: dict, addr: str) -> int:
             f"{scrub_address(addr)}. Refusing to build a TX that could spend "
             f"from the wrong subaddress."
         )
-    return addr_index[addr]
+    return addr_index[addr][1]
+
+
+def _src_account(addr_index: dict, addr: str) -> int:
+    """Resolve a source address to the ACCOUNT that holds it.
+
+    Every planned source lives in its own account now (see create_subs), so a
+    subaddress index alone no longer identifies an output: index 1 exists in
+    every one of them. Spending the right index in the wrong account is the
+    failure this exists to prevent, and it is silent -- the wallet would
+    happily spend some other output of the same index.
+    """
+    _src_index(addr_index, addr)          # shared not-found abort
+    return addr_index[addr][0]
 
 
 def xmr_balance(rpc_primary, bal_account: int,
@@ -1525,7 +1566,12 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
 
 def resolve_mix_account(args, rpc_primary, receive_mode: bool,
                         receive_account_index: int) -> int:
-    """Pick the account the mix runs in — i.e. where its change comes to rest."""
+    """The account a RECEIVE run is pinned to, or None for a send run.
+
+    A send run's account is whichever one create_subs made for ENTRY; the
+    caller reads it back from addr_index. Returning None rather than a guess
+    is deliberate -- there is no correct value to invent here.
+    """
     # WHICH ACCOUNT THE MIX RUNS IN. This decides where every leftover in the
     # run comes to rest.
     #
@@ -1545,35 +1591,21 @@ def resolve_mix_account(args, rpc_primary, receive_mode: bool,
     # In RECEIVE mode the account is fixed by the bundle -- the money is
     # already sitting in it -- so rotation there belongs to
     # create_receive_wallet, which now issues a fresh account per receive.
-    if receive_mode:
-        sub_account = receive_account_index
-    else:
-        try:
-            # Shared, fail-closed helper. This read
-            #   int((_acct or {}).get("account_index", 0))
-            # so a create_account that SUCCEEDED with an unexpected shape
-            # became account 0 -- the wallet's primary-address account -- and
-            # the print below then told the operator their change had been
-            # rotated away from it. The except block right underneath already
-            # explains why that is the worst available outcome.
-            sub_account = create_fresh_account(rpc_primary, "")
-            integrity_log("stage3", f"mix_account_rotated:{sub_account}")
-            print(f"  [*] Mix runs in a fresh account ({sub_account}); the run's "
-                  f"change stays off the wallet's primary address.")
-        except Exception as e:                       # noqa: BLE001
-            # Fail closed. Silently falling back to account 0 would put the
-            # run's change on the wallet's identity address while the operator
-            # believed it had been rotated away -- worse than not offering the
-            # feature, because the belief is what they act on.
-            integrity_log("stage3", "mix_account_rotate_FAILED")
-            sys.exit(
-                f"[!] Could not create a fresh account for this mix "
-                f"({str(e)[:60]}).\n"
-                f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
-                f"    wallet's primary address, and every leftover in this run would\n"
-                f"    come to rest there — on that address, on every run.\n"
-                f"    Check monero-wallet-rpc has a writable open wallet, then re-run.")
-    return sub_account
+    #
+    # SEND MODE NO LONGER ROTATES HERE, and that is not a weakening. This used
+    # to create one fresh account and create_subs put ENTRY and every mix
+    # subaddress in it. create_subs now gives EVERY subaddress its own fresh
+    # account -- so ENTRY already lands in one, already never account 0
+    # (create_fresh_account refuses that outcome), and the run's change already
+    # rests in an account made for this run and used for nothing else. Creating
+    # a second account on top, that nothing spends and nothing receives, and
+    # then announcing it as "the mix account", would be exactly the theatre the
+    # paragraphs above object to.
+    #
+    # So: receive mode is fixed by the bundle, send mode is answered by
+    # whichever account create_subs made for ENTRY, and main() reads that back
+    # with _src_account rather than either of them being assumed.
+    return receive_account_index if receive_mode else None
 
 
 def verify_spend_source(rpc_primary, account: int, index: int,
@@ -1688,6 +1720,9 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
             dag_plan.append({
                 "src": s,
                 "src_index": _src_index(addr_index, s),
+                # Each hop source is in its own account, so the index alone
+                # would not identify it -- index 1 exists in all of them.
+                "account_index": _src_account(addr_index, s),
                 "dst": d,
                 "sweep": True,
                 "delay": hop_delay(_secrets, delay_window),
@@ -1732,6 +1767,52 @@ def resolve_hop_delay(args) -> tuple:
         print(f"  [*] Per-TX broadcast delay: {window[0]}-{window[1]}s "
               f"(default is {DEFAULT_HOP_DELAY[0]}-{DEFAULT_HOP_DELAY[1]}s).")
     return window
+
+
+def resolve_entry_account(rpc, addr_index: dict, entry_addr: str,
+                          bundle_account) -> tuple:
+    """Which (account, subaddress) the whole run spends from. Returns the pair.
+
+    READ BACK, never assigned from a branch. This used to be
+
+        bal_account = receive_account_index if receive_mode else 0
+
+    and that hard-coded 0 drove the balance poll, the peel carriers, the plan's
+    account_index, the change-sweep destination and change_target -- so a send
+    run polled a balance that was not ENTRY's, sized its plan from it, and put
+    every spend and all its change on account 0 / subaddress 0, the wallet's
+    PRIMARY address, which the change sweep then spent. Nothing failed.
+
+    "The mix account" also stopped being a single answer once create_subs began
+    giving every output its own account, so guessing it is doubly wrong now:
+    receive mode is the bundle's account, send mode is whichever account
+    create_subs made for subs[0], and only addr_index knows which.
+
+    `bundle_account` is what the receive bundle claimed, or None for a send
+    run. The two are derived independently -- one from a file on disk, one from
+    the wallet -- so a disagreement means the bundle does not describe this
+    wallet: a stale bundle, the wrong wallet open, an edited file. It exits
+    rather than picking one, because spending on the strength of a
+    disagreement is how funds move from somewhere the operator did not intend.
+    """
+    account = _src_account(addr_index, entry_addr)
+    index = _src_index(addr_index, entry_addr)
+    if bundle_account is not None and bundle_account != account:
+        integrity_log("stage3", "entry_account_mismatch")
+        sys.exit(
+            f"[!] The receive bundle says ENTRY is in account "
+            f"{bundle_account}, but the wallet puts it in account "
+            f"{account}.\n"
+            f"    Refusing to spend: one of them is describing a different "
+            f"wallet. Check that the\n"
+            f"    bundle belongs to the wallet monero-wallet-rpc currently "
+            f"has open.")
+    # And PROVE the pair, rather than trusting it. A one-line mistake here is
+    # invisible: the pipeline runs, the plan looks sane, and the only symptom
+    # is that the money moves from the wrong account. Ask the wallet to
+    # resolve (account, index) back to an address; it must be ENTRY.
+    verify_spend_source(rpc, account, index, entry_addr)
+    return account, index
 
 
 def main():
@@ -1813,7 +1894,7 @@ def main():
         # deterministic fingerprint of the `wallets` setting under public code.
         _num_decoys = secrets.SystemRandom().randint(DECOY_MIN, DECOY_MAX)
         subs, addr_index, decoy_addrs = create_subs(
-            rpc_primary, args.wallets, _num_decoys, acct_idx=sub_account)
+            rpc_primary, args.wallets, _num_decoys)
         if len(subs) < MIN_WALLETS + 1:
             sys.exit("[!] Failed to create enough subaddresses")
 
@@ -1822,7 +1903,7 @@ def main():
             if ENTRY in subs:
                 subs.remove(ENTRY)
             subs.insert(0, ENTRY)
-            addr_index[ENTRY] = receive_subaddress_index
+            addr_index[ENTRY] = (receive_account_index, receive_subaddress_index)
             integrity_log("stage3", "entry_reused_from_receive_wallet")
             print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
         else:
@@ -1938,17 +2019,8 @@ def main():
         # the work. An analyst labelling that address recovers it from every send
         # graph, which is exactly what rotation was added to prevent.
         #
-        # In receive mode resolve_mix_account already returns the bundle's account,
-        # so one assignment is correct for both paths.
-        bal_account = sub_account
-        entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
-
-        # And PROVE it, rather than trusting the assignment. A one-line mistake
-        # here is invisible: the pipeline runs, the plan looks sane, and the only
-        # symptom is that the money moves from the wrong account. The wallet is
-        # asked to resolve (account, index) back to an address and it must be
-        # ENTRY.
-        verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)
+        bal_account, entry_index = resolve_entry_account(
+            rpc_primary, addr_index, ENTRY, sub_account)
 
         total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
 
@@ -2126,7 +2198,8 @@ def main():
         # Subaddresses that will receive a fan-out output, with the (account, index)
         # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
         funded_targets = list(fanout_dests)
-        fanout_targets_indexed = [(sub_account, _src_index(addr_index, a))
+        fanout_targets_indexed = [(_src_account(addr_index, a),
+                                   _src_index(addr_index, a))
                                   for a in funded_targets]
 
         # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------
@@ -2187,16 +2260,22 @@ def main():
         # be an N-input transaction, which is public proof that all N peels
         # share an owner.
         #
-        # The destinations are distinct too. Sweeping N outputs into ONE
-        # subaddress does not link them today (stealth addresses make each
-        # arrival a separate one-time key), but it stacks N outputs on one
-        # address, and whoever spends that address later merges them and
-        # proves the same fact one hop downstream.
+        # The destinations are distinct addresses AND distinct ACCOUNTS.
+        #
+        # Distinct addresses alone is not enough, and getting that far and
+        # stopping is how this stays broken one level up. Sweeping N outputs
+        # into one address does not link them today -- stealth addresses make
+        # each arrival a separate one-time key -- but N outputs in one ACCOUNT
+        # can be spent by one transaction, and that transaction's input count
+        # proves they share an owner. These are swept change: they are what
+        # the operator is left holding, so they get the same treatment every
+        # other resting output gets (see create_subs).
         change_sweep_jobs = []
         for _acct in change_accounts:
             try:
+                _csacct = create_fresh_account(rpc_primary, label="")
                 _csa, _csi = rpc_primary.new_subaddress_indexed(
-                    account_index=bal_account, label="")
+                    account_index=_csacct, label="")
             except Exception as e:                           # noqa: BLE001
                 integrity_log("stage4", f"change_sweep_target_FAILED:{_acct}")
                 print(f"  [!] Could not create a destination for the change on "
@@ -2204,7 +2283,7 @@ def main():
                       f"on account {_acct}, subaddress 0 — UNMIXED, and it is "
                       f"an output that never moves.")
                 continue
-            addr_index[_csa] = _csi
+            addr_index[_csa] = (_csacct, _csi)
             change_sweep_jobs.append((_acct, 0, _csa, _csi))
 
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,

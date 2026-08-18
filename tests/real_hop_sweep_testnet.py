@@ -140,8 +140,11 @@ try:
               f"{bal(ACC, s['address_index'])[0]/1e12} XMR")
 
     # THE SHIPPED PLANNER decides the hop shape.
-    addr_index = {s["address"]: s["address_index"] for s in srcs}
-    addr_index.update({t["address"]: t["address_index"] for t in tgts})
+    # addr_index maps an address to its (account, subaddress) pair: every
+    # output the pipeline creates now lives in its OWN account, so a bare
+    # index no longer identifies one -- index 1 exists in all of them.
+    addr_index = {s["address"]: (ACC, s["address_index"]) for s in srcs}
+    addr_index.update({t["address"]: (ACC, t["address_index"]) for t in tgts})
     hops = ghost.build_dag_plan(
         A_(dag_mixing=True), Decimal("0.0024"),
         [s["address"] for s in srcs],

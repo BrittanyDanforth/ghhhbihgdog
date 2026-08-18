@@ -784,16 +784,54 @@ for _pat in ("exitplan_*.json", "monero-wallet-rpc.log", "outputs_export.hex",
 #
 # Nothing failed. That is why it needs a test AND a runtime guard.
 # ---------------------------------------------------------------------------
-_gs_src3 = open(os.path.join(REPO, "GhostSpiral")).read()
+# code_only: the docstrings in this area QUOTE the buggy lines they replaced
+# ("bal_account = receive_account_index if receive_mode else 0"), so a raw
+# source search matches its own post-mortem and passes on the defect.
+_gs_src3 = code_only(os.path.join(REPO, "GhostSpiral"))
 check("spend account: send mode no longer hard-codes account 0",
       "bal_account = receive_account_index if receive_mode else 0" not in _gs_src3)
-check("spend account: the spend account IS the mix account",
-      "bal_account = sub_account" in _gs_src3)
-# The mix subaddresses and the spends must name the SAME account, or the plan
-# spends from one place and the confirmation-wait watches another.
-check("spend account: create_subs and the spend account agree",
-      "acct_idx=sub_account" in _gs_src3
-      and "fanout_targets_indexed = [(sub_account" in _gs_src3)
+check("spend account: it is READ BACK from ENTRY, not assigned from a branch",
+      "_src_account(addr_index, entry_addr)" in _gs_src3)
+check("spend account: no branch assigns it from a shared mix account",
+      "bal_account = sub_account" not in _gs_src3)
+check("spend account: main() gets the pair from the resolver, not a literal",
+      "bal_account, entry_index = resolve_entry_account(" in _gs_src3)
+# The confirmation-wait must watch the same place the plan spends from. Each
+# address now carries its OWN account, so this is per-address, not one shared
+# value -- drive create_subs rather than grepping for a variable name.
+class _FakeAcctRpc:
+    """A wallet that hands out accounts and subaddresses like the real one:
+    account 0 pre-exists, every create_account returns the next index."""
+    def __init__(self): self.acct = 0; self.subs = {}
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            self.acct += 1
+            return {"account_index": self.acct}
+        raise AssertionError(f"unexpected RPC {method}")
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        self.subs[account_index] = self.subs.get(account_index, 0) + 1
+        return (f"ADDR_{account_index}_{self.subs[account_index]}",
+                self.subs[account_index])
+
+_far = _FakeAcctRpc()
+_subs, _ai2, _dec = ghost.create_subs(_far, 5, 3)
+check("spend account: create_subs makes one subaddress per output", len(_subs) == 8)
+check("spend account: EVERY output gets its OWN account -- a transaction "
+      "cannot spend across accounts, so they can never be merged",
+      len({_ai2[a][0] for a in _subs}) == len(_subs))
+check("spend account: no output lands in account 0 (its subaddr 0 is the PRIMARY)",
+      all(_ai2[a][0] != 0 for a in _subs))
+check("spend account: decoys are isolated too -- they are funded fan-out "
+      "outputs, so an unmergeable decoy is the point as much as a real one",
+      len(_dec) == 3 and all(_ai2[a][0] != 0 for a in _dec))
+check("spend account: _src_account and _src_index round-trip every address",
+      all((ghost._src_account(_ai2, a), ghost._src_index(_ai2, a)) == _ai2[a]
+          for a in _subs))
+# An index alone stopped identifying an output: index 1 exists in every
+# account, so resolving one without its account would spend the wrong money.
+check("spend account: the same subaddress index recurs across accounts, so "
+      "an index alone is no longer an identity",
+      len({ghost._src_index(_ai2, a) for a in _subs}) < len(_subs))
 
 # The runtime guard, driven directly.
 class _RpcAddr:
@@ -833,12 +871,42 @@ class _BoomRpc:
 
 check("spend guard: an unverifiable source fails CLOSED, never assumed",
       _vs_rejects(7, 3, "ENTRY_ADDR", rpc=_BoomRpc()))
-check("spend guard: stage 4 actually calls it before planning",
-      "verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)" in _gs_src3)
-# It must run BEFORE the balance is read, or a wrong account still sizes a plan.
-check("spend guard: it runs before the balance poll",
-      _gs_src3.index("verify_spend_source(rpc_primary, bal_account")
-      < _gs_src3.index("total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account"))
+# DRIVE the resolver: it must verify the pair before handing it back, and it
+# must refuse a bundle that disagrees with the wallet. A source search for the
+# call site stopped meaning anything once the block moved into a function.
+_calls = []
+class _EntryRpc:
+    def raw_request(self, method, params=None):
+        if method == "get_address":
+            return {"addresses": [{"address": "ENTRY_ADDR"}]}
+        raise AssertionError(method)
+_real_vss = ghost.verify_spend_source
+try:
+    ghost.verify_spend_source = lambda rpc, a, i, addr: _calls.append((a, i, addr))
+    _ai3 = {"ENTRY_ADDR": (9, 4)}
+    _got = ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", None)
+    check("spend guard: the resolver returns ENTRY's own (account, index)",
+          _got == (9, 4))
+    check("spend guard: it verifies that exact pair before returning it",
+          _calls == [(9, 4, "ENTRY_ADDR")])
+    _got2 = ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", 9)
+    check("spend guard: a bundle that AGREES with the wallet is accepted",
+          _got2 == (9, 4))
+    try:
+        ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", 3)
+        check("spend guard: a bundle that DISAGREES with the wallet aborts", False)
+    except SystemExit:
+        check("spend guard: a bundle that DISAGREES with the wallet aborts", True)
+finally:
+    ghost.verify_spend_source = _real_vss
+# It must verify BEFORE the balance is read, or a wrong account still sizes a
+# plan. The resolver owns both the verify and the return, and main() reads the
+# balance from what it returned, so ordering is structural now rather than a
+# question of which line comes first.
+check("spend guard: the balance is read from the resolver's answer",
+      "xmr_balance(rpc_primary, bal_account, entry_index)" in _gs_src3
+      and _gs_src3.index("bal_account, entry_index = resolve_entry_account(")
+      < _gs_src3.index("xmr_balance(rpc_primary, bal_account, entry_index)"))
 
 
 # ---------------------------------------------------------------------------
@@ -1034,8 +1102,20 @@ _hops = ghost.build_dag_plan(
     _A(dag_mixing=True), Decimal("0.0024"), ["s1", "s2"],
     {"s1": Decimal("5"), "s2": Decimal("5")},
     {"s1": ["t1"], "s2": ["t2"]}, ["t1", "t2"],
-    {"s1": 11, "s2": 12, "t1": 13, "t2": 14}, __import__("secrets"))
+    {"s1": (21, 11), "s2": (22, 12), "t1": (23, 13), "t2": (24, 14)},
+    __import__("secrets"))
 check("sweep: the DAG round plans one hop per fundable source", len(_hops) == 2)
+# Each hop source lives in its own account, so the hop has to name it: index 1
+# exists in every account, and spending the right index in the wrong account
+# is silent.
+check("sweep: every DAG hop names the account it spends from",
+      sorted(h.get("account_index") for h in _hops) == [21, 22])
+# The account and the index are separate fields and must not be confused:
+# every hop source sits in its own account, so index 11 in account 21 and
+# index 11 in account 22 are different money.
+check("sweep: the account and the index are carried independently",
+      sorted((h["account_index"], h["src_index"]) for h in _hops)
+      == [(21, 11), (22, 12)])
 check("sweep: every DAG hop is a sweep", all(h.get("sweep") is True for h in _hops))
 check("sweep: no DAG hop carries an amount", all("amt" not in h for h in _hops))
 check("sweep: each hop still names its own source index",
@@ -1084,9 +1164,15 @@ class _RpcAcct:
 
 
 _ra = _RpcAcct(idx=7)
-check("mix account: SEND mode creates a FRESH account for the run",
-      ghost.resolve_mix_account(_A(), _ra, False, 0) == 7
-      and "create_account" in _ra.calls)
+# SEND mode no longer rotates HERE, and that is not a weakening. create_subs
+# gives EVERY output its own fresh account, so ENTRY already lands in one and
+# already never in account 0. A second account on top, that nothing spends and
+# nothing receives, announced as "the mix account", would be the theatre this
+# function's own docstring objects to.
+check("mix account: SEND mode returns None rather than inventing an account",
+      ghost.resolve_mix_account(_A(), _ra, False, 0) is None)
+check("mix account: ...and creates nothing to leave orphaned in the wallet",
+      "create_account" not in _ra.calls)
 # Receive mode must NOT rotate: the money is already sitting in the bundle's
 # account, so a new account here would point the pipeline at an empty one.
 _rb = _RpcAcct(idx=7)
@@ -1097,13 +1183,28 @@ check("mix account: RECEIVE mode does not create an account at all",
 # FAIL CLOSED. Falling back to account 0 would put the run's change on the
 # wallet's identity address while the operator believed it had been rotated
 # away -- worse than not having the feature, because the belief is acted on.
+# FAIL CLOSED, now enforced where the accounts are actually made. A wallet
+# that cannot create one must stop the run, not hand back account 0 -- whose
+# subaddress 0 is the wallet's PRIMARY address -- while the operator believes
+# the outputs were isolated.
 try:
-    ghost.resolve_mix_account(_A(), _RpcAcct(boom=True), False, 0)
+    ghost.create_subs(_RpcAcct(boom=True), 3, 1)
     _rot_ok = False
-except SystemExit as e:
-    _rot_ok = "account 0" in str(e)
-check("mix account: a failed rotation ABORTS, never silently uses account 0",
-      _rot_ok)
+except Exception:
+    _rot_ok = True
+check("mix account: create_subs ABORTS if an account cannot be made", _rot_ok)
+class _ZeroAcctRpc:
+    """A wallet answering create_account with 0 -- which cannot have happened,
+    account 0 always pre-exists, and 0 is the one value that would hurt."""
+    def raw_request(self, m, p=None): return {"account_index": 0}
+    def new_subaddress_indexed(self, account_index=0, label=""): return ("A", 1)
+try:
+    ghost.create_subs(_ZeroAcctRpc(), 2, 0)
+    _zero_ok = False
+except Exception:
+    _zero_ok = True
+check("mix account: an output is never placed in account 0, even if the "
+      "wallet claims it made one", _zero_ok)
 
 _crw_src = open(os.path.join(REPO, "create_receive_wallet")).read()
 
@@ -1155,10 +1256,27 @@ check("mix account: GhostSpiral uses it too",
           os.path.join(REPO, "GhostSpiral")))
 # ...and the stripper itself must actually work, or the two checks above are
 # just weaker versions of the greps they replaced.
+# Self-contained: this used to assert against a sentinel that happened to
+# appear in a GhostSpiral comment, and went red the day that comment was
+# deleted -- a test of the stripper that depended on unrelated prose.
+_co_probe = os.path.join(_scratch, "co_probe.py")
+open(_co_probe, "w").write(
+    '# SENTINEL_IN_COMMENT = 1\n'
+    'def f():\n'
+    '    """SENTINEL_IN_DOCSTRING"""\n'
+    '    s = "SENTINEL_IN_STRING"\n'
+    '    SENTINEL_IN_CODE = 2\n'
+    '    return s, SENTINEL_IN_CODE\n')
+_co = code_only(_co_probe)
 check("code_only(): a pattern present ONLY in a comment does not match",
-      'get("account_index", 0)' in open(os.path.join(REPO, "GhostSpiral")).read()
-      and 'get("account_index", 0)' not in code_only(
-          os.path.join(REPO, "GhostSpiral")))
+      "SENTINEL_IN_COMMENT" not in _co)
+check("code_only(): a pattern present ONLY in a docstring does not match",
+      "SENTINEL_IN_DOCSTRING" not in _co)
+check("code_only(): a string literal the code USES is kept",
+      "SENTINEL_IN_STRING" in _co)
+check("code_only(): real code is kept", "SENTINEL_IN_CODE" in _co)
+check("code_only(): line numbers are preserved, so offsets still line up",
+      len(_co.split(chr(10))) == len(open(_co_probe).read().split(chr(10))))
 check("code_only(): real code is still visible",
       "create_fresh_account(" in code_only(os.path.join(REPO, "GhostSpiral")))
 check("code_only(): string literals the tool uses are kept",

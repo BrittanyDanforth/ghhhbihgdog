@@ -141,16 +141,26 @@ try:
     mine(primary, 90)
     rpc = Rpc()
 
-    # 1. The SHIPPED rotation picks the mix account for a SEND run.
+    # 1. A SEND run is no longer pinned to an account here: create_subs gives
+    #    every output its own, so there is nothing correct for the resolver to
+    #    invent and it says so.
     ghost.integrity_log = lambda *a, **k: None
-    ACC = ghost.resolve_mix_account(A_(), rpc, False, 0)
-    check("SEND: the shipped resolver rotated to a fresh account", ACC != 0)
+    check("SEND: the resolver invents no account for a send run",
+          ghost.resolve_mix_account(A_(), rpc, False, 0) is None)
 
-    # 2. The SHIPPED create_subs puts ENTRY and the mix subs in that account.
-    subs, addr_index, _decoys = ghost.create_subs(rpc, 4, 2, acct_idx=ACC)
+    # 2. The SHIPPED create_subs puts EVERY output in its OWN account.
+    subs, addr_index, _decoys = ghost.create_subs(rpc, 4, 2)
     ENTRY = subs[0]
-    E = addr_index[ENTRY]
-    check("SEND: ENTRY was created inside the rotated account", ENTRY in addr_index)
+    ACC, E = addr_index[ENTRY]
+    check("SEND: ENTRY was created in an account of its own", ACC != 0)
+    check("SEND: every output got a DIFFERENT account -- a transaction cannot "
+          "spend across accounts, so the mix cannot be merged back together",
+          len({addr_index[a][0] for a in subs}) == len(subs))
+    check("SEND: no output was placed in account 0 (its subaddr 0 is PRIMARY)",
+          all(addr_index[a][0] != 0 for a in subs))
+    # The shipped resolver must read ENTRY's account back, not be told it.
+    check("SEND: the shipped resolver agrees on ENTRY's (account, index)",
+          ghost.resolve_entry_account(rpc, addr_index, ENTRY, None) == (ACC, E))
 
     # 3. THE FIX: the spend account is the mix account. Prove that (ACC, E)
     #    really is ENTRY, and that (0, E) is a DIFFERENT address -- which is
@@ -238,8 +248,8 @@ try:
 
     check("ON-CHAIN: the run's change came to rest in the ROTATED account",
           change_in_mix > 0)
-    check("ON-CHAIN: every fan-out destination is in the ROTATED account",
-          all(addr_index[d] in mix_after for d in dests))
+    check("ON-CHAIN: every fan-out destination landed in its OWN account",
+          all(scan(addr_index[d][0]).get(addr_index[d][1], 0) > 0 for d in dests))
     # THE DECISIVE ONE, by conservation of value rather than by watching
     # account 0. This harness mines to the primary address after the spend, so
     # account 0's balance necessarily grows for reasons that have nothing to do
@@ -250,15 +260,37 @@ try:
     # of those live in the mix account, then nothing from this transaction
     # reached account 0. That is airtight and immune to the mining noise.
     fee_paid = sum(r["result"].get("fee_list", []))
-    distributed = sum(mix_after.get(addr_index[d], 0) for d in dests)
+    distributed = sum(scan(addr_index[d][0]).get(addr_index[d][1], 0)
+                      for d in dests)
     accounted = distributed + change_in_mix + fee_paid
     entry_held = int(10 * A)
     print(f"  accounting: distributed {distributed/1e12} + change "
           f"{change_in_mix/1e12} + fee {fee_paid/1e12} = {accounted/1e12} "
           f"(ENTRY held {entry_held/1e12})")
-    check("ON-CHAIN: every piconero ENTRY held is accounted for INSIDE the mix "
-          "account, so nothing from this run reached the wallet PRIMARY",
+    check("ON-CHAIN: every piconero ENTRY held is accounted for in the run's "
+          "own accounts, so nothing from this run reached the wallet PRIMARY",
           accounted == entry_held)
+
+    # THE EXIT. What the operator is left holding must not be spendable by one
+    # transaction: a transaction's input count is public, and spending N of
+    # these together proves all N share an owner -- which is exactly what the
+    # distribution spent its effort separating. Verified by asking the wallet,
+    # not by reasoning: each destination account holds well under the total, so
+    # any single-transaction exit is impossible.
+    _held = [scan(addr_index[d][0]).get(addr_index[d][1], 0) for d in dests]
+    _biggest = max(_held)
+    _total = sum(_held)
+    print(f"  exit: {len(dests)} outputs, biggest single account holds "
+          f"{_biggest/1e12} XMR of {_total/1e12} XMR total")
+    check("EXIT: no single account holds the whole distribution, so no single "
+          "transaction can spend it", _biggest < _total)
+    _r = wj("transfer_split", {
+        "destinations": [{"amount": _total, "address": primary}],
+        "account_index": addr_index[dests[0]][0], "priority": 1,
+        "do_not_relay": True})
+    check("EXIT: asking one output's account for the whole amount is refused "
+          "by the wallet, not merely discouraged",
+          "not enough money" in str((_r.get("error") or {}).get("message", "")))
 
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:

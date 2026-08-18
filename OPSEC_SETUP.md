@@ -183,6 +183,35 @@ of its own) after the distribution, in both fan-out and peel modes. That is a
 correctness fix as much as an OPSEC one — roughly a tenth of the balance was
 previously never mixed at all while the run reported success.
 
+**The exit is where a mix is usually lost, so the outputs are built to make
+losing it hard.** A run ends with N outputs that you eventually spend, and
+until now they all sat in one account. Measured on a chain running current
+consensus, six mix outputs in one account:
+
+| what the operator does | on-chain |
+|---|---|
+| "empty this account" | **one transaction, 6 inputs** |
+| "send 5 XMR" | **one transaction, 4 inputs** |
+
+A transaction's inputs are public. Spending six outputs together is permanent
+proof that all six have one owner — no ring analysis, the input count is right
+there — and those six are exactly what the peel chain spent six transactions
+and several hours separating. The off-ramp planner does not help with this: it
+plans *where* to sell, not how to spend.
+
+Every output the run creates now lives in **its own account**. That makes the
+merge impossible rather than merely discouraged, because a Monero transaction
+cannot spend across accounts — asking one account for more than it holds
+answers "not enough money" while a sibling account holds the rest. The same
+six outputs then leave as six 1-in transactions for about 0.005 XMR more in
+fees. `tests/real_spend_account_testnet.py` asks the wallet to prove it rather
+than reasoning about it.
+
+What this does **not** solve: sending all six to one exchange deposit address
+tells that exchange they are yours. That is a custodial link, not a chain
+link, and no on-chain structure can remove it — it is what the off-ramp
+planner's split-across-venues guidance is for.
+
 **How far apart the hops land is yours to choose, and the default is not the
 strong setting.** A peel hop cannot be built until the previous hop's output
 has confirmed and unlocked — about 10 blocks — and `--hop-delay` is added on
