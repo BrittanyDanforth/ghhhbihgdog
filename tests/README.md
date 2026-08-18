@@ -38,9 +38,9 @@ python3 tests/test_console.py       # gs_console: wallet-password scope, no
 python3 tests/track_origin_attack.py # ORIGIN TRACE: name1 (sender PRIMARY)
                                      #   and name2 (receiver PRIMARY) against
                                      #   the shipped planners on this tree.
-python3 tests/leak_hidden_user.py    # LEAK THE HIDDEN USER: seized-wallet
-                                     #   labels, --account 0, explicit-0
-                                     #   receive bundle, integrity log, memo.
+python3 tests/leak_hidden_user.py    # OUTSIDER hunt: no seed/phrase. Chain,
+                                     #   ThorChain memo, and disk artifacts.
+                                     #   Seized wallet is out of scope.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
