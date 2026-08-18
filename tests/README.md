@@ -12,7 +12,9 @@ python3 tests/test_cli_flags.py     # every script: --help, argparse validation,
                                      # required/mutually-exclusive/choice flags,
                                      # pre-network runtime checks
 python3 tests/test_ipleak.py        # IP-LEAK defences: proxy scheme, empty-dict
-                                     # egress guards, localhost spoofing, fail-closed
+                                     # egress guards, localhost spoofing,
+                                     # unproxied requests, JoinMarket DNS,
+                                     # fail-closed remote RPC
 python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
                                      # paranoia_mode wipes (OPSEC leak guard)
 python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-delay,
