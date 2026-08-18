@@ -584,18 +584,59 @@ class MoneroRPC:
         """Send a raw JSON-RPC request to monero-wallet-rpc."""
         return self._backend.raw_request(method, params)
 
+    def new_subaddress_indexed(self, account_index: int = 0, label: str = "") -> tuple:
+        """Create a new subaddress and return (address_str, subaddress_index).
+
+        Goes STRAIGHT to wallet-rpc's create_address, not through
+        monero-python's `self._wallet.accounts[account_index]`.
+
+        That list is a snapshot taken when the Wallet object was built. Every
+        other call in this toolchain goes through raw_request(), so an account
+        created after construction is invisible to it -- and creating one is
+        exactly what create_receive_wallet does immediately before asking for
+        the subaddress:
+
+            acct = rpc.raw_request("create_account", ...)   # -> account_index 1
+            rpc.new_subaddress_indexed(account_index=1)     # accounts == [0]
+            -> IndexError: list index out of range
+
+        Reproduced against real monero-wallet-rpc 0.18.3.1 on a fresh wallet.
+        So the DEFAULT receive path -- the fresh-account-per-receive behaviour
+        that keeps a run's change off the wallet's primary address -- crashed
+        on every real wallet. It survived because every offline suite supplies
+        a fake RPC that stubs this method, so the stale-cache dependency was
+        never executed: the tests exercised the caller, never the call.
+
+        create_address is the same operation without the cache. It returns
+        {"address": ..., "address_index": N}; the index is validated rather
+        than defaulted, because a wrong subaddress index is written into the
+        receive bundle and later used to poll for the payment.
+        """
+        res = self.raw_request("create_address", {
+            "account_index": int(account_index), "label": label or "",
+        }) or {}
+        addr = res.get("address")
+        idx = res.get("address_index")
+        if not isinstance(addr, str) or not addr:
+            raise RuntimeError(
+                f"create_address returned no address for account {account_index}")
+        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+            raise RuntimeError(
+                f"create_address returned no usable address_index "
+                f"({idx!r}) for account {account_index}. Refusing to guess: the "
+                f"index is written into the receive bundle and is what the "
+                f"watcher polls for the payment.")
+        return addr, idx
+
     def new_subaddress(self, account_index: int = 0, label: str = "") -> str:
         """Create a new subaddress and return its string address.
-        Uses monero-python's Account.new_address() which returns (Address, index)."""
-        acct = self._wallet.accounts[account_index]
-        addr, _idx = acct.new_address(label=label)
-        return str(addr)
 
-    def new_subaddress_indexed(self, account_index: int = 0, label: str = "") -> tuple:
-        """Create a new subaddress and return (address_str, subaddress_index)."""
-        acct = self._wallet.accounts[account_index]
-        addr, idx = acct.new_address(label=label)
-        return str(addr), idx
+        Thin wrapper over new_subaddress_indexed so both share one
+        implementation -- it carried its own copy of the stale-cache lookup,
+        which is how one of the pair could be fixed while the other stayed
+        broken."""
+        addr, _idx = self.new_subaddress_indexed(account_index, label)
+        return addr
 
     def get_subaddress_balance(self, account_index: int = 0,
                                address_index: int = 0) -> tuple:

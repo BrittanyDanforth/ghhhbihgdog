@@ -664,6 +664,77 @@ def test_receive_is_btc_to_monero():
           "not the address you give the sender" in seg)
 
 
+def test_gui_never_stamps_a_tool_name_into_the_wallet():
+    """The GUI must NOT label receive subaddresses.
+
+    The page's collect() hardcoded `label:'GhostSpiral_entry'` and the
+    make_receive action built its argv with
+    `p.get("label", "GhostSpiral_entry")`, so the default UI -- the way this
+    is actually run -- stamped the tool's own name onto every receive
+    subaddress AND onto the fresh account holding it. That string lives in the
+    WALLET FILE, the single artifact paranoia_mode deliberately never deletes
+    because it is the operator's money. Anyone who opens that wallet learns
+    which tool built the layout and which address the run entered on.
+
+    create_receive_wallet had already been fixed to default to no label,
+    OPSEC_SETUP.md documents labels as removed, and a unit test pins the CLI
+    tool's default -- all three were true while the GUI kept sending the exact
+    string the fix removed. Every on-chain heuristic this toolchain defeats was
+    bypassed by reading a local string.
+    """
+    c = load_console()
+    src = open(os.path.join(REPO, "gs_console")).read()
+
+    # 1. the page must not send a label at all
+    js = src[src.index("function collect()"):]
+    js = js[:js.index("\n}")]
+    # Strip // comments first: the explanation of WHY there is no label
+    # necessarily names the string that used to be there, and a raw substring
+    # check cannot tell the documentation from the defect.
+    js_code = "\n".join(l.split("//")[0] for l in js.split("\n"))
+    check("the collect() body was actually found (the scan is not vacuous)",
+          "receive_wallet" in js_code)
+    check("the page's collect() sends no hardcoded label",
+          "GhostSpiral_entry" not in js_code)
+    check("...and sends no label key whatsoever", "label:" not in js_code)
+
+    # 2. the action must not invent one either
+    argv = c.ACTIONS["make_receive"]["build"]({
+        "rpc_primary": "http://127.0.0.1:18083",
+        "tor_proxy": "socks5h://127.0.0.1:9050"})
+    check("the default GUI argv carries NO --label", "--label" not in argv)
+    check("...and no tool name anywhere on it",
+          not any("GhostSpiral" in a for a in argv[1:]))
+    check("the receive action still really invokes create_receive_wallet",
+          "create_receive_wallet" in argv)
+    check("...still forced through Tor",
+          argv[argv.index("--tor-proxy") + 1].startswith("socks5h://"))
+
+    # 3. an operator who deliberately asks for a label still gets one
+    argv2 = c.ACTIONS["make_receive"]["build"]({
+        "rpc_primary": "http://127.0.0.1:18083",
+        "tor_proxy": "socks5h://127.0.0.1:9050", "label": "Savings"})
+    check("a deliberate label is still passed through",
+          "--label" in argv2 and argv2[argv2.index("--label") + 1] == "Savings")
+
+    # 4. no OTHER action may smuggle the tool name onto a child's argv either
+    _probe = {"rpc_primary": "http://127.0.0.1:18083",
+              "tor_proxy": "socks5h://127.0.0.1:9050",
+              "receive_wallet": "w.json", "wallet_file": "w",
+              "swap_btc": "0.05", "btc_amount": "0.05",
+              "btc_entry": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+              "split": 1, "wallets": 10, "deep": 2, "fee_priority": 1,
+              "mode": "receive"}
+    for name, act in c.ACTIONS.items():
+        try:
+            a = act["build"](_probe)
+        except Exception:
+            continue
+        offenders = [x for x in a[1:] if isinstance(x, str) and "GhostSpiral_" in x]
+        check(f"action {name} puts no tool-name label on its child's argv",
+              not offenders)
+
+
 def test_daemon_detection_fixes_no_estimate():
     """'Cannot get estimates' is nearly always 'nothing is listening where the
     daemon field points'. The console must be able to go find it."""

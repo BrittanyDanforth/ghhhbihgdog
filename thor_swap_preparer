@@ -90,6 +90,93 @@ def _dest_from_bundle(path: str) -> str:
     return addr
 
 
+def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
+    """Decide where each swap delivers. ONE FRESH ADDRESS PER SWAP, enforced.
+
+    This is the most dangerous field in the tool -- whatever lands here goes
+    into the swap memo and the XMR is delivered to it irreversibly -- and it
+    had grown into a run of conditionals in main() with no invariant of its
+    own. It is a function now so the rule can be stated once and tested.
+
+    THE RULE, and why it is a refusal rather than a warning:
+
+      args.dests = [_dest_from_bundle(bundle)] * len(args.amounts)
+
+    was the old one-liner. Split a swap into three amounts to avoid one large
+    one, and all three quotes went out naming the SAME XMR address. Two
+    consequences, and the second is worse than the first.
+
+      * ThorChain (or any aggregator) sees three BTC deposits routed to one
+        Monero address, so the three payments -- and the people who made them
+        -- are linked to each other by the party that already has to know the
+        destination. Splitting the amount bought nothing and cost three sets
+        of fees.
+
+      * It silently defeats the NEWNYM rotation between quotes. That rotation
+        exists so the aggregator sees N unrelated clients rather than one
+        client arranging N swaps -- and the code comment says exactly that.
+        A new Tor circuit cannot help when every request body carries the
+        same unique 95-character identifier. The rotation was theatre for any
+        batch of more than one.
+
+    A destination is reused ONLY because the operator asked for it, so it is
+    refused here rather than warned about: by the time a warning is read the
+    quotes are already fetched and the aggregator already has the linkage.
+
+    What the swap discloses no matter what: the aggregator is told the XMR
+    destination and returns the BTC deposit address, so it can always tie
+    "this BTC payment" to "this first XMR address". Tor hides who asked; it
+    does not hide the linkage. Mixing afterwards hides what happens NEXT --
+    it cannot retract what the aggregator already saw. A fresh address per
+    swap is what keeps that disclosure from also linking the swaps together.
+    """
+    if dests and bundles:
+        sys.exit(
+            "[!] Give either --dests or --dest-from-receive-wallet, not both — "
+            "with both set it is ambiguous which address the XMR is sent to.")
+
+    if bundles:
+        # One bundle per amount. A single bundle for a single amount is the
+        # normal case and reads exactly as before.
+        if len(bundles) != len(amounts):
+            sys.exit(
+                f"[!] {len(amounts)} amount(s) but {len(bundles)} receive bundle(s).\n"
+                f"    Each swap needs its OWN destination address: reusing one across\n"
+                f"    a batch tells the aggregator that these BTC payments belong\n"
+                f"    together, which is the linkage splitting the amount was meant\n"
+                f"    to avoid.\n"
+                f"    Mint {len(amounts)} of them in one go:\n"
+                f"        python3 create_receive_wallet --count {len(amounts)} "
+                f"--tor-proxy <SOCKS5H_PROXY>\n"
+                f"    then pass every bundle it writes:\n"
+                f"        --dest-from-receive-wallet wallet_a.json wallet_b.json ...")
+        out = [_dest_from_bundle(b) for b in bundles]
+    else:
+        out = list(dests)
+
+    if len(out) != len(amounts):
+        sys.exit(f"[!] Mismatch: {len(amounts)} amounts vs {len(out)} dests")
+
+    # The invariant, checked on the FINAL list so it holds however the
+    # addresses were supplied -- bundles, --dests, or the environment.
+    seen: Dict[str, int] = {}
+    for i, d in enumerate(out):
+        if d in seen:
+            sys.exit(
+                f"[!] Swaps {seen[d]} and {i} both deliver to "
+                f"{scrub_address(d)}.\n"
+                f"    Refusing: the aggregator is told each destination, so one\n"
+                f"    address across several swaps hands it a link between those\n"
+                f"    BTC payments -- and no amount of mixing afterwards retracts\n"
+                f"    a link it already recorded. It also defeats the circuit\n"
+                f"    rotation between quotes, which cannot disguise identical\n"
+                f"    request bodies.\n"
+                f"    Use one fresh receive address per swap "
+                f"(create_receive_wallet --count {len(amounts)}).")
+        seen[d] = i
+    return out
+
+
 def _validate_xmr_addr(addr: str) -> None:
     """Validate XMR address format and checksum."""
     if not _XMR_RE.match(addr):
@@ -120,13 +207,19 @@ def main():
                          "/proc/<pid>/cmdline (mode 444), and the amount is the "
                          "value that links this swap to the sender.")
     ap.add_argument("--dests", nargs="+",
-                    help="XMR destination addresses (one per amount)")
-    ap.add_argument("--dest-from-receive-wallet",
-                    help="take the XMR destination from a gs_receive_wallet_v1 bundle "
-                         "written by create_receive_wallet, instead of --dests. The "
-                         "address in that bundle was already read back and validated "
+                    help="XMR destination addresses, ONE PER AMOUNT and all distinct. "
+                         "Prefer GS_SWAP_DESTS or --dest-from-receive-wallet: an argv "
+                         "address is world-readable via ps and /proc/<pid>/cmdline "
+                         "(mode 444), and it is the value that says where the swapped "
+                         "Monero lands.")
+    ap.add_argument("--dest-from-receive-wallet", nargs="+", metavar="BUNDLE",
+                    help="take the XMR destinations from gs_receive_wallet_v1 bundles "
+                         "written by create_receive_wallet, instead of --dests. Give "
+                         "ONE BUNDLE PER AMOUNT (create_receive_wallet --count N writes "
+                         "N of them). Each address was already read back and validated "
                          "by the wallet itself, so this avoids retyping a 95-character "
-                         "address into the one field where a typo is irreversible.")
+                         "address into the one field where a typo is irreversible, and "
+                         "keeps it off argv.")
     ap.add_argument("--tor-proxy",
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
@@ -163,22 +256,23 @@ def main():
     if args.max_slippage <= 0:
         sys.exit("[!] --max-slippage must be positive.")
 
-    # The destination is the single most dangerous field in this tool: whatever
-    # ends up here is written into the swap memo and the XMR is delivered to it
-    # irreversibly. Reading it from the bundle the wallet already verified beats
-    # retyping it, so that path is offered -- but never BOTH at once, because
-    # then it is ambiguous which address the money actually goes to.
-    if args.dest_from_receive_wallet and args.dests:
-        sys.exit("[!] Give either --dests or --dest-from-receive-wallet, not both — "
-                 "with both set it is ambiguous which address the XMR is sent to.")
-    if args.dest_from_receive_wallet:
-        args.dests = [_dest_from_bundle(args.dest_from_receive_wallet)] * len(args.amounts)
-    if not args.dests:
-        sys.exit("[!] No XMR destination. Pass --dests, or --dest-from-receive-wallet "
-                 "with the JSON create_receive_wallet wrote.")
+    # The XMR destination is the single most linkable value this tool handles:
+    # the aggregator is told it, and it is the address the swap output lands
+    # on. Keep it off argv for the same reason as the amounts -- /proc/<pid>/
+    # cmdline is mode 444, so any local account could read where the swapped
+    # Monero is going while the process runs.
+    _env_dests = env_or_argv("GS_SWAP_DESTS",
+                             " ".join(args.dests) if args.dests else None,
+                             "The XMR destination address(es)")
+    args.dests = str(_env_dests).split() if _env_dests else []
 
-    if len(args.amounts) != len(args.dests):
-        sys.exit(f"[!] Mismatch: {len(args.amounts)} amounts vs {len(args.dests)} dests")
+    if not args.dests and not args.dest_from_receive_wallet:
+        sys.exit("[!] No XMR destination. Pass --dest-from-receive-wallet with the "
+                 "JSON create_receive_wallet wrote (preferred — the wallet already "
+                 "verified that address), set GS_SWAP_DESTS, or pass --dests.")
+
+    args.dests = resolve_destinations(args.amounts, args.dests,
+                                      args.dest_from_receive_wallet)
 
     for amt in args.amounts:
         if amt <= 0:
@@ -359,6 +453,32 @@ def main():
     print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
     print("  route the swap. Quotes expire — send promptly.")
     print("  ============================================================")
+    print()
+    # What this step costs you, stated where the operator is looking at the
+    # values it costs. Everything below is a property of using an aggregator at
+    # all -- none of it is a defect in this tool, and none of it is fixable by
+    # this tool, which is exactly why it has to be said rather than hidden.
+    print("  ---- WHAT THE SWAP DISCLOSES (unavoidable, read once) ----")
+    print("  The aggregator was told your XMR address and gave back the deposit")
+    print("  address above. It can therefore always tie THIS BTC PAYMENT to")
+    print("  THAT FIRST XMR ADDRESS. Tor hid who asked; it did not hide the")
+    print("  link. Mixing afterwards hides what you do NEXT with the Monero —")
+    print("  it does not retract what the aggregator already recorded.")
+    print()
+    print("  So:")
+    print("   * Do not reuse the destination address above for anything else.")
+    print("     It is burned: one party already associates it with a BTC payer.")
+    print(f"   * The memo{'s' if len(pairs) > 1 else ''} above "
+          f"name{'' if len(pairs) > 1 else 's'} that address in plain text. Send "
+          f"{'them' if len(pairs) > 1 else 'it'} to the payer")
+    print("     the same way you would a password — not into a public paste site,")
+    print("     an issue tracker, a support chat or a group thread. Anything that")
+    print("     indexes it publishes the BTC-to-XMR link to everyone, not just")
+    print("     to the aggregator that already had it.")
+    print("   * If you do not want ANY party to see the destination, an")
+    print("     aggregator swap is the wrong tool. This one cannot route without")
+    print("     being told where to deliver.")
+    print("  ----------------------------------------------------------")
 
     if args.gpg_recipient:
         # Encryption was explicitly requested. The plaintext bundle (deposit

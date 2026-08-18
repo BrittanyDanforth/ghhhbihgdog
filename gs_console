@@ -185,13 +185,30 @@ ACTIONS = {
                         "desc": "what paranoia_mode WOULD erase — deletes nothing",
                         "build": lambda p: [PY, "paranoia_mode", "--dry-run"]},
 
-    # receive side — creates a subaddress, spends nothing
+    # receive side — creates a subaddress, spends nothing.
+    #
+    # NO --label unless the operator deliberately supplies one.
+    #
+    # This built the argv with `p.get("label", "GhostSpiral_entry")` while the
+    # page's collect() hardcoded `label:'GhostSpiral_entry'`, so the default UI
+    # -- the way essentially everyone runs this -- stamped the tool's own name
+    # onto every receive subaddress AND onto the fresh account created to hold
+    # it. That string lands in the WALLET FILE, which is the single artifact
+    # paranoia_mode deliberately never deletes because it is the operator's
+    # money. Anyone who opens that wallet reads "GhostSpiral_entry" and knows
+    # both which tool produced the layout and which address the run entered on.
+    #
+    # create_receive_wallet had already been fixed to default to no label, and
+    # OPSEC_SETUP.md documents labels as removed, and a unit test pins the CLI
+    # tool's default -- all three were true while the GUI kept sending the
+    # exact string the fix removed. Every on-chain heuristic this toolchain
+    # defeats was bypassed by reading a local string.
     "make_receive":    {"group": "Receive", "label": "Create receive address", "risk": "safe",
                         "desc": "fresh subaddress + gs_receive_wallet_v1 JSON for the sender",
                         "build": lambda p: [PY, "create_receive_wallet",
                                             "--rpc", p.get("rpc_primary", "http://127.0.0.1:18083"),
-                                            "--tor-proxy", p.get("tor_proxy", ""),
-                                            "--label", p.get("label", "GhostSpiral_entry")]},
+                                            "--tor-proxy", p.get("tor_proxy", "")]
+                                           + (["--label", p["label"]] if p.get("label") else [])},
     # THE step that makes "receive" mean BTC -> Monero. Without it the address
     # handed to the sender is a Monero one, so the sender must already hold XMR
     # and the swap that the whole receive flow exists for never happens.
@@ -1408,6 +1425,10 @@ function setMode(m){
 }
 $$('#mode button').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.m)));
 
+// Deliberately sends NO subaddress label. One used to be hardcoded in the
+// returned object, so every receive subaddress the GUI created was tagged with
+// the tool's own name -- in the wallet file, the one artifact paranoia_mode
+// never deletes. See the make_receive action for the full reasoning.
 function collect(){
  const v=id=>$('#'+id)?.value.trim()||'';
  const c=id=>!!$('#'+id)?.checked;
@@ -1418,7 +1439,7 @@ function collect(){
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),
   rpc_primary:v('rpc_primary'), rpc_daemon:v('rpc_daemon'),
-  wallet_file:v('wallet_file'), label:'GhostSpiral_entry'};
+  wallet_file:v('wallet_file')};
 }
 
 // ── NON-NEGOTIABLE OPSEC preflight ─────────────────────────────────────────

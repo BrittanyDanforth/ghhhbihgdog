@@ -122,61 +122,14 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int,
           f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
 
 
-def main():
-    install_signal_handlers()
+def mint_one_receive(wallet_rpc, args) -> tuple:
+    """Create ONE receive address in its own account and write its bundle.
 
-    ap = argparse.ArgumentParser(
-        "create_receive_wallet v10",
-        description="Generate a fresh Monero receive subaddress for GhostSpiral",
-    )
-    ap.add_argument("--rpc", default="http://127.0.0.1:18083",
-                    help="monero-wallet-rpc endpoint")
-    ap.add_argument("--tor-proxy",
-                    help="socks5h://host:port if routing via Tor")
-    ap.add_argument("--label", default="",
-                    help="label for the new subaddress. Empty by default and best "
-                         "left that way: labels live in the WALLET FILE, which is "
-                         "the one artifact paranoia_mode never deletes, so a "
-                         "seized or auto-unlocking wallet hands a reader the "
-                         "role of every address -- and a label naming the tool "
-                         "names the tool.")
-    ap.add_argument("--account", type=int, default=None,
-                    help="use this existing account instead of creating a fresh one. "
-                         "Only for an existing wallet layout — a fresh account per "
-                         "receive is what keeps the mix's change off the wallet's "
-                         "primary address.")
-    ap.add_argument("--output-dir", default=".",
-                    help="directory for wallet JSON output")
-    args = ap.parse_args()
-
-    require_resources(min_disk_gb=2.0)
-
-    if not args.tor_proxy:
-        sys.exit(
-            "[!] --tor-proxy is REQUIRED. The Tor verification check itself needs\n"
-            "    a proxy to confirm safe operation. Aborting."
-        )
-    proxy = validate_proxy(args.tor_proxy)
-    verify_tor(proxy)
-
-    try:
-        wallet_rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
-    except Exception as e:
-        integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
-        sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
-
-    # A subaddress can only be created on an already-open wallet. The old code
-    # here did `if not wallet_rpc.accounts: new_account(...)`, which is a dead,
-    # confused branch: accessing .accounts with no open wallet RAISES (never
-    # returns empty), and if it somehow did, new_account creates account 1 while
-    # the next line spends from account 0. Fail clearly instead.
-    try:
-        if not wallet_rpc.accounts:
-            raise RuntimeError("no accounts")
-    except Exception as ex:
-        integrity_log("wallet", "no_open_wallet")
-        sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
-                 f"Open/create a wallet in wallet-rpc first, then re-run.")
+    Returns (address, bundle_path). Extracted from main() so --count can mint
+    several without duplicating the verification, the bundle write or the
+    circuit rotation -- and so a single receive can be driven from a test
+    without standing up the whole CLI.
+    """
     # A FRESH ACCOUNT PER RECEIVE, not just a fresh subaddress in account 0.
     #
     # Verified against real monerod 0.18: change is returned to the SPENDING
@@ -218,7 +171,16 @@ def main():
 
     verify_receive_address(wallet_rpc, addr_str, sub_idx, acct_idx)
 
-    integrity_log("wallet", f"created:{scrub_address(addr_str)}:label={args.label}")
+    # The label's CONTENT never reaches the integrity chain -- only whether one
+    # was set. This logged `label={args.label}` verbatim. The entire reason
+    # this tool defaults to no label is that a label describes an address's
+    # role to whoever reads it, and the integrity chain is a file on disk that
+    # outlives the run and is wiped LAST, so an operator who set a meaningful
+    # label got it written straight back out into a second artifact. Whether a
+    # label exists is all an audit trail needs; what it says is the leak.
+    _has_label = "set" if args.label else "none"
+    integrity_log("wallet",
+                  f"created:{scrub_address(addr_str)}:label={_has_label}")
 
     out = {
         "schema": "gs_receive_wallet_v1",
@@ -245,28 +207,161 @@ def main():
     # failure leaves the subaddress creation on the same circuit as whatever
     # follows it -- which is the correlation the rotation exists to break.
     newnym(required=True)
+    return addr_str, fname
 
-    print(f"  [+] Integrity chain updated.")
+
+def print_next_steps(bundles: list) -> None:
+    """What to run next, and what the next step costs you.
+
+    REWRITTEN, because the old version taught the leak this toolchain spent
+    the rest of its effort closing. It printed
+
+        python3 thor_swap_preparer --amounts <BTC_AMOUNT> --dests <address>
+
+    -- putting BOTH the swap amount and the 95-character XMR destination on a
+    command line. /proc/<pid>/cmdline is mode 444, so any local account can
+    read `ps -eo args` and learn how much is being swapped and where the
+    Monero lands. thor_swap_preparer already prefers GS_SWAP_AMOUNTS and
+    already has --dest-from-receive-wallet for exactly this, and the tool's
+    own next-steps text recommended neither. A fix that the guidance walks
+    the operator around is not a fix.
+
+    The disclosure paragraph is here rather than buried in a doc because this
+    is the moment the operator is about to hand the address to an aggregator,
+    and it is the last moment the choice is still open.
+    """
+    n = len(bundles)
     print()
-    print(f"  === RECEIVER FLOW: NEXT STEPS ===")
-    print(f"  1. Run thor_swap_preparer to generate a BTC deposit address + memo:")
-    print(f"       python3 thor_swap_preparer \\")
-    print(f"         --amounts <BTC_AMOUNT> \\")
-    print(f"         --dests {addr_str} \\")
-    print(f"         --tor-proxy <SOCKS5H_PROXY>")
-    print(f"  2. Give the BTC deposit address + memo to the sender")
-    print(f"  3. Wait for the payment. Do NOT refresh a block explorer to check —")
-    print(f"     asking one whether that BTC address has been paid tells a party")
-    print(f"     that did not know it that someone is watching it. This polls your")
-    print(f"     OWN wallet instead, and asks what to do once the money lands:")
+    print("  === RECEIVER FLOW: NEXT STEPS ===")
+    print("  1. Get the BTC deposit address + memo. The destination comes from")
+    print("     the bundle(s) above — never retype a 95-character address, and")
+    print("     never put the address or the amount on the command line (any")
+    print("     local user can read those from ps / /proc/<pid>/cmdline):")
+    print(f"       GS_SWAP_AMOUNTS='{' '.join(['<BTC_AMOUNT>'] * n)}' \\")
+    print("       python3 thor_swap_preparer \\")
+    print(f"         --dest-from-receive-wallet {' '.join(str(f) for _, f in bundles)} \\")
+    print("         --tor-proxy <SOCKS5H_PROXY>")
+    if n == 1:
+        print("     (Splitting into several swaps? Each one needs its OWN address —")
+        print("      re-run this tool with --count N and pass all N bundles.)")
+    print("  2. Give the BTC deposit address + memo to the sender.")
+    print("  3. Wait for the payment. Do NOT refresh a block explorer to check —")
+    print("     asking one whether that BTC address has been paid tells a party")
+    print("     that did not know it that someone is watching it. This polls your")
+    print("     OWN wallet instead, and asks what to do once the money lands:")
     print(f"       python3 receive_watch \\")
-    print(f"         --receive-wallet {fname} \\")
+    print(f"         --receive-wallet {bundles[0][1]} \\")
     print(f"         --pairs <THOR_PAIRS_JSON> \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
-    print(f"  4. It prints the mix command for whichever option you pick, e.g.:")
+    print("  4. It prints the mix command for whichever option you pick, e.g.:")
     print(f"       python3 GhostSpiral \\")
-    print(f"         --receive-wallet {fname} \\")
+    print(f"         --receive-wallet {bundles[0][1]} \\")
     print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print()
+    print("  === WHAT THE SWAP WILL DISCLOSE (decide now, not after) ===")
+    print("  A BTC->XMR aggregator has to be TOLD where to deliver the Monero.")
+    print("  That instruction travels in the memo attached to the sender's BTC")
+    print("  payment, so the aggregator — and anyone it shares with, or anyone")
+    print("  who later compels it — can tie THAT BTC PAYMENT to THE ADDRESS")
+    print("  ABOVE. Tor hides who arranged the swap. It does not hide the link.")
+    print()
+    print("  The mixing that follows hides what you do NEXT with the Monero. It")
+    print("  cannot retract what the aggregator already saw. So treat the")
+    print("  address above as burned: use it for this one swap, let the mix move")
+    print("  the funds off it, and do not reuse it. Keep the memo off anything")
+    print("  public — a paste site, an issue, a group chat — because the memo")
+    print("  names that address in plain text, and publishing it turns a link")
+    print("  one company holds into a link everyone holds.")
+    print()
+    print("  What is NOT at risk here: nobody reads your wallet off the")
+    print("  blockchain. Monero hides the amount and the spender, and your view")
+    print("  key is not derivable from chain data. A view key leaks one way —")
+    print("  somebody gets your FILES: the online view-only machine, a laptop")
+    print("  that auto-unlocks, a backup, or a key you pasted somewhere. That is")
+    print("  a disk-encryption and physical-custody problem, not a chain problem,")
+    print("  and it is the one paranoia_mode deliberately cannot solve for you.")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "create_receive_wallet v10",
+        description="Generate a fresh Monero receive subaddress for GhostSpiral",
+    )
+    ap.add_argument("--rpc", default="http://127.0.0.1:18083",
+                    help="monero-wallet-rpc endpoint")
+    ap.add_argument("--tor-proxy",
+                    help="socks5h://host:port if routing via Tor")
+    ap.add_argument("--label", default="",
+                    help="label for the new subaddress. Empty by default and best "
+                         "left that way: labels live in the WALLET FILE, which is "
+                         "the one artifact paranoia_mode never deletes, so a "
+                         "seized or auto-unlocking wallet hands a reader the "
+                         "role of every address -- and a label naming the tool "
+                         "names the tool.")
+    ap.add_argument("--account", type=int, default=None,
+                    help="use this existing account instead of creating a fresh one. "
+                         "Only for an existing wallet layout — a fresh account per "
+                         "receive is what keeps the mix's change off the wallet's "
+                         "primary address.")
+    ap.add_argument("--count", type=int, default=1, metavar="N",
+                    help="mint N receive addresses, each in its OWN account, each "
+                         "with its own bundle file. Use one per swap: a swap "
+                         "aggregator is told the destination, so reusing one address "
+                         "across several swaps hands it a link between those BTC "
+                         "payments. thor_swap_preparer refuses a batch that reuses "
+                         "a destination, and this is how you satisfy it in one go.")
+    ap.add_argument("--output-dir", default=".",
+                    help="directory for wallet JSON output")
+    args = ap.parse_args()
+
+    if args.count < 1:
+        sys.exit("[!] --count must be at least 1.")
+    if args.count > 1 and args.account is not None:
+        sys.exit(
+            "[!] --count > 1 with --account pins every receive to ONE account, so "
+            "they would\n"
+            "    share a change sink and the separation --count exists for is lost. "
+            "Drop\n"
+            "    --account to let each receive get its own account, or mint them one "
+            "at a time.")
+
+    require_resources(min_disk_gb=2.0)
+
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. The Tor verification check itself needs\n"
+            "    a proxy to confirm safe operation. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+
+    try:
+        wallet_rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
+    except Exception as e:
+        integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
+        sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
+
+    # A subaddress can only be created on an already-open wallet. The old code
+    # here did `if not wallet_rpc.accounts: new_account(...)`, which is a dead,
+    # confused branch: accessing .accounts with no open wallet RAISES (never
+    # returns empty), and if it somehow did, new_account creates account 1 while
+    # the next line spends from account 0. Fail clearly instead.
+    try:
+        if not wallet_rpc.accounts:
+            raise RuntimeError("no accounts")
+    except Exception as ex:
+        integrity_log("wallet", "no_open_wallet")
+        sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
+                 f"Open/create a wallet in wallet-rpc first, then re-run.")
+    bundles = []
+    for n in range(args.count):
+        if args.count > 1:
+            print(f"\n  === receive {n + 1} of {args.count} ===")
+        bundles.append(mint_one_receive(wallet_rpc, args))
+
+    print_next_steps(bundles)
 
 
 if __name__ == "__main__":

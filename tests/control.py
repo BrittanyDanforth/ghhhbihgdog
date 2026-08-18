@@ -58,6 +58,7 @@ ACTIONS = {
     "realpeel":    {**suite("real_peel_testnet", "SHIPPED peeling chain: N dests via N separate txs"), "group": "Real binaries"},
     "peelcold":    {**suite("real_peel_cold_testnet", "SHIPPED phase_create+phase_sign COLD peel chain"), "group": "Real binaries"},
     "leakaudit":   {**suite("leak_audit_testnet", "runs 3 stages, audits what hits disk", VENV_PY), "group": "Real binaries"},
+    "recvcount":   {**suite("real_receive_count_testnet", "--count mints N independent receives; reuse refused"), "group": "Real binaries"},
 
     # -- operational checks: inspect the live environment, change nothing --
     "paranoia_dry": {"cmd": [PY, "paranoia_mode", "--dry-run"], "group": "Operational checks",

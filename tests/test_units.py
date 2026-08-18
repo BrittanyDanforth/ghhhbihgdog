@@ -1571,6 +1571,74 @@ check("broadcast: no raw str(e) slice is logged or printed",
 
 
 # ---------------------------------------------------------------------------
+# MoneroRPC.new_subaddress_indexed must not use python-monero's CACHED account
+# list. That list is a snapshot from Wallet construction; every other call here
+# goes through raw_request, so an account created afterwards is invisible to
+# it. create_receive_wallet does exactly that, one line earlier:
+#     rpc.raw_request("create_account")  -> account_index 1
+#     rpc.new_subaddress_indexed(account_index=1)   # accounts == [0]
+# -> IndexError on real monero-wallet-rpc 0.18.3.1 (reproduced). So the DEFAULT
+# receive path -- fresh account per receive, the thing keeping a run's change
+# off the wallet primary -- crashed on every real wallet, while every offline
+# suite passed because they all stub this method. The tests exercised the
+# caller and never the call.
+# ---------------------------------------------------------------------------
+class _FakeBackend:
+    def __init__(self, resp): self.resp = resp; self.calls = []
+    def raw_request(self, method, params):
+        self.calls.append((method, params))
+        return self.resp
+
+
+def _rpc_with(resp):
+    r = gs.MoneroRPC.__new__(gs.MoneroRPC)
+    r._backend = _FakeBackend(resp)
+    # deliberately NOT set: a wallet object with a stale accounts list. If the
+    # implementation reaches for self._wallet at all, this raises instead of
+    # silently working on a fake.
+    return r
+
+
+_r = _rpc_with({"address": "8" + "Z" * 94, "address_index": 7})
+_addr, _idx = _r.new_subaddress_indexed(account_index=3, label="")
+check("new_subaddress_indexed goes through create_address, not the cache",
+      _r._backend.calls[0][0] == "create_address")
+check("...forwarding the account index it was asked for",
+      _r._backend.calls[0][1]["account_index"] == 3)
+check("...and returns the wallet's own address + index", _addr.startswith("8") and _idx == 7)
+check("...without touching a cached wallet object",
+      not hasattr(_r, "_wallet"))
+
+# new_subaddress had its OWN copy of the stale lookup -- one of the pair could
+# be fixed while the other stayed broken. It must share the implementation.
+_r2 = _rpc_with({"address": "8" + "Y" * 94, "address_index": 2})
+check("new_subaddress shares that implementation",
+      _r2.new_subaddress(account_index=1) == "8" + "Y" * 94
+      and _r2._backend.calls[0][0] == "create_address")
+
+# The index is written into the receive bundle and is what the watcher polls,
+# so an unusable one must raise rather than default to 0 -- polling index 0 of
+# a fresh account watches its CHANGE SINK, which would report the wrong money.
+for _bad, _why in [({"address": "8" + "Z" * 94}, "missing index"),
+                   ({"address": "8" + "Z" * 94, "address_index": None}, "null index"),
+                   ({"address": "8" + "Z" * 94, "address_index": -1}, "negative index"),
+                   ({"address": "8" + "Z" * 94, "address_index": True}, "bool index"),
+                   ({"address": "", "address_index": 1}, "empty address"),
+                   ({}, "empty response")]:
+    _raised = False
+    try:
+        _rpc_with(_bad).new_subaddress_indexed(account_index=1)
+    except RuntimeError:
+        _raised = True
+    check(f"a create_address response with a {_why} raises, never defaults", _raised)
+
+# explicit 0 IS valid and must be accepted (account 0's first subaddress)
+_ok0 = _rpc_with({"address": "8" + "Q" * 94, "address_index": 0})
+check("address_index 0 is accepted (it is a real index, not 'missing')",
+      _ok0.new_subaddress_indexed(account_index=0)[1] == 0)
+
+
+# ---------------------------------------------------------------------------
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

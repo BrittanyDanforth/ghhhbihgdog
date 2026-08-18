@@ -218,6 +218,40 @@ the balances, the transaction history and every subaddress a run created:
 the whole mix graph. Section 6's "door kick, they take the ThinkPad → partly"
 is exactly this.
 
+**The swap is seen. Plan around it, not against it.**
+
+A BTC→XMR aggregator has to be **told** where to deliver the Monero. That
+instruction rides in the memo attached to the sender's Bitcoin payment, so the
+aggregator — and anyone it shares with, or anyone who later compels it — can
+tie *that BTC payment* to *your first XMR address*. Tor hides who arranged the
+swap. It does not hide the link, and nothing in this toolchain can retract it.
+
+The mixing that follows hides what you do **next** with the Monero. That is
+the whole and only claim. So:
+
+- **One fresh receive address per swap.** `thor_swap_preparer` now *refuses* a
+  batch that routes two swaps to the same address — reusing one hands the
+  aggregator a link between those BTC payments, which is exactly what
+  splitting the amount was meant to avoid, and it silently defeats the NEWNYM
+  rotation between quotes (a new circuit cannot disguise identical request
+  bodies). Mint them with `create_receive_wallet --count N` and pass every
+  bundle to `--dest-from-receive-wallet`.
+- **Treat the receive address as burned** once the swap is arranged. Let the
+  mix move the funds off it; do not reuse it for anything.
+- **Keep the memo off anything public.** It names your XMR address in plain
+  text. A paste site, an issue tracker, a group chat — anything indexed turns
+  a link one company holds into a link everybody holds.
+- **If you do not want any party to see the destination, an aggregator is the
+  wrong tool.** This one cannot route without being told.
+
+**What is *not* at risk: your wallet, from the chain.** Nobody reads your
+balance off the blockchain. Monero hides the amount and the spender, and your
+view key is not derivable from chain data. A view key leaks exactly one way —
+somebody gets your **files**: the online view-only box, a laptop that
+auto-unlocks, a backup, or a key you pasted somewhere. That is a
+disk-encryption and physical-custody problem, and it is precisely the one
+`paranoia_mode` deliberately cannot solve for you (see the wallet note above).
+
 **Where the wipe reaches (and where it did not)**
 
 `paranoia_mode`'s Temp files phase sweeps `/tmp` and `/var/tmp` wholesale for

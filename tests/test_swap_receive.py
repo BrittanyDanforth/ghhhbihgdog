@@ -6,7 +6,7 @@ memo is the only thing routing the XMR to you, and the receive subaddress is
 what gets pasted into that memo. Both are driven here through their real code
 paths with only the network stubbed. Confirmed to FAIL against the pre-fix build.
 """
-import sys, os, json, tempfile, importlib.util, importlib.machinery
+import sys, os, json, tempfile, types, importlib.util, importlib.machinery
 from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +41,7 @@ crw = load("create_receive_wallet")
 # A real-format mainnet Monero subaddress (starts with 8, 95 chars).
 DEST = "8" + "A" + "1" * 93
 OTHER = "8" + "B" + "2" * 93
+THIRD = "8" + "0" + "3" * 93
 # A real mainnet bech32 P2WPKH address (valid BIP173 checksum).
 DEPOSIT = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 
@@ -332,6 +333,220 @@ def test_dest_from_receive_bundle():
     # Ambiguity about where money goes must be refused, never silently resolved.
     check("--dests and --dest-from-receive-wallet together are refused",
           "not both" in src)
+
+
+def test_one_fresh_destination_per_swap():
+    """A batch must never route two swaps to the SAME XMR address.
+
+    The old resolver was
+        args.dests = [_dest_from_bundle(bundle)] * len(args.amounts)
+    so splitting a swap into three amounts sent three quotes naming one
+    address. That hands the aggregator a link between three BTC payments --
+    the very link splitting the amount was meant to avoid -- and it silently
+    defeats the NEWNYM rotation between quotes, because a fresh Tor circuit
+    cannot disguise three request bodies carrying the same unique
+    95-character identifier.
+    """
+    from decimal import Decimal as D
+    A, B, C = DEST, OTHER, THIRD
+
+    def resolve(amounts, dests=None, bundles=None):
+        try:
+            return thor.resolve_destinations([D(x) for x in amounts],
+                                             dests or [], bundles or [])
+        except SystemExit as e:
+            return "REFUSED:" + str(e.code or "")
+
+    # the normal single swap still works, unchanged
+    check("one amount, one dest resolves", resolve(["0.01"], dests=[A]) == [A])
+    check("three amounts, three DISTINCT dests resolve",
+          resolve(["0.01", "0.02", "0.03"], dests=[A, B, C]) == [A, B, C])
+
+    # the defect
+    r = resolve(["0.01", "0.02"], dests=[A, A])
+    check("two swaps to the SAME address are REFUSED", str(r).startswith("REFUSED"))
+    check("...the refusal names both swap positions",
+          "0 and 1" in str(r))
+    check("...and explains the aggregator keeps the link",
+          "no amount of mixing afterwards retracts" in str(r))
+    check("...and points at the circuit rotation it defeats",
+          "rotation" in str(r))
+    check("...and says how to fix it",
+          "--count 2" in str(r))
+
+    # a duplicate anywhere in a longer batch, not just adjacent
+    check("a duplicate at the END of a batch is caught",
+          str(resolve(["1", "2", "3"], dests=[A, B, A])).startswith("REFUSED"))
+
+    # length mismatches
+    check("more amounts than dests is refused",
+          str(resolve(["1", "2"], dests=[A])).startswith("REFUSED"))
+    check("both input forms at once is refused",
+          str(resolve(["1"], dests=[A], bundles=["x.json"])).startswith("REFUSED"))
+
+
+def test_one_bundle_cannot_serve_many_swaps():
+    """--dest-from-receive-wallet takes ONE BUNDLE PER AMOUNT.
+
+    This is the path the tool's own guidance recommends, so it is the path
+    that actually produced the reuse: one bundle multiplied across N amounts.
+    """
+    import json as _json
+    d = tempfile.mkdtemp(prefix="gs_bundle_n_")
+
+    def bundle(name, addr):
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            _json.dump({"schema": "gs_receive_wallet_v1", "address": addr,
+                        "account_index": 1, "subaddress_index": 1}, fh)
+        return p
+
+    from decimal import Decimal as D
+    b1, b2 = bundle("a.json", DEST), bundle("b.json", OTHER)
+
+    def resolve(amounts, bundles):
+        try:
+            return thor.resolve_destinations([D(x) for x in amounts], [], bundles)
+        except SystemExit as e:
+            return "REFUSED:" + str(e.code or "")
+
+    check("one bundle for one amount still works (the normal case)",
+          resolve(["0.01"], [b1]) == [DEST])
+    check("two bundles for two amounts works",
+          resolve(["0.01", "0.02"], [b1, b2]) == [DEST, OTHER])
+
+    r = resolve(["0.01", "0.02", "0.03"], [b1])
+    check("ONE bundle for THREE amounts is REFUSED — no silent reuse",
+          str(r).startswith("REFUSED"))
+    check("...and tells the operator to mint three",
+          "--count 3" in str(r))
+
+    # two bundles that happen to hold the SAME address must also be refused:
+    # the invariant is on the resolved addresses, not on the file names
+    b3 = bundle("c.json", DEST)
+    check("two DIFFERENT bundle files holding the same address are refused",
+          str(resolve(["0.01", "0.02"], [b1, b3])).startswith("REFUSED"))
+
+
+def test_next_steps_do_not_teach_an_argv_leak():
+    """create_receive_wallet's own guidance used to print
+
+        python3 thor_swap_preparer --amounts <BTC_AMOUNT> --dests <address>
+
+    putting the swap amount AND the 95-char XMR destination on a command line
+    that /proc/<pid>/cmdline (mode 444) exposes to every local account. Both
+    tools already had the non-leaking path -- GS_SWAP_AMOUNTS and
+    --dest-from-receive-wallet -- and the text recommended neither.
+    """
+    src = open(os.path.join(REPO, "create_receive_wallet")).read()
+
+    # Scan what is PRINTED, not the whole file. print_next_steps' docstring
+    # quotes the old leaking command verbatim to explain why it was removed,
+    # and a plain grep cannot tell a documented counter-example from live
+    # guidance -- it flagged the explanation as the defect.
+    import ast as _ast
+    _fn = next(n for n in _ast.walk(_ast.parse(src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "print_next_steps")
+    printed = []
+    for _n in _ast.walk(_fn):
+        if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name)
+                and _n.func.id == "print"):
+            for _a in _n.args:
+                for _c in _ast.walk(_a):
+                    if isinstance(_c, _ast.Constant) and isinstance(_c.value, str):
+                        printed.append(_c.value)
+    printed_text = "\n".join(printed)
+    check("the printed guidance is non-trivial (the scan actually found it)",
+          len(printed) > 20)
+    check("next steps no longer put --dests on the printed command line",
+          "--dests" not in printed_text)
+    check("next steps no longer put --amounts on the printed command line",
+          "--amounts" not in printed_text)
+    check("next steps use the env var for the amount",
+          "GS_SWAP_AMOUNTS=" in printed_text)
+    check("next steps use the bundle path for the destination",
+          "--dest-from-receive-wallet" in printed_text)
+
+    # and the disclosure the operator needs BEFORE handing the address over
+    for phrase, why in [
+        ("does not hide the link", "Tor hides who asked, not the linkage"),
+        ("do not reuse", "the address is burned by the swap"),
+        ("public", "the memo must not be posted anywhere indexed"),
+        ("view key", "how a view key actually leaks"),
+    ]:
+        check(f"next steps state: {why}", phrase.lower() in src.lower())
+
+    # thor says it too, at the moment the memo is on screen
+    tsrc = open(os.path.join(REPO, "thor_swap_preparer")).read()
+    check("thor's sender instructions state the disclosure",
+          "WHAT THE SWAP DISCLOSES" in tsrc)
+    check("thor tells the operator not to reuse the destination",
+          "Do not reuse the destination" in tsrc)
+
+
+def test_count_mints_independent_receives():
+    """--count N must give N addresses in N DIFFERENT accounts.
+
+    Same account would share a change sink, which is the whole reason a
+    receive gets its own account: change lands on the SPENDING account's
+    subaddress 0, so two receives in one account pool their leftovers on one
+    address.
+    """
+    made = []
+
+    class FakeRPC:
+        accounts = [0]
+        def __init__(self):
+            self.next_acct = 0
+        def raw_request(self, m, p=None):
+            if m == "create_account":
+                self.next_acct += 1
+                return {"account_index": self.next_acct}
+            if m == "get_address":
+                idx = p["address_index"][0]
+                return {"addresses": [{"address_index": idx,
+                                       "address": made[-1][0]}]}
+            if m == "validate_address":
+                return {"valid": True, "integrated": False,
+                        "subaddress": True, "nettype": "mainnet"}
+            return {}
+        def new_subaddress_indexed(self, account_index, label=""):
+            addr = f"8{account_index}" + "A" * 93
+            made.append((addr, account_index))
+            return addr, 1
+
+    outdir = tempfile.mkdtemp(prefix="gs_count_")
+    crw.newnym = lambda *a, **k: None
+    crw.integrity_log = lambda *a, **k: None
+    args = types.SimpleNamespace(account=None, label="", rpc="http://127.0.0.1:18083",
+                                 output_dir=outdir, count=3)
+    rpc = FakeRPC()
+    import io
+    real, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        bundles = [crw.mint_one_receive(rpc, args) for _ in range(3)]
+    finally:
+        sys.stdout = real
+
+    accts = [a for _, a in made]
+    check("--count 3 created three receives", len(bundles) == 3)
+    check("...each in its OWN account (no shared change sink)",
+          len(set(accts)) == 3, )
+    check("...none of them in account 0 (the wallet PRIMARY)",
+          0 not in accts)
+    addrs = [b[0] for b in bundles]
+    check("...with three DISTINCT addresses", len(set(addrs)) == 3)
+    files = [b[1] for b in bundles]
+    check("...and three distinct bundle files", len(set(map(str, files))) == 3)
+    for f in files:
+        check(f"bundle {os.path.basename(str(f))} is owner-only 0600",
+              (os.stat(f).st_mode & 0o777) == 0o600)
+
+    # the resolver must accept exactly what --count produced
+    from decimal import Decimal as D
+    got = thor.resolve_destinations([D("1"), D("2"), D("3")], [],
+                                    [str(f) for f in files])
+    check("thor accepts the three bundles --count wrote", got == addrs)
 
 
 def run_all():
