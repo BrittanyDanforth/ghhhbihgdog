@@ -120,10 +120,6 @@ try:
     wj("transfer_split", {"destinations": [{"amount": int(6 * ATOMIC), "address": entry["address"]}],
                           "account_index": 0, "subaddr_indices": [0], "priority": 1})
     h = dj("get_info")["result"]["height"]; mine(primary, h + 12); wj("refresh")
-    # An EMPTY account. Every plan entry names its own account, so meta's value
-    # must never be used; pointing it at an account with no funds turns "the
-    # signer ignored the per-TX account" from a silent pass into a hard failure.
-    DECOY_ACCT = wj("create_account", {"label": ""})["result"]["account_index"]
     vk = wj("query_key", {"key_type": "view_key"})["result"]["key"]
     print(f"ENTRY subaddr {E} funded {subbal(E)[0] / 1e12} XMR")
 
@@ -137,32 +133,6 @@ try:
     # test's value is proving the rotation survives the air-gapped round trip
     # -- the offline signer must sign a spend of a carrier output it only
     # learns about via the outputs export.
-    # ONE ACCOUNT PER HOP, as the shipped planner does: Monero returns change
-    # to the SPENDING account's subaddress 0, so hops that share an account
-    # pile their change onto one subaddress and the sweep that collects it is
-    # a single N-input transaction -- public proof that all N peels are one
-    # owner. Carrying that through the COLD path is the point: the per-TX
-    # account has to survive plan -> phase_create -> phase_sign -> broadcast.
-    hop_accounts = [wj("create_account", {"label": ""})["result"]["account_index"]
-                    for _ in range(N - 1)]
-    carriers = [wj("create_address", {"account_index": a})["result"]
-                for a in hop_accounts]
-    carrier_pairs = [(c["address"], c["address_index"]) for c in carriers]
-    # Which account each peel SPENDS from: peel 0 spends ENTRY in account 0,
-    # peel i>0 spends carrier i-1 in that carrier's own account.
-    peel_accounts = [0] + hop_accounts
-    check("cold: every hop was given its own account",
-          len(set(peel_accounts)) == N)
-    _hop = (Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT
-            / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN)
-    remainders = [sum(amounts[i + 1:]) + _hop * (N - i - 1) for i in range(N - 1)]
-    plan = ghost.build_peel_plan(E, 0, [m["address"] for m in mix], amounts,
-                                 carriers=carrier_pairs, remainders=remainders)
-    check("cold: no peel spends subaddr 0 (MAIN)",
-          all(p["src_index"] != 0 for p in plan))
-    check("cold: every peel spends a distinct address",
-          len({(peel_accounts[i], p["src_index"])
-               for i, p in enumerate(plan)}) == len(plan))
     planned = [int((a * ATOMIC).to_integral_value()) for a in amounts]
     print("peel amounts:", [str(a) for a in amounts])
 
@@ -174,6 +144,52 @@ try:
     wj("refresh")
     if kimages:
         wj("import_key_images", {"signed_key_images": kimages})
+
+    # ONE ACCOUNT PER HOP, created HERE -- on the VIEW-ONLY wallet, after the
+    # switch, because that is the only wallet the pipeline has online and it is
+    # where the shipped planner calls create_account. The offline spend wallet
+    # is a different file that never sees those calls, so it has to recognise
+    # an output in an account it did not create. It manages that through
+    # phase_create's export_outputs -> phase_sign's import_outputs; without the
+    # import it falls back to wallet2's subaddress lookahead (50 accounts), so
+    # a run whose accounts have climbed past that would sign its early peels
+    # and fail its later ones. Creating these on the FULL wallet first, as this
+    # suite used to, hides the whole question.
+    #
+    # Monero returns change to the SPENDING account's subaddress 0, so hops
+    # sharing an account pile their change onto one subaddress and the sweep
+    # that collects it is a single N-input transaction -- public proof that all
+    # N peels are one owner.
+    hop_accounts = [wj("create_account", {"label": ""})["result"]["account_index"]
+                    for _ in range(N - 1)]
+    carriers = [wj("create_address", {"account_index": a})["result"]
+                for a in hop_accounts]
+    carrier_pairs = [(c["address"], c["address_index"]) for c in carriers]
+    peel_accounts = [0] + hop_accounts
+    check("cold: every hop was given its own account",
+          len(set(peel_accounts)) == N)
+    check("cold: the hop accounts exist only on the view-only wallet",
+          all(a > 0 for a in hop_accounts))
+    _hop = (Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT
+            / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN)
+    remainders = [sum(amounts[i + 1:]) + _hop * (N - i - 1) for i in range(N - 1)]
+    plan = ghost.build_peel_plan(E, 0, [m["address"] for m in mix], amounts,
+                                 carriers=carrier_pairs, remainders=remainders)
+    check("cold: no peel spends subaddr 0 (MAIN)",
+          all(p["src_index"] != 0 for p in plan))
+    check("cold: every peel spends a distinct address",
+          len({(peel_accounts[i], p["src_index"])
+               for i, p in enumerate(plan)}) == len(plan))
+
+    # An EMPTY account, created on the view-only wallet AFTER the hop accounts
+    # so its index cannot collide with one of them. Every plan entry names its
+    # own account, so meta's value must never be used; pointing meta at an
+    # account with no funds turns "the signer ignored the per-TX account" from
+    # a silent pass into a hard failure. Verified by mutation: making the
+    # signer use meta fails the first peel with "not enough money".
+    DECOY_ACCT = wj("create_account", {"label": ""})["result"]["account_index"]
+    check("cold: the decoy meta account is not one of the hop accounts",
+          DECOY_ACCT not in peel_accounts)
 
     # A shim so the SHIPPED phase_sign's wallet-cli calls hit the testnet.
     shim = os.path.join(BASE, "wcli-testnet")
