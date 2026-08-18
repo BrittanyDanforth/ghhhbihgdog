@@ -376,6 +376,147 @@ check("the stalled message only blames the swap when sync was verified",
 
 
 # ---------------------------------------------------------------------------
+# LIVENESS MUST MEAN "SCANNED RECENTLY", AND MUST NOT HIDE BEHIND THE BALANCE.
+#
+# Both of these were defects in the FIRST version of the sync fix, found by
+# adversarial review of that fix rather than by any test:
+#   * liveness was `h_now > height_at_change`, satisfied by ONE block in thirty
+#     minutes, while main() reported "your wallet has kept scanning throughout"
+#     and advised accepting less money;
+#   * the whole check sat behind `not still_confirming`, so a wallet that froze
+#     during the ~10-block unlock window -- the twenty minutes right after the
+#     money lands -- never reached it and ran to the 24-hour timeout undiagnosed.
+# ---------------------------------------------------------------------------
+class OneBlockThenBlind(FakeRPC):
+    """Scans exactly one block after the balance settles, then nothing."""
+    def __init__(self, script):
+        super().__init__(script, scanning=False, height=100)
+        self._bumped = False
+
+    def raw_request(self, method, params=None):
+        if method == "get_height":
+            self.height_calls += 1
+            if len(self.calls) >= 2 and not self._bumped:
+                self._bumped = True
+                self.height += 1
+            return {"height": self.height}
+        return {}
+
+
+FLAT = [(0.5, 0.5)] * 60
+r, _ = run(FLAT, 5.0, rpc=OneBlockThenBlind(FLAT))
+check("one block in a whole stall window is still inside the threshold "
+      "(so: reported, not silently escalated)", r["state"] == "stalled")
+check("...and the AGE of that last scan is reported, not hidden",
+      isinstance(r.get("last_scan_age_s"), int) and r["last_scan_age_s"] > 600)
+
+# Read what main() PRINTS, via the AST -- the comment explaining why the old
+# claim was wrong necessarily quotes it, and a text search cannot tell the two
+# apart. (Fifth time in this repo; source-substring checks keep doing this.)
+import ast as _ast
+_mainf = next(n for n in _ast.walk(_ast.parse(_src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "main")
+_printed = []
+for _n in _ast.walk(_mainf):
+    if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name)
+            and _n.func.id == "print"):
+        for _a in _n.args:
+            for _c in _ast.walk(_a):
+                if isinstance(_c, _ast.Constant) and isinstance(_c.value, str):
+                    _printed.append(_c.value)
+_ptext = "\n".join(_printed)
+check("the print scan found main()'s output (not vacuous)", len(_printed) > 20)
+check("main() never PRINTS that the wallet 'kept scanning throughout'",
+      "kept scanning throughout" not in _ptext)
+check("...it prints the measured fact: when the wallet last scanned",
+      "last scanned a new block" in _ptext)
+check("...and warns when that gap is long even though it passed the threshold",
+      "a long gap though" in _ptext)
+# the docstring must not over-claim either -- it is the contract callers read
+check("watch()'s docstring does not promise 'kept scanning throughout' either",
+      "kept scanning throughout, so no more" not in (rw.watch.__doc__ or ""))
+
+# A healthy wallet must report a small age and get no warning.
+r, _ = run(FLAT, 5.0, rpc=FakeRPC(FLAT, scanning=True))
+check("a healthy wallet reports a recent scan", r["last_scan_age_s"] == 0)
+
+
+class FreezeDuringUnlock(FakeRPC):
+    """Money lands, then the wallet freezes while unlocked < total forever."""
+    def __init__(self):
+        super().__init__([(0, 0)] + [(3.0, 0.5)] * 60, scanning=False, height=100)
+
+
+r, _ = run(None, 5.0, timeout_s=3000, rpc=FreezeDuringUnlock())
+check("a wallet frozen DURING the unlock window is caught, not run to timeout",
+      r["state"] == "not_syncing")
+check("...rather than the old outcome of a bare 'timeout'", r["state"] != "timeout")
+
+# The liveness check must be evaluated independently of the balance state --
+# proven by the fact that it fires while still_confirming is permanently true.
+check("liveness is checked independently of whether funds are still confirming",
+      r["total"] > r["unlocked"] and r["state"] == "not_syncing")
+
+
+# ---------------------------------------------------------------------------
+# The wrong-wallet guard must FAIL CLOSED on an out-of-bound index.
+# Real monero-wallet-rpc answers get_address for a missing account/subaddress
+# with a JSON-RPC ERROR (-14/-15), which landed in the warn-and-continue
+# branch -- so the guard whose comment says it catches "a bundle from a
+# different wallet" failed open on exactly that. get_balance then returns
+# (0, 0) with no error, so the watch cannot recover it either: it waits 24h and
+# blames the swap provider.
+# ---------------------------------------------------------------------------
+_rb = _src[_src.index("    except SystemExit:\n        raise"):]
+_rb = _rb[:_rb.index("integrity_log(\"recv\", f\"watch_start")]
+check("an out-of-bound index aborts instead of warning-and-continuing",
+      "out of bound" in _rb and "sys.exit(" in _rb)
+check("...and says the bundle belongs to a different wallet",
+      "DIFFERENT wallet" in _rb)
+check("a genuine transport failure still only warns",
+      "Continuing, but verify the wallet is the right one" in _rb)
+
+
+# ---------------------------------------------------------------------------
+# The memo is re-validated before the sender instructions are re-printed.
+# ---------------------------------------------------------------------------
+_DEST = "8" + "A" + "1" * 93
+_OTHER = "8" + "B" + "2" * 93
+def _instr(pairs, dest):
+    try:
+        rw._print_sender_instructions(pairs, dest, echo=lambda *a, **k: None)
+        return "PRINTED"
+    except SystemExit as e:
+        return "REFUSED:" + str(e)
+
+
+_good = [{"btc_in": "0.05", "deposit": "bc1qxy", "expected_xmr": "1.0",
+          "memo": f"=:XMR.XMR:{_DEST}:0/1/0"}]
+_bad = [{"btc_in": "0.05", "deposit": "bc1qxy", "expected_xmr": "1.0",
+         "memo": f"=:XMR.XMR:{_OTHER}:0/1/0"}]
+check("a memo naming our address still prints", _instr(_good, _DEST) == "PRINTED")
+check("a memo naming SOMEONE ELSE'S address is refused",
+      _instr(_bad, _DEST).startswith("REFUSED"))
+check("...explaining the payment would be irreversible",
+      "irreversible" in _instr(_bad, _DEST))
+check("an empty memo is refused too",
+      _instr([{"btc_in": "1", "deposit": "bc1q", "memo": ""}], _DEST).startswith("REFUSED"))
+
+
+# ---------------------------------------------------------------------------
+# --expect-xmr must have an environment path. This process runs for up to 24
+# hours with /proc/<pid>/cmdline at mode 0444, so it is the worst place in the
+# toolchain to leave an amount on argv -- and every sibling already moved this
+# class of value off it via gs_common.env_or_argv.
+# ---------------------------------------------------------------------------
+check("receive_watch imports the shared env_or_argv helper",
+      "env_or_argv" in _src)
+check("...and applies it to the expected amount", "GS_EXPECT_XMR" in _src)
+check("...with --help pointing at the env var",
+      "Prefer GS_EXPECT_XMR" in _src)
+
+
+# ---------------------------------------------------------------------------
 # "ANY balance" has to mean any SETTLED balance, or the mix strands money on
 # the one address the swap provider already knows.
 #

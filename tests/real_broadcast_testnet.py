@@ -46,8 +46,8 @@ airgap = load("airgap_tx_signer")
 bcast = load("broadcast_signed_xmr")       # <-- the SHIPPED relay loop
 
 BASE = tempfile.mkdtemp(prefix="rb_")
-DR = "http://127.0.0.1:28191"; D = DR + "/json_rpc"
-WBASE = "http://127.0.0.1:28193"; WR = WBASE + "/json_rpc"
+DR = "http://127.0.0.1:30101"; D = DR + "/json_rpc"
+WBASE = "http://127.0.0.1:30103"; WR = WBASE + "/json_rpc"
 
 PASS = 0; FAIL = 0; FAILURES = []
 
@@ -134,7 +134,7 @@ def run_broadcast(path, progfile, extra=()):
 result = "INCOMPLETE"
 try:
     L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28191", "--p2p-bind-port", "28190",
+       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30101", "--p2p-bind-port", "30100",
        "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
@@ -144,8 +144,8 @@ try:
                 break
         except Exception:
             pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28191", "--trusted-daemon",
-       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "28193", "--rpc-bind-ip", "127.0.0.1",
+    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30101", "--trusted-daemon",
+       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30103", "--rpc-bind-ip", "127.0.0.1",
        "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"],
       os.path.join(BASE, "w.out"))
     for _ in range(45):

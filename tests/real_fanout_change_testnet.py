@@ -40,8 +40,8 @@ def load(name):
 ghost = load("GhostSpiral")
 
 BASE = tempfile.mkdtemp(prefix="fanchg_")
-DR = "http://127.0.0.1:28091"; D = DR + "/json_rpc"
-WPORT = 28093
+DR = "http://127.0.0.1:30121"; D = DR + "/json_rpc"
+WPORT = 30123
 WR = f"http://127.0.0.1:{WPORT}/json_rpc"
 ATOMIC = Decimal(10) ** 12
 
@@ -96,8 +96,8 @@ def check(name, cond):
 result = "INCOMPLETE"
 try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28091",
-        "--p2p-bind-port", "28090", "--no-igd", "--hide-my-port",
+        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30121",
+        "--p2p-bind-port", "30120", "--no-igd", "--hide-my-port",
         "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"],
        os.path.join(BASE, "d.out"))
@@ -106,7 +106,7 @@ try:
         try:
             if dj("get_info").get("result", {}).get("height") is not None: break
         except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28091",
+    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30121",
         "--trusted-daemon", "--wallet-dir", os.path.join(BASE, "w"),
         "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"),

@@ -47,8 +47,8 @@ thor = load("thor_swap_preparer")        # the SHIPPED resolver
 import gs_common
 
 BASE = tempfile.mkdtemp(prefix="recvcnt_")
-DR = "http://127.0.0.1:28281"
-WPORT = 28283
+DR = "http://127.0.0.1:30191"
+WPORT = 30193
 WR = f"http://127.0.0.1:{WPORT}/json_rpc"
 procs = []
 
@@ -82,8 +82,8 @@ def check(name, cond):
 result = "INCOMPLETE"
 try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28281",
-        "--p2p-bind-port", "28280", "--no-igd", "--hide-my-port",
+        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30191",
+        "--p2p-bind-port", "30190", "--no-igd", "--hide-my-port",
         "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"],
        os.path.join(BASE, "d.out"))
@@ -93,7 +93,7 @@ try:
             if dj("get_info").get("result", {}).get("height") is not None: break
         except Exception: pass
 
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28281",
+    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30191",
         "--trusted-daemon", "--wallet-dir", os.path.join(BASE, "w"),
         "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"),

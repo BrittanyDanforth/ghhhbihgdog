@@ -41,7 +41,7 @@ ghost = load("GhostSpiral")
 airgap = load("airgap_tx_signer")
 
 BASE = tempfile.mkdtemp(prefix="hopsweep_")
-DR = "http://127.0.0.1:28131"; D = DR + "/json_rpc"; WP = 28133
+DR = "http://127.0.0.1:30141"; D = DR + "/json_rpc"; WP = 30143
 WR = f"http://127.0.0.1:{WP}/json_rpc"
 A = Decimal(10) ** 12
 
@@ -94,8 +94,8 @@ class A_:
 result = "INCOMPLETE"
 try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", BASE + "/n",
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28131",
-        "--p2p-bind-port", "28130", "--no-igd", "--hide-my-port",
+        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30141",
+        "--p2p-bind-port", "30140", "--no-igd", "--hide-my-port",
         "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", BASE + "/d.log", "--log-level", "0"], BASE + "/d.out")
     for _ in range(45):
@@ -103,7 +103,7 @@ try:
         try:
             if dj("get_info").get("result", {}).get("height") is not None: break
         except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28131",
+    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30141",
         "--trusted-daemon", "--wallet-dir", BASE + "/w", "--rpc-bind-port", str(WP),
         "--rpc-bind-ip", "127.0.0.1", "--disable-rpc-login",
         "--log-file", BASE + "/w.log", "--log-level", "0"], BASE + "/w.out")

@@ -22,6 +22,10 @@ unsigned_manifest.json
 signer_progress.json
 broadcast_progress.json
 wallet_*.json
+# Both shapes: 'thor_pairs_*.json' needs an underscore after 'pairs', so it
+# never matched the plain 'thor_pairs.json' the console writes by default.
+thor_pairs.json
+thor_pairs.json.gpg
 thor_pairs_*.json
 thor_pairs_*.json.gpg
 exitplan_*.json
@@ -32,6 +36,8 @@ exitplan_*.json
 *.wallet.keys
 *.wallet.address.txt
 .ghostspiral.lock
+# integrity_log's serialisation lock
+*.log.lock
 # Partial writes from atomic_write_json/_text: same plaintext as the final
 # file, but no '*.json' pattern matches a '.json.tmp' suffix.
 *.json.tmp

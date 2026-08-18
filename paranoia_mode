@@ -416,8 +416,17 @@ def _secure_delete_dir(path: Path) -> bool:
 # .gitignore is missing it.
 GS_ARTIFACT_FILE_PATTERNS = [
     "unsigned_*.json", "signer_progress.json",
-    "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
-    "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+    "broadcast_progress.json", "wallet_*.json",
+    # BOTH shapes. "thor_pairs_*.json" requires an underscore after "pairs",
+    # so it never matched the plain "thor_pairs.json" -- which is the DEFAULT
+    # filename gs_console writes ("--outfile", p.get("pairs_file") or
+    # "thor_pairs.json"), the name in receive_watch's own usage line, and the
+    # one OPSEC_SETUP.md lists among the secrets. The most common file in the
+    # whole receive flow survived every wipe, holding BTC deposit addresses,
+    # BTC amounts, and swap memos that carry the full 95-character XMR
+    # destination in plain text.
+    "thor_pairs.json", "thor_pairs.json.gpg",
+    "thor_pairs_*.json", "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
     "exitplan_*.json", "exitplan_v1.json",
     "integrity_chain.log", "integrity.log",
     "*.blob", "*.signed", "*.unsigned",
@@ -435,6 +444,9 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # starts with a dot and none of the patterns above are dotfile globs.
     ".gs_pw_*",
     ".ghostspiral.lock",
+    # integrity_log's serialisation lock (integrity_chain.log.lock). Holds no
+    # content, but it is a per-run artifact and its mere presence dates a run.
+    "*.log.lock",
     # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
     # Ctrl-C in that window leaves the partial file behind holding the SAME
     # plaintext (deposit addresses, memos, XMR destinations) -- and none of the

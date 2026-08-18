@@ -36,7 +36,7 @@ from typing import Dict
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
-    atomic_write_json, install_signal_handlers,
+    atomic_write_json, install_signal_handlers, shutdown_requested,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -56,13 +56,25 @@ def fetch_prices(proxy):
     """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails."""
     try:
         j = safe_get(CG_URL, proxy)
-        return {
+        out = {
             "xmr_usd": Decimal(str(j["monero"]["usd"])),
             "xmr_eur": Decimal(str(j["monero"]["eur"])),
             "btc_usd": Decimal(str(j["bitcoin"]["usd"])),
             "btc_eur": Decimal(str(j["bitcoin"]["eur"])),
-            "source": "coingecko",
         }
+        # Every rate must be POSITIVE. The Bisq branch below guards each field
+        # with `price > 0` and gs_common.btc_per_xmr_oracle raises on a
+        # non-positive rate -- this path, reading the same CoinGecko endpoint,
+        # took whatever number came back. A zero or negative rate would be
+        # served as a live price under a header promising the tool "never
+        # serves a made-up price", and a zero rate silently values the entire
+        # holding at 0.00. Falling through to Bisq is the right response, and
+        # is what the sibling would already have done.
+        bad = [k for k, v in out.items() if v <= 0]
+        if bad:
+            raise ValueError(f"non-positive rate(s) from CoinGecko: {bad}")
+        out["source"] = "coingecko"
+        return out
     except Exception as e:
         integrity_log("exit", f"coingecko_fail:{str(e)[:40]}")
 
@@ -196,6 +208,21 @@ def main():
     proxy = validate_proxy(args.tor_proxy)
     verify_tor(proxy)
 
+    # HONOUR the handlers this installed. install_signal_handlers() replaces
+    # the default SIGINT/SIGTERM disposition with one that sets a flag -- so a
+    # tool that installs it and never checks the flag has SWALLOWED Ctrl-C
+    # outright: not slow to respond, unresponsive. Every other tool in the
+    # chain checks shutdown_requested(); this one imported the installer and
+    # not the predicate.
+    #
+    # Checked at the two points where stopping still means something: before
+    # the oracle fetch (which goes out over Tor) and before the plan is written
+    # to disk. An operator who hits Ctrl-C because the screen is being shared
+    # wants exactly those two things not to happen.
+    if shutdown_requested():
+        sys.exit("[!] Interrupted before contacting the price oracle. Nothing "
+                 "was fetched and no plan was written.")
+
     prices = fetch_prices(proxy)
 
     cfg = METHODS[args.method]
@@ -249,6 +276,9 @@ def main():
         "liquidity_guidance": liq_guidance,
     }
 
+    if shutdown_requested():
+        sys.exit(f"[!] Interrupted before writing {args.outfile}. No plan file "
+                 f"was created.")
     atomic_write_json(plan, Path(args.outfile))
 
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"

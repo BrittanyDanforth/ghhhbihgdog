@@ -43,8 +43,8 @@ airgap = load("airgap_tx_signer")
 bcast = load("broadcast_signed_xmr")
 
 BASE = tempfile.mkdtemp(prefix="leak_")
-DR = "http://127.0.0.1:28131"; D = DR + "/json_rpc"
-WPORT = 28133
+DR = "http://127.0.0.1:30241"; D = DR + "/json_rpc"
+WPORT = 30243
 WR = f"http://127.0.0.1:{WPORT}/json_rpc"
 WALLET_PW = "LeakAudit-Spend-Pass-9271"
 
@@ -103,7 +103,7 @@ def _other_testnet_suites_running():
     diff and is reported as a leak that does not exist.
 
     That could not happen until recently: every suite here launched monerod
-    without --no-zmq, and monerod's ZMQ port defaults to 28082 on testnet
+    without --no-zmq, and monerod's ZMQ port defaults to 30242 on testnet
     REGARDLESS of --rpc-bind-port, so the second concurrent daemon always died
     at startup. Fixing that made these suites genuinely parallel -- and made
     this audit's global assumption reachable.
@@ -163,7 +163,7 @@ result = "INCOMPLETE"
 cwd0 = os.getcwd()
 try:
     L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28131", "--p2p-bind-port", "28130",
+       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30241", "--p2p-bind-port", "30240",
        "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
@@ -173,7 +173,7 @@ try:
                 break
         except Exception:
             pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28131", "--trusted-daemon",
+    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30241", "--trusted-daemon",
        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
        "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"],
       os.path.join(BASE, "w.out"))

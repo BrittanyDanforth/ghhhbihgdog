@@ -415,15 +415,58 @@ def start(argv, label, action_id=None, extra_env=None):
             env = _child_env(action_id)     # password only for PASSWORD_ACTIONS
             # The BTC address and amounts ride here, not on argv.
             env.update(extra_env or {})
+            # stdin=DEVNULL: a job must never be able to WAIT FOR A HUMAN.
+            # Children inherited the console's fd 0, so receive_watch's
+            # `if pick is None and sys.stdin.isatty()` was True for a job
+            # nobody can type into: the moment a payment landed, the job
+            # blocked on input() forever. Nothing could clear it -- see the
+            # watchdog below for why the job timeout could not either.
+            #
+            # PYTHONUNBUFFERED: stdout here is a PIPE, so CPython block-buffers
+            # at 8192 bytes. bufsize=1 is the PARENT's read side and does not
+            # change the child's buffering, so the live-output pane stayed
+            # empty for hours on a slow-ticking job like receive_watch (41-byte
+            # progress lines at a 45-90s cadence -- roughly 188 ticks, over
+            # three hours, before the first flush). Set it for every child
+            # rather than adding flush=True to one tool's prints, so the next
+            # tool cannot half-apply the fix.
+            env.setdefault("PYTHONUNBUFFERED", "1")
             p = subprocess.Popen(argv, cwd=REPO, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                 start_new_session=True, env=env)   # shell=False
+                                 start_new_session=True, env=env,
+                                 stdin=subprocess.DEVNULL)   # shell=False
             job["proc"] = p
-            for line in p.stdout:
+            # WATCHDOG, because p.wait(timeout=...) below can never fire.
+            #
+            # The drain loop `for line in p.stdout` ends only when the child
+            # closes stdout, i.e. when it exits -- so by the time the timeout
+            # was armed the process was already gone. JOB_TIMEOUT_S was dead
+            # code, and a child that hung while holding stdout open (the
+            # input() hang above, an RPC read with no timeout) pinned this
+            # thread forever with the UI still showing "running".
+            #
+            # A timer that kills the process GROUP does fire during the drain.
+            # start_new_session=True above gives each job its own group, so
+            # this cannot reach anything else.
+            def _watchdog():
                 with LOCK:
-                    job["lines"].append(line.rstrip("\n"))
-                    if len(job["lines"]) > 5000:
-                        del job["lines"][:1500]
+                    job["lines"].append(
+                        f"[console] job exceeded {JOB_TIMEOUT_S}s — killing it.")
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+            _wd = threading.Timer(JOB_TIMEOUT_S, _watchdog)
+            _wd.daemon = True
+            _wd.start()
+            try:
+                for line in p.stdout:
+                    with LOCK:
+                        job["lines"].append(line.rstrip("\n"))
+                        if len(job["lines"]) > 5000:
+                            del job["lines"][:1500]
+            finally:
+                _wd.cancel()
             try:
                 p.wait(timeout=JOB_TIMEOUT_S)
             except subprocess.TimeoutExpired:

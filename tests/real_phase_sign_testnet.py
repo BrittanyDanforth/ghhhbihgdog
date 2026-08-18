@@ -40,7 +40,7 @@ def load(name):
 airgap = load("airgap_tx_signer")          # <-- the SHIPPED module, not a copy
 
 BASE = tempfile.mkdtemp(prefix="ps_")
-DR = "http://127.0.0.1:28091"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:28093/json_rpc"
+DR = "http://127.0.0.1:30181"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30183/json_rpc"
 
 PASS = 0; FAIL = 0; FAILURES = []
 
@@ -91,7 +91,7 @@ result = "INCOMPLETE"
 cwd0 = os.getcwd()
 try:
     L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28091", "--p2p-bind-port", "28090",
+       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30181", "--p2p-bind-port", "30180",
        "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
@@ -101,8 +101,8 @@ try:
                 break
         except Exception:
             pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28091", "--trusted-daemon",
-       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "28093", "--rpc-bind-ip", "127.0.0.1",
+    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30181", "--trusted-daemon",
+       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30183", "--rpc-bind-ip", "127.0.0.1",
        "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"],
       os.path.join(BASE, "w.out"))
     for _ in range(45):

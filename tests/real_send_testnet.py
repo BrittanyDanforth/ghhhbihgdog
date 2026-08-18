@@ -39,7 +39,7 @@ def load(name):
 ghost = load("GhostSpiral")          # the SHIPPED jitter function
 
 BASE = tempfile.mkdtemp(prefix="send_")
-DR = "http://127.0.0.1:28071"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:28073/json_rpc"
+DR = "http://127.0.0.1:30221"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30223/json_rpc"
 
 
 def dj(m, p=None):
@@ -84,7 +84,7 @@ ATOMIC = Decimal(10) ** 12
 result = "INCOMPLETE"
 try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28071", "--p2p-bind-port", "28070",
+        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30221", "--p2p-bind-port", "30220",
         "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
@@ -92,8 +92,8 @@ try:
         try:
             if dj("get_info").get("result", {}).get("height") is not None: break
         except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28071", "--trusted-daemon",
-        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "28073", "--rpc-bind-ip", "127.0.0.1",
+    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30221", "--trusted-daemon",
+        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30223", "--rpc-bind-ip", "127.0.0.1",
         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"],
        os.path.join(BASE, "w.out"))
     for _ in range(45):

@@ -383,6 +383,85 @@ def _scan_integrity_log_calls(path):
     return hits
 
 
+# ---------------------------------------------------------------------------
+# A NON-LOCALHOST RPC MUST GO THROUGH THE PROXY, OR NOT GO AT ALL.
+#
+# The old code built the backend unproxied and then patched
+# `self._backend._session.proxies`. monero-python 1.1.1 names that attribute
+# `session`, so the hasattr was always False and the fail-closed branch fired
+# unconditionally -- broken, but safe.
+#
+# Patching the SESSION would have been WORSE than the abort:
+# JSONRPCWallet.raw_request passes `proxies=self.proxies` on EVERY request, and
+# a per-request proxies argument overrides the Session's. Measured: with
+# session.proxies set to the SOCKS URL the request still opened a plain
+# HTTPConnection to the remote host -- a clearnet connection to a Monero node.
+# These pin all three outcomes by the CONNECTION ACTUALLY ATTEMPTED, not by
+# reading the source.
+# ---------------------------------------------------------------------------
+def _connect_path(url, proxy_url):
+    """Return 'socks', 'clearnet', or 'abort:<msg>' for a real connection try.
+
+    10.1.2.3 is unroutable, so the exception names the path taken:
+    SOCKSHTTPConnectionPool means the proxy was used, HTTPConnectionPool means
+    it was not.
+    """
+    try:
+        gs.MoneroRPC(url, proxy_url=proxy_url)
+        return "connected"
+    except SystemExit as e:
+        return "abort:" + str(e).splitlines()[0]
+    except Exception as e:                                   # noqa: BLE001
+        m = str(e)
+        if "SOCKS" in m:
+            return "socks"
+        return "clearnet"
+
+
+_p = _connect_path("http://10.1.2.3:18083", "socks5h://127.0.0.1:9050")
+check("remote RPC with a proxy actually routes through SOCKS "
+      f"(got {_p!r})", _p == "socks")
+check("remote RPC with a proxy NEVER opens a direct connection", _p != "clearnet")
+check("remote RPC with NO proxy aborts instead of connecting",
+      _connect_path("http://10.1.2.3:18083", None).startswith("abort:"))
+
+# localhost must not be wrapped: the daemon behind it already syncs over Tor,
+# and sending 127.0.0.1 through SOCKS just fails.
+import monero.backends.jsonrpc.wallet as _W
+_orig_init = _W.JSONRPCWallet.__init__
+_seen = {}
+def _spy(self, *a, **k):
+    _seen.update(k)
+    return _orig_init(self, *a, **k)
+_W.JSONRPCWallet.__init__ = _spy
+try:
+    gs.MoneroRPC("http://127.0.0.1:1", proxy_url="socks5h://127.0.0.1:9050")
+except Exception:
+    pass
+_W.JSONRPCWallet.__init__ = _orig_init
+check("a localhost RPC is NOT wrapped in the SOCKS proxy",
+      _seen.get("proxy_url") is None)
+
+# The dead attribute name must not come back -- checked over the AST, not the
+# text. The comment explaining WHY _session was wrong necessarily names it, and
+# a substring check cannot tell the explanation from the defect. (That false
+# positive fired while writing this, for the fourth time in this codebase; it
+# is the reason the checks here read code rather than source strings.)
+import ast as _ast
+_gtree = _ast.parse(open(os.path.join(REPO, "gs_common.py")).read())
+_attrs = {n.attr for n in _ast.walk(_gtree) if isinstance(n, _ast.Attribute)}
+check("gs_common no longer touches the nonexistent _session attribute",
+      "_session" not in _attrs)
+# and the proxy really is handed to the constructor
+_ctor_kwargs = set()
+for _n in _ast.walk(_gtree):
+    if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name)
+            and _n.func.id == "JSONRPCWallet"):
+        _ctor_kwargs.update(k.arg for k in _n.keywords)
+check("...and JSONRPCWallet is constructed with proxy_url",
+      "proxy_url" in _ctor_kwargs)
+
+
 _total_leaks = []
 for _script in _SHIPPED:
     _p = os.path.join(REPO, _script)

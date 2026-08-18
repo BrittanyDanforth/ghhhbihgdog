@@ -13,7 +13,7 @@ for b in ("monerod", "monero-wallet-rpc"):
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
 BASE = tempfile.mkdtemp(prefix="dag_")
-DR = "http://127.0.0.1:28061"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:28063/json_rpc"
+DR = "http://127.0.0.1:30111"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30113/json_rpc"
 def dj(m, p=None):
     b = {"jsonrpc": "2.0", "id": "0", "method": m}; b.update({"params": p} if p is not None else {})
     return requests.post(D, json=b, timeout=40).json()
@@ -39,7 +39,7 @@ def check(name, cond):
 
 try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28061", "--p2p-bind-port", "28060",
+        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30111", "--p2p-bind-port", "30110",
         "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
@@ -47,8 +47,8 @@ try:
         try:
             if dj("get_info").get("result", {}).get("height") is not None: break
         except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:28061", "--trusted-daemon",
-        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "28063", "--rpc-bind-ip", "127.0.0.1",
+    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30111", "--trusted-daemon",
+        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30113", "--rpc-bind-ip", "127.0.0.1",
         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"], os.path.join(BASE, "w.out"))
     for _ in range(45):
         time.sleep(1)

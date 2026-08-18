@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import errno, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -77,15 +77,56 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     An attacker with the log can only narrow the operation to a 10-min window
     instead of the exact second.
     """
-    prev = "0" * 64
-    if log_path.exists():
-        text = log_path.read_text()
-        lines = text.splitlines()
-        if lines:
-            prev = lines[-1].split(" | ")[0].strip()
-    ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
-    line = f"{ts}|{VERSION}|{stage}|{msg}"
-    h = hashlib.sha256((prev + line).encode()).hexdigest()
+    # LOCKED read-modify-write. This read the whole file, took the last line's
+    # hash as `prev`, and appended -- with nothing serialising the three steps.
+    # Two processes whose windows overlap both chain off the SAME prev, so
+    # every link after that point fails recomputation and the file stops being
+    # tamper-evidence, which is its only job. That is not hypothetical here:
+    # gs_console runs jobs concurrently by construction (a thread per job), and
+    # every tool in the chain logs at startup while receive_watch logs once per
+    # failed poll for up to 24 hours.
+    #
+    # A separate lock file, not the log itself: the log is securely deleted by
+    # paranoia_mode, and holding the lock on a file that gets unlinked
+    # mid-flight would silently stop serialising anything.
+    lock_path = Path(str(log_path) + ".lock")
+    lock_fd = None
+    try:
+        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        # No lock available (odd filesystem, no permission). Proceed unlocked
+        # rather than lose the entry entirely -- a forked chain is bad, a
+        # missing chain is worse -- but say so in the entry itself so a later
+        # reader knows this link was written without serialisation.
+        if lock_fd is not None:
+            try: os.close(lock_fd)
+            except OSError: pass
+        lock_fd = None
+        stage = f"{stage}!nolock"
+    try:
+        prev = "0" * 64
+        if log_path.exists():
+            text = log_path.read_text()
+            lines = text.splitlines()
+            if lines:
+                prev = lines[-1].split(" | ")[0].strip()
+        ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
+        line = f"{ts}|{VERSION}|{stage}|{msg}"
+        h = hashlib.sha256((prev + line).encode()).hexdigest()
+        _append_chain_line(log_path, h, line)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
+    return h
+
+
+def _append_chain_line(log_path: Path, h: str, line: str) -> None:
+    """Append one already-computed chain line. Caller holds the lock."""
     # O_CREAT with an explicit 0600, NOT open("a") + chmod afterwards. The plain
     # append-open creates the file 0644 under the default umask, so the very
     # first log line of a run -- and this file records the wallet label, exact
@@ -104,7 +145,6 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     # Narrow a log that already existed with wider perms (O_CREAT leaves an
     # existing file's mode untouched).
     secure_file_perms(log_path)
-    return h
 
 # ---------------------------------------------------------------------------
 #  File security
@@ -551,25 +591,50 @@ class MoneroRPC:
                     f"    Either: (a) use 127.0.0.1 with a local RPC, or\n"
                     f"            (b) tunnel the RPC through Tor externally (socat/ssh)."
                 )
-        self._backend = JSONRPCWallet(host=host, port=port)
-
-        if proxy_url and host.lower() not in _LOCALHOST_NAMES:
-            # Only log success AFTER the patch actually applies. The old code
-            # logged "proxy_patched" up front, so if the session attribute wasn't
-            # present the proxy silently didn't apply yet the integrity chain
-            # asserted it was patched -- a clearnet IP leak under a green log.
-            proxies = {"http": proxy_url, "https": proxy_url}
-            if hasattr(self._backend, "_session"):
-                self._backend._session.proxies.update(proxies)
-                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_applied")
-            else:
-                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_UNAVAILABLE")
+        # PROXY AT CONSTRUCTION, and verify it took.
+        #
+        # This used to build the backend unproxied and then patch
+        # `self._backend._session.proxies`. Two things were wrong with that,
+        # and the second is why this is not a cosmetic fix:
+        #
+        #  1. monero-python 1.1.1 names the attribute `session`, not
+        #     `_session`, so the hasattr was always False and the fail-closed
+        #     else-branch fired unconditionally. Every non-localhost --rpc
+        #     aborted, and the docstring's "or patch the session with proxy
+        #     support" described code that could not run.
+        #
+        #  2. Patching the SESSION would not have worked either, and would
+        #     have been WORSE than the abort. JSONRPCWallet.raw_request passes
+        #     `proxies=self.proxies` on every single request, and a
+        #     per-request proxies argument OVERRIDES the Session's. Measured:
+        #     with session.proxies set to the SOCKS URL, the request still
+        #     opened a plain HTTPConnection straight to the remote host --
+        #     a clearnet connection to a Monero node, which is precisely the
+        #     IP leak this whole guard exists to prevent.
+        #
+        # JSONRPCWallet accepts proxy_url= and stores it in self.proxies, so
+        # pass it there. Then CHECK it landed before any request goes out --
+        # the lesson of (2) is that an assignment that looks right is not
+        # evidence the traffic is proxied.
+        if host.lower() in _LOCALHOST_NAMES:
+            # Loopback: never wrap in Tor. The daemon behind it syncs over Tor
+            # already; sending 127.0.0.1 through a SOCKS proxy would fail and
+            # gains nothing.
+            self._backend = JSONRPCWallet(host=host, port=port)
+        else:
+            self._backend = JSONRPCWallet(host=host, port=port,
+                                          proxy_url=proxy_url)
+            applied = getattr(self._backend, "proxies", None) or {}
+            if not any(str(v) == str(proxy_url) for v in applied.values()):
+                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_VERIFY_FAILED")
                 sys.exit(
-                    f"[!] Cannot attach the proxy to monero-python's session for\n"
-                    f"    non-localhost RPC {host}:{port}; the connection would be\n"
-                    f"    clearnet and leak your IP. Aborting. Tunnel the RPC\n"
-                    f"    externally (socat/ssh) and point at 127.0.0.1 instead."
+                    f"[!] The proxy did not attach to the RPC client for "
+                    f"{host}:{port}.\n"
+                    f"    Refusing to continue: the connection would be clearnet and\n"
+                    f"    would leak your IP to that node. Tunnel the RPC externally\n"
+                    f"    (socat/ssh) and point at 127.0.0.1 instead."
                 )
+            integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_applied")
 
         self._wallet = XMRWallet(self._backend)
 
