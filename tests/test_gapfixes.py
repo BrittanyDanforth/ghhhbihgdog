@@ -8,6 +8,8 @@ from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tests"))
+from srcutil import code_only
 
 
 def load(name):
@@ -368,6 +370,117 @@ def test_dns_check_failure_does_not_abort_the_wipe():
         socket.getaddrinfo = orig
     check("dns_check does NOT sys.exit on failure", not exited)
     check("dns_check reports failure as a return code", rc == 1)
+
+
+def test_shell_history_coverage():
+    """The phase's own docstring names the stake -- "an operator who ran the
+    pipeline with `--wallet-password ...` has that password sitting in
+    ~/.bash_history verbatim" -- and then the list named bash and zsh and
+    stopped. Two separate ways that failed."""
+    para = load("paranoia_mode")
+
+    prev_hf = os.environ.get("HISTFILE")
+    os.environ["HISTFILE"] = "/tmp/gs_custom_histfile_probe"
+    try:
+        hs = [str(x) for x in para._shell_histories()]
+    finally:
+        if prev_hf is None:
+            os.environ.pop("HISTFILE", None)
+        else:
+            os.environ["HISTFILE"] = prev_hf
+
+    check("history: fish is covered (a whole mainstream shell was missing)",
+          any("fish_history" in h for h in hs))
+    check("history: $HISTFILE is covered (bash and zsh both honour it, so an "
+          "operator who moved their history kept it through every wipe)",
+          any("gs_custom_histfile_probe" in h for h in hs))
+    check("history: zsh's other conventional name is covered",
+          any(h.endswith(".zhistory") for h in hs))
+    check("history: ash/dash and ksh are covered",
+          any(h.endswith(".ash_history") for h in hs)
+          and any(h.endswith(".sh_history") for h in hs))
+    check("history: the originals are still covered",
+          any(h.endswith(".bash_history") for h in hs)
+          and any(h.endswith(".zsh_history") for h in hs))
+    check("history: no duplicates in the list", len(hs) == len(set(hs)))
+
+
+def test_shell_history_rewrite_warning():
+    """The part it CANNOT fix, which is what made the phase look effective.
+
+    Demonstrated with a real bash: a session holding
+    `GhostSpiral --wallet-password s3cret...` had its history file wiped to
+    zero bytes by this phase, and bash wrote the password BACK verbatim on
+    exit. paranoia_mode cannot reach another process's memory, so it must say
+    so -- otherwise the phase reports success and the run summary says "every
+    phase reported success" while the password is already back on disk.
+    """
+    import io as _io, contextlib as _ctx
+    para = load("paranoia_mode")
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        para._warn_history_will_be_rewritten(dry=False)
+    w = buf.getvalue()
+    check("history: the wipe warns an open shell will write its history BACK",
+          "in MEMORY" in w and "put its history BACK" in w)
+    check("history: ...and gives the operator the actual remedy",
+          "history -c" in w or "history clear" in w or "history -p" in w)
+    check("history: ...and says this phase cannot do it for them",
+          "cannot do it for you" in w)
+
+    prev_sh = os.environ.get("SHELL")
+    try:
+        os.environ["SHELL"] = "/usr/bin/fish"
+        b2 = _io.StringIO()
+        with _ctx.redirect_stdout(b2):
+            para._warn_history_will_be_rewritten(dry=False)
+        check("history: a fish user is given fish's command, not bash's",
+              "history clear" in b2.getvalue())
+    finally:
+        if prev_sh is None:
+            os.environ.pop("SHELL", None)
+        else:
+            os.environ["SHELL"] = prev_sh
+
+    check("history: wipe_shell_histories actually emits that warning",
+          "_warn_history_will_be_rewritten(" in code_only(
+              os.path.join(REPO, "paranoia_mode")))
+
+
+def test_env_scrub_names_the_survivors():
+    """The docstring was always right that a process cannot change its parent's
+    environment. The operator reads the TERMINAL, and "Unset 5 sensitive env
+    var(s) in this process" followed by the run summary's "every phase reported
+    success" reads as done -- while the shell that exported
+    GS_WALLET_PASSWORD still has it, still hands it to everything launched from
+    that terminal, and still shows it in /proc/<shell-pid>/environ."""
+    import io as _io, contextlib as _ctx
+    para = load("paranoia_mode")
+    para.integrity_log = lambda *a, **k: None
+    prev = {k: os.environ.get(k) for k in ("GS_WALLET_PASSWORD", "GS_BTC_ENTRY")}
+    try:
+        os.environ["GS_WALLET_PASSWORD"] = "x"
+        os.environ["GS_BTC_ENTRY"] = "y"
+        buf = _io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            para.scrub_env_vars(dry=False)
+        out = buf.getvalue()
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("env scrub: says the vars survive in the PARENT shell",
+          "still set in the SHELL" in out)
+    check("env scrub: names them, so the operator does not have to guess",
+          "GS_WALLET_PASSWORD" in out and "GS_BTC_ENTRY" in out)
+    check("env scrub: gives the exact command", "unset GS_" in out)
+    check("env scrub: says why it matters while the terminal stays open",
+          "/proc/<shell-pid>/environ" in out)
+    # and it must still actually clear its own copy
+    check("env scrub: this process's copy really is cleared",
+          os.environ.get("GS_WALLET_PASSWORD") in (None, prev["GS_WALLET_PASSWORD"]))
 
 
 def run_all():

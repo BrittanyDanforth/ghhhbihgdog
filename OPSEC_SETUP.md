@@ -271,6 +271,24 @@ auto-unlocks, a backup, or a key you pasted somewhere. That is a
 disk-encryption and physical-custody problem, and it is precisely the one
 `paranoia_mode` deliberately cannot solve for you (see the wallet note above).
 
+**Close your terminals BEFORE you wipe**
+
+A shell keeps its history in **memory** and writes it out when it **exits**.
+`paranoia_mode` wipes the history file, but it cannot reach into a running
+shell — so any terminal still open will write its history straight back when
+you close it. Demonstrated: a bash session holding
+`GhostSpiral --wallet-password s3cret…` had the file wiped to zero bytes, and
+bash restored the password verbatim on exit.
+
+The wipe now says this out loud, but the remedy is yours: in every open window
+run `history -c && history -w` (fish: `history clear`), or close every terminal
+first and run the wipe from a fresh one.
+
+It also now covers the history files it used to miss entirely — **fish**
+(`~/.local/share/fish/fish_history`), a custom **`$HISTFILE`**, `.zhistory`,
+`.sh_history` and `.ash_history`. Previously a fish user's wipe erased nothing
+they had typed while reporting success.
+
 **Where the wipe reaches (and where it did not)**
 
 `paranoia_mode`'s Temp files phase sweeps `/tmp` and `/var/tmp` wholesale for

@@ -27,14 +27,61 @@ from gs_common import (
 )
 
 # Paths to wipe
-SHELL_HISTORIES = [
-    Path.home() / ".bash_history",
-    Path.home() / ".zsh_history",
-    Path.home() / ".python_history",
-    Path.home() / ".lesshst",
-    Path.home() / ".wget-hsts",
-    Path.home() / ".viminfo",
-]
+def _shell_histories() -> list:
+    """Every history file this host might actually be using.
+
+    The old list named .bash_history and .zsh_history and stopped. That misses:
+
+      * FISH -- ~/.local/share/fish/fish_history, a completely different path,
+        and fish is a mainstream interactive shell. A fish user's wipe erased
+        nothing they had typed.
+      * $HISTFILE -- bash and zsh both honour it, so an operator who moved
+        their history anywhere kept it through every wipe.
+      * .zhistory (zsh's other conventional name), .sh_history (ksh),
+        .ash_history (ash/dash/busybox), .local/share/zsh/history.
+
+    That matters more here than it would elsewhere, because the phase's own
+    docstring names the stake: an operator who ran the pipeline with
+    `--wallet-password ...` has that password sitting in their history
+    verbatim. Missing their shell means missing the password while reporting
+    success.
+
+    Resolved at call time rather than at import so $HISTFILE and $HOME are read
+    from the environment the wipe actually runs in.
+    """
+    home = Path.home()
+    cands = [
+        home / ".bash_history",
+        home / ".zsh_history",
+        home / ".zhistory",
+        home / ".sh_history",
+        home / ".ash_history",
+        home / ".local/share/zsh/history",
+        home / ".local/share/fish/fish_history",
+        home / ".config/fish/fish_history",
+        home / ".python_history",
+        home / ".lesshst",
+        home / ".wget-hsts",
+        home / ".viminfo",
+    ]
+    # Wherever the operator actually pointed it.
+    hf = os.environ.get("HISTFILE")
+    if hf:
+        cands.append(Path(hf).expanduser())
+    out, seen = [], set()
+    for c in cands:
+        try:
+            key = str(c.resolve())
+        except OSError:
+            key = str(c)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+#: Kept as a module name for the tests and for anything that introspects it.
+SHELL_HISTORIES = _shell_histories()
 
 PYCACHE_GLOBS = [
     str(Path.home() / "**/__pycache__"),
@@ -154,7 +201,7 @@ def wipe_shell_histories(dry: bool):
     """
     count = 0
     failed = 0
-    for hist in SHELL_HISTORIES:
+    for hist in _shell_histories():
         if not hist.exists():
             continue
         if dry:
@@ -177,7 +224,41 @@ def wipe_shell_histories(dry: bool):
                   else f"histories_dry:{count}")
     print(f"  [+] {'Would securely wipe' if dry else 'Securely wiped'} "
           f"{count} history file(s){tail}")
+    _warn_history_will_be_rewritten(dry)
     return failed
+
+
+def _warn_history_will_be_rewritten(dry: bool) -> None:
+    """Say the thing that makes this phase look like it worked when it did not.
+
+    A shell keeps its history IN MEMORY and writes it out when it exits. Wiping
+    the file from a script running inside that shell is therefore undone
+    seconds later, the moment the operator closes the terminal.
+
+    DEMONSTRATED, not assumed: a bash session with
+    `GhostSpiral --wallet-password s3cret...` in its history had the file wiped
+    to zero bytes by this phase, and on exit bash wrote the password back
+    verbatim. This tool cannot reach into another process's memory to prevent
+    that, so the only honest thing it can do is say so -- otherwise the phase
+    reports success, the run summary says "every phase reported success", and
+    the password is back before the operator has stood up.
+    """
+    shell = os.environ.get("SHELL", "")
+    name = os.path.basename(shell) or "your shell"
+    print(f"  [!] {'(dry run) ' if dry else ''}A shell keeps its history in MEMORY "
+          f"and writes it out when it EXITS.")
+    print(f"      Wiping the file does not touch that copy, so any shell still "
+          f"open will put its history BACK when you close it — including any "
+          f"command you typed with a password or an address in it.")
+    if name in ("fish",):
+        print(f"      In each open {name} window, run:  history clear")
+    elif name in ("zsh",):
+        print(f"      In each open {name} window, run:  history -p && "
+              f"exec zsh")
+    else:
+        print(f"      In each open {name} window, run:  history -c && history -w")
+    print(f"      ...or close every terminal FIRST and run this wipe from a "
+          f"fresh one. This phase cannot do it for you.")
 
 
 def wipe_pycache(dry: bool):
@@ -782,8 +863,10 @@ def scrub_env_vars(dry: bool):
         "MONERO_RPC", "XMR_", "BTC_", "GHOSTSPIRAL", "GS_",
     ]
     count = 0
+    found = []
     for key in list(os.environ.keys()):
         if any(key.upper().startswith(p) for p in sensitive_prefixes):
+            found.append(key)
             if dry:
                 print(f"  [dry] would unset env {key}")
             else:
@@ -792,6 +875,25 @@ def scrub_env_vars(dry: bool):
     integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
     print(f"  [+] {'Would unset' if dry else 'Unset'} {count} sensitive env var(s) "
           f"in this process")
+    # NAME THEM, and name the remedy.
+    #
+    # The docstring has always been correct that a process cannot change its
+    # parent's environment -- but the operator reads the terminal, not the
+    # docstring, and "Unset 5 sensitive env var(s) in this process" followed by
+    # "every phase reported success" reads as done. It is not: the shell that
+    # exported GS_WALLET_PASSWORD still has it, still hands it to everything
+    # launched from that terminal, and still shows it in
+    # /proc/<shell-pid>/environ for as long as the terminal is open.
+    #
+    # The variables are known here by name, so say which ones and give the
+    # exact command rather than leaving the operator to work it out.
+    if found:
+        print(f"  [!] These are still set in the SHELL that started this — this "
+              f"process cannot unset them there:")
+        print(f"        unset {' '.join(sorted(found))}")
+        print(f"      Until you do, that terminal keeps handing them to every "
+              f"command you run, and they stay readable in "
+              f"/proc/<shell-pid>/environ.")
     # del os.environ[...] cannot fail here, so this phase has no failure mode.
     return 0
 
