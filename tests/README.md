@@ -41,6 +41,11 @@ python3 tests/track_origin_attack.py # ORIGIN TRACE: name1 (sender PRIMARY)
 python3 tests/leak_hidden_user.py    # OUTSIDER hunt: no seed/phrase. Chain,
                                      #   ThorChain memo, and disk artifacts.
                                      #   Seized wallet is out of scope.
+python3 tests/outsider_tx_sim.py     # REAL payment + shipped fan-out mix on
+                                     #   isolated testnet, then outsider search
+                                     #   of daemon txs + disk for name1/name2
+                                     #   PRIMARY. SKIPS if monero binaries are
+                                     #   absent.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
