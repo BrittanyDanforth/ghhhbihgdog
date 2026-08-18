@@ -483,6 +483,64 @@ def test_env_scrub_names_the_survivors():
           os.environ.get("GS_WALLET_PASSWORD") in (None, prev["GS_WALLET_PASSWORD"]))
 
 
+def test_shm_pressure_is_bounded():
+    """The tmpfs pressure write must not push other software into ENOSPC.
+
+    /dev/shm is shared infrastructure -- Chromium, PostgreSQL and PulseAudio
+    keep live segments there -- and it is a tmpfs, so filling it returns ENOSPC
+    to whoever asks NEXT, not to us. The targeted-wipe phase in this same file
+    reasons about exactly that hazard and refuses to touch other software's
+    segments; this phase then wrote a flat 128 MiB into the same tmpfs blind.
+    Same tmpfs, same hazard, opposite treatment.
+    """
+    src = code_only(os.path.join(REPO, "paranoia_mode"))
+    check("shm pressure: the write is sized from free space, not hard-coded",
+          "statvfs" in src and "f_bavail" in src)
+    check("shm pressure: it takes at most half of what is free",
+          "_free_mib // 2" in src)
+    check("shm pressure: it is still capped at the original 128 MiB",
+          "min(128" in src)
+    check("shm pressure: a full tmpfs is skipped rather than forced",
+          "no free tmpfs space" in src or "no_space" in src)
+
+    # And it must still actually run and clean up after itself.
+    import io as _io, contextlib as _ctx
+    para = load("paranoia_mode")
+    para.integrity_log = lambda *a, **k: None
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        para.wipe_swap_ram(dry=False)
+    check("shm pressure: the scratch file is removed afterwards",
+          not os.path.exists("/dev/shm/gs_paranoia_wipe"))
+    check("shm pressure: the phase still reports what it did",
+          "tmpfs scratch" in buf.getvalue() or "tmpfs" in buf.getvalue())
+
+
+def test_summary_lists_outstanding_operator_actions():
+    """"Every phase reported success" must not be the last word when actions
+    remain that only the operator can take.
+
+    Both were printed by their own phases, thirteen phases and a lot of
+    scrolling earlier. This file already decided -- when it added the wallet
+    caveat -- that a completion line standing alone misleads by silence. These
+    are not caveats about what cannot be done, they are outstanding ACTIONS.
+    """
+    src = code_only(os.path.join(REPO, "paranoia_mode"))
+    # the summary block, not the phases
+    seg = src[src.index("paranoia_mode complete"):]
+    seg = seg[:seg.index("paranoia_mode FINISHED WITH FAILURES")]
+    check("summary: names the shell-history action",
+          "Close every terminal" in seg)
+    check("summary: explains WHY (history lives in memory until the shell exits)",
+          "MEMORY" in seg)
+    check("summary: names the env-unset action, with the actual variables",
+          "unset " in seg and "_envleft" in seg)
+    check("summary: it is conditional -- nothing to do, nothing printed",
+          "if _still:" in seg)
+    check("summary: the wallet caveat is still there too",
+          "THE WALLET IS STILL HERE" in src)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

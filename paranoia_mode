@@ -425,8 +425,33 @@ def wipe_swap_ram(dry: bool):
 
     shm_done = False
     wipe_file = "/dev/shm/gs_paranoia_wipe"
+    # SIZE THE WRITE TO WHAT IS FREE, instead of always asking for 128 MiB.
+    #
+    # /dev/shm is shared infrastructure: Chromium, PostgreSQL and PulseAudio
+    # keep live segments there, and it is a tmpfs, so filling it returns ENOSPC
+    # to whoever asks next -- not to us. The targeted-wipe phase in this same
+    # file reasons about exactly that hazard and refuses to touch other
+    # software's segments; this phase then filled the same tmpfs blind. Same
+    # tmpfs, same hazard, opposite treatment.
+    #
+    # Half of what is free keeps the pressure meaningful while leaving room for
+    # everything else. If nothing is free there is nothing to pressure, and
+    # saying so is better than an ENOSPC that reads as a failure of the wipe.
     try:
-        subprocess.run(["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M", "count=128"],
+        _st = os.statvfs("/dev/shm")
+        _free_mib = (_st.f_bavail * _st.f_frsize) // (1024 * 1024)
+    except OSError:
+        _free_mib = 0
+    _count = min(128, max(0, _free_mib // 2))
+    if _count <= 0:
+        integrity_log("paranoia", "shm_write_skipped:no_space")
+        print("  [!] /dev/shm has no free space to pressure; skipping the tmpfs "
+              "scratch write rather than pushing other software into ENOSPC.")
+    try:
+        if _count <= 0:
+            raise FileNotFoundError("no free tmpfs space")
+        subprocess.run(["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M",
+                        f"count={_count}"],
                        check=True, capture_output=True, timeout=60)
         if os.path.exists(wipe_file):
             os.unlink(wipe_file)
@@ -1001,6 +1026,36 @@ def main():
         print("      sees the run regardless of how clean this host now looks.")
         print("      Protecting it is disk encryption and where the keys live")
         print("      (see OPSEC_SETUP.md), not this wipe.")
+        # THE TWO THINGS ONLY THE OPERATOR CAN DO.
+        #
+        # Both were printed by their own phases, thirteen phases and a lot of
+        # scrolling ago. The last thing on screen is "every phase reported
+        # success", and this file already decided -- when it added the wallet
+        # caveat above -- that letting a completion line stand alone misleads
+        # by silence. These belong in the same place, for the same reason: they
+        # are not caveats about what cannot be done, they are ACTIONS still
+        # outstanding, and a wipe that ends without naming them ends early.
+        _still = []
+        if any(h.exists() for h in _shell_histories()):
+            _still.append(
+                "Close every terminal that was open during the run, or run "
+                "`history -c && history -w`\n        in each one (fish: "
+                "`history clear`). A shell holds its history in MEMORY and "
+                "writes it\n        back out when it exits — including any "
+                "command you typed a password or address into.")
+        _envleft = [k for k in os.environ
+                    if k.upper().startswith(("GS_", "GHOSTSPIRAL", "XMR_", "BTC_"))]
+        if _envleft:
+            _still.append(
+                "Run `unset " + " ".join(sorted(_envleft)) + "` in the shell "
+                "that started this.\n        This process cannot unset them "
+                "there, and until you do that terminal keeps\n        handing "
+                "them to every command you run.")
+        if _still:
+            print()
+            print("  [!] STILL TO DO — this tool cannot do these for you:")
+            for _i, _t in enumerate(_still, 1):
+                print(f"      {_i}. {_t}")
     else:
         print(f"  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT known clean.")
         for name, n in bad.items():
