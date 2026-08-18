@@ -183,6 +183,29 @@ of its own) after the distribution, in both fan-out and peel modes. That is a
 correctness fix as much as an OPSEC one — roughly a tenth of the balance was
 previously never mixed at all while the run reported success.
 
+**How far apart the hops land is yours to choose, and the default is not the
+strong setting.** A peel hop cannot be built until the previous hop's output
+has confirmed and unlocked — about 10 blocks — and `--hop-delay` is added on
+top of that. The default is 180–720 seconds, so each carrier output is spent
+at roughly 11–16 blocks of age and a six-hop chain finishes inside two hours.
+
+That is close to the youngest an output can legally be spent. Monero's decoy
+selection draws ring members from a distribution fitted to how people actually
+spend, and its bulk sits far above that floor, so an output spent at the floor
+tends to be the youngest member of its own ring — and "assume the newest ring
+member is the real one" is a standard heuristic against exactly that shape.
+The peel chain removes the co-created fan-out an analyst can cluster; it does
+not remove this.
+
+This has **not been measured here** and no number is claimed for it. Doing it
+honestly needs a chain with a realistic output-age distribution, and the
+throwaway chains these tests run on have none — every output on them is
+minutes old, so any ring-age statistic they produced would be an artifact.
+
+`--hop-delay 21600-86400` spreads a six-hop chain over days: it costs time and
+buys ring-age plausibility. The default stays short so a run finishes in one
+sitting, not because it is the better choice.
+
 **...and the sweep is not allowed to undo the peel chain.** Monero returns a
 transaction's change to the *spending account's* subaddress 0, and that is not
 selectable. When every peel ran in one account, all N peels deposited their

@@ -95,6 +95,78 @@ PEEL_CARRIER_RESERVE_MULT = Decimal("8")
 # drift, so a changed margin would have made the printed number a lie.
 FEE_SAFETY_MARGIN = Decimal("1.5")
 
+
+# Default per-TX broadcast delay, in seconds: 3 to 12 minutes. Written inline
+# as `randbelow(540) + 180` in four separate places, which is the same
+# single-source-of-truth problem FEE_SAFETY_MARGIN was pulled out for.
+DEFAULT_HOP_DELAY = (180, 720)
+
+#: Refuse a delay range longer than this. broadcast_signed_xmr caps a
+#: manifest-supplied delay at 7 days, so anything past that would be silently
+#: clamped there instead of doing what the operator asked.
+HOP_DELAY_MAX = 7 * 24 * 3600
+
+
+def parse_hop_delay(spec, default=DEFAULT_HOP_DELAY) -> tuple:
+    """Parse a "MIN-MAX" (or "N") seconds spec into an inclusive range.
+
+    Raises ValueError with an operator-readable message; the caller turns that
+    into an exit. Deliberately strict: a delay silently misread as 0 turns a
+    peel chain into a burst of transactions minutes apart, which is the shape
+    the delay exists to avoid.
+    """
+    if spec is None or spec == "":
+        return default
+    txt = str(spec).strip()
+    parts = txt.split("-", 1)
+    try:
+        lo = int(parts[0])
+        hi = int(parts[1]) if len(parts) == 2 else lo
+    except ValueError:
+        raise ValueError(f"--hop-delay must be SECONDS or MIN-MAX seconds, "
+                         f"got {spec!r}")
+    if lo < 0 or hi < 0:
+        raise ValueError("--hop-delay cannot be negative")
+    if hi < lo:
+        raise ValueError(f"--hop-delay MIN-MAX is backwards: {lo} > {hi}")
+    if hi > HOP_DELAY_MAX:
+        raise ValueError(f"--hop-delay above {HOP_DELAY_MAX}s (7 days) would be "
+                         f"clamped by the broadcaster anyway; got {hi}s")
+    return (lo, hi)
+
+
+def hop_delay(rng, window=None) -> int:
+    """A jittered per-TX broadcast delay in seconds, from `window`.
+
+    HOW LONG THIS IS, IS AN OPSEC PARAMETER, and the default is not a strong
+    one. A peel hop cannot be built until the previous hop's output has
+    confirmed and unlocked, which is ~10 blocks, and this delay is added on
+    top -- so with the default 3-12 minutes each carrier output is spent at
+    roughly 11-16 blocks of age and the whole chain finishes inside two hours.
+
+    That is close to the youngest an output can legally be spent. Monero's
+    decoy selection draws ring members from a distribution fitted to how
+    people actually spend, whose bulk sits far above that floor, so an output
+    spent at the floor tends to be the youngest member of its own ring -- and
+    "assume the newest ring member is the real one" is a standard heuristic
+    against exactly this shape. The peel chain removes the co-created fan-out
+    an analyst can cluster; it does not remove that.
+
+    This has NOT been measured here. Doing it honestly needs a chain with a
+    realistic output-age distribution, and a throwaway regtest chain has none
+    -- every output on it is minutes old, so any ring-age statistic it
+    produced would be an artifact. It is stated as a known limitation rather
+    than quantified.
+
+    What follows from it is that the operator should be able to choose:
+    --hop-delay 21600-86400 spreads a six-hop chain over days, which costs
+    time and buys ring-age plausibility. The default stays short because a
+    multi-day default would strand operators who close the laptop.
+    """
+    lo, hi = window or DEFAULT_HOP_DELAY
+    return lo if hi <= lo else lo + rng.randbelow(hi - lo)
+
+
 # Fraction of the post-fee balance the fan-out distributes. The remainder stays
 # on ENTRY as headroom for the fan-out transaction's own fee. Verified fundable:
 # across every balance/wallet/depth combination that clears the dust guards the
@@ -492,7 +564,8 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
 
 def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
                           entry_index: int, dests: list,
-                          amount_by_addr: dict, hop_fee: Decimal):
+                          amount_by_addr: dict, hop_fee: Decimal,
+                          delay_window=None):
     """Provision the peel chain's carriers and turn a peel plan into stage-5
     entries. Returns (plan, change_accounts).
 
@@ -560,7 +633,7 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
             "account_index": hop_acct,
             "dst": p["dst"],
             "amt": p["amt"],
-            "delay": secrets.randbelow(540) + 180,
+            "delay": hop_delay(secrets, delay_window),
             "extra": secure_hex(16),
             "peel_num": p["peel_num"],
         }
@@ -1152,6 +1225,23 @@ def build_cli() -> argparse.ArgumentParser:
                           "Off by default: the default run does the fan-out "
                           "distribution only (fast, and still spreads funds "
                           "across fresh subaddresses).")
+    cli.add_argument("--hop-delay", default=None, metavar="SECONDS|MIN-MAX",
+                     help="How long to wait before broadcasting each planned "
+                          "transaction, in seconds (default 180-720, i.e. 3-12 "
+                          "minutes of jitter). THIS IS AN OPSEC PARAMETER. A "
+                          "peel hop cannot be built until the previous hop's "
+                          "output has confirmed and unlocked (~10 blocks), and "
+                          "this is added on top, so the default spends each "
+                          "carrier output at roughly 11-16 blocks of age — "
+                          "close to the youngest an output can legally be "
+                          "spent, and Monero's decoy selection draws ring "
+                          "members from a distribution whose bulk sits far "
+                          "above that. Something like 21600-86400 spreads a "
+                          "six-hop chain over days instead of under two "
+                          "hours; it costs time and buys ring-age "
+                          "plausibility. The default is short so a run "
+                          "finishes in one sitting, not because it is the "
+                          "strong choice.")
     cli.add_argument("--peel", action="store_true",
                      help="PEELING CHAIN instead of a single fan-out: distribute "
                           "to the mix subaddresses ONE PER TRANSACTION, each "
@@ -1529,7 +1619,8 @@ def verify_spend_source(rpc_primary, account: int, index: int,
 
 
 def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
-                   mix_targets, addr_index, _secrets) -> list:
+                   mix_targets, addr_index, _secrets,
+                   delay_window=None) -> list:
     """Plan the DAG hop round: one SWEEP per fan-out output.
 
     Returns the hop plan (empty when DAG mixing is off or nothing can fund
@@ -1599,7 +1690,7 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                 "src_index": _src_index(addr_index, s),
                 "dst": d,
                 "sweep": True,
-                "delay": _secrets.randbelow(540) + 180,
+                "delay": hop_delay(_secrets, delay_window),
                 "extra": secure_hex(16),
             })
         if not dag_plan:
@@ -1622,11 +1713,36 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
     return dag_plan
 
 
+def resolve_hop_delay(args) -> tuple:
+    """Turn --hop-delay into a window, exiting on a bad spec.
+
+    Separate from parse_hop_delay so the parsing stays pure and testable while
+    the exit-and-announce behaviour lives in one place. A non-default window
+    is announced BECAUSE it changes how long the run takes -- an operator who
+    passes 21600-86400 and then watches nothing happen for six hours should
+    have been told, and one who fat-fingers it should not silently get the
+    default back.
+    """
+    try:
+        window = parse_hop_delay(getattr(args, "hop_delay", None))
+    except ValueError as exc:
+        sys.exit(f"[!] {exc}")
+    if window != DEFAULT_HOP_DELAY:
+        integrity_log("stage0", f"hop_delay:{window[0]}-{window[1]}")
+        print(f"  [*] Per-TX broadcast delay: {window[0]}-{window[1]}s "
+              f"(default is {DEFAULT_HOP_DELAY[0]}-{DEFAULT_HOP_DELAY[1]}s).")
+    return window
+
+
 def main():
     install_signal_handlers()
 
     cli = build_cli()
     args = cli.parse_args()
+
+    # Purely syntactic flag validation, so a typo is reported before anything
+    # semantic (a wallet password prompt, a bech32 checksum) can mask it.
+    _delay_window = resolve_hop_delay(args)
 
     resolve_wallet_password(args)
     resolve_sensitive_inputs(args)
@@ -1983,7 +2099,7 @@ def main():
             fanout_plan, change_accounts = build_peel_stage_plan(
                 rpc_primary, bal_account, ENTRY,
                 _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
-                _hop_fee)
+                _hop_fee, delay_window=_delay_window)
             integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
             print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
                   f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
@@ -1993,7 +2109,7 @@ def main():
                 "src": ENTRY,
                 "src_index": _src_index(addr_index, ENTRY),
                 "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
-                "delay": _secrets.randbelow(540) + 180,
+                "delay": hop_delay(_secrets, _delay_window),
                 "extra": secure_hex(16),
             }]
             # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
@@ -2024,7 +2140,8 @@ def main():
         # be created until the fan-out confirms on-chain, which is why it runs as a
         # separate confirmation-gated round in Stage 5 (see _stage5_run).
         dag_plan = build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,
-                                  dag, mix_targets, addr_index, _secrets)
+                                  dag, mix_targets, addr_index, _secrets,
+                              delay_window=_delay_window)
 
         meta = {
             "schema": "unsigned_v1",
@@ -2568,7 +2685,8 @@ def _change_residue(args, account, sub_idx):
         return None
 
 
-def _run_change_sweeps(args, jobs, staging_dir, proxy, meta) -> int:
+def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
+                       delay_window=None) -> int:
     """Sweep each change location in its OWN transaction. Returns how many failed.
 
     Deliberately a loop of single sweeps rather than one collecting sweep. The
@@ -2592,7 +2710,8 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta) -> int:
         label = f"change sweep {n}/{len(jobs)}"
         if not _run_change_sweep(args, account, change_index, dest_addr,
                                  dest_index, staging_dir, proxy, meta,
-                                 label=label, seq=n):
+                                 label=label, seq=n,
+                                 delay_window=delay_window):
             failed += 1
     if len(jobs) > 1:
         integrity_log("stage5", f"change_sweeps:{len(jobs) - failed}_of_{len(jobs)}")
@@ -2603,7 +2722,8 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta) -> int:
 
 
 def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
-                      staging_dir, proxy, meta, label="change sweep", seq=0):
+                      staging_dir, proxy, meta, label="change sweep", seq=0,
+                      delay_window=None):
     """Sweep ONE change location into the mix, leaving nothing behind.
 
     Neither distribution can allocate its input exactly, because the fee is not
@@ -2658,7 +2778,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         "account_index": account,
         "dst": dest_addr,
         "sweep": True,
-        "delay": secrets.SystemRandom().randbelow(540) + 180,
+        "delay": hop_delay(secrets.SystemRandom(), delay_window),
         "extra": secure_hex(16),
     }
     path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
@@ -2700,7 +2820,8 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
 
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
-                change_target=(0, 0), change_sweep_jobs=None):
+                change_target=(0, 0), change_sweep_jobs=None,
+                delay_window=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -2732,7 +2853,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
             _missed = _run_change_sweeps(args, change_sweep_jobs, staging_dir,
-                                         proxy, _cs_meta)
+                                         proxy, _cs_meta, delay_window)
             if _missed:
                 incomplete.append(
                     f"{_missed} of {len(change_sweep_jobs)} peel change output(s) "
@@ -2751,7 +2872,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
             if _run_change_sweeps(args, change_sweep_jobs, staging_dir,
-                                  proxy, _cs_meta):
+                                  proxy, _cs_meta, delay_window):
                 incomplete.append("the fan-out's change was NOT swept into the mix "
                                   "— roughly a tenth of the balance is unmixed on "
                                   "the change address")

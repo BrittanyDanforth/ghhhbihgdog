@@ -943,7 +943,7 @@ _real_cs = ghost._run_change_sweep
 try:
     ghost._run_change_sweep = (lambda args, account, change_index, dest_addr,
                                dest_index, staging_dir, proxy, meta,
-                               label="change sweep", seq=0:
+                               label="change sweep", seq=0, delay_window=None:
                                _swept.append((account, change_index, dest_addr,
                                               seq)) or account != 99)
     _jobs = [(5, 0, "DST5", 50), (6, 0, "DST6", 60), (99, 0, "DSTX", 70),
@@ -2136,6 +2136,58 @@ if _locks:
     _guard_lines = (_lk.end_lineno or _lk.body[-1].lineno) - _lk.lineno
     check("the lock covers the bulk of main(), not just its tail",
           _guard_lines > _body_lines * 0.7)
+
+
+# ---------------------------------------------------------------------------
+# Per-TX broadcast delay: one source of truth, and operator-controllable.
+# ---------------------------------------------------------------------------
+check("hop delay: the default window is a named constant, not four literals",
+      ghost.DEFAULT_HOP_DELAY == (180, 720))
+# The literal appeared inline in four separate places, which is the same
+# drift risk FEE_SAFETY_MARGIN was extracted for. code_only() so the comment
+# that records the defect does not satisfy the check.
+check("hop delay: no inline randbelow(540) + 180 survives in the code",
+      "randbelow(540) + 180" not in _gs_code)
+
+check("hop delay: no spec means the default", ghost.parse_hop_delay(None) == (180, 720))
+check("hop delay: empty spec means the default", ghost.parse_hop_delay("") == (180, 720))
+check("hop delay: a single number is a fixed delay, not a range",
+      ghost.parse_hop_delay("600") == (600, 600))
+check("hop delay: MIN-MAX parses", ghost.parse_hop_delay("21600-86400") == (21600, 86400))
+for _bad, _why in (("abc", "not a number"), ("5-x", "half a number"),
+                   ("-5", "negative"), ("900-100", "backwards"),
+                   ("700000000", "past the broadcaster's 7-day cap")):
+    try:
+        ghost.parse_hop_delay(_bad)
+        check(f"hop delay: {_why} is rejected ({_bad!r})", False)
+    except ValueError:
+        check(f"hop delay: {_why} is rejected ({_bad!r})", True)
+
+import secrets as _sec
+_dv = [ghost.hop_delay(_sec, (100, 200)) for _ in range(300)]
+check("hop delay: every draw is inside the window",
+      all(100 <= v < 200 for v in _dv))
+check("hop delay: the window is actually sampled, not pinned to one value",
+      len(set(_dv)) > 20)
+check("hop delay: a degenerate window returns that value, not a ZeroDivision "
+      "or a randbelow(0)", ghost.hop_delay(_sec, (300, 300)) == 300)
+check("hop delay: the default window is used when none is given",
+      180 <= ghost.hop_delay(_sec) < 720)
+
+# It has to reach the plan, or the flag is decoration.
+_fr3 = _FakeSubRpc()
+_real_cfa3 = ghost.create_fresh_account
+try:
+    _sq = iter(range(21, 99))
+    ghost.create_fresh_account = lambda rpc, label="": next(_sq)
+    _p3, _ = ghost.build_peel_stage_plan(
+        _fr3, 3, "ENTRYADDR", 7, [f"D{i}" for i in range(4)],
+        {f"D{i}": Decimal("1.0") for i in range(4)}, _HR,
+        delay_window=(9000, 9001))
+finally:
+    ghost.create_fresh_account = _real_cfa3
+check("hop delay: the window reaches every peel in the plan",
+      all(p["delay"] == 9000 for p in _p3))
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

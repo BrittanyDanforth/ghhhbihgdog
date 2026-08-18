@@ -99,6 +99,28 @@ check("broadcast:tor-proxy-required", rc != 0 and "tor" in out.lower() and "requ
 rc, out = run("exit_strategy_simulator", ["0"])
 check("exit:amount-positive", rc != 0 and "positive" in out.lower())
 
+# --hop-delay is validated BEFORE anything semantic, so a typo is reported
+# rather than masked by a wallet password prompt or a bech32 checksum error.
+# Driven through the real script, because the ordering is the point: this
+# check used to sit below the BTC address validation, where none of these
+# messages could be reached without first supplying a valid address.
+_GS_OK = ["--tor-proxy", "socks5h://127.0.0.1:9999", "--wallets", "4",
+          "--btc-entry", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"]
+for _spec, _want in (("900-100", "backwards"),
+                     ("abc", "SECONDS or MIN-MAX"),
+                     ("5-x", "SECONDS or MIN-MAX"),
+                     ("700000000", "7 days")):
+    rc, out = run("GhostSpiral", ["--hop-delay", _spec] + _GS_OK)
+    check(f"hop-delay:reject:{_spec}", rc != 0 and _want in out)
+rc, out = run("GhostSpiral", ["--hop-delay", "21600-86400"] + _GS_OK)
+check("hop-delay:accepts a multi-hour window and says so",
+      "21600-86400s" in out)
+# A typo'd delay must never be silently ignored -- a peel chain relayed with
+# no jitter is a burst of transactions minutes apart.
+rc, out = run("GhostSpiral", ["--hop-delay", "0-0"] + _GS_OK)
+check("hop-delay:an explicit zero window is accepted but announced",
+      "0-0s" in out)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS); sys.exit(1)
