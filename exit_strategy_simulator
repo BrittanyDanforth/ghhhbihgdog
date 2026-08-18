@@ -162,7 +162,10 @@ def main():
     ap.add_argument("--redact", action="store_true",
                     help="mask amounts and values on the terminal (the full plan "
                          "is still written to the 0600 JSON file). Use when "
-                         "screen-sharing or in a shoulder-surfing risk.")
+                         "screen-sharing or in a shoulder-surfing risk. It masks "
+                         "the DIGITS, not the digit COUNT -- a 3-digit holding "
+                         "still shows as ###.#### -- so it hides the exact figure, "
+                         "not the order of magnitude.")
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
@@ -216,6 +219,18 @@ def main():
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
     liq_guidance = liquidity_estimate(args.method, gross)
+    # What is safe to show when --redact is on. The guidance for bisq/haveno is
+    # a pure function of the amount -- it bins it at 10 and 50 XMR -- so
+    # printing it verbatim under --redact hands an observer the band while the
+    # figures beside it are masked. Measured: a 2-digit holding shows as
+    # "##.####" either way, but "MEDIUM" narrows it to 11-50 and "LOW" to
+    # 51-99, roughly halving the range --redact is supposed to be hiding.
+    # The methods whose guidance does NOT depend on the amount (p2p, azteco)
+    # are still shown, because they leak nothing.
+    liq_shown = f"{liq_guidance} (heuristic)"
+    if args.redact and args.method in ("bisq", "haveno"):
+        liq_shown = ("redacted — this guidance is derived from the amount, so "
+                     "printing it would give away the magnitude")
 
     plan = {
         "schema": "exitplan_v1",
@@ -247,7 +262,23 @@ def main():
         d = len(str(int(Decimal(str(v)).copy_abs())))
         return f"{'#' * d}.{'#' * 4}{unit} (redacted, {d}-digit)"
 
-    kyc_label = "KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"
+    # THE LABEL IS ALWAYS THE TRUTH. --suppress-kyc silences the warning line
+    # below; it does not change what the method is.
+    #
+    # This read `"KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"`,
+    # so `--suppress-kyc --method azteco` printed
+    #     Method      : azteco (No-KYC)
+    # for a method this file's own METHODS table marks kyc=True -- while the
+    # exitplan_v1.json it wrote in the same run recorded kyc_required: true.
+    # The screen and the file contradicted each other and the screen is the one
+    # the operator reads.
+    #
+    # A flag named "suppress" reads as "stop nagging me", not "relabel the
+    # venue". KYC is the precise point where a pseudonymous chain position
+    # becomes a legal identity, so an off-ramp planner in a privacy toolchain
+    # calling a KYC venue No-KYC is the single worst false statement it can
+    # make. Suppress the WARNING, never the fact.
+    kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
     print(f"  Method      : {args.method} ({kyc_label})")
     print(f"  Gross       : {_m(gross, ' XMR')}")
     print(f"  Fees        : {_m(round(fee, 4), ' XMR')} ({cfg['fee_pct'] * 100:.1f}%)")
@@ -256,7 +287,7 @@ def main():
     print(f"  Net         : {_m(round(net, 4), ' XMR')}")
     print(f"  Value       : {_m(fiat_val, ' ' + args.currency.upper())}")
     print(f"  Prices from : {prices.get('source', 'unknown')}")
-    print(f"  Liquidity   : {liq_guidance} (heuristic)")
+    print(f"  Liquidity   : {liq_shown}")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
     print(f"  [+] Plan saved -> {args.outfile}")

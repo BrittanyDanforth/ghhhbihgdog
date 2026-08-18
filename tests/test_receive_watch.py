@@ -156,11 +156,27 @@ print("=== the watch loop ===")
 
 
 class FakeRPC:
-    """A wallet-rpc that returns a scripted sequence of (total, unlocked)."""
+    """A wallet-rpc that returns a scripted sequence of (total, unlocked).
 
-    def __init__(self, script):
+    It also answers get_height, and by default the height ADVANCES on every
+    call -- i.e. it models a wallet that is keeping up with the chain.
+
+    That default matters. This class originally had no raw_request at all, so
+    when watch() started asking the wallet whether it was still scanning, every
+    existing test silently fell into the "cannot tell" branch: the assertions
+    still passed while the branch they were meant to cover never ran. A fake
+    that cannot represent a state is a fake that hides every bug in it -- which
+    is exactly how an IndexError in the real RPC wrapper survived a full test
+    suite elsewhere in this repo. Set scanning=False to model a wallet whose
+    daemon connection has dropped, or height=None for one that will not answer.
+    """
+
+    def __init__(self, script, scanning=True, height=0):
         self.script = list(script)
         self.calls = []
+        self.scanning = scanning
+        self.height = height
+        self.height_calls = 0
 
     def get_subaddress_balance(self, account_index=0, address_index=0):
         self.calls.append((account_index, address_index))
@@ -171,6 +187,18 @@ class FakeRPC:
         self.last = (t, u)
         return int(t * ATOMIC), int(u * ATOMIC)
 
+    def raw_request(self, method, params=None):
+        if method == "get_height":
+            self.height_calls += 1
+            if self.height is None:
+                raise RuntimeError("wallet-rpc will not answer get_height")
+            if self.scanning:
+                # ~2 min/block, so a real wallet advances many blocks across a
+                # 30-minute stall window.
+                self.height += 15
+            return {"height": self.height}
+        return {}
+
 
 class Clock:
     def __init__(self):
@@ -180,9 +208,9 @@ class Clock:
         return self.t
 
 
-def run(script, floor_, timeout_s=10_000, stall_s=1800, step=60):
+def run(script, floor_, timeout_s=10_000, stall_s=1800, step=60, rpc=None):
     clk = Clock()
-    rpc = FakeRPC(script)
+    rpc = rpc if rpc is not None else FakeRPC(script)
 
     def sleep(_s):
         clk.t += step
@@ -284,6 +312,159 @@ _gs = open(os.path.join(REPO, "GhostSpiral")).read()
 _flags = {a for a in argv + argv2 + argv3 if a.startswith("--")}
 check("menu: every flag it prints is a real GhostSpiral flag",
       all(f'"{f}"' in _gs or f"'{f}'" in _gs for f in _flags))
+
+
+# ---------------------------------------------------------------------------
+# A FROZEN BALANCE HAS TWO CAUSES AND THEY NEED OPPOSITE ANSWERS.
+#
+# Proven against real monero-wallet-rpc 0.18.3.1 by killing the daemon
+# mid-poll: get_balance KEEPS ANSWERING, successfully, with the last scanned
+# figure -- it does not raise, so watch()'s transient-error path never fires --
+# while get_height stops advancing. From the balance alone, "the swap sent no
+# more" and "my wallet stopped looking" are the same picture, and the tool used
+# to assert the first one as fact and tell the operator to accept less money.
+# ---------------------------------------------------------------------------
+SHORT = [(0, 0), (0.5, 0.5)] + [(0.5, 0.5)] * 60
+
+# (a) the wallet kept scanning -> the shortfall is REAL and may be stated
+r, rpc = run(SHORT, 0.9, rpc=FakeRPC(SHORT, scanning=True))
+check("watch: a real shortfall (wallet still scanning) reports 'stalled'",
+      r["state"] == "stalled")
+check("...and records that the sync was verified, not assumed",
+      r.get("sync") == "ok")
+check("...having actually asked the wallet its height", rpc.height_calls > 0)
+
+# (b) the wallet stopped scanning -> this is NOT a shortfall
+r, _ = run(SHORT, 0.9, rpc=FakeRPC(SHORT, scanning=False))
+check("watch: a frozen balance with a FROZEN wallet is 'not_syncing', "
+      "never 'stalled'", r["state"] == "not_syncing")
+check("...and says the sync is the problem", r.get("sync") == "stuck")
+check("...and still reports what it did see",
+      r["unlocked"] == Decimal("0.500000000000"))
+
+# (c) the wallet will not answer at all -> say 'unknown', do not guess
+r, _ = run(SHORT, 0.9, rpc=FakeRPC(SHORT, height=None))
+check("watch: an unreadable scan height reports stalled with sync='unknown'",
+      r["state"] == "stalled" and r.get("sync") == "unknown")
+
+# The two branches must be genuinely different: same balances, same timings,
+# opposite verdicts, decided only by whether the wallet kept scanning.
+r_ok, _ = run(SHORT, 0.9, rpc=FakeRPC(SHORT, scanning=True))
+r_bad, _ = run(SHORT, 0.9, rpc=FakeRPC(SHORT, scanning=False))
+check("the verdict is decided by the SCAN HEIGHT, not by the balance "
+      "(identical balances, opposite states)",
+      r_ok["state"] == "stalled" and r_bad["state"] == "not_syncing"
+      and r_ok["unlocked"] == r_bad["unlocked"])
+
+# A wallet that stops scanning must never be reported as a shortfall, because
+# the recovery advice for a shortfall is "accept less money".
+_src = open(os.path.join(REPO, "receive_watch")).read()
+_ns = _src[_src.index('if state == "not_syncing":'):_src.index('if state == "stalled":')]
+check("the not_syncing message does NOT tell the operator to accept less",
+      "--any" not in _ns and "--expect-xmr" not in _ns)
+check("...and says plainly it is not the swap under-delivering",
+      "NOT the swap" in _ns)
+check("...and warns against lowering the target to get past it",
+      "Do NOT lower the target" in _ns)
+
+# The honest-cause rule for the real shortfall: it may only claim the swap paid
+# short when the sync was actually verified.
+_st = _src[_src.index('if state == "stalled":'):]
+_st = _st[:_st.index("return 1")]
+check("the stalled message only blames the swap when sync was verified",
+      'r.get("sync") == "unknown"' in _st and "kept scanning throughout" in _st)
+
+
+# ---------------------------------------------------------------------------
+# "ANY balance" has to mean any SETTLED balance, or the mix strands money on
+# the one address the swap provider already knows.
+#
+# --any fired on `unlocked > 0` alone, so a swap delivered as TWO transactions
+# returned as soon as the first unlocked -- while the wallet could already see
+# the second on the same subaddress. Mixing then moves only the unlocked part
+# and leaves the rest on the receive address. That is not a cosmetic problem:
+# the receive address is bound to a BTC payment by the swap memo, so value left
+# there is value sitting on a burned address after the mix has already run.
+# ---------------------------------------------------------------------------
+TWO_TX = [(0, 0), (3.0, 0), (3.0, 0.5), (3.0, 0.5), (3.0, 3.0)]
+r, _ = run(TWO_TX, 0)          # floor 0 == --any
+check("--any waits for the whole visible balance, not the first unlock",
+      r["state"] == "funded" and r["unlocked"] == Decimal("3.000000000000"))
+check("--any reports nothing left confirming when it returns",
+      r["pending"] == Decimal(0))
+
+# It must still return promptly when there is genuinely only one payment.
+r, _ = run([(0, 0), (1.0, 0), (1.0, 1.0)], 0)
+check("--any still returns on a single settled payment",
+      r["state"] == "funded" and r["unlocked"] == Decimal("1.000000000000"))
+
+# A met TARGET is a real event and must still fire -- but the operator has to
+# be told what is still in flight, or they mix and strand it.
+r, _ = run([(0, 0), (3.0, 0), (3.0, 2.8), (3.0, 3.0)], 2.7)
+check("a met target still reports funded even with money still confirming",
+      r["state"] == "funded" and r["unlocked"] == Decimal("2.800000000000"))
+check("...and reports the amount still confirming",
+      r["pending"] == Decimal("0.200000000000"))
+check("a fully settled payment reports zero pending",
+      run([(0, 0), (1.0, 1.0)], 0.9)[0]["pending"] == Decimal(0))
+
+# main() must actually warn, and name the risk rather than just the number.
+_pend = _src[_src.index('_pending = r.get("pending")'):]
+_pend = _pend[:_pend.index('integrity_log("recv", "watch_complete")')]
+check("main() warns when a mix would strand the pending balance",
+      "left sitting on the receive address" in _pend)
+check("...naming WHY that address is the wrong place to leave it",
+      "the swap provider already knows" in _pend)
+
+
+# ---------------------------------------------------------------------------
+# The printed mix command must survive copy-paste.
+# ---------------------------------------------------------------------------
+_argv = rw.build_mix_command(rw.choice_by_key("1"),
+                             "/home/op/My Wallets/w.json",
+                             "socks5h://127.0.0.1:9050")
+check("build_mix_command returns the path as ONE argv element",
+      "/home/op/My Wallets/w.json" in _argv)
+
+import shlex as _shlex
+_printed = rw.format_mix_command(_argv)
+_reparsed = _shlex.split(_printed)
+check("the PRINTED form survives shell splitting unchanged",
+      _reparsed == _argv)
+check("...so a spaced path is still one argument after copy-paste",
+      _reparsed[_reparsed.index("--receive-wallet") + 1] == "/home/op/My Wallets/w.json")
+# main() must actually USE it. Checked by AST over what main() passes to
+# print(), not by grepping the file: format_mix_command's docstring quotes the
+# old ' '.join(argv) verbatim to explain what was wrong with it, and a
+# substring check cannot tell the explanation from the defect. (This exact
+# false positive fired while writing this test.)
+import ast as _ast
+_mainfn = next(n for n in _ast.walk(_ast.parse(_src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "main")
+_join_calls, _fmt_calls = 0, 0
+for _n in _ast.walk(_mainfn):
+    if isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name) and _n.func.id == "print":
+        for _sub in _ast.walk(_n):
+            if isinstance(_sub, _ast.Call):
+                _f = _sub.func
+                if isinstance(_f, _ast.Name) and _f.id == "format_mix_command":
+                    _fmt_calls += 1
+                if (isinstance(_f, _ast.Attribute) and _f.attr == "join"
+                        and any(isinstance(a, _ast.Name) and a.id == "argv"
+                                for a in _sub.args)):
+                    _join_calls += 1
+check("main() prints the mix command through format_mix_command", _fmt_calls == 1)
+check("...and never prints a bare join of argv", _join_calls == 0)
+
+# an ordinary path must not gain noisy quotes
+_plain = _shlex.split(rw.format_mix_command(
+    rw.build_mix_command(rw.choice_by_key("2"), "wallet_ab12.json",
+                         "socks5h://127.0.0.1:9050")))
+check("a path with no spaces is printed without added quoting",
+      "'" not in rw.format_mix_command(
+          rw.build_mix_command(rw.choice_by_key("2"), "wallet_ab12.json",
+                               "socks5h://127.0.0.1:9050")))
+check("...and still round-trips", "wallet_ab12.json" in _plain)
 
 
 print("=== the menu must match the console's presets, not drift from them ===")

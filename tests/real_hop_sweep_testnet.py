@@ -96,7 +96,7 @@ try:
     Lp(["monerod", "--testnet", "--offline", "--data-dir", BASE + "/n",
         "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28131",
         "--p2p-bind-port", "28130", "--no-igd", "--hide-my-port",
-        "--fixed-difficulty", "1", "--non-interactive",
+        "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
         "--log-file", BASE + "/d.log", "--log-level", "0"], BASE + "/d.out")
     for _ in range(45):
         time.sleep(1)

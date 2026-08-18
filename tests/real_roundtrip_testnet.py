@@ -45,7 +45,7 @@ result = "INCOMPLETE"
 try:
     L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28081", "--p2p-bind-port", "28080",
-       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive",
+       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
         time.sleep(1)

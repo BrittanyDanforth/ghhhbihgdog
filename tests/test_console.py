@@ -48,14 +48,31 @@ def test_password_scope():
     c = load_console(SECRET)
 
     def child_sees(action_id):
+        """Run a probe child and return what it saw, or raise if it never ran.
+
+        The wait used to be 100 x 0.05s = 5 seconds, and on expiry it fell
+        straight through to comparing whatever output existed -- usually "".
+        On a loaded machine (this repo's suites run back-to-back alongside
+        monero daemons) a bare interpreter start exceeds 5s, so the run
+        reported 'the pipeline child DOES get the password' as FAILED.
+
+        The direction was safe -- a timeout can only produce a mismatch, never
+        a false pass -- but the message was a lie about the cause, and a
+        password-scope failure is exactly the kind of thing someone drops
+        everything to chase. Wait long enough for a slow host, and if it still
+        has not finished, say THAT instead of pretending it is a result.
+        """
         jid = c.start([sys.executable, "-c",
                        "import os;print(os.environ.get('GS_WALLET_PASSWORD'))"],
                       "probe", action_id=action_id)
-        for _ in range(100):
+        deadline = time.time() + 60
+        while time.time() < deadline:
             if c.JOBS[jid]["done"]:
-                break
+                return "\n".join(c.JOBS[jid]["lines"]).strip()
             time.sleep(0.05)
-        return "\n".join(c.JOBS[jid]["lines"]).strip()
+        raise AssertionError(
+            f"probe child for action {action_id!r} did not finish within 60s "
+            f"-- this is a TIMEOUT, not a password-scope result")
 
     check("the pipeline child DOES get the password",
           child_sees("run_pipeline") == SECRET)

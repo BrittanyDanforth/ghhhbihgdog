@@ -48,7 +48,7 @@ OPSEC hardening:
     arming and running a spend stays where the rest of the toolchain puts it.
 """
 from __future__ import annotations
-import argparse, json, secrets, sys, time
+import argparse, json, secrets, shlex, sys, time
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
@@ -224,6 +224,24 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str) -> list
     return argv
 
 
+def format_mix_command(argv: list) -> str:
+    """Render an argv list as a line the operator can paste into a shell.
+
+    build_mix_command's own docstring says the command is "built as a list,
+    never a string" because "a quoted-string command is how a path with a space
+    becomes two arguments" -- and main() then printed " ".join(argv), producing
+    exactly that. Verified: with --receive-wallet '/home/op/My Wallets/w.json'
+    the printed line splits into '/home/op/My' plus a stray
+    'Wallets/w.json', so GhostSpiral is handed the wrong path and an unknown
+    positional. The care taken in building the list was thrown away by the one
+    place its output is consumed.
+
+    shlex.quote leaves ordinary paths untouched, so the common case still reads
+    as a plain command; only an argument that actually needs quoting gets it.
+    """
+    return " ".join(shlex.quote(str(a)) for a in argv)
+
+
 def render_choices() -> str:
     out = ["", "  === THE MONEY IS YOURS. WHAT DO YOU WANT TO DO WITH IT? ===", ""]
     for c in CHOICES:
@@ -239,6 +257,24 @@ def choice_by_key(key: str):
     return None
 
 
+def wallet_height(rpc):
+    """The wallet's own scanned height, or None if it cannot be read.
+
+    This exists because a frozen balance has TWO causes and they need opposite
+    responses. Verified against real monero-wallet-rpc 0.18.3.1 by killing the
+    daemon mid-poll: get_balance KEEPS ANSWERING, successfully, with the last
+    scanned value -- it does not raise, so the transient-error path in watch()
+    never fires -- while get_height stops advancing. From inside the balance
+    poll alone, "the swap sent no more money" and "my wallet stopped looking"
+    are the same picture.
+    """
+    try:
+        h = (rpc.raw_request("get_height", {}) or {}).get("height")
+        return int(h) if isinstance(h, int) and not isinstance(h, bool) else None
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
           timeout_s: int, stall_s: int, sleep_fn=time.sleep,
           clock=time.monotonic, rng=None, echo=print) -> dict:
@@ -250,7 +286,10 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
     aborting the watch would lose the operator's place for no reason.
 
     Outcomes: 'funded' (>= floor, unlocked), 'stalled' (money arrived, stopped
-    growing, still short), 'timeout', 'interrupted'.
+    growing, still short, AND the wallet kept scanning throughout, so no more
+    is coming), 'not_syncing' (the balance froze because this wallet stopped
+    scanning -- says nothing about how much was sent), 'timeout',
+    'interrupted'. A 'stalled' result also carries sync='ok'|'unknown'.
     """
     started = clock()
     seen_any = False
@@ -258,6 +297,10 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
     last_unlocked = to_xmr(0)
     last_change = started
     ticks = 0
+    # Wallet scan height at the moment the balance last MOVED. A stall is only
+    # meaningful if the wallet has kept scanning since then -- see the
+    # 'stalled' branch below and wallet_height().
+    height_at_change = wallet_height(rpc)
     while True:
         if shutdown_requested():
             return {"state": "interrupted", "unlocked": last_unlocked,
@@ -285,27 +328,76 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
                     echo("  [+] Something arrived. Waiting for it to confirm and unlock.")
                 last_change = clock()
                 last_total = total
+                height_at_change = wallet_height(rpc)
             echo(f"  [*] {progress_line(unlocked, total, floor_)}")
 
+            # Balance the wallet can SEE on this subaddress but that has not
+            # unlocked yet. A Monero output needs ~10 blocks, and a swap that
+            # arrives as two transactions has the second one sitting here for
+            # ~20 minutes after the first is spendable.
+            still_confirming = total > unlocked
+            pending = (total - unlocked) if still_confirming else Decimal(0)
+
             if floor_ > 0 and unlocked >= floor_:
+                # The target was met, so this IS the event -- but say what is
+                # still in flight. Mixing now spends only the unlocked part and
+                # leaves the rest sitting on the RECEIVE address, which is the
+                # one address the swap provider has already bound to a BTC
+                # payment. The caller prints this; it must not be silent.
                 integrity_log("recv", "funded")
                 return {"state": "funded", "unlocked": unlocked,
-                        "total": total, "ticks": ticks}
-            if floor_ <= 0 and unlocked > 0:
-                # --any mode: any unlocked balance is the event.
+                        "total": total, "pending": pending, "ticks": ticks}
+            if floor_ <= 0 and unlocked > 0 and not still_confirming:
+                # --any: "any balance" has to mean any SETTLED balance.
+                #
+                # This fired on `unlocked > 0` alone, so a swap delivered as two
+                # transactions returned as soon as the FIRST unlocked -- while
+                # the wallet could already see the second on the same
+                # subaddress. Demonstrated: with 3.0 XMR visible and 0.5
+                # unlocked, --any reported "PAID: 0.5" and offered to mix. The
+                # 2.5 then stays on the receive address after the mix has
+                # already run: value stranded on a burned address, which is
+                # precisely what the mix exists to move it off.
+                #
+                # Nothing is lost by waiting -- the balance is already on-chain
+                # and the stall/timeout paths still bound the wait.
                 integrity_log("recv", "funded_any")
                 return {"state": "funded", "unlocked": unlocked,
-                        "total": total, "ticks": ticks}
+                        "total": total, "pending": Decimal(0), "ticks": ticks}
             # "Stalled" means no MORE money is coming -- not that we are still
             # waiting for what arrived to confirm. While unlocked < total there
-            # is balance in the confirmation pipeline (a Monero output takes ~10
-            # blocks to unlock, which is longer than a short stall window), so
-            # calling that a shortfall would abandon a payment mid-confirmation.
-            still_confirming = total > unlocked
+            # is balance in the confirmation pipeline, so calling that a
+            # shortfall would abandon a payment mid-confirmation.
             if (seen_any and not still_confirming
                     and (clock() - last_change) >= stall_s):
+                # A frozen balance is not evidence that the money stopped
+                # coming -- only that this wallet stopped SEEING it. Ask the
+                # wallet whether it has scanned any new blocks since the
+                # balance last moved. If it has not, the daemon connection is
+                # down or the wallet is stuck, and reporting "the swap
+                # under-delivered" would be a false cause with a dangerous
+                # remedy: the operator is told to accept less, when the rest of
+                # the money may already be on-chain and simply unscanned.
+                #
+                # Reproduced on real monero-wallet-rpc 0.18.3.1: with the
+                # daemon killed, get_balance kept returning the stale figure
+                # without error while get_height stayed put.
+                h_now = wallet_height(rpc)
+                scanned_on = (h_now is not None and height_at_change is not None
+                              and h_now > height_at_change)
+                if h_now is None or height_at_change is None:
+                    # Cannot tell. Say so rather than pick the reassuring
+                    # answer -- 'unknown' is reported honestly by the caller.
+                    integrity_log("recv", "stalled_sync_unknown")
+                    return {"state": "stalled", "sync": "unknown",
+                            "unlocked": unlocked, "total": total, "ticks": ticks}
+                if not scanned_on:
+                    integrity_log("recv", "wallet_not_scanning")
+                    return {"state": "not_syncing", "sync": "stuck",
+                            "unlocked": unlocked, "total": total,
+                            "ticks": ticks, "height": h_now}
                 integrity_log("recv", "stalled_short")
-                return {"state": "stalled", "unlocked": unlocked,
+                return {"state": "stalled", "sync": "ok", "unlocked": unlocked,
                         "total": total, "ticks": ticks}
 
         if (clock() - started) >= timeout_s:
@@ -335,6 +427,22 @@ def _print_sender_instructions(matched: list, echo=print) -> None:
     echo("  The memo goes in the BTC transaction's OP_RETURN. Without it the")
     echo("  swap is not routed to you. Quotes expire — the sender should pay")
     echo("  promptly, or re-quote.")
+    echo("")
+    # SAME WARNING AS thor_swap_preparer, because this reprints the SAME
+    # values. thor gained an explicit disclosure block above its sender
+    # instructions; this tool re-prints the identical deposit address and memo
+    # -- and is the copy the operator actually has open while they message the
+    # sender, hours later, having long since scrolled thor's output away. A
+    # warning attached to only one of two identical outputs is a warning that
+    # is missed exactly when it matters.
+    echo("  The memo names your XMR address in plain text. Send it to the payer")
+    echo("  the way you would a password — never into a paste site, an issue, a")
+    echo("  support chat or a group thread. The swap provider already holds the")
+    echo("  BTC-payment-to-XMR-address link and cannot un-know it; posting the")
+    echo("  memo publicly turns a link one company has into one everybody has.")
+    echo("  Mixing afterwards hides what you do NEXT with the Monero. It cannot")
+    echo("  retract that link, so treat this receive address as burned: this one")
+    echo("  swap, then let the mix move the funds off it.")
     echo("  ============================================================")
 
 
@@ -479,17 +587,52 @@ def main():
         print("  [!] The funds (if any) are safe on the receive subaddress. Re-run to "
               "keep waiting, or check the swap with the provider.")
         return 1
+    if state == "not_syncing":
+        # The balance froze because the WALLET stopped scanning, not because
+        # the swap stopped paying. Never recommend accepting less here: the
+        # rest of the money may already be on-chain and merely unseen.
+        print(f"\n  [!] The balance stopped changing, but your wallet has not scanned "
+              f"a single new block since it last moved.")
+        print(f"  [!] That is your wallet losing the daemon — NOT the swap "
+              f"under-delivering. Nothing here says how much was actually sent.")
+        print(f"      wallet scan height: {r.get('height', '?')}")
+        print(f"  [!] Check monero-wallet-rpc still has its --daemon-address, that "
+              f"monerod is running and synced, then re-run. The funds are safe "
+              f"either way; only this wallet's view of them is stale.")
+        print(f"  [!] Do NOT lower the target to get past this — you would be "
+              f"accepting a number your wallet has not finished counting.")
+        return 1
     if state == "stalled":
         short = floor_ - r["unlocked"]
         print(f"\n  [!] {fmt(r['unlocked'])} XMR arrived and stopped growing for "
               f"{args.stall_min} min — {fmt(short)} short of the {fmt(floor_)} XMR target.")
-        print("  [!] That usually means the swap under-delivered (rate moved, or a "
-              "partial fill). The money that DID arrive is yours and safe.")
+        if r.get("sync") == "unknown":
+            # Say what was not established, instead of naming a cause.
+            print("  [!] Your wallet's scan height could not be read, so this could "
+                  "also be the wallet falling behind rather than the swap paying "
+                  "short. Confirm monerod is running and synced before deciding.")
+        else:
+            # The wallet HAS scanned new blocks since the balance last moved, so
+            # "no more is coming" is an established fact here, not a guess.
+            print(f"  [!] Your wallet has kept scanning throughout, so this is the "
+                  f"swap paying short (rate moved, or a partial fill) — not a sync "
+                  f"problem. The money that DID arrive is yours and safe.")
         print("  [!] Re-run with --any to accept it, or --expect-xmr to set a lower "
               "target, once you have decided it is all that is coming.")
         return 1
 
     print(f"\n  [+] PAID: {fmt(r['unlocked'])} XMR unlocked on the receive subaddress.")
+    _pending = r.get("pending") or Decimal(0)
+    if _pending > 0:
+        # The target was reached while more is still confirming. Mixing now
+        # spends the unlocked part and strands the rest on the receive address
+        # -- the address the swap provider has already tied to a BTC payment.
+        print(f"  [!] {fmt(_pending)} XMR MORE is on this subaddress but has not "
+              f"unlocked yet.")
+        print(f"  [!] If you mix now, only the {fmt(r['unlocked'])} XMR gets moved and "
+              f"that {fmt(_pending)} XMR is left sitting on the receive address —")
+        print(f"      the one address the swap provider already knows. Wait ~20 min "
+              f"and re-run to move all of it in one go.")
     integrity_log("recv", "watch_complete")
 
     print(render_choices())
@@ -512,7 +655,7 @@ def main():
 
     argv = build_mix_command(c, args.receive_wallet, args.tor_proxy)
     print(f"\n  [+] {c['name']} — run this to start the mix:\n")
-    print("      " + " ".join(argv))
+    print("      " + format_mix_command(argv))
     print("\n  This tool does not spend. Nothing moves until you run that command,")
     print("  or arm and launch the same preset from the console.")
     return 0

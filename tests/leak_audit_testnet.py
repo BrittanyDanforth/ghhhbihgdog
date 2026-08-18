@@ -93,6 +93,54 @@ def step(s):
 WATCH_DIRS = ["/tmp", "/dev/shm", "/var/tmp", os.path.expanduser("~")]
 
 
+def _other_testnet_suites_running():
+    """Other real-binary suites running right now, by pid.
+
+    This audit answers "what did the run leave in /tmp, /dev/shm, ...?" by
+    diffing a global before/after snapshot, so it is only meaningful when it
+    has those directories to itself. A second suite doing a cold sign at the
+    same moment has its OWN .gs_pw_* in /dev/shm, which lands in this run's
+    diff and is reported as a leak that does not exist.
+
+    That could not happen until recently: every suite here launched monerod
+    without --no-zmq, and monerod's ZMQ port defaults to 28082 on testnet
+    REGARDLESS of --rpc-bind-port, so the second concurrent daemon always died
+    at startup. Fixing that made these suites genuinely parallel -- and made
+    this audit's global assumption reachable.
+
+    Refuse rather than weaken the assertion: a /dev/shm leftover really is a
+    leak, and the check must stay strict. Detect the interference and say so.
+    """
+    # Skip our OWN process and every ancestor of it. A wrapper such as
+    # `timeout 500 python3 tests/leak_audit_testnet.py` carries this script's
+    # name in its cmdline, so a naive scan reports our own launcher as a
+    # competing suite -- which it did, first run.
+    mine = set()
+    pid_walk = os.getpid()
+    for _ in range(64):
+        mine.add(pid_walk)
+        try:
+            with open(f"/proc/{pid_walk}/stat") as fh:
+                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+        if ppid <= 1 or ppid in mine:
+            break
+        pid_walk = ppid
+    others = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) in mine:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "_testnet.py" in cmd or "leak_audit_testnet" in cmd:
+            others.append((pid, cmd.replace("\x00", " ").strip()[:80]))
+    return others
+
+
 def snapshot(dirs):
     """Set of files currently present in the watched dirs (one level deep is
     not enough -- the signer nests, so walk)."""
@@ -116,7 +164,7 @@ cwd0 = os.getcwd()
 try:
     L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "28131", "--p2p-bind-port", "28130",
-       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive",
+       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
     for _ in range(45):
         time.sleep(1)
@@ -243,6 +291,17 @@ try:
             pass
 
     step("AUDIT 1: files the run LEFT BEHIND in /tmp, /dev/shm, /var/tmp, $HOME")
+    _others = _other_testnet_suites_running()
+    if _others:
+        print("    [!] Another real-binary suite is running concurrently:")
+        for _pid, _cmd in _others:
+            print(f"        pid {_pid}: {_cmd}")
+        print("    [!] This audit diffs GLOBAL /tmp and /dev/shm, so another")
+        print("        suite's scratch would be reported as this run's leak.")
+        print("    [!] Refusing to report an unattributable result. Run this")
+        print("        suite on its own.")
+        result = "INCONCLUSIVE"
+        raise SystemExit(2)
     leftovers = sorted(after - before)
     for f in leftovers:
         print(f"    left: {f}")
