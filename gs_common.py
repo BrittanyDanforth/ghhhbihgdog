@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -738,6 +738,82 @@ class MoneroRPC:
             f"{[e.get('address_index') for e in per_sub]} when asked about "
             f"account {want_a} index {want_i}. Refusing to report another "
             f"address's balance as this one's.")
+
+
+@contextlib.contextmanager
+def run_lock(path: Path, what: str = "GhostSpiral"):
+    """Refuse to run twice at once. Held by the KERNEL, so it cannot go stale.
+
+    The version this replaces was
+
+        if lock_path.exists(): sys.exit(...)
+        lock_path.write_text(str(os.getpid()))
+
+    which is check-then-act: two runs started milliseconds apart both saw no
+    lock and both went on to spend the same wallet. The console starts jobs
+    from threads, so that is an ordinary race. The PID it wrote was never read
+    either, so a crash left a file whose only remedy was "delete the lock file
+    manually" -- advice that teaches an operator to clear the guard
+    reflexively, which is exactly what makes the race dangerous.
+
+    THE FIRST REWRITE OF THIS WAS ALSO WRONG, and the way it was wrong is worth
+    keeping. It used O_CREAT|O_EXCL (atomic, correct) plus a PID-liveness check
+    to reclaim a stale lock, and -- to avoid locking an operator out when the
+    OS recycled a PID -- treated a holder whose /proc cmdline did not mention
+    the tool as dead. Under test, TWELVE concurrent acquirers all won: every
+    holder's cmdline failed that match, so everyone judged everyone else stale.
+    A heuristic added to soften a lockout had quietly removed the lock.
+
+    flock has none of those problems. The kernel drops it when the holding
+    process dies, however it dies, so there is no stale state to detect, no PID
+    to inspect and no reuse to guess about. This module already relies on the
+    same primitive for the integrity chain.
+
+    The file is NOT unlinked on release, deliberately: unlinking it while
+    another process is blocked on it leaves that process holding a lock on a
+    deleted inode while a third creates a fresh file and locks that instead --
+    two winners again, by a different route. An empty marker file costs
+    nothing, is gitignored, and paranoia_mode wipes it.
+    """
+    path = Path(path)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = ""
+            try:
+                holder = f" (pid {os.read(fd, 64).decode('utf-8', 'replace').split()[0]})"
+            except Exception:                                # noqa: BLE001
+                pass
+            os.close(fd)
+            sys.exit(
+                f"[!] {what} is already running{holder}.\n"
+                f"    Two runs spending the same wallet at once fight over the "
+                f"same outputs and\n"
+                f"    can leave a mix half-executed. Wait for it, or stop it "
+                f"first.\n"
+                f"    Lock: {path}\n"
+                f"    (This lock is held by the kernel — if the other run has "
+                f"really died it is\n"
+                f"     already released, so there is never anything to delete "
+                f"by hand.)")
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n{what}\n".encode())
+        except OSError:
+            pass                # informational only; the flock is the lock
+        secure_file_perms(path)
+        yield path
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def create_fresh_account(rpc, label: str = "") -> int:

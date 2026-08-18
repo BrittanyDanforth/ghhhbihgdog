@@ -37,7 +37,7 @@ from gs_common import (
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv,
-    create_fresh_account,
+    create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation,
 )
 
@@ -1799,17 +1799,6 @@ def main():
 
     _stage5_cleanup(Path(args.output), fanout_file, dag_file)
 
-    # Lock file to prevent concurrent runs
-    lock_path = Path(".ghostspiral.lock")
-    if lock_path.exists():
-        sys.exit(
-            "[!] Lock file exists: .ghostspiral.lock\n"
-            "    Another GhostSpiral instance may be running.\n"
-            "    If not, delete the lock file manually."
-        )
-    lock_path.write_text(str(os.getpid()))
-    secure_file_perms(lock_path)
-
     staging_dir = "tx_staging"
 
     # A destination for whatever change the distribution leaves behind.
@@ -1836,15 +1825,26 @@ def main():
                   f"subaddress 0 — UNMIXED, and the only fan-out output that "
                   f"never moves.")
 
-    try:  # ensures lock file is cleaned even on error
+    # ONE RUN AT A TIME, atomically, and covering everything that spends.
+    #
+    # This was `if lock_path.exists(): exit` followed by `write_text(pid)` --
+    # check-then-act, so two runs started milliseconds apart both saw no lock
+    # and both went on to spend the same wallet. The console starts jobs from
+    # threads, so that is an ordinary race rather than an exotic one. The PID
+    # it wrote was never read either, so a crash left a lock whose only remedy
+    # was "delete the lock file manually" -- advice that teaches an operator to
+    # clear the guard reflexively, which is what made the race dangerous.
+    #
+    # The guarded region now also STARTS before the spend-side subaddress
+    # provisioning above rather than after it: the old acquire sat several
+    # statements outside its own try/finally, so an exception in between leaked
+    # the lock and blocked every later run.
+    with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
                                  change_sweep_target=change_sweep_target)
-    finally:
-        if lock_path.exists():
-            lock_path.unlink()
 
     # Honest completion. This used to print "pipeline complete." unconditionally,
     # so a peel chain that stopped partway or a DAG round that was skipped still

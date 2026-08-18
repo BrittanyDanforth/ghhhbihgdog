@@ -24,6 +24,8 @@ from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tests"))
+from srcutil import code_only
 
 PASS = 0; FAIL = 0; FAILURES = []
 
@@ -182,6 +184,94 @@ check("...and actually CHECKS the flag they set (it did not, so Ctrl-C was "
       "swallowed entirely)", "shutdown_requested()" in esrc)
 check("...before the oracle fetch and before writing the plan",
       esrc.count("shutdown_requested()") >= 2)
+
+print("=== the run lock must actually be a lock ===")
+# The original was `if path.exists(): exit` then `write_text(pid)` -- check
+# then act, so two runs started milliseconds apart both saw no lock and both
+# went on to spend the same wallet. The console starts jobs from threads, so
+# that is an ordinary race.
+#
+# The FIRST rewrite of it was also wrong, and this is the check that caught it:
+# it used O_CREAT|O_EXCL plus a PID-liveness test, and -- to avoid locking an
+# operator out on a recycled PID -- treated a holder whose /proc cmdline did
+# not mention the tool as dead. Twelve concurrent acquirers ALL won, because no
+# holder's cmdline matched. A heuristic meant to soften a lockout had removed
+# the lock. flock has no such failure mode: the kernel releases it when the
+# holder dies, so there is no staleness to detect and nothing to guess.
+import multiprocessing as _mp
+_lk_dir = Path(tempfile.mkdtemp(prefix="gs_lock_"))
+_LK = _lk_dir / ".ghostspiral.lock"
+
+
+def _lock_child(path_str, q, ready, hold_s):
+    import sys as _s
+    _s.path.insert(0, REPO)
+    import gs_common as _g
+    _g.integrity_log = lambda *a, **k: None
+    try:
+        with _g.run_lock(Path(path_str), "GhostSpiral"):
+            q.put("won")
+            if ready is not None:
+                ready.set()
+            time.sleep(hold_s)
+    except SystemExit:
+        q.put("blocked")
+
+
+with gs.run_lock(_LK, "GhostSpiral"):
+    check("run lock: the lock file is created owner-only",
+          _LK.exists() and (_LK.stat().st_mode & 0o777) == 0o600)
+
+# A LIVE holder must block.
+_ready = _mp.Event(); _q = _mp.Queue()
+_h = _mp.Process(target=_lock_child, args=(str(_LK), _q, _ready, 2.5))
+_h.start(); _ready.wait(10)
+_blocked = False
+try:
+    with gs.run_lock(_LK, "GhostSpiral"):
+        pass
+except SystemExit as e:
+    _blocked = "already running" in str(e)
+check("run lock: a second run is REFUSED while the first holds it", _blocked)
+_h.join()
+
+# A holder that is SIGKILLed leaves nothing to clean up. The old design's
+# advice on a stale lock was "delete the lock file manually", which is what
+# trains an operator to clear the guard reflexively.
+_r2 = _mp.Event(); _q2 = _mp.Queue()
+_k = _mp.Process(target=_lock_child, args=(str(_LK), _q2, _r2, 60))
+_k.start(); _r2.wait(10)
+os.kill(_k.pid, 9); _k.join()
+_after_kill = False
+try:
+    with gs.run_lock(_LK, "GhostSpiral"):
+        _after_kill = True
+except SystemExit:
+    _after_kill = False
+check("run lock: a SIGKILLed holder leaves NO stale lock (the kernel releases "
+      "it, so there is never a file to delete by hand)", _after_kill)
+
+# THE RACE ITSELF: many simultaneous acquirers, exactly one winner.
+_q3 = _mp.Queue()
+_ps = [_mp.Process(target=_lock_child, args=(str(_LK), _q3, None, 0.5))
+       for _ in range(12)]
+for _p in _ps: _p.start()
+for _p in _ps: _p.join()
+_res = [_q3.get() for _ in range(_q3.qsize())]
+check(f"run lock: 12 concurrent runs -> exactly ONE wins "
+      f"(won={_res.count('won')}, blocked={_res.count('blocked')})",
+      _res.count("won") == 1 and _res.count("blocked") == 11)
+
+# and GhostSpiral must use it rather than keeping its own check-then-act
+_gs_code = code_only(os.path.join(REPO, "GhostSpiral"))
+check("run lock: GhostSpiral acquires it through the shared helper",
+      "run_lock(" in _gs_code)
+check("run lock: ...and no longer does exists()-then-write",
+      "lock_path.exists()" not in _gs_code)
+
+import shutil as _sh2
+_sh2.rmtree(_lk_dir, ignore_errors=True)
+
 
 print("=== every real-binary suite must own its ports ===")
 # Three suites shared 28090/28091/28093, two shared 28100, two shared 28080,
