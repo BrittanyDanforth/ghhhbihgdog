@@ -73,6 +73,45 @@ POLL_MAX_S = 90
 # forever for a number that is never going to arrive.
 STALL_MINUTES_DEFAULT = 30
 
+# ── what counts as MONEY ARRIVING, as opposed to noise ─────────────────────
+#
+# Four separate decisions in watch() used to read "any non-zero balance" as
+# "the payment": setting seen_any, restarting the no-more-is-coming timer,
+# deciding something is still confirming, and firing --any. The receive
+# address is not a secret -- the swap memo names it in plaintext and the
+# sender puts that memo in a Bitcoin OP_RETURN -- so anyone reading the BTC
+# chain, the swap provider included, can send to it. One piconero was enough
+# to make the tool assert "the swap paid short" when nothing had arrived, and
+# a piconero every 25 minutes held the shortfall verdict off for a full day.
+#
+# The floor below is not a magic number, it is "an amount that cannot even pay
+# to move itself". A Monero output smaller than the fee needed to spend it is
+# not money the operator can act on -- mixing it costs more than it is worth --
+# so treating it as an arrival is wrong independently of any attacker. A
+# typical mainnet fee at default priority is a few times 1e-5 XMR; 5e-4 sits
+# comfortably above that and far below any real swap (ThorChain's own BTC->XMR
+# minimums are orders of magnitude larger).
+DUST_FLOOR_XMR = Decimal("0.0005")
+
+# ...and scaled for large swaps, so the attack does not simply get more
+# expensive-but-still-cheap as the amount grows. 0.1% of a 1000 XMR swap is
+# 1 XMR: an attacker must now spend real money to move the verdict.
+#
+# Erring HIGH is the safe direction here. Too high only delays a verdict --
+# the watch keeps waiting and the operator loses nothing. Too low produces a
+# CONFIDENT WRONG ANSWER about someone's money, which is the failure this
+# whole tool exists to avoid.
+ARRIVAL_FRACTION_OF_TARGET = Decimal("0.001")
+
+
+def arrival_floor(target: Decimal, override: Decimal = None) -> Decimal:
+    """The smallest balance this watch will treat as the payment arriving."""
+    if override is not None:
+        return override
+    if target > 0:
+        return max(DUST_FLOOR_XMR, target * ARRIVAL_FRACTION_OF_TARGET)
+    return DUST_FLOOR_XMR
+
 
 def to_xmr(atomic: int) -> Decimal:
     """Atomic units -> XMR, truncated at 12dp (never rounded up: this number is
@@ -323,7 +362,8 @@ def wallet_height(rpc):
 
 def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
           timeout_s: int, stall_s: int, sleep_fn=_sleep_interruptible,
-          clock=time.monotonic, rng=None, echo=print) -> dict:
+          clock=time.monotonic, rng=None, echo=print,
+          min_arrival: Decimal = DUST_FLOOR_XMR) -> dict:
     """Poll one subaddress until it holds `floor_` unlocked XMR.
 
     Returns a result dict rather than exiting, so the caller (and the tests)
@@ -349,6 +389,13 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
     last_unlocked = to_xmr(0)
     last_change = started
     ticks = 0
+    # The total as of the last MEANINGFUL move. Compared against this rather
+    # than against the previous tick, so a long run of sub-threshold increments
+    # that add up to a real amount still counts -- 58 dust drips of 0.0001 are
+    # 0.0058 XMR, and a naive `total - previous_tick >= min_arrival` test would
+    # never notice, which is exactly the hole the drip attack walks through.
+    marked_total = Decimal(0)
+    dust_reported = False
     # WALLET LIVENESS, tracked continuously and independently of the balance.
     #
     # The first version of this sampled the height only at the last balance
@@ -411,20 +458,55 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
             last_unlocked = unlocked
             ticks += 1
             if total != last_total:
-                if total > 0 and not seen_any:
-                    seen_any = True
-                    integrity_log("recv", "first_funds_seen")
-                    echo("  [+] Something arrived. Waiting for it to confirm and unlock.")
-                last_change = clock()
                 last_total = total
+                # A MEANINGFUL increase is what "something arrived" means, and
+                # what restarts the no-more-is-coming timer. Any change at all
+                # used to do both: dust set seen_any (so a balance that never
+                # moved again was reported as "the swap paid short"), and a
+                # drip reset last_change forever (so the shortfall verdict
+                # could be suppressed for the whole 24 hours).
+                if total >= marked_total + min_arrival:
+                    marked_total = total
+                    last_change = clock()
+                    if not seen_any:
+                        seen_any = True
+                        integrity_log("recv", "first_funds_seen")
+                        echo("  [+] Something arrived. Waiting for it to "
+                             "confirm and unlock.")
+                elif total < marked_total:
+                    # Balance went DOWN (the operator spent from it, or a
+                    # reorg). Re-anchor so later arrivals are measured from
+                    # where things actually stand.
+                    marked_total = total
+                    last_change = clock()
+                elif total > 0 and not seen_any and not dust_reported:
+                    # Do not hide it. Something IS on the address; it is just
+                    # too small to be the payment being waited for.
+                    dust_reported = True
+                    integrity_log("recv", "sub_threshold_balance")
+                    echo(f"  [!] {fmt(total)} XMR is on this subaddress but that "
+                         f"is below the {fmt(min_arrival)} XMR arrival "
+                         f"threshold, so it is NOT being treated as the "
+                         f"payment. Anyone who has seen the swap memo can send "
+                         f"here; --min-arrival changes the threshold.")
             echo(f"  [*] {progress_line(unlocked, total, floor_)}")
 
             # Balance the wallet can SEE on this subaddress but that has not
             # unlocked yet. A Monero output needs ~10 blocks, and a swap that
             # arrives as two transactions has the second one sitting here for
             # ~20 minutes after the first is spendable.
-            still_confirming = total > unlocked
-            pending = (total - unlocked) if still_confirming else Decimal(0)
+            # `pending` stays the true figure for reporting; the DECISION
+            # uses the threshold. A single permanently-locked piconero used to
+            # pin `total > unlocked` true forever, which blocked the shortfall
+            # verdict just as effectively as the drip did.
+            pending = (total - unlocked) if total > unlocked else Decimal(0)
+            # `pending > 0` as well as the threshold. `pending >= min_arrival`
+            # alone is TRUE when both are zero, so with --min-arrival 0 nothing
+            # was ever "settled" and the shortfall verdict could never be
+            # reached -- the escape hatch silently broke the thing it was meant
+            # to restore. Caught by the real-binary control run, not by
+            # inspection.
+            still_confirming = pending > 0 and pending >= min_arrival
 
             if floor_ > 0 and unlocked >= floor_:
                 # The target was met, so this IS the event -- but say what is
@@ -435,7 +517,7 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
                 integrity_log("recv", "funded")
                 return {"state": "funded", "unlocked": unlocked,
                         "total": total, "pending": pending, "ticks": ticks}
-            if floor_ <= 0 and unlocked > 0 and not still_confirming:
+            if floor_ <= 0 and unlocked >= min_arrival and not still_confirming:
                 # --any: "any balance" has to mean any SETTLED balance.
                 #
                 # This fired on `unlocked > 0` alone, so a swap delivered as two
@@ -588,6 +670,13 @@ def main():
     ap.add_argument("--any", action="store_true",
                     help="stop as soon as ANY unlocked balance appears, with no "
                          "target amount")
+    ap.add_argument("--min-arrival", type=Decimal, default=None,
+                    help="smallest XMR balance treated as the payment arriving. "
+                         "Defaults to the larger of 0.0005 XMR and 0.1%% of the "
+                         "target. Anyone who has seen the swap memo knows this "
+                         "address and can send to it, so a balance below this is "
+                         "reported but not acted on. Lower it only for a "
+                         "genuinely tiny swap.")
     ap.add_argument("--tolerance", type=Decimal, default=Decimal("0.10"),
                     help="fraction under the target that still counts as paid, "
                          "absorbing swap slippage (default 0.10 = accept 90%%)")
@@ -687,6 +776,23 @@ def main():
 
     floor_ = accept_floor(target, args.tolerance) if target > 0 else Decimal(0)
 
+    if args.min_arrival is not None and args.min_arrival < 0:
+        sys.exit("[!] --min-arrival cannot be negative.")
+    min_arrival = arrival_floor(target, args.min_arrival)
+    if floor_ > 0 and min_arrival > floor_:
+        sys.exit(
+            f"[!] --min-arrival ({fmt(min_arrival)} XMR) is above the amount that "
+            f"would count as paid\n"
+            f"    ({fmt(floor_)} XMR), so this watch could never succeed. Lower it, "
+            f"or raise the target.")
+    if args.min_arrival is not None and args.min_arrival == 0:
+        print("  [!] --min-arrival 0 restores the old behaviour: ANY balance, down "
+              "to one\n"
+              "      piconero, counts as the payment. The swap provider knows this "
+              "address\n"
+              "      from the memo, so a trivial send from anyone will now decide "
+              "this watch.")
+
     proxy = validate_proxy(args.tor_proxy)
     verify_tor(proxy)          # ONCE. Not per poll — see the module docstring.
 
@@ -757,6 +863,8 @@ def main():
         print("  [*] --any: stopping as soon as any unlocked balance appears.")
     print(f"  [*] Polling your OWN wallet-rpc only — no explorer, no third party "
           f"is told this address is being watched.")
+    print(f"  [*] Treating {fmt(min_arrival)} XMR or more as the payment arriving; "
+          f"anything smaller is reported but not acted on.")
     print(f"  [*] Timeout {args.timeout_min} min. Ctrl-C is safe: nothing is "
           f"pending, this only reads.")
 
@@ -764,7 +872,8 @@ def main():
 
     r = watch(rpc, account, sub_idx, floor_,
               timeout_s=args.timeout_min * 60,
-              stall_s=args.stall_min * 60)
+              stall_s=args.stall_min * 60,
+              min_arrival=min_arrival)
 
     state = r["state"]
     if state == "interrupted":
@@ -817,6 +926,14 @@ def main():
                   f"still following the chain — this looks like the swap paying "
                   f"short (rate moved, or a partial fill) rather than a sync "
                   f"problem. The money that DID arrive is yours and safe.")
+            # Honest about what this cannot establish. The floor makes a
+            # trivial send unable to reach this branch, but nothing here proves
+            # the balance came from the swap rather than from anyone else who
+            # has seen the memo.
+            print(f"  [!] This tool cannot tell WHO sent what is here — only "
+                  f"that {fmt(r['unlocked'])} XMR is on the address. If the swap "
+                  f"provider reports a different figure, believe the chain, not "
+                  f"this line.")
             if _age is not None and _age > 600:
                 # Inside the threshold, but old enough to be worth doubting.
                 print(f"  [!] {_when} is a long gap though — a healthy wallet "

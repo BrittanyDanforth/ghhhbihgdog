@@ -413,6 +413,144 @@ check("the stalled message only blames the swap when sync was verified",
 
 
 # ---------------------------------------------------------------------------
+# DUST MUST NOT DECIDE ANYTHING.
+#
+# The receive address is not a secret: the swap memo names it in plaintext and
+# the sender puts that memo in a Bitcoin OP_RETURN, so anyone reading the BTC
+# chain -- the swap provider included -- can send to it. Four decisions in
+# watch() used to read "any non-zero balance" as "the payment", which gave an
+# outsider two levers for the price of a transaction fee:
+#   * one piconero set seen_any, so a balance that never moved again was
+#     reported as "the swap paid short" when nothing had arrived;
+#   * one piconero every 25 minutes reset the no-more-is-coming timer, and one
+#     permanently-LOCKED piconero pinned still_confirming, either of which held
+#     the shortfall verdict off for the entire 24 hours.
+# ---------------------------------------------------------------------------
+PICO = Decimal("0.000000000001")
+
+
+class SeqRPC:
+    """Balance follows a scripted sequence; the wallet always scans."""
+    def __init__(self, seq):
+        self.seq = seq; self.i = 0; self.h = 100
+    def get_subaddress_balance(self, account_index=0, address_index=0):
+        t, u = self.seq[min(self.i, len(self.seq) - 1)]
+        self.i += 1
+        return int(Decimal(str(t)) * ATOMIC), int(Decimal(str(u)) * ATOMIC)
+    def raw_request(self, method, params=None):
+        if method == "get_height":
+            self.h += 15
+            return {"height": self.h}
+        return {}
+
+
+def dust_run(seq, floor_, target, timeout_s=100_000, stall_s=1800, min_arr=None):
+    clk = Clock()
+    ma = Decimal(str(min_arr)) if min_arr is not None else rw.arrival_floor(
+        Decimal(str(target)))
+    return rw.watch(SeqRPC(seq), 0, 7, Decimal(str(floor_)), timeout_s=timeout_s,
+                    stall_s=stall_s, sleep_fn=lambda _s: setattr(clk, "t", clk.t + 60),
+                    clock=clk, echo=lambda *a, **k: None, min_arrival=ma)
+
+
+# the floor itself: absolute for small swaps, proportional for large ones, so
+# the attack does not just get more expensive-but-still-cheap as amounts grow
+check("arrival floor for a tiny target is the absolute dust floor",
+      rw.arrival_floor(Decimal("0.5")) == rw.DUST_FLOOR_XMR)
+check("arrival floor scales with a large target (0.1%)",
+      rw.arrival_floor(Decimal("1000")) == Decimal("1.000"))
+check("arrival floor with no target is the absolute floor",
+      rw.arrival_floor(Decimal(0)) == rw.DUST_FLOOR_XMR)
+check("an explicit override wins",
+      rw.arrival_floor(Decimal("1000"), Decimal("0.01")) == Decimal("0.01"))
+check("the dust floor is above a typical Monero fee (it cannot pay to move "
+      "itself below this)", rw.DUST_FLOOR_XMR >= Decimal("0.0002"))
+
+# ATTACK 1: dust must not make the tool assert a shortfall
+r = dust_run([(0, 0)] + [(PICO, PICO)] * 80, 2.7, target=3)
+check("one piconero does NOT produce a 'swap paid short' verdict",
+      r["state"] != "stalled")
+check("...the watch keeps waiting instead", r["state"] == "timeout")
+
+# ATTACK 2: a drip must not suppress the real verdict
+_drip = [(0, 0), (Decimal("0.5"), Decimal("0.5"))]
+for _k in range(1, 150):
+    _drip.append((Decimal("0.5") + PICO * _k, Decimal("0.5") + PICO * _k))
+check("a piconero drip no longer suppresses the shortfall verdict",
+      dust_run(_drip, 2.7, target=3)["state"] == "stalled")
+
+# ATTACK 2b: a permanently locked piconero must not pin still_confirming
+check("a permanently LOCKED piconero no longer pins 'still confirming'",
+      dust_run([(0, 0)] + [(Decimal("0.5") + PICO, Decimal("0.5"))] * 80,
+               2.7, target=3)["state"] == "stalled")
+
+# The accumulation case a naive `total - previous_tick >= floor` test misses:
+# many sub-threshold increments that add up to a real amount must still count.
+_acc = [(0, 0)]; _tot = Decimal(0)
+for _k in range(60):
+    _tot += Decimal("0.0005"); _acc.append((_tot, _tot))
+_acc += [(_tot, _tot)] * 90
+check("sub-threshold increments that ACCUMULATE to a real amount are seen "
+      "(compared against the last marked total, not the previous tick)",
+      dust_run(_acc, 2.7, target=3)["state"] == "stalled")
+
+# --any must not be satisfiable by dust either
+check("--any is NOT satisfied by dust",
+      dust_run([(0, 0)] + [(PICO, PICO)] * 80, 0, target=0,
+               timeout_s=3000)["state"] == "timeout")
+check("--any still fires on a real payment",
+      dust_run([(0, 0), (1.0, 0), (1.0, 1.0)], 0, target=0)["state"] == "funded")
+
+# ...and none of this may break the legitimate paths
+check("a real short delivery is still reported as a shortfall",
+      dust_run([(0, 0)] + [(Decimal("0.5"), Decimal("0.5"))] * 80,
+               2.7, target=3)["state"] == "stalled")
+_full = dust_run([(0, 0), (3.0, 0), (3.0, 3.0)], 2.7, target=3)
+check("the full payment still funds",
+      _full["state"] == "funded" and _full["unlocked"] == Decimal("3.000000000000"))
+
+# A sub-threshold balance must be REPORTED, not silently hidden -- it is the
+# operator's address and something really is sitting on it.
+_lines = []
+_clk2 = Clock()
+rw.watch(SeqRPC([(0, 0)] + [(PICO, PICO)] * 40), 0, 7, Decimal("2.7"),
+         timeout_s=3000, stall_s=1800,
+         sleep_fn=lambda _s: setattr(_clk2, "t", _clk2.t + 60), clock=_clk2,
+         echo=lambda *a, **k: _lines.append(" ".join(str(x) for x in a)),
+         min_arrival=Decimal("0.003"))
+_txt = "\n".join(_lines)
+check("a sub-threshold balance is reported to the operator, not hidden",
+      "below the" in _txt and "arrival threshold" in _txt)
+check("...and the operator is told who can send there",
+      "seen the swap memo" in _txt)
+check("...and how to change it", "--min-arrival" in _txt)
+
+# The escape hatch must actually restore the old behaviour. `pending >=
+# min_arrival` alone is TRUE when both are zero, so --min-arrival 0 left
+# still_confirming permanently set and the shortfall verdict unreachable --
+# the flag silently broke the thing it exists to restore. Found by the
+# real-binary control run, not by inspection.
+check("--min-arrival 0 really does restore the old dust-sensitive behaviour",
+      dust_run([(0, 0)] + [(PICO, PICO)] * 80, 2.7, target=3,
+               min_arr=0)["state"] == "stalled")
+check("...and a settled balance is not reported as 'still confirming' at "
+      "threshold zero",
+      dust_run([(0, 0), (3.0, 3.0)], 2.7, target=3, min_arr=0)["state"] == "funded")
+
+# main() must wire it, validate it, and say what it is using
+check("main() exposes --min-arrival", "--min-arrival" in _src)
+check("main() refuses a threshold above the amount that counts as paid",
+      "could never succeed" in _src)
+check("main() warns that --min-arrival 0 restores the old behaviour",
+      "restores the old behaviour" in _src)
+check("main() prints the threshold it is actually using",
+      "as the payment arriving" in _src)
+# and the shortfall message must not claim it can attribute the source
+check("the shortfall message admits it cannot tell WHO sent the balance",
+      "cannot tell WHO sent" in _src)
+
+
+# ---------------------------------------------------------------------------
 # LIVENESS MUST MEAN "SCANNED RECENTLY", AND MUST NOT HIDE BEHIND THE BALANCE.
 #
 # Both of these were defects in the FIRST version of the sync fix, found by

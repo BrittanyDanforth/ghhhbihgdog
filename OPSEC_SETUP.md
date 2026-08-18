@@ -218,6 +218,25 @@ the balances, the transaction history and every subaddress a run created:
 the whole mix graph. Section 6's "door kick, they take the ThinkPad → partly"
 is exactly this.
 
+**Your receive address is public, so dust can be sent to it**
+
+The swap memo names your XMR address in plain text and the sender puts that
+memo in the Bitcoin transaction's OP_RETURN. So the swap provider — and anyone
+reading the Bitcoin chain — knows exactly where to send. That costs them one
+transaction fee.
+
+`receive_watch` therefore ignores balances below an **arrival floor**: the
+larger of 0.0005 XMR and 0.1% of the target. Below that, a balance is reported
+but is not treated as the payment. It is not an arbitrary number — an output
+smaller than the fee needed to spend it is not money you can act on, so
+counting it as an arrival is wrong even with no attacker present.
+
+Without that floor, one piconero was enough to make the tool assert *"the swap
+paid short"* when nothing had arrived, and one piconero every 25 minutes held
+the shortfall verdict off for the entire 24-hour watch. `--min-arrival` changes
+the threshold; `--min-arrival 0` restores the old, steerable behaviour and says
+so when you use it.
+
 **The swap is seen. Plan around it, not against it.**
 
 A BTC→XMR aggregator has to be **told** where to deliver the Monero. That
