@@ -1816,8 +1816,27 @@ def main():
     # deposits onto the same subaddress 0. Rotating the carriers stopped that
     # address being SPENT; it did not stop it being a convergence point, and
     # the balance sitting there is unmixed either way.
-    change_sweep_target = None
-    if True:
+    # ONE RUN AT A TIME, atomically, and covering everything that touches the
+    # wallet from here on.
+    #
+    # This was `if lock_path.exists(): exit` followed by `write_text(pid)` --
+    # check-then-act, so two runs started milliseconds apart both saw no lock
+    # and both went on to spend the same wallet. gs_console starts jobs from
+    # threads, so that is an ordinary race rather than an exotic one. The PID
+    # it wrote was never read either, so a crash left a lock whose only remedy
+    # was "delete the lock file manually" -- advice that teaches an operator to
+    # clear the guard reflexively, which is what made the race dangerous.
+    #
+    # The guarded region STARTS HERE, before the change-sweep subaddress is
+    # provisioned, not after it. Provisioning is not itself a spend, but it is
+    # a wallet mutation made on the strength of a balance the other run is
+    # about to consume -- so two concurrent runs would each read the same
+    # balance, each create a subaddress for it, and only then would one of them
+    # discover it had been planning against money that was already gone. The
+    # loser also left an orphan subaddress behind. Locking before the read is
+    # the point of locking at all.
+    with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
+        change_sweep_target = None
         try:
             _csa, _csi = rpc_primary.new_subaddress_indexed(
                 account_index=bal_account, label="")
@@ -1830,21 +1849,6 @@ def main():
                   f"subaddress 0 — UNMIXED, and the only fan-out output that "
                   f"never moves.")
 
-    # ONE RUN AT A TIME, atomically, and covering everything that spends.
-    #
-    # This was `if lock_path.exists(): exit` followed by `write_text(pid)` --
-    # check-then-act, so two runs started milliseconds apart both saw no lock
-    # and both went on to spend the same wallet. The console starts jobs from
-    # threads, so that is an ordinary race rather than an exotic one. The PID
-    # it wrote was never read either, so a crash left a lock whose only remedy
-    # was "delete the lock file manually" -- advice that teaches an operator to
-    # clear the guard reflexively, which is what made the race dangerous.
-    #
-    # The guarded region now also STARTS before the spend-side subaddress
-    # provisioning above rather than after it: the old acquire sat several
-    # statements outside its own try/finally, so an exception in between leaked
-    # the lock and blocked every later run.
-    with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
