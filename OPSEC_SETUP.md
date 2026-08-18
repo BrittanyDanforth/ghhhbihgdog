@@ -198,6 +198,18 @@ hop returned nothing to the account.
   `gs_console` all point at that RPC.
 - Console binds `127.0.0.1` only. Do not punch it out.
 
+**Nothing identifying goes on a command line**
+
+`/proc/<pid>/cmdline` is mode **0444** — every account on the host can read a
+running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
+console hands its children the sensitive values through the environment, not
+argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
+`GS_SWAP_AMOUNTS`, `GS_EXIT_AMOUNT`, and `GS_WALLET_PASSWORD` as before. The
+command preview the page shows you is the real argv, which is why no secret
+appears in it.
+
+Running a tool by hand still accepts the flags — it warns and logs when you do.
+
 **What the wallet file gives away**
 
 `paranoia_mode` wipes the pipeline's artifacts and **never touches the wallet

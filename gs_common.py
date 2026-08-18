@@ -361,6 +361,16 @@ def validate_proxy(proxy_url: str) -> Dict[str, str]:
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=3, max=20), reraise=True)
 def _verify_tor_once(proxy: Dict[str, str]) -> dict:
+    # Same falsy-proxies guard safe_get carries. requests treats proxies={} as
+    # NO proxy and connects directly, so an empty dict would send a clearnet
+    # request to check.torproject.org -- announcing this host's real IP to the
+    # very service being used to prove it is hidden. It would then abort
+    # (IsTor false), so the outcome is fail-closed, but the packet has already
+    # left. Every other network call in this toolchain has this guard; these
+    # two were the ones the lesson was never applied to.
+    if not proxy:
+        sys.exit("[!] Tor verification called without proxies — that request "
+                 "would go clearnet. Aborting.")
     r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy)
     r.raise_for_status()
     return r.json()
@@ -399,6 +409,9 @@ def verify_tor(proxy: Dict[str, str]) -> None:
 
 def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
     """Re-verify Tor mid-operation. Logs but doesn't retry as aggressively."""
+    if not proxy:
+        sys.exit("[!] Tor recheck called without proxies — that request would go "
+                 "clearnet. Aborting.")
     try:
         r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy)
         r.raise_for_status()
@@ -696,6 +709,41 @@ def install_signal_handlers():
 
 def shutdown_requested() -> bool:
     return _SHUTDOWN_REQUESTED
+
+# ---------------------------------------------------------------------------
+#  Secrets must not travel on a command line
+# ---------------------------------------------------------------------------
+
+def env_or_argv(env_name: str, argv_value, label: str, cast=None):
+    """Take a sensitive value from the environment, falling back to argv.
+
+    /proc/<pid>/cmdline is mode 0444 -- readable by EVERY account on the host,
+    for the whole life of the process -- while /proc/<pid>/environ is 0400,
+    owner only. Both measured on Linux, not assumed. A command line is
+    therefore a broadcast; an environment is merely not a secret store.
+
+    This exists because the same defect kept reappearing. The rule was written
+    for the wallet password, then the off-ramp amount went on argv, then the
+    BTC entry ADDRESS and the swap amounts. Every one of those is a value this
+    toolchain deliberately keeps out of the integrity chain on the grounds that
+    it deanonymises the operator -- and then published it to `ps`. One helper,
+    so the next caller cannot half-apply the lesson.
+
+    Environment wins over argv (matching the wallet-password precedence
+    everywhere else). An argv value still works, because an operator running a
+    tool by hand should not be blocked, but it warns and chains the warning.
+    Returns None when neither is set; the caller decides whether that is fatal.
+    """
+    raw = os.environ.get(env_name)
+    if raw is not None and raw != "":
+        return cast(raw) if cast else raw
+    if argv_value is not None:
+        print(f"  [!] {label} was passed on the command line, where any local "
+              f"user can read it via ps or /proc/<pid>/cmdline (mode 444). "
+              f"Prefer {env_name}=... .")
+        integrity_log("argv", f"warn:{env_name}_on_argv")
+    return argv_value
+
 
 # ---------------------------------------------------------------------------
 #  Swap quote sanity: is this rate anywhere near reality?

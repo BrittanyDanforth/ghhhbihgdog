@@ -238,7 +238,17 @@ check("cli: --tor-proxy is REQUIRED (fail closed, never optional)",
 # neither has no source of funds, a run with both is ambiguous about which.
 _groups = [g for g in _cli._mutually_exclusive_groups]
 check("cli: exactly one mutually exclusive entry-mode group exists", len(_groups) == 1)
-check("cli: the entry-mode group is required", _groups[0].required is True)
+# The group is deliberately NOT argparse-required: the BTC entry may arrive in
+# GS_BTC_ENTRY, because an address on argv is world-readable via
+# /proc/<pid>/cmdline. The "exactly one mode" contract moved into
+# resolve_sensitive_inputs, and must still be enforced there.
+check("cli: the entry-mode group is NOT argparse-required (env may supply it)",
+      _groups[0].required is False)
+_gs_env = open(os.path.join(REPO, "GhostSpiral")).read()
+check("cli: the exactly-one-mode contract is enforced in code instead",
+      "No entry mode" in _gs_env and "not both" in _gs_env)
+check("cli: GS_BTC_ENTRY and GS_BTC_AMOUNT are the supported env inputs",
+      "GS_BTC_ENTRY" in _gs_env and "GS_BTC_AMOUNT" in _gs_env)
 check("cli: that group is --btc-entry vs --receive-wallet",
       sorted(a.option_strings[0] for a in _groups[0]._group_actions)
       == ["--btc-entry", "--receive-wallet"])
@@ -536,6 +546,74 @@ check("peel+dag: every peeled output can fund its later DAG hop",
 check("peel+dag: the DAG hop amount is derived from THAT output's peeled amount",
       ghost.compute_hop_amount(_cby["C"], Decimal("0.01"))
       > ghost.compute_hop_amount(_cby["B"], Decimal("0.01")))   # C peeled more than B
+
+# ---------------------------------------------------------------------------
+# NOTHING THAT IDENTIFIES THE OPERATOR GOES ON A COMMAND LINE.
+#
+# /proc/<pid>/cmdline is mode 0444 -- every account on the host can read a
+# child's argv for as long as it runs -- while /proc/<pid>/environ is 0400.
+# The rule was written once for the wallet password and then not applied to
+# the off-ramp amount, the BTC entry ADDRESS, or the swap amounts. Those are
+# the values that tie a run to a Bitcoin identity, and the same toolchain
+# strips them from the integrity chain for exactly that reason.
+#
+# gs_common.env_or_argv is the single implementation so the next caller cannot
+# half-apply it again.
+# ---------------------------------------------------------------------------
+check("argv: gs_common owns one env-over-argv helper", hasattr(gs, "env_or_argv"))
+os.environ.pop("GS_T_SECRET", None)
+check("argv: with no env var the argv value is used",
+      gs.env_or_argv("GS_T_SECRET", "from-argv", "x") == "from-argv")
+os.environ["GS_T_SECRET"] = "from-env"
+check("argv: the environment WINS over argv",
+      gs.env_or_argv("GS_T_SECRET", "from-argv", "x") == "from-env")
+check("argv: a cast is applied to the env value",
+      gs.env_or_argv("GS_T_SECRET", None, "x", cast=str.upper) == "FROM-ENV")
+os.environ["GS_T_SECRET"] = ""
+check("argv: an EMPTY env var falls through to argv, not to a blank secret",
+      gs.env_or_argv("GS_T_SECRET", "from-argv", "x") == "from-argv")
+os.environ.pop("GS_T_SECRET", None)
+check("argv: neither source yields None for the caller to decide on",
+      gs.env_or_argv("GS_T_SECRET", None, "x") is None)
+
+_gsx = open(os.path.join(REPO, "GhostSpiral")).read()
+_thx = open(os.path.join(REPO, "thor_swap_preparer")).read()
+_cnx = open(os.path.join(REPO, "gs_console")).read()
+# The three values, and the tools that must read them from the environment.
+check("argv: GhostSpiral reads the BTC entry from the environment",
+      "GS_BTC_ENTRY" in _gsx and "env_or_argv" in _gsx)
+check("argv: GhostSpiral reads the BTC amount from the environment",
+      "GS_BTC_AMOUNT" in _gsx)
+check("argv: thor reads the swap amounts from the environment",
+      "GS_SWAP_AMOUNTS" in _thx and "env_or_argv" in _thx)
+# THE CONSOLE IS THE CALLER THAT LEAKED. It must not put them back on argv.
+check("argv: the console no longer appends --btc-entry to a child's argv",
+      '"--btc-entry", p["btc_entry"]' not in _cnx)
+check("argv: the console no longer appends --btc-amount",
+      '"--btc-amount", p["btc_amount"]' not in _cnx)
+check("argv: the console no longer appends --amounts for the swap",
+      '"--amounts", p.get("swap_btc"' not in _cnx)
+check("argv: the console has one place that decides what is env-only",
+      "def secret_env(" in _cnx)
+# And the preview the page renders is the real argv, so secrets stay off it.
+check("argv: keeping them off argv keeps them out of the command preview",
+      "command PREVIEW" in _cnx or "preview" in _cnx)
+
+# Every network call must refuse a falsy proxies dict. requests treats
+# proxies={} as NO proxy and connects directly -- the defect safe_get records
+# having observed reach a real target. verify/recheck were the two calls the
+# guard was never added to.
+for _bad in ({}, None):
+    for _fn, _nm in ((gs._verify_tor_once, "_verify_tor_once"),
+                     (gs.tor_recheck, "tor_recheck")):
+        try:
+            _fn(_bad); _ok = False
+        except SystemExit as _e:
+            _ok = "clearnet" in str(_e)
+        except Exception:
+            _ok = False
+        check(f"noleak: {_nm}({_bad!r}) aborts instead of connecting clearnet", _ok)
+
 
 # ---------------------------------------------------------------------------
 # WHAT SURVIVES THE WIPE, AND WHAT A COMMAND LINE PUBLISHES.

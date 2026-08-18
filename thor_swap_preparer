@@ -37,7 +37,7 @@ from gs_common import (
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
-    load_receive_bundle, memo_binds_destination,
+    load_receive_bundle, memo_binds_destination, env_or_argv,
     btc_per_xmr_oracle, quote_deviation,
 )
 
@@ -114,8 +114,11 @@ def main():
         "thor_swap_preparer v10.0",
         description="Fetch ThorChain BTC->XMR quotes with OPSEC hardening",
     )
-    ap.add_argument("--amounts", nargs="+", required=True, type=Decimal,
-                    help="BTC amounts to swap")
+    ap.add_argument("--amounts", nargs="+", type=Decimal,
+                    help="BTC amounts to swap. Prefer GS_SWAP_AMOUNTS='0.05 0.03' : "
+                         "an argv amount is world-readable via ps and "
+                         "/proc/<pid>/cmdline (mode 444), and the amount is the "
+                         "value that links this swap to the sender.")
     ap.add_argument("--dests", nargs="+",
                     help="XMR destination addresses (one per amount)")
     ap.add_argument("--dest-from-receive-wallet",
@@ -140,6 +143,22 @@ def main():
                          "deliver to someone else's address.")
     ap.add_argument("--outfile", default="thor_pairs_batch.json")
     args = ap.parse_args()
+
+    # The BTC amounts move off the command line for the same reason the wallet
+    # password and the BTC entry address did: /proc/<pid>/cmdline is 0444, so
+    # every local account could read the size of the swap being arranged.
+    _amts = env_or_argv("GS_SWAP_AMOUNTS",
+                        " ".join(str(a) for a in args.amounts) if args.amounts else None,
+                        "The swap amount(s)")
+    if not _amts:
+        sys.exit("[!] No amounts. Set GS_SWAP_AMOUNTS='0.05 0.03' (preferred) or "
+                 "pass --amounts.")
+    try:
+        args.amounts = [Decimal(x) for x in str(_amts).split()]
+    except Exception:                                        # noqa: BLE001
+        sys.exit("[!] GS_SWAP_AMOUNTS must be space-separated numbers.")
+    if not args.amounts:
+        sys.exit("[!] No amounts given.")
 
     if args.max_slippage <= 0:
         sys.exit("[!] --max-slippage must be positive.")

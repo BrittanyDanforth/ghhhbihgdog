@@ -631,8 +631,12 @@ def test_receive_is_btc_to_monero():
                        "pairs_file": "thor_pairs.json"})
     check("the swap action really invokes thor_swap_preparer",
           "thor_swap_preparer" in argv)
-    check("the BTC amount the sender pays is passed through",
-          argv[argv.index("--amounts") + 1] == "0.05")
+    # The amount is NOT on argv: /proc/<pid>/cmdline is world-readable (0444),
+    # so the sum being swapped would be visible to any local account via ps.
+    check("the swap amount is NOT on the child's argv",
+          "--amounts" not in argv and "0.05" not in argv)
+    check("the swap amount is handed over in the environment instead",
+          c.secret_env({"swap_btc": "0.05"}).get("GS_SWAP_AMOUNTS") == "0.05")
     # The destination must come from the verified bundle, never a retyped
     # 95-char address -- a typo there is irreversible.
     check("the XMR destination is taken from the receive bundle, not retyped",

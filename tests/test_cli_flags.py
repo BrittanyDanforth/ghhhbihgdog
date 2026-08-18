@@ -38,7 +38,13 @@ arg_reject("airgap:no-args",             "airgap_tx_signer", [])
 arg_reject("airgap:bad-phase",           "airgap_tx_signer", ["x.json", "--phase", "bogus"])
 arg_reject("airgap:fee-priority-5",      "airgap_tx_signer", ["x.json", "--phase", "create", "--fee-priority", "5"])
 arg_reject("airgap:fee-priority-0",      "airgap_tx_signer", ["x.json", "--phase", "create", "--fee-priority", "0"])
-arg_reject("ghost:no-mode",              "GhostSpiral", ["--tor-proxy", PROXY])
+# Not argparse's job any more: the BTC entry may arrive in GS_BTC_ENTRY, so the
+# mutually-exclusive group cannot be required=True. The CONTRACT -- exactly one
+# entry mode, or refuse -- is enforced in resolve_sensitive_inputs instead.
+_rc, _o = run("GhostSpiral", ["--tor-proxy", PROXY])
+check("ghost:no-mode refuses to run", _rc != 0)
+check("ghost:no-mode names both ways to supply an entry",
+      "GS_BTC_ENTRY" in _o and "--receive-wallet" in _o)
 arg_reject("ghost:both-modes",           "GhostSpiral", ["--btc-entry", "bc1qxyz", "--receive-wallet", "f.json", "--tor-proxy", PROXY])
 arg_reject("ghost:missing-tor-proxy",    "GhostSpiral", ["--btc-entry", "bc1qxyz"])
 arg_reject("ghost:fee-priority-9",       "GhostSpiral", ["--btc-entry", "bc1qxyz", "--tor-proxy", PROXY, "--fee-priority", "9"])
@@ -57,7 +63,9 @@ check("exit:env amount is accepted (it gets past the amount check)",
       "No amount" not in _out2)
 arg_reject("exit:bad-method",            "exit_strategy_simulator", ["10", "--method", "bogus"])
 arg_reject("exit:bad-currency",          "exit_strategy_simulator", ["10", "--currency", "yen"])
-arg_reject("thor:no-required",           "thor_swap_preparer", [])
+_rc, _o = run("thor_swap_preparer", [])
+check("thor:no-amounts refuses to run", _rc != 0)
+check("thor:no-amounts names the env var", "GS_SWAP_AMOUNTS" in _o)
 
 # ---- valid flags ACCEPTED: they get PAST argparse to a runtime check (rc != 2) ----
 def accepted_past_argparse(name, script, args, needle):

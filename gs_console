@@ -132,9 +132,9 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")
         else:
-            a += ["--btc-entry", p["btc_entry"]]
+            pass   # the address goes in GS_BTC_ENTRY -- see secret_env()
         if p.get("btc_amount"):
-            a += ["--btc-amount", p["btc_amount"]]
+            pass   # the amount goes in GS_BTC_AMOUNT -- see secret_env()
         else:
             why.append("Send mode needs a BTC amount.")
         if p.get("split", 1) > 1:
@@ -199,7 +199,6 @@ ACTIONS = {
     "swap_quote":      {"group": "Receive", "label": "Get the BTC deposit address", "risk": "safe",
                         "desc": "BTC→XMR quote: the address + memo you give the sender",
                         "build": lambda p: [PY, "thor_swap_preparer",
-                                            "--amounts", p.get("swap_btc", ""),
                                             "--dest-from-receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", ""),
                                             "--outfile", p.get("pairs_file") or "thor_pairs.json"]},
@@ -335,6 +334,33 @@ PASSWORD_ACTIONS = {"run_pipeline"}
 _JOB_SEQ = [0]
 
 
+def secret_env(params: dict) -> dict:
+    """Values passed to a child through the ENVIRONMENT, never on its argv.
+
+    /proc/<pid>/cmdline is mode 0444 -- every account on the host can read a
+    child's command line for as long as it runs -- while /proc/<pid>/environ is
+    0400, owner only. Both measured on Linux.
+
+    The console used to spawn `GhostSpiral --btc-entry bc1... --btc-amount 0.42`
+    and `thor_swap_preparer --amounts 0.42`, so the operator's own Bitcoin
+    address and the sum being moved were readable by any local user via ps.
+    Those are the two values that tie a run to a Bitcoin identity, and this
+    toolchain already keeps both out of the integrity chain for that reason.
+
+    Keeping them out of argv also keeps them out of the command PREVIEW the
+    page renders, which is the same rule the wallet password already follows:
+    the preview shows the real argv, and the real argv has no secrets on it.
+    """
+    env = {}
+    if params.get("btc_entry"):
+        env["GS_BTC_ENTRY"] = params["btc_entry"]
+    if params.get("btc_amount"):
+        env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
+    if params.get("swap_btc"):
+        env["GS_SWAP_AMOUNTS"] = str(params["swap_btc"])
+    return env
+
+
 def _child_env(action_id):
     """Environment for a child process.
 
@@ -350,7 +376,7 @@ def _child_env(action_id):
     return env
 
 
-def start(argv, label, action_id=None):
+def start(argv, label, action_id=None, extra_env=None):
     with LOCK:
         _JOB_SEQ[0] += 1
         seq = _JOB_SEQ[0]
@@ -370,6 +396,8 @@ def start(argv, label, action_id=None):
     def run():
         try:
             env = _child_env(action_id)     # password only for PASSWORD_ACTIONS
+            # The BTC address and amounts ride here, not on argv.
+            env.update(extra_env or {})
             p = subprocess.Popen(argv, cwd=REPO, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  start_new_session=True, env=env)   # shell=False
@@ -963,7 +991,8 @@ class H(BaseHTTPRequestHandler):
                     return self._send(400, json.dumps({"error": "; ".join(c["errors"])}))
                 argv = act["build"](c["params"])
             return self._send(200, json.dumps(
-                {"jid": start(argv, act["label"], action_id=aid)}))
+                {"jid": start(argv, act["label"], action_id=aid,
+                              extra_env=secret_env(c["params"]))}))
         if self.path.startswith("/stop/"):
             return self._send(200, json.dumps({"stopped": stop(self.path[6:])}))
         self._send(404, json.dumps({"error": "not found"}))

@@ -36,7 +36,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
-    load_receive_bundle, memo_binds_destination,
+    load_receive_bundle, memo_binds_destination, env_or_argv,
     btc_per_xmr_oracle, quote_deviation,
 )
 
@@ -841,7 +841,10 @@ def build_cli() -> argparse.ArgumentParser:
         description="BTC->XMR mixing pipeline with Tor, ThorChain, and JoinMarket support",
     )
 
-    mode_group = cli.add_mutually_exclusive_group(required=True)
+    # NOT required=True: the BTC entry may arrive in GS_BTC_ENTRY instead of
+    # argv (see resolve_sensitive_inputs). The "exactly one mode" contract is
+    # enforced there, after the environment has been read.
+    mode_group = cli.add_mutually_exclusive_group(required=False)
     mode_group.add_argument("--btc-entry",
                             help="BTC entry address (bech32) — SENDER mode: you own the BTC")
     mode_group.add_argument("--receive-wallet",
@@ -913,6 +916,43 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--rpc-daemon", default="http://127.0.0.1:18081",
                      help="monerod daemon RPC endpoint for broadcast (NOT wallet-rpc)")
     return cli
+
+
+def resolve_sensitive_inputs(args) -> None:
+    """Move the operator-identifying inputs off the command line.
+
+    --btc-entry is the SENDER'S OWN BITCOIN ADDRESS and --btc-amount is the sum
+    being moved. Both sat in /proc/<pid>/cmdline, which is mode 0444: every
+    account on the host could read the address that links this run to a
+    Bitcoin identity, and the size of it, for as long as the pipeline ran.
+
+    This toolchain keeps both values out of the integrity chain precisely
+    because they deanonymise the operator, and refuses argv for the wallet
+    password in the same breath -- then put the address on a command line.
+    GS_BTC_ENTRY / GS_BTC_AMOUNT are read first; argv still works for a manual
+    run but warns. Enforces the mode contract afterwards, because argparse can
+    no longer do it once the entry may come from the environment.
+    """
+    args.btc_entry = env_or_argv("GS_BTC_ENTRY", args.btc_entry,
+                                 "The BTC entry address")
+    _amt = env_or_argv("GS_BTC_AMOUNT",
+                       str(args.btc_amount) if args.btc_amount is not None else None,
+                       "The BTC amount")
+    if _amt is not None:
+        try:
+            args.btc_amount = Decimal(str(_amt))
+        except Exception:                                    # noqa: BLE001
+            sys.exit("[!] GS_BTC_AMOUNT is not a number.")
+
+    # Exactly one entry mode. argparse enforced this while --btc-entry was a
+    # required mutually-exclusive member; it cannot once the value may come
+    # from the environment, so the same contract is enforced here.
+    if args.btc_entry and args.receive_wallet:
+        sys.exit("[!] Give either a BTC entry (--btc-entry / GS_BTC_ENTRY) or "
+                 "--receive-wallet, not both.")
+    if not args.btc_entry and not args.receive_wallet:
+        sys.exit("[!] No entry mode. Set GS_BTC_ENTRY=<bc1...> (preferred) or pass "
+                 "--btc-entry, or use --receive-wallet for receive mode.")
 
 
 def resolve_wallet_password(args) -> None:
@@ -1300,6 +1340,7 @@ def main():
     args = cli.parse_args()
 
     resolve_wallet_password(args)
+    resolve_sensitive_inputs(args)
 
     (receive_mode, receive_entry_addr, receive_account_index,
      receive_subaddress_index) = resolve_entry_mode(args)
