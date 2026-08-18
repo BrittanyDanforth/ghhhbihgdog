@@ -300,8 +300,20 @@ check(f"no port is claimed by two suites (dupes: {_dupes})", not _dupes)
 # suite must disable ZMQ -- its port ignores --rpc-bind-port entirely.
 check("nobody binds monerod's default testnet ZMQ port (28082)",
       28082 not in _count)
-_no_zmq = [os.path.basename(f) for f in _suites if "--no-zmq" not in open(f).read()]
-check(f"every suite disables ZMQ (missing: {_no_zmq})", not _no_zmq)
+# A suite may launch monerod itself, or delegate to tests/monerolab.py. Either
+# way the flag has to be there: check the helper explicitly rather than letting
+# "it must be in the helper" be an assumption.
+_lab_src = open(os.path.join(REPO, "tests", "monerolab.py")).read()
+check("the shared regtest lab disables ZMQ", "--no-zmq" in _lab_src)
+_no_zmq = [os.path.basename(f) for f in _suites
+           if "--no-zmq" not in open(f).read()
+           and "monerolab" not in open(f).read()]
+check(f"every suite disables ZMQ, directly or via the lab (missing: {_no_zmq})",
+      not _no_zmq)
+# The lab must not hardcode a port either, or two suites using it collide on
+# exactly the ports this block exists to keep apart.
+check("the shared lab takes its ports from the caller",
+      "def __init__(self, base, daemon_port, wallet_port)" in _lab_src)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

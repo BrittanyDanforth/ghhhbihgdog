@@ -183,6 +183,27 @@ of its own) after the distribution, in both fan-out and peel modes. That is a
 correctness fix as much as an OPSEC one — roughly a tenth of the balance was
 previously never mixed at all while the run reported success.
 
+**...and the sweep is not allowed to undo the peel chain.** Monero returns a
+transaction's change to the *spending account's* subaddress 0, and that is not
+selectable. When every peel ran in one account, all N peels deposited their
+change onto one subaddress 0 and a single sweep collected the lot — one
+transaction with N inputs. A transaction's inputs are public, so spending N
+outputs together is permanent proof that those N outputs share one owner, and
+it takes no ring analysis to read: the input count is right there. Those N
+outputs are the change of the N peels, so that one tidy transaction announced
+that the whole chain was one entity — the exact fact it spent N transactions
+and several hours concealing.
+
+Each peel now runs in its **own account**, so each hop's change lands on a
+different subaddress 0 and is swept **alone**, to its **own** destination.
+Measured on a chain running current consensus: six peels swept together
+produced one 6-input transaction; swept separately they produced six
+1-in/2-out transactions — the commonest shape on the network — for about
+0.005 XMR more in fees against a 0.0024 XMR estimate. That fee difference is
+the entire cost of not announcing the link.
+`tests/real_peel_testnet.py` asserts the property directly: **no transaction
+in the run may spend more than one input.**
+
 The same rule bites per hop, not just once. A DAG hop that sent a *fixed
 amount* had to pick that amount before the fee was known, so it always left a
 remainder — 40 hops at `wallets=10 deep=2`, each dropping dust on that one

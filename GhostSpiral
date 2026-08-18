@@ -1665,407 +1665,401 @@ def main():
     newnym(required=True)   # anonymity gate before stage 3
     tor_recheck(proxy, "stage3_pre")
 
-    sub_account = resolve_mix_account(args, rpc_primary, receive_mode,
-                                     receive_account_index)
-
-    # Random per-run extra-output count, so the total (wallets + this) is not a
-    # deterministic fingerprint of the `wallets` setting under public code.
-    _num_decoys = secrets.SystemRandom().randint(DECOY_MIN, DECOY_MAX)
-    subs, addr_index, decoy_addrs = create_subs(
-        rpc_primary, args.wallets, _num_decoys, acct_idx=sub_account)
-    if len(subs) < MIN_WALLETS + 1:
-        sys.exit("[!] Failed to create enough subaddresses")
-
-    if receive_mode:
-        ENTRY = receive_entry_addr
-        if ENTRY in subs:
-            subs.remove(ENTRY)
-        subs.insert(0, ENTRY)
-        addr_index[ENTRY] = receive_subaddress_index
-        integrity_log("stage3", "entry_reused_from_receive_wallet")
-        print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
-    else:
-        ENTRY = subs[0]
-        integrity_log("stage3", "entry_created")
-
-    import secrets as _secrets
-    _secrets.SystemRandom().shuffle(subs)
-
-    ###########################################################################
-    # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
-    ###########################################################################
-    newnym(required=True)   # anonymity gate before ThorChain execution
-    tor_recheck(proxy, "stage2_exec")
-
-    if receive_mode:
-        integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
-        print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
-        print(f"  [+] Entry address: {scrub_address(ENTRY)}")
-    else:
-        btc_chunks = []
-
-        if jm_utxos:
-            btc_chunks = jm_utxos
-        elif args.btc_amount and args.btc_amount > 0:
-            num_splits = max(args.split, 1)
-            per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
-            btc_chunks = [per_chunk] * num_splits
-            remainder = args.btc_amount - (per_chunk * num_splits)
-            if remainder > 0:
-                btc_chunks[0] += remainder
-            # COUNT only, never the per-chunk BTC amount: the integrity log
-            # persists, and the exact BTC-per-swap correlates directly with the
-            # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
-            # the fan-out/hop amounts stay off the chain.
-            integrity_log("stage2", f"btc_split:{num_splits}_chunks")
-            print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
-
-        if btc_chunks:
-            swap_deposits = stage2_get_swap_quotes(args, proxy, btc_chunks, ENTRY)
-            integrity_log("stage2", "swap_quotes_generated")
-            total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
-            print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
-            print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
-            print()
-            print("  ============================================================")
-            print("  SENDER INSTRUCTIONS — send BTC to these deposit addresses:")
-            print("  ============================================================")
-            for dep in swap_deposits:
-                print(f"\n  --- Chunk {dep['chunk']} ---")
-                print(f"  Send exactly: {dep['btc_amount']} BTC")
-                print(f"  To address:   {dep['deposit_address']}")
-                if dep.get("memo"):
-                    print(f"  With memo:    {dep['memo']}")
-                print(f"  Expected XMR: ~{dep['expected_xmr']}")
-            print()
-            print("  ============================================================")
-            print("  [!] YOU MUST manually send BTC to each deposit address above!")
-            print("  [!] Include the memo in the BTC transaction OP_RETURN field!")
-            print("  [!] Wait for XMR to arrive and confirm before proceeding!")
-            print("  ============================================================")
-        else:
-            integrity_log("stage2", "manual_mode")
-            print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
-            print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
-            print(f"        python3 thor_swap_preparer \\")
-            print(f"          --amounts <BTC_AMOUNT> \\")
-            print(f"          --dests {scrub_address(ENTRY)} \\")
-            print(f"          --tor-proxy {args.tor_proxy}")
-            print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
-
-    dag = {}
-    for a in subs:
-        others = [b for b in subs if b != a]
-        max_k = len(others)
-        k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
-        k = max(k, 1)
-        chosen = []
-        pool = list(others)
-        for _ in range(k):
-            idx = _secrets.randbelow(len(pool))
-            chosen.append(pool.pop(idx))
-        dag[a] = chosen
-    integrity_log("stage3", "dag_built")
-
-    ###########################################################################
-    # Stage 4 - Balance, amounts, plan
-    ###########################################################################
-
-    # THE SPEND ACCOUNT IS THE MIX ACCOUNT. Not "0 unless receiving".
+    # ONE RUN AT A TIME, AND THE GUARD STARTS BEFORE THE FIRST WALLET
+    # MUTATION -- not before the last one.
     #
-    # This line used to read `receive_account_index if receive_mode else 0`,
-    # written before the mix account was rotated and never revisited when it
-    # was. resolve_mix_account creates a fresh account and create_subs puts
-    # ENTRY and every mix subaddress in it -- and then send mode came back
-    # here and hard-coded 0, which is used for:
-    #   * the balance poll (xmr_balance),
-    #   * the peel carriers,
-    #   * the PLAN's account_index, i.e. which account every spend comes from,
-    #   * the change-sweep destination, and
-    #   * change_target -- so change went to account 0 / subaddress 0.
+    # This lock used to be taken 400 lines below, around the change-sweep
+    # provisioning, with a comment claiming that 'locking before the read is
+    # the point of locking at all'. The balance read, the account rotation,
+    # every mix subaddress, every peel carrier and every per-hop account were
+    # all created above it. Two concurrent runs would both read the same
+    # balance, both build a complete plan, both litter the wallet with
+    # accounts and subaddresses, and only then would the loser discover it
+    # had been planning against money the winner was already spending.
     #
-    # Two failures, and the second is the one that matters.
+    # Nothing here double-spends -- the loser exits before stage 5 -- so the
+    # cost was wasted work and an unexplained late failure, plus orphan
+    # accounts left in the wallet. That is still not what the comment said
+    # was happening, and a guard that starts after the thing it guards is a
+    # guard in name only.
     #
-    # FUNCTIONAL: the balance was polled from account 0 at ENTRY's index. That
-    # is a DIFFERENT subaddress -- account 0's subaddress at that number -- so
-    # send mode sized its plan from an unrelated balance, or from nothing.
-    #
-    # OPSEC: every spend named account 0, so the run's change came to rest on
-    # account 0 / subaddress 0 -- the wallet PRIMARY -- and the change sweep
-    # then SPENT it. The account rotation was theatre in send mode: the fresh
-    # account held the subaddresses while the wallet's identity address did all
-    # the work. An analyst labelling that address recovers it from every send
-    # graph, which is exactly what rotation was added to prevent.
-    #
-    # In receive mode resolve_mix_account already returns the bundle's account,
-    # so one assignment is correct for both paths.
-    bal_account = sub_account
-    entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
-
-    # And PROVE it, rather than trusting the assignment. A one-line mistake
-    # here is invisible: the pipeline runs, the plan looks sane, and the only
-    # symptom is that the money moves from the wrong account. The wallet is
-    # asked to resolve (account, index) back to an address and it must be
-    # ENTRY.
-    verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)
-
-    total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
-
-    # Sender mode: the swapped XMR lands on ENTRY only AFTER the operator sends
-    # BTC and ThorChain settles (and in manual mode, whenever they send it).
-    # ENTRY is fresh this run so a single check here is always ~0 -> abort.
-    # Poll for arrival instead. Receiver mode already has funds on ENTRY.
-    if not receive_mode and unlocked_bal <= DUST_XMR:
-        print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
-              f"{scrub_address(ENTRY)} (up to {XMR_ARRIVAL_TIMEOUT // 60} min)...")
-        waited = 0
-        while unlocked_bal <= DUST_XMR and waited < XMR_ARRIVAL_TIMEOUT:
-            if shutdown_requested():
-                sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
-            time.sleep(XMR_ARRIVAL_POLL)
-            waited += XMR_ARRIVAL_POLL
-            total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
-            if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
-                print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
-        # NOT the balance: unlocked_bal is the exact XMR that arrived from the
-        # swap, the most linkable amount on the receive side. Log only that
-        # arrival completed.
-        integrity_log("stage4", "xmr_arrival_done")
-
-    integrity_log("stage4", "balance_fetched")
-
-    if total_bal > unlocked_bal + DUST_XMR:
-        print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
-
-    bal = unlocked_bal
-    if bal <= DUST_XMR:
-        sys.exit(
-            f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
-            f"    Cannot create a real TX plan without funds.\n"
-            f"    Total balance: {total_bal} XMR (may be locked/unconfirmed)."
-        )
-
-    usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
-                                                    args.deep)
-    if usable <= DUST_XMR:
-        sys.exit(
-            f"[!] Balance {bal} XMR insufficient.\n"
-            f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
-            f"    Usable after fees: {usable} XMR"
-        )
-
-    integrity_log("stage4", "plan_calculated")
-
-    # -- Phase A: Fan-out -------------------------------------------------
-    # Distribute funds from ENTRY into mix subaddresses. In receiver mode ALL
-    # funds sit on ENTRY; in sender mode ThorChain deposits to ENTRY. Either
-    # way funds must spread outward before any hop-mixing can source from a
-    # mix subaddress. Fan-out sources from ENTRY, which is already funded and
-    # confirmed, so this round can always be created in one batch.
-    mix_targets = [s for s in subs if s != ENTRY]
-    # Fund wallets + a random number of extra outputs; ALL of them hop (no
-    # dead-end tell). hop_sources_real == fanout_dests, so no output is a
-    # distinguishable class under public code.
-    fanout_dests, hop_sources_real = select_fanout_targets(
-        mix_targets, decoy_addrs, args.wallets, _num_decoys)
-    fanout_count = len(fanout_dests)
-    if fanout_count <= 0:
-        # Guard the divisor. mix_targets excludes ENTRY, so a degenerate
-        # subaddress set (or a create_subs that returned only ENTRY) would
-        # divide by zero here and crash with a bare ZeroDivisionError after
-        # the wallet work was already done.
-        integrity_log("stage4", "no_mix_targets")
-        sys.exit("[!] No mix subaddresses available to fan out into "
-                 f"(got {len(mix_targets)}). Cannot build a plan.")
-    # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
-    # give a chain analyst one value and one shape to cluster and follow.
-    # NOTE ON THE 10% THAT DOES NOT GET ALLOCATED.
-    #
-    # FANOUT_SPEND_FRACTION leaves ~10% of usable unallocated, and whatever a
-    # transaction does not allocate becomes monerod's change. That is a real
-    # leak -- see the account-rotation comment below for what is done about
-    # WHERE it lands -- and the obvious fix is to allocate nearly all of it,
-    # holding back only a fee-sized buffer the way compute_hop_amount does.
-    #
-    # That fix was written, and then NOT shipped, because it could not be
-    # verified. On an isolated testnet a 12-output fan-out spending ~90-99% of
-    # a single input fails "transaction was not constructed" repeatedly (6/6 at
-    # 0.90), while the same shape at 0.80-0.88 succeeds intermittently. The
-    # behaviour is not a clean threshold, so it may be an artifact of a
-    # fixed-difficulty offline chain rather than a real wallet constraint --
-    # but "may be an artifact" is not good enough to justify raising the
-    # allocation of a live pipeline to ~100%. If the constraint is real on
-    # mainnet, that change makes the fan-out unconstructible and the run dies
-    # before it starts.
-    #
-    # So the fraction stays, and the leak is addressed where it can be fixed
-    # with certainty: the DESTINATION of the change, not its size.
-    fanout_amounts = compute_fanout_amounts(
-        usable, fanout_count, fee_xmr, args.dag_mixing, _secrets.SystemRandom())
-
-    # A peel chain has to leave every hop its own fee, so it can distribute
-    # less than an equal fan-out. Size that here -- discovering it mid-chain
-    # means real money has already moved and is stranded on a carrier.
-    if args.peel and fanout_amounts:
-        _hf = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
-        try:
-            fanout_amounts, _frac = fit_peel_distribution(
-                fanout_amounts, bal, usable, fanout_count, fee_xmr,
-                args.dag_mixing, _secrets.SystemRandom(), _hf)
-        except PeelBudgetError as exc:
-            integrity_log("stage4", "peel_budget_impossible")
-            sys.exit(
-                f"[!] A {fanout_count}-hop peel chain cannot be funded from "
-                f"{bal} XMR.\n"
-                f"    Each hop spends nearly all of what the previous one "
-                f"forwarded, and every hop\n"
-                f"    needs {exc.hop_headroom} XMR of headroom for the wallet "
-                f"to build it at all — {exc.hops} hops\n"
-                f"    is {exc.hop_headroom * exc.hops} XMR before anything is "
-                f"distributed. Use fewer --wallets,\n"
-                f"    drop --peel for a one-shot fan-out, or fund the wallet "
-                f"more.")
-        if _frac is not None:
-            integrity_log("stage4", f"peel_budget_reduced:{_frac}")
-            print(f"  [*] Peel chain: reduced the distribution to "
-                  f"{_frac * 100:.0f}% of usable so every hop keeps the "
-                  f"headroom a wallet needs to build the next one "
-                  f"({_hf} XMR per hop, {fanout_count - 1} hops).")
-
-    if not fanout_amounts:
-        sys.exit(
-            f"[!] Usable balance {usable} XMR too small to fan out across "
-            f"{fanout_count} subaddresses with the fee reserve each output needs. "
-            f"Use fewer wallets, disable --dag-mixing, or fund the wallet more."
-        )
-    # Fan-out is ONE transaction: a single transfer_split from ENTRY's single
-    # confirmed output to all fanout_count mix subaddresses at once (one input
-    # -> many outputs). Emitting fanout_count SEPARATE TXs from ENTRY would fail
-    # for the SAME reason the DAG round is confirmation-gated: ENTRY holds ONE
-    # confirmed output (one swap / one deposit), spendable once per batch, so
-    # the 2nd..Nth separate TX would fail 'no unlocked output' and abort the run
-    # (the change output from TX0 is unconfirmed and unspendable in the batch).
-    # Per-destination amount, so each mix subaddress receives its OWN magnitude.
-    fanout_by_addr = dict(zip(fanout_dests, fanout_amounts))
-
-    distribution_mode = "peel" if args.peel else "fanout"
-    if args.peel:
-        # A peel chain has to leave every hop the headroom to be built at all;
-        # under-reserving strands the remainder on a carrier and this pipeline
-        # has no auto-resume. Found on a real chain, where a one-fee-per-hop
-        # reserve failed on the second peel.
-        _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
-        fanout_plan, change_accounts = build_peel_stage_plan(
-            rpc_primary, bal_account, ENTRY,
-            _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
-            _hop_fee)
-        integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
-        print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
-              f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
-              f"transaction — no co-created fan-out for an analyst to cluster.")
-    else:
-        fanout_plan = [{
-            "src": ENTRY,
-            "src_index": _src_index(addr_index, ENTRY),
-            "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
-            "delay": _secrets.randbelow(540) + 180,
-            "extra": secure_hex(16),
-        }]
-        # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
-        # amount. integrity_chain.log persists on disk, and the exact fan-out
-        # amount is the single most linkable quantity in the whole pipeline:
-        # recovered from the log it correlates directly against the on-chain
-        # outputs and unmixes what the fan-out exists to mix. The amount stays
-        # in the plan file (0600), off the persistent hash chain.
-        integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
-        # A fan-out is one transaction, so it leaves change in exactly one
-        # place: the spending account's subaddress 0.
-        change_accounts = [bal_account]
-
-    # Subaddresses that will receive a fan-out output, with the (account, index)
-    # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
-    funded_targets = list(fanout_dests)
-    fanout_targets_indexed = [(sub_account, _src_index(addr_index, a))
-                              for a in funded_targets]
-
-    # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------
-    # Each funded mix subaddress hops a chunk of its balance onward to a DAG
-    # neighbour. CRITICAL: after fan-out, a mix subaddress holds exactly ONE
-    # confirmed output. Monero can spend that output only once per confirmation
-    # round, so each subaddress may source AT MOST ONE hop in a single created
-    # batch -- source it twice and every hop after the first fails for "no
-    # unlocked output". We therefore iterate each funded subaddress once (a
-    # permutation), not random-with-replacement. This whole round also cannot
-    # be created until the fan-out confirms on-chain, which is why it runs as a
-    # separate confirmation-gated round in Stage 5 (see _stage5_run).
-    dag_plan = build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,
-                              dag, mix_targets, addr_index, _secrets)
-
-    meta = {
-        "schema": "unsigned_v1",
-        "version": VERSION,
-        "created": int(time.time()) // 600 * 600,
-        "rounds": len(fanout_plan) + len(dag_plan),
-        "fee_per_round": str(per_round_fee),
-        "total_fees": str(total_fees),
-        "account_index": bal_account,
-        "distribution_mode": distribution_mode,
-    }
-
-    outdir = Path(args.output)
-    secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing
-    plan_tag = secure_hex(8)
-    fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
-    atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
-    dag_file = None
-    if dag_plan:
-        dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
-        atomic_write_json({"meta": meta, "txs": dag_plan}, dag_file)
-    integrity_log("stage4", "unsigned_dump_saved")
-    print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
-    if dag_file:
-        print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
-
-    ###########################################################################
-    # Stage 5 - Auto sign + broadcast
-    ###########################################################################
-    newnym(required=True)   # anonymity gate before broadcast
-    tor_recheck(proxy, "stage5_pre")
-
-    _stage5_cleanup(Path(args.output), fanout_file, dag_file)
-
-    staging_dir = "tx_staging"
-
-    # A destination for whatever change the distribution leaves behind.
-    # Provisioned before the spend, because it must exist when the sweep runs.
-    #
-    # BOTH modes need it. The fan-out cannot allocate its input exactly, so
-    # ~10% returns as change. The peel chain forwards its remainder explicitly,
-    # which removed the SPEND hub -- but each peel still leaves its
-    # (carrier reserve - real fee) as change, so an N-peel chain makes N
-    # deposits onto the same subaddress 0. Rotating the carriers stopped that
-    # address being SPENT; it did not stop it being a convergence point, and
-    # the balance sitting there is unmixed either way.
-    # ONE RUN AT A TIME, atomically, and covering everything that touches the
-    # wallet from here on.
-    #
-    # This was `if lock_path.exists(): exit` followed by `write_text(pid)` --
-    # check-then-act, so two runs started milliseconds apart both saw no lock
-    # and both went on to spend the same wallet. gs_console starts jobs from
-    # threads, so that is an ordinary race rather than an exotic one. The PID
-    # it wrote was never read either, so a crash left a lock whose only remedy
-    # was "delete the lock file manually" -- advice that teaches an operator to
-    # clear the guard reflexively, which is what made the race dangerous.
-    #
-    # The guarded region STARTS HERE, before the change-sweep subaddress is
-    # provisioned, not after it. Provisioning is not itself a spend, but it is
-    # a wallet mutation made on the strength of a balance the other run is
-    # about to consume -- so two concurrent runs would each read the same
-    # balance, each create a subaddress for it, and only then would one of them
-    # discover it had been planning against money that was already gone. The
-    # loser also left an orphan subaddress behind. Locking before the read is
-    # the point of locking at all.
+    # flock, so the kernel releases it if this process dies: there is no
+    # stale-lock state and therefore no advice anywhere that tells an
+    # operator to delete the lock file, which is what made the original race
+    # dangerous. It is held for the whole run, which is hours for a peel
+    # chain, and that is the intent: two GhostSpiral runs against one wallet
+    # is never safe.
     with run_lock(Path(".ghostspiral.lock"), "GhostSpiral"):
+        sub_account = resolve_mix_account(args, rpc_primary, receive_mode,
+                                         receive_account_index)
+
+        # Random per-run extra-output count, so the total (wallets + this) is not a
+        # deterministic fingerprint of the `wallets` setting under public code.
+        _num_decoys = secrets.SystemRandom().randint(DECOY_MIN, DECOY_MAX)
+        subs, addr_index, decoy_addrs = create_subs(
+            rpc_primary, args.wallets, _num_decoys, acct_idx=sub_account)
+        if len(subs) < MIN_WALLETS + 1:
+            sys.exit("[!] Failed to create enough subaddresses")
+
+        if receive_mode:
+            ENTRY = receive_entry_addr
+            if ENTRY in subs:
+                subs.remove(ENTRY)
+            subs.insert(0, ENTRY)
+            addr_index[ENTRY] = receive_subaddress_index
+            integrity_log("stage3", "entry_reused_from_receive_wallet")
+            print(f"  [+] ENTRY (from receive wallet): {scrub_address(ENTRY)}")
+        else:
+            ENTRY = subs[0]
+            integrity_log("stage3", "entry_created")
+
+        import secrets as _secrets
+        _secrets.SystemRandom().shuffle(subs)
+
+        ###########################################################################
+        # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
+        ###########################################################################
+        newnym(required=True)   # anonymity gate before ThorChain execution
+        tor_recheck(proxy, "stage2_exec")
+
+        if receive_mode:
+            integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
+            print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
+            print(f"  [+] Entry address: {scrub_address(ENTRY)}")
+        else:
+            btc_chunks = []
+
+            if jm_utxos:
+                btc_chunks = jm_utxos
+            elif args.btc_amount and args.btc_amount > 0:
+                num_splits = max(args.split, 1)
+                per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
+                btc_chunks = [per_chunk] * num_splits
+                remainder = args.btc_amount - (per_chunk * num_splits)
+                if remainder > 0:
+                    btc_chunks[0] += remainder
+                # COUNT only, never the per-chunk BTC amount: the integrity log
+                # persists, and the exact BTC-per-swap correlates directly with the
+                # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
+                # the fan-out/hop amounts stay off the chain.
+                integrity_log("stage2", f"btc_split:{num_splits}_chunks")
+                print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
+
+            if btc_chunks:
+                swap_deposits = stage2_get_swap_quotes(args, proxy, btc_chunks, ENTRY)
+                integrity_log("stage2", "swap_quotes_generated")
+                total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+                print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+                print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+                print()
+                print("  ============================================================")
+                print("  SENDER INSTRUCTIONS — send BTC to these deposit addresses:")
+                print("  ============================================================")
+                for dep in swap_deposits:
+                    print(f"\n  --- Chunk {dep['chunk']} ---")
+                    print(f"  Send exactly: {dep['btc_amount']} BTC")
+                    print(f"  To address:   {dep['deposit_address']}")
+                    if dep.get("memo"):
+                        print(f"  With memo:    {dep['memo']}")
+                    print(f"  Expected XMR: ~{dep['expected_xmr']}")
+                print()
+                print("  ============================================================")
+                print("  [!] YOU MUST manually send BTC to each deposit address above!")
+                print("  [!] Include the memo in the BTC transaction OP_RETURN field!")
+                print("  [!] Wait for XMR to arrive and confirm before proceeding!")
+                print("  ============================================================")
+            else:
+                integrity_log("stage2", "manual_mode")
+                print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
+                print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
+                print(f"        python3 thor_swap_preparer \\")
+                print(f"          --amounts <BTC_AMOUNT> \\")
+                print(f"          --dests {scrub_address(ENTRY)} \\")
+                print(f"          --tor-proxy {args.tor_proxy}")
+                print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
+
+        dag = {}
+        for a in subs:
+            others = [b for b in subs if b != a]
+            max_k = len(others)
+            k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
+            k = max(k, 1)
+            chosen = []
+            pool = list(others)
+            for _ in range(k):
+                idx = _secrets.randbelow(len(pool))
+                chosen.append(pool.pop(idx))
+            dag[a] = chosen
+        integrity_log("stage3", "dag_built")
+
+        ###########################################################################
+        # Stage 4 - Balance, amounts, plan
+        ###########################################################################
+
+        # THE SPEND ACCOUNT IS THE MIX ACCOUNT. Not "0 unless receiving".
+        #
+        # This line used to read `receive_account_index if receive_mode else 0`,
+        # written before the mix account was rotated and never revisited when it
+        # was. resolve_mix_account creates a fresh account and create_subs puts
+        # ENTRY and every mix subaddress in it -- and then send mode came back
+        # here and hard-coded 0, which is used for:
+        #   * the balance poll (xmr_balance),
+        #   * the peel carriers,
+        #   * the PLAN's account_index, i.e. which account every spend comes from,
+        #   * the change-sweep destination, and
+        #   * change_target -- so change went to account 0 / subaddress 0.
+        #
+        # Two failures, and the second is the one that matters.
+        #
+        # FUNCTIONAL: the balance was polled from account 0 at ENTRY's index. That
+        # is a DIFFERENT subaddress -- account 0's subaddress at that number -- so
+        # send mode sized its plan from an unrelated balance, or from nothing.
+        #
+        # OPSEC: every spend named account 0, so the run's change came to rest on
+        # account 0 / subaddress 0 -- the wallet PRIMARY -- and the change sweep
+        # then SPENT it. The account rotation was theatre in send mode: the fresh
+        # account held the subaddresses while the wallet's identity address did all
+        # the work. An analyst labelling that address recovers it from every send
+        # graph, which is exactly what rotation was added to prevent.
+        #
+        # In receive mode resolve_mix_account already returns the bundle's account,
+        # so one assignment is correct for both paths.
+        bal_account = sub_account
+        entry_index = addr_index[ENTRY]  # fan-out spends ONLY from this subaddress
+
+        # And PROVE it, rather than trusting the assignment. A one-line mistake
+        # here is invisible: the pipeline runs, the plan looks sane, and the only
+        # symptom is that the money moves from the wrong account. The wallet is
+        # asked to resolve (account, index) back to an address and it must be
+        # ENTRY.
+        verify_spend_source(rpc_primary, bal_account, entry_index, ENTRY)
+
+        total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
+
+        # Sender mode: the swapped XMR lands on ENTRY only AFTER the operator sends
+        # BTC and ThorChain settles (and in manual mode, whenever they send it).
+        # ENTRY is fresh this run so a single check here is always ~0 -> abort.
+        # Poll for arrival instead. Receiver mode already has funds on ENTRY.
+        if not receive_mode and unlocked_bal <= DUST_XMR:
+            print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
+                  f"{scrub_address(ENTRY)} (up to {XMR_ARRIVAL_TIMEOUT // 60} min)...")
+            waited = 0
+            while unlocked_bal <= DUST_XMR and waited < XMR_ARRIVAL_TIMEOUT:
+                if shutdown_requested():
+                    sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
+                time.sleep(XMR_ARRIVAL_POLL)
+                waited += XMR_ARRIVAL_POLL
+                total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
+                if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
+                    print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
+            # NOT the balance: unlocked_bal is the exact XMR that arrived from the
+            # swap, the most linkable amount on the receive side. Log only that
+            # arrival completed.
+            integrity_log("stage4", "xmr_arrival_done")
+
+        integrity_log("stage4", "balance_fetched")
+
+        if total_bal > unlocked_bal + DUST_XMR:
+            print(f"  [!] {total_bal - unlocked_bal} XMR still locked (pending confirmations)")
+
+        bal = unlocked_bal
+        if bal <= DUST_XMR:
+            sys.exit(
+                f"[!] Unlocked balance is {unlocked_bal} XMR (below dust threshold).\n"
+                f"    Cannot create a real TX plan without funds.\n"
+                f"    Total balance: {total_bal} XMR (may be locked/unconfirmed)."
+            )
+
+        usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
+                                                        args.deep)
+        if usable <= DUST_XMR:
+            sys.exit(
+                f"[!] Balance {bal} XMR insufficient.\n"
+                f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
+                f"    Usable after fees: {usable} XMR"
+            )
+
+        integrity_log("stage4", "plan_calculated")
+
+        # -- Phase A: Fan-out -------------------------------------------------
+        # Distribute funds from ENTRY into mix subaddresses. In receiver mode ALL
+        # funds sit on ENTRY; in sender mode ThorChain deposits to ENTRY. Either
+        # way funds must spread outward before any hop-mixing can source from a
+        # mix subaddress. Fan-out sources from ENTRY, which is already funded and
+        # confirmed, so this round can always be created in one batch.
+        mix_targets = [s for s in subs if s != ENTRY]
+        # Fund wallets + a random number of extra outputs; ALL of them hop (no
+        # dead-end tell). hop_sources_real == fanout_dests, so no output is a
+        # distinguishable class under public code.
+        fanout_dests, hop_sources_real = select_fanout_targets(
+            mix_targets, decoy_addrs, args.wallets, _num_decoys)
+        fanout_count = len(fanout_dests)
+        if fanout_count <= 0:
+            # Guard the divisor. mix_targets excludes ENTRY, so a degenerate
+            # subaddress set (or a create_subs that returned only ENTRY) would
+            # divide by zero here and crash with a bare ZeroDivisionError after
+            # the wallet work was already done.
+            integrity_log("stage4", "no_mix_targets")
+            sys.exit("[!] No mix subaddresses available to fan out into "
+                     f"(got {len(mix_targets)}). Cannot build a plan.")
+        # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
+        # give a chain analyst one value and one shape to cluster and follow.
+        # NOTE ON THE 10% THAT DOES NOT GET ALLOCATED.
+        #
+        # FANOUT_SPEND_FRACTION leaves ~10% of usable unallocated, and whatever a
+        # transaction does not allocate becomes monerod's change. That is a real
+        # leak -- see the account-rotation comment below for what is done about
+        # WHERE it lands -- and the obvious fix is to allocate nearly all of it,
+        # holding back only a fee-sized buffer the way compute_hop_amount does.
+        #
+        # That fix was written, and then NOT shipped, because it could not be
+        # verified. On an isolated testnet a 12-output fan-out spending ~90-99% of
+        # a single input fails "transaction was not constructed" repeatedly (6/6 at
+        # 0.90), while the same shape at 0.80-0.88 succeeds intermittently. The
+        # behaviour is not a clean threshold, so it may be an artifact of a
+        # fixed-difficulty offline chain rather than a real wallet constraint --
+        # but "may be an artifact" is not good enough to justify raising the
+        # allocation of a live pipeline to ~100%. If the constraint is real on
+        # mainnet, that change makes the fan-out unconstructible and the run dies
+        # before it starts.
+        #
+        # So the fraction stays, and the leak is addressed where it can be fixed
+        # with certainty: the DESTINATION of the change, not its size.
+        fanout_amounts = compute_fanout_amounts(
+            usable, fanout_count, fee_xmr, args.dag_mixing, _secrets.SystemRandom())
+
+        # A peel chain has to leave every hop its own fee, so it can distribute
+        # less than an equal fan-out. Size that here -- discovering it mid-chain
+        # means real money has already moved and is stranded on a carrier.
+        if args.peel and fanout_amounts:
+            _hf = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
+            try:
+                fanout_amounts, _frac = fit_peel_distribution(
+                    fanout_amounts, bal, usable, fanout_count, fee_xmr,
+                    args.dag_mixing, _secrets.SystemRandom(), _hf)
+            except PeelBudgetError as exc:
+                integrity_log("stage4", "peel_budget_impossible")
+                sys.exit(
+                    f"[!] A {fanout_count}-hop peel chain cannot be funded from "
+                    f"{bal} XMR.\n"
+                    f"    Each hop spends nearly all of what the previous one "
+                    f"forwarded, and every hop\n"
+                    f"    needs {exc.hop_headroom} XMR of headroom for the wallet "
+                    f"to build it at all — {exc.hops} hops\n"
+                    f"    is {exc.hop_headroom * exc.hops} XMR before anything is "
+                    f"distributed. Use fewer --wallets,\n"
+                    f"    drop --peel for a one-shot fan-out, or fund the wallet "
+                    f"more.")
+            if _frac is not None:
+                integrity_log("stage4", f"peel_budget_reduced:{_frac}")
+                print(f"  [*] Peel chain: reduced the distribution to "
+                      f"{_frac * 100:.0f}% of usable so every hop keeps the "
+                      f"headroom a wallet needs to build the next one "
+                      f"({_hf} XMR per hop, {fanout_count - 1} hops).")
+
+        if not fanout_amounts:
+            sys.exit(
+                f"[!] Usable balance {usable} XMR too small to fan out across "
+                f"{fanout_count} subaddresses with the fee reserve each output needs. "
+                f"Use fewer wallets, disable --dag-mixing, or fund the wallet more."
+            )
+        # Fan-out is ONE transaction: a single transfer_split from ENTRY's single
+        # confirmed output to all fanout_count mix subaddresses at once (one input
+        # -> many outputs). Emitting fanout_count SEPARATE TXs from ENTRY would fail
+        # for the SAME reason the DAG round is confirmation-gated: ENTRY holds ONE
+        # confirmed output (one swap / one deposit), spendable once per batch, so
+        # the 2nd..Nth separate TX would fail 'no unlocked output' and abort the run
+        # (the change output from TX0 is unconfirmed and unspendable in the batch).
+        # Per-destination amount, so each mix subaddress receives its OWN magnitude.
+        fanout_by_addr = dict(zip(fanout_dests, fanout_amounts))
+
+        distribution_mode = "peel" if args.peel else "fanout"
+        if args.peel:
+            # A peel chain has to leave every hop the headroom to be built at all;
+            # under-reserving strands the remainder on a carrier and this pipeline
+            # has no auto-resume. Found on a real chain, where a one-fee-per-hop
+            # reserve failed on the second peel.
+            _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
+            fanout_plan, change_accounts = build_peel_stage_plan(
+                rpc_primary, bal_account, ENTRY,
+                _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
+                _hop_fee)
+            integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
+            print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
+                  f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
+                  f"transaction — no co-created fan-out for an analyst to cluster.")
+        else:
+            fanout_plan = [{
+                "src": ENTRY,
+                "src_index": _src_index(addr_index, ENTRY),
+                "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
+                "delay": _secrets.randbelow(540) + 180,
+                "extra": secure_hex(16),
+            }]
+            # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
+            # amount. integrity_chain.log persists on disk, and the exact fan-out
+            # amount is the single most linkable quantity in the whole pipeline:
+            # recovered from the log it correlates directly against the on-chain
+            # outputs and unmixes what the fan-out exists to mix. The amount stays
+            # in the plan file (0600), off the persistent hash chain.
+            integrity_log("stage4", f"fanout_plan:1_tx:{fanout_count}_dests")
+            # A fan-out is one transaction, so it leaves change in exactly one
+            # place: the spending account's subaddress 0.
+            change_accounts = [bal_account]
+
+        # Subaddresses that will receive a fan-out output, with the (account, index)
+        # pair Stage 5 polls to confirm they've unlocked before hop-mixing.
+        funded_targets = list(fanout_dests)
+        fanout_targets_indexed = [(sub_account, _src_index(addr_index, a))
+                                  for a in funded_targets]
+
+        # -- Phase B: DAG hop-mixing (opt-in, --dag-mixing) -------------------
+        # Each funded mix subaddress hops a chunk of its balance onward to a DAG
+        # neighbour. CRITICAL: after fan-out, a mix subaddress holds exactly ONE
+        # confirmed output. Monero can spend that output only once per confirmation
+        # round, so each subaddress may source AT MOST ONE hop in a single created
+        # batch -- source it twice and every hop after the first fails for "no
+        # unlocked output". We therefore iterate each funded subaddress once (a
+        # permutation), not random-with-replacement. This whole round also cannot
+        # be created until the fan-out confirms on-chain, which is why it runs as a
+        # separate confirmation-gated round in Stage 5 (see _stage5_run).
+        dag_plan = build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,
+                                  dag, mix_targets, addr_index, _secrets)
+
+        meta = {
+            "schema": "unsigned_v1",
+            "version": VERSION,
+            "created": int(time.time()) // 600 * 600,
+            "rounds": len(fanout_plan) + len(dag_plan),
+            "fee_per_round": str(per_round_fee),
+            "total_fees": str(total_fees),
+            "account_index": bal_account,
+            "distribution_mode": distribution_mode,
+        }
+
+        outdir = Path(args.output)
+        secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing
+        plan_tag = secure_hex(8)
+        fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
+        atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
+        dag_file = None
+        if dag_plan:
+            dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
+            atomic_write_json({"meta": meta, "txs": dag_plan}, dag_file)
+        integrity_log("stage4", "unsigned_dump_saved")
+        print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
+        if dag_file:
+            print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
+
+        ###########################################################################
+        # Stage 5 - Auto sign + broadcast
+        ###########################################################################
+        newnym(required=True)   # anonymity gate before broadcast
+        tor_recheck(proxy, "stage5_pre")
+
+        _stage5_cleanup(Path(args.output), fanout_file, dag_file)
+
+        staging_dir = "tx_staging"
         # ONE SWEEP DESTINATION PER CHANGE LOCATION, and one sweep each.
         #
         # A fan-out leaves change in one place, so this is one job. A peel
@@ -2102,21 +2096,21 @@ def main():
                                  change_target=(bal_account, 0),
                                  change_sweep_jobs=change_sweep_jobs)
 
-    # Honest completion. This used to print "pipeline complete." unconditionally,
-    # so a peel chain that stopped partway or a DAG round that was skipped still
-    # read as a finished mix -- the same fake-success pattern already removed
-    # from paranoia_mode. Say what actually happened.
-    print()
-    if incomplete:
-        integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
-        print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
-        for _w in incomplete:
-            print(f"      - {_w}")
-        print("  [!] Funds are safe in the wallet, but do NOT assume the full "
-              "mixing depth was applied.")
-        sys.exit(1)
-    integrity_log("main", "pipeline_complete")
-    print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
+        # Honest completion. This used to print "pipeline complete." unconditionally,
+        # so a peel chain that stopped partway or a DAG round that was skipped still
+        # read as a finished mix -- the same fake-success pattern already removed
+        # from paranoia_mode. Say what actually happened.
+        print()
+        if incomplete:
+            integrity_log("main", f"pipeline_incomplete:{len(incomplete)}")
+            print("  [!] GhostSpiral finished, but the mix is NOT what was planned:")
+            for _w in incomplete:
+                print(f"      - {_w}")
+            print("  [!] Funds are safe in the wallet, but do NOT assume the full "
+                  "mixing depth was applied.")
+            sys.exit(1)
+        integrity_log("main", "pipeline_complete")
+        print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.

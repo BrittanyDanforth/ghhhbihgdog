@@ -2093,6 +2093,51 @@ check("peel accounts: the signer's validator accepts a per-hop account",
       (lambda: (airgap._validate_plan(_plan2), True)[1])())
 
 
+# ---------------------------------------------------------------------------
+# WHERE the run lock sits, checked structurally.
+#
+# It was once taken 400 lines below the balance read, under a comment claiming
+# "locking before the read is the point of locking at all". Everything it was
+# supposed to guard -- the account rotation, the balance read, every mix
+# subaddress, every peel carrier and per-hop account -- happened above it, and
+# nothing noticed because no test knew where the lock was meant to be.
+#
+# AST, not grep: the comment that describes this defect names every one of
+# these functions, so a source search matches its own post-mortem.
+# ---------------------------------------------------------------------------
+import ast as _ast
+_gtree = _ast.parse(open(os.path.join(REPO, "GhostSpiral")).read())
+_main_fn = next(n for n in _gtree.body
+                if isinstance(n, _ast.FunctionDef) and n.name == "main")
+_locks = [n for n in _ast.walk(_main_fn) if isinstance(n, _ast.With)
+          and any(isinstance(i.context_expr, _ast.Call)
+                  and getattr(i.context_expr.func, "id", "") == "run_lock"
+                  for i in n.items)]
+check("main() takes the run lock exactly once", len(_locks) == 1)
+if _locks:
+    _lk = _locks[0]
+    _guarded = range(_lk.body[0].lineno, (_lk.end_lineno or _lk.body[-1].lineno) + 1)
+    # Everything that mutates the wallet or reads the balance the plan is
+    # sized against. A losing concurrent run must not get as far as any of it.
+    _MUST_GUARD = {"resolve_mix_account", "create_subs", "xmr_balance",
+                   "new_subaddress_indexed", "create_fresh_account",
+                   "build_peel_stage_plan", "compute_fee_budget",
+                   "fit_peel_distribution", "_stage5_run"}
+    _outside = []
+    for _n in _ast.walk(_main_fn):
+        if isinstance(_n, _ast.Call):
+            _nm = getattr(_n.func, "id", None) or getattr(_n.func, "attr", None)
+            if _nm in _MUST_GUARD and _n.lineno not in _guarded:
+                _outside.append((_nm, _n.lineno))
+    check(f"every wallet mutation and balance read is INSIDE the run lock "
+          f"(outside: {_outside})", not _outside)
+    # ...and it is not so late that it only covers the tail of the run.
+    _body_lines = _main_fn.end_lineno - _main_fn.lineno
+    _guard_lines = (_lk.end_lineno or _lk.body[-1].lineno) - _lk.lineno
+    check("the lock covers the bulk of main(), not just its tail",
+          _guard_lines > _body_lines * 0.7)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
