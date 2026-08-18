@@ -98,6 +98,10 @@ for url, expect, why in [
     ("http://127.0.0.1@evil.com/", False, "loopback as userinfo"),
     ("http://user@evil.com:18083", False, "userinfo spoof"),
     ("http://example.com:18083", False, "plain remote host"),
+    ("http://127.1:18083", False, "short 127.1 is NOT treated as loopback"),
+    ("http://2130706433:18083", False, "decimal 127.0.0.1 is NOT treated as loopback"),
+    ("http://[::ffff:127.0.0.1]:18083", False, "ipv4-mapped loopback is NOT trusted"),
+    ("http://0.0.0.0:18081", True, "unspecified bind is this machine"),
 ]:
     got = bcast._is_localhost(url)
     check(f"is_localhost: {why} -> {expect}", got == expect)
@@ -418,6 +422,91 @@ check("scanner does NOT flag a count wrapper len(btc_chunks)",
       _planted_flags('integrity_log("x", f"n={len(btc_chunks)}")') == [])
 check("scanner does NOT flag a scrubbed address",
       _planted_flags('integrity_log("x", f"a={scrub_address(addr)}")') == [])
+
+# ---------------------------------------------------------------------------
+# 8. More IP/DNS angles: unproxied requests, localhost-set drift, JoinMarket
+#    SOCKS5 (not h), check.torproject.org never hit in the clear.
+# ---------------------------------------------------------------------------
+print("=== extra IP/DNS surfaces ===")
+_HTTP_FUNCS = {"get", "post", "put", "head", "request", "patch", "delete"}
+_BARE_NET = []
+for _script in _SHIPPED + ["gs_console"]:
+    _p = os.path.join(REPO, _script)
+    if not os.path.exists(_p):
+        continue
+    _tree = ast.parse(open(_p).read())
+    for n in ast.walk(_tree):
+        if not isinstance(n, ast.Call):
+            continue
+        fn = n.func
+        name = ""
+        if isinstance(fn, ast.Attribute):
+            name = fn.attr
+            owner = fn.value
+            owner_name = owner.id if isinstance(owner, ast.Name) else (
+                owner.attr if isinstance(owner, ast.Attribute) else "")
+        elif isinstance(fn, ast.Name):
+            name = fn.id
+            owner_name = ""
+        else:
+            continue
+        if name not in _HTTP_FUNCS:
+            continue
+        if owner_name not in ("requests", "self", "gs", ""):
+            # requests.get / requests.post / Session.get
+            if owner_name not in ("requests",):
+                continue
+        kw = {k.arg for k in n.keywords if k.arg}
+        if "proxies" not in kw and owner_name == "requests":
+            _BARE_NET.append(f"{_script}:{getattr(n, 'lineno', '?')} requests.{name} has no proxies=")
+check("every shipped requests.get/post passes proxies= (no silent clearnet)",
+      not _BARE_NET)
+if _BARE_NET:
+    for _l in _BARE_NET:
+        print("   BARE:", _l)
+
+# gs and broadcast must agree on what "localhost" means, or one path skips
+# the proxy while the other requires it.
+check("gs_common and broadcast share 0.0.0.0 as this-machine",
+      "0.0.0.0" in gs._LOCALHOST_NAMES and bcast._is_localhost("http://0.0.0.0:18081"))
+for url, expect, why in [
+    ("http://127.0.0.1:18083", True, "loopback ip"),
+    ("http://127.1:18083", False, "short 127.1"),
+    ("http://[::ffff:127.0.0.1]:18083", False, "ipv4-mapped"),
+    ("http://127.0.0.1.evil.com:18083", False, "suffix spoof"),
+]:
+    from urllib.parse import urlparse as _up
+    host = _up(url).hostname or ""
+    got = host.lower() in gs._LOCALHOST_NAMES
+    check(f"gs localhost: {why} -> {expect}", got == expect)
+
+_gs = open(os.path.join(REPO, "GhostSpiral")).read()
+check("JoinMarket path warns that --socks5-host is not socks5h (DNS may leak)",
+      "Maker DNS may resolve on this box" in _gs)
+check("JoinMarket still forces a socks host/port onto tumble.py",
+      "--socks5-host" in _gs and "--socks5-port" in _gs)
+
+_gsc = open(os.path.join(REPO, "gs_common.py")).read()
+check("check.torproject.org is only fetched with proxies=",
+      "CHECK_TOR_URL" in _gsc and "proxies=proxy" in _gsc)
+check("verify_tor / tor_recheck / safe_get / safe_post never call requests without proxies",
+      _gsc.count("requests.get(CHECK_TOR_URL") == 2)
+
+# remote RPC must validate the proxy (socks5:// is a DNS leak) and refuse
+# a missing proxy. Checked in source so this does not need the monero package.
+check("MoneroRPC validates proxy_url before talking to a remote host",
+      "proxy_url = validate_proxy(proxy_url)" in _gsc)
+check("MoneroRPC aborts a remote host with no proxy (clearnet leak)",
+      "is NOT localhost" in _gsc and "leaking your IP" in _gsc)
+
+# paranoia's post-spoof check resolves google over clearnet ON PURPOSE
+# (must not hit check.torproject.org on the new MAC). That is an IP
+# to Google DNS, not a mix leak.
+_para = open(os.path.join(REPO, "paranoia_mode")).read()
+_dns = _para.split("def dns_check")[1].split("def rand_mac")[0]
+check("paranoia dns_check getaddrinfo is google, not check.torproject.org",
+      'getaddrinfo("www.google.com"' in _dns
+      and "getaddrinfo(\"check.torproject" not in _dns)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

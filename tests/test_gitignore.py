@@ -98,10 +98,13 @@ for leaked in [
 ]:
     check(f"regression: {leaked} stays ignored", is_ignored(leaked))
 
-# Wallet files are NOT on paranoia's list but are the worst thing to publish:
-# the .keys file holds the encrypted spend key, which is offline-crackable.
-print("=== monero-wallet-cli's own output must not be committable ===")
-for w in ["offline.wallet", "offline.wallet.keys", "offline.wallet.address.txt"]:
+# Wallet files are the worst thing to publish: .keys is the encrypted spend
+# key (offline-crackable) and .address.txt is PRIMARY in plaintext.
+# wallet-cli --generate-from-keys uses *.wallet*; wallet-rpc create_wallet
+# "name1" uses name1.keys / name1.address.txt. Both must be ignored.
+print("=== monero wallet files must not be committable ===")
+for w in ["offline.wallet", "offline.wallet.keys", "offline.wallet.address.txt",
+          "name1.keys", "name1.address.txt", "name2.keys", "name2.address.txt"]:
     check(f"wallet artifact {w} ignored", is_ignored(w))
 
 # Guard the other direction: the wider patterns must not swallow real source.

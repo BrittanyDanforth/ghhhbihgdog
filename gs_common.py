@@ -474,7 +474,7 @@ def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
 #  RPC connection (monero-wallet-rpc)
 # ---------------------------------------------------------------------------
 
-_LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_LOCALHOST_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
 
 
 class MoneroRPC:
@@ -503,6 +503,9 @@ class MoneroRPC:
                     f"    Either: (a) use 127.0.0.1 with a local RPC, or\n"
                     f"            (b) tunnel the RPC through Tor externally (socat/ssh)."
                 )
+            # Callers usually already validated, but a raw socks5:// here
+            # would resolve DNS locally and leak every RPC hostname to the ISP.
+            proxy_url = validate_proxy(proxy_url)["http"]
         self._backend = JSONRPCWallet(host=host, port=port)
 
         if proxy_url and host.lower() not in _LOCALHOST_NAMES:

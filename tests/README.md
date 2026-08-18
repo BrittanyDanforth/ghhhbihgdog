@@ -12,7 +12,9 @@ python3 tests/test_cli_flags.py     # every script: --help, argparse validation,
                                      # required/mutually-exclusive/choice flags,
                                      # pre-network runtime checks
 python3 tests/test_ipleak.py        # IP-LEAK defences: proxy scheme, empty-dict
-                                     # egress guards, localhost spoofing, fail-closed
+                                     # egress guards, localhost spoofing,
+                                     # unproxied requests, JoinMarket DNS,
+                                     # fail-closed remote RPC
 python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
                                      # paranoia_mode wipes (OPSEC leak guard)
 python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-delay,
@@ -35,6 +37,21 @@ python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
+python3 tests/track_origin_attack.py # ORIGIN TRACE: name1 (sender PRIMARY)
+                                     #   and name2 (receiver PRIMARY) against
+                                     #   the shipped planners on this tree.
+python3 tests/leak_hidden_user.py    # OUTSIDER hunt: no seed/phrase. Chain,
+                                     #   ThorChain memo, and disk artifacts.
+                                     #   Seized wallet is out of scope.
+python3 tests/outsider_tx_sim.py     # REAL payment + shipped fan-out mix on
+                                     #   isolated testnet, then outsider search
+                                     #   of daemon txs + disk for name1/name2
+                                     #   PRIMARY. SKIPS if monero binaries are
+                                     #   absent.
+python3 tests/outsider_metadata_hunt.py # METADATA: labels, time buckets, RPC
+                                     #   URL, host/user, wipe/gitignore gaps,
+                                     #   whether tx extra hits the chain.
+                                     #   No monero binaries required.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)

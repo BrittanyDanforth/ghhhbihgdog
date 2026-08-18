@@ -445,6 +445,12 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # that from here; wiping it is what we can do.
     "monero-wallet-cli.log", "monero-wallet-rpc.log",
     "monerod.log", "bitmonero.log",
+    # wallet-rpc create_wallet "foo" writes foo.keys + foo.address.txt.
+    # foo.address.txt is the wallet PRIMARY in plaintext. The older
+    # *.wallet.address.txt rule only matched wallet-cli's --generate-from-keys
+    # naming and left the rpc names behind after a wipe.
+    "*.keys",
+    "*.address.txt",
     "renamethis1",
 ]
 GS_ARTIFACT_DIR_PATTERNS = [

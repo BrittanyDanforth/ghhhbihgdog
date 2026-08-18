@@ -31,6 +31,10 @@ exitplan_*.json
 *.wallet
 *.wallet.keys
 *.wallet.address.txt
+# monero-wallet-rpc create_wallet "name1" writes name1.keys + name1.address.txt
+# (PRIMARY in plaintext). The *.wallet.* patterns above miss those names.
+*.keys
+*.address.txt
 .ghostspiral.lock
 # Partial writes from atomic_write_json/_text: same plaintext as the final
 # file, but no '*.json' pattern matches a '.json.tmp' suffix.
