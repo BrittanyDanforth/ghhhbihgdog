@@ -37,6 +37,7 @@ from typing import Dict
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, shutdown_requested,
+    env_or_argv,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -198,16 +199,21 @@ def main():
 
     # Environment wins over argv, matching GhostSpiral's and the signer's rule
     # for the wallet password, so the two agree.
-    _env_amt = os.environ.get("GS_EXIT_AMOUNT")
-    if _env_amt is not None:
+    # Shared helper -- see GhostSpiral.resolve_wallet_password. The hand-rolled
+    # copy here had the same hole: GS_EXIT_AMOUNT and a positional amount
+    # together produced no warning while the amount sat on argv, and the typed
+    # value was discarded without saying the two disagreed.
+    #
+    # No allow_empty: an empty GS_EXIT_AMOUNT is a shell unsetting a variable,
+    # not a request to off-ramp nothing.
+    _amt = env_or_argv("GS_EXIT_AMOUNT", args.amount, "The off-ramp amount")
+    if _amt is not None:
         try:
-            args.amount = Decimal(_env_amt)
+            args.amount = Decimal(str(_amt))
         except Exception:                                    # noqa: BLE001
-            sys.exit("[!] GS_EXIT_AMOUNT is not a number.")
-    elif args.amount is not None:
-        print("  [!] The amount was passed on argv, where any local user can read "
-              "it via ps or /proc/<pid>/cmdline. Prefer GS_EXIT_AMOUNT=... .")
-        integrity_log("exit", "warn:amount_on_argv")
+            sys.exit(f"[!] The off-ramp amount is not a number: {str(_amt)[:40]!r}")
+    else:
+        args.amount = None
 
     if args.amount is None:
         sys.exit("[!] No amount. Set GS_EXIT_AMOUNT=<xmr> (preferred) or pass it "

@@ -37,7 +37,7 @@ from typing import List
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
-    redact_addresses,
+    redact_addresses, env_or_argv,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
@@ -970,14 +970,15 @@ def main():
     # /proc/<pid>/environ is mode 400, readable only by the owner and root
     # (verified: an unprivileged user is DENIED environ but ALLOWED cmdline).
     # GhostSpiral passes the password this way when it spawns us.
-    _env_pw = os.environ.get("GS_WALLET_PASSWORD")
-    if _env_pw is not None:
-        args.wallet_password = _env_pw
-    elif args.wallet_password and args.phase == "sign":
-        print("  [!] --wallet-password puts the wallet password on this "
-              "process's argv, where any local user can read it via ps or "
-              "/proc/<pid>/cmdline. Prefer GS_WALLET_PASSWORD=... instead.")
-        integrity_log("signer", "warn:password_on_argv")
+    # Shared helper -- see GhostSpiral.resolve_wallet_password for why the
+    # hand-rolled copies were retired. The warning is no longer gated on
+    # `phase == "sign"` either: a password typed on the command line is exposed
+    # in /proc/<pid>/cmdline whether or not THIS phase happens to read it, so
+    # staying quiet during --phase create told the operator their password was
+    # safe at the exact moment it was not.
+    args.wallet_password = env_or_argv(
+        "GS_WALLET_PASSWORD", args.wallet_password, "The wallet password",
+        allow_empty=True)
 
     plan_path = Path(args.unsigned_json)
     if not plan_path.exists():

@@ -3,10 +3,12 @@
 Loads the real extensionless scripts as modules and asserts real behavior."""
 import ast
 import re
-import sys, os, tempfile, importlib.util, importlib.machinery
+import sys, os, shutil, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "tests"))
+from srcutil import code_only
 sys.path.insert(0, REPO)
 
 def load(name):
@@ -640,8 +642,72 @@ check("exit: the amount is handed over in the environment instead",
       'GS_EXIT_AMOUNT' in _gs_a and 'GS_EXIT_AMOUNT' in _exit_src)
 check("exit: the positional amount is optional, so argv need never carry it",
       'nargs="?"' in _exit_src)
-check("exit: an argv amount still WARNS rather than passing silently",
-      "warn:amount_on_argv" in _exit_src)
+# Asserted by DRIVING the tool, not by grepping for a literal. The old check
+# looked for the string "warn:amount_on_argv" inside exit_strategy_simulator;
+# when the three hand-rolled env/argv copies were retired in favour of the
+# shared gs_common.env_or_argv, that literal moved and the check went red while
+# the behaviour was correct. A test that pins where a string lives fails on
+# refactors and passes on regressions -- the wrong way round.
+def _drive_exit(env_amount, argv_amount):
+    """Run the real main() and report (warned?, chained?)."""
+    import io as _io, contextlib as _ctx, types as _ty
+    esm = load("exit_strategy_simulator")
+    esm.verify_tor = lambda p: None
+    esm.validate_proxy = lambda p: {"http": p}
+    esm.install_signal_handlers = lambda: None
+    esm.shutdown_requested = lambda: False
+    esm.fetch_prices = lambda p: {"xmr_usd": Decimal("150"),
+                                  "btc_usd": Decimal("60000"), "source": "stub"}
+    chained = []
+    esm.integrity_log = lambda st, m, **k: chained.append(f"{st}:{m}")
+    import gs_common as _g
+    _real = _g.integrity_log
+    _g.integrity_log = lambda st, m, **k: chained.append(f"{st}:{m}")
+    _prev = os.environ.get("GS_EXIT_AMOUNT")
+    _d = tempfile.mkdtemp(prefix="gs_exitwarn_")
+    _cwd = os.getcwd()
+    try:
+        os.chdir(_d)
+        if env_amount is None:
+            os.environ.pop("GS_EXIT_AMOUNT", None)
+        else:
+            os.environ["GS_EXIT_AMOUNT"] = env_amount
+        sys.argv = (["exit_strategy_simulator"]
+                    + ([argv_amount] if argv_amount else [])
+                    + ["--method", "bisq", "--tor-proxy", "socks5h://127.0.0.1:9050",
+                       "--outfile", "p.json"])
+        buf = _io.StringIO()
+        try:
+            with _ctx.redirect_stdout(buf):
+                esm.main()
+        except SystemExit:
+            pass
+        out = buf.getvalue()
+    finally:
+        os.chdir(_cwd)
+        _g.integrity_log = _real
+        if _prev is None:
+            os.environ.pop("GS_EXIT_AMOUNT", None)
+        else:
+            os.environ["GS_EXIT_AMOUNT"] = _prev
+        shutil.rmtree(_d, ignore_errors=True)
+    return ("command line" in out,
+            any("on_argv" in c for c in chained),
+            out)
+
+
+_w, _c, _ = _drive_exit(None, "200")
+check("exit: an argv amount still WARNS rather than passing silently", _w)
+check("exit: ...and the warning reaches the integrity chain", _c)
+_w2, _c2, _ = _drive_exit("200", None)
+check("exit: the environment path stays quiet (nothing is on argv)", not _w2)
+# The case all three hand-rolled copies got wrong: BOTH supplied. The env wins,
+# but the argv copy is still in /proc/<pid>/cmdline and must be called out.
+_w3, _c3, _out3 = _drive_exit("200", "900")
+check("exit: env AND argv together still warns (the old `elif` went silent)", _w3)
+check("exit: ...and says the two values disagree", "DISAGREE" in _out3)
+check("exit: ...and the environment value is the one used",
+      "200 XMR" in _out3 and "900 XMR" not in _out3)
 check("exit: with neither source it refuses instead of guessing",
       "No amount. Set GS_EXIT_AMOUNT" in _exit_src)
 
@@ -789,16 +855,38 @@ check("spend guard: it runs before the balance poll",
 _gs_src2 = open(os.path.join(REPO, "GhostSpiral")).read()
 check("changesweep: a _run_change_sweep helper exists",
       "def _run_change_sweep(" in _gs_src2)
-_cs_fn = _gs_src2[_gs_src2.index("def _run_change_sweep("):
-                  _gs_src2.index("def _stage5_run(")]
+# code_only(): these are substring checks over a function body, and this
+# suite has been bitten six times by matching a phrase that lived only in a
+# comment explaining the OLD defect.
+_gs_code = code_only(os.path.join(REPO, "GhostSpiral"))
+_cs_fn = _gs_code[_gs_code.index("def _run_change_sweep("):
+                  _gs_code.index("def _stage5_run(")]
 check("changesweep: it issues a SWEEP (whole balance, zero change of its own)",
       '"sweep": True' in _cs_fn)
 check("changesweep: it carries no amount (a sweep has none)",
       '"amt"' not in _cs_fn)
 check("changesweep: it spends the CHANGE index, not a guessed 0",
       '"src_index": change_index' in _cs_fn)
-check("changesweep: it waits for the change to confirm before spending it",
-      "_wait_for_carrier(" in _cs_fn)
+# It must wait for ALL the change, not merely for some. sweep_all can only
+# spend UNLOCKED outputs -- proven on a real chain: a subaddress holding 2 XMR
+# unlocked and 3 XMR still locked swept the 2 and LEFT THE 3. A peel chain
+# makes one change output PER PEEL on this same subaddress, so the old
+# "_wait_for_carrier(..., DUST_XMR, ...)" was satisfied by peel 0's change long
+# before the last peel's had confirmed: the sweep ran early, took what had
+# unlocked, abandoned the rest, and the caller printed "nothing is parked on
+# the change address". A fan-out has one distribution tx, so the two conditions
+# were identical there -- they stopped being identical when peel mode landed.
+check("changesweep: it waits for ALL the change to settle, not just some",
+      "_wait_for_change_settled(" in _cs_fn)
+check("changesweep: ...and the settle condition is 'nothing still confirming'",
+      "tot == unlk" in code_only(os.path.join(REPO, "GhostSpiral")))
+# The success message must be VERIFIED, not asserted.
+check("changesweep: it re-reads the balance instead of claiming success",
+      "_change_residue(" in _cs_fn)
+check("changesweep: a residual is reported honestly",
+      "STILL on account" in _cs_fn)
+check("changesweep: the clean case says the result was verified",
+      "verified nothing is parked" in _cs_fn)
 check("changesweep: a timeout is reported honestly, not silently swallowed",
       "NOT swept" in _cs_fn and "UNMIXED" in _cs_fn)
 check("changesweep: the plan file is wiped after the round",
@@ -974,8 +1062,63 @@ check("mix account: a failed rotation ABORTS, never silently uses account 0",
       _rot_ok)
 
 _crw_src = open(os.path.join(REPO, "create_receive_wallet")).read()
-check("mix account: create_receive_wallet issues a fresh account per receive",
-      'raw_request("create_account"' in _crw_src)
+
+# Asserted by BEHAVIOUR, not by grepping for a call that has since moved into
+# gs_common.create_fresh_account. Both callers used to inline
+#     int((acct or {}).get("account_index", 0))
+# so a create_account that SUCCEEDED with an unexpected shape -- a dict with no
+# account_index, a None result, an older or proxied wallet-rpc -- silently
+# became account 0, whose subaddress 0 IS the wallet's primary address. The
+# try/except around it only caught exceptions, and GhostSpiral then printed
+# "Mix runs in a fresh account (0); the run's change stays off the wallet's
+# primary address", which is the exact opposite of what had happened.
+class _AcctRPC:
+    def __init__(self, resp): self.resp = resp
+    def raw_request(self, m, p=None): return self.resp
+
+
+check("mix account: a well-formed create_account is accepted",
+      gs.create_fresh_account(_AcctRPC({"account_index": 4})) == 4)
+for _resp, _why in [
+    ({}, "no account_index (absent is not zero)"),
+    (None, "a None result"),
+    ({"account_index": 0}, "index 0 — a NEW account is never 0, and 0 is the "
+                           "primary-address account"),
+    ({"account_index": True}, "a bool (True == 1 in Python)"),
+    ({"account_index": "2"}, "a string"),
+    ({"account_index": -1}, "a negative index"),
+]:
+    _refused = False
+    try:
+        gs.create_fresh_account(_AcctRPC(_resp))
+    except RuntimeError:
+        _refused = True
+    check(f"mix account: REFUSES {_why}", _refused)
+
+# ...and both callers must go through it rather than keeping a private copy.
+# Source-text checks go through code_only(), which blanks comments and
+# docstrings. Six checks in this suite have gone red because they matched a
+# string that appeared only in a COMMENT explaining the old defect -- a search
+# cannot tell a bug from its own post-mortem, and that failure mode is the
+# wrong way round: noisy on refactors, silent on regressions.
+check("mix account: create_receive_wallet uses the shared fail-closed helper",
+      "create_fresh_account(" in code_only(os.path.join(REPO, "create_receive_wallet"))
+      and 'get("account_index", 0)' not in code_only(
+          os.path.join(REPO, "create_receive_wallet")))
+check("mix account: GhostSpiral uses it too",
+      "create_fresh_account(" in code_only(os.path.join(REPO, "GhostSpiral"))
+      and 'get("account_index", 0)' not in code_only(
+          os.path.join(REPO, "GhostSpiral")))
+# ...and the stripper itself must actually work, or the two checks above are
+# just weaker versions of the greps they replaced.
+check("code_only(): a pattern present ONLY in a comment does not match",
+      'get("account_index", 0)' in open(os.path.join(REPO, "GhostSpiral")).read()
+      and 'get("account_index", 0)' not in code_only(
+          os.path.join(REPO, "GhostSpiral")))
+check("code_only(): real code is still visible",
+      "create_fresh_account(" in code_only(os.path.join(REPO, "GhostSpiral")))
+check("code_only(): string literals the tool uses are kept",
+      "GS_WALLET_PASSWORD" in code_only(os.path.join(REPO, "GhostSpiral")))
 check("mix account: it verifies the address in the account it actually used",
       "acct_idx" in _crw_src and "int(acct_idx), \"address_index\"" in _crw_src)
 check("mix account: the bundle records the real account, not a hard-coded 0",

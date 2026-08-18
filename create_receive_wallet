@@ -36,6 +36,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
+    create_fresh_account,
 )
 
 
@@ -148,8 +149,13 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
         acct_idx = int(args.account)
     else:
         try:
-            acct = wallet_rpc.raw_request("create_account", {"label": args.label})
-            acct_idx = int((acct or {}).get("account_index", 0))
+            # Shared, fail-closed helper -- see gs_common.create_fresh_account.
+            # This read `int((acct or {}).get("account_index", 0))`, so a
+            # create_account that succeeded with an unexpected shape silently
+            # put the receive in account 0, whose subaddress 0 is the wallet's
+            # PRIMARY address. The warning below could not tell that apart from
+            # an operator who had deliberately chosen `--account 0`.
+            acct_idx = create_fresh_account(wallet_rpc, args.label)
         except Exception as e:                                   # noqa: BLE001
             integrity_log("wallet", "account_create_FAILED")
             sys.exit(
@@ -160,9 +166,13 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
                 f"    receive would come to rest there. Use --account N to choose an\n"
                 f"    account deliberately if that is what you want.")
     if acct_idx == 0:
-        print("  [!] This receive is in account 0, whose subaddress 0 is the "
-              "wallet's PRIMARY address. Every leftover from mixing it will "
-              "come to rest there, on the same address as every other receive.")
+        # Only reachable via an explicit `--account 0` now: the fresh-account
+        # path refuses to report 0 at all. So this is a deliberate operator
+        # choice, and the message says so rather than implying the tool did it.
+        print("  [!] You asked for account 0 (--account 0). Its subaddress 0 is "
+              "the wallet's PRIMARY address, so every leftover from mixing this "
+              "receive will come to rest there, on the same address as every "
+              "other receive.")
     integrity_log("wallet", f"receive_account:{acct_idx}")
 
     addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(

@@ -37,6 +37,7 @@ from gs_common import (
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv,
+    create_fresh_account,
     btc_per_xmr_oracle, quote_deviation,
 )
 
@@ -373,13 +374,21 @@ def build_peel_plan(entry_index: int, change_index: int,
     one-time addresses instead of collapsing onto one, so there is no repeated
     spender to anchor on and no single address that names the wallet.
 
-    HONEST LIMIT: monerod still creates its own change output for whatever the
-    real fee leaves over, and that dust still lands on subaddress 0. It is
-    never spent here, so it cannot be walked, but an analyst with the view key
-    does see several small outputs arriving at one address. That is a
-    common-receiver correlation, weaker than a spend-walk and not zero. Only
-    sweep_all is genuinely zero-change, and sweep_all cannot also pay a
-    destination.
+    HONEST LIMIT: monerod still creates its own change output on every peel,
+    and it lands on the spending account's subaddress 0. Calling that "dust"
+    would understate it: peel 0's change is whatever FANOUT_SPEND_FRACTION did
+    not allocate -- around a TENTH of the run -- and each later peel adds its
+    unused fee reserve. So subaddress 0 accumulates one output per peel, the
+    first of them large.
+
+    That is why the change sweep is load-bearing here rather than tidy-up, and
+    why it must wait for EVERY peel's change to confirm before it runs:
+    sweep_all can only spend unlocked outputs (verified on a real chain), so a
+    sweep fired while later change is still locked takes some and strands the
+    rest. See _wait_for_change_settled.
+
+    Only sweep_all is genuinely zero-change, and sweep_all cannot also pay a
+    destination -- which is why the peels themselves cannot use it.
 
     Because each peel spends an output the previous peel created, the peels are
     necessarily SEQUENTIAL and CONFIRMATION-GATED (unspendable until ~10 blocks
@@ -418,8 +427,26 @@ def build_peel_plan(entry_index: int, change_index: int,
             "peel_num": i,
         }
         # Every peel but the last carries the remainder forward explicitly.
-        if i < n - 1 and i < len(carriers) and i < len(remainders) \
-                and remainders[i] is not None and Decimal(str(remainders[i])) > 0:
+        #
+        # REFUSE rather than silently skip, for the same reason the carrier
+        # branch above raises. A non-last peel with no remainder pays only its
+        # destination, so the leftover falls to monerod's change on subaddress 0
+        # -- rebuilding the hub this function exists to remove -- AND the next
+        # peel then waits forever on a carrier nobody funded. The real caller
+        # always supplies n-1 positive remainders, so this is unreachable
+        # today; it is here so a future caller cannot reintroduce the hub by
+        # passing a short list, which is exactly how the carrier case would
+        # have gone wrong before it was made to raise.
+        if i < n - 1:
+            if (i >= len(carriers) or i >= len(remainders)
+                    or remainders[i] is None
+                    or Decimal(str(remainders[i])) <= 0):
+                raise ValueError(
+                    f"peel {i} has no remainder to carry forward "
+                    f"({len(remainders)} remainder(s) for {n} peels, need at "
+                    f"least {n - 1}, all positive). Refusing to let the "
+                    f"leftover fall to subaddress 0 as change, which would "
+                    f"rebuild the hub and strand the next carrier unfunded.")
             entry["destinations"] = [
                 {"address": dests[i], "amount": str(amounts[i])},
                 {"address": carriers[i][0], "amount": str(remainders[i])},
@@ -969,14 +996,22 @@ def resolve_wallet_password(args) -> None:
     # Prefer the environment over argv for the wallet password (see the
     # --wallet-password help and the env handoff in _stage5_run). Same
     # precedence rule the signer uses, so the two agree.
-    _env_pw = os.environ.get("GS_WALLET_PASSWORD")
-    if _env_pw is not None:
-        args.wallet_password = _env_pw
-    elif args.wallet_password:
-        print("  [!] --wallet-password puts the wallet password on this "
-              "process's argv, where any local user can read it via ps or "
-              "/proc/<pid>/cmdline. Prefer GS_WALLET_PASSWORD=... instead.")
-        integrity_log("main", "warn:password_on_argv")
+    # THE SHARED HELPER, not a fourth hand-rolled copy.
+    #
+    # This, airgap_tx_signer and exit_strategy_simulator each carried their own
+    # `if env: use env / elif argv: warn`, and all three had the same hole: when
+    # BOTH were supplied the warning never fired, even though the password was
+    # sitting in /proc/<pid>/cmdline (0444) for the whole run. Setting the
+    # environment variable AND passing the flag is a natural belt-and-braces
+    # move, so the silent case was the one an operator was most likely to hit.
+    # Fixing the helper and leaving the copies would have been the same defect
+    # this file keeps being audited for.
+    #
+    # allow_empty=True because an empty wallet password is legitimate:
+    # GS_WALLET_PASSWORD="" must mean "no password", not "unset".
+    args.wallet_password = env_or_argv(
+        "GS_WALLET_PASSWORD", args.wallet_password, "The wallet password",
+        allow_empty=True)
     return None
 
 
@@ -1176,8 +1211,14 @@ def resolve_mix_account(args, rpc_primary, receive_mode: bool,
         sub_account = receive_account_index
     else:
         try:
-            _acct = rpc_primary.raw_request("create_account", {"label": ""})
-            sub_account = int((_acct or {}).get("account_index", 0))
+            # Shared, fail-closed helper. This read
+            #   int((_acct or {}).get("account_index", 0))
+            # so a create_account that SUCCEEDED with an unexpected shape
+            # became account 0 -- the wallet's primary-address account -- and
+            # the print below then told the operator their change had been
+            # rotated away from it. The except block right underneath already
+            # explains why that is the worst available outcome.
+            sub_account = create_fresh_account(rpc_primary, "")
             integrity_log("stage3", f"mix_account_rotated:{sub_account}")
             print(f"  [*] Mix runs in a fresh account ({sub_account}); the run's "
                   f"change stays off the wallet's primary address.")
@@ -2202,6 +2243,70 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     return relayed
 
 
+def _wait_for_change_settled(args, account, sub_idx, proxy, label):
+    """Block until `sub_idx` has NO balance still confirming, then report it.
+
+    Returns (ok, total_atomic). ok is False on timeout or a dead RPC.
+
+    sweep_all can only spend UNLOCKED outputs -- proven on a real chain: a
+    subaddress holding 2 XMR unlocked and 3 XMR still locked swept the 2 and
+    LEFT THE 3 BEHIND. That matters here because a PEELING CHAIN produces one
+    change output PER PEEL, all to this same subaddress. The old wait asked
+    only for DUST_XMR to be unlocked, which peel 0's change satisfies long
+    before the last peel's change has confirmed -- so the sweep ran early, took
+    what had unlocked, abandoned the rest, and the caller then printed
+    "nothing is parked on the change address".
+
+    A fan-out has exactly one distribution transaction, so waiting for "some
+    unlocked change" and waiting for "all the change" were the same thing
+    there. They stopped being the same thing when the peel chain was added, and
+    nothing noticed.
+
+    "Nothing still confirming" (total == unlocked) is the right condition
+    because it is the sweep's ACTUAL precondition, rather than a guess at how
+    much change to expect -- which cannot be known in advance, since it is
+    whatever the real fees left over.
+    """
+    try:
+        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("stage5", f"change_settle_rpc_fail:{str(e)[:40]}")
+        print(f"  [!] {label}: cannot connect wallet-rpc to await the change: {e}")
+        return False, 0
+    print(f"  [*] {label}: waiting for ALL of the distribution's change to "
+          f"confirm on subaddr {sub_idx} (a peel chain leaves one change output "
+          f"per peel; sweeping early would strand the later ones)...")
+    waited = 0
+    while waited < FANOUT_CONFIRM_TIMEOUT:
+        if shutdown_requested():
+            integrity_log("stage5", "change_settle_interrupted")
+            return False, 0
+        try:
+            rpc.raw_request("refresh", {})
+            tot, unlk = rpc.get_subaddress_balance(account, sub_idx)
+            tot, unlk = int(tot or 0), int(unlk or 0)
+            if tot > 0 and tot == unlk:
+                integrity_log("stage5", "change_settled")
+                return True, tot
+        except Exception as e:                               # noqa: BLE001
+            integrity_log("stage5", f"change_settle_poll_err:{str(e)[:30]}")
+        time.sleep(FANOUT_CONFIRM_POLL)
+        waited += FANOUT_CONFIRM_POLL
+    integrity_log("stage5", "change_settle_timeout")
+    return False, 0
+
+
+def _change_residue(args, account, sub_idx):
+    """Atomic balance left on the change subaddress, or None if unreadable."""
+    try:
+        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        rpc.raw_request("refresh", {})
+        tot, _ = rpc.get_subaddress_balance(account, sub_idx)
+        return int(tot or 0)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                       staging_dir, proxy, meta):
     """Sweep the distribution's change output into the mix, leaving nothing behind.
@@ -2236,8 +2341,8 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     """
     # Wait for the change to actually exist and unlock -- it is an output of
     # the distribution transaction, so it is locked for the usual ~10 blocks.
-    if not _wait_for_carrier(args, account, change_index, DUST_XMR, proxy,
-                             "change sweep"):
+    if not _wait_for_change_settled(args, account, change_index, proxy,
+                                    "change sweep")[0]:
         integrity_log("stage5", "change_sweep_skipped:not_confirmed")
         print("  [!] The distribution's change did not confirm in time, so it was "
               "NOT swept into the mix. It is safe on the mix account's subaddress "
@@ -2258,9 +2363,30 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     stage = f"{staging_dir}/changesweep"
     try:
         _run_round(args, path, stage, "Change sweep")
-        integrity_log("stage5", "change_swept_into_mix")
-        print("  [+] The distribution's change was swept into the mix; nothing is "
-              "parked on the change address.")
+        # VERIFY, do not assert. This printed "nothing is parked on the change
+        # address" unconditionally -- a claim the code never checked, and one
+        # that was false whenever the sweep ran while some change was still
+        # locked (sweep_all can only spend unlocked outputs). If something is
+        # still there, the operator needs to know, because it is the one output
+        # of the distribution that never moves.
+        _left = _change_residue(args, account, change_index)
+        if _left is None:
+            integrity_log("stage5", "change_swept_unverified")
+            print("  [+] The change sweep was relayed, but the balance could not "
+                  "be re-read to confirm the address is now empty. Check "
+                  f"account {account} / subaddr {change_index} yourself.")
+        elif _left > 0:
+            integrity_log("stage5", "change_sweep_residual")
+            print(f"  [!] The change sweep relayed, but "
+                  f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on account "
+                  f"{account} / subaddr {change_index} — change that had not "
+                  f"unlocked when the sweep was built, so sweep_all could not "
+                  f"take it. It is safe, but it is UNMIXED and it is the one "
+                  f"output that never moves. Sweep it by hand once it unlocks.")
+        else:
+            integrity_log("stage5", "change_swept_into_mix")
+            print("  [+] The distribution's change was swept into the mix; "
+                  "verified nothing is parked on the change address.")
         return True
     finally:
         secure_delete_file(path)

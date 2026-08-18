@@ -740,6 +740,57 @@ class MoneroRPC:
             f"address's balance as this one's.")
 
 
+def create_fresh_account(rpc, label: str = "") -> int:
+    """Create a new wallet account and return its index. FAILS CLOSED.
+
+    Both callers wrote this inline as
+
+        acct = rpc.raw_request("create_account", {...})
+        idx  = int((acct or {}).get("account_index", 0))
+
+    inside a try/except that exits on an EXCEPTION -- and GhostSpiral's except
+    block says, in as many words, that "silently falling back to account 0
+    would put the run's change on the wallet's identity address while the
+    operator believed it had been rotated away". The line above it did exactly
+    that for a call that SUCCEEDS but answers with a shape nobody checked: a
+    dict without account_index, a None result, an older or proxied wallet-rpc.
+    `.get(..., 0)` turns every one of those into account 0, whose subaddress 0
+    IS the wallet's primary address, and GhostSpiral then prints "Mix runs in a
+    fresh account (0); the run's change stays off the wallet's primary
+    address" -- the exact opposite of what happened.
+
+    Three checks, because each catches a different way the answer can be wrong:
+
+      * account_index must be PRESENT. Absent is not zero.
+      * it must be a non-negative int, and not a bool (True == 1 in Python, and
+        every index guard in this repo has needed that exclusion).
+      * it must not be ZERO. Account 0 always pre-exists, so a newly CREATED
+        account is never index 0 -- verified against real monero-wallet-rpc
+        0.18.3.1, where the first create_account on a brand-new wallet returns
+        1, then 2, then 3. A create that reports 0 is reporting something that
+        cannot have happened, and 0 is precisely the value that would hurt.
+
+    Raises RuntimeError; callers turn that into their own refusal message.
+    """
+    res = rpc.raw_request("create_account", {"label": label or ""})
+    if not isinstance(res, dict) or "account_index" not in res:
+        raise RuntimeError(
+            f"create_account returned no account_index "
+            f"({type(res).__name__}); the wallet did not say which account it "
+            f"made.")
+    idx = res["account_index"]
+    if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+        raise RuntimeError(
+            f"create_account returned an unusable account_index {idx!r}.")
+    if idx == 0:
+        raise RuntimeError(
+            "create_account reported the NEW account as index 0. Account 0 "
+            "always pre-exists, so a freshly created account is never 0 -- and "
+            "0 is the wallet's primary-address account, the one value that "
+            "must never be accepted here by accident.")
+    return idx
+
+
 def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
     """Connect to monero-wallet-rpc extracting host and port from URL.
 
@@ -878,7 +929,20 @@ def shutdown_requested() -> bool:
 #  Secrets must not travel on a command line
 # ---------------------------------------------------------------------------
 
-def env_or_argv(env_name: str, argv_value, label: str, cast=None):
+def _argv_supplied(value) -> bool:
+    """Did the operator actually put something on the command line?
+
+    Not `value is not None`. argparse defaults --wallet-password to "", so that
+    test is true on EVERY run and would warn about an exposure that did not
+    happen -- and a warning that fires when nothing is wrong is a warning
+    operators learn to scroll past. An empty string on a command line also
+    exposes nothing, so it is not "supplied" for the purpose of this warning.
+    """
+    return value is not None and str(value) != ""
+
+
+def env_or_argv(env_name: str, argv_value, label: str, cast=None,
+                allow_empty: bool = False):
     """Take a sensitive value from the environment, falling back to argv.
 
     /proc/<pid>/cmdline is mode 0444 -- readable by EVERY account on the host,
@@ -897,9 +961,18 @@ def env_or_argv(env_name: str, argv_value, label: str, cast=None):
     everywhere else). An argv value still works, because an operator running a
     tool by hand should not be blocked, but it warns and chains the warning.
     Returns None when neither is set; the caller decides whether that is fatal.
+
+    allow_empty exists for ONE real case: an empty WALLET PASSWORD is
+    legitimate and common, so GS_WALLET_PASSWORD="" must mean "the password is
+    empty", not "unset". For an amount or an address an empty environment
+    variable is how a shell unsets a value, so the default treats it as absent.
+    Getting this backwards silently swaps which of two values is used for a
+    spend key, which is why it is a parameter rather than a judgement call left
+    to each caller -- there were three hand-rolled copies of this function
+    before it existed, and all three had drifted.
     """
     raw = os.environ.get(env_name)
-    if raw is not None and raw != "":
+    if raw is not None and (allow_empty or raw != ""):
         # The environment WINS, but argv is still argv. When both are supplied
         # the value is sitting in /proc/<pid>/cmdline (mode 0444) for the
         # lifetime of the process regardless of which one this function
@@ -907,7 +980,7 @@ def env_or_argv(env_name: str, argv_value, label: str, cast=None):
         # the warning -- and the integrity-chain entry -- were skipped in
         # exactly that case. It also discarded the operator's typed value in
         # silence, so a mismatch between the two was never surfaced.
-        if argv_value is not None:
+        if _argv_supplied(argv_value):
             print(f"  [!] {label} was ALSO passed on the command line, where any "
                   f"local user can read it via ps or /proc/<pid>/cmdline (mode "
                   f"444). {env_name} takes precedence and was used; the "
@@ -918,7 +991,7 @@ def env_or_argv(env_name: str, argv_value, label: str, cast=None):
                       f"meant.")
             integrity_log("argv", f"warn:{env_name}_on_argv_and_env")
         return cast(raw) if cast else raw
-    if argv_value is not None:
+    if _argv_supplied(argv_value):
         print(f"  [!] {label} was passed on the command line, where any local "
               f"user can read it via ps or /proc/<pid>/cmdline (mode 444). "
               f"Prefer {env_name}=... .")
