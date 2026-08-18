@@ -135,7 +135,7 @@ def parse_hop_delay(spec, default=DEFAULT_HOP_DELAY) -> tuple:
     return (lo, hi)
 
 
-def hop_delay(rng, window=None) -> int:
+def hop_delay(window=None) -> int:
     """A jittered per-TX broadcast delay in seconds, from `window`.
 
     HOW LONG THIS IS, IS AN OPSEC PARAMETER, and the default is not a strong
@@ -164,7 +164,13 @@ def hop_delay(rng, window=None) -> int:
     multi-day default would strand operators who close the laptop.
     """
     lo, hi = window or DEFAULT_HOP_DELAY
-    return lo if hi <= lo else lo + rng.randbelow(hi - lo)
+    # secrets.randbelow, NOT SystemRandom().randbelow. randbelow is a MODULE
+    # function; SystemRandom has no such method and the call raises
+    # AttributeError. This took no rng parameter for exactly that reason --
+    # every caller wants the same CSPRNG, and offering the choice is what let
+    # `secrets.SystemRandom().randbelow(540)` sit in the change sweep from the
+    # commit that introduced it, raising on every sweep it ever built.
+    return lo if hi <= lo else lo + secrets.randbelow(hi - lo)
 
 
 # Fraction of the post-fee balance the fan-out distributes. The remainder stays
@@ -562,6 +568,56 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
+def build_entry_veil(rpc, entry_addr: str, entry_account: int,
+                     entry_index: int, delay_window=None) -> tuple:
+    """The first spend out of ENTRY, shaped like ordinary traffic.
+
+    Returns ((plan_entry,), (account, index, address)) for the fresh carrier
+    the swap's value is moved to.
+
+    THE ONE OUTPUT AN ANALYST GETS FOR FREE. A ThorChain swap's memo is
+    public: it names the address the swap paid, so anyone watching knows which
+    on-chain output funded this run. Ring signatures still hide WHICH later
+    transaction spent it -- an analyst has a list of candidates, every
+    transaction whose ring happens to include that output, and no way to pick
+    the real one out of sixteen.
+
+    Unless the real one looks different. Measured on a chain running current
+    consensus, the first transaction out of ENTRY used to be:
+
+        fan-out mode (the default) :  1-in / 7-out,  extra 259
+        peel mode                  :  1-in / 3-out,  extra 131
+        an ordinary sweep          :  1-in / 2-out,  extra  44
+
+    Two outputs is the overwhelmingly common shape on the network. Seven is
+    not. So an analyst holding the swap output does not need to break the ring:
+    he lists the transactions that reference it and keeps the ones with the
+    unusual shape, and in fan-out mode that is close to a single candidate.
+    The distribution advertised itself.
+
+    So ENTRY is swept, once, into a fresh carrier -- 1-in/2-out, zero change,
+    the shape most of the network is making -- and the distribution runs from
+    that carrier instead. Every transaction after this one spends an output the
+    analyst has never seen and cannot enumerate.
+
+    It costs one transaction, one fee, and one confirmation wait. It also
+    inherits --hop-delay, which matters more here than anywhere else: this is
+    the only hop where an analyst knows both endpoints of the wait.
+    """
+    acct = create_fresh_account(rpc, label="")
+    addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
+    entry = {
+        "src": entry_addr,
+        "src_index": entry_index,
+        "account_index": entry_account,
+        "dst": addr,
+        "sweep": True,
+        "delay": hop_delay(delay_window),
+        "extra": secure_hex(16),
+    }
+    return [entry], (acct, idx, addr)
+
+
 def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
                           entry_index: int, dests: list,
                           amount_by_addr: dict, hop_fee: Decimal,
@@ -633,7 +689,7 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
             "account_index": hop_acct,
             "dst": p["dst"],
             "amt": p["amt"],
-            "delay": hop_delay(secrets, delay_window),
+            "delay": hop_delay(delay_window),
             "extra": secure_hex(16),
             "peel_num": p["peel_num"],
         }
@@ -1283,6 +1339,19 @@ def build_cli() -> argparse.ArgumentParser:
                           "plausibility. The default is short so a run "
                           "finishes in one sitting, not because it is the "
                           "strong choice.")
+    cli.add_argument("--no-entry-veil", dest="entry_veil", action="store_false",
+                     default=True,
+                     help="Spend the swap's output DIRECTLY in the "
+                          "distribution instead of sweeping it into a fresh "
+                          "carrier first. Saves one transaction, one fee and "
+                          "one confirmation wait — and costs the one thing an "
+                          "analyst is handed for free. The ThorChain memo is "
+                          "public, so the output that funded the run is known; "
+                          "ring signatures hide which transaction spent it "
+                          "only for as long as that transaction looks like "
+                          "everything else. Measured: the fan-out spending it "
+                          "directly is 1-in/7-out where an ordinary send is "
+                          "1-in/2-out. Not recommended.")
     cli.add_argument("--peel", action="store_true",
                      help="PEELING CHAIN instead of a single fan-out: distribute "
                           "to the mix subaddresses ONE PER TRANSACTION, each "
@@ -1725,7 +1794,7 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                 "account_index": _src_account(addr_index, s),
                 "dst": d,
                 "sweep": True,
-                "delay": hop_delay(_secrets, delay_window),
+                "delay": hop_delay(delay_window),
                 "extra": secure_hex(16),
             })
         if not dag_plan:
@@ -1911,6 +1980,37 @@ def report_completion(rpc, incomplete, accounts) -> None:
     report_holdings(rpc, accounts)
     integrity_log("main", "pipeline_complete")
     print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
+
+
+def resolve_entry_veil(rpc, args, addr_index: dict, entry_addr: str,
+                       entry_account: int, entry_index: int, bal: Decimal,
+                       fee_xmr: Decimal, delay_window=None) -> tuple:
+    """Decide what the distribution actually spends. Returns
+    (veil_plan, spend_addr, account, index, balance).
+
+    With the veil on (the default) that is a fresh carrier one sweep fee
+    lighter than ENTRY; with --no-entry-veil it is ENTRY itself, unchanged.
+    Everything downstream sizes and plans against whatever comes back, so the
+    two paths cannot drift apart. See build_entry_veil for the measurement
+    that makes the veil the default.
+    """
+    if not getattr(args, "entry_veil", True):
+        integrity_log("stage4", "entry_veil_disabled")
+        print("  [!] --no-entry-veil: the distribution spends the swap's "
+              "output DIRECTLY. That transaction's shape is unusual and the "
+              "swap memo is public, so an analyst can filter the candidate "
+              "transactions down to it by output count alone.")
+        return [], entry_addr, entry_account, entry_index, bal
+
+    veil_plan, (acct, idx, addr) = build_entry_veil(
+        rpc, entry_addr, entry_account, entry_index, delay_window)
+    addr_index[addr] = (acct, idx)
+    integrity_log("stage4", "entry_veiled")
+    print(f"  [*] ENTRY is swept once into a fresh carrier before the "
+          f"distribution, so the transaction spending the swap's output is an "
+          f"ordinary 2-output send rather than one an analyst can pick out by "
+          f"shape.")
+    return veil_plan, addr, acct, idx, bal - hop_fee_reserve(fee_xmr)
 
 
 def main():
@@ -2156,6 +2256,13 @@ def main():
                 f"    Total balance: {total_bal} XMR (may be locked/unconfirmed)."
             )
 
+        veil_plan, SPEND_ADDR, bal_account, entry_index, bal = resolve_entry_veil(
+            rpc_primary, args, addr_index, ENTRY, bal_account, entry_index,
+            bal, fee_xmr, _delay_window)
+        if bal <= DUST_XMR:
+            sys.exit(f"[!] Balance {bal} XMR left after the entry sweep's fee "
+                     f"reserve. Fund the wallet more.")
+
         usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
                                                         args.deep)
         if usable <= DUST_XMR:
@@ -2267,8 +2374,8 @@ def main():
             # reserve failed on the second peel.
             _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
             fanout_plan, change_accounts = build_peel_stage_plan(
-                rpc_primary, bal_account, ENTRY,
-                _src_index(addr_index, ENTRY), fanout_dests, fanout_by_addr,
+                rpc_primary, bal_account, SPEND_ADDR,
+                _src_index(addr_index, SPEND_ADDR), fanout_dests, fanout_by_addr,
                 _hop_fee, delay_window=_delay_window)
             integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
             print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
@@ -2276,10 +2383,11 @@ def main():
                   f"transaction — no co-created fan-out for an analyst to cluster.")
         else:
             fanout_plan = [{
-                "src": ENTRY,
-                "src_index": _src_index(addr_index, ENTRY),
+                "src": SPEND_ADDR,
+                "src_index": _src_index(addr_index, SPEND_ADDR),
+                "account_index": _src_account(addr_index, SPEND_ADDR),
                 "destinations": [{"address": a, "amount": str(fanout_by_addr[a])} for a in fanout_dests],
-                "delay": hop_delay(_secrets, _delay_window),
+                "delay": hop_delay(_delay_window),
                 "extra": secure_hex(16),
             }]
             # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
@@ -2330,6 +2438,10 @@ def main():
         plan_tag = secure_hex(8)
         fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
         atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
+        veil_file = None
+        if veil_plan:
+            veil_file = outdir / f"unsigned_veil_{plan_tag}.json"
+            atomic_write_json({"meta": meta, "txs": veil_plan}, veil_file)
         dag_file = None
         if dag_plan:
             dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
@@ -2943,7 +3055,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         "account_index": account,
         "dst": dest_addr,
         "sweep": True,
-        "delay": hop_delay(secrets.SystemRandom(), delay_window),
+        "delay": hop_delay(delay_window),
         "extra": secure_hex(16),
     }
     path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
@@ -2986,13 +3098,38 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
                 change_target=(0, 0), change_sweep_jobs=None,
-                delay_window=None):
+                delay_window=None, veil_file=None, veil_target=None,
+                veil_need=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
     then the exit-strategy simulation."""
-    # -- Distribution: fan-out (one tx) or peel chain (N gated txs) --------
+    # -- Round 0: veil the entry ------------------------------------------
+    # ENTRY holds the one output an analyst is handed for free (the swap memo
+    # is public). Sweep it into a fresh carrier FIRST, so the transaction that
+    # spends it is an ordinary 2-output send rather than the distribution's
+    # unusual shape, and everything afterwards spends an output nobody outside
+    # this wallet can enumerate. See build_entry_veil.
+    #
+    # The distribution cannot be created until this has confirmed and unlocked
+    # -- it spends the carrier -- so the wait is not optional politeness.
     incomplete = []
+    if veil_file:
+        print("  [*] === Round 0: entry veil ===")
+        newnym(required=True)
+        tor_recheck(proxy, "stage5_veil")
+        _run_round(args, veil_file, f"{staging_dir}/veil", "Entry veil")
+        _vacct, _vidx = veil_target
+        if not _wait_for_carrier(args, _vacct, _vidx, veil_need, proxy,
+                                 "entry veil"):
+            integrity_log("stage5", "veil_carrier_timeout")
+            print("  [!] The entry sweep did not confirm and unlock in time, so "
+                  "the distribution was NOT created. The funds are safe on "
+                  f"account {_vacct}, subaddress {_vidx} — but they are "
+                  "UNDISTRIBUTED. Re-run once it confirms, or distribute by "
+                  "hand.")
+            return ["the entry sweep did not confirm, so nothing was distributed"]
+
     if distribution_mode == "peel":
         try:
             with open(fanout_file) as _pf:

@@ -2282,15 +2282,15 @@ for _bad, _why in (("abc", "not a number"), ("5-x", "half a number"),
         check(f"hop delay: {_why} is rejected ({_bad!r})", True)
 
 import secrets as _sec
-_dv = [ghost.hop_delay(_sec, (100, 200)) for _ in range(300)]
+_dv = [ghost.hop_delay((100, 200)) for _ in range(300)]
 check("hop delay: every draw is inside the window",
       all(100 <= v < 200 for v in _dv))
 check("hop delay: the window is actually sampled, not pinned to one value",
       len(set(_dv)) > 20)
 check("hop delay: a degenerate window returns that value, not a ZeroDivision "
-      "or a randbelow(0)", ghost.hop_delay(_sec, (300, 300)) == 300)
+      "or a randbelow(0)", ghost.hop_delay((300, 300)) == 300)
 check("hop delay: the default window is used when none is given",
-      180 <= ghost.hop_delay(_sec) < 720)
+      180 <= ghost.hop_delay() < 720)
 
 # It has to reach the plan, or the flag is decoration.
 _fr3 = _FakeSubRpc()
@@ -2404,6 +2404,150 @@ except SystemExit as _se:
 check("holdings: an incomplete run reports the shortfall, not a balance table",
       "NOT what was planned" in _buf5.getvalue()
       and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# THE ENTRY VEIL. A ThorChain memo is public, so the output that funded the run
+# is the one thing an analyst gets for free. Ring signatures hide which
+# transaction spent it only for as long as that transaction looks like the rest
+# of the network. Measured on a chain running current consensus:
+#
+#     fan-out spending ENTRY directly :  1-in / 7-out, extra 259
+#     peel 0 spending ENTRY directly  :  1-in / 3-out, extra 131
+#     an ordinary sweep               :  1-in / 2-out, extra  44
+#
+# Two outputs is what most of the network makes. Seven is not, so an analyst
+# holding the swap output lists the transactions referencing it and keeps the
+# odd-shaped one.
+# ---------------------------------------------------------------------------
+class _VeilRpc:
+    def __init__(self): self.acct = 40; self.made = []
+    def raw_request(self, method, params=None):
+        assert method == "create_account"
+        self.acct += 1
+        self.made.append(self.acct)
+        return {"account_index": self.acct}
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return (f"VEIL_{account_index}", 1)
+
+_vr = _VeilRpc()
+_vplan, (_va, _vi, _vaddr) = ghost.build_entry_veil(_vr, "ENTRY_ADDR", 3, 7,
+                                                    (100, 101))
+check("veil: it is a SWEEP -- whole balance, zero change, two outputs",
+      len(_vplan) == 1 and _vplan[0].get("sweep") is True)
+check("veil: a sweep carries no amount (that is what makes it zero-change)",
+      "amt" not in _vplan[0])
+check("veil: it spends ENTRY, naming both its account and its index",
+      _vplan[0]["src"] == "ENTRY_ADDR" and _vplan[0]["src_index"] == 7
+      and _vplan[0]["account_index"] == 3)
+check("veil: the carrier is a FRESH account, not ENTRY's",
+      _va != 3 and _va in _vr.made)
+check("veil: it pays that carrier", _vplan[0]["dst"] == _vaddr)
+check("veil: it honours --hop-delay, which matters most here -- it is the one "
+      "hop where an analyst knows both endpoints of the wait",
+      _vplan[0]["delay"] == 100)
+check("veil: the entry it builds passes the shipped signer's validator",
+      (lambda: (airgap._validate_plan(_vplan), True)[1])())
+
+# resolve_entry_veil decides what the distribution actually spends. Both paths
+# must return the same shape or they drift.
+class _VA:
+    def __init__(self, **kw): self.__dict__.update(kw)
+
+_ai4 = {"ENTRY_ADDR": (3, 7)}
+_buf6 = _io.StringIO()
+with _ctx.redirect_stdout(_buf6):
+    _p, _sa, _ac, _ix, _b = ghost.resolve_entry_veil(
+        _VeilRpc(), _VA(entry_veil=True), _ai4, "ENTRY_ADDR", 3, 7,
+        Decimal("10"), Decimal("0.0024"), (100, 101))
+check("veil: ON -- the distribution spends the CARRIER, not ENTRY",
+      _sa != "ENTRY_ADDR" and (_ac, _ix) == (41, 1))
+check("veil: ON -- the carrier is registered so its account can be resolved",
+      _ai4.get(_sa) == (41, 1))
+check("veil: ON -- the balance is reduced by the sweep's fee reserve",
+      _b == Decimal("10") - ghost.hop_fee_reserve(Decimal("0.0024")))
+check("veil: ON -- a plan is produced", len(_p) == 1)
+
+_ai5 = {"ENTRY_ADDR": (3, 7)}
+_buf7 = _io.StringIO()
+with _ctx.redirect_stdout(_buf7):
+    _p2, _sa2, _ac2, _ix2, _b2 = ghost.resolve_entry_veil(
+        _VeilRpc(), _VA(entry_veil=False), _ai5, "ENTRY_ADDR", 3, 7,
+        Decimal("10"), Decimal("0.0024"), (100, 101))
+check("veil: OFF -- the distribution spends ENTRY unchanged",
+      (_p2, _sa2, _ac2, _ix2, _b2) == ([], "ENTRY_ADDR", 3, 7, Decimal("10")))
+check("veil: OFF -- and the operator is told what that costs them",
+      "DIRECTLY" in _buf7.getvalue() and "memo is public" in _buf7.getvalue())
+check("veil: OFF -- no carrier is registered",
+      _ai5 == {"ENTRY_ADDR": (3, 7)})
+
+# Stage 5 must WAIT for the veil to unlock: the distribution spends its output.
+_s5v = _gs_code[_gs_code.index("def _stage5_run("):]
+_s5v = _s5v[:_s5v.index(chr(10) + "def ")] if (chr(10) + "def ") in _s5v[10:] else _s5v
+check("veil: stage 5 runs it as its own round, before the distribution",
+      _s5v.index("veil_file") < _s5v.index("distribution_mode ==")
+      if "distribution_mode ==" in _s5v else True)
+check("veil: stage 5 waits for the carrier to confirm and unlock",
+      "_wait_for_carrier(args, _vacct, _vidx, veil_need" in _s5v)
+check("veil: a veil that never confirms stops the run instead of distributing",
+      "nothing was distributed" in _s5v)
+
+
+# ---------------------------------------------------------------------------
+# _run_change_sweep must actually BUILD its sweep entry.
+#
+# It shipped with `secrets.SystemRandom().randbelow(540) + 180` from the commit
+# that introduced it. randbelow is a MODULE function; SystemRandom has no such
+# method, so every change sweep raised AttributeError while building its own
+# plan -- the feature added to stop value being left parked could never run.
+#
+# Nothing caught it because every test that touches the change sweep STUBS
+# this function. So drive it: stub only what talks to the outside world and let
+# the entry get built for real.
+# ---------------------------------------------------------------------------
+_built = {}
+_r_settle = ghost._wait_for_change_settled
+_r_round = ghost._run_round
+_r_res = ghost._change_residue
+_r_sdf = ghost.secure_delete_file
+_r_awj = ghost.atomic_write_json
+try:
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 5_000_000_000)
+    ghost._run_round = lambda *a, **k: None
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.secure_delete_file = lambda *a, **k: True
+    ghost.atomic_write_json = lambda payload, path: _built.update(payload)
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _ok_cs = ghost._run_change_sweep(
+            _VA(rpc_primary="http://127.0.0.1:1", tor_proxy=None),
+            5, 0, "DEST_ADDR", 9, "stg", None, {"account_index": 5},
+            label="change sweep 1/3", seq=1, delay_window=(600, 601))
+    _tx = (_built.get("txs") or [{}])[0]
+    check("changesweep: it builds its entry without raising", _ok_cs is True)
+    check("changesweep: the entry is a sweep of the change subaddress",
+          _tx.get("sweep") is True and _tx.get("src_index") == 0)
+    check("changesweep: it names the account it sweeps, not meta's",
+          _tx.get("account_index") == 5)
+    check("changesweep: it pays the destination it was given",
+          _tx.get("dst") == "DEST_ADDR")
+    check("changesweep: the delay comes from the run's window",
+          _tx.get("delay") == 600)
+    check("changesweep: the entry passes the shipped signer's validator",
+          (lambda: (airgap._validate_plan([_tx]), True)[1])())
+finally:
+    ghost._wait_for_change_settled = _r_settle
+    ghost._run_round = _r_round
+    ghost._change_residue = _r_res
+    ghost.secure_delete_file = _r_sdf
+    ghost.atomic_write_json = _r_awj
+
+# The delay helper takes NO rng, so the wrong one cannot be handed to it again.
+import inspect as _insp
+check("hop delay: takes no rng parameter -- there is one right CSPRNG and "
+      "offering the choice is what shipped the bug above",
+      list(_insp.signature(ghost.hop_delay).parameters) == ["window"])
+check("hop delay: no caller passes SystemRandom().randbelow anywhere",
+      "SystemRandom().randbelow" not in _gs_code)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

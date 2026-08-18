@@ -183,6 +183,32 @@ of its own) after the distribution, in both fan-out and peel modes. That is a
 correctness fix as much as an OPSEC one — roughly a tenth of the balance was
 previously never mixed at all while the run reported success.
 
+**The entry is the one output an analyst is handed for free, so the run does
+not spend it in the open.** A ThorChain swap's memo is public: it names the
+address the swap paid, so anyone watching knows which on-chain output funded
+your run. Ring signatures still hide *which* later transaction spent it — an
+analyst has sixteen candidates per ring and no way to pick — **unless the real
+transaction looks different from the rest of the network.** Measured on a chain
+running current consensus, the first transaction out of the entry used to be:
+
+| first spend out of the entry | shape | extra |
+|---|---|---|
+| fan-out mode (the default) | 1-in / **7**-out | 259 |
+| peel mode | 1-in / **3**-out | 131 |
+| an ordinary sweep | 1-in / 2-out | 44 |
+
+Two outputs is what most of the network makes. Seven is not — so an analyst
+holding the swap output does not need to break a ring, he lists the
+transactions that reference it and keeps the odd-shaped one.
+
+The run now sweeps the entry **once** into a fresh carrier first — 1-in/2-out,
+zero change — and distributes from that carrier. Every transaction after it
+spends an output nobody outside your wallet can enumerate. It costs one
+transaction, one fee and one confirmation wait, and it inherits `--hop-delay`,
+which matters more here than anywhere else: this is the only hop where an
+analyst knows both endpoints of the wait. `--no-entry-veil` turns it off and
+says what that costs.
+
 **The exit is where a mix is usually lost, so the outputs are built to make
 losing it hard.** A run ends with N outputs that you eventually spend, and
 until now they all sat in one account. Measured on a chain running current
