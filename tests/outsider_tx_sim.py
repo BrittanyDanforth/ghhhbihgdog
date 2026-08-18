@@ -22,7 +22,7 @@ Outsider corpus:
 If either PRIMARY string appears in that corpus, the hidden user is
 uncovered. Isolated testnet. SKIPs if monero binaries are absent.
 """
-import subprocess, time, os, shutil, tempfile, sys, json, random, traceback, re
+import subprocess, time, os, shutil, tempfile, sys, json, random, traceback, re, getpass, socket
 import importlib.machinery, importlib.util
 from decimal import Decimal
 import requests
@@ -192,10 +192,12 @@ try:
     # Public receive bundle (what create_receive_wallet writes).
     bundle = {
         "schema": "gs_receive_wallet_v1",
+        "created": int(time.time()) // 600 * 600,
         "address": ENTRY,
         "account_index": ACC,
         "subaddress_index": EIDX,
         "label": "GhostSpiral_entry",
+        "rpc_endpoint": WR.rsplit("/", 1)[0],
     }
     open(os.path.join(PUBLIC, "wallet_recv.json"), "w").write(json.dumps(bundle, indent=2))
 
@@ -253,11 +255,18 @@ try:
     dests = [{"amount": int((a * ATOMIC).to_integral_value()), "address": m["address"]}
              for a, m in zip(amounts, mix)]
     open(os.path.join(PUBLIC, "unsigned_fanout.json"), "w").write(json.dumps({
-        "meta": {"account_index": ACC, "distribution_mode": "fanout"},
+        "meta": {
+            "schema": "unsigned_v1",
+            "version": ghost.VERSION if hasattr(ghost, "VERSION") else "10.5",
+            "created": int(time.time()) // 600 * 600,
+            "account_index": ACC,
+            "distribution_mode": "fanout",
+        },
         "txs": [{
             "src": ENTRY, "src_index": EIDX,
             "destinations": [{"address": m["address"], "amount": str(a)}
                              for a, m in zip(amounts, mix)],
+            "delay": 240, "extra": "not_forwarded_to_rpc",
         }],
     }, indent=2))
     open(os.path.join(PUBLIC, "integrity_chain.log"), "w").write(
@@ -325,6 +334,21 @@ try:
     check("public addresses are ENTRY/mix dests only (never PRIMARY)",
           pub_addrs and all(a == ENTRY or a in mix_addrs for a in pub_addrs)
           and name1 not in pub_addrs and name2 not in pub_addrs)
+
+    print("\n  --- metadata leads in PUBLIC (not the people) ---")
+    b = json.load(open(os.path.join(PUBLIC, "wallet_recv.json")))
+    print(f"    label:        {b.get('label')}")
+    print(f"    created:      {b.get('created')} (10-min bucket)")
+    print(f"    rpc_endpoint: {b.get('rpc_endpoint')}")
+    print(f"    schema:       {b.get('schema')}")
+    check("PUBLIC files do not contain this username",
+          getpass.getuser() not in corpus)
+    check("PUBLIC files do not contain this hostname",
+          socket.gethostname() not in corpus)
+    check("bundle label is a tool fingerprint, not a person",
+          b.get("label") == "GhostSpiral_entry")
+    check("bundle rpc_endpoint is present (HOST lead if they got the working dir)",
+          "rpc_endpoint" in b)
 
     # What they DO find.
     check("OUTSIDER does find ENTRY (memo / bundle / plan dest)",

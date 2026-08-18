@@ -46,6 +46,10 @@ python3 tests/outsider_tx_sim.py     # REAL payment + shipped fan-out mix on
                                      #   of daemon txs + disk for name1/name2
                                      #   PRIMARY. SKIPS if monero binaries are
                                      #   absent.
+python3 tests/outsider_metadata_hunt.py # METADATA: labels, time buckets, RPC
+                                     #   URL, host/user, wipe/gitignore gaps,
+                                     #   whether tx extra hits the chain.
+                                     #   No monero binaries required.
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)
