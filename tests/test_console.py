@@ -752,6 +752,37 @@ def test_gui_never_stamps_a_tool_name_into_the_wallet():
               not offenders)
 
 
+def test_quote_and_watch_agree_on_the_pairs_file():
+    """The GUI must not throw away the quote it just wrote.
+
+    swap_quote defaulted a blank pairs_file to "thor_pairs.json" and wrote the
+    quote there; watch_receive, reading the SAME blank field, substituted
+    --any. So the default GUI flow produced a quote and then watched with no
+    target at all -- discarding the expected amount, the under-delivery check
+    and the shortfall report, and firing on any dust that reached the address.
+    The step that reads must not silently weaken what the step that writes
+    produced.
+    """
+    c = load_console()
+    blank = {"receive_wallet": "w.json", "tor_proxy": "socks5h://127.0.0.1:9050"}
+    q = c.ACTIONS["swap_quote"]["build"](blank)
+    w = c.ACTIONS["watch_receive"]["build"](blank)
+    check("with the field blank, the watch does NOT fall back to --any",
+          "--any" not in w)
+    check("...it reads the same file the quote step wrote",
+          "--pairs" in w
+          and w[w.index("--pairs") + 1] == q[q.index("--outfile") + 1])
+
+    # An explicit filename must still be honoured by both.
+    named = dict(blank, pairs_file="myquote.json")
+    q2 = c.ACTIONS["swap_quote"]["build"](named)
+    w2 = c.ACTIONS["watch_receive"]["build"](named)
+    check("an explicit pairs file is used by the quote step",
+          q2[q2.index("--outfile") + 1] == "myquote.json")
+    check("...and by the watch step",
+          w2[w2.index("--pairs") + 1] == "myquote.json")
+
+
 def test_daemon_detection_fixes_no_estimate():
     """'Cannot get estimates' is nearly always 'nothing is listening where the
     daemon field points'. The console must be able to go find it."""

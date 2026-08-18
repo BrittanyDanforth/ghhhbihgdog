@@ -115,10 +115,25 @@ def fetch_prices(proxy):
             return out
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{str(e)[:40]}")
+        _bisq_err = e
 
+    # Name the ACTUAL failure. This always said "Check Tor connectivity", but
+    # the broad except above catches parse and type errors too -- a malformed
+    # or changed Bisq payload was reported to the operator as a network
+    # problem, sending them to debug Tor when Tor was fine.
+    _why = ""
+    try:
+        _e = _bisq_err
+    except NameError:
+        _e = None
+    if _e is not None and not isinstance(
+            _e, (OSError, ConnectionError, TimeoutError)):
+        _why = (f"\n    The Bisq fallback did not fail on the network: it failed "
+                f"parsing the\n    response ({type(_e).__name__}: {str(_e)[:60]}). "
+                f"That is a payload/format\n    problem, not a connectivity one.")
     sys.exit(
         "[!] All price oracles failed (CoinGecko + Bisq).\n"
-        "    Cannot generate exit plan without prices.\n"
+        "    Cannot generate exit plan without prices." + _why + "\n"
         "    Check Tor connectivity and retry."
     )
 
@@ -197,6 +212,13 @@ def main():
     if args.amount is None:
         sys.exit("[!] No amount. Set GS_EXIT_AMOUNT=<xmr> (preferred) or pass it "
                  "as the positional argument.")
+    # Decimal ACCEPTS "NaN", "Infinity" and "1e400". NaN then makes the
+    # positivity test below raise InvalidOperation (a raw traceback instead of
+    # a message), and Infinity sails past it into the fee/net arithmetic and
+    # produces a plan file full of garbage. Reject them by name first.
+    if not args.amount.is_finite():
+        sys.exit(f"[!] Amount must be a finite number (got {args.amount}). "
+                 f"'NaN' and 'Infinity' parse as Decimals but are not amounts.")
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")
 
@@ -270,16 +292,51 @@ def main():
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
         "currency": args.currency,
         "amount_out_fiat": str(fiat_val),
-        "oracle_prices": {k: str(v) for k, v in prices.items()
-                          if k != "source"},
+        # COARSENED to whole currency units, to match the coarsened timestamp
+        # above. `timestamp` is floored to a 10-minute bucket specifically to
+        # blur when this plan was made -- and then this field recorded four
+        # live spot prices at full precision from that same instant. Spot
+        # prices move continuously, so anyone with price history can invert
+        # them to the minute and undo the coarsening, in the same file, two
+        # lines apart. Whole units are plenty for auditing which venue and rate
+        # the plan assumed.
+        "oracle_prices": {k: str(Decimal(str(v)).quantize(Decimal("1")))
+                          for k, v in prices.items() if k != "source"},
+        "oracle_prices_note": "rounded to whole units: full precision would "
+                              "re-establish the timestamp this plan coarsens",
         "price_source": prices.get("source", "unknown"),
-        "liquidity_guidance": liq_guidance,
+        # Carries the marker the header promises ("clearly labelled; not a
+        # probe"). The terminal appended "(heuristic)"; the JSON -- the
+        # machine-readable artefact something else may consume -- did not, so
+        # the one copy a program would read looked like a measurement.
+        "liquidity_guidance": f"{liq_guidance} (heuristic, not an order-book probe)",
     }
 
     if shutdown_requested():
         sys.exit(f"[!] Interrupted before writing {args.outfile}. No plan file "
                  f"was created.")
-    atomic_write_json(plan, Path(args.outfile))
+    _out = Path(args.outfile)
+    # Say so when the plan is being written somewhere the wipe cannot reach.
+    # paranoia_mode globs fixed roots (cwd, $HOME, $HOME/ghostspiral,
+    # $HOME/GhostSpiral) at depth 0 and 1, so `--outfile /mnt/usb/plan.json`
+    # writes the holding size, its fiat value and the venue to a file no wipe
+    # will ever find -- and the operator has no reason to suspect it, because
+    # the tool reports "Plan saved" either way.
+    try:
+        _res = _out.resolve().parent
+        _roots = [Path.cwd().resolve(), Path.home().resolve(),
+                  (Path.home() / "ghostspiral").resolve(),
+                  (Path.home() / "GhostSpiral").resolve()]
+        _covered = any(_res == r or r in _res.parents for r in _roots)
+    except OSError:
+        _covered = False
+    if not _covered:
+        print(f"  [!] {_out} is outside every directory paranoia_mode searches.")
+        print(f"  [!] This file holds the holding size, its fiat value and the "
+              f"venue. The wipe will NOT find it — erase it yourself, or pass "
+              f"--search-dir {_res} to paranoia_mode.")
+        integrity_log("exit", "outfile_outside_wipe_roots")
+    atomic_write_json(plan, _out)
 
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")

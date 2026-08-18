@@ -1639,6 +1639,88 @@ check("address_index 0 is accepted (it is a real index, not 'missing')",
 
 
 # ---------------------------------------------------------------------------
+# get_subaddress_balance must not trust per_subaddress POSITIONALLY.
+# The answer is reported as "the balance of the address you are watching" --
+# receive_watch prints PAID on it, GhostSpiral plans a spend from it -- and it
+# was read out of per_sub[0] without ever checking the entry's own indices.
+# Measured on real wallet-rpc 0.18.3.1: asking about an index the wallet does
+# NOT have returns HTTP 200 with a synthesised zero entry carrying that index,
+# so the reply's shape is not self-evidently trustworthy.
+# ---------------------------------------------------------------------------
+class _Bk:
+    def __init__(self, per): self.per = per
+    def raw_request(self, m, p): return {"per_subaddress": self.per}
+
+
+def _bal(per, acct=0, idx=7):
+    r = gs.MoneroRPC.__new__(gs.MoneroRPC)
+    r._backend = _Bk(per)
+    return r.get_subaddress_balance(account_index=acct, address_index=idx)
+
+
+check("the matching entry's balance is returned",
+      _bal([{"account_index": 0, "address_index": 7,
+             "balance": 5, "unlocked_balance": 4}]) == (5, 4))
+check("...found by INDEX even when it is not first in the list",
+      _bal([{"account_index": 0, "address_index": 3, "balance": 999,
+             "unlocked_balance": 999},
+            {"account_index": 0, "address_index": 7, "balance": 5,
+             "unlocked_balance": 4}]) == (5, 4))
+for _per, _why in [
+    ([{"account_index": 0, "address_index": 3, "balance": 999,
+       "unlocked_balance": 999}], "a DIFFERENT subaddress"),
+    ([{"account_index": 9, "address_index": 7, "balance": 999,
+       "unlocked_balance": 999}], "the right index in the WRONG account"),
+    ([{"balance": 999, "unlocked_balance": 999}], "an entry with no index"),
+]:
+    _raised = False
+    try:
+        _bal(_per)
+    except RuntimeError:
+        _raised = True
+    check(f"a reply describing {_why} is REFUSED, not reported as ours", _raised)
+check("an empty per_subaddress is still a clean zero", _bal([]) == (0, 0))
+
+
+# ---------------------------------------------------------------------------
+# env_or_argv: the environment WINNING does not make argv safe.
+# The old shape was `if env: return / elif argv: warn`, so supplying both
+# skipped the warning AND the integrity-chain entry -- while the value sat in
+# /proc/<pid>/cmdline (0444) all the same -- and silently discarded the
+# operator's typed value with no mention that the two disagreed.
+# ---------------------------------------------------------------------------
+import io as _io, contextlib as _ctx
+_seen_logs = []
+_real_ilog = gs.integrity_log
+gs.integrity_log = lambda st, m, **k: _seen_logs.append(f"{st}:{m}")
+try:
+    os.environ["GS_TEST_BOTH"] = "111"
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _v = gs.env_or_argv("GS_TEST_BOTH", "222", "The test value")
+    _out = _buf.getvalue()
+    check("the environment value still wins", str(_v) == "111")
+    check("...but the operator IS warned that argv also carried it",
+          "command line" in _out)
+    check("...and the disagreement is surfaced", "DISAGREE" in _out)
+    check("...and it reaches the integrity chain",
+          any("on_argv_and_env" in l for l in _seen_logs))
+
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _v = gs.env_or_argv("GS_TEST_BOTH", None, "The test value")
+    check("env alone stays quiet", _buf.getvalue().strip() == "")
+    os.environ.pop("GS_TEST_BOTH", None)
+    _buf = _io.StringIO()
+    with _ctx.redirect_stdout(_buf):
+        _v = gs.env_or_argv("GS_TEST_BOTH", "222", "The test value")
+    check("argv alone still warns and is returned",
+          str(_v) == "222" and "command line" in _buf.getvalue())
+finally:
+    gs.integrity_log = _real_ilog
+    os.environ.pop("GS_TEST_BOTH", None)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

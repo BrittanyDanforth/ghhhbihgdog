@@ -227,8 +227,15 @@ ACTIONS = {
                         "build": lambda p: [PY, "receive_watch",
                                             "--receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", "")]
-                                           + (["--pairs", p["pairs_file"]] if p.get("pairs_file")
-                                              else ["--any"])},
+                                           + ["--pairs", p.get("pairs_file") or "thor_pairs.json"]},
+    # NOT "--any" when the field is blank. The swap_quote action two entries
+    # above defaults the SAME blank field to "thor_pairs.json" and writes the
+    # quote there -- so the GUI's default flow produced a quote file and then
+    # watched with no target at all, discarding the expected amount, the
+    # under-delivery check and the shortfall report, and firing on any dust
+    # that reached the address. The two actions must agree on the default, and
+    # the one that reads must not silently weaken what the one that writes
+    # produced. --any stays available from the CLI, where it is explicit.
 
     # the pipeline itself — this one moves money
     "run_pipeline":    {"group": "Pipeline", "label": "Run pipeline", "risk": "spends",

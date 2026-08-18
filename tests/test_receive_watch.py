@@ -107,12 +107,49 @@ allp = rw.load_pairs(pf)
 mine = rw.pairs_for_dest(allp, DEST)
 check("pairs: only pairs whose dest_xmr is this address are kept", len(mine) == 2)
 check("pairs: a swap to a DIFFERENT destination never inflates the target",
-      rw.expected_total(mine) == Decimal("2.0"))
+      rw.expected_total(mine)[0] == Decimal("2.0"))
 check("pairs: the other destination's 9.0 XMR is excluded",
-      rw.expected_total(allp) != rw.expected_total(mine))
+      rw.expected_total(allp)[0] != rw.expected_total(mine)[0])
 check("pairs: unreadable expected_xmr counts as 0, not a crash",
-      rw.expected_total([pair(DEST, "not-a-number"), pair(DEST, "1.0")])
+      rw.expected_total([pair(DEST, "not-a-number"), pair(DEST, "1.0")])[0]
       == Decimal("1.0"))
+
+# ...but it must also SAY it did. A quote it could not read used to vanish into
+# a smaller target with no mention: three swaps whose 2nd and 3rd quotes are
+# unreadable produced a target of only the first, so the watch reported "PAID"
+# and offered to mix once a third of the money had arrived. The count is
+# returned so the caller can surface it.
+_tot, _bad = rw.expected_total([pair(DEST, "3.0"), pair(DEST, "junk"),
+                                pair(DEST, "0")])
+check("pairs: the number of unreadable quotes is reported, not swallowed",
+      _bad == 2 and _tot == Decimal("3.0"))
+check("pairs: a fully readable set reports zero unreadable",
+      rw.expected_total(mine)[1] == 0)
+# and main() must actually print it. Joined from the AST's string constants,
+# because the message is split across f-string continuations -- a literal
+# substring search for the sentence fails on the line break, which is how this
+# check first went red.
+import ast as _ast0
+_rw_src = open(os.path.join(REPO, "receive_watch")).read()
+_m0 = next(n for n in _ast0.walk(_ast0.parse(_rw_src))
+           if isinstance(n, _ast0.FunctionDef) and n.name == "main")
+_pr0 = []
+for _n0 in _ast0.walk(_m0):
+    if (isinstance(_n0, _ast0.Call) and isinstance(_n0.func, _ast0.Name)
+            and _n0.func.id == "print"):
+        for _a0 in _n0.args:
+            _pr0.append("".join(
+                c.value for c in _ast0.walk(_a0)
+                if isinstance(c, _ast0.Constant) and isinstance(c.value, str)))
+_ptext0 = "\n".join(_pr0)
+check("main() warns when the target was built from only some of the pairs",
+      "contribute NOTHING to the target" in _ptext0)
+
+# A shortfall INSIDE --tolerance is still a shortfall and must be named. The
+# aggregator knows the default is 10%; skimming just inside it was reported as
+# an unqualified success.
+check("main() reports how far a 'PAID' result fell below the quote",
+      "BELOW the" in _ptext0 and "tolerance, so it counts as paid" in _ptext0)
 def _rej(path):
     try:
         rw.load_pairs(path)

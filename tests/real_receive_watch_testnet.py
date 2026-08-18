@@ -193,7 +193,11 @@ try:
               "deposit": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
               "memo": f"=:XMR.XMR:{RECV}", "dest_xmr": RECV,
               "expected_xmr": "3.2", "ts": 1700000000}]
-    target = rw.expected_total(rw.pairs_for_dest(pairs, RECV))
+    # expected_total returns (total, n_unreadable): an unreadable quote used to
+    # vanish into a smaller target with no mention, so the count comes back for
+    # the caller to surface.
+    target, _unreadable = rw.expected_total(rw.pairs_for_dest(pairs, RECV))
+    check("every quote in the pairs file was readable", _unreadable == 0)
     floor_ = rw.accept_floor(target, Decimal("0.10"))
     check("a 3.2 XMR quote with 10% tolerance accepts the 3.0 that really arrived",
           target == Decimal("3.2") and floor_ <= Decimal("3.0"))

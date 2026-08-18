@@ -109,10 +109,23 @@ def pairs_for_dest(pairs: list, dest_addr: str) -> list:
     return [p for p in pairs if p.get("dest_xmr") == dest_addr]
 
 
-def expected_total(pairs: list) -> Decimal:
-    """Sum of quoted XMR output across pairs. Unreadable/absent quotes count 0,
-    matching thor_swap_preparer, which already warned about them at quote time."""
+def expected_total(pairs: list) -> tuple:
+    """Sum of quoted XMR output. Returns (total, n_unreadable).
+
+    An unreadable or zero quote used to be counted as 0 and never mentioned
+    again, on the grounds that thor_swap_preparer had already warned at quote
+    time -- a warning from a different run, hours earlier, on a different
+    screen. The effect: three swaps whose second and third quotes are
+    unreadable produce a target of ONLY THE FIRST, so the watch reports "PAID"
+    and offers to mix when one third of the money has arrived, and the operator
+    is never told the target was built from one pair out of three.
+
+    The count comes back so the caller can say so out loud. Deflating a target
+    silently is the one thing a tool that decides "has the money arrived?" must
+    not do.
+    """
     tot = Decimal(0)
+    unreadable = 0
     for p in pairs:
         try:
             v = Decimal(str(p.get("expected_xmr") or "0"))
@@ -120,7 +133,9 @@ def expected_total(pairs: list) -> Decimal:
             v = Decimal(0)
         if v > 0:
             tot += v
-    return tot
+        else:
+            unreadable += 1
+    return tot, unreadable
 
 
 def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
@@ -203,7 +218,8 @@ CHOICES = [
 ]
 
 
-def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str) -> list:
+def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
+                      rpc_url: str = "") -> list:
     """The exact argv for a chosen mix. Returns [] for the do-nothing choice.
 
     Built as a list, never a string: it is printed for the operator to run, and
@@ -214,7 +230,16 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str) -> list
         return []
     argv = [sys.executable, "GhostSpiral",
             "--receive-wallet", receive_wallet,
-            "--tor-proxy", tor_proxy,
+            "--tor-proxy", tor_proxy]
+    # Carry the endpoint this watch actually used. The docstring calls this
+    # "the exact argv for a chosen mix", but it omitted the RPC entirely:
+    # receive_watch resolves it from --rpc or the bundle's rpc_endpoint, while
+    # GhostSpiral falls back to its own default of 127.0.0.1:18083. An operator
+    # whose wallet-rpc is anywhere else got a command pointed at the wrong
+    # daemon -- from the tool that had just been talking to the right one.
+    if rpc_url:
+        argv += ["--rpc-primary", rpc_url]
+    argv += [
             "--wallets", str(f["wallets"]),
             "--deep", str(f["deep"]),
             "--fee-priority", str(f["fee_priority"])]
@@ -601,6 +626,19 @@ def main():
 
     if args.tolerance < 0 or args.tolerance >= 1:
         sys.exit("[!] --tolerance must be >= 0 and < 1.")
+    # --tolerance was validated twice; these two had no bounds at all.
+    # --stall-min 0 opens the stall gate on the very first tick, so a perfectly
+    # healthy wallet is declared stuck or short before it has had a chance to
+    # scan anything; --timeout-min 0 expires the watch before the first poll.
+    if args.stall_min < 1:
+        sys.exit("[!] --stall-min must be at least 1 minute. A zero stall window "
+                 "reports a healthy wallet as stuck on its first tick.")
+    if args.timeout_min < 1:
+        sys.exit("[!] --timeout-min must be at least 1 minute.")
+    if args.stall_min > args.timeout_min:
+        print(f"  [!] --stall-min ({args.stall_min}) exceeds --timeout-min "
+              f"({args.timeout_min}), so the shortfall check can never run — "
+              f"this watch can only ever time out.")
 
     try:
         bundle = load_receive_bundle(args.receive_wallet)
@@ -628,7 +666,15 @@ def main():
                 f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
                 f"    this receive address ({scrub_address(dest)}).\n"
                 f"    Watching it would wait for a payment that is going somewhere else.")
-        target = expected_total(matched)
+        target, _unreadable = expected_total(matched)
+        if _unreadable:
+            print(f"  [!] {_unreadable} of {len(matched)} swap pair(s) carry no "
+                  f"readable expected_xmr, so they contribute NOTHING to the "
+                  f"target.")
+            print(f"  [!] The target below is built from {len(matched) - _unreadable} "
+                  f"pair(s) only — the watch will report success once THOSE have "
+                  f"landed, even if the others never do.")
+            integrity_log("recv", f"quotes_unreadable:{_unreadable}_of_{len(matched)}")
     if args.expect_xmr is not None:
         target = args.expect_xmr
     if args.any:
@@ -781,6 +827,22 @@ def main():
         return 1
 
     print(f"\n  [+] PAID: {fmt(r['unlocked'])} XMR unlocked on the receive subaddress.")
+    # Say what was QUOTED, not just what arrived.
+    #
+    # The floor sits --tolerance (default 10%) below the quote, so anything in
+    # that band printed as an unqualified "PAID" and the quoted figure was
+    # never mentioned again. Under Kerckhoffs the aggregator knows the default,
+    # and a provider that skims just inside it is indistinguishable here from
+    # one that paid in full -- across many swaps that is a systematic loss the
+    # operator is never shown. The tolerance exists because rates move; it is
+    # not a reason to stop reporting the difference.
+    if target > 0 and r["unlocked"] < target:
+        _short = target - r["unlocked"]
+        _pct = (_short / target * 100).quantize(Decimal("0.1"))
+        print(f"  [!] That is {fmt(_short)} XMR ({_pct}%) BELOW the {fmt(target)} XMR "
+              f"quoted — inside the {args.tolerance * 100:.0f}% tolerance, so it "
+              f"counts as paid, but it is a real shortfall.")
+        integrity_log("recv", "paid_under_quote")
     _pending = r.get("pending") or Decimal(0)
     if _pending > 0:
         # The target was reached while more is still confirming. Mixing now
@@ -812,7 +874,7 @@ def main():
               f"subaddress.")
         return 0
 
-    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy)
+    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy, rpc_url)
     print(f"\n  [+] {c['name']} — run this to start the mix:\n")
     print("      " + format_mix_command(argv))
     print("\n  This tool does not spend. Nothing moves until you run that command,")

@@ -711,10 +711,33 @@ class MoneroRPC:
             "address_indices": [address_index],
         })
         per_sub = res.get("per_subaddress", [])
-        if per_sub:
-            entry = per_sub[0]
-            return entry.get("balance", 0), entry.get("unlocked_balance", 0)
-        return 0, 0
+        if not per_sub:
+            return 0, 0
+        # VERIFY the entry describes the subaddress we asked about.
+        #
+        # This took per_sub[0] positionally and read its balance, without ever
+        # checking the entry's own account_index/address_index. The answer is
+        # then reported as "the balance of the address you are watching" --
+        # receive_watch prints "PAID" on it, GhostSpiral plans a spend from it.
+        # A response whose first element describes a DIFFERENT subaddress would
+        # be believed silently.
+        #
+        # Measured against real monero-wallet-rpc 0.18.3.1: asking for an index
+        # the wallet does not have returns HTTP 200 with a SYNTHESISED
+        # zero-balance entry carrying that index -- so the RPC is comfortable
+        # answering about things that do not exist, and the shape of the reply
+        # is not self-evidently trustworthy. Match the indices explicitly and
+        # fail closed rather than pick an element by position.
+        want_a, want_i = int(account_index), int(address_index)
+        for entry in per_sub:
+            if (entry.get("address_index") == want_i
+                    and entry.get("account_index", want_a) == want_a):
+                return entry.get("balance", 0), entry.get("unlocked_balance", 0)
+        raise RuntimeError(
+            f"get_balance answered about subaddress(es) "
+            f"{[e.get('address_index') for e in per_sub]} when asked about "
+            f"account {want_a} index {want_i}. Refusing to report another "
+            f"address's balance as this one's.")
 
 
 def connect_rpc(url: str, proxy_url: Optional[str] = None) -> MoneroRPC:
@@ -877,6 +900,23 @@ def env_or_argv(env_name: str, argv_value, label: str, cast=None):
     """
     raw = os.environ.get(env_name)
     if raw is not None and raw != "":
+        # The environment WINS, but argv is still argv. When both are supplied
+        # the value is sitting in /proc/<pid>/cmdline (mode 0444) for the
+        # lifetime of the process regardless of which one this function
+        # returns, and the old `if env: return / elif argv: warn` shape meant
+        # the warning -- and the integrity-chain entry -- were skipped in
+        # exactly that case. It also discarded the operator's typed value in
+        # silence, so a mismatch between the two was never surfaced.
+        if argv_value is not None:
+            print(f"  [!] {label} was ALSO passed on the command line, where any "
+                  f"local user can read it via ps or /proc/<pid>/cmdline (mode "
+                  f"444). {env_name} takes precedence and was used; the "
+                  f"command-line copy is still exposed.")
+            if str(argv_value) != str(raw):
+                print(f"  [!] They DISAGREE — the environment value was used. "
+                      f"Re-run with only one of them if that is not what you "
+                      f"meant.")
+            integrity_log("argv", f"warn:{env_name}_on_argv_and_env")
         return cast(raw) if cast else raw
     if argv_value is not None:
         print(f"  [!] {label} was passed on the command line, where any local "
