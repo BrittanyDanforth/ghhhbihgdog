@@ -73,10 +73,10 @@ def mine(addr, target):
     draw("/stop_mining")
 
 
-def subbal(idx):
+def subbal(idx, acct=0):
     wj("refresh")
-    r = wj("get_balance", {"account_index": 0, "address_indices": [idx]})["result"]
-    e = r.get("per_subaddress", [])
+    r = wj("get_balance", {"account_index": acct, "address_indices": [idx]})["result"]
+    e = [x for x in r.get("per_subaddress", []) if x.get("address_index") == idx]
     return (e[0].get("balance", 0), e[0].get("unlocked_balance", 0)) if e else (0, 0)
 
 
@@ -120,6 +120,10 @@ try:
     wj("transfer_split", {"destinations": [{"amount": int(6 * ATOMIC), "address": entry["address"]}],
                           "account_index": 0, "subaddr_indices": [0], "priority": 1})
     h = dj("get_info")["result"]["height"]; mine(primary, h + 12); wj("refresh")
+    # An EMPTY account. Every plan entry names its own account, so meta's value
+    # must never be used; pointing it at an account with no funds turns "the
+    # signer ignored the per-TX account" from a silent pass into a hard failure.
+    DECOY_ACCT = wj("create_account", {"label": ""})["result"]["account_index"]
     vk = wj("query_key", {"key_type": "view_key"})["result"]["key"]
     print(f"ENTRY subaddr {E} funded {subbal(E)[0] / 1e12} XMR")
 
@@ -133,8 +137,22 @@ try:
     # test's value is proving the rotation survives the air-gapped round trip
     # -- the offline signer must sign a spend of a carrier output it only
     # learns about via the outputs export.
-    carriers = [wj("create_address", {"account_index": 0})["result"] for _ in range(N - 1)]
+    # ONE ACCOUNT PER HOP, as the shipped planner does: Monero returns change
+    # to the SPENDING account's subaddress 0, so hops that share an account
+    # pile their change onto one subaddress and the sweep that collects it is
+    # a single N-input transaction -- public proof that all N peels are one
+    # owner. Carrying that through the COLD path is the point: the per-TX
+    # account has to survive plan -> phase_create -> phase_sign -> broadcast.
+    hop_accounts = [wj("create_account", {"label": ""})["result"]["account_index"]
+                    for _ in range(N - 1)]
+    carriers = [wj("create_address", {"account_index": a})["result"]
+                for a in hop_accounts]
     carrier_pairs = [(c["address"], c["address_index"]) for c in carriers]
+    # Which account each peel SPENDS from: peel 0 spends ENTRY in account 0,
+    # peel i>0 spends carrier i-1 in that carrier's own account.
+    peel_accounts = [0] + hop_accounts
+    check("cold: every hop was given its own account",
+          len(set(peel_accounts)) == N)
     _hop = (Decimal("0.05") * ghost.PEEL_CARRIER_RESERVE_MULT
             / Decimal("1.5") * ghost.FEE_SAFETY_MARGIN)
     remainders = [sum(amounts[i + 1:]) + _hop * (N - i - 1) for i in range(N - 1)]
@@ -143,7 +161,8 @@ try:
     check("cold: no peel spends subaddr 0 (MAIN)",
           all(p["src_index"] != 0 for p in plan))
     check("cold: every peel spends a distinct address",
-          len({p["src_index"] for p in plan}) == len(plan))
+          len({(peel_accounts[i], p["src_index"])
+               for i, p in enumerate(plan)}) == len(plan))
     planned = [int((a * ATOMIC).to_integral_value()) for a in amounts]
     print("peel amounts:", [str(a) for a in amounts])
 
@@ -189,17 +208,19 @@ try:
                            for d in p["destinations"]) + int(ATOMIC // 20)
             else:
                 need = planned[i] + int(ATOMIC // 20)
+            _sa = peel_accounts[i]
             for _ in range(80):
-                if subbal(src)[1] >= need:
+                if subbal(src, _sa)[1] >= need:
                     break
                 h = dj("get_info")["result"]["height"]; mine(primary, h + 2)
-            check(f"peel {i}: view-only sees rotating carrier {src} unlocked",
-                  subbal(src)[1] >= need)
+            check(f"peel {i}: view-only sees rotating carrier {_sa}/{src} unlocked",
+                  subbal(src, _sa)[1] >= need)
 
         # Carry the carrier output through to the signer. Without it the cold
         # path would forward nothing and the next peel would have no carrier
         # to spend -- the rotation would silently degrade back to the hub.
         one = [{"src": "ENTRY" if i == 0 else "CARRIER", "src_index": p["src_index"],
+                "account_index": peel_accounts[i],
                 "dst": p["dst"], "amt": p["amt"], "delay": 0}]
         if p.get("destinations"):
             one[0]["destinations"] = p["destinations"]
@@ -208,7 +229,7 @@ try:
         # SHIPPED phase_create (online, view-only) -> unsigned + outputs_export
         airgap.phase_create(
             A(tor_proxy="socks5h://127.0.0.1:9050", rpc=WR.replace("/json_rpc", ""),
-              outdir=stage, fee_priority=1), one, {"account_index": 0})
+              outdir=stage, fee_priority=1), one, {"account_index": DECOY_ACCT})
         check(f"peel {i + 1}/{N}: SHIPPED phase_create built the unsigned tx",
               os.path.exists(os.path.join(stage, "tx_0.unsigned")))
         if i == 0:

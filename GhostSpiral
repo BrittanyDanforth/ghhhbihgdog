@@ -2517,22 +2517,22 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
 
     sweep_all can only spend UNLOCKED outputs -- proven on a real chain: a
     subaddress holding 2 XMR unlocked and 3 XMR still locked swept the 2 and
-    LEFT THE 3 BEHIND. That matters here because a PEELING CHAIN produces one
-    change output PER PEEL, all to this same subaddress. The old wait asked
-    only for DUST_XMR to be unlocked, which peel 0's change satisfies long
-    before the last peel's change has confirmed -- so the sweep ran early, took
-    what had unlocked, abandoned the rest, and the caller then printed
-    "nothing is parked on the change address".
+    LEFT THE 3 BEHIND, while the caller printed "nothing is parked on the
+    change address". The old wait asked only for DUST_XMR to be unlocked,
+    which is satisfied the moment ANY change confirms.
 
-    A fan-out has exactly one distribution transaction, so waiting for "some
-    unlocked change" and waiting for "all the change" were the same thing
-    there. They stopped being the same thing when the peel chain was added, and
-    nothing noticed.
+    That was found when a peel chain put every hop's change on one subaddress,
+    where peel 0's change satisfied the wait long before the last peel's had
+    confirmed. Each hop now runs in its own account, so this is called once per
+    hop and each call watches a subaddress holding exactly one output -- but
+    the guard is not obsolete, it is just no longer racing several outputs
+    against each other. A single change output is still locked for ~10 blocks
+    after its peel confirms, and sweeping before then sweeps nothing at all.
 
     "Nothing still confirming" (total == unlocked) is the right condition
     because it is the sweep's ACTUAL precondition, rather than a guess at how
     much change to expect -- which cannot be known in advance, since it is
-    whatever the real fees left over.
+    whatever the real fee left over.
     """
     try:
         rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
@@ -2540,9 +2540,9 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
         integrity_log("stage5", f"change_settle_rpc_fail:{str(e)[:40]}")
         print(f"  [!] {label}: cannot connect wallet-rpc to await the change: {e}")
         return False, 0
-    print(f"  [*] {label}: waiting for ALL of the distribution's change to "
-          f"confirm on subaddr {sub_idx} (a peel chain leaves one change output "
-          f"per peel; sweeping early would strand the later ones)...")
+    print(f"  [*] {label}: waiting for the change on account {account} / subaddr "
+          f"{sub_idx} to confirm and unlock (sweep_all can only spend unlocked "
+          f"outputs, so sweeping early sweeps nothing)...")
     waited = 0
     while waited < FANOUT_CONFIRM_TIMEOUT:
         if shutdown_requested():

@@ -422,6 +422,22 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                     "do_not_relay": True,
                 })
             else:
+                # A peel pays its mix destination AND the next carrier, so
+                # transfer_split leaves a change output and the transaction is
+                # 1-in/3-out. Two outputs is by far the commonest shape on the
+                # network, so the obvious improvement is to spend the input
+                # EXACTLY and have no change -- which is what
+                # subtract_fee_from_outputs is for.
+                #
+                # DO NOT ADD IT. Monero v0.18.3.1 (wallet RPC 1.26) accepts the
+                # field and silently ignores it: measured, a transfer_split
+                # carrying subtract_fee_from_outputs delivered both
+                # destinations their FULL requested amounts, still produced the
+                # change output, and charged an identical fee -- and an
+                # out-of-range output index in that list is accepted without
+                # any error, which is how you can tell the field is never
+                # parsed. epee drops unknown JSON fields, so adding it would
+                # look like a fix, change nothing, and read as done.
                 result = rpc.raw_request("transfer_split", {
                     "destinations": dests,
                     "account_index": tx_acct,
