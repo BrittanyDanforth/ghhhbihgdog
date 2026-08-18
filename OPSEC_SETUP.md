@@ -218,6 +218,29 @@ the balances, the transaction history and every subaddress a run created:
 the whole mix graph. Section 6's "door kick, they take the ThinkPad → partly"
 is exactly this.
 
+**Where the wipe reaches (and where it did not)**
+
+`paranoia_mode`'s Temp files phase sweeps `/tmp` and `/var/tmp` wholesale for
+anything you own. It now also sweeps **`/dev/shm` and `$TMPDIR`** — but only
+for this toolchain's own scratch names (`gs_sign_*`, `gs_impout_*`,
+`.gs_pw_*`), never wholesale.
+
+That gap mattered because `airgap_tx_signer` *prefers* `/dev/shm` for its two
+worst artifacts: the plaintext wallet password, and the wallet output-set blob
+(a map of your holdings). Both are erased in a `finally`, so a normal run left
+nothing — but a SIGKILL, an OOM kill or a power cut runs no `finally`, and
+`/dev/shm` is a tmpfs that survives all but the power cut. Choosing RAM-backed
+scratch made those files *more* dangerous to leave behind, not less: what is
+there is the copy that existed at the moment things went wrong.
+
+`$TMPDIR` was the same story for `gs_sign_*`, which holds a signed, relayable
+transaction: `mkdtemp()` honours `TMPDIR`, and the sweep only knew `/tmp`.
+
+The targeting is deliberate and must stay that way. `/dev/shm` holds live
+segments belonging to Chromium, PostgreSQL and PulseAudio under your own uid —
+wiping it wholesale breaks running software — and `TMPDIR` can legitimately
+point at `$HOME`.
+
 Subaddresses are therefore created with **no label**. They used to be tagged
 `Mix_0`, `Decoy_3`, `Carrier_2`, `ChangeSweep`, `GhostSpiral_entry` — local
 only, invisible on-chain, and a complete annotated map to anyone who opens the

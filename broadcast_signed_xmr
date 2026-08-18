@@ -34,7 +34,7 @@ import requests
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json, check_daemon_relay_egress,
-    install_signal_handlers, shutdown_requested,
+    install_signal_handlers, shutdown_requested, redact_addresses,
 )
 
 _LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
@@ -781,7 +781,14 @@ def main():
                     break
 
                 ecode = err.get("code") if isinstance(err, dict) else None
-                emsg = str(err.get("message", "") or res)[:160]
+                # redact_addresses first: this is the NODE's text, not ours,
+                # and the `or res` fallback stringifies the WHOLE RPC response
+                # when there is no message field -- whatever that happens to
+                # contain. wallet-rpc errors quote addresses back at the caller
+                # for several conditions, and this line is printed on every
+                # retry. Redacting is unconditional so it does not depend on
+                # knowing which messages do.
+                emsg = redact_addresses(str(err.get("message", "") or res))[:160]
                 emsg_l = emsg.lower()
                 print(f"  Node: {emsg[:80]}")
                 # Classification uses the wallet-rpc error CODE where it's a
@@ -818,8 +825,13 @@ def main():
                     break
                 # anything else: treat as transient and retry on a new circuit
             except Exception as e:
-                integrity_log("broadcast", f"error:idx={real_idx}:{str(e)[:40]}")
-                print(f"  [!] Error: {str(e)[:80]}")
+                # Same reasoning: an exception raised while talking to the
+                # node can carry the URL or the response body in its message,
+                # and this goes to BOTH the terminal and the integrity chain
+                # (which is a file on disk).
+                _emsg = redact_addresses(str(e))
+                integrity_log("broadcast", f"error:idx={real_idx}:{_emsg[:40]}")
+                print(f"  [!] Error: {_emsg[:80]}")
 
             attempts -= 1
             if attempts > 0:

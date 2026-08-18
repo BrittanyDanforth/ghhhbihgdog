@@ -45,6 +45,7 @@ ACTIONS = {
     "gapfixes":    {**suite("test_gapfixes", "MAC-spoof restore/leak, exit-sim --redact"), "group": "Offline suites"},
     "swaprecv":    {**suite("test_swap_receive", "swap memo binding, slippage stop, receive addr"), "group": "Offline suites"},
     "console":     {**suite("test_console", "password scope, no invented fees, egress, HTTP gates"), "group": "Offline suites"},
+    "shmwipe":     {**suite("test_shmwipe", "/dev/shm + $TMPDIR scratch is wiped, other software's is not"), "group": "Offline suites"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},

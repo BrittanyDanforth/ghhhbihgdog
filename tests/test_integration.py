@@ -552,6 +552,72 @@ check("E: malformed hash length rejected by the validator",
                              "entries": [_entry(hash="abc")]},
                             "64-char sha256"))
 
+# --- E2: the manifest must be COMPLETE, not merely authentic ---------------
+# The fingerprint is computed over the PLAN, so deleting manifest entries
+# leaves it matching perfectly. Two ways that happens:
+#   * phase_create exits 1 on a failed TX but has ALREADY written a manifest
+#     containing only the entries that succeeded. Carry that staging dir
+#     forward and every prior check passes.
+#   * anyone who can edit the manifest in transit can delete an entry -- no
+#     forgery, no key -- and drop the hop that moves funds off an address they
+#     are watching.
+# Either way the plan is a CHAIN, so signing a subset relays the early hops and
+# strands the funds mid-mix while reporting success. phase_sign's own gapped-
+# batch guard cannot catch it: it compares signed_count to len(ENTRIES), the
+# already-shrunken list.
+_E2_PLAN = [
+    {"src": "A", "src_index": 0, "dst": "B", "amt": "0.1", "delay": 0},
+    {"src": "B", "src_index": 1, "dst": "C", "amt": "0.2", "delay": 0},
+    {"src": "C", "src_index": 2, "dst": "D", "amt": "0.3", "delay": 0},
+]
+_E2_FP = airgap._compute_plan_fingerprint(_E2_PLAN)
+for _i in (0, 1, 2):
+    (_E_dir / f"tx_{_i}.unsigned").write_text("00")
+
+
+def _e2_entry(i):
+    return {"idx": i, "file": str(_E_dir / f"tx_{i}.unsigned"),
+            "hash": _E_HASH, "dst": "X", "amt": "0.1", "delay": 0}
+
+
+check("E2: a COMPLETE 3-entry manifest still signs",
+      _run_sign({"plan_fingerprint": _E2_FP,
+                 "entries": [_e2_entry(i) for i in (0, 1, 2)]},
+                plan=_E2_PLAN) == "SIGNED")
+
+# the partial-create case: the middle TX failed to build
+_r = _run_sign({"plan_fingerprint": _E2_FP,
+                "entries": [_e2_entry(0), _e2_entry(2)]}, plan=_E2_PLAN)
+check("E2: a manifest missing a middle TX is REFUSED", _r.startswith("REFUSED"))
+check("E2: ...and the refusal names the missing index", "[1]" in _r)
+check("E2: ...and says a partial batch strands funds", "strand" in _r.lower())
+
+# truncation at the end -- the shape a killed phase_create leaves
+check("E2: a manifest truncated at the end is REFUSED",
+      _run_sign({"plan_fingerprint": _E2_FP,
+                 "entries": [_e2_entry(0), _e2_entry(1)]},
+                plan=_E2_PLAN).startswith("REFUSED"))
+
+# a single surviving entry -- the fingerprint alone would still pass
+check("E2: a one-entry manifest for a 3-TX plan is REFUSED",
+      _run_sign({"plan_fingerprint": _E2_FP, "entries": [_e2_entry(0)]},
+                plan=_E2_PLAN).startswith("REFUSED"))
+
+# and an EXTRA entry the plan does not contain
+_r = _run_sign({"plan_fingerprint": _E2_FP,
+                "entries": [_e2_entry(i) for i in (0, 1, 2)] +
+                           [dict(_e2_entry(0), idx=9)]}, plan=_E2_PLAN)
+check("E2: an entry with an index the plan does not have is REFUSED",
+      _r.startswith("REFUSED"))
+check("E2: ...and the refusal names the unexpected index", "[9]" in _r)
+
+# renumbered (right count, wrong indices) -- passes the count check a naive
+# len() comparison would have used, so the check must be on the index SET
+check("E2: a renumbered manifest (right count, wrong indices) is REFUSED",
+      _run_sign({"plan_fingerprint": _E2_FP,
+                 "entries": [_e2_entry(0), _e2_entry(1), dict(_e2_entry(2), idx=5)]},
+                plan=_E2_PLAN).startswith("REFUSED"))
+
 # ===========================================================================
 # F. PEELING CHAIN orchestration: drive the SHIPPED _run_peel_chain with the
 #    subprocess (signer/broadcast) and wallet-rpc mocked, so the loop, the

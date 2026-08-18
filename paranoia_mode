@@ -18,7 +18,7 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, shutil, socket, subprocess, sys, time
+import argparse, glob, os, random, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 from gs_common import (
@@ -427,6 +427,13 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # exactly the holdings picture a forensic reader wants -- so it must not
     # survive the wipe. Written 0600, but 0600 is not gone.
     "outputs_export.hex",
+    # The WALLET PASSWORD, in plaintext. airgap_tx_signer cannot hand a
+    # password to monero-wallet-cli on argv (/proc/<pid>/cmdline is mode 444 --
+    # any local user reads it), so it writes one 0600 file and feeds it via
+    # stdin redirection. It is deleted in a finally, but a SIGKILL runs no
+    # finally, and 0600 is not gone. Nothing here matched it before: the name
+    # starts with a dot and none of the patterns above are dotfile globs.
+    ".gs_pw_*",
     ".ghostspiral.lock",
     # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
     # Ctrl-C in that window leaves the partial file behind holding the SAME
@@ -455,7 +462,10 @@ GS_ARTIFACT_DIR_PATTERNS = [
     # airgap_tx_signer's multi-round output-import scratch (prefix="gs_impout_"),
     # which holds the wallet OUTPUT-SET blob. Normally /dev/shm (RAM) and wiped
     # in a finally, but a SIGKILL before that -- or a host with no /dev/shm, so
-    # it falls back to /tmp -- would leave the holdings map behind.
+    # it falls back to $TMPDIR -- would leave the holdings map behind. Neither
+    # of those two locations is a search_root here, which is why the Temp files
+    # phase now sweeps them by prefix (_wipe_targeted_temp_roots); this pattern
+    # only catches a copy left in the cwd or under $HOME.
     "gs_impout_*",
 ]
 
@@ -514,6 +524,89 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     return failed
 
 
+# Scratch names this toolchain creates OUTSIDE /tmp. Prefixes, not globs,
+# because these are matched with str.startswith against real directory entries.
+#   gs_sign_*   -- airgap_tx_signer's per-TX dir: holds unsigned_monero_tx and
+#                  the wallet-cli-produced signed_monero_tx (a RELAYABLE tx).
+#   gs_impout_* -- the multi-round output-import dir: holds the wallet
+#                  OUTPUT-SET blob, i.e. the holdings picture.
+#   .gs_pw_*    -- the wallet password in plaintext.
+GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_")
+
+
+def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
+    """Securely delete OUR scratch from temp roots we must not wipe wholesale.
+
+    Two roots were missed entirely, and both hold the worst material this
+    pipeline produces:
+
+    /dev/shm -- airgap_tx_signer PREFERS it for exactly the two files it most
+    wants gone quickly: the plaintext wallet password (.gs_pw_*) and the wallet
+    output-set scratch (gs_impout_*). Both are removed in a finally, so the
+    normal path was clean and the gap never showed in testing -- but a SIGKILL,
+    an OOM kill or a power loss runs no finally, and /dev/shm is a tmpfs that
+    survives every one of those short of the power loss. The module comment on
+    gs_impout_* already reasoned about precisely this SIGKILL case and then
+    named only /tmp as the fallback to cover, so the PREFERRED location went
+    uncovered. Choosing RAM-backed scratch made the file MORE sensitive to
+    leave behind, not less: it is the copy that exists when the crash happened.
+
+    $TMPDIR -- gs_sign_* is created with tempfile.mkdtemp(), which honours
+    TMPDIR. The blanket sweep hard-codes /tmp, so any operator with TMPDIR set
+    (common on shared hosts and inside some sandboxes) kept a signed, relayable
+    transaction on disk after a "successful" wipe.
+
+    These roots get PREFIX-TARGETED deletion, never the blanket uid-scoped
+    sweep /tmp gets. /dev/shm is shared infrastructure -- Chromium, PostgreSQL
+    and PulseAudio all keep live segments there owned by this same uid, and
+    wiping them would break running software. TMPDIR is worse: an operator can
+    legitimately point it at $HOME, and a blanket wipe would then destroy the
+    home directory. Matching our own prefixes is the only version of this that
+    is safe to run unattended.
+    """
+    count = 0
+    failed = 0
+    roots = ["/dev/shm", tempfile.gettempdir()]
+    seen = set(os.path.realpath(d) for d in already_done)
+    for root in roots:
+        try:
+            real = os.path.realpath(root)
+        except OSError:
+            continue
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        try:
+            entries = list(os.scandir(real))
+        except (PermissionError, OSError):
+            failed += 1
+            continue
+        for entry in entries:
+            if not entry.name.startswith(GS_TEMP_PREFIXES):
+                continue
+            try:
+                # lstat, so a symlink is judged by its OWN ownership rather
+                # than its target's -- otherwise a symlink planted by another
+                # user could aim this at a file we would then overwrite.
+                if os.lstat(entry.path).st_uid != uid:
+                    continue
+                if dry:
+                    print(f"  [dry] would securely remove {entry.path}")
+                    count += 1
+                    continue
+                p = Path(entry.path)
+                ok = (_secure_delete_dir(p)
+                      if entry.is_dir(follow_symlinks=False)
+                      else _secure_delete_file(p))
+                if ok:
+                    count += 1
+                else:
+                    failed += 1
+            except (PermissionError, OSError):
+                failed += 1
+    return count, failed
+
+
 def wipe_tmp_files(dry: bool):
     """SECURELY remove user-owned files from temp directories.
 
@@ -528,11 +621,16 @@ def wipe_tmp_files(dry: bool):
     Uses os.lstat (not entry.stat()) so a symlink in /tmp is judged by its own
     ownership rather than its target's -- and _secure_delete_file refuses to
     follow it regardless.
+
+    /tmp and /var/tmp get the blanket uid-scoped sweep. /dev/shm and $TMPDIR
+    are swept by PREFIX only -- see _wipe_targeted_temp_roots for why both are
+    real gaps and why neither may be wiped wholesale.
     """
     uid = os.getuid()
     count = 0
     failed = 0
-    for tmpdir in ["/tmp", "/var/tmp"]:
+    blanket = ["/tmp", "/var/tmp"]
+    for tmpdir in blanket:
         if not os.path.isdir(tmpdir):
             continue
         for entry in os.scandir(tmpdir):
@@ -553,6 +651,11 @@ def wipe_tmp_files(dry: bool):
                     failed += 1
             except (PermissionError, OSError):
                 failed += 1
+
+    c2, f2 = _wipe_targeted_temp_roots(dry, uid, blanket)
+    count += c2
+    failed += f2
+
     tail = f" ({failed} could not be removed)" if failed else ""
     print(f"  [+] {'Would securely remove' if dry else 'Securely removed'} "
           f"{count} temp entr{'y' if count == 1 else 'ies'}{tail}")

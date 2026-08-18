@@ -17,7 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
-import hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import errno, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
@@ -136,19 +136,54 @@ def secure_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     os.open() applies the mode at creation time, atomically. 0o600 has no
     group/other bits, so a umask cannot widen it (a umask can only clear bits),
     which makes this umask-safe as well -- confirmed 0o600 under umask 022.
+
+    O_NOFOLLOW, for the same reason secure_delete_file has it. Without it,
+    os.open FOLLOWS a symlink at `path` and writes THROUGH it -- demonstrated:
+    a planted `broadcast_progress.json -> victim.txt` had victim.txt
+    overwritten while the symlink itself survived, and the 0600 mode landed on
+    the symlink's TARGET, so this function's own guarantee was applied to
+    someone else's file. That is a write-where-I-want primitive for any local
+    user who can create a name in a directory this toolchain writes to: a
+    staging dir the operator made by hand under a shared path, or simply
+    running the relayer from /tmp, where broadcast_progress.json has a
+    predictable name.
+    
+    The delete primitive in this module already refused to follow symlinks and
+    documented exactly this reasoning; the write primitive beside it did not.
+    Same threat, same module, one of the pair defended.
+    
+    O_NOFOLLOW applies only to the FINAL path component, so a deliberately
+    symlinked staging DIRECTORY (a common, legitimate setup -- stage onto
+    another disk) still works. Only a symlink standing in for the output FILE
+    is refused, which nothing legitimate does.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     mode)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.EMLINK):
+            raise OSError(
+                f"Refusing to write {path}: it is a symbolic link. Writing "
+                f"through it would put this file's contents -- and its 0600 "
+                f"mode -- on whatever it points at, which is how a local user "
+                f"turns a predictable output name into a write primitive. "
+                f"Remove the link and re-run."
+            ) from e
+        raise
     try:
         with os.fdopen(fd, "wb", closefd=True) as f:
             fd = -1
             f.write(data)
             f.flush()
+            # fchmod on the OPEN descriptor, not chmod on the path: a
+            # pre-existing file keeps its old mode through O_CREAT and must
+            # still be narrowed, but doing it by path re-resolves the name and
+            # could land the chmod on a file swapped in after the open.
+            os.fchmod(f.fileno(), mode)
             os.fsync(f.fileno())
     finally:
         if fd >= 0:
             os.close(fd)
-    # A pre-existing file keeps its old mode through O_CREAT, so narrow it too.
-    secure_file_perms(path, mode)
 
 
 def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
@@ -906,6 +941,45 @@ def load_receive_bundle(path) -> dict:
 # ---------------------------------------------------------------------------
 #  Sensitive data scrubbing
 # ---------------------------------------------------------------------------
+
+#: Monero's base58 alphabet -- Bitcoin's, minus the visually ambiguous
+#: 0/O/I/l. A standard address is 95 chars, a subaddress 95, an integrated
+#: address 106; nothing else this toolchain prints is a 90+ char base58 run,
+#: so the length floor makes false positives effectively impossible while
+#: still catching all three forms and any future longer one.
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_ADDRESS_RE = re.compile(f"[{_B58}]{{90,}}")
+
+
+def redact_addresses(text: str) -> str:
+    """Mask every Monero address inside an arbitrary block of text.
+
+    For output this toolchain did NOT write -- specifically monero-wallet-cli's
+    stdout/stderr, which the signer prints when a step fails so the operator
+    can see why.
+
+    That output carries the wallet's PRIMARY ADDRESS unconditionally: every
+    invocation prints "Opened wallet: <95-char address>" at the default log
+    level (measured against monero-wallet-cli 0.18.3.1, no --log-level needed).
+    The primary address is the single value that ties an operator to every
+    subaddress in the mix, and the signer's error paths print fixed-length
+    slices of that output -- result.stdout[:200], and the tail of the combined
+    streams. Measured on the real binary, the address currently sits at offset
+    333 and lands in NEITHER window, so nothing leaks today. But that is an
+    accident of how long wallet-cli's startup banner happens to be: it is not a
+    documented interface, and a banner one warning shorter, a longer wallet
+    path, or a build that trims the help block slides the address straight into
+    a slice we print.
+
+    Redacting makes the property structural instead of measured -- true because
+    of what this function does, not because of a byte count in someone else's
+    release. scrub_address is the display form used everywhere else; this
+    applies it to text rather than to a single known value.
+    """
+    if not text:
+        return text
+    return _ADDRESS_RE.sub(lambda m: scrub_address(m.group(0)), str(text))
+
 
 def scrub_address(addr: str, visible: int = 8) -> str:
     """Mask an address for terminal display. NEVER returns the full value.

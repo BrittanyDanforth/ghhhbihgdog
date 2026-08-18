@@ -54,6 +54,11 @@ signed_blobs/
 tx_staging/
 .venv/
 
+# The wallet password, written 0600 by airgap_tx_signer because a password on
+# argv is world-readable via /proc/<pid>/cmdline. Deleted in a finally; a
+# SIGKILL leaves it, and it must never be committed if it does.
+.gs_pw_*
+
 # Wallet output-set export written by airgap_tx_signer phase_create so the
 # offline wallet can sign spends of earlier rounds. Maps the wallet holdings.
 outputs_export.hex

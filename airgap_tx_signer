@@ -37,6 +37,7 @@ from typing import List
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
+    redact_addresses,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
@@ -542,6 +543,60 @@ def _load_signing_manifest(outdir, plan: list) -> list:
     if not entries:
         sys.exit("[!] No unsigned TX entries in manifest")
     _validate_manifest_entries(entries, outdir)
+
+    # The manifest must be COMPLETE, not merely authentic.
+    #
+    # The fingerprint above proves the PLAN is the one this manifest was built
+    # for. It proves nothing about the manifest's own entry list, because the
+    # fingerprint is computed over the plan -- so dropping entries leaves it
+    # matching perfectly. Two ways that happens, one accidental and one not:
+    #
+    #   * phase_create exits 1 when a TX fails to build, but it has ALREADY
+    #     written the manifest, and it writes only the entries that succeeded.
+    #     Carry that staging dir to the offline machine and every check here
+    #     passes: the plan is untouched, so the fingerprint matches; the
+    #     surviving entries are individually well-formed. phase_sign then signs
+    #     them, finds signed_count == len(entries), and reports success. Its
+    #     partial-batch guard compares against len(ENTRIES) -- the already
+    #     shrunken list -- so it cannot see a gap that was created upstream.
+    #
+    #   * anyone able to edit the manifest in transit can delete entries. That
+    #     needs no fingerprint forgery and no key. Deleting the hop that moves
+    #     funds away from an observed address leaves that hop unmade while the
+    #     operator is told the batch signed cleanly.
+    #
+    # Either way a peel chain or DAG round is silently truncated: the earlier
+    # transactions relay, the missing one never does, and the funds stop on an
+    # intermediate subaddress. Under Kerckhoffs that is worse than a loud
+    # failure -- an analyst who knows this tool sees n-1 outputs move on and
+    # one that does not, which is a class marker, and the operator believes the
+    # round completed.
+    #
+    # phase_create numbers entries with enumerate() over the plan, so a
+    # complete manifest is exactly {0 .. len(plan)-1}. Anything else is a
+    # truncated, extended or renumbered manifest. Refuse; do not reconcile.
+    expected = set(range(len(plan)))
+    got = {e["idx"] for e in entries}          # ints, deduped by the validator
+    if got != expected:
+        missing = sorted(expected - got)
+        extra = sorted(got - expected)
+        integrity_log("signer", f"manifest_incomplete:{len(got)}_of_{len(plan)}")
+        detail = ""
+        if missing:
+            detail += f"\n    missing TX indices: {missing}"
+        if extra:
+            detail += f"\n    unexpected TX indices (not in the plan): {extra}"
+        sys.exit(
+            f"[!] Manifest describes {len(got)} of the plan's {len(plan)} "
+            f"transactions.{detail}\n"
+            f"    Refusing to sign a partial batch: the plan's transactions are "
+            f"a chain, and\n"
+            f"    signing only some of them relays the early hops and strands "
+            f"the funds on an\n"
+            f"    intermediate subaddress while reporting success.\n"
+            f"    If phase create reported failures, fix the cause and re-run "
+            f"--phase create."
+        )
     return entries
 
 
@@ -606,9 +661,12 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
                           f"(needed to sign spends of earlier rounds' outputs).")
                 else:
                     integrity_log("signer", "outputs_import_unconfirmed")
+                    # redact_addresses: this is monero-wallet-cli's own output,
+                    # which always contains "Opened wallet: <primary address>".
                     print(f"  [!] import_outputs did not confirm success. If this round "
                           f"spends an output an earlier round created, signing will "
-                          f"fail. Last output: {_txt.strip()[-160:]}")
+                          f"fail. Last output: "
+                          f"{redact_addresses(_txt.strip()[-160:])}")
         except subprocess.TimeoutExpired:
             integrity_log("signer", "outputs_import_timeout")
             print("  [!] import_outputs timed out.")
@@ -803,8 +861,14 @@ def phase_sign(args, plan: List[dict]):
                 signed_count += 1
                 print(f"  [+] TX {idx} signed -> {signed_file.name}")
             else:
-                stderr = result.stderr[:200] if result.stderr else ""
-                stdout = result.stdout[:200] if result.stdout else ""
+                # Redact before slicing AND before printing: wallet-cli prints
+                # the wallet's PRIMARY ADDRESS on every run ("Opened wallet:
+                # ..."), and the primary address is what links the operator to
+                # every subaddress in the mix. Redacting first also means the
+                # slice can never cut an address in half and leave a fragment
+                # long enough to search for.
+                stderr = redact_addresses(result.stderr)[:200] if result.stderr else ""
+                stdout = redact_addresses(result.stdout)[:200] if result.stdout else ""
                 print(f"  [!] TX {idx} signing produced no output")
                 if stderr:
                     print(f"      stderr: {stderr}")
@@ -841,15 +905,29 @@ def phase_sign(args, plan: List[dict]):
     integrity_log("signer", f"sign_done:{signed_count}_signed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
     if signed_count < len(entries):
-        # A gap in the signed idx sequence (e.g. tx_2 missing) shifts every
-        # subsequent TX's position in the broadcast blob list, which makes
-        # broadcast_signed_xmr apply the WRONG planned per-TX delay to every
-        # TX after the gap -- silently defeating the anti-timing-correlation
-        # protection. Fail loudly here rather than let that happen quietly.
+        # Refuse a gapped batch. The original reason given here -- that a gap
+        # shifts every later TX's POSITION in the broadcast list and so
+        # misapplies the planned delays -- is no longer true: broadcast keys
+        # each delay on the manifest entry's own idx, not on list position, so
+        # a gap now costs the right delay on the right transaction.
+        #
+        # The reason that does still hold is the one that matters more. A plan
+        # is a CHAIN: a peel spends the previous peel's change, a DAG hop
+        # spends a fan-out output. Broadcasting the transactions that did sign
+        # relays the early links and leaves the funds parked on whichever
+        # intermediate subaddress the missing link was supposed to move them
+        # off -- with the operator told the round succeeded. A partial mix that
+        # stops in the middle is a distinctive on-chain shape, not a neutral
+        # outcome.
+        #
+        # _load_signing_manifest now also proves entries covers the WHOLE plan,
+        # so this is the second half of one invariant: every planned TX has an
+        # entry, and every entry gets signed.
         integrity_log("signer", f"partial_sign:{signed_count}_of_{len(entries)}")
         sys.exit(
             f"[!] Only {signed_count}/{len(entries)} TXs signed. Aborting rather than "
-            f"broadcast a gapped batch (would misalign per-TX timing delays)."
+            f"broadcast a partial chain: the transactions that did sign would relay "
+            f"the early hops and strand the funds on an intermediate subaddress."
         )
     print(f"  [+] Signed TXs ready in {signed_dir}/ for broadcast.")
 

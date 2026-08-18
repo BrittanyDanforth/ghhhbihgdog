@@ -2,7 +2,7 @@
 """Test the REAL exit_strategy_simulator.fetch_prices (rate-inversion fix) and
 paranoia_mode.wipe_gs_artifacts (BUG 4: log must not be recreated in a real
 wipe). Delete functions are no-op'd so NOTHING on disk is actually deleted."""
-import sys, os, json, tempfile, importlib.util, importlib.machinery
+import sys, os, json, shutil, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 from pathlib import Path
 
@@ -264,6 +264,96 @@ for _fn, _label in [("disable_core_dumps", "disable_core_dumps()"),
     check(f"core dumps: {_label} sets soft limit to 0", "SOFT=0" in _out)
     check(f"core dumps: {_label} also drops the HARD limit "
           "(cannot be re-enabled later)", "HARD=0" in _out)
+
+# ---------------------------------------------------------------------------
+# secure_write_bytes must NOT follow a symlink.
+#
+# Demonstrated before the fix: a planted `broadcast_progress.json -> victim.txt`
+# had victim.txt overwritten while the symlink survived, and the 0600 mode this
+# function exists to guarantee was applied to someone ELSE'S file. That is a
+# write-where-I-want primitive for any local user who can create a name in a
+# directory this toolchain writes to -- a staging dir made by hand under a
+# shared path, or simply running the relayer from /tmp, where
+# broadcast_progress.json has a completely predictable name.
+#
+# secure_delete_file in the same module already refused to follow symlinks and
+# documented exactly this reasoning. The write primitive beside it did not:
+# same threat, same file, one of the pair defended. This pins both halves.
+# ---------------------------------------------------------------------------
+_sym_dir = Path(tempfile.mkdtemp(prefix="gs_sym_"))
+_victim = _sym_dir / "victim.txt"
+_victim.write_text("IMPORTANT ORIGINAL CONTENT")
+os.chmod(_victim, 0o644)
+_victim_mode0 = _victim.stat().st_mode & 0o777
+_planted = _sym_dir / "broadcast_progress.json"
+os.symlink(str(_victim), str(_planted))
+
+_refused = False
+try:
+    gs.secure_write_bytes(_planted, b"WROTE THROUGH THE SYMLINK")
+except OSError as e:
+    _refused = "symbolic link" in str(e)
+check("secure_write_bytes REFUSES to write through a symlink", _refused)
+check("...and the symlink's target is untouched",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+check("...and the target did not inherit this function's 0600 "
+      "(the mode landed nowhere)",
+      _victim.stat().st_mode & 0o777 == _victim_mode0)
+
+# atomic_write_json is safe by a DIFFERENT mechanism, and the difference is
+# worth pinning rather than assuming: it writes to '<name>.tmp' and then
+# os.replace()s it into place, and rename does not follow a destination
+# symlink -- it REPLACES the link. So a planted link at the final name is
+# consumed, not written through, and no error is raised.
+_planted2 = _sym_dir / "unsigned_manifest.json"
+os.symlink(str(_victim), str(_planted2))
+gs.atomic_write_json({"a": 1}, _planted2)
+check("atomic_write_json does not write through a planted symlink",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+check("...it replaces the link instead of following it",
+      not _planted2.is_symlink() and json.loads(_planted2.read_text()) == {"a": 1})
+check("...and the result is 0600, not the target's mode",
+      _planted2.stat().st_mode & 0o777 == 0o600)
+_planted2.unlink()
+
+# The staging file it writes THROUGH is the attackable one, and that is where
+# the O_NOFOLLOW refusal has to bite: a planted '<name>.tmp' link.
+_planted3 = _sym_dir / "unsigned_manifest.json"
+os.symlink(str(_victim), str(_sym_dir / "unsigned_manifest.json.tmp"))
+_refused3 = False
+try:
+    gs.atomic_write_json({"a": 1}, _planted3)
+except OSError as e:
+    _refused3 = "symbolic link" in str(e)
+check("atomic_write_json REFUSES a planted '.tmp' symlink", _refused3)
+check("...target still untouched after the atomic path",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+
+# The legitimate cases must all still work.
+_normal = _sym_dir / "normal.json"
+_normal.write_text("x")
+os.chmod(_normal, 0o644)                       # pre-existing, world-readable
+gs.secure_write_bytes(_normal, b'{"ok":1}')
+check("a pre-existing 0644 file is still narrowed to 0600",
+      _normal.stat().st_mode & 0o777 == 0o600)
+check("...and its content was actually written", _normal.read_text() == '{"ok":1}')
+
+_fresh = _sym_dir / "fresh.bin"
+gs.secure_write_bytes(_fresh, b"hello")
+check("a new file is created 0600 at creation",
+      _fresh.stat().st_mode & 0o777 == 0o600)
+
+# O_NOFOLLOW applies to the FINAL component only, so a symlinked staging
+# DIRECTORY -- staging onto another disk, a normal setup -- still works.
+_realdir = _sym_dir / "realstaging"; _realdir.mkdir()
+_linkdir = _sym_dir / "tx_staging"
+os.symlink(str(_realdir), str(_linkdir))
+gs.secure_write_bytes(_linkdir / "tx_0.unsigned", b"payload")
+check("a symlinked staging DIRECTORY still works (only the final component "
+      "is refused)", (_realdir / "tx_0.unsigned").read_bytes() == b"payload")
+
+shutil.rmtree(_sym_dir, ignore_errors=True)
+
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

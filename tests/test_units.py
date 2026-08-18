@@ -2,6 +2,7 @@
 """Executable tests for the pure-Python (non-Monero-stack) logic I changed.
 Loads the real extensionless scripts as modules and asserts real behavior."""
 import ast
+import re
 import sys, os, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 
@@ -1487,6 +1488,87 @@ try:
           _rate is None)
 finally:
     thor.safe_get = _real_safe_get
+
+# ---------------------------------------------------------------------------
+# redact_addresses -- for output this toolchain did NOT write.
+#
+# monero-wallet-cli prints "Opened wallet: <95-char primary address>" on EVERY
+# invocation at the default log level (measured on 0.18.3.1: no --log-level
+# needed). The signer prints slices of that output when a step fails, so the
+# operator can see why -- result.stdout[:200] and the tail of the combined
+# streams. Measured on the real binary the address sits at offset 333 and lands
+# in NEITHER window, so nothing leaked. But that safety is a byte count in
+# someone else's startup banner, not a property of this code: one warning line
+# fewer, a longer wallet path, or a trimmed help block slides the primary
+# address -- the value that ties the operator to every subaddress in the mix --
+# straight into a slice we print. These pin the structural version.
+# ---------------------------------------------------------------------------
+_REAL_PRIMARY = ("A2feEzqiMBDbMn1vnGj8pCeAMZzEoBBFTW4AR8AbSQGK1puUDwKKv2y1fzcu"
+                 "yZgNqe4kxigJLCzZnbZXrMpEe3oz3ri7mh6")   # real testnet wallet
+check("redact: a 95-char address is 95 chars", len(_REAL_PRIMARY) == 95)
+
+_banner = ("Monero 'Fluorine Fermi' (v0.18.3.1-unknown)\n"
+           f"Opened wallet: {_REAL_PRIMARY}\n"
+           "Error: Failed to import outputs: Bad magic from outputs\n")
+_red = gs.redact_addresses(_banner)
+check("redact: the primary address is gone from wallet-cli output",
+      _REAL_PRIMARY not in _red)
+check("redact: no 90+ char base58 run survives anywhere in the result",
+      not re.search(r"[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{90,}",
+                    _red))
+check("redact: the surrounding diagnostic text is preserved",
+      "Bad magic from outputs" in _red and "Fluorine Fermi" in _red)
+check("redact: what remains is the same masked form used everywhere else",
+      gs.scrub_address(_REAL_PRIMARY) in _red)
+
+# Every address form Monero produces, not just the standard one.
+_SUBADDR = "8" + _REAL_PRIMARY[1:]                    # subaddress: also 95
+_INTEGRATED = _REAL_PRIMARY + "0123456789ab"          # integrated: 106
+for _label, _a in (("subaddress", _SUBADDR), ("integrated", _INTEGRATED)):
+    check(f"redact: a {_label} address is masked too",
+          _a not in gs.redact_addresses(f"Opened wallet: {_a}\n"))
+
+# TWO addresses in one blob -- a sub() must catch every occurrence, not the
+# first. This is the case a search-and-replace-once implementation fails.
+_two = f"from {_REAL_PRIMARY} to {_SUBADDR}"
+_red2 = gs.redact_addresses(_two)
+check("redact: every address in the text is masked, not just the first",
+      _REAL_PRIMARY not in _red2 and _SUBADDR not in _red2)
+
+# Must NOT eat ordinary output. A txid is 64 hex chars, a sha256 digest is 64:
+# both are below the 90-char floor and are legitimately printed by this
+# toolchain, so redaction that swallowed them would destroy real diagnostics.
+_txid = "a" * 64
+check("redact: a 64-char txid/sha256 is left intact",
+      gs.redact_addresses(f"relayed {_txid}") == f"relayed {_txid}")
+check("redact: ordinary prose is unchanged",
+      gs.redact_addresses("Error: fee too low") == "Error: fee too low")
+check("redact: empty and None are safe",
+      gs.redact_addresses("") == "" and gs.redact_addresses(None) is None)
+
+# The signer must actually USE it on wallet-cli output, not merely import it.
+_signer_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
+check("signer: redacts wallet-cli stdout before printing it",
+      "redact_addresses(result.stdout)" in _signer_src)
+check("signer: redacts wallet-cli stderr before printing it",
+      "redact_addresses(result.stderr)" in _signer_src)
+check("signer: redacts the import_outputs output tail before printing it",
+      "redact_addresses(_txt" in _signer_src)
+# ...and no raw slice of captured output survives anywhere in the file
+check("signer: no unredacted slice of captured wallet-cli output is printed",
+      "result.stdout[:" not in _signer_src and "result.stderr[:" not in _signer_src)
+
+# The relayer prints the NODE's error text on every retry, and its `or res`
+# fallback stringifies the WHOLE RPC response when there is no message field.
+_bcast_src = open(os.path.join(REPO, "broadcast_signed_xmr")).read()
+check("broadcast: redacts the node's error text before printing it",
+      "redact_addresses(str(err.get(" in _bcast_src)
+check("broadcast: redacts an exception message before it reaches the "
+      "integrity chain ON DISK",
+      "_emsg = redact_addresses(str(e))" in _bcast_src)
+check("broadcast: no raw str(e) slice is logged or printed",
+      "str(e)[:40]" not in _bcast_src and "str(e)[:80]" not in _bcast_src)
+
 
 # ---------------------------------------------------------------------------
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
