@@ -495,7 +495,8 @@ def _secure_delete_file(path: Path) -> bool:
     """
     ok = secure_delete_file(path)
     if not ok:
-        integrity_log("paranoia", f"secure_delete_fail:{str(path)[-40:]}")
+        _chain_safe_log("paranoia", f"secure_delete_fail:{str(path)[-40:]}",
+                        f"could not securely delete {path}")
     return ok
 
 
@@ -521,6 +522,37 @@ def _secure_delete_dir(path: Path) -> bool:
 # guarantee -- they had already drifted once). Anything worth secure-deleting
 # is worth refusing to commit. Add a pattern here and the test tells you if
 # .gitignore is missing it.
+#: True while wipe_gs_artifacts is destroying the integrity chain.
+#:
+#: THE PHASE THAT DELETES THE CHAIN COULD RECREATE IT. wipe_gs_artifacts goes
+#: to deliberate lengths not to log after erasing integrity_chain.log -- its
+#: own comment explains that integrity_log() opens the file in append mode and
+#: would "resurrect the exact forensic artifact this phase exists to destroy",
+#: and main() repeats the point. But the per-FILE helper still logged on every
+#: failed delete, and it is called from inside that same loop.
+#:
+#: Reproduced: with one artifact whose secure delete fails (a root-owned
+#: monerod.log is the realistic case, and the patterns explicitly target files
+#: "created world-readable" that "we cannot change from here"), the wipe erased
+#: integrity_chain.log, then the next failure logged secure_delete_fail and
+#: brought BOTH the chain and its .lock back -- the new entry naming the path
+#: that failed. The failure count stayed honest; the artifact did not stay gone.
+#:
+#: A flag rather than a parameter because _secure_delete_dir also calls the
+#: helper, and any future logger inside this phase would reintroduce the same
+#: bug. The failure is still reported -- to the terminal, which leaves nothing
+#: behind.
+_WIPING_CHAIN = False
+
+
+def _chain_safe_log(stage: str, msg: str, human: str) -> None:
+    """integrity_log, unless we are mid-way through destroying the chain."""
+    if _WIPING_CHAIN:
+        print(f"  [!] {human}")
+        return
+    integrity_log(stage, msg)
+
+
 GS_ARTIFACT_FILE_PATTERNS = [
     "unsigned_*.json", "signer_progress.json",
     "broadcast_progress.json", "wallet_*.json",
@@ -591,7 +623,24 @@ GS_ARTIFACT_DIR_PATTERNS = [
 
 def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
-    common subdirectories, and any --search-dir paths provided."""
+    common subdirectories, and any --search-dir paths provided.
+
+    A REAL wipe runs with _WIPING_CHAIN set, so nothing inside it can write the
+    integrity chain back after erasing it -- see that flag. A DRY run leaves
+    logging on, because it deletes nothing and the chain is still meant to
+    record that the preview happened.
+    """
+    global _WIPING_CHAIN
+    _WIPING_CHAIN = not dry
+    try:
+        return _wipe_gs_artifacts_inner(dry, extra_dirs)
+    finally:
+        _WIPING_CHAIN = False
+
+
+def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
+    """The sweep itself. Split out so the flag above is released even if a
+    pattern raises, and so no future early return can leave it set."""
     file_patterns = GS_ARTIFACT_FILE_PATTERNS
     dir_patterns = GS_ARTIFACT_DIR_PATTERNS
 

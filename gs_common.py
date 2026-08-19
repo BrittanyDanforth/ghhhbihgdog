@@ -704,33 +704,94 @@ _NEWNYM_CONSECUTIVE_FAILURES = 0
 _NEWNYM_MAX_FAILURES = 3
 
 
-def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
-    """Request new Tor circuit. Aborts after consecutive failures if required.
+#: In-call retries before a REQUIRED rotation is declared impossible. Control
+#: -port contention is genuinely transient, and aborting a multi-hour peel chain
+#: on one blip would be brittle -- so the tolerance lives HERE, inside the call
+#: that must succeed, rather than in a counter that lets the caller proceed.
+_NEWNYM_REQUIRED_ATTEMPTS = 3
+_NEWNYM_RETRY_BACKOFF = 2.0
 
-    If NEWNYM fails _NEWNYM_MAX_FAILURES times in a row and required=True,
-    the process aborts to prevent all operations going over one circuit.
+
+def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
+    """Request a new Tor circuit. With required=True: rotate, or STOP.
+
+    WHAT THIS USED TO DO, AND WHY IT WAS A FAKE GUARANTEE. Every caller passing
+    required=True says in its own comment that the rotation must happen -- "a
+    silent failure leaves the subaddress creation on the same circuit as
+    whatever follows it", "a silently-failed rotation puts every quote in the
+    batch on ONE circuit". None of them check the return value; all twelve rely
+    on this function to stop the process. It did not.
+
+    A failure incremented a PROCESS-GLOBAL consecutive counter and returned
+    False, aborting only on the third strike. So:
+
+      * the first TWO required rotations could silently not happen, and the
+        operation continued on the old circuit with nothing printed at all --
+        only an integrity_log line nobody reads mid-run;
+      * a script that calls this FEWER than three times could never abort.
+        create_receive_wallet calls it exactly once, so required=True there was
+        decorative: with no control socket the rotation simply did not occur
+        and the receive address was minted on the un-rotated circuit;
+      * any success reset the counter, so an alternating fail/success pattern
+        never aborted -- every failed rotation in it was silent, forever.
+
+    Reproduced before changing: one call with required=True returned False,
+    printed nothing, and did not abort; three consecutive calls leaked two
+    silent non-rotations before the third stopped.
+
+    Now required=True retries in-call (transient control-port contention is
+    real) and then ABORTS if the circuit could not be rotated, independent of
+    any counter. required=False stays best-effort but SAYS SO on every failure
+    instead of staying quiet until the third.
+
+    WHAT IT STILL CANNOT PROMISE: Tor rate-limits NEWNYM and answers 250 OK
+    even when it coalesces two signals sent close together, so a True here
+    means "Tor accepted the request", not "this stream is provably on a new
+    circuit". The 5s settle below narrows that window; it does not close it,
+    and no control-port command exposes the guarantee.
     """
     global _NEWNYM_CONSECUTIVE_FAILURES
-    try:
-        from stem import Signal as StemSignal
-        from stem.control import Controller
-        with Controller.from_socket_file(ctrl) as c:
-            c.authenticate()
-            c.signal(StemSignal.NEWNYM)
-        time.sleep(5)
-        _NEWNYM_CONSECUTIVE_FAILURES = 0
-        return True
-    except Exception as e:
-        _NEWNYM_CONSECUTIVE_FAILURES += 1
-        integrity_log("tor", f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(e)[:40]}")
-        if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
-            msg = (f"[!] NEWNYM failed {_NEWNYM_MAX_FAILURES} consecutive times. "
-                   f"Tor circuit rotation is NOT working.")
-            if required:
-                sys.exit(msg + " Aborting for OPSEC safety.")
-            else:
-                print(f"  {msg}")
-        return False
+    attempts = _NEWNYM_REQUIRED_ATTEMPTS if required else 1
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            from stem import Signal as StemSignal
+            from stem.control import Controller
+            with Controller.from_socket_file(ctrl) as c:
+                c.authenticate()
+                c.signal(StemSignal.NEWNYM)
+            time.sleep(5)
+            _NEWNYM_CONSECUTIVE_FAILURES = 0
+            return True
+        except Exception as e:                               # noqa: BLE001
+            last_err = e
+            if attempt < attempts:
+                integrity_log("tor", f"NEWNYM_retry:{attempt}:{str(e)[:40]}")
+                time.sleep(_NEWNYM_RETRY_BACKOFF * attempt)
+
+    _NEWNYM_CONSECUTIVE_FAILURES += 1
+    integrity_log("tor",
+                  f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(last_err)[:40]}")
+    if required:
+        # ABORT NOW, not on some later strike. The caller asked for a rotation
+        # it is about to depend on; proceeding without it is the correlation
+        # the rotation exists to break.
+        sys.exit(
+            f"[!] Tor circuit rotation FAILED after {attempts} attempts: "
+            f"{str(last_err)[:120]}\n"
+            f"    This operation requires a fresh circuit and will not proceed "
+            f"on the old one.\n"
+            f"    Check that Tor is running with a ControlSocket at {ctrl} "
+            f"(or pass the right path), that this user can read it, and that "
+            f"'stem' is installed.")
+    # Best-effort path: still say it, every time. A rotation that did not
+    # happen is an OPSEC degradation whether or not it is the third one.
+    print(f"  [!] Tor circuit rotation failed ({str(last_err)[:60]}). This "
+          f"operation continues on the SAME circuit as the previous one.")
+    if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
+        print(f"  [!] NEWNYM has now failed {_NEWNYM_CONSECUTIVE_FAILURES} "
+              f"consecutive times. Tor circuit rotation is NOT working.")
+    return False
 
 # ---------------------------------------------------------------------------
 #  Retry-wrapped HTTP
@@ -1370,22 +1431,78 @@ def memo_binds_destination(memo: str, dest: str) -> bool:
     happily instruct it sat in the same repo. It is shared now so that cannot
     diverge again.
 
-    THORChain memos carry the destination inline, e.g.
+    THORChain memos carry the destination POSITIONALLY:
         =:XMR.XMR:<dest>:<limit>/<interval>/<qty>:<affiliate>:<fee>
     (and the long form SWAP:XMR.XMR:<dest>:...). Some aggregators return the
     memo hex-encoded for the OP_RETURN, so the hex form counts too.
+
+    THIS USED TO BE `dest in memo` -- A SUBSTRING TEST -- AND THAT IS NOT WHAT
+    THE FORMAT MEANS. The docstring above has always shown an <affiliate>
+    field, and an address sitting in it (or in the fee field, or in trailing
+    junk) satisfied a substring test while THORChain read the DESTINATION from
+    field 2 and paid whoever was named there. Measured against this function
+    before the change, with OURS and ATTACKER both real addresses:
+
+        =:XMR.XMR:<ATTACKER>:0/1/0:<OURS>:10        -> accepted
+        =:XMR.XMR:<ATTACKER>:0/1/0::0 <OURS>        -> accepted
+        =:BTC.BTC:<ATTACKER>:0/1/0:<OURS>:0         -> accepted
+        =:XMR.XMR:<ATTACKER>:0/1/0 // refund <OURS> -> accepted
+        (and the hex-encoded form of the first)     -> accepted
+
+    Five of six hostile memos passed. This is the ONLY thing standing between
+    the operator and an irreversible swap to someone else's address: the BTC
+    goes to a shared THORChain vault, the memo alone says where the XMR comes
+    out, and all three callers -- thor_swap_preparer before it records a pair,
+    GhostSpiral before it prints deposit instructions, and receive_watch
+    specifically to catch a pairs file edited between runs -- treat a True here
+    as permission to tell a sender to pay.
+
+    So it parses the fields now: the op must be a swap, the asset must be on
+    the XMR chain (which is what refuses the BTC.BTC case), and field 2 must
+    EQUAL dest -- not contain it.
+
+    Strictness is the safe direction here and the asymmetry is not close: a
+    memo wrongly refused costs the operator a re-quote, while a memo wrongly
+    accepted costs them the entire swap with no recourse.
     """
     if not memo or not dest:
         return False
     m = str(memo).strip()
-    if dest in m:
+    if _memo_fields_bind(m, dest):
         return True
+    # Hex-encoded for the OP_RETURN. Decode, then apply the SAME structural
+    # check -- decoding and then substring-matching would reopen the hole.
     compact = m[2:] if m[:2].lower() == "0x" else m
     try:
         decoded = bytes.fromhex(compact).decode("utf-8", errors="ignore")
     except ValueError:
         return False
-    return dest in decoded
+    return _memo_fields_bind(decoded, dest)
+
+
+#: THORChain swap operations, long and short. A memo whose op is not one of
+#: these is not a swap instruction at all.
+_THOR_SWAP_OPS = ("swap", "s", "=")
+
+
+def _memo_fields_bind(memo: str, dest: str) -> bool:
+    """True only if this memo's DESTINATION FIELD is exactly `dest`.
+
+    Split on ':' and read by position, because that is how THORChain reads it.
+    The asset check accepts any asset on the XMR chain (XMR, XMR.XMR) rather
+    than one exact spelling: refusing a legitimate memo over notation would
+    block a real swap, while accepting a non-XMR asset is how the BTC.BTC case
+    above got through.
+    """
+    parts = str(memo).strip().split(":")
+    if len(parts) < 3:
+        return False
+    if parts[0].strip().lower() not in _THOR_SWAP_OPS:
+        return False
+    asset = parts[1].strip().upper()
+    if not (asset == "XMR" or asset.startswith("XMR.")):
+        return False
+    return parts[2].strip() == dest
 
 
 # ---------------------------------------------------------------------------

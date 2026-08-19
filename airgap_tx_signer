@@ -694,13 +694,37 @@ def _load_signing_manifest(outdir, plan: list) -> list:
     return entries
 
 
+def _pw_scratch_dir(fallback: str = None) -> str:
+    """Where a wallet-password file may be staged. Prefers tmpfs.
+
+    THE PREFERENCE WAS NOT APPLIED EVERYWHERE. The signing loop and the
+    output-import helper both stage the password in /dev/shm and this file's
+    comments make "the secret normally never touches a disk at all" an explicit
+    property -- but _offline_account_count and _ensure_offline_accounts called
+    tempfile.mkstemp(prefix=".gs_pw_") with NO dir=, so in those two paths the
+    spend-key password was written to $TMPDIR (physical disk) instead. Both
+    then hand it to monero-wallet-cli, so it is the same secret, just on a
+    medium secure_delete_file cannot reliably erase on a journalling FS or SSD.
+
+    One chooser rather than a third and fourth copy of the same conditional:
+    the copies are how the two paths came to disagree in the first place.
+
+    This is a PREFERENCE, not a guarantee -- on a host with no usable /dev/shm
+    it still falls back to disk, which is what the callers already did. The
+    file is 0600 from creation and securely deleted in a finally regardless.
+    """
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return fallback or tempfile.gettempdir()
+
+
 def _offline_account_count(wallet_file: str, args) -> int:
     """How many accounts the OFFLINE wallet has, via wallet-cli's `account`.
 
     Returns 0 when it cannot be determined, which the caller treats as "top up
     anyway" rather than "assume it is fine".
     """
-    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_")
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=_pw_scratch_dir())
     try:
         os.fchmod(pw_fd, 0o600)
         os.write(pw_fd, (args.wallet_password or "").encode())
@@ -767,7 +791,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
     print(f"  [*] The offline wallet has {have or 'an unknown number of'} "
           f"account(s); this run's wallet has {needed}. Creating {missing} so "
           f"the outputs can be imported (~{missing // 2}s, once)...")
-    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_")
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=_pw_scratch_dir())
     try:
         os.fchmod(pw_fd, 0o600)
         os.write(pw_fd, (args.wallet_password or "").encode())
@@ -1013,8 +1037,8 @@ def phase_sign(args, plan: List[dict]):
             # works but was rejected: it changes the exact stdin sequence whose
             # mismatch caused the original "y taken as the password" bug, for
             # no gain over a tmpfs-backed file.
-            pw_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else work_dir
-            pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=pw_dir)
+            pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_",
+                                              dir=_pw_scratch_dir(work_dir))
             try:
                 os.fchmod(pw_fd, 0o600)
                 os.write(pw_fd, (args.wallet_password or "").encode())

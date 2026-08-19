@@ -26,6 +26,15 @@ python3 tests/test_receive_wallet_cli.py
                                     #   covered, the repo's lowest). The gates were
                                     #   already correct -- this locks them in rather
                                     #   than fixing anything
+python3 tests/test_opsec_guarantees.py
+                                    # GUARANTEES THAT COULD PASS WITHOUT ESTABLISHING
+                                    #   THEIR FACT: memo_binds_destination was a
+                                    #   SUBSTRING test (a memo paying an attacker while
+                                    #   merely mentioning you passed); newnym(required)
+                                    #   did not rotate-or-stop; the artifact wipe
+                                    #   RESURRECTED the chain it had destroyed; the
+                                    #   broadcast's per-submit egress check was a timer;
+                                    #   the signer staged the wallet password on disk
 python3 tests/test_console_exit.py   # the CONSOLE's exit wiring, over REAL HTTP:
                                     #   token/origin/content-type gates, the arm
                                     #   phrase, server-side OPSEC preflight, and that

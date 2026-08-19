@@ -5,8 +5,13 @@ broadcast_signed_xmr v10.0 - Resilient Monero relay & confirmation
 Fee-aware, Tor-hardened, integrity-logged broadcast of pre-signed XMR blobs.
 
 OPSEC hardening:
-  - Tor verified before first broadcast, and BOTH Tor and the daemon's relay
-    egress re-verified immediately before each submit (not merely on a timer)
+  - Tor verified before first broadcast. The DAEMON's relay egress is
+    re-verified immediately before EVERY submit (a local RPC on the usual
+    loopback daemon), so a monerod that picks up clearnet peers mid-batch is
+    caught before the next transaction rather than up to a timer-interval
+    later. The Tor exit check is an external request, so it stays on a
+    ~5-minute timer and is forced before any transaction that had a planned
+    delay -- the delay is what makes the previous sample stale
   - NEWNYM circuit rotation between every TX broadcast
   - Planned per-TX delay honoured in full; a shutdown during a delay ABORTS
     that TX instead of relaying it early
@@ -254,12 +259,36 @@ class EgressGate:
         self.last_tor_check = time.time()
 
     def check(self, tag: str, force: bool) -> None:
+        """Re-verify egress. The DAEMON check runs before every submit.
+
+        THESE TWO CHECKS WERE GATED TOGETHER, AND ONLY ONE CAN AFFORD TO BE.
+        The whole method returned early unless `force` or the 300s timer had
+        elapsed, and the only caller passes `force=item.delay > 0`. So for any
+        transaction with NO planned delay, neither check ran before its submit
+        -- it relied on a sample taken up to five minutes earlier. "No delays
+        found" is an explicitly supported, warned-about configuration in which
+        EVERY transaction has delay 0, so a whole batch could relay off one
+        stale sample while this file's header promised the egress was
+        "re-verified immediately before each submit (not merely on a timer)".
+
+        Split by what each costs:
+
+        * tor_recheck is an external request to check.torproject.org. Doing it
+          per transaction would put N extra requests on the wire for a batch of
+          N, which is its own pattern. It stays timer-gated, and forced before
+          a delayed transaction because the delay itself is what makes the
+          previous sample stale.
+        * check_daemon_relay_egress asks the operator's OWN daemon who its
+          peers are. For the normal loopback daemon that is a local RPC costing
+          nothing, and it is the leak-critical fact for THIS transaction --
+          would this tx go to raw-IP peers? It now runs before every submit,
+          which is what the header claimed all along.
+        """
         if not self.proxy:
             return
-        if not force and (time.time() - self.last_tor_check) <= TOR_RECHECK_INTERVAL:
-            return
-        tor_recheck(self.proxy, tag)
-        self.last_tor_check = time.time()
+        if force or (time.time() - self.last_tor_check) > TOR_RECHECK_INTERVAL:
+            tor_recheck(self.proxy, tag)
+            self.last_tor_check = time.time()
         if not self.args.rpc_daemon:
             return
         _eg = check_daemon_relay_egress(self.args.rpc_daemon, self.proxy)
