@@ -44,6 +44,7 @@ ACTIONS = {
     "broadcast":   {**suite("test_broadcast", "relay loop: delays, resume, manifest boundary"), "group": "Offline suites"},
     "gapfixes":    {**suite("test_gapfixes", "MAC-spoof restore/leak, exit-sim --redact"), "group": "Offline suites"},
     "swaprecv":    {**suite("test_swap_receive", "swap memo binding, slippage stop, receive addr"), "group": "Offline suites"},
+    "swaparrival": {**suite("test_swap_arrival", "--split N: the wait needs EVERY chunk, not the first"), "group": "Offline suites"},
     "console":     {**suite("test_console", "password scope, no invented fees, egress, HTTP gates"), "group": "Offline suites"},
     "shmwipe":     {**suite("test_shmwipe", "/dev/shm + $TMPDIR scratch is wiped, other software's is not"), "group": "Offline suites"},
     "concurrency": {**suite("test_concurrency", "hash chain under parallel writers; console hangs, stdin, buffering"), "group": "Offline suites"},

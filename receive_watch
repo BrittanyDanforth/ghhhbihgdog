@@ -56,7 +56,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     install_signal_handlers, shutdown_requested, scrub_address,
     load_receive_bundle, RECEIVE_SCHEMA, memo_binds_destination,
-    env_or_argv, decimal_arg,
+    env_or_argv, decimal_arg, accept_floor,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -195,20 +195,11 @@ def expected_total(pairs: list) -> tuple:
     return tot, unreadable
 
 
-def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
-    """The amount at which we call the payment complete.
-
-    A swap essentially never delivers its quote to the digit -- the rate moves
-    between quote and execution and the network takes its cut. Waiting for the
-    exact quoted figure is waiting for something that will not happen, so the
-    gate sits a tolerance below it and the shortfall is shown honestly.
-    """
-    if target <= 0:
-        return Decimal(0)
-    if not (Decimal(0) <= tolerance < Decimal(1)):
-        raise ValueError("tolerance must be >= 0 and < 1")
-    return (target * (Decimal(1) - tolerance)).quantize(
-        Decimal("0.000000000001"), rounding=ROUND_DOWN)
+# accept_floor -- "how much counts as the payment complete" -- now lives in
+# gs_common, because GhostSpiral's stage-4 arrival wait needs the same gate and
+# a second copy of the formula would be free to drift from this one. It is
+# imported above, so receive_watch.accept_floor still resolves for every caller
+# and test that had it here.
 
 
 def poll_seconds(rng=None) -> int:

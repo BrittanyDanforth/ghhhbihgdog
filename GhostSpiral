@@ -48,7 +48,7 @@ from gs_common import (
     load_receive_bundle, memo_binds_destination, env_or_argv,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
-    validate_xmr_address,
+    validate_xmr_address, accept_floor,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -256,8 +256,40 @@ FANOUT_CONFIRM_POLL = 30        # seconds between balance polls
 # operator sends BTC and the cross-chain swap settles (minutes to well over an
 # hour). ENTRY is created fresh this run, so its balance starts at zero -- we
 # poll for the funds to arrive rather than checking once and aborting.
-XMR_ARRIVAL_TIMEOUT = 7200      # seconds to wait for swapped XMR to arrive
+#
+# TWO CLOCKS, because --split N makes them different questions.
+#
+# The wait used to be a single 2-hour deadline on a `> DUST_XMR` gate, which
+# under --split N returned the instant the FIRST of N chunks landed: the plan
+# was then sized from a fraction of the money, the remaining chunks arrived on
+# ENTRY after it was built, and nothing ever mixed them. They were swept out by
+# the exit instead -- one transaction from the address the swap memo names in
+# public, straight to the operator's destination.
+#
+# So the stall clock asks "has anything NEW arrived recently?" and restarts on
+# every real arrival, which is what lets N chunks land over an afternoon
+# without anyone having to guess N * (swap settle time) in advance. The
+# absolute cap is the backstop that keeps a run from waiting forever when a
+# chunk is never sent at all.
+XMR_ARRIVAL_STALL = 7200        # seconds with NOTHING new arriving -> give up
+XMR_ARRIVAL_TIMEOUT = 86400     # absolute cap on the whole arrival wait
 XMR_ARRIVAL_POLL = 30           # seconds between arrival polls
+
+#: How far below the summed quotes still counts as "all of it arrived".
+#: A swap never pays its quote to the digit (the rate moves between quote and
+#: settlement, and the network takes its cut), so an exact-match gate waits for
+#: a number that is not coming. Same default and same formula as receive_watch
+#: --tolerance; the formula itself is gs_common.accept_floor, shared so the two
+#: cannot drift.
+SWAP_TOLERANCE_DEFAULT = Decimal("0.10")
+
+#: The smallest increase that counts as "another chunk arrived" and restarts
+#: the stall clock, as a fraction of the expected total. Anyone can pay ENTRY
+#: -- the swap memo names it in plaintext in a Bitcoin OP_RETURN -- so without
+#: a floor here a piconero every 20 minutes would hold the stall clock open
+#: indefinitely. Mirrors receive_watch's ARRIVAL_FRACTION_OF_TARGET, for the
+#: same attack.
+SWAP_ARRIVAL_STEP_FRACTION = Decimal("0.001")
 
 
 def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal:
@@ -1184,6 +1216,129 @@ def xmr_balance(rpc_primary, bal_account: int,
     return total, unlocked
 
 
+def swap_expected_total(deposits: list) -> tuple:
+    """How much XMR this run is waiting for. Returns (total, n_unreadable).
+
+    Sums the quoted output of EVERY chunk, because that -- not the first
+    deposit to settle -- is what "the swap arrived" means under --split N.
+
+    An unreadable quote contributes nothing and is COUNTED, so the caller can
+    say so out loud. stage2_get_swap_quotes already warns when it cannot read a
+    route's expected output, but that warning scrolls past hours before this
+    number is used, and a target silently built from 2 of 3 chunks is a target
+    the run will reach while a third of the money is still in flight -- which
+    is the exact failure the summed target exists to prevent. Same reasoning,
+    and the same (total, unreadable) shape, as receive_watch.expected_total.
+    """
+    total = Decimal(0)
+    unreadable = 0
+    for dep in deposits:
+        try:
+            v = Decimal(str((dep or {}).get("expected_xmr") or "0"))
+        except Exception:                                    # noqa: BLE001
+            v = Decimal(0)
+        if v > 0:
+            total += v
+        else:
+            unreadable += 1
+    return total, unreadable
+
+
+def swap_arrival_step(target: Decimal, dust: Decimal = DUST_XMR) -> Decimal:
+    """The smallest increase that counts as another chunk arriving.
+
+    Anything smaller does not restart the stall clock. ENTRY is not a secret --
+    the swap memo names it in plaintext and the sender puts that memo in a
+    Bitcoin OP_RETURN -- so without this floor anyone reading the BTC chain
+    could hold the wait open indefinitely with periodic dust, and the run would
+    sit at stage 4 believing more of its own money was still on the way.
+    """
+    if target > 0:
+        return max(dust, target * SWAP_ARRIVAL_STEP_FRACTION)
+    return dust
+
+
+def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
+                          stall_s: int = XMR_ARRIVAL_STALL,
+                          timeout_s: int = XMR_ARRIVAL_TIMEOUT,
+                          poll_s: int = XMR_ARRIVAL_POLL,
+                          step: Decimal = None, dust: Decimal = DUST_XMR,
+                          sleep_fn=time.sleep, clock=time.monotonic,
+                          echo=print) -> dict:
+    """Wait for ALL of the swapped XMR to arrive and unlock on ENTRY.
+
+    Returns a result dict rather than falling through, so the caller has to
+    decide what a shortfall means instead of inheriting one silently.
+    Outcomes: 'funded' (>= floor_, unlocked), 'stalled' (nothing new for a full
+    stall window), 'timeout' (the absolute cap), 'interrupted'.
+
+    THE GATE IS THE SUMMED TARGET, NOT "SOME MONEY IS HERE". This loop used to
+    be `while unlocked <= DUST_XMR`, which is the right test for exactly one
+    swap and wrong for every other case. With --split N the operator makes N
+    separate BTC deposits, ThorChain settles them independently, and their XMR
+    lands on ENTRY minutes to hours apart -- so the old gate opened on chunk 1
+    of N. Everything downstream then sized itself from that fraction: the entry
+    veil swept it, the distribution spread it, and chunks 2..N arrived on an
+    ENTRY that the run had already finished with. They were never mixed. The
+    exit found them sitting there and swept them out, one transaction each,
+    from the address the swap memo publicly names straight to --exit-to. The
+    run's whole purpose is to break that link and it re-created it, for the
+    majority of the money, whenever --split was used.
+
+    `floor_` <= 0 means no target could be built (manual mode, or every quote
+    unreadable) and the old dust gate is all that is available. The caller must
+    say so; this cannot tell chunk 1 from chunk N without a number to compare
+    against.
+    """
+    if step is None:
+        step = swap_arrival_step(floor_ if floor_ > 0 else Decimal(0), dust)
+    started = clock()
+    # The total as of the last MEANINGFUL arrival -- compared against this and
+    # not against the previous tick, so a long run of sub-step increments that
+    # add up to a real chunk still restarts the clock. Same reasoning as
+    # receive_watch's marked_total.
+    marked = Decimal(0)
+    last_arrival = started
+    total = unlocked = Decimal(0)
+    locked_reported = False
+    while True:
+        if shutdown_requested():
+            return {"state": "interrupted", "total": total, "unlocked": unlocked}
+        try:
+            total, unlocked = balance_fn()
+        except Exception as e:                               # noqa: BLE001
+            # Transient by assumption: a wallet that is momentarily busy or
+            # resyncing is normal across a multi-hour wait, and dropping the
+            # run over one bad poll would lose hours for nothing.
+            integrity_log("stage4", "arrival_poll_error")
+            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:50]}); retrying.")
+
+        if unlocked > dust and (floor_ <= 0 or unlocked >= floor_):
+            return {"state": "funded", "total": total, "unlocked": unlocked}
+
+        if total - marked >= step:
+            marked = total
+            last_arrival = clock()
+            if floor_ > 0:
+                echo(f"  [*] {total} XMR on ENTRY so far, of ~{floor_} needed "
+                     f"across {chunks} chunk(s); still waiting.")
+            else:
+                echo(f"  [*] {total} XMR on ENTRY so far; still waiting.")
+        elif total > dust and unlocked <= dust and not locked_reported:
+            echo(f"  [*] Seen {total} XMR total; waiting for it to unlock...")
+            locked_reported = True
+
+        now = clock()
+        if now - started >= timeout_s:
+            return {"state": "timeout", "total": total, "unlocked": unlocked}
+        # The stall clock runs from the start too, so a swap that is never sent
+        # at all fails in one stall window rather than holding the run for the
+        # full absolute cap.
+        if now - last_arrival >= stall_s:
+            return {"state": "stalled", "total": total, "unlocked": unlocked}
+        sleep_fn(poll_s)
+
+
 def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
     if not args.joinmarket:
         integrity_log("stage1", "JM_skipped")
@@ -1446,6 +1601,35 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--btc-amount", type=decimal_arg,
                      help="Total BTC amount for ThorChain swap "
                           "(required when --split > 0 in sender mode)")
+    # The three flags below all size ONE decision: when has all of the swapped
+    # XMR arrived on ENTRY? Under --split N that is a real question with a
+    # wrong answer available (see wait_for_swap_arrival).
+    cli.add_argument("--expect-total-xmr", type=decimal_arg,
+                     help="Total XMR expected across ALL swap chunks. Only "
+                          "needed in MANUAL mode (no --btc-amount, quotes "
+                          "fetched by thor_swap_preparer instead): without a "
+                          "target this run cannot tell the first chunk of N "
+                          "from all N, and will plan against whatever landed "
+                          "first. With --btc-amount the target is summed from "
+                          "the quotes automatically.")
+    cli.add_argument("--swap-tolerance", type=decimal_arg,
+                     default=SWAP_TOLERANCE_DEFAULT,
+                     help=f"How far below the expected total still counts as "
+                          f"fully arrived (default "
+                          f"{SWAP_TOLERANCE_DEFAULT} = "
+                          f"{SWAP_TOLERANCE_DEFAULT * 100:.0f}%%). Rates move "
+                          f"between quote and settlement, so an exact-match "
+                          f"gate waits for a number that never comes. Same "
+                          f"meaning as receive_watch --tolerance.")
+    cli.add_argument("--accept-partial-swap", action="store_true",
+                     help="Proceed when only part of the expected XMR has "
+                          "arrived. WITHOUT this the run STOPS and leaves the "
+                          "funds on ENTRY, because planning against a fraction "
+                          "is how the rest ends up unmixed: a chunk that lands "
+                          "after the plan is built is never distributed, and "
+                          "the swap memo naming ENTRY is public. Nothing has "
+                          "been spent at that point, so waiting or re-running "
+                          "costs only time.")
     cli.add_argument("--wallets", type=int, default=10,
                      help=f"Number of mix wallets (min {MIN_WALLETS})")
     cli.add_argument("--deep", type=int, default=2,
@@ -2128,6 +2312,30 @@ def resolve_hop_delay(args) -> tuple:
     return window
 
 
+def resolve_swap_arrival(args) -> None:
+    """Bounds-check the flags that decide when the swap has fully arrived.
+
+    Up front, next to the other syntactic checks, because every one of these is
+    only consulted at stage 4 -- after the accounts are made, the quotes are
+    fetched and the operator has already sent BTC. A tolerance of 1.5 accepted
+    there would compute a NEGATIVE floor, which no balance can fail to clear:
+    the gate would open on the first piconero and the run would be back to the
+    defect this whole path exists to fix, silently.
+    """
+    tol = getattr(args, "swap_tolerance", SWAP_TOLERANCE_DEFAULT)
+    if not (Decimal(0) <= tol < Decimal(1)):
+        sys.exit(f"[!] --swap-tolerance must be >= 0 and < 1 (got {tol}). It is "
+                 f"the FRACTION of the expected total that may be missing and "
+                 f"still count as fully arrived, so 0.10 means 10%.")
+    exp = getattr(args, "expect_total_xmr", None)
+    if exp is not None and exp <= 0:
+        sys.exit(f"[!] --expect-total-xmr must be positive (got {exp}). A "
+                 f"non-positive target is no target: the run would stop waiting "
+                 f"on the first chunk of however many are coming.")
+    if getattr(args, "accept_partial_swap", False):
+        integrity_log("stage0", "accept_partial_swap")
+
+
 def resolve_entry_account(rpc, addr_index: dict, entry_addr: str,
                           bundle_account) -> tuple:
     """Which (account, subaddress) the whole run spends from. Returns the pair.
@@ -2172,6 +2380,142 @@ def resolve_entry_account(rpc, addr_index: dict, entry_addr: str,
     # resolve (account, index) back to an address; it must be ENTRY.
     verify_spend_source(rpc, account, index, entry_addr)
     return account, index
+
+
+def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
+                      entry_addr: str, swap_deposits: list, receive_mode: bool,
+                      total_bal: Decimal, unlocked_bal: Decimal) -> tuple:
+    """Block until ALL of the swapped XMR is on ENTRY. Returns (total, unlocked).
+
+    Sender mode only: the swapped XMR lands on ENTRY after the operator sends
+    BTC and ThorChain settles (and in manual mode, whenever they send it).
+    ENTRY is fresh this run, so a single check is always ~0 and would abort a
+    perfectly good run. Receiver mode already has the funds.
+
+    WAIT FOR ALL OF IT, not for the first thing to land. --split N means N
+    independent swaps settling minutes to hours apart; the gate that decides
+    "the swap has arrived" is the SUMMED quote, not any balance above dust.
+    See wait_for_swap_arrival for what the old gate cost.
+
+    A shortfall EXITS unless --accept-partial-swap. Nothing has been spent at
+    this point, so stopping costs time and nothing else -- while proceeding
+    commits the run to planning against a fraction, and whatever lands
+    afterwards is money nothing in the pipeline will ever mix.
+    """
+    n_chunks = len(swap_deposits) or max(args.split, 1)
+    quoted, unreadable = swap_expected_total(swap_deposits)
+    if args.expect_total_xmr is not None:
+        # An explicit target overrides the quotes: in manual mode there are
+        # none, and where there are both, the operator holding the
+        # thor_swap_preparer bundle knows what was actually sent.
+        quoted = args.expect_total_xmr
+        unreadable = 0
+    floor_ = accept_floor(quoted, args.swap_tolerance)
+
+    # ENTERED ON A SHORTFALL, not only on an empty ENTRY. The guard used to
+    # read `unlocked_bal <= DUST_XMR` alone, which is sound only while ENTRY is
+    # guaranteed fresh and empty here -- true today, and exactly the kind of
+    # assumption that makes the wait skippable the moment something upstream
+    # changes. With a target in hand, "not enough has arrived yet" is the
+    # condition that actually matters.
+    if receive_mode or not (unlocked_bal <= DUST_XMR
+                            or (floor_ > 0 and unlocked_bal < floor_)):
+        return total_bal, unlocked_bal
+
+    if unreadable:
+        print(f"  [!] {unreadable} of {len(swap_deposits)} swap quote(s) carry "
+              f"no readable expected XMR, so they contribute NOTHING to the "
+              f"target below. The wait will finish once the READABLE ones have "
+              f"landed, even if the others are still in flight — pass "
+              f"--expect-total-xmr to set the real total.")
+        integrity_log("stage4", f"arrival_quotes_unreadable:"
+                                f"{unreadable}_of_{len(swap_deposits)}")
+    if floor_ > 0:
+        print(f"  [*] Waiting for ~{floor_} XMR ({n_chunks} chunk(s), "
+              f"{args.swap_tolerance * 100:.0f}% slippage tolerance) to "
+              f"arrive+unlock on ENTRY {scrub_address(entry_addr)}...")
+    else:
+        # No target: nothing here can distinguish "all of it" from "the first
+        # of several", so say that rather than implying a check that is not
+        # happening.
+        print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
+              f"{scrub_address(entry_addr)}...")
+        if n_chunks > 1:
+            print(f"  [!] NO EXPECTED TOTAL is known for this run, but "
+                  f"{n_chunks} chunks are expected. This run will plan against "
+                  f"WHATEVER HAS LANDED when the first chunk unlocks; anything "
+                  f"arriving later is never mixed. Pass --expect-total-xmr "
+                  f"<total> to wait for all of it.")
+            integrity_log("stage4", f"arrival_no_target:{n_chunks}_chunks")
+
+    arrival = wait_for_swap_arrival(
+        lambda: xmr_balance(rpc, bal_account, entry_index), floor_, n_chunks)
+    total_bal, unlocked_bal = arrival["total"], arrival["unlocked"]
+
+    if arrival["state"] == "interrupted":
+        sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
+    if arrival["state"] == "funded":
+        # NOT the balance: unlocked_bal is the exact XMR that arrived from the
+        # swap, the most linkable amount on the receive side. Log only that
+        # arrival completed.
+        integrity_log("stage4", "xmr_arrival_done")
+        return total_bal, unlocked_bal
+
+    # A SHORTFALL IS NOT A DETAIL TO PROCEED THROUGH. Whatever is missing
+    # arrives on ENTRY after this run has finished planning against the rest,
+    # and nothing downstream ever spends it: the veil already swept ENTRY, the
+    # distribution already sized itself. It sits on the one address the swap
+    # memo names in public until the exit sweeps it, in a single transaction,
+    # to the operator's destination.
+    short = floor_ - unlocked_bal if floor_ > 0 else Decimal(0)
+    integrity_log("stage4", f"arrival_incomplete:{arrival['state']}")
+    why = (f"nothing new arrived for {XMR_ARRIVAL_STALL // 60} min"
+           if arrival["state"] == "stalled"
+           else f"the {XMR_ARRIVAL_TIMEOUT // 3600}h limit was reached")
+    if not args.accept_partial_swap:
+        sys.exit(
+            f"[!] The swap has NOT fully arrived: {why}.\n"
+            f"    On ENTRY now: {unlocked_bal} XMR unlocked "
+            f"({total_bal} XMR total).\n"
+            + (f"    Expected:     ~{floor_} XMR — short by {short}.\n"
+               if floor_ > 0 else "")
+            + f"    Chunks expected: {n_chunks}.\n"
+            f"\n"
+            f"    NOTHING HAS BEEN SPENT. The funds are on ENTRY and they are "
+            f"safe.\n"
+            f"    Planning against part of the money is what leaves the rest "
+            f"unmixed:\n"
+            f"    a chunk that lands after the plan is built is never "
+            f"distributed, and\n"
+            f"    the swap memo naming ENTRY is public — so it would leave in "
+            f"one hop\n"
+            f"    from that address to your --exit-to destination.\n"
+            f"\n"
+            f"    Wait for the rest and re-run, or pass --accept-partial-swap "
+            f"to mix what\n"
+            f"    arrived and deal with the remainder yourself.")
+    print(f"  [!] --accept-partial-swap: proceeding with {unlocked_bal} XMR "
+          f"after {why}.")
+    if floor_ > 0:
+        print(f"  [!] That is {short} XMR short of the ~{floor_} expected.")
+    print("  [!] ANYTHING THAT ARRIVES FROM HERE ON is NOT mixed by this run. "
+          "It stays on ENTRY, which the swap memo names in public.")
+    # Conditional because it is only TRUE with the veil on -- _exit_hold_list
+    # holds nothing under --no-entry-veil, where the operator has already
+    # accepted that the swap's output is spent in the open. Printing the
+    # reassurance unconditionally would be the pipeline telling the operator it
+    # was protecting an output it is about to sweep.
+    if getattr(args, "entry_veil", True):
+        print("      The exit will NOT withdraw it — that would be a one-hop "
+              "link from the swap to your destination. Mix it with a fresh run "
+              "instead.")
+    else:
+        print("      --no-entry-veil: the exit WILL withdraw it, in one hop "
+              "from the address the swap memo names to your --exit-to "
+              "destination. Withdraw it by hand from a fresh run instead, or "
+              "drop --no-entry-veil.")
+    integrity_log("stage4", "arrival_partial_accepted")
+    return total_bal, unlocked_bal
 
 
 def report_holdings(rpc, accounts) -> list:
@@ -2319,6 +2663,7 @@ def main():
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
     resolve_exit_destinations(args)
+    resolve_swap_arrival(args)
 
     resolve_wallet_password(args)
     resolve_sensitive_inputs(args)
@@ -2414,6 +2759,12 @@ def main():
         newnym(required=True)   # anonymity gate before ThorChain execution
         tor_recheck(proxy, "stage2_exec")
 
+        # The quotes outlive the stage that fetched them: the arrival wait below
+        # needs the SUM of what every chunk was quoted to deliver, not just the
+        # instructions that were printed here. It used to be a local inside the
+        # `if btc_chunks:` arm, so the wait had no idea how many chunks were
+        # coming or how much they were worth, and stopped on the first one.
+        swap_deposits = []
         if receive_mode:
             integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
             print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
@@ -2446,7 +2797,7 @@ def main():
             if btc_chunks:
                 swap_deposits = stage2_get_swap_quotes(args, proxy, btc_chunks, ENTRY)
                 integrity_log("stage2", "swap_quotes_generated")
-                total_expected = sum(Decimal(d["expected_xmr"]) for d in swap_deposits)
+                total_expected, _unreadable_quotes = swap_expected_total(swap_deposits)
                 print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
                 print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
                 print()
@@ -2525,26 +2876,9 @@ def main():
 
         total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
 
-        # Sender mode: the swapped XMR lands on ENTRY only AFTER the operator sends
-        # BTC and ThorChain settles (and in manual mode, whenever they send it).
-        # ENTRY is fresh this run so a single check here is always ~0 -> abort.
-        # Poll for arrival instead. Receiver mode already has funds on ENTRY.
-        if not receive_mode and unlocked_bal <= DUST_XMR:
-            print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
-                  f"{scrub_address(ENTRY)} (up to {XMR_ARRIVAL_TIMEOUT // 60} min)...")
-            waited = 0
-            while unlocked_bal <= DUST_XMR and waited < XMR_ARRIVAL_TIMEOUT:
-                if shutdown_requested():
-                    sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
-                time.sleep(XMR_ARRIVAL_POLL)
-                waited += XMR_ARRIVAL_POLL
-                total_bal, unlocked_bal = xmr_balance(rpc_primary, bal_account, entry_index)
-                if total_bal > DUST_XMR and unlocked_bal <= DUST_XMR:
-                    print(f"  [*] Seen {total_bal} XMR total; waiting for it to unlock...")
-            # NOT the balance: unlocked_bal is the exact XMR that arrived from the
-            # swap, the most linkable amount on the receive side. Log only that
-            # arrival completed.
-            integrity_log("stage4", "xmr_arrival_done")
+        total_bal, unlocked_bal = stage4_await_swap(
+            args, rpc_primary, bal_account, entry_index, ENTRY, swap_deposits,
+            receive_mode, total_bal, unlocked_bal)
 
         integrity_log("stage4", "balance_fetched")
 
@@ -2798,7 +3132,8 @@ def main():
                                  veil_target=(bal_account, entry_index),
                                  veil_need=usable,
                                  exit_accounts=_exit_account_list(
-                                     addr_index, change_accounts, bal_account))
+                                     addr_index, change_accounts, bal_account),
+                                 exit_hold=_exit_hold_list(args, addr_index, ENTRY))
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
@@ -3530,6 +3865,37 @@ def _exit_account_list(addr_index, change_accounts, bal_account) -> list:
             + [bal_account])
 
 
+def _exit_hold_list(args, addr_index, entry_addr) -> list:
+    """The outputs the exit must refuse to withdraw: ENTRY, and only ENTRY.
+
+    The entry veil swept ENTRY once, at the start of stage 5, so a balance
+    there when the exit runs arrived afterwards -- under --split N, a swap
+    chunk that settled late. It has been through none of the mixing, and its
+    funding transaction is named by a public ThorChain memo, so one sweep to
+    --exit-to would publish the link the whole run exists to break.
+
+    A SECOND WAY MONEY REACHES ENTRY IS STILL OPEN, and this is deliberately
+    not claiming otherwise: the DAG round picks hop destinations from the mix
+    subaddress list, which still contains ENTRY, so a hop can pay a MIXED
+    output back to the address the memo names. That is a separate defect and
+    it is not fixed here. Its effect on this function is that a held output is
+    not always a late swap chunk -- sometimes it is mixed value that came home.
+    Holding it back is still the right side of that trade: the cost is funds
+    left on the wallet with the reason printed, and the alternative is
+    publishing a link that no later transaction can retract.
+
+    NOT held under --no-entry-veil: there ENTRY is the address the distribution
+    spends from, so the operator has already accepted (loudly, at stage 4) that
+    the swap's output is spent in the open. Holding funds back at that point
+    buys nothing and only strands them.
+    """
+    if not getattr(args, "entry_veil", True):
+        return []
+    if entry_addr not in addr_index:
+        return []
+    return [addr_index[entry_addr]]
+
+
 def _funded_subaddresses(rpc, accounts) -> list:
     """Every (account, subaddress, atomic_balance) in `accounts` holding money.
 
@@ -3556,8 +3922,9 @@ def _funded_subaddresses(rpc, accounts) -> list:
 
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
-                          delay_window=None) -> tuple:
-    """ACTUALLY SPEND THE MIXED FUNDS OUT. Returns (relayed, failed, skipped).
+                          delay_window=None, hold=()) -> tuple:
+    """ACTUALLY SPEND THE MIXED FUNDS OUT.
+    Returns (relayed, failed, skipped, held).
 
     THIS IS THE EXIT, and it moves real value. Everything before it only
     rearranges coins inside one wallet; until this runs, the operator still
@@ -3579,16 +3946,48 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     Each withdrawal waits for its output to settle first: sweep_all can only
     spend UNLOCKED outputs, so sweeping early sweeps less than everything and
     reports success (proven on a real chain -- see _wait_for_change_settled).
+
+    `hold` is the (account, index) pairs this must NOT withdraw, and it exists
+    for exactly one output: ENTRY. The veil swept ENTRY once, hours ago, so a
+    balance there now arrived afterwards -- typically a swap chunk that settled
+    late (see _exit_hold_list for the other, still-open way value gets there).
+    Sweeping it would be a single transaction from the address the ThorChain
+    memo names in public to the operator's own destination: the one link the
+    entire pipeline exists to break, re-created in its final step. It is left
+    where it is and reported instead, because "your money is on a known
+    address" is a problem the operator can fix with another run and "your
+    destination is now publicly tied to your swap" is not fixable at all.
     """
     targets = _funded_subaddresses(connect_rpc(args.rpc_primary,
                                                proxy_url=args.tor_proxy),
                                    accounts)
+    held = [t for t in targets if (t[0], t[1]) in {(int(a), int(i))
+                                                   for a, i in (hold or ())}]
+    if held:
+        targets = [t for t in targets if t not in held]
+        for _ha, _hi, _hamt in held:
+            integrity_log("exit", f"withheld_unmixed_entry:{_ha}/{_hi}")
+            print(f"  [!] EXIT: {Decimal(_hamt) / Decimal(10 ** 12)} XMR is on "
+                  f"ENTRY (account {_ha} / subaddr {_hi}) and was NOT "
+                  f"withdrawn.")
+            print("      It landed after the run had planned — usually a swap "
+                  "chunk that settled late. The swap memo names that address "
+                  "in public, so sending it to your exit destination would tie "
+                  "the two together in one hop — which is what the rest of "
+                  "this run spent hours preventing.")
+            print("      It is safe where it is. Mix it with a fresh run "
+                  "(create_receive_wallet + --receive-wallet) rather than "
+                  "spending it by hand.")
     if not targets:
+        if held:
+            print("  [!] EXIT: nothing was withdrawn — the only funded output "
+                  "is the unmixed one on ENTRY described above.")
+            return (0, 0, 0, len(held))
         print("  [!] EXIT: no funded output was found on this run's accounts, "
               "so nothing was withdrawn. If you expected funds here, do NOT "
               "assume they are gone — check the wallet before re-running.")
         integrity_log("exit", "no_funded_outputs")
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
 
     # `secrets`, the module-level import -- NOT `_secrets`, which is a local
     # alias created inside main() and passed around as a parameter. Writing the
@@ -3669,14 +4068,14 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             if _es.is_dir() and not secure_delete_tree(_es):
                 print(f"  [!] Could not securely wipe {stage}; remove it manually.")
     integrity_log("exit", f"withdraw_done:{relayed}_of_{total}:failed={failed}")
-    return (relayed, failed, skipped)
+    return (relayed, failed, skipped, len(held))
 
 
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
                 change_target=(0, 0), change_sweep_jobs=None,
                 delay_window=None, veil_file=None, veil_target=None,
-                veil_need=None, exit_accounts=None):
+                veil_need=None, exit_accounts=None, exit_hold=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -3799,14 +4198,27 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 _exit_meta = json.load(_ef).get("meta", {})
         except Exception:                                    # noqa: BLE001
             _exit_meta = {}
-        _relayed, _failed, _skipped = _run_exit_withdrawals(
+        _relayed, _failed, _skipped, _held = _run_exit_withdrawals(
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
-            _exit_meta, delay_window)
+            _exit_meta, delay_window, hold=exit_hold or ())
+        if _held:
+            # Reported separately from a failure because it is not one: the
+            # exit deliberately refused to spend an unmixed output out of
+            # ENTRY. It is still money left behind, so it still belongs in the
+            # completion report -- with the reason attached, or the operator
+            # reads it as a bug and sweeps it by hand, which is the exact
+            # transaction being avoided.
+            incomplete.append(
+                f"{_held} unmixed output(s) on ENTRY were NOT withdrawn — they "
+                f"arrived after the run had planned, and the swap memo names "
+                f"that address in public, so withdrawing them would link the "
+                f"swap to your exit destination in one hop. Mix them with a "
+                f"fresh run")
         if _failed or _skipped:
             incomplete.append(
                 f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
                 f"were NOT sent — that value is still on this wallet")
-        elif _relayed:
+        elif _relayed and not _held:
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
                   f"its own transaction. Nothing left on this run's accounts.")
     else:

@@ -19,7 +19,7 @@ OPSEC design principles
 from __future__ import annotations
 import argparse
 import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
@@ -1410,6 +1410,29 @@ def quote_deviation(expected_out, amount_in, rate_in_per_out):
     if oracle_out <= 0:
         return None
     return abs(exp - oracle_out) / oracle_out
+
+
+def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
+    """The amount at which a swap's payment counts as having FULLY arrived.
+
+    A swap essentially never delivers its quote to the digit -- the rate moves
+    between quote and execution and the network takes its cut. Waiting for the
+    exact quoted figure is waiting for something that will not happen, so the
+    gate sits a tolerance below it and the shortfall is shown honestly.
+
+    TWO CALLERS, ONE DEFINITION, and that is the point of it living here.
+    receive_watch has always had this gate; GhostSpiral's own stage-4 arrival
+    wait did not, and waited for `> DUST_XMR` instead -- so under --split N it
+    returned the moment the FIRST of N chunks landed. Copying the formula into
+    the second caller would have left two versions of "how much is enough" free
+    to drift apart, which is the same class of defect as the one being fixed.
+    """
+    if target <= 0:
+        return Decimal(0)
+    if not (Decimal(0) <= tolerance < Decimal(1)):
+        raise ValueError("tolerance must be >= 0 and < 1")
+    return (target * (Decimal(1) - tolerance)).quantize(
+        Decimal("0.000000000001"), rounding=ROUND_DOWN)
 
 
 # ---------------------------------------------------------------------------

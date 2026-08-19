@@ -199,7 +199,7 @@ try:
     _stg = os.path.join(_tf.mkdtemp(prefix="exitwd_"), "tx_staging")
     os.makedirs(_stg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()):
-        relayed, failed, skipped = ghost._run_exit_withdrawals(
+        relayed, failed, skipped, held = ghost._run_exit_withdrawals(
             _args, [7, 8, 9], [A1, A2], _stg, None, {}, (0, 0))
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
@@ -208,7 +208,7 @@ finally:
 
 _txs = [t for r in rec.rounds for t in r]
 check("exit: withdrew every funded output (4 of them)",
-      relayed == 4 and failed == 0 and skipped == 0)
+      relayed == 4 and failed == 0 and skipped == 0 and held == 0)
 check("exit: ONE transaction per round -- never a collecting sweep",
       all(len(r) == 1 for r in rec.rounds) and len(rec.rounds) == 4)
 check("exit: every withdrawal is a SWEEP (leaves no change behind)",
@@ -226,6 +226,78 @@ check("exit: the withdrawal is SPREAD across both destinations",
       len({t["dst"] for t in _txs}) == 2)
 check("exit: each carries its own random extra (no shared fingerprint)",
       len({t["extra"] for t in _txs}) == len(_txs))
+
+
+# ---- the exit must NOT withdraw an unmixed output off ENTRY --------------
+#
+# Under --split N the swap chunks settle independently, so one can land on
+# ENTRY after the run has finished planning against the others. It has been
+# through none of the mixing, and the ThorChain memo names ENTRY in public --
+# so a sweep from it to --exit-to publishes exactly the link the run exists to
+# break, in the pipeline's final step, on the money it never mixed.
+#
+# Account 9 / subaddr 0 below stands in for that late chunk.
+_saved2 = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+rec2 = _Recorder()
+try:
+    ghost._run_round = rec2
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {7: {1: 3_000_000_000_000},
+         9: {0: 1_000_000_000_000, 1: 4_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _stg2 = os.path.join(_tf.mkdtemp(prefix="exithold_"), "tx_staging")
+    os.makedirs(_stg2, exist_ok=True)
+    _held_out = io.StringIO()
+    with contextlib.redirect_stdout(_held_out):
+        _r2, _f2, _s2, _h2 = ghost._run_exit_withdrawals(
+            _args, [7, 9], [A1, A2], _stg2, None, {}, (0, 0), hold=[(9, 0)])
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _saved2
+
+_txs2 = [t for r in rec2.rounds for t in r]
+check("exit: the held ENTRY output is NOT withdrawn",
+      (9, 0) not in [(t["account_index"], t["src_index"]) for t in _txs2])
+check("exit: ...and is reported as held, not as a silent success",
+      _h2 == 1 and _r2 == 2 and _f2 == 0 and _s2 == 0)
+check("exit: ...while every MIXED output still leaves",
+      sorted((t["account_index"], t["src_index"]) for t in _txs2)
+      == [(7, 1), (9, 1)])
+_held_msg = _held_out.getvalue()
+check("exit: ...and the operator is told it was not withdrawn",
+      "NOT withdrawn" in _held_msg)
+check("exit: ...and told the reason is the public swap memo, not a failure",
+      "memo" in _held_msg and "FAILED" not in _held_msg)
+check("exit: ...and told what to do with it instead of spending it by hand",
+      "--receive-wallet" in _held_msg)
+# The amount is printed so the operator knows what is sitting there. It is on
+# an address the memo already names, so this leaks nothing they do not have.
+check("exit: ...and how much is sitting there", "1 XMR" in _held_msg)
+
+# The hold list itself: ENTRY, and only when the veil actually ran.
+_ai = {"ENTRYADDR": (3, 1), "mixaddr": (4, 1)}
+_hold_on = ghost._exit_hold_list(types.SimpleNamespace(entry_veil=True),
+                                 _ai, "ENTRYADDR")
+check("hold: ENTRY is held back when the entry veil ran", _hold_on == [(3, 1)])
+check("hold: ...and nothing else is",
+      (4, 1) not in _hold_on)
+# --no-entry-veil spends the swap's output in the open by the operator's own
+# explicit choice, announced at stage 4. Holding funds back there buys nothing
+# and only strands them.
+check("hold: nothing is held under --no-entry-veil",
+      ghost._exit_hold_list(types.SimpleNamespace(entry_veil=False),
+                            _ai, "ENTRYADDR") == [])
+check("hold: an ENTRY that is not in addr_index holds nothing (no crash)",
+      ghost._exit_hold_list(types.SimpleNamespace(entry_veil=True),
+                            _ai, "unknown") == [])
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
