@@ -331,6 +331,25 @@ def compute_hop_amount(fanout_amt: Decimal, fee_xmr: Decimal) -> Decimal:
         DUST_XMR, rounding=ROUND_DOWN)
 
 
+def _tool(name: str) -> str:
+    """Absolute path to a sibling tool in this repo.
+
+    The pipeline spawned its own children as `["python3", "airgap_tx_signer",
+    ...]` -- a bare name resolved against the CURRENT WORKING DIRECTORY, not
+    against this file. Run from anywhere except the repo root, every round died
+    with "can't open file '<cwd>/airgap_tx_signer'", and it died AFTER the plan
+    was written and every account and subaddress had been created. Found by
+    running the shipped CLI from an operator's own directory for the first
+    time; no test caught it because the suites all import the modules instead
+    of spawning them, and the one suite that spawns runs from the repo.
+
+    sys.executable, not "python3", for the same reason gs_console already uses
+    it: the child must be the interpreter that has this project's
+    dependencies, not whatever "python3" happens to mean on PATH.
+    """
+    return str(Path(__file__).resolve().parent / name)
+
+
 def hop_fee_reserve(fee_xmr: Decimal) -> Decimal:
     """Amount withheld from a hop to pay its transaction fee.
 
@@ -1628,8 +1647,11 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
     money", after the funds have already been split across subaddresses.
     """
     rounds = wallets * 2 * deep
-    per_round_fee = fee_xmr * FEE_SAFETY_MARGIN
-    total_fees = per_round_fee * rounds
+    # hop_fee_reserve, not a second copy of `fee_xmr * FEE_SAFETY_MARGIN`.
+    # It was written out here as `per_round_fee`, which made this the third
+    # place that expression lived AND left main() referencing the local by
+    # name -- see the NameError note on the meta dict below.
+    total_fees = hop_fee_reserve(fee_xmr) * rounds
     return bal - total_fees, total_fees, rounds
 
 
@@ -2427,7 +2449,10 @@ def main():
             "version": VERSION,
             "created": int(time.time()) // 600 * 600,
             "rounds": len(fanout_plan) + len(dag_plan),
-            "fee_per_round": str(per_round_fee),
+            # hop_fee_reserve(fee_xmr), NOT `per_round_fee` (a local of
+            # compute_fee_budget) -- that name raised NameError here on every
+            # run, so no plan was ever written. See compute_fee_budget.
+            "fee_per_round": str(hop_fee_reserve(fee_xmr)),
             "total_fees": str(total_fees),
             "account_index": bal_account,
             "distribution_mode": distribution_mode,
@@ -2496,11 +2521,16 @@ def main():
             addr_index[_csa] = (_csacct, _csi)
             change_sweep_jobs.append((_acct, 0, _csa, _csi))
 
+        # All four veil/delay kwargs below are required -- see _stage5_run.
         incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
-                                 change_sweep_jobs=change_sweep_jobs)
+                                 change_sweep_jobs=change_sweep_jobs,
+                                 delay_window=_delay_window,
+                                 veil_file=veil_file,
+                                 veil_target=(bal_account, entry_index),
+                                 veil_need=usable)
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()]
@@ -2588,17 +2618,53 @@ def _stage5_cleanup(outdir_path: Path, *current_files):
                     print(f"  [!] Could not securely erase {old_plan}; remove it manually.")
 
 
-def _run_round(args, plan_file, staging_dir, label):
+def _run_round(args, plan_file, staging_dir, label, wipe: bool = True):
     """Create -> sign -> broadcast one plan file. Aborts on any failure.
 
     Each round gets its own staging subdir so its unsigned/signed blobs and
     manifest never collide with another round's. Returns the number of TXs
     broadcast for this round.
+
+    THE STAGING IS WIPED HERE, for every round, because three of the five
+    rounds were not wiping it. _run_peel_chain wipes its own per-peel staging
+    and says why -- "a peel chain runs for hours, and leaving each peel's
+    signed (relayable) blob on disk for the whole run is exactly the exposure
+    secure staging exists to avoid" -- and the entry veil, the fan-out (the
+    DEFAULT distribution) and the DAG round all left theirs behind. Observed
+    on a real run: tx_staging/veil/ still held signed/tx_0.signed, its
+    manifest with destinations and amounts, and outputs_export.hex (a map of
+    the wallet's holdings) long after the transaction was on-chain.
+
+    Doing it in the caller is what allowed three callers to differ, so it is
+    done here where a new round cannot forget it. Mode is already 0600/0700;
+    this is about the blobs existing at all, not about who can read them.
+
+    It wipes on the FAILURE path too, deliberately. Every failure below is a
+    sys.exit, i.e. the whole pipeline is over; the operator restarts, and a
+    restart designs a fresh plan against the balances that actually exist, so
+    the old round's unsigned/signed blobs and its bcast_progress.json have no
+    remaining use. Worse, they have negative use: a stale bcast_progress.json
+    left in this same staging path is exactly what the resume guard treats as
+    a half-finished broadcast, so keeping it would make the NEXT run abort.
     """
+    try:
+        return _run_round_body(args, plan_file, staging_dir, label)
+    finally:
+        _sd = Path(staging_dir)
+        if wipe and _sd.is_dir() and not secure_delete_tree(_sd):
+            print(f"  [!] Could not securely wipe {staging_dir}; it holds this "
+                  f"round's signed, relayable transaction blob. Remove it "
+                  f"manually.")
+
+
+def _run_round_body(args, plan_file, staging_dir, label):
+    """The three phases themselves. Split out only so _run_round can wrap
+    them in the staging wipe without re-indenting all of this; nothing else
+    calls it."""
     try:
         print(f"  [*] {label} 5a: Creating unsigned TXs via wallet-rpc...")
         subprocess.run(
-            ["python3", "airgap_tx_signer", str(plan_file),
+            [sys.executable, _tool("airgap_tx_signer"), str(plan_file),
              "--phase", "create",
              "--rpc", args.rpc_primary,
              "--tor-proxy", args.tor_proxy,
@@ -2634,7 +2700,7 @@ def _run_round(args, plan_file, staging_dir, label):
         # 400, so only the owner and root can read it.
         _sign_env = _child_env(args.wallet_password or "")
         subprocess.run(
-            ["python3", "airgap_tx_signer", str(plan_file),
+            [sys.executable, _tool("airgap_tx_signer"), str(plan_file),
              "--phase", "sign",
              "--wallet-file", args.wallet_file,
              "--outdir", staging_dir],
@@ -2672,7 +2738,7 @@ def _run_round(args, plan_file, staging_dir, label):
         # the moment of relay. --allow-clearnet-relay is forwarded too, or the
         # operator's explicit override at the top level would be silently
         # dropped and the child would refuse anyway.
-        _bcast_cmd = ["python3", "broadcast_signed_xmr", f"{staging_dir}/signed",
+        _bcast_cmd = [sys.executable, _tool("broadcast_signed_xmr"), f"{staging_dir}/signed",
                       "--tor-proxy", args.tor_proxy,
                       "--rpc", args.rpc_primary,
                       "--rpc-daemon", args.rpc_daemon,
@@ -2888,15 +2954,10 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
             relayed += 1
         finally:
             # The per-peel plan carries the full destination + amount; wipe it.
+            # The staging subdir itself is wiped by _run_round -- this loop used
+            # to be the ONLY caller that did it, which is precisely why the
+            # veil, fan-out and DAG rounds did not.
             secure_delete_file(one_path)
-            # And securely wipe THIS peel's staging subdir now that it is
-            # broadcast: a peel chain runs for hours, and leaving each peel's
-            # signed (relayable) blob on disk for the whole run is exactly the
-            # exposure secure staging exists to avoid. The tx is already
-            # on-chain, so the blob is spent -- there is nothing to keep.
-            _ps = Path(peel_stage)
-            if _ps.is_dir() and not secure_delete_tree(_ps):
-                print(f"  [!] Could not securely wipe {peel_stage}; remove it manually.")
     integrity_log("stage5", f"peel_chain_done:{relayed}_of_{n}")
     print(f"  [+] Peeling chain: {relayed}/{n} peels relayed.")
     return relayed
@@ -3107,7 +3168,16 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
-    then the exit-strategy simulation."""
+    then the exit-strategy simulation.
+
+    veil_file/veil_target/veil_need and delay_window are REQUIRED for a real
+    run even though they default to None. The entry veil (Round 0 below) and
+    --hop-delay were added to this signature and then, at the one call site in
+    main(), silently never passed -- so the veil round did not run and the
+    first peel spent a carrier that had never been funded ("not enough
+    money"). No test caught it because nothing executes main(). They default
+    to None only so the confirmation-gated helper stays callable in isolation;
+    the pipeline must pass all four."""
     # -- Round 0: veil the entry ------------------------------------------
     # ENTRY holds the one output an analyst is handed for free (the swap memo
     # is public). Sweep it into a fresh carrier FIRST, so the transaction that
@@ -3211,7 +3281,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         _exit_env = _child_env()
         _exit_env["GS_EXIT_AMOUNT"] = str(spendable_amount)
         subprocess.run(
-            ["python3", "exit_strategy_simulator",
+            [sys.executable, _tool("exit_strategy_simulator"),
              "--method", "bisq", "--tor-proxy", args.tor_proxy],
             check=True, timeout=300,
             env=_exit_env,          # no password needed; amount passed here

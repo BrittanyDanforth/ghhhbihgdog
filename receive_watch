@@ -267,7 +267,11 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
     f = choice.get("flags")
     if not f:
         return []
-    argv = [sys.executable, "GhostSpiral",
+    # Absolute path: this is the command the operator copies and runs, and a
+    # bare "GhostSpiral" only resolves if their shell happens to be sitting in
+    # the repo. Same reason the pipeline resolves its own children by path.
+    argv = [sys.executable,
+            str(Path(__file__).resolve().parent / "GhostSpiral"),
             "--receive-wallet", receive_wallet,
             "--tor-proxy", tor_proxy]
     # Carry the endpoint this watch actually used. The docstring calls this

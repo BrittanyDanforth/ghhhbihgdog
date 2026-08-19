@@ -98,16 +98,50 @@ class MoneroLab:
         return base * 2000
 
     def gen(self, address, n):
-        """Mine exactly n blocks to `address`. Instant, no overshoot."""
+        """Mine exactly n blocks to `address`, and PROVE the chain grew.
+
+        MALFORMED SUCCESS LIVES HERE. On a node that is not synchronized --
+        which is any regtest node started without --offline and without a peer
+        -- generateblocks answers
+
+            {"height": 0, "status": "BUSY", "untrusted": false}
+
+        with NO "error" key. Checking only for `error` therefore reported
+        success while producing zero blocks, and every downstream failure
+        ("not enough money", "no unlocked balance") pointed somewhere else
+        entirely. The absence of an error is not a postcondition.
+
+        So: check the documented status field, and then independently observe
+        that the height actually moved.
+        """
         left = int(n)
+        want = self.height() + left
         while left > 0:
             step = min(left, 40)
+            before = self.height()
             r = self.dj("generateblocks", {"amount_of_blocks": step,
                                            "wallet_address": address,
                                            "starting_nonce": 0})
             if "error" in r:
                 raise RuntimeError(f"generateblocks failed: {r['error']}")
+            status = (r.get("result") or {}).get("status")
+            if status != "OK":
+                raise RuntimeError(
+                    f"generateblocks answered status={status!r} instead of OK "
+                    f"(no error key, so this looks like success). The node is "
+                    f"most likely not synchronized: a regtest node started "
+                    f"without --offline and without a peer never reports "
+                    f"synchronized, and refuses to generate.")
+            after = self.height()
+            if after <= before:
+                raise RuntimeError(
+                    f"generateblocks reported OK but the height did not move "
+                    f"({before} -> {after}).")
             left -= step
+        got = self.height()
+        if got < want:
+            raise RuntimeError(f"asked for {n} blocks, chain reached {got} "
+                               f"instead of {want}")
         self.wj("refresh")
 
     def mine(self, address, target_height):
@@ -166,15 +200,48 @@ class MoneroLab:
         return out
 
     # -- lifecycle ---------------------------------------------------------
-    def start(self, wallet=True):
+    def _daemon_argv(self, datadir, rpc_port, p2p_port, offline, peer_port=None):
+        argv = ["monerod", "--regtest", "--no-zmq"]
+        if offline:
+            argv.append("--offline")
+        argv += ["--data-dir", datadir,
+                 "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", str(rpc_port),
+                 "--p2p-bind-port", str(p2p_port), "--no-igd", "--hide-my-port",
+                 "--fixed-difficulty", "1", "--non-interactive",
+                 "--log-file", os.path.join(self.base, f"d{rpc_port}.log"),
+                 "--log-level", "0"]
+        if peer_port:
+            argv += ["--add-exclusive-node", f"127.0.0.1:{peer_port}"]
+        return argv
+
+    def start(self, wallet=True, offline=True):
+        """offline=False starts a SECOND daemon and peers the two.
+
+        A regtest node with no peers never reports `synchronized`, and an
+        unsynchronized node answers generateblocks with status BUSY and no
+        error key -- so a lab that merely drops --offline silently produces no
+        blocks. Two nodes peered to each other reach `synchronized` while
+        still reaching nothing outside this host.
+
+        offline=True is right for suites that only build and inspect
+        transactions. offline=False is required to drive the shipped pipeline,
+        whose preflight refuses an offline daemon on the grounds that "every
+        broadcast would silently go nowhere" -- a correct guard that a lab
+        must satisfy rather than bypass.
+        """
         os.makedirs(os.path.join(self.base, "n"), exist_ok=True)
+        if not offline:
+            peer_dir = os.path.join(self.base, "peer")
+            os.makedirs(peer_dir, exist_ok=True)
+            self.procs.append(subprocess.Popen(
+                self._daemon_argv(peer_dir, self.dp - 20, self.dp - 21, False,
+                                  peer_port=self.dp - 1),
+                stdout=open(os.path.join(self.base, "peer.out"), "w"),
+                stderr=subprocess.STDOUT))
         self.procs.append(subprocess.Popen(
-            ["monerod", "--regtest", "--offline", "--no-zmq",
-             "--data-dir", os.path.join(self.base, "n"),
-             "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", str(self.dp),
-             "--p2p-bind-port", str(self.dp - 1), "--no-igd", "--hide-my-port",
-             "--fixed-difficulty", "1", "--non-interactive",
-             "--log-file", os.path.join(self.base, "d.log"), "--log-level", "0"],
+            self._daemon_argv(os.path.join(self.base, "n"), self.dp,
+                              self.dp - 1, offline,
+                              peer_port=None if offline else self.dp - 21),
             stdout=open(os.path.join(self.base, "d.out"), "w"),
             stderr=subprocess.STDOUT))
         for _ in range(60):
@@ -218,6 +285,20 @@ class MoneroLab:
                 f"enabled hard fork >= 15 (RingCT, ring 16). Without it the "
                 f"chain is pre-RingCT and no fee, output-count or ring "
                 f"measurement taken on it means anything.")
+        if not offline:
+            # An unsynchronized node answers generateblocks BUSY with no error
+            # key, so wait for the peering to settle rather than discovering it
+            # three phases later as "not enough money".
+            for _ in range(60):
+                if self.dj("get_info").get("result", {}).get("synchronized"):
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError(
+                    "the regtest node never reported synchronized even with a "
+                    "peer; generateblocks would answer BUSY and produce "
+                    "nothing. See " + os.path.join(self.base, "d.out"))
+
         if not wallet:
             return self
 
