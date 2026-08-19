@@ -195,7 +195,15 @@ def test_redact_masks_amount_and_value():
     check("--redact hides the fiat value",
           bool(value_line) and "22" not in value_line.replace("USD", ""))
     check("--redact still shows the method", "bisq" in red)
-    check("--redact still shows liquidity guidance", "Liquidity" in red)
+    # Was "--redact still shows liquidity guidance". The liquidity guidance was
+    # a three-branch `if` on the trade size dressed as market-depth analysis,
+    # and under --redact it leaked the very magnitude being masked (the band is
+    # a pure function of the amount). It is gone; what remains is a CONSTANT
+    # statement that depth is not knowable from here, which cannot leak a size.
+    check("--redact shows the depth caveat, and it carries no size band",
+          "Depth" in red and "not known from here" in red)
+    check("--redact no longer prints a size-bucketed liquidity verdict",
+          not any(w in red for w in ("MEDIUM", "typical volume for P2P")))
 
     import json
     plan = {}
@@ -206,6 +214,77 @@ def test_redact_masks_amount_and_value():
           plan.get("amount_in_xmr") == "137.4491")
     check("the saved plan file is 0600",
           os.path.exists(outfile) and oct(os.stat(outfile).st_mode)[-3:] == "600")
+
+
+def test_exit_tool_no_longer_simulates_what_it_cannot_measure():
+    """The exit step fabricated two numbers and printed them beside real ones.
+
+    liquidity_estimate() returned "LOW"/"MEDIUM"/"OK -- typical volume for P2P
+    markets" from a three-branch `if` bucketing the trade size at 10 and 50
+    XMR. It probed nothing, and it appeared under a heading called "Liquidity"
+    next to a live price -- which is how an invented verdict gets read as a
+    measurement. It also leaked: the band is a pure function of the amount, so
+    it handed back the magnitude --redact had just masked on the same screen.
+
+    Each method also carried a hard-coded slippage constant (1%, 0.8%, 3%)
+    that was silently subtracted from the operator's net. Slippage exists only
+    relative to a live quote against a live book; this tool has neither.
+
+    Both are gone. What is left is either measured (the live rate), a plain
+    property of the venue (KYC), or explicitly the operator's own input.
+    """
+    import json
+    sim = load("exit_strategy_simulator")
+    check("the liquidity heuristic function is gone entirely",
+          not hasattr(sim, "liquidity_estimate"))
+    check("no method carries an invented slippage constant any more",
+          all("slippage" not in cfg for cfg in sim.METHODS.values()))
+
+    code, out, outfile = _run_exit_sim(["100", "--method", "bisq"], PRICES)
+    plan = json.load(open(outfile)) if os.path.exists(outfile) else {}
+    check("exit tool still runs", code == 0)
+    check("no size-bucketed liquidity verdict is printed",
+          not any(w in out for w in ("MEDIUM", "typical volume for P2P")))
+    check("depth is reported as NOT KNOWN rather than guessed",
+          "not known from here" in plan.get("liquidity_guidance", ""))
+    check("slippage defaults to zero instead of an invented constant",
+          plan.get("slippage_pct") == "0"
+          and plan.get("slippage_pct_source") == "not_supplied_assumed_zero")
+    check("an unconfirmed venue fee is labelled as such in the JSON",
+          plan.get("fee_pct_confirmed") is False
+          and plan.get("fee_pct_source") == "venue_nominal_unconfirmed")
+    check("...and on the terminal, with the flag that fixes it",
+          "UNCONFIRMED" in out and "--fee-pct" in out)
+    check("the file records that nothing was executed",
+          plan.get("executed") is False)
+    check("the tool never claims an exit happened", "no XMR moved" in out)
+
+
+def test_exit_tool_uses_operator_rates_when_given():
+    """A rate the operator confirmed and one this file shipped as a default
+    must not be reported identically -- that equivalence is what made an
+    assumption read as a quote."""
+    import json
+    code, out, outfile = _run_exit_sim(
+        ["100", "--method", "bisq", "--fee-pct", "0.011",
+         "--slippage-pct", "0.02"], PRICES)
+    plan = json.load(open(outfile)) if os.path.exists(outfile) else {}
+    check("operator-supplied fee is used and marked confirmed",
+          plan.get("fee_pct") == "0.011" and plan.get("fee_pct_confirmed") is True)
+    check("operator-supplied slippage is used",
+          plan.get("slippage_pct") == "0.02"
+          and plan.get("slippage_pct_source") == "operator")
+    check("the net reflects BOTH supplied rates",
+          plan.get("net_xmr") == str((Decimal("100") - Decimal("100") * Decimal("0.011")
+                                      - Decimal("100") * Decimal("0.02")
+                                      ).quantize(Decimal("0.0001"))))
+    check("a confirmed fee is not labelled UNCONFIRMED", "UNCONFIRMED" not in out)
+
+    # A rate outside [0,1) is refused rather than quietly producing a negative
+    # or absurd net.
+    for bad in ("1.5", "-0.1"):
+        c, _o, _f = _run_exit_sim(["100", "--method", "bisq", "--fee-pct", bad], PRICES)
+        check(f"a fee rate of {bad} is refused", c != 0)
 
 
 def test_header_no_longer_claims_terminal_is_redacted():

@@ -1,21 +1,49 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 - Off-Ramp Planner (heuristic liquidity guidance)
-==============================================================================
+exit_strategy_simulator v10.1 - Off-Ramp Reference (measured values only)
+========================================================================
 Part of the GhostSpiral v10 tool-chain. Generates a schema-tagged
 exitplan_v1.json bundle.
 
-Prices are LIVE (CoinGecko, Bisq oracle fallback) or the tool aborts -- it never
-serves a made-up price. Fees/slippage per method are STATIC ESTIMATES, not live
-quotes, and the "liquidity" output is a HEURISTIC based on trade size only, NOT
-a real order-book/depth probe (Bisq/Haveno P2P markets have no queryable book).
+IT DOES NOT SIMULATE ANYTHING, AND IT NO LONGER PRETENDS TO. It reports what
+can actually be established and refuses to invent the rest. Two things it
+used to fabricate are gone:
+
+  * LIQUIDITY. There was a liquidity_estimate() that returned "LOW" / "MEDIUM"
+    / "OK — typical volume for P2P markets" from a three-branch `if` on the
+    trade size, bucketed at 10 and 50 XMR. It probed nothing. It was printed
+    beside live prices under a heading called "Liquidity", which is exactly
+    how an invented number gets read as a measurement. Bisq and Haveno are
+    P2P and have no queryable order book, so the honest output is to say the
+    depth is not knowable from here -- not to guess it and label the guess.
+    (It also leaked: the band is a pure function of the amount, so it gave
+    away the magnitude that --redact had just masked on the same screen.)
+
+  * SLIPPAGE. Each method carried a hard-coded slippage constant (1%, 0.8%,
+    3%) that was silently subtracted from the operator's net. Slippage is a
+    property of a live quote against a live book; nothing here has either.
+    It is now supplied by the operator (--slippage-pct) and defaults to ZERO,
+    so nothing invented ever reduces the figure they are shown.
+
+What IS real, and why each is allowed to stay:
+  * The PRICE is fetched live (CoinGecko, Bisq oracle fallback) or the tool
+    aborts. It never serves a made-up price.
+  * The FIAT VALUE is that live rate times the amount -- an actual
+    calculation over two real inputs.
+  * KYC is a checkable property of the venue, not an estimate.
+  * The venue FEE is a nominal published rate, and is now labelled as
+    UNCONFIRMED unless the operator passes --fee-pct with the rate their
+    venue actually quoted. The net is marked with which of the two it used.
+
+This tool moves NO XMR, contacts no venue, and places no order. The exit
+itself is manual, and report_holdings in GhostSpiral carries the rule that
+matters when performing it: spend the accounts one at a time.
 
 OPSEC hardening:
   - Tor verified before any API access
   - Atomic fsync-rename output with 0600 perms
   - Integrity hash-chain logging (amounts are NOT written to the chain)
   - KYC risk flagging
-  - Heuristic liquidity guidance by trade size (clearly labelled; not a probe)
   - --redact masks the figures on screen for shoulder-surfing / screen-sharing
   - The amount comes from GS_EXIT_AMOUNT, NOT argv: /proc/<pid>/cmdline is
     world-readable (0444) while /proc/<pid>/environ is owner-only (0400), so a
@@ -24,7 +52,7 @@ OPSEC hardening:
 TERMINAL OUTPUT IS NOT REDACTED BY DEFAULT, and this header used to claim it
 was ("No sensitive amounts or addresses leaked to terminal (redacted)") while
 printing the exact holding and its exact fiat value. That claim was false: the
-figures ARE the output of an off-ramp planner and the operator needs to read
+figures ARE the output of an off-ramp reference and the operator needs to read
 them. Use --redact when someone may be looking, which masks the magnitudes on
 screen while the full plan still goes to the 0600 JSON file.
 """
@@ -45,11 +73,24 @@ CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_cu
 # The Bisq price oracle is the closest to an official data source.
 BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
 
+# NOMINAL published fee rates, and the venue's KYC status.
+#
+# `slippage` used to live here too, as a per-method constant (1%, 0.8%, 3%)
+# that was subtracted from the operator's net as though it had been measured.
+# Slippage only exists relative to a live quote against a live book; this tool
+# has neither, so inventing one produced a smaller, more precise-looking number
+# than anybody could actually know. It is now --slippage-pct, operator-supplied
+# and defaulting to zero.
+#
+# fee_pct stays because a venue's published rate is a real, checkable figure --
+# but it is what the venue ADVERTISES, not what this run was quoted, so it is
+# reported as UNCONFIRMED unless the operator passes --fee-pct. kyc is a plain
+# property of the venue and is never estimated.
 METHODS: Dict[str, Dict] = {
-    "bisq":   {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.01"),  "kyc": False},
-    "haveno": {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.008"), "kyc": False},
-    "azteco": {"fee_pct": Decimal("0.05"),  "slippage": Decimal("0.00"),  "kyc": True},
-    "p2p":    {"fee_pct": Decimal("0.00"),  "slippage": Decimal("0.03"),  "kyc": False},
+    "bisq":   {"fee_pct": Decimal("0.003"), "kyc": False},
+    "haveno": {"fee_pct": Decimal("0.003"), "kyc": False},
+    "azteco": {"fee_pct": Decimal("0.05"),  "kyc": True},
+    "p2p":    {"fee_pct": Decimal("0.00"),  "kyc": False},
 }
 
 
@@ -139,30 +180,15 @@ def fetch_prices(proxy):
     )
 
 
-def liquidity_estimate(method: str, amount_xmr: Decimal) -> str:
-    """Provide liquidity guidance based on method and amount.
-    P2P DEXs like Bisq/Haveno don't have queryable order books,
-    so we give heuristic guidance instead of fake API calls."""
-    if method in ("bisq", "haveno"):
-        if amount_xmr > Decimal("50"):
-            return "LOW — consider splitting across multiple trades over days"
-        elif amount_xmr > Decimal("10"):
-            return "MEDIUM — may take multiple trades to fill"
-        else:
-            return "OK — typical volume for P2P markets"
-    elif method == "p2p":
-        return "UNKNOWN — depends on your counterparty"
-    elif method == "azteco":
-        return "HIGH — voucher-based, no order book"
-    return "UNKNOWN"
-
-
 def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "exit_strategy_simulator v10.0",
-        description="Plan XMR off-ramp with liquidity analysis",
+        "exit_strategy_simulator v10.1",
+        # Not "liquidity analysis": nothing here analyses liquidity, and the
+        # function that claimed to has been removed.
+        description="XMR off-ramp reference: live valuation and venue facts. "
+                    "Moves no XMR and places no order.",
     )
     # The amount is read from GS_EXIT_AMOUNT by preference, and the positional
     # is OPTIONAL so the pipeline never has to put it on a command line.
@@ -185,6 +211,19 @@ def main():
                          "/proc/<pid>/cmdline (mode 444).")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
+    # Real numbers come from the operator, not from this file. Without these
+    # the fee falls back to the venue's NOMINAL published rate (reported as
+    # unconfirmed) and slippage is ZERO rather than an invented constant.
+    ap.add_argument("--fee-pct", type=Decimal, default=None,
+                    help="the fee rate your venue ACTUALLY quoted, as a "
+                         "fraction (0.003 = 0.3%%). Without it the venue's "
+                         "nominal published rate is used and the result is "
+                         "labelled UNCONFIRMED.")
+    ap.add_argument("--slippage-pct", type=Decimal, default=None,
+                    help="slippage from a real quote, as a fraction. Defaults "
+                         "to 0: slippage is only knowable against a live order "
+                         "book, and this tool has no quote, so it will not "
+                         "invent one.")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
     ap.add_argument("--redact", action="store_true",
@@ -255,8 +294,21 @@ def main():
 
     cfg = METHODS[args.method]
     gross = args.amount
-    fee = gross * cfg["fee_pct"]
-    slip = gross * cfg["slippage"]
+
+    # Every rate that reduces the operator's figure is either supplied by them
+    # or flagged as the venue's unconfirmed advertised rate. Nothing invented
+    # here shrinks the number they read.
+    fee_confirmed = args.fee_pct is not None
+    fee_pct = args.fee_pct if fee_confirmed else cfg["fee_pct"]
+    slip_pct = args.slippage_pct if args.slippage_pct is not None else Decimal("0")
+    for _label, _v in (("--fee-pct", args.fee_pct),
+                       ("--slippage-pct", args.slippage_pct)):
+        if _v is not None and (not _v.is_finite() or _v < 0 or _v >= 1):
+            sys.exit(f"[!] {_label} must be a fraction in [0, 1) -- 0.003 means "
+                     f"0.3%. Got {_v}.")
+
+    fee = gross * fee_pct
+    slip = gross * slip_pct
     net = gross - fee - slip
 
     if net <= 0:
@@ -273,19 +325,11 @@ def main():
     fiat_rate = prices[rate_key]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
-    liq_guidance = liquidity_estimate(args.method, gross)
-    # What is safe to show when --redact is on. The guidance for bisq/haveno is
-    # a pure function of the amount -- it bins it at 10 and 50 XMR -- so
-    # printing it verbatim under --redact hands an observer the band while the
-    # figures beside it are masked. Measured: a 2-digit holding shows as
-    # "##.####" either way, but "MEDIUM" narrows it to 11-50 and "LOW" to
-    # 51-99, roughly halving the range --redact is supposed to be hiding.
-    # The methods whose guidance does NOT depend on the amount (p2p, azteco)
-    # are still shown, because they leak nothing.
-    liq_shown = f"{liq_guidance} (heuristic)"
-    if args.redact and args.method in ("bisq", "haveno"):
-        liq_shown = ("redacted — this guidance is derived from the amount, so "
-                     "printing it would give away the magnitude")
+    # Depth is stated as NOT KNOWN rather than guessed. This is a constant, so
+    # unlike the old size-bucketed guidance it cannot leak the magnitude that
+    # --redact masks on the same screen.
+    DEPTH_UNKNOWN = ("not known from here — Bisq/Haveno are P2P and expose no "
+                     "order book; check depth at the venue before committing")
 
     plan = {
         "schema": "exitplan_v1",
@@ -293,8 +337,16 @@ def main():
         "method": args.method,
         "kyc_required": cfg["kyc"],
         "amount_in_xmr": str(gross),
-        "fee_pct": str(cfg["fee_pct"]),
-        "slippage_pct": str(cfg["slippage"]),
+        "fee_pct": str(fee_pct),
+        # A machine reading this file must be able to tell a rate the operator
+        # confirmed from the venue's advertised one. Without these two flags
+        # both look identical, which is how an assumption gets consumed as a
+        # measurement downstream.
+        "fee_pct_confirmed": fee_confirmed,
+        "fee_pct_source": "operator" if fee_confirmed else "venue_nominal_unconfirmed",
+        "slippage_pct": str(slip_pct),
+        "slippage_pct_source": ("operator" if args.slippage_pct is not None
+                                else "not_supplied_assumed_zero"),
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
         "currency": args.currency,
         "amount_out_fiat": str(fiat_val),
@@ -311,11 +363,14 @@ def main():
         "oracle_prices_note": "rounded to whole units: full precision would "
                               "re-establish the timestamp this plan coarsens",
         "price_source": prices.get("source", "unknown"),
-        # Carries the marker the header promises ("clearly labelled; not a
-        # probe"). The terminal appended "(heuristic)"; the JSON -- the
-        # machine-readable artefact something else may consume -- did not, so
-        # the one copy a program would read looked like a measurement.
-        "liquidity_guidance": f"{liq_guidance} (heuristic, not an order-book probe)",
+        # Was "liquidity_guidance", carrying a size-bucketed guess. A consumer
+        # reading that key got an invented verdict in the same shape as the
+        # real fields beside it. The key now states that the depth is unknown,
+        # which is the true answer, and there is no number to misread.
+        "liquidity_guidance": DEPTH_UNKNOWN,
+        "executed": False,
+        "executed_note": "this tool moves no XMR, contacts no venue and places "
+                         "no order; the off-ramp is manual",
     }
 
     if shutdown_requested():
@@ -372,18 +427,32 @@ def main():
     # calling a KYC venue No-KYC is the single worst false statement it can
     # make. Suppress the WARNING, never the fact.
     kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
+    # Each derived line says where its rate came from. A number the operator
+    # confirmed and a number this file shipped as a default must never print
+    # the same way -- that equivalence is what made the old output read like a
+    # quote when it was an assumption.
+    _fee_src = "confirmed" if fee_confirmed else "NOMINAL, UNCONFIRMED"
+    _slip_src = "from your quote" if args.slippage_pct is not None \
+        else "not supplied, assumed 0"
     print(f"  Method      : {args.method} ({kyc_label})")
     print(f"  Gross       : {_m(gross, ' XMR')}")
-    print(f"  Fees        : {_m(round(fee, 4), ' XMR')} ({cfg['fee_pct'] * 100:.1f}%)")
-    print(f"  Slippage    : {_m(round(slip, 4), ' XMR')}")
+    print(f"  Fees        : {_m(round(fee, 4), ' XMR')} "
+          f"({fee_pct * 100:.1f}% — {_fee_src})")
+    print(f"  Slippage    : {_m(round(slip, 4), ' XMR')} ({_slip_src})")
     print(f"  ----------------------------------------")
     print(f"  Net         : {_m(round(net, 4), ' XMR')}")
     print(f"  Value       : {_m(fiat_val, ' ' + args.currency.upper())}")
-    print(f"  Prices from : {prices.get('source', 'unknown')}")
-    print(f"  Liquidity   : {liq_shown}")
+    print(f"  Prices from : {prices.get('source', 'unknown')} (live)")
+    print(f"  Depth       : {DEPTH_UNKNOWN}")
+    if not fee_confirmed:
+        print(f"  [!] The fee above is {args.method}'s advertised rate, not a "
+              f"quote for this trade. Pass --fee-pct with what your venue "
+              f"actually charges to make the net figure real.")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan saved -> {args.outfile}")
+    # Never "exit complete": nothing was sold and no XMR moved.
+    print(f"  [+] Reference saved -> {args.outfile} (no XMR moved; the "
+          f"off-ramp itself is manual)")
 
 
 if __name__ == "__main__":

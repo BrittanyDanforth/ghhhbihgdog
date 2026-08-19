@@ -3301,7 +3301,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     secure_delay(5.0, 15.0)
 
     try:
-        print("  [*] Stage 5d: Exit strategy simulation...")
+        print("  [*] Stage 5d: Off-ramp reference (no XMR is moved here)...")
         # The amount goes in the ENVIRONMENT, never on argv. A command line is
         # world-readable through /proc/<pid>/cmdline (0444); the environment is
         # owner-only (0400). Putting the total on a command line told every
@@ -3319,7 +3319,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         integrity_log("stage5", "exit_sim_ok")
     except Exception as e:
         integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
-        print(f"  [!] Exit simulation failed (non-fatal): {e}")
+        # Non-fatal on purpose: this step moves no money, so its failure
+        # cannot leave the mix half-executed. Say that, rather than letting a
+        # bare "failed" read as a lost exit.
+        print(f"  [!] Off-ramp reference failed (non-fatal — no XMR moved, the "
+              f"mix is unaffected): {e}")
 
     integrity_log("stage5", f"stage5_done:incomplete={len(incomplete)}")
     return incomplete

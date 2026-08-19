@@ -350,16 +350,44 @@ finally:
 # implemented in broadcast first and left unwired here, so the orchestrated
 # path -- the primary one -- silently skipped it.
 _stage = Path(os.getcwd()) / "stageD"
-(_stage / "signed").mkdir(parents=True, exist_ok=True)
-(_stage / "tx_0.unsigned").write_text("00")
-(_stage / "signed" / "tx_0.signed").write_bytes(b"x")
+
+
+def _mkstage():
+    """(Re)build the staging fixture a round expects to find.
+
+    _run_round securely wipes its staging dir in a finally now -- the veil,
+    fan-out and DAG rounds used to leave the signed, relayable blob on disk for
+    the whole run, and only the peel chain cleaned up after itself. So every
+    helper below that drives a round has to build this fresh: the second caller
+    used to run against the directory the first had deleted, find no *.signed,
+    and sys.exit before spawning a single child.
+    """
+    (_stage / "signed").mkdir(parents=True, exist_ok=True)
+    (_stage / "tx_0.unsigned").write_text("00")
+    (_stage / "signed" / "tx_0.signed").write_bytes(b"x")
+
+
+_mkstage()
 _planD = Path(os.getcwd()) / "planD.json"
 _planD.write_text("{}")
+
+
+def _has_tool(cmd, name):
+    """True if argv spawns `name`.
+
+    Was `name in cmd`, an exact list-membership test. The children are now
+    spawned by ABSOLUTE path (Path(__file__).parent / name) because a bare name
+    resolved against the CWD, so every round died with "can't open file" when
+    GhostSpiral was run from anywhere but the repo root. Exact membership stops
+    matching once the element is a full path, so match the basename.
+    """
+    return any(str(part).rsplit("/", 1)[-1] == name for part in cmd)
 
 
 def _child_argv(allow_clearnet):
     seen = []
     real_run, real_log = ghost.subprocess.run, ghost.integrity_log
+    _mkstage()
     try:
         ghost.subprocess.run = lambda cmd, **kw: (
             seen.append(list(cmd)), types.SimpleNamespace(returncode=0))[1]
@@ -377,21 +405,23 @@ def _child_argv(allow_clearnet):
 
 
 _cmds = _child_argv(False)
-_bc = [c for c in _cmds if "broadcast_signed_xmr" in c]
+check("D2: the round securely wipes its staging dir even on the orchestrated "
+      "path (it held a signed, relayable blob)", not _stage.exists())
+_bc = [c for c in _cmds if _has_tool(c, "broadcast_signed_xmr")]
 check("D2: GhostSpiral spawns the broadcast child", len(_bc) == 1)
 check("D2: --rpc-daemon forwarded (so the child VERIFIES egress, not warns)",
       "--rpc-daemon" in _bc[0])
 check("D2: --allow-clearnet-relay NOT forwarded when not requested",
       "--allow-clearnet-relay" not in _bc[0])
 
-_bc_allow = [c for c in _child_argv(True) if "broadcast_signed_xmr" in c]
+_bc_allow = [c for c in _child_argv(True) if _has_tool(c, "broadcast_signed_xmr")]
 check("D2: --allow-clearnet-relay IS forwarded when the operator set it "
       "(otherwise the child would refuse despite the override)",
       "--allow-clearnet-relay" in _bc_allow[0])
 
 # D3: the signer child must never receive the wallet password on argv, where
 # any local user can read it from /proc/<pid>/cmdline (mode 444).
-_sign = [c for c in _cmds if "airgap_tx_signer" in c and "sign" in c]
+_sign = [c for c in _cmds if _has_tool(c, "airgap_tx_signer") and "sign" in c]
 check("D3: GhostSpiral spawns the signer child", len(_sign) == 1)
 check("D3: wallet password NOT on the signer child's argv",
       not any("SECRET-PW" in str(t) for t in _sign[0]))
@@ -408,6 +438,7 @@ def _child_envs(pw_in_environ):
     seen = []
     real_run, real_log = ghost.subprocess.run, ghost.integrity_log
     prev = os.environ.get("GS_WALLET_PASSWORD")
+    _mkstage()
     try:
         if pw_in_environ:
             os.environ["GS_WALLET_PASSWORD"] = "SpendKeyPass-99"
@@ -655,12 +686,22 @@ def _drive_peel(stop_at_peel=None):
     """Run the SHIPPED _run_peel_chain; record each _run_round call. If
     stop_at_peel is set, the carrier never confirms for that peel (timeout)."""
     calls = []
-    saved = (ghost2._run_round, ghost2.connect_rpc, ghost2.newnym,
+    saved = (ghost2._run_round_body, ghost2.connect_rpc, ghost2.newnym,
              ghost2.tor_recheck, ghost2.secure_delay, ghost2.integrity_log,
              ghost2.shutdown_requested, ghost2.time)
     import types as _t
 
-    def fake_round(a, plan_file, staging, label):
+    def fake_round_body(a, plan_file, staging, label):
+        # Stubs the THREE PHASES ONLY (_run_round_body), not _run_round itself.
+        #
+        # This used to replace _run_round wholesale, which quietly made the
+        # staging-wipe assertion below vacuous: the wipe moved out of
+        # _run_peel_chain and into _run_round's finally (the veil, fan-out and
+        # DAG rounds were not wiping at all), so a stub standing in for
+        # _run_round meant the test was checking its own fake. Stubbing the
+        # body instead leaves the REAL wrapper -- and therefore the real
+        # finally -- in the path being tested.
+        #
         # A real round writes signed blobs into `staging`; emulate that so the
         # cleanup path has something to wipe.
         sd = Path(staging) / "signed"; sd.mkdir(parents=True, exist_ok=True)
@@ -668,6 +709,7 @@ def _drive_peel(stop_at_peel=None):
         with open(plan_file) as f:
             calls.append({"label": label, "staging": staging,
                           "peel": json.load(f)["txs"][0]})
+        return 1
 
     class _NeverReady:
         def raw_request(self, m, p): return {}
@@ -679,7 +721,7 @@ def _drive_peel(stop_at_peel=None):
             return _NeverReady()
         return _FakeCarrierRPC(ready_after=1)
 
-    ghost2._run_round = fake_round
+    ghost2._run_round_body = fake_round_body
     ghost2.connect_rpc = fake_connect
     ghost2.newnym = lambda *a, **k: None
     ghost2.tor_recheck = lambda *a, **k: None
@@ -696,7 +738,7 @@ def _drive_peel(stop_at_peel=None):
     try:
         n = ghost2._run_peel_chain(a, _peel_file, "tx_staging_peelF", None, (0, 0))
     finally:
-        (ghost2._run_round, ghost2.connect_rpc, ghost2.newnym, ghost2.tor_recheck,
+        (ghost2._run_round_body, ghost2.connect_rpc, ghost2.newnym, ghost2.tor_recheck,
          ghost2.secure_delay, ghost2.integrity_log, ghost2.shutdown_requested,
          ghost2.time) = saved
         ghost2.FANOUT_CONFIRM_TIMEOUT = _saved_to
