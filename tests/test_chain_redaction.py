@@ -619,6 +619,506 @@ check("control: the SAME payloads written unflattened DO break the verifier",
       not gsc.verify_integrity_chain(_raw)[0])
 
 
+# ==========================================================================
+# N. THE CHAIN MUST NOT CARRY TEXT THIS TOOLCHAIN DID NOT AUTHOR.
+#
+# Every rule above is about what the run's own vocabulary may say. This is the
+# other half: an EXCEPTION MESSAGE, or another program's stderr, is written by
+# someone else and its content is unbounded. Three call sites put one straight
+# into the persistent chain, and the worst of them was on the most-travelled
+# path in the toolchain -- newnym(), whose exception comes from
+# Controller.from_socket_file(ctrl) and therefore quotes the CONTROL SOCKET
+# PATH. Under a per-user Tor that is /home/<operator>/... or /run/user/<uid>/,
+# so the chain recorded a username. Found in a REAL integrity_chain.log: 294
+# entries from that one line.
+#
+# chain_safe does not help here. It strips addresses and digits; a path is
+# neither.
+#
+# Driven, not read: each function below is executed with a failure injected
+# whose text carries a marker no redactor would recognise, and BOTH halves are
+# asserted -- the marker must be absent from the chain and PRESENT on the
+# terminal, because the fix is "log the type, print the text", not "say less".
+# ==========================================================================
+print("\n=== the chain must not carry foreign text ===")
+
+MARKER = "/home/zzoperatorzz/.tor/ctrl"
+
+
+def _capture(fn, *a, **k):
+    """Run fn with integrity_log captured. Returns (chain_lines, stdout, exit)."""
+    lines = []
+    saved = gsc.integrity_log
+    buf = io.StringIO()
+    code = None
+    try:
+        gsc.integrity_log = lambda stage, msg, **kw: lines.append(str(msg))
+        try:
+            with contextlib.redirect_stdout(buf):
+                fn(*a, **k)
+        except SystemExit as e:
+            code = str(e.code)
+    finally:
+        gsc.integrity_log = saved
+    return lines, buf.getvalue() + (code or ""), code
+
+
+# -- newnym: the control socket path ---------------------------------------
+# stem is genuinely absent here, so import it into existence with a Controller
+# whose from_socket_file raises the error a real per-user Tor would.
+def _with_fake_stem(exc):
+    saved = {k: sys.modules.get(k) for k in ("stem", "stem.control")}
+
+    class _Ctx:
+        def __enter__(self):
+            pkg = types.ModuleType("stem")
+            pkg.Signal = types.SimpleNamespace(NEWNYM="NEWNYM")
+            ctl = types.ModuleType("stem.control")
+
+            class _Controller:
+                @staticmethod
+                def from_socket_file(path):
+                    raise exc
+            ctl.Controller = _Controller
+            pkg.control = ctl
+            sys.modules["stem"] = pkg
+            sys.modules["stem.control"] = ctl
+            return self
+
+        def __exit__(self, *a):
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+    return _Ctx()
+
+
+_saved_sleep, _saved_backoff = gsc.time.sleep, gsc._NEWNYM_RETRY_BACKOFF
+try:
+    gsc.time.sleep = lambda *a, **k: None      # no real backoff in a test
+    gsc._NEWNYM_RETRY_BACKOFF = 0
+    for _exc, _what in (
+            (FileNotFoundError(2, "No such file or directory", MARKER),
+             "a missing control socket"),
+            (PermissionError(13, "Permission denied", MARKER),
+             "an unreadable control socket")):
+        with _with_fake_stem(_exc):
+            _chain, _term, _code = _capture(gsc.newnym, MARKER, required=False)
+        _joined = " ".join(_chain)
+        check(f"newnym: {_what} does NOT put the socket path on the chain",
+              MARKER not in _joined)
+        check(f"newnym: ...it records the failure by TYPE ({type(_exc).__name__}), "
+              f"which is what tells the cases apart",
+              type(_exc).__name__ in _joined)
+        check(f"newnym: ...and the operator still sees the path on the terminal",
+              MARKER in _term)
+        # And nothing else foreign rode along: the payload after the counter
+        # must be exactly the type name.
+        _nl = [m for m in _chain if m.startswith("NEWNYM_fail:")]
+        check("newnym: the NEWNYM_fail payload is counter + type and nothing else",
+              bool(_nl) and _nl[-1].split(":")[-1] == type(_exc).__name__)
+
+    # required=True aborts, and the abort must not leak it either.
+    with _with_fake_stem(PermissionError(13, "Permission denied", MARKER)):
+        _chain, _term, _code = _capture(gsc.newnym, MARKER, required=True)
+    check("newnym: a REQUIRED rotation still aborts", _code is not None)
+    check("newnym: ...and the abort path leaves no path on the chain",
+          MARKER not in " ".join(_chain))
+    check("newnym: ...while the abort message names it for the operator",
+          MARKER in _term)
+finally:
+    gsc.time.sleep, gsc._NEWNYM_RETRY_BACKOFF = _saved_sleep, _saved_backoff
+
+# -- paranoia: dns_check and clear_journal ---------------------------------
+_pl = importlib.machinery.SourceFileLoader("paranoia_mode",
+                                           os.path.join(REPO, "paranoia_mode"))
+_par = importlib.util.module_from_spec(importlib.util.spec_from_loader(_pl.name, _pl))
+_pl.exec_module(_par)
+
+
+def _capture_par(fn, *a, **k):
+    lines = []
+    saved = _par.integrity_log
+    buf = io.StringIO()
+    try:
+        _par.integrity_log = lambda stage, msg, **kw: lines.append(str(msg))
+        with contextlib.redirect_stdout(buf):
+            fn(*a, **k)
+    finally:
+        _par.integrity_log = saved
+    return lines, buf.getvalue()
+
+
+_saved_gai = _par.socket.getaddrinfo
+try:
+    def _boom(*a, **k):
+        raise OSError(101, "Network is unreachable", MARKER)
+    _par.socket.getaddrinfo = _boom
+    _chain, _term = _capture_par(_par.dns_check)
+    check("dns_check: the resolver's error text does NOT reach the chain",
+          MARKER not in " ".join(_chain))
+    check("dns_check: ...the type does", "OSError" in " ".join(_chain))
+    check("dns_check: ...and the operator still sees the message",
+          MARKER in _term)
+finally:
+    _par.socket.getaddrinfo = _saved_gai
+
+_saved_run = _par.subprocess.run
+try:
+    def _boom_run(*a, **k):
+        raise _par.subprocess.CalledProcessError(
+            1, "journalctl", output=b"", stderr=MARKER.encode())
+    _par.subprocess.run = _boom_run
+    _chain, _term = _capture_par(_par.clear_journal, False)
+    check("clear_journal: journalctl's OWN stderr does NOT reach the chain",
+          MARKER not in " ".join(_chain))
+    check("clear_journal: ...it records WHICH failure, in a fixed vocabulary",
+          any(m.startswith("journal_fail:")
+              and m.split(":", 1)[1] in ("needs_root", "journalctl_error")
+              for m in _chain))
+    check("clear_journal: ...and the stderr still reaches the operator",
+          MARKER in _term)
+finally:
+    _par.subprocess.run = _saved_run
+
+# -- CONTROL: the markers are findable at all ------------------------------
+# Every check above is an absence. Without this, a _capture that silently
+# returned nothing would make all of them pass.
+check("control: _capture does see chain lines when they are written",
+      len(_capture(lambda: gsc.integrity_log("t", "hello:world"))[0]) == 1)
+# CONTROL: the absence above is the CALL SITE's doing.
+#
+# This used to assert the marker survives chain_safe. It no longer does -- the
+# path rule further down now collapses it too -- so that phrasing would be
+# quietly testing the redactor instead of the call site. Say the true thing
+# instead: the injection really carries the marker, and the redactor alone
+# does NOT turn the old payload into the new one. What changed is what the
+# call site sends.
+_exc_probe = PermissionError(13, "Permission denied", MARKER)
+check("control: the injected exception really does carry the marker "
+      "(so the checks above had something to find)",
+      MARKER in str(_exc_probe))
+check("control: chain_safe alone does NOT reduce the payload this call site "
+      "used to write to the one it writes now — the difference is the call "
+      "site, not the redactor",
+      gsc.chain_safe(f"NEWNYM_fail:1:{str(_exc_probe)[:40]}")
+      != gsc.chain_safe("NEWNYM_fail:1:PermissionError"))
+
+
+# -- STRUCTURAL: no future call site may reintroduce it --------------------
+#
+# The three sites above were found by reading a real chain log, which is not a
+# process that scales. The rule is mechanical, so enforce it mechanically:
+# inside an `except ... as <name>` handler, no integrity_log argument may
+# interpolate <name> itself or str(<name>). type(<name>).__name__ is the
+# sanctioned form and is what ~24 other sites already use.
+# DISCOVERED, not listed. A hand-maintained list of tools is the same hope as
+# a comment asking two lists to stay in sync -- a tool added later would simply
+# not be checked, and nothing would say so. Anything in the repo root that
+# calls integrity_log is in scope, by definition.
+def _is_python_source(p):
+    """A .py file, or an extensionless script with a python shebang.
+
+    NOT "any file mentioning integrity_log": the first version of this swept
+    the repo root and picked up BRUTAL_AUDIT.md, which discusses the function
+    in prose. ast.parse then died on a markdown heading and took the suite
+    with it -- a discovery rule is only an improvement over a hand list if it
+    discovers the right thing.
+    """
+    if p.suffix == ".py":
+        return True
+    try:
+        return p.read_bytes()[:2] == b"#!" and b"python" in p.read_bytes()[:64]
+    except OSError:
+        return False
+
+
+_TOOLS = sorted(
+    p.name for p in Path(REPO).iterdir()
+    if p.is_file() and not p.name.startswith(".") and _is_python_source(p)
+    and "integrity_log" in p.read_text(errors="ignore"))
+check("the rule below is applied to every tool that logs to the chain, found "
+      f"by looking rather than by a list ({len(_TOOLS)} of them)",
+      len(_TOOLS) >= 10 and "gs_common.py" in _TOOLS
+      and "GhostSpiral" in _TOOLS)
+
+
+def _exc_text_in_chain(path):
+    """[(line, expr)] for every integrity_log arg quoting an exception's text."""
+    tree = ast.parse(Path(path).read_text())
+    bad = []
+
+    class V(ast.NodeVisitor):
+        def __init__(self):
+            self.bound = []          # names bound by enclosing except handlers
+
+        def visit_ExceptHandler(self, node):
+            self.bound.append(node.name)
+            self.generic_visit(node)
+            self.bound.pop()
+
+        def visit_Call(self, node):
+            f = node.func
+            if (isinstance(f, ast.Name) and f.id == "integrity_log") or \
+               (isinstance(f, ast.Attribute) and f.attr == "integrity_log"):
+                names = {b for b in self.bound if b}
+                for arg in node.args + [k.value for k in node.keywords]:
+                    for sub in ast.walk(arg):
+                        if isinstance(sub, ast.FormattedValue):
+                            e = sub.value
+                            if isinstance(e, ast.Name) and e.id in names:
+                                bad.append((node.lineno, e.id))
+                            if (isinstance(e, ast.Call)
+                                    and isinstance(e.func, ast.Name)
+                                    and e.func.id == "str"
+                                    and e.args
+                                    and isinstance(e.args[0], ast.Name)
+                                    and e.args[0].id in names):
+                                bad.append((node.lineno, f"str({e.args[0].id})"))
+                            # str(e)[:40] and friends
+                            if isinstance(e, ast.Subscript):
+                                for s2 in ast.walk(e):
+                                    if (isinstance(s2, ast.Call)
+                                            and isinstance(s2.func, ast.Name)
+                                            and s2.func.id == "str"
+                                            and s2.args
+                                            and isinstance(s2.args[0], ast.Name)
+                                            and s2.args[0].id in names):
+                                        bad.append((node.lineno,
+                                                    f"str({s2.args[0].id})[...]"))
+            self.generic_visit(node)
+
+    V().visit(tree)
+    return bad
+
+
+_offenders = []
+for _t in _TOOLS:
+    _offenders += [(_t, ln, ex) for ln, ex in _exc_text_in_chain(os.path.join(REPO, _t))]
+check("no integrity_log call anywhere interpolates a caught exception's TEXT"
+      + (f" (found {_offenders})" if _offenders else ""),
+      not _offenders)
+
+# The rule detector must actually detect. Feed it the code as it was.
+_probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+_probe.write(
+    "def f():\n"
+    "    try:\n"
+    "        g()\n"
+    "    except Exception as e:\n"
+    "        integrity_log('tor', f'fail:{str(e)[:40]}')\n"
+    "        integrity_log('tor', f'fail:{e}')\n"
+    "        integrity_log('tor', f'ok:{type(e).__name__}')\n")
+_probe.close()
+_found = _exc_text_in_chain(_probe.name)
+os.unlink(_probe.name)
+check("control: the rule CATCHES the two forms that were shipped "
+      "(str(e)[:40] and a bare {e})", len(_found) == 2)
+check("control: ...and does NOT flag the sanctioned type(e).__name__ form",
+      all("type" not in f[1] for f in _found))
+
+
+# ==========================================================================
+# ...AND A FILESYSTEM PATH IS FOREIGN TEXT TOO.
+#
+# The exception rule above was scoped to `except ... as e`, and it missed the
+# site right next to it: paranoia_mode logged `str(path)[-40:]` for every
+# artifact it could not securely delete. /home/<operator>/... is not an
+# address and not a digit, so nothing above touched it -- the operator's
+# USERNAME went onto the persistent chain, written by the tool whose entire
+# job is leaving nothing behind.
+#
+# Two defences, because they fail differently:
+#   * the CALL SITE logs a basename. A left-truncated path fragment
+#     ("alice/.local/share/x") is not something a chokepoint can fully undo.
+#   * CHAIN_SAFE collapses any path that still reaches it, so a future call
+#     site cannot reintroduce this the way this one was introduced.
+# ==========================================================================
+print("\n=== a path is an identifier ===")
+
+_USER = "zzoperatorzz"
+for _p, _keep in (
+        (f"/home/{_USER}/.local/share/recently-used.xbel", "recently-used.xbel"),
+        (f"/home/{_USER}/ghostspiral/thor_pairs.json", "thor_pairs.json"),
+        ("/run/user/1000/tor/control", "control"),
+        (f"/tmp/gs_sign_ab12/unsigned_monero_tx", "unsigned_monero_tx")):
+    _got = gsc.chain_safe(f"secure_delete_fail:{_p}")
+    check(f"chain_safe drops the directories of {_p}", _USER not in _got
+          and "/home/" not in _got and "/run/" not in _got)
+    check(f"...and keeps the basename ({_keep}), which is the diagnostic",
+          _keep.replace("1", "#").replace("2", "#") in _got or _keep in _got)
+
+# The left-truncated form the old call site produced.
+check("chain_safe also collapses a path that was already truncated from the "
+      "left (the shape `str(path)[-40:]` produced)",
+      _USER not in gsc.chain_safe(
+          f"secure_delete_fail:{_USER}/.local/share/recently-used.xbel"))
+
+# NOT VACUOUS: it must leave the chain's own vocabulary alone. These are the
+# real payloads the tools build, and an over-eager path rule would eat the
+# account/subaddress pairs this file spends the rest of its length on.
+for _p in REAL:
+    check(f"real payload survives the path rule: {_p}",
+          "<path>" not in gsc.chain_safe(_p))
+check("in particular an account/subaddress pair is NOT read as a path",
+      gsc.chain_safe("withdrawn:4/1") == "withdrawn:#/#")
+
+# The call site itself, driven: paranoia's own failure log.
+_recorded = []
+_saved_log, _saved_del = _par.integrity_log, _par.secure_delete_file
+try:
+    _par.integrity_log = lambda stage, msg, **kw: _recorded.append(
+        gsc.chain_safe(str(msg)))
+    _par.secure_delete_file = lambda p: False        # every delete "fails"
+    with contextlib.redirect_stdout(io.StringIO()):
+        _par._secure_delete_file(Path(f"/home/{_USER}/ghostspiral/thor_pairs.json"))
+finally:
+    _par.integrity_log, _par.secure_delete_file = _saved_log, _saved_del
+check("paranoia's own delete-failure line names the FILE, not where it lived",
+      any("thor_pairs.json" in m for m in _recorded))
+check("...and does not carry the operator's home directory",
+      _recorded and not any(_USER in m for m in _recorded))
+check("control: it did log something (so the absence above is a redaction, "
+      "not a missing call)", len(_recorded) == 1)
+
+# THE CASE ONLY THE CALL SITE CAN FIX, and the reason it is fixed there too.
+#
+# chain_safe needs TWO separators to recognise a path, so it cleans the
+# ordinary `str(path)[-40:]` tail. It cannot clean a tail that truncation left
+# with only ONE: a deep home directory pushes the leading separators off the
+# front, and what remains is `<end-of-username>/f.json` -- which is a filename
+# with a directory in front of it as far as any rule can tell.
+#
+# Without this case, reverting the call site to str(path)[-40:] changes
+# nothing observable and the fix reads as redundant. It is not.
+_DEEP = "/home/" + "x" * 30 + _USER + "/f.json"
+check("a truncated tail with ONE separator is NOT recognisable as a path — "
+      "which is why the call site must send a basename, not a tail",
+      _USER in gsc.chain_safe(f"secure_delete_fail:{_DEEP[-40:]}"))
+
+_recorded2 = []
+_saved_log, _saved_del = _par.integrity_log, _par.secure_delete_file
+try:
+    _par.integrity_log = lambda stage, msg, **kw: _recorded2.append(
+        gsc.chain_safe(str(msg)))
+    _par.secure_delete_file = lambda p: False
+    with contextlib.redirect_stdout(io.StringIO()):
+        _par._secure_delete_file(Path(_DEEP))
+finally:
+    _par.integrity_log, _par.secure_delete_file = _saved_log, _saved_del
+check("...and with a deep home directory the real call site STILL leaks no "
+      "part of the operator's name",
+      _recorded2 and not any(_USER in m for m in _recorded2))
+check("...while still naming the file", any("f.json" in m for m in _recorded2))
+
+
+# ==========================================================================
+# ...AND THE REDACTOR MUST NOT EAT THE DIAGNOSTIC IT PROTECTS.
+#
+# Every check above asserts what does NOT reach the chain. This is the other
+# direction, and it is the one a redactor gets switched off over.
+#
+# _b58_run_is_addressy's own docstring says "chain payloads now carry
+# exception TYPE names for exactly the reason this function exists -- so a
+# rule that ate them would delete the diagnostic it was introduced to
+# protect". It was eating them. Swept over 34 realistic type names, three came
+# out as addresses:
+#
+#     FileNotFoundError   -> Fil<addr>     ('l' is not base58, so the run is
+#                                           "eNotFoundError": 6 flips over 14)
+#     ModuleNotFoundError -> Modul<addr>
+#     MaxRetryError       -> <addr>
+#
+# and the first two are this toolchain's commonest failures -- a missing Tor
+# control socket, a missing plan file, an absent `stem`.
+#
+# IT SURVIVED BECAUSE EVERY TEST MEASURED THE WRONG THING. The suites capture
+# integrity_log's ARGUMENT, which never passes through chain_safe. It was
+# found by writing a real chain entry to disk and reading the file back, which
+# is what the end-to-end check at the bottom of this section does.
+#
+# Reporting <addr> where no address existed is not a harmless over-redaction:
+# integrity_chain.log is what an operator reads to find out what happened, and
+# <addr> tells them an address leaked into the chain and was caught. Both
+# halves are false.
+# ==========================================================================
+print("\n=== the redactor must not eat the diagnostic ===")
+
+TYPE_NAMES = """FileNotFoundError PermissionError ConnectionError ModuleNotFoundError
+NotADirectoryError IsADirectoryError TimeoutError OSError RuntimeError ValueError
+TypeError KeyError IndexError AttributeError JSONDecodeError InvalidOperation
+CalledProcessError TimeoutExpired RequestException InvalidSchema HTTPError
+ConnectionRefusedError BrokenPipeError InterruptedError UnicodeDecodeError
+AuthenticationFailure SocketError ProtocolError ReadTimeout SSLError
+MaxRetryError NewConnectionError ProxyError ChunkedEncodingError""".split()
+
+_eaten = [n for n in TYPE_NAMES
+          if gsc.chain_safe(f"verify_fail:{n}") != f"verify_fail:{n}"]
+check(f"no exception TYPE name is redacted by chain_safe"
+      + (f" (eaten: {_eaten})" if _eaten else ""), not _eaten)
+
+# The three that were, named individually so a regression says WHICH.
+for _n in ("FileNotFoundError", "ModuleNotFoundError", "MaxRetryError"):
+    check(f"{_n} survives the chain intact", gsc.chain_safe(f"x:{_n}") == f"x:{_n}")
+
+# ...and the type names this toolchain writes today, taken from the call sites
+# rather than from a list someone remembered to update.
+for _n in ("NEWNYM_fail:3:ModuleNotFoundError", "dns_fail:OSError",
+           "verify_fail:ConnectionError", "peel_carrier_timeout:0"):
+    check(f"a real payload keeps its meaning: {_n}",
+          "<addr>" not in gsc.chain_safe(_n))
+
+# NON-VACUITY: addresses must STILL be redacted, or this section would be
+# satisfied by deleting the rule.
+_FULL = ("4AdUndZSGRTuLDcnbXWuqiCRjxvJyfKUnKbGRvHfHDbHqPBb7pTuT9Y2NPmEZQPHT"
+         "RPtLbLDBnPa6NPRjXcSjSbUFqPWWxq")
+check("control: a WHOLE address is still redacted", "<addr>" in gsc.chain_safe(f"x:{_FULL}"))
+check("control: a scrub_address fragment is still redacted",
+      "<addr>" in gsc.chain_safe("entry=4AdUndZS...9kQjMdKr"))
+for _L in (30, 40, 60):
+    check(f"control: a {_L}-character address fragment is still redacted",
+          "<addr>" in gsc.chain_safe("x:" + _FULL[:_L]))
+
+# The rule's shape, stated as a property rather than by example: at or above
+# the threshold, length alone decides, so a digitless slice of an address is
+# still caught. (Below it, a digitless run is treated as a word -- that is the
+# trade, and the docstring measures its cost.)
+_DIGITLESS = "AbCdEfGhAbCdEfGhAbCdEfGhAbCdEfGhAbCd"          # 36, no digits
+check("a long DIGITLESS base58 run is still redacted — the threshold is a "
+      "floor on the digit requirement, not a hole above it",
+      "<addr>" in gsc.chain_safe(f"x:{_DIGITLESS}"))
+check("...while a short digitless run (a word) is not",
+      "<addr>" not in gsc.chain_safe("x:AbCdEfGh"))
+
+# -- END TO END, through the file, which is how this was found ---------------
+# Everything above calls chain_safe directly. The bug lived in the gap between
+# what a test captured and what reached the disk, so close it: write real
+# entries with the real writer and read the real file back.
+_d = tempfile.mkdtemp(prefix="gs_chain_e2e_")
+_lp = Path(_d, "chain.log")
+_WROTE = [("tor", "NEWNYM_fail:3:ModuleNotFoundError"),
+          ("tor", "NEWNYM_fail:1:FileNotFoundError"),
+          ("paranoia", "secure_delete_fail:/home/zzoperatorzz/gs/thor_pairs.json"),
+          ("exit", "withdrawn:4/1"),
+          ("stage3", "entry_created")]
+for _s, _m in _WROTE:
+    gsc.integrity_log(_s, _m, log_path=_lp)
+_disk = _lp.read_text()
+check("e2e: the type name reaches the FILE unmangled",
+      "ModuleNotFoundError" in _disk and "FileNotFoundError" in _disk)
+check("e2e: ...and no <addr> was invented for it", "<addr>" not in _disk)
+check("e2e: the operator's home directory does NOT reach the file",
+      "zzoperatorzz" not in _disk and "/home/" not in _disk)
+check("e2e: ...while the file that failed is still named",
+      "thor_pairs.json" in _disk)
+check("e2e: numbers are still stripped", "withdrawn:#/#" in _disk)
+_v = gsc.verify_integrity_chain(_lp)
+check("e2e: and the chain the real writer produced VERIFIES", _v[0] is True)
+check("control: e2e actually wrote every line",
+      len([ln for ln in _disk.splitlines() if " | " in ln]) == len(_WROTE))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

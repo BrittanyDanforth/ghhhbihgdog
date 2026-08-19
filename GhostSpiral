@@ -1240,6 +1240,53 @@ def create_subs(rpc, n: int, decoys: int) -> tuple:
         addr_index[addr] = (acct, idx)
         if i >= n:
             decoy_addrs.add(addr)
+    # PROVE THEY ARE ACTUALLY SEPARATE, rather than assuming the wallet
+    # numbered them for us.
+    #
+    # Stated honestly: this is defence in depth, not a reproduced bug. Real
+    # monero-wallet-rpc 0.18.3.1 hands out 1, 2, 3... and no run here has seen
+    # otherwise. But the guarantee resting on it is the one this docstring
+    # calls the exit defence -- "makes the merge IMPOSSIBLE rather than merely
+    # discouraged" -- and it holds ONLY because a Monero transaction cannot
+    # spend across accounts. Two outputs that share an account can be merged,
+    # and nothing downstream would notice: the run would print the
+    # one-account-per-output promise and be wrong.
+    #
+    # A repeated ADDRESS is worse than a wasted account, and silently so. The
+    # dict above is keyed by address, so a duplicate collapses two entries into
+    # one while `subs` keeps both -- then fanout_by_addr = dict(zip(dests,
+    # amounts)) collapses again and one output's amount is dropped without a
+    # word. len(subs) still passes its floor.
+    #
+    # Every other RPC answer in this toolchain is verified the same way and for
+    # the same stated reason (get_subaddress_balance matches the indices it
+    # asked about; new_subaddress_indexed checks the address is address-shaped;
+    # create_fresh_account refuses a reported index of 0) -- because the wallet
+    # is not expected to lie, but the failure mode if it does is the silent
+    # kind. Costs one set comparison and no RPC.
+    if len(set(subs)) != len(subs):
+        integrity_log("stage3", "DUPLICATE_SUBADDRESS")
+        sys.exit(
+            f"[!] The wallet handed out the same subaddress twice while "
+            f"creating {len(subs)} of them.\n"
+            f"    Refusing to plan: two mix outputs on one address can be "
+            f"spent by ONE transaction,\n"
+            f"    which is the merge every output getting its own account "
+            f"exists to make impossible —\n"
+            f"    and the fan-out would silently drop one output's amount on "
+            f"the way there.")
+    _accts = [a for a, _ in addr_index.values()]
+    if len(set(_accts)) != len(_accts):
+        integrity_log("stage3", "DUPLICATE_MIX_ACCOUNT")
+        sys.exit(
+            f"[!] Two mix subaddresses were created in the SAME wallet "
+            f"account.\n"
+            f"    Refusing to plan: one account per output is what makes "
+            f"merging them impossible\n"
+            f"    rather than merely discouraged, and a Monero transaction "
+            f"CAN spend two subaddresses\n"
+            f"    of one account. The run would report a separation it does "
+            f"not have.")
     return subs, addr_index, decoy_addrs
 
 

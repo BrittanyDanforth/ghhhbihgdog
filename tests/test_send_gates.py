@@ -531,6 +531,117 @@ check("control: a FOREIGN --exit-to lets the real main() run ON to the swap "
       _state == "past")
 
 
+# ==========================================================================
+# create_subs must PROVE the wallet gave it separate accounts
+#
+# One account per output is what this pipeline calls its exit defence, and it
+# works only because a Monero transaction cannot spend across accounts. Two
+# outputs sharing an account CAN be merged, and nothing downstream looks --
+# the run would print the guarantee and be wrong. A repeated ADDRESS is worse
+# still: addr_index is keyed by address, so the duplicate collapses two
+# entries into one while subs keeps both, and fanout_by_addr = dict(zip(...))
+# then drops one output's amount without a word.
+#
+# Defence in depth against a wallet that misnumbers, not a reproduced bug --
+# but every other RPC answer here is verified the same way for the same
+# reason, and this is the answer the central guarantee rests on.
+# ==========================================================================
+print("\n=== create_subs verifies the separation it promises ===")
+
+
+class _SubsRPC:
+    """A wallet-rpc that hands out accounts/addresses from scripted lists."""
+
+    def __init__(self, accounts, addresses):
+        self._accts = list(accounts)
+        self._addrs = list(addresses)
+
+    def raw_request(self, method, params):
+        if method == "create_account":
+            return {"account_index": self._accts.pop(0)}
+        raise AssertionError(method)
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return self._addrs.pop(0), 1
+
+
+def _mk(seed, k):
+    return [_addr(1000 + seed * 100 + i) for i in range(k)]
+
+
+def _run_subs(accounts, addresses, n, decoys):
+    return aborts(ghost.create_subs, _SubsRPC(accounts, addresses), n, decoys)
+
+
+# -- the honest wallet still works -----------------------------------------
+_good = _mk(1, 5)
+_msg = _run_subs([1, 2, 3, 4, 5], list(_good), 3, 2)
+check("control: a wallet numbering 1,2,3,4,5 with distinct addresses is "
+      "accepted", _msg is None)
+
+def _subs_or_none(*a, **k):
+    """create_subs's return value, or None if it refused.
+
+    NOT a bare call: a mutation that makes the check fire unconditionally
+    would raise SystemExit straight out of the module and kill the suite
+    before it printed a RESULT line — which reads as 'no result', not as a
+    catch. Same pathology this file's harness was fixed for once already.
+    """
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ghost.create_subs(*a, **k)
+    except SystemExit:
+        return None
+
+
+_ok = _subs_or_none(_SubsRPC([1, 2, 3, 4, 5], list(_good)), 3, 2)
+check("control: ...and returns all five, each in its own account",
+      _ok is not None and len(_ok[0]) == 5
+      and len({a for a, _ in _ok[1].values()}) == 5)
+check("control: ...with the last `decoys` marked as the extra outputs",
+      _ok is not None and _ok[2] == set(_good[3:]))
+
+# -- a repeated ACCOUNT ----------------------------------------------------
+_msg = _run_subs([1, 2, 2, 4, 5], list(_good), 3, 2)
+check("two outputs in the SAME account are REFUSED", _msg is not None)
+check("...and the refusal says why it matters (a transaction CAN spend two "
+      "subaddresses of one account)",
+      _msg is not None and "same wallet account" in _msg.lower())
+
+# -- a repeated ADDRESS ----------------------------------------------------
+_dupaddr = list(_good)
+_dupaddr[3] = _dupaddr[0]
+_msg = _run_subs([1, 2, 3, 4, 5], _dupaddr, 3, 2)
+check("the same subaddress handed out TWICE is REFUSED", _msg is not None)
+check("...and the refusal names the silent half — the dropped fan-out amount",
+      _msg is not None and "drop" in _msg.lower())
+
+# -- the duplicate is caught wherever it falls -----------------------------
+for _pos in (1, 4):
+    _d = list(_good)
+    _d[_pos] = _d[0]
+    check(f"a duplicate address at position {_pos} is caught too",
+          _run_subs([1, 2, 3, 4, 5], _d, 3, 2) is not None)
+    _a = [1, 2, 3, 4, 5]
+    _a[_pos] = _a[0]
+    check(f"a duplicate account at position {_pos} is caught too",
+          _run_subs(_a, list(_good), 3, 2) is not None)
+
+# -- NOT vacuous: the old code would have sailed through -------------------
+# Without the check, a duplicated address leaves subs longer than addr_index,
+# which is exactly the silent state described above. Show that state is real
+# so the refusal above is not guarding an impossibility.
+_d = list(_good)
+_d[3] = _d[0]
+_subs_raw, _idx_raw = [], {}
+for _i, (_ac, _ad) in enumerate(zip([1, 2, 3, 4, 5], _d)):
+    _subs_raw.append(_ad)
+    _idx_raw[_ad] = (_ac, 1)
+check("control: a duplicate really does collapse addr_index while subs keeps "
+      "both — the silent state the refusal exists to stop",
+      len(_subs_raw) == 5 and len(_idx_raw) == 4)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

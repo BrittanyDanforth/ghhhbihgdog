@@ -113,7 +113,12 @@ def dns_check() -> int:
         print("  [+] Network reachable post-spoof")
         return 0
     except (socket.gaierror, OSError, RuntimeError) as e:
-        integrity_log("paranoia", f"dns_fail:{e}")
+        # Type, not text -- and unlike the other two sites this one was not
+        # even truncated, so an arbitrarily long OSError string went verbatim
+        # into a persistent, append-only hash chain. See newnym() in gs_common
+        # for the class: the chain must not carry text this toolchain did not
+        # author. The message still reaches the terminal on the next line.
+        integrity_log("paranoia", f"dns_fail:{type(e).__name__}")
         print(f"  [!] DNS/connectivity failed post-spoof: {str(e)[:80]}")
         print("  [!] The MAC spoof may have dropped the link — the WIPE CONTINUES "
               "regardless (it needs no network).")
@@ -354,8 +359,16 @@ def clear_journal(dry: bool):
         return 0
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or b"").decode("utf-8", errors="ignore")[:120]
-        integrity_log("paranoia", f"journal_fail:{stderr[:40] or 'unknown'}")
         needs_root = os.geteuid() != 0
+        # journalctl's OWN stderr was going into the chain. It is another
+        # program's output -- unbounded vocabulary, and on a failure it names
+        # unit files, paths and the invoking user. What the chain needs is
+        # which of the two failures happened, which is a two-word vocabulary
+        # and leaks nothing; the stderr itself is printed below. (A return
+        # code would not survive chain_safe's digit redaction anyway, so it
+        # would record 'rc=#' and answer nothing.)
+        integrity_log("paranoia", "journal_fail:" +
+                      ("needs_root" if needs_root else "journalctl_error"))
         print(f"  [!] Journal NOT cleared "
               f"({'needs root' if needs_root else 'journalctl error'}): "
               f"{stderr or 'no output'}")
@@ -495,7 +508,16 @@ def _secure_delete_file(path: Path) -> bool:
     """
     ok = secure_delete_file(path)
     if not ok:
-        _chain_safe_log("paranoia", f"secure_delete_fail:{str(path)[-40:]}",
+        # THE BASENAME, not the tail of the path. `str(path)[-40:]` put
+        # /home/<operator>/... on the persistent chain -- the operator's
+        # username, written by the tool whose entire job is leaving nothing
+        # behind. Truncating from the LEFT also made it worse than useless as
+        # a diagnostic: it kept the directories and could cut the filename in
+        # half, which is the opposite of what a reader needs. chain_safe now
+        # collapses any path that reaches it, but this site should not be
+        # sending one -- a left-truncated fragment is not something a
+        # chokepoint can fully undo.
+        _chain_safe_log("paranoia", f"secure_delete_fail:{Path(path).name}",
                         f"could not securely delete {path}")
     return ok
 

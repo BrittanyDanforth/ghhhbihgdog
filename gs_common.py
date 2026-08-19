@@ -170,6 +170,20 @@ _CHAIN_ADDR_RE = re.compile(
 #: alphabet, so it breaks every run well below 12.
 _CHAIN_B58_RUN_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{10,}")
 
+#: An absolute (or left-truncated) filesystem path inside a chain payload.
+#: Two or more '/'-separated segments, so the account/subaddress pairs this
+#: chain is full of (`withdrawn:4/1`) are not mistaken for one. Defined here
+#: with the other chain regexes rather than beside the address scrubbers 1800
+#: lines below: chain_safe is the only caller, and a module-level name
+#: resolved after its user is one import-order change away from a NameError
+#: inside the logger.
+_CHAIN_PATH_RE = re.compile(r"[^/\s|:]*(?:/[^/\s|]+){2,}")
+
+
+#: Below this length a digitless base58 run is treated as a word, not an
+#: address fragment. See _b58_run_is_addressy for the measurement.
+_B58_RUN_DIGITLESS_MIN = 30
+
 
 def _b58_run_is_addressy(run: str) -> bool:
     """Dense case ALTERNATION is what separates an address from a word.
@@ -195,9 +209,53 @@ def _b58_run_is_addressy(run: str) -> bool:
     defence against a call site added later -- and a rule that occasionally
     misses a short slice is better than one that deletes the diagnostics, which
     is how a redactor gets switched off.
+
+    AND IT WAS DELETING THEM, on the names that matter most here. The rate rule
+    was measured against ConnectionError and ConnectionRefusedError and cleared
+    both, so the contract above looked kept. It is not: swept over 34 realistic
+    type names, THREE are eaten --
+
+        FileNotFoundError    -> Fil<addr>      (l is not base58, so the run is
+                                                "eNotFoundError": 6 flips / 14)
+        ModuleNotFoundError  -> Modul<addr>
+        MaxRetryError        -> <addr>
+
+    -- and the first two are this toolchain's commonest failures by a distance:
+    a missing Tor control socket, a missing plan file, an absent `stem`. Found
+    by writing a real chain entry to disk and reading it back, not by a test:
+    every test here captured integrity_log's ARGUMENT, which never passes
+    through this function.
+
+    Reporting "<addr>" where no address existed is worse than saying nothing.
+    integrity_chain.log is the artifact an operator reads to find out what
+    happened, and a reader who sees <addr> concludes an address leaked into the
+    chain and that the redactor caught it. Both halves are false.
+
+    SO A SHORT RUN MUST ALSO CARRY A DIGIT. A Monero address is uniform over
+    base58, 9 of whose 58 symbols are digits, so a run of length L containing
+    none has probability (49/58)^L -- 11% at 14 characters, 0.95% at 30, 0.2%
+    at 40. An identifier essentially never contains one. So: a digit is
+    required below 30 characters, and above it length alone still decides,
+    which keeps every real address fragment the rate rule was catching (an
+    address of any useful length is far past 30) while no CamelCase name
+    reaches it -- the longest in the sweep, ConnectionRefusedError, is 22.
+
+    THE COST, MEASURED rather than asserted. 4000 random base58 runs per
+    length, share still redacted, before and after the digit requirement:
+
+        length        10      14      20      25      30
+        before      95.7%   98.4%   99.9%  100.0%   99.9%
+        after       81.4%   89.8%   96.8%   98.8%  100.0%
+
+    So nothing changes for a run of 30 or more, and the loss is confined to
+    slices short enough to be ambiguous anyway -- a ten-character base58 run
+    is as likely to be a filename as a key. A WHOLE address is not affected at
+    all: the {90,} rule above matches it exactly, with no heuristic involved.
     """
     cased = [c for c in run if c.isalpha()]
     if len(cased) < 8:
+        return False
+    if len(run) < _B58_RUN_DIGITLESS_MIN and not any(c.isdigit() for c in run):
         return False
     if sum(1 for c in cased if c.isupper()) < 2:
         return False
@@ -261,6 +319,26 @@ def chain_safe(msg: str) -> str:
         # it IS splitlines(). The test that missed this swept exactly the three
         # characters the implementation already handled.
         out = " ".join(str(msg).splitlines())
+        # A FILESYSTEM PATH IS AN IDENTIFIER. /home/<operator>/... names the
+        # account; /run/user/<uid>/... names the login. Neither is an address
+        # or a digit, so every rule below misses them, and paths reach here
+        # from ordinary call sites: paranoia_mode logged the path of every
+        # artifact it could not securely delete, and newnym logged the Tor
+        # control socket's (that one is fixed at the call site, this is why it
+        # cannot come back).
+        #
+        # Collapse to the BASENAME, because that is the half worth keeping --
+        # WHICH file could not be wiped is the diagnostic; WHERE it lived is
+        # the disclosure. Two or more segments are required, so the
+        # account/subaddress pairs this chain is full of (`withdrawn:4/1`)
+        # are untouched; verified against the corpus of real payloads in
+        # tests/test_chain_redaction.py, which this changes none of.
+        #
+        # BEFORE the '|' -> '/' substitution below, deliberately: run after
+        # it, a payload carrying two pipes would look like a path and lose its
+        # leading fields.
+        out = _CHAIN_PATH_RE.sub(
+            lambda m: "<path>/" + m.group(0).rsplit("/", 1)[1], out)
         out = out.replace("\t", " ").replace("|", "/")
         # A FULL address next, matched exactly rather than statistically: a
         # run of 90+ base58 characters is an address and nothing else, so this
@@ -1070,8 +1148,30 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
                 time.sleep(_NEWNYM_RETRY_BACKOFF * attempt)
 
     _NEWNYM_CONSECUTIVE_FAILURES += 1
+    # THE TYPE, NOT THE TEXT, and the difference is a filesystem path.
+    #
+    # This logged `str(last_err)[:40]` into integrity_chain.log, which is the
+    # persistent on-disk artifact every other rule in this file exists to keep
+    # clean -- chain_safe strips addresses and digits from it, report_holdings
+    # refuses to write the account grouping to it, create_subs stopped
+    # labelling subaddresses because labels outlive the run, and MoneroRPC
+    # stopped logging its own host:port here for exactly this reason.
+    #
+    # The exception comes from Controller.from_socket_file(ctrl), so its text
+    # is the CONTROL SOCKET PATH: FileNotFoundError and PermissionError both
+    # quote it, and under a per-user Tor that path is /home/<operator>/... or
+    # /run/user/<uid>/... -- a username, on disk, in a file whose whole design
+    # premise is that it carries nothing identifying. Found in a real chain
+    # log: 294 entries, every one of them written by this line.
+    #
+    # The TYPE is what the operator actually needs to tell the cases apart --
+    # ModuleNotFoundError (stem missing), FileNotFoundError (no socket),
+    # PermissionError (cannot read it), AuthenticationFailure (cookie) -- and
+    # it names no path. The full text still reaches the terminal below, in
+    # both the abort and the best-effort warning, where it stops.
     integrity_log("tor",
-                  f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:{str(last_err)[:40]}")
+                  f"NEWNYM_fail:{_NEWNYM_CONSECUTIVE_FAILURES}:"
+                  f"{type(last_err).__name__ if last_err else 'unknown'}")
     if required:
         # ABORT NOW, not on some later strike. The caller asked for a rotation
         # it is about to depend on; proceeding without it is the correlation
@@ -1086,8 +1186,25 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
             f"'stem' is installed.")
     # Best-effort path: still say it, every time. A rotation that did not
     # happen is an OPSEC degradation whether or not it is the third one.
-    print(f"  [!] Tor circuit rotation failed ({str(last_err)[:60]}). This "
-          f"operation continues on the SAME circuit as the previous one.")
+    #
+    # NAME `ctrl` RATHER THAN LETTING THE EXCEPTION CARRY IT. The chain now
+    # records only the failure TYPE (above), so this print is the operator's
+    # ONLY sight of which socket failed -- and str(last_err)[:60] was cutting
+    # the path off mid-way for the commonest case there is: a missing socket.
+    #     [Errno 2] No such file or directory: '/home/<user>/.tor/ctrl'
+    # is 66 characters, so the truncation ate the end of the path and left a
+    # message that says a file is missing without finishing its name.
+    # PermissionError's text is shorter and survived, which is why this only
+    # showed up when both were driven.
+    #
+    # ctrl is the exact value, is bounded, and is the thing to check -- the
+    # required=True abort a few lines above already names it for the same
+    # reason.
+    print(f"  [!] Tor circuit rotation failed: "
+          f"{type(last_err).__name__ if last_err else 'unknown'} on {ctrl} "
+          f"({str(last_err)[:80]}).")
+    print(f"      This operation continues on the SAME circuit as the "
+          f"previous one.")
     if _NEWNYM_CONSECUTIVE_FAILURES >= _NEWNYM_MAX_FAILURES:
         print(f"  [!] NEWNYM has now failed {_NEWNYM_CONSECUTIVE_FAILURES} "
               f"consecutive times. Tor circuit rotation is NOT working.")
