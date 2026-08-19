@@ -1,0 +1,551 @@
+# Operator setup — reception vs custody
+
+This is the hardware/network layout for running GhostSpiral **without**
+leaving the spend key on a box that stays online, and **without** the
+home ISP seeing Tor guards.
+
+The Telegram doorbell is a **pager**. It is not in this repo yet. Until
+it exists, you sit at the ThinkPad and use `gs_console` the same way.
+The split below still applies.
+
+```
+ phone (throwaway Telegram)
+        |  "ready" / "landed" only — never the memo
+        v
+ Pi  ---- WireGuard ---->  Mullvad  ---->  Tor  ---->  Telegram / Thor
+ ^         (pipe)           (ISP sees this, not Tor)
+ |
+ WOL + signed "do this job" on the LAN only
+ |
+ ThinkPad (off unless a receive is in flight)
+   view-only wallet, own Tor over the same Mullvad pipe
+   spend key is NOT here — LUKS USB, other room
+```
+
+Thor still links BTC deposit → XMR dest. That is the swap. This file
+does not fix that. KYC BTC and a real-name Telegram account also are
+not fixed by any of this.
+
+
+## 1. What lives where
+
+| thing | where | if seized |
+|---|---|---|
+| spend key / seed | LUKS USB, not in the laptop drawer | they can spend |
+| view-only wallet | ThinkPad disk (auto-unlock so it can wake) | they can watch incoming |
+| BTC address + Thor memo | ThinkPad file, `0600` — copy from the bay | they see that receive |
+| bot token, chat id | Pi only | they can wake / spam `/depo` |
+| Mullvad account number | paper / Pi `/etc`, not GitHub | they can use your pipe |
+| mix / `run_pipeline` | ThinkPad, you present, USB plugged in | — |
+
+Telegram never gets: XMR address, memo (the memo **is** the address),
+wallet path, RPC URL, view key.
+
+
+## 2. Buy list
+
+**Doorbell (always on)**
+- Raspberry Pi **3B+** (1 GB) or **Pi 4 2 GB**. 1 GB is the floor.
+  A Zero (512 MB) will swap under Tor. Do not buy an 8 GB toy.
+- Official PSU, **ethernet** cable, 16 GB SD + a second SD already flashed
+- Case, leave it in a closet next to the switch. A few watts.
+
+**Vault (off by default)**
+- Cheap ThinkPad, 8 GB RAM is plenty (wallet-rpc + Tor, not a node)
+- Ethernet. BIOS: WiFi off, Bluetooth off, **Power Loss: Stay Off**
+- Enable Wake-on-LAN
+- Full-disk LUKS. Unlock must work **without you** or the Pi cannot
+  wake a job — see §5. That means TPM/keyfile auto-unlock of the
+  **view-only** volume only.
+
+**Spend**
+- Separate USB, its own LUKS passphrase. Different hiding place.
+  Never left in the ThinkPad after a mix.
+
+**Pipe**
+- Mullvad account (number, no email). Pay cash or coin, not your card.
+- WireGuard config for **one** device: the Pi. ThinkPad exits through
+  the Pi, it does not get its own Mullvad key.
+
+**Phone**
+- Throwaway Telegram, not your real account, not your daily SIM.
+  If the pager is your name, the rest is decoration.
+
+
+## 3. Pi — doorbell
+
+Raspberry Pi OS **Lite** (64-bit). No desktop. Ethernet only.
+
+```bash
+# as root, once
+rfkill block wifi
+rfkill block bluetooth
+systemctl disable wpa_supplicant 2>/dev/null || true
+
+apt-get update
+apt-get install -y wireguard tor wakeonlan python3
+
+# hostname that is not your name
+hostnamectl set-hostname fuse
+```
+
+`/etc/sysctl.d/99-fuse.conf`:
+
+```
+net.ipv4.ip_forward=1
+```
+
+### Mullvad first, Tor inside
+
+1. Mullvad site (over Tor from some *other* machine) → WireGuard config.
+2. Install as `/etc/wireguard/wg0.conf`, `chmod 600`.
+3. `systemctl enable --now wg-quick@wg0`
+4. Check: `curl https://am.i.mullvad.net/connected` should say yes.
+   The home ISP now sees one VPN to Mullvad, not Tor.
+
+`/etc/tor/torrc` — Tor must use the tunnel, and fail if the tunnel is down:
+
+```
+# do not listen to the world
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+
+# only after wg0 is up (use a systemd After=wg-quick@wg0.service)
+# Isolate the client: no default route except the VPN.
+```
+
+Force the Pi’s default route through `wg0` only. If Mullvad is down,
+**nothing** else leaves the ethernet (no “just this once” clearnet).
+`systemctl enable tor` with `After=wg-quick@wg0.service` and
+`Requires=wg-quick@wg0.service`.
+
+The bot (when it exists) talks to Telegram **only** via `socks5h://127.0.0.1:9050`.
+If Tor is down, the bot does not start. Same fail-closed as `gs_console`.
+
+### Wake-on-LAN is not a login
+
+WOL is a magic packet on the LAN. Anyone on the switch can send one.
+
+- Do **not** forward UDP 9 on the router.
+- ThinkPad only runs a job after a **signed** note from the Pi
+  (shared key on the Pi and the ThinkPad). Random WOL = boot, sit,
+  shut down.
+- Pi and ThinkPad on the same switch. No WAN path to WOL.
+
+### What the Pi must never hold
+
+Spend key, view key, `wallet_*.json`, `thor_pairs.json`, memo, seed.
+If you find any of those on the SD, the split is already broken.
+
+
+## 4. ThinkPad — vault
+
+Debian or whatever you already run. Disk encrypted.
+
+**BIOS**
+- WiFi / BT disabled
+- WOL enabled
+- After power loss: **Off** (a blackout must not auto-boot it)
+
+**Network**
+- Ethernet to the same switch as the Pi
+- Default route = the Pi (Pi NATs onto Mullvad). The ThinkPad never
+  speaks to the home ISP.
+- Run **its own** Tor on the ThinkPad (`127.0.0.1:9050`). Do not use
+  the Pi as a Tor proxy — a pwned Pi would sit on the path.
+  Cost: when a job is running, Mullvad sees two Tor clients in one
+  tunnel. The ISP still only sees Mullvad.
+
+**Wallet — accounts, not just subaddresses**
+
+Monero returns a transaction's change to the **spending account's subaddress
+0**. So whatever a mix does not allocate — the fan-out remainder, the dust
+from every hop — comes to rest on the subaddress 0 of whichever account the
+run used. If that is account 0, it is the wallet's own primary address, on
+every run, and two runs sharing a change address are trivially the same
+wallet.
+
+So: `create_receive_wallet` issues a **fresh account per receive**, and a send
+runs the mix in a **fresh account** too. The wallet's primary address is not a
+participant in the pipeline. Verified on-chain by
+`tests/real_fanout_change_testnet.py`.
+
+Do not point the pipeline at account 0 with `--account 0` unless you have a
+reason; it warns, and the warning is the whole story above.
+
+**Nothing is left parked.** A distribution cannot allocate its input exactly
+— the fee is not known when the amounts are chosen — so a remainder always
+comes back as change. Rotating the account moved that off your primary
+address, but the value still sat there: unmixed, and the one fan-out output
+that never moved. It is now **swept into the mix** (`sweep_all`, zero change
+of its own) after the distribution, in both fan-out and peel modes. That is a
+correctness fix as much as an OPSEC one — roughly a tenth of the balance was
+previously never mixed at all while the run reported success.
+
+**The entry is the one output an analyst is handed for free, so the run does
+not spend it in the open.** A ThorChain swap's memo is public: it names the
+address the swap paid, so anyone watching knows which on-chain output funded
+your run. Ring signatures still hide *which* later transaction spent it — an
+analyst has sixteen candidates per ring and no way to pick — **unless the real
+transaction looks different from the rest of the network.** Measured on a chain
+running current consensus, the first transaction out of the entry used to be:
+
+| first spend out of the entry | shape | extra |
+|---|---|---|
+| fan-out mode (the default) | 1-in / **7**-out | 259 |
+| peel mode | 1-in / **3**-out | 131 |
+| an ordinary sweep | 1-in / 2-out | 44 |
+
+Two outputs is what most of the network makes. Seven is not — so an analyst
+holding the swap output does not need to break a ring, he lists the
+transactions that reference it and keeps the odd-shaped one.
+
+The run now sweeps the entry **once** into a fresh carrier first — 1-in/2-out,
+zero change — and distributes from that carrier. Every transaction after it
+spends an output nobody outside your wallet can enumerate. It costs one
+transaction, one fee and one confirmation wait, and it inherits `--hop-delay`,
+which matters more here than anywhere else: this is the only hop where an
+analyst knows both endpoints of the wait. `--no-entry-veil` turns it off and
+says what that costs.
+
+**The exit is where a mix is usually lost, so the outputs are built to make
+losing it hard.** A run ends with N outputs that you eventually spend, and
+until now they all sat in one account. Measured on a chain running current
+consensus, six mix outputs in one account:
+
+| what the operator does | on-chain |
+|---|---|
+| "empty this account" | **one transaction, 6 inputs** |
+| "send 5 XMR" | **one transaction, 4 inputs** |
+
+A transaction's inputs are public. Spending six outputs together is permanent
+proof that all six have one owner — no ring analysis, the input count is right
+there — and those six are exactly what the peel chain spent six transactions
+and several hours separating.
+
+`--exit-to <address>` performs the withdrawal for you, **one transaction per
+output**, so the merge never happens by accident. Repeat the flag to spread the
+withdrawal across several destinations. Without it nothing is withdrawn and the
+funds simply stay on the wallet — the run tells you so rather than implying it
+exited.
+
+Every output the run creates now lives in **its own account**. That makes the
+merge impossible rather than merely discouraged, because a Monero transaction
+cannot spend across accounts — asking one account for more than it holds
+answers "not enough money" while a sibling account holds the rest. The same
+six outputs then leave as six 1-in transactions for about 0.005 XMR more in
+fees. `tests/real_spend_account_testnet.py` asks the wallet to prove it rather
+than reasoning about it.
+
+What this does **not** solve: sending all six to one exchange deposit address
+tells that exchange they are yours. That is a custodial link, not a chain
+link, and no on-chain structure can remove it — which is why `--exit-to` is
+repeatable, and why splitting across venues and over time is the operator's
+call rather than something the software can do for them.
+
+`exit_strategy_simulator` is a **standalone valuation reference**, not the
+exit. It fetches a live price and reports what a holding is worth; it moves no
+XMR, contacts no venue and places no order, and the pipeline no longer runs it.
+The exit is `--exit-to`.
+
+**Create the offline spend wallet with a large subaddress lookahead.** A
+Monero wallet only derives subaddresses for a bounded number of accounts — 50
+by default — and that bound is fixed when the wallet is **created**:
+`monero-wallet-cli` refuses `--subaddress-lookahead` alongside `--wallet-file`,
+so an existing wallet cannot be told a bigger number.
+
+Isolating every output costs roughly twenty accounts per run, so the online
+view-only wallet passes 50 accounts during your **second** run. After that the
+offline wallet cannot derive the keys for the exported outputs:
+`import_outputs` fails with *"Failed to generate key image"* and
+`sign_transfer` prints *"Loaded 1 transactions"* and writes nothing. Nothing is
+lost, but the round will not sign.
+
+So restore the offline wallet from its seed with room to grow:
+
+```
+monero-wallet-cli --restore-deterministic-wallet     --generate-new-wallet /path/to/offline-wallet     --subaddress-lookahead 400:50
+```
+
+If your offline wallet already exists, you do **not** have to recreate it:
+`phase_create` records how many accounts the online wallet has and
+`phase_sign` creates the missing ones on the offline wallet before importing
+(about half a second each, once — accounts persist). The lookahead above just
+makes that unnecessary. `tests/real_cold_lookahead_testnet.py` pins both
+halves, including a negative control that fails without the fix.
+
+**How far apart the hops land is yours to choose, and the default is not the
+strong setting.** A peel hop cannot be built until the previous hop's output
+has confirmed and unlocked — about 10 blocks — and `--hop-delay` is added on
+top of that. The default is 180–720 seconds, so each carrier output is spent
+at roughly 11–16 blocks of age and a six-hop chain finishes inside two hours.
+
+That is close to the youngest an output can legally be spent. Monero's decoy
+selection draws ring members from a distribution fitted to how people actually
+spend, and its bulk sits far above that floor, so an output spent at the floor
+tends to be the youngest member of its own ring — and "assume the newest ring
+member is the real one" is a standard heuristic against exactly that shape.
+The peel chain removes the co-created fan-out an analyst can cluster; it does
+not remove this.
+
+This has **not been measured here** and no number is claimed for it. Doing it
+honestly needs a chain with a realistic output-age distribution, and the
+throwaway chains these tests run on have none — every output on them is
+minutes old, so any ring-age statistic they produced would be an artifact.
+
+`--hop-delay 21600-86400` spreads a six-hop chain over days: it costs time and
+buys ring-age plausibility. The default stays short so a run finishes in one
+sitting, not because it is the better choice.
+
+**...and the sweep is not allowed to undo the peel chain.** Monero returns a
+transaction's change to the *spending account's* subaddress 0, and that is not
+selectable. When every peel ran in one account, all N peels deposited their
+change onto one subaddress 0 and a single sweep collected the lot — one
+transaction with N inputs. A transaction's inputs are public, so spending N
+outputs together is permanent proof that those N outputs share one owner, and
+it takes no ring analysis to read: the input count is right there. Those N
+outputs are the change of the N peels, so that one tidy transaction announced
+that the whole chain was one entity — the exact fact it spent N transactions
+and several hours concealing.
+
+Each peel now runs in its **own account**, so each hop's change lands on a
+different subaddress 0 and is swept **alone**, to its **own** destination.
+Measured on a chain running current consensus: six peels swept together
+produced one 6-input transaction; swept separately they produced six
+1-in/2-out transactions — the commonest shape on the network — for about
+0.005 XMR more in fees against a 0.0024 XMR estimate. That fee difference is
+the entire cost of not announcing the link.
+`tests/real_peel_testnet.py` asserts the property directly: **no transaction
+in the run may spend more than one input.**
+
+The same rule bites per hop, not just once. A DAG hop that sent a *fixed
+amount* had to pick that amount before the fee was known, so it always left a
+remainder — 40 hops at `wallets=10 deep=2`, each dropping dust on that one
+address. Hops are now **sweeps** (`sweep_all`: move the whole subaddress
+balance, minus fee), which produce **no change output at all**. Verified
+end-to-end through the cold path by `tests/real_hop_sweep_testnet.py`: every
+hop returned nothing to the account.
+
+**Wallet**
+- `monero-wallet-rpc` with a **view-only** wallet (create it from the
+  spend wallet on an offline machine, then copy the view-only files).
+- `create_receive_wallet` / `thor_swap_preparer` / `receive_watch` /
+  `gs_console` all point at that RPC.
+- Console binds `127.0.0.1` only. Do not punch it out.
+
+**Nothing identifying goes on a command line**
+
+`/proc/<pid>/cmdline` is mode **0444** — every account on the host can read a
+running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
+console hands its children the sensitive values through the environment, not
+argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
+`GS_SWAP_AMOUNTS`, `GS_EXIT_AMOUNT`, and `GS_WALLET_PASSWORD` as before. The
+command preview the page shows you is the real argv, which is why no secret
+appears in it.
+
+Running a tool by hand still accepts the flags — it warns and logs when you do.
+
+**What the wallet file gives away**
+
+`paranoia_mode` wipes the pipeline's artifacts and **never touches the wallet
+file** — that file is your money. So the wallet survives every wipe, holding
+the balances, the transaction history and every subaddress a run created:
+the whole mix graph. Section 6's "door kick, they take the ThinkPad → partly"
+is exactly this.
+
+**Your receive address is public, so dust can be sent to it**
+
+The swap memo names your XMR address in plain text and the sender puts that
+memo in the Bitcoin transaction's OP_RETURN. So the swap provider — and anyone
+reading the Bitcoin chain — knows exactly where to send. That costs them one
+transaction fee.
+
+`receive_watch` therefore ignores balances below an **arrival floor**: the
+larger of 0.0005 XMR and 0.1% of the target. Below that, a balance is reported
+but is not treated as the payment. It is not an arbitrary number — an output
+smaller than the fee needed to spend it is not money you can act on, so
+counting it as an arrival is wrong even with no attacker present.
+
+Without that floor, one piconero was enough to make the tool assert *"the swap
+paid short"* when nothing had arrived, and one piconero every 25 minutes held
+the shortfall verdict off for the entire 24-hour watch. `--min-arrival` changes
+the threshold; `--min-arrival 0` restores the old, steerable behaviour and says
+so when you use it.
+
+**The swap is seen. Plan around it, not against it.**
+
+A BTC→XMR aggregator has to be **told** where to deliver the Monero. That
+instruction rides in the memo attached to the sender's Bitcoin payment, so the
+aggregator — and anyone it shares with, or anyone who later compels it — can
+tie *that BTC payment* to *your first XMR address*. Tor hides who arranged the
+swap. It does not hide the link, and nothing in this toolchain can retract it.
+
+The mixing that follows hides what you do **next** with the Monero. That is
+the whole and only claim. So:
+
+- **One fresh receive address per swap.** `thor_swap_preparer` now *refuses* a
+  batch that routes two swaps to the same address — reusing one hands the
+  aggregator a link between those BTC payments, which is exactly what
+  splitting the amount was meant to avoid, and it silently defeats the NEWNYM
+  rotation between quotes (a new circuit cannot disguise identical request
+  bodies). Mint them with `create_receive_wallet --count N` and pass every
+  bundle to `--dest-from-receive-wallet`.
+- **Treat the receive address as burned** once the swap is arranged. Let the
+  mix move the funds off it; do not reuse it for anything.
+- **Keep the memo off anything public.** It names your XMR address in plain
+  text. A paste site, an issue tracker, a group chat — anything indexed turns
+  a link one company holds into a link everybody holds.
+- **If you do not want any party to see the destination, an aggregator is the
+  wrong tool.** This one cannot route without being told.
+
+**What is *not* at risk: your wallet, from the chain.** Nobody reads your
+balance off the blockchain. Monero hides the amount and the spender, and your
+view key is not derivable from chain data. A view key leaks exactly one way —
+somebody gets your **files**: the online view-only box, a laptop that
+auto-unlocks, a backup, or a key you pasted somewhere. That is a
+disk-encryption and physical-custody problem, and it is precisely the one
+`paranoia_mode` deliberately cannot solve for you (see the wallet note above).
+
+**Close your terminals BEFORE you wipe**
+
+A shell keeps its history in **memory** and writes it out when it **exits**.
+`paranoia_mode` wipes the history file, but it cannot reach into a running
+shell — so any terminal still open will write its history straight back when
+you close it. Demonstrated: a bash session holding
+`GhostSpiral --wallet-password s3cret…` had the file wiped to zero bytes, and
+bash restored the password verbatim on exit.
+
+The wipe now says this out loud, but the remedy is yours: in every open window
+run `history -c && history -w` (fish: `history clear`), or close every terminal
+first and run the wipe from a fresh one.
+
+It also now covers the history files it used to miss entirely — **fish**
+(`~/.local/share/fish/fish_history`), a custom **`$HISTFILE`**, `.zhistory`,
+`.sh_history` and `.ash_history`. Previously a fish user's wipe erased nothing
+they had typed while reporting success.
+
+**Where the wipe reaches (and where it did not)**
+
+`paranoia_mode`'s Temp files phase sweeps `/tmp` and `/var/tmp` wholesale for
+anything you own. It now also sweeps **`/dev/shm` and `$TMPDIR`** — but only
+for this toolchain's own scratch names (`gs_sign_*`, `gs_impout_*`,
+`.gs_pw_*`), never wholesale.
+
+That gap mattered because `airgap_tx_signer` *prefers* `/dev/shm` for its two
+worst artifacts: the plaintext wallet password, and the wallet output-set blob
+(a map of your holdings). Both are erased in a `finally`, so a normal run left
+nothing — but a SIGKILL, an OOM kill or a power cut runs no `finally`, and
+`/dev/shm` is a tmpfs that survives all but the power cut. Choosing RAM-backed
+scratch made those files *more* dangerous to leave behind, not less: what is
+there is the copy that existed at the moment things went wrong.
+
+`$TMPDIR` was the same story for `gs_sign_*`, which holds a signed, relayable
+transaction: `mkdtemp()` honours `TMPDIR`, and the sweep only knew `/tmp`.
+
+The targeting is deliberate and must stay that way. `/dev/shm` holds live
+segments belonging to Chromium, PostgreSQL and PulseAudio under your own uid —
+wiping it wholesale breaks running software — and `TMPDIR` can legitimately
+point at `$HOME`.
+
+Subaddresses are therefore created with **no label**. They used to be tagged
+`Mix_0`, `Decoy_3`, `Carrier_2`, `ChangeSweep`, `GhostSpiral_entry` — local
+only, invisible on-chain, and a complete annotated map to anyone who opens the
+wallet. Every on-chain heuristic this tool defeats was bypassed by reading a
+string. Protecting the wallet is disk encryption and where the keys live, not
+the wipe.
+
+**Spend USB**
+- Only plugged in to mix / cold-sign (`airgap_tx_signer`).
+- Auto-job user on the ThinkPad must **not** be allowed to mount
+  removable disks. If you leave the USB in and `/depo` wakes the
+  box, you put custody on a networked machine. That is the failure
+  this whole layout exists to prevent.
+
+**Unattended boot (the trade you cannot dodge)**
+
+The Pi cannot type your LUKS passphrase.
+
+- Human passphrase at boot → no remote `/depo`. Babysitting.
+- TPM / keyfile auto-unlock of the view-only OS → a thief who takes
+  the **whole laptop** and plugs it in gets view-only.
+- Steal-the-SSD-only is blocked if the key is in the TPM.
+
+If you will not accept “laptop theft = they can watch incoming,”
+there is no doorbell. Stop here and use the console by hand.
+
+
+## 5. Job cycle (when the bot exists)
+
+1. Phone: `/recv` then `/depo 0.05` to the throwaway account.
+2. Pi checks Tor, allowlisted chat id, rate limit.
+3. Pi WOL + signed job file on the LAN.
+4. ThinkPad boots, waits a **random 5–20 min** (breaks the obvious
+   Telegram→power-spike→Thor clock), brings up Tor, runs the same
+   actions as the console: `create_receive_wallet`, `thor_swap_preparer`.
+5. Slip stays on the ThinkPad (`0600`). Telegram gets `depo ready · slip A3F1`.
+6. You copy BTC address + memo from the bay (or the file). Not from chat.
+7. ThinkPad `receive_watch` until landed **or** a few hours, then
+   `landed` / timeout, then **shutdown**.
+8. Idle weeks: ThinkPad is off. Only the Pi hums.
+
+Until the bot exists: skip 1–3. You are at the ThinkPad. Same files,
+same “memo never leaves the machine except to the sender.”
+
+
+## 6. Bad situations (and whether this beats them)
+
+| happens | beaten? |
+|---|---|
+| ISP “this house runs Tor” | **Yes** — they see Mullvad |
+| Hotspot / SIM / towers | **Yes** — no cellular |
+| VPS host images a wallet | **Yes** — no wallet on Mullvad |
+| Door kick, Pi only | **Yes** — rotate the bot token |
+| Door kick, they take the ThinkPad | **Partly** — view-only if auto-unlock; spend USB elsewhere |
+| Spend USB left in the laptop | **No** — you blew the split |
+| Stolen Telegram / bot token | **Partly** — they can wake and spam quotes, not spend |
+| Roommate sends WOL | **Yes** if jobs need a signed Pi note |
+| WOL from the internet | **Yes** if UDP 9 is not forwarded |
+| Power cut | **Yes** if BIOS stays Off |
+| Tor / Mullvad down | **Yes** — fail closed, no clearnet “backup” |
+| SD card dies | **Yes** — spare image; Telegram goes quiet |
+| Telegram + Mullvad + Thor lined up on the clock | **Not really** — jitter helps, does not erase |
+| BTC from a named exchange | **No** |
+| Real-name Telegram | **No** |
+
+
+## 7. Checks before you call it live
+
+- [ ] `rfkill` on the Pi shows wifi/bt **blocked**
+- [ ] Pi has **no** default route when `wg0` is down
+- [ ] `am.i.mullvad.net` is connected **before** Tor starts
+- [ ] ThinkPad `curl` to anything with Tor down **fails**
+- [ ] `gs_console` still only on `127.0.0.1`
+- [ ] `find` on the Pi SD: no `wallet`, no `thor_pairs`, no `.keys`
+- [ ] Spend USB not in the ThinkPad
+- [ ] Router: no port forwards, especially UDP 9
+- [ ] Throwaway Telegram, not the account with your face
+- [ ] A test `/depo` (or a hand-run quote) writes the slip **only**
+      on the ThinkPad; chat has no memo
+
+
+## 8. What this repo actually runs today
+
+On the ThinkPad, after Tor is up:
+
+```bash
+python3 gs_console          # http://127.0.0.1:8765/?t=…  (token is per-run)
+```
+
+Receive path (no mix):
+
+- Create receive address → `create_receive_wallet`
+- BTC deposit + memo → `thor_swap_preparer` (`--dest-from-receive-wallet`)
+- Wait → `receive_watch`
+
+Mix is `run_pipeline` / GhostSpiral and needs the spend USB. Do not
+point a pager at it.
+
+The Pi doorbell + signed job file are **operator procedure**, not a
+shipped binary. Do not “just run a Telegram bot” that prints the memo
+— that throws away the only reason to have a Pi.

@@ -1,0 +1,1845 @@
+#!/usr/bin/env python3
+"""GhostSpiral operator console — one surface for the whole pipeline.
+
+    python3 gs_console              # http://127.0.0.1:8765
+    python3 gs_console --port 9000
+
+Send or receive, fee selection with LIVE per-priority estimates pulled from
+your own daemon, safety presets, preflight checks, the exact command preview,
+and live output — in one page.
+
+SAFETY MODEL, because this can spend money:
+
+  * Binds 127.0.0.1 ONLY. Never all interfaces.
+  * The browser NEVER supplies a command. It posts an action id plus typed
+    parameters; this file validates every one against its own schema and
+    COMPOSES the argv. There is no path from a request string to a shell.
+  * Actions are graded. `safe` actions (checks, dry-runs, tests) run on click.
+    `spends` actions (the pipeline itself) refuse unless the request carries
+    the exact arm phrase, which the UI only sends after you type it.
+  * shell=False everywhere. No shell metacharacter can matter.
+  * The wallet password is taken from the GS_WALLET_PASSWORD environment of
+    the console process and forwarded ONLY to the pipeline child (see
+    PASSWORD_ACTIONS / _child_env — every other child has it stripped from its
+    environment). It is never accepted over HTTP, never rendered, and never
+    written to the command preview — the preview shows the real argv, which by
+    design has no password on it.
+  * Fee estimates come from your own daemon or are not shown at all. There is
+    no built-in fee table to fall back on; a number about your money is never
+    invented to fill the space.
+  * Every network check obeys the same egress rule as the rest of the
+    toolchain: loopback direct, remote only through the Tor proxy, refuse
+    rather than connect when there is no proxy.
+
+Stdlib only, so it runs on the air-gapped machine too.
+"""
+from __future__ import annotations
+import argparse, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+PY = sys.executable
+VENV_PY = os.environ.get("GS_VENV_PY", PY)
+ARM_PHRASE = "SPEND"
+
+# ── request authentication ─────────────────────────────────────────────────
+# A localhost server that can spend money is reachable by EVERY page the
+# operator's browser loads. Verified against an earlier build of this file:
+#   * a cross-origin POST with Content-Type: text/plain started a job. That
+#     content type is "simple" per CORS, so an attacker's <form> reaches us
+#     with no preflight and no consent.
+#   * a spoofed Host header was accepted, so a hostile domain resolving to
+#     127.0.0.1 (DNS rebinding) could drive the console.
+#   * nothing required credentials at all.
+# Four independent gates now close that, checked on every request:
+TOKEN = secrets.token_urlsafe(24)          # per-run, printed once at startup
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+MAX_JOBS = 200                             # bound the in-memory job table
+JOB_TIMEOUT_S = 4 * 3600                   # nothing legitimate runs longer
+
+# ── parameter schema. Anything not here cannot reach an argv. ───────────────
+SOCKS_RE = re.compile(r"^socks5h://[A-Za-z0-9._-]+:\d{1,5}$")
+URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:\d{1,5})?$")
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
+PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")
+DEC_RE = re.compile(r"^\d{1,10}(\.\d{1,12})?$")
+#: Monero address: 95 chars, base58 (no 0OIl), 4/8 prefix. Standard AND
+#: subaddress forms both start 4/8 and both are legitimate exit destinations --
+#: an exchange deposit address is normally a subaddress. This is a FORMAT check
+#: only; the CHECKSUM is verified by GhostSpiral's resolve_exit_destinations
+#: before anything moves, because a stdlib-only console cannot compute Monero's
+#: keccak variant and inventing a weaker check here would be worse than none.
+XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+
+SCHEMA = {
+    "mode":         ("choice", ["send", "receive"]),
+    "btc_entry":    ("re", BTC_RE),
+    "receive_wallet": ("re", PATH_RE),
+    "pairs_file":   ("re", PATH_RE),
+    "swap_btc":     ("re", DEC_RE),
+    "btc_amount":   ("re", DEC_RE),
+    "split":        ("int", (1, 20)),
+    "wallets":      ("int", (3, 60)),
+    "deep":         ("int", (1, 6)),
+    "fee_priority": ("int", (1, 4)),
+    "dag_mixing":   ("bool", None),
+    "peel":         ("bool", None),
+    "joinmarket":   ("bool", None),
+    "allow_clearnet_relay": ("bool", None),
+    "tor_proxy":    ("re", SOCKS_RE),
+    "rpc_primary":  ("re", URL_RE),
+    "rpc_daemon":   ("re", URL_RE),
+    "wallet_file":  ("re", PATH_RE),
+    "output":       ("re", PATH_RE),
+    "label":        ("re", re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")),
+    #: THE EXIT DESTINATIONS. A list, because --exit-to is repeatable and
+    #: spreading the withdrawal is the point: one address re-joins off-chain
+    #: everything the run separated on-chain.
+    "exit_to":      ("list_re", XMR_RE),
+}
+
+#: Most destinations anyone can sensibly hand-manage, and a hard bound on how
+#: much a single request can make this compose.
+MAX_EXIT_DESTS = 16
+
+
+def clean(params: dict) -> dict:
+    """Validate every parameter against SCHEMA. Unknown keys are dropped."""
+    out, errs = {}, []
+    for k, v in (params or {}).items():
+        if k not in SCHEMA:
+            continue
+        kind, spec = SCHEMA[k]
+        try:
+            if kind == "bool":
+                out[k] = bool(v)
+            elif kind == "int":
+                n = int(v)
+                if not (spec[0] <= n <= spec[1]):
+                    errs.append(f"{k} must be {spec[0]}–{spec[1]} (got {n})")
+                else:
+                    out[k] = n
+            elif kind == "choice":
+                if v not in spec:
+                    errs.append(f"{k} must be one of {spec}")
+                else:
+                    out[k] = v
+            elif kind == "re":
+                s = str(v).strip()
+                if s and not spec.match(s):
+                    errs.append(f"{k} is not a valid {k.replace('_',' ')}: {s[:48]}")
+                elif s:
+                    out[k] = s
+            elif kind == "list_re":
+                # Accept a JSON array or a newline/comma separated string, so
+                # the field works whether the page sends a list or raw text.
+                raw = v if isinstance(v, list) else re.split(r"[\s,]+", str(v))
+                items, seen = [], set()
+                for it in raw:
+                    t = str(it).strip()
+                    if not t:
+                        continue
+                    if not spec.match(t):
+                        errs.append(f"{k}: not a valid Monero address: {t[:16]}…")
+                        continue
+                    if t in seen:
+                        # Same reasoning as GhostSpiral.resolve_exit_destinations:
+                        # repeating an address looks like spreading while
+                        # actually concentrating the withdrawal.
+                        errs.append(f"{k}: {t[:12]}… is listed more than once — "
+                                    f"repeating spreads the withdrawal, it does "
+                                    f"not send more to one place")
+                        continue
+                    seen.add(t)
+                    items.append(t)
+                if len(items) > MAX_EXIT_DESTS:
+                    errs.append(f"{k}: at most {MAX_EXIT_DESTS} destinations")
+                elif items:
+                    out[k] = items
+        except (TypeError, ValueError):
+            errs.append(f"{k} is not readable")
+    return {"params": out, "errors": errs}
+
+
+def pipeline_argv(p: dict) -> tuple[list, list]:
+    """Compose the GhostSpiral argv from validated params. Returns (argv, problems)."""
+    a, why = [PY, "GhostSpiral"], []
+    if p.get("mode") == "receive":
+        if not p.get("receive_wallet"):
+            why.append("Receive mode needs the wallet JSON from create_receive_wallet.")
+        else:
+            a += ["--receive-wallet", p["receive_wallet"]]
+    else:
+        if not p.get("btc_entry"):
+            why.append("Send mode needs a BTC entry address (bech32).")
+        else:
+            pass   # the address goes in GS_BTC_ENTRY -- see secret_env()
+        if p.get("btc_amount"):
+            pass   # the amount goes in GS_BTC_AMOUNT -- see secret_env()
+        else:
+            why.append("Send mode needs a BTC amount.")
+        if p.get("split", 1) > 1:
+            a += ["--split", str(p["split"])]
+        if p.get("joinmarket"):
+            a.append("--joinmarket")
+    if not p.get("tor_proxy"):
+        why.append("A socks5h:// Tor proxy is required — the pipeline refuses to run without one.")
+    else:
+        a += ["--tor-proxy", p["tor_proxy"]]
+    a += ["--wallets", str(p.get("wallets", 10)),
+          "--deep", str(p.get("deep", 2)),
+          "--fee-priority", str(p.get("fee_priority", 1))]
+    if p.get("dag_mixing"):
+        a.append("--dag-mixing")
+    if p.get("peel"):
+        a.append("--peel")
+    for flag, key in (("--rpc-primary", "rpc_primary"), ("--rpc-daemon", "rpc_daemon"),
+                      ("--wallet-file", "wallet_file"), ("--output", "output")):
+        if p.get(key):
+            a += [flag, p[key]]
+    if p.get("allow_clearnet_relay"):
+        a.append("--allow-clearnet-relay")
+    # THE EXIT. Repeated once per destination, which is how GhostSpiral spreads
+    # the withdrawal. Absent, nothing is withdrawn and the run says so -- the
+    # console must not imply otherwise, so there is no default here.
+    for d in p.get("exit_to") or []:
+        a += ["--exit-to", d]
+    return a, why
+
+
+# ── actions. `spends` ones need the arm phrase. ────────────────────────────
+def _suite(name, interp=None):
+    return [interp or PY, os.path.join("tests", f"{name}.py")]
+
+
+ACTIONS = {
+    # operator checks — safe, they inspect and change nothing
+    "preflight_tor":   {"group": "Preflight", "label": "Verify Tor exit", "risk": "safe",
+                        "desc": "confirm traffic really leaves via Tor, fail closed if not",
+                        "build": lambda p: [PY, "-c", PREFLIGHT_TOR, p.get("tor_proxy", "")]},
+    "preflight_egress": {"group": "Preflight", "label": "Check relay egress", "risk": "safe",
+                         "desc": "inspect monerod's peers — would a broadcast leave over clearnet?",
+                         "build": lambda p: [PY, "-c", PREFLIGHT_EGRESS,
+                                             p.get("rpc_daemon", ""),
+                                             p.get("tor_proxy", "")]},
+    "preflight_wallet": {"group": "Preflight", "label": "Wallet + balance", "risk": "safe",
+                         "desc": "reach the wallet-rpc and read the unlocked balance",
+                         "build": lambda p: [PY, "-c", PREFLIGHT_WALLET,
+                                             p.get("rpc_primary", ""),
+                                             p.get("tor_proxy", "")]},
+    "paranoia_dry":    {"group": "Preflight", "label": "Wipe preview", "risk": "safe",
+                        "desc": "what paranoia_mode WOULD erase — deletes nothing",
+                        "build": lambda p: [PY, "paranoia_mode", "--dry-run"]},
+
+    # receive side — creates a subaddress, spends nothing.
+    #
+    # NO --label unless the operator deliberately supplies one.
+    #
+    # This built the argv with `p.get("label", "GhostSpiral_entry")` while the
+    # page's collect() hardcoded `label:'GhostSpiral_entry'`, so the default UI
+    # -- the way essentially everyone runs this -- stamped the tool's own name
+    # onto every receive subaddress AND onto the fresh account created to hold
+    # it. That string lands in the WALLET FILE, which is the single artifact
+    # paranoia_mode deliberately never deletes because it is the operator's
+    # money. Anyone who opens that wallet reads "GhostSpiral_entry" and knows
+    # both which tool produced the layout and which address the run entered on.
+    #
+    # create_receive_wallet had already been fixed to default to no label, and
+    # OPSEC_SETUP.md documents labels as removed, and a unit test pins the CLI
+    # tool's default -- all three were true while the GUI kept sending the
+    # exact string the fix removed. Every on-chain heuristic this toolchain
+    # defeats was bypassed by reading a local string.
+    "make_receive":    {"group": "Receive", "label": "Create receive address", "risk": "safe",
+                        "desc": "fresh subaddress + gs_receive_wallet_v1 JSON for the sender",
+                        "build": lambda p: [PY, "create_receive_wallet",
+                                            "--rpc", p.get("rpc_primary", "http://127.0.0.1:18083"),
+                                            "--tor-proxy", p.get("tor_proxy", "")]
+                                           + (["--label", p["label"]] if p.get("label") else [])},
+    # THE step that makes "receive" mean BTC -> Monero. Without it the address
+    # handed to the sender is a Monero one, so the sender must already hold XMR
+    # and the swap that the whole receive flow exists for never happens.
+    # Destination comes from the receive bundle, never a retyped address.
+    "swap_quote":      {"group": "Receive", "label": "Get the BTC deposit address", "risk": "safe",
+                        "desc": "BTC→XMR quote: the address + memo you give the sender",
+                        "build": lambda p: [PY, "thor_swap_preparer",
+                                            "--dest-from-receive-wallet", p.get("receive_wallet", ""),
+                                            "--tor-proxy", p.get("tor_proxy", ""),
+                                            "--outfile", p.get("pairs_file") or "thor_pairs.json"]},
+    # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
+    # never spends, so it stays a `safe` action even though it is the step
+    # that decides a mix is about to happen.
+    "watch_receive":   {"group": "Receive", "label": "Wait for the payment", "risk": "safe",
+                        "desc": "watch the receive subaddress until the swapped XMR arrives",
+                        "build": lambda p: [PY, "receive_watch",
+                                            "--receive-wallet", p.get("receive_wallet", ""),
+                                            "--tor-proxy", p.get("tor_proxy", "")]
+                                           + ["--pairs", p.get("pairs_file") or "thor_pairs.json"]},
+    # NOT "--any" when the field is blank. The swap_quote action two entries
+    # above defaults the SAME blank field to "thor_pairs.json" and writes the
+    # quote there -- so the GUI's default flow produced a quote file and then
+    # watched with no target at all, discarding the expected amount, the
+    # under-delivery check and the shortfall report, and firing on any dust
+    # that reached the address. The two actions must agree on the default, and
+    # the one that reads must not silently weaken what the one that writes
+    # produced. --any stays available from the CLI, where it is explicit.
+
+    # the pipeline itself — this one moves money
+    "run_pipeline":    {"group": "Pipeline", "label": "Run pipeline", "risk": "spends",
+                        "desc": "fan-out, optional DAG hops, sign and broadcast — "
+                                "and, with exit destinations set, WITHDRAW the "
+                                "mixed funds off this wallet",
+                        "build": lambda p: pipeline_argv(p)[0]},
+
+    # verification
+    "units":       {"group": "Verify", "label": "Unit suite", "risk": "safe",
+                    "desc": "validation, fingerprint, money math", "build": lambda p: _suite("test_units")},
+    "integration": {"group": "Verify", "label": "Integration suite", "risk": "safe",
+                    "desc": "real phase_create/sign/broadcast + orchestration",
+                    "build": lambda p: _suite("test_integration")},
+    "ipleak":      {"group": "Verify", "label": "IP-leak suite", "risk": "safe",
+                    "desc": "proxy scheme, egress guards, localhost spoofing",
+                    "build": lambda p: _suite("test_ipleak")},
+    "leakaudit":   {"group": "Verify", "label": "Disk leak audit", "risk": "safe",
+                    "desc": "runs 3 stages on testnet, audits what hits disk",
+                    "build": lambda p: _suite("leak_audit_testnet", VENV_PY)},
+    "compile":     {"group": "Verify", "label": "Compile all", "risk": "safe",
+                    "desc": "every shipped script parses",
+                    "build": lambda p: [PY, "-m", "py_compile", "gs_common.py", "GhostSpiral",
+                                        "airgap_tx_signer", "broadcast_signed_xmr",
+                                        "create_receive_wallet", "exit_strategy_simulator",
+                                        "paranoia_mode", "thor_swap_preparer",
+                                        "receive_watch"]},
+}
+
+PREFLIGHT_TOR = """
+import sys, importlib.machinery, importlib.util
+l=importlib.machinery.SourceFileLoader('gs','gs_common.py')
+s=importlib.util.spec_from_loader('gs',l); gs=importlib.util.module_from_spec(s); l.exec_module(gs)
+p=sys.argv[1] if len(sys.argv)>1 else ''
+if not p: print('[!] No Tor proxy set in the console.'); raise SystemExit(2)
+print('[*] validating proxy format ...'); pr=gs.validate_proxy(p); print('    ok', pr)
+print('[*] asking check.torproject.org whether we are exiting via Tor ...')
+gs.verify_tor(pr); print('[+] Tor exit verified.')
+"""
+
+PREFLIGHT_EGRESS = """
+import sys, json, importlib.machinery, importlib.util
+l=importlib.machinery.SourceFileLoader('gs','gs_common.py')
+s=importlib.util.spec_from_loader('gs',l); gs=importlib.util.module_from_spec(s); l.exec_module(gs)
+d=sys.argv[1] if len(sys.argv)>1 else 'http://127.0.0.1:18081'
+tor=sys.argv[2] if len(sys.argv)>2 else ''
+# Pass the proxy through so a REMOTE daemon can actually be inspected. Without
+# it check_daemon_relay_egress refuses to query a non-loopback daemon (rightly
+# -- it will not open a clearnet connection to do so) and can only answer
+# "unknown", which reads like a broken check rather than a missing proxy.
+prox=gs.validate_proxy(tor) if tor else None
+print('[*] inspecting relay egress at', d)
+v=gs.check_daemon_relay_egress(d, prox)
+print(json.dumps(v, indent=2))
+verdict=v['verdict']
+print({'tor':'[+] Relay egress is anonymous.',
+       'clearnet':'[!] CLEARNET — a broadcast would reveal your IP to raw-IP peers.',
+       'offline':'[!] Daemon is --offline; a broadcast would go nowhere.',
+       'unknown':'[!] Could not determine egress. Treat it as clearnet.'}[verdict])
+raise SystemExit(0 if verdict=='tor' else 1)
+"""
+
+# argv: [rpc_url, tor_proxy]
+#
+# This used to be a hand-rolled urllib.request with no egress guard at all,
+# while the parameter schema happily accepts ANY http(s) host. Pointing the
+# console at a remote wallet-rpc therefore opened a direct clearnet connection
+# from the operator's real IP -- verified by aiming it at an unroutable
+# TEST-NET address and watching it spend 20s trying to connect. Every other
+# network path in this toolchain goes through the same rule, so this one does
+# too: loopback direct, remote only through the Tor proxy, and refuse rather
+# than connect when there is no proxy to use.
+PREFLIGHT_WALLET = """
+import sys, json, importlib.machinery, importlib.util
+from urllib.parse import urlparse
+l=importlib.machinery.SourceFileLoader('gs','gs_common.py')
+s=importlib.util.spec_from_loader('gs',l); gs=importlib.util.module_from_spec(s); l.exec_module(gs)
+import requests
+
+url=(sys.argv[1] if len(sys.argv)>1 else 'http://127.0.0.1:18083').rstrip('/')
+tor=sys.argv[2] if len(sys.argv)>2 else ''
+host=(urlparse(url).hostname or '').lower()
+proxies=None
+if host not in gs._LOCALHOST_NAMES:
+    if not tor:
+        print('[!] %s is not loopback and no Tor proxy is configured.' % host)
+        print('[!] Connecting directly would send your IP to that wallet-rpc.')
+        print('[!] Set the Tor proxy in the console, or point --rpc-primary at 127.0.0.1.')
+        raise SystemExit(2)
+    proxies=gs.validate_proxy(tor)
+    print('[*] remote wallet-rpc -> routing this check through', tor)
+else:
+    print('[*] loopback wallet-rpc -> direct (Tor cannot route to loopback)')
+
+u=url+'/json_rpc'
+def rpc(m,p=None):
+    b={'jsonrpc':'2.0','id':'0','method':m}
+    if p: b['params']=p
+    r=requests.post(u,json=b,timeout=25,proxies=proxies)
+    r.raise_for_status(); return r.json()
+print('[*] contacting wallet-rpc at', u)
+try:
+    v=rpc('get_version'); print('    version:', v.get('result',{}).get('version','?'))
+    rpc('refresh')     # updates the wallet's view of the chain; spends nothing
+    b=rpc('get_balance',{'account_index':0}).get('result',{})
+    tot=b.get('balance',0)/1e12; unl=b.get('unlocked_balance',0)/1e12
+    print(f'[+] balance {tot:.6f} XMR   unlocked {unl:.6f} XMR')
+    if unl<=0.0001: print('[!] Unlocked balance is dust or zero — the pipeline will abort.')
+except Exception as e:
+    print('[!] wallet-rpc unreachable:', e); raise SystemExit(1)
+"""
+
+JOBS: dict[str, dict] = {}
+LOCK = threading.Lock()
+
+
+#: Actions allowed to see GS_WALLET_PASSWORD. Only the pipeline needs it (it
+#: forwards the password to the signer); every other action is a check, a test
+#: suite or a third-party script that has no business holding the spend
+#: password of a funded wallet.
+PASSWORD_ACTIONS = {"run_pipeline"}
+_JOB_SEQ = [0]
+
+
+def secret_env(params: dict) -> dict:
+    """Values passed to a child through the ENVIRONMENT, never on its argv.
+
+    /proc/<pid>/cmdline is mode 0444 -- every account on the host can read a
+    child's command line for as long as it runs -- while /proc/<pid>/environ is
+    0400, owner only. Both measured on Linux.
+
+    The console used to spawn `GhostSpiral --btc-entry bc1... --btc-amount 0.42`
+    and `thor_swap_preparer --amounts 0.42`, so the operator's own Bitcoin
+    address and the sum being moved were readable by any local user via ps.
+    Those are the two values that tie a run to a Bitcoin identity, and this
+    toolchain already keeps both out of the integrity chain for that reason.
+
+    Keeping them out of argv also keeps them out of the command PREVIEW the
+    page renders, which is the same rule the wallet password already follows:
+    the preview shows the real argv, and the real argv has no secrets on it.
+    """
+    env = {}
+    if params.get("btc_entry"):
+        env["GS_BTC_ENTRY"] = params["btc_entry"]
+    if params.get("btc_amount"):
+        env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
+    if params.get("swap_btc"):
+        env["GS_SWAP_AMOUNTS"] = str(params["swap_btc"])
+    return env
+
+
+def _child_env(action_id):
+    """Environment for a child process.
+
+    The module header promises the wallet password is "forwarded ONLY to the
+    pipeline child". It was not: every action inherited os.environ verbatim, so
+    a funded wallet's spend password was handed to the unit suites, to
+    paranoia_mode, to py_compile and to anything else a click could start.
+    Verified by running a non-pipeline child and printing the variable.
+    """
+    env = dict(os.environ)
+    if action_id not in PASSWORD_ACTIONS:
+        env.pop("GS_WALLET_PASSWORD", None)
+    return env
+
+
+def start(argv, label, action_id=None, extra_env=None):
+    with LOCK:
+        _JOB_SEQ[0] += 1
+        seq = _JOB_SEQ[0]
+    # Sequence-suffixed: two jobs started inside the same millisecond used to
+    # get the same id, so one silently replaced the other in JOBS and the UI
+    # polled the wrong process's output.
+    jid = f"j{int(time.time()*1000)}_{seq}"
+    job = {"id": jid, "label": label, "lines": [], "done": False, "rc": None,
+           "started": time.time(), "proc": None, "argv": argv}
+    with LOCK:
+        JOBS[jid] = job
+        if len(JOBS) > MAX_JOBS:          # bound memory; drop oldest finished
+            for k in [k for k, v in sorted(JOBS.items(), key=lambda kv: kv[1]["started"])
+                      if v["done"]][:len(JOBS) - MAX_JOBS]:
+                JOBS.pop(k, None)
+
+    def run():
+        try:
+            env = _child_env(action_id)     # password only for PASSWORD_ACTIONS
+            # The BTC address and amounts ride here, not on argv.
+            env.update(extra_env or {})
+            # stdin=DEVNULL: a job must never be able to WAIT FOR A HUMAN.
+            # Children inherited the console's fd 0, so receive_watch's
+            # `if pick is None and sys.stdin.isatty()` was True for a job
+            # nobody can type into: the moment a payment landed, the job
+            # blocked on input() forever. Nothing could clear it -- see the
+            # watchdog below for why the job timeout could not either.
+            #
+            # PYTHONUNBUFFERED: stdout here is a PIPE, so CPython block-buffers
+            # at 8192 bytes. bufsize=1 is the PARENT's read side and does not
+            # change the child's buffering, so the live-output pane stayed
+            # empty for hours on a slow-ticking job like receive_watch (41-byte
+            # progress lines at a 45-90s cadence -- roughly 188 ticks, over
+            # three hours, before the first flush). Set it for every child
+            # rather than adding flush=True to one tool's prints, so the next
+            # tool cannot half-apply the fix.
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            p = subprocess.Popen(argv, cwd=REPO, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 start_new_session=True, env=env,
+                                 stdin=subprocess.DEVNULL)   # shell=False
+            job["proc"] = p
+            # WATCHDOG, because p.wait(timeout=...) below can never fire.
+            #
+            # The drain loop `for line in p.stdout` ends only when the child
+            # closes stdout, i.e. when it exits -- so by the time the timeout
+            # was armed the process was already gone. JOB_TIMEOUT_S was dead
+            # code, and a child that hung while holding stdout open (the
+            # input() hang above, an RPC read with no timeout) pinned this
+            # thread forever with the UI still showing "running".
+            #
+            # A timer that kills the process GROUP does fire during the drain.
+            # start_new_session=True above gives each job its own group, so
+            # this cannot reach anything else.
+            def _watchdog():
+                with LOCK:
+                    job["lines"].append(
+                        f"[console] job exceeded {JOB_TIMEOUT_S}s — killing it.")
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+            _wd = threading.Timer(JOB_TIMEOUT_S, _watchdog)
+            _wd.daemon = True
+            _wd.start()
+            try:
+                for line in p.stdout:
+                    with LOCK:
+                        job["lines"].append(line.rstrip("\n"))
+                        if len(job["lines"]) > 5000:
+                            del job["lines"][:1500]
+            finally:
+                _wd.cancel()
+            try:
+                p.wait(timeout=JOB_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                job["lines"].append(f"[console] killed after {JOB_TIMEOUT_S}s timeout")
+                p.wait()
+            job["rc"] = p.returncode
+        except FileNotFoundError as e:
+            job["lines"].append(f"[console] not found: {e}"); job["rc"] = 127
+        except Exception as e:                                  # noqa: BLE001
+            job["lines"].append(f"[console] error: {e}"); job["rc"] = 1
+        finally:
+            job["done"] = True
+            job["elapsed"] = round(time.time() - job["started"], 1)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jid
+
+
+def stop(jid):
+    j = JOBS.get(jid)
+    if not j or j["done"] or not j["proc"]:
+        return False
+    try:
+        os.killpg(os.getpgid(j["proc"].pid), signal.SIGTERM)
+        j["lines"].append("[console] SIGTERM sent to process group")
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+#: A ~2 kB transaction costs single-digit milli-XMR on a healthy mainnet.
+#: Anything past this is not a real fee, it is a misconfigured or freshly
+#: initialised chain -- a fresh offline testnet daemon reports a base fee that
+#: works out to ~4 XMR per transaction (observed). Selecting that silently
+#: would be a very expensive click, so the console flags it instead.
+FEE_PLAUSIBLE_MAX_XMR = 0.1
+
+
+def _flag_fees(res):
+    """Attach a warning when the daemon's numbers are not believable."""
+    top = max(res.get("xmr") or [0])
+    lo = min(res.get("xmr") or [0])
+    if top > FEE_PLAUSIBLE_MAX_XMR:
+        res["implausible"] = True
+        res["warning"] = (f"Daemon reports up to {top} XMR per ~2 kB transaction — "
+                          f"far above a real mainnet fee. This usually means the daemon "
+                          f"is on a fresh or offline chain. Do NOT treat these as real "
+                          f"costs.")
+    elif lo <= 0:
+        res["implausible"] = True
+        res["warning"] = "Daemon returned a zero fee — the estimate is not usable."
+    else:
+        res["implausible"] = False
+    return res
+
+
+_GS_MOD = None
+_GS_LOCK = threading.Lock()
+
+
+def _gs_common():
+    """Load gs_common.py once and cache it.
+
+    live_fees() used to re-exec the whole module on every poll AND push another
+    copy of REPO onto sys.path each time, so an open console grew sys.path
+    without bound and re-ran gs_common's import-time work on a timer.
+    """
+    global _GS_MOD
+    with _GS_LOCK:
+        if _GS_MOD is None:
+            import importlib.machinery, importlib.util
+            l = importlib.machinery.SourceFileLoader(
+                "gs_common_console", os.path.join(REPO, "gs_common.py"))
+            s = importlib.util.spec_from_loader(l.name, l)
+            m = importlib.util.module_from_spec(s)
+            l.exec_module(m)
+            _GS_MOD = m
+    return _GS_MOD
+
+
+def live_fees(daemon_url, tor_proxy=""):
+    """Real per-priority fees from the operator's own daemon, or none at all.
+
+    THERE IS NO FALLBACK TABLE. This used to answer an unreachable daemon with
+    a hard-coded 0.00005-XMR-per-priority ladder, labelled "built-in fallback"
+    in a `source` string most of the page never showed, and -- because
+    _flag_fees was not applied to that branch -- with the implausibility
+    warning suppressed. The operator was then choosing a fee priority against
+    invented numbers.
+
+    That is the same defect this repo already removed twice: from
+    exit_strategy_simulator, which now aborts rather than serve a made-up
+    price, and from thor_swap_preparer's _btc_per_xmr, which returned a
+    hard-coded 0.003 that the slippage check then compared real quotes
+    against. A fee estimate is a number about the operator's own money; if the
+    daemon cannot supply it, the honest answer is that there is no estimate.
+
+    A REMOTE daemon is queried through the Tor proxy, exactly like the two
+    preflight checks: without it, gs.daemon_fee_estimate refuses a non-loopback
+    daemon (it will not open a clearnet connection to it) and returns nothing,
+    so an operator with a remote daemon behind Tor silently saw "no estimate".
+    A loopback daemon is queried directly (Tor cannot route to loopback).
+    """
+    try:
+        gs = _gs_common()
+        from urllib.parse import urlparse as _up
+        host = (_up(daemon_url).hostname or "").lower()
+        proxies = None
+        if host not in gs._LOCALHOST_NAMES and tor_proxy:
+            proxies = gs.validate_proxy(tor_proxy)
+        est = gs.daemon_fee_estimate(daemon_url, proxies)
+        fees = est.get("fees")
+        if isinstance(fees, list) and fees:
+            return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
+                               "xmr": [round(int(f) * 2000 / 1e12, 6) for f in fees[:4]]})
+        base = est.get("fee")
+        if base:
+            mult = [1, 4, 20, 166]
+            return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
+                               "xmr": [round(int(base) * 2000 * m / 1e12, 6) for m in mult]})
+        return {"ok": False, "xmr": None, "implausible": False,
+                "source": "no estimate — the daemon returned no fee data",
+                "warning": ("Could not reach a daemon at "
+                            f"{daemon_url} for a fee estimate. No numbers are shown "
+                            "because inventing them would be worse than showing none: "
+                            "point --rpc-daemon at your monerod (usually "
+                            "http://127.0.0.1:18081). Priority still applies — the "
+                            "wallet computes the real fee at signing time.")}
+    except Exception as e:
+        return {"ok": False, "xmr": None, "implausible": False,
+                "source": f"no estimate — {str(e)[:60]}",
+                "warning": ("The fee estimate could not be produced, so none is "
+                            "shown. Priority still applies; the wallet computes the "
+                            "real fee at signing time.")}
+
+
+#: Where monerod's RPC commonly listens. 18081 is the mainnet default; 18089 is
+#: the conventional "restricted/public" port that remote-node operators expose
+#: and that many wallets are pointed at; 28081/38081 are testnet/stagenet. An
+#: operator whose node is on any of these should not have to discover that the
+#: fee panel wanted a different number.
+DAEMON_PORTS = (18081, 18089, 28081, 38081)
+
+
+def detect_daemon(preferred: str = "", tor_proxy: str = "") -> dict:
+    """Find a monerod that will actually answer a fee estimate.
+
+    "Cannot get estimates" is almost never a broken console -- it is that no
+    daemon is listening where the field points. Rather than leaving the
+    operator to guess the port, probe the likely ones and keep whichever really
+    returns fee data, the same way the Tor proxy is detected.
+
+    Only the CONFIGURED endpoint may be remote (queried through Tor, exactly as
+    live_fees does). The probe list is loopback-only on purpose: sweeping ports
+    on anything but this machine would be scanning someone else's host.
+    """
+    try:
+        _gs_common()
+    except Exception as e:                            # noqa: BLE001
+        return {"ok": False, "daemon": None,
+                "detail": f"cannot load dependencies — {str(e)[:100]}"}
+    cands = []
+    p = (preferred or "").strip()
+    if p:
+        cands.append(p)
+    for port in DAEMON_PORTS:
+        u = f"http://127.0.0.1:{port}"
+        if u not in cands:
+            cands.append(u)
+    tried = []
+    doubtful = None
+    for url in cands:
+        try:
+            r = live_fees(url, tor_proxy)
+        except Exception:                             # noqa: BLE001
+            tried.append(url); continue
+        if r.get("ok") and r.get("xmr"):
+            # A daemon that answers is not automatically the right one. A fresh
+            # or offline chain quotes fees orders of magnitude above mainnet, and
+            # picking it just because it replied first would hand the operator
+            # invented-looking costs while a real node sat on the next port.
+            # Prefer a believable one; keep an implausible one only as a
+            # last resort, and say so rather than presenting it as found.
+            if not r.get("implausible"):
+                return {"ok": True, "daemon": url,
+                        "detail": f"monerod answering fee estimates at {url}"}
+            if doubtful is None:
+                doubtful = (url, max(r.get("xmr") or [0]))
+        tried.append(url)
+    if doubtful:
+        url, top = doubtful
+        return {"ok": True, "daemon": url,
+                "detail": (f"Only {url} answered, and it quotes up to {top} XMR per "
+                           f"~2 kB transaction — far above a real mainnet fee, so it "
+                           f"is almost certainly a fresh, offline or test chain. "
+                           f"Selected it because nothing else replied; do NOT treat "
+                           f"these numbers as real costs.")}
+    return {"ok": False, "daemon": None,
+            "detail": ("No monerod answered a fee estimate on " + ", ".join(tried) +
+                       ". Start your node (monerod), or point the daemon field at the "
+                       "remote node your wallet already uses — a remote one is queried "
+                       "through Tor, not clearnet. Fees are still charged correctly "
+                       "without an estimate; the wallet computes the real fee when it "
+                       "signs, so this only costs you the preview.")}
+
+
+#: Where Tor's SOCKS proxy commonly listens: 9050 = the standalone tor daemon /
+#: Tor Expert Bundle / most Linux packages; 9150 = the Tor Browser bundle. The
+#: operator should not have to know which — we probe both and keep whichever
+#: ACTUALLY exits via Tor.
+TOR_SOCKS_PORTS = (9050, 9150)
+
+
+def detect_tor_proxy(preferred: str = "") -> dict:
+    """Find a working Tor SOCKS proxy on localhost by REAL verification.
+
+    A port being open is not enough (a random SOCKS proxy is not Tor), so each
+    candidate is checked with the same tor_recheck used everywhere else: it must
+    confirm the exit is Tor. Tries the operator's current value first, then the
+    well-known ports. Returns {"ok", "proxy", "detail"}. Never raises.
+    """
+    try:
+        gs = _gs_common()
+    except Exception as e:                            # noqa: BLE001
+        return {"ok": False, "proxy": None,
+                "detail": f"cannot load dependencies — {str(e)[:100]}"}
+    cands = []
+    p = (preferred or "").strip()
+    if p:
+        cands.append(p)
+    for port in TOR_SOCKS_PORTS:
+        u = f"socks5h://127.0.0.1:{port}"
+        if u not in cands:
+            cands.append(u)
+    tried = []
+    for u in cands:
+        try:
+            proxy = gs.validate_proxy(u)
+            gs.tor_recheck(proxy, "console_detect")   # single-shot; exits/raises on fail
+            return {"ok": True, "proxy": u, "detail": f"verified Tor exit via {u}"}
+        except SystemExit:
+            tried.append(u.rsplit(":", 1)[-1])
+        except Exception:
+            tried.append(u.rsplit(":", 1)[-1])
+    return {"ok": False, "proxy": None,
+            "detail": ("no working Tor proxy on ports " + ", ".join(tried) +
+                       ". Start Tor Browser (9150) or tor.exe (9050) and retry.")}
+
+
+_TOR_PROC = None
+_TOR_LOCK = threading.Lock()
+
+
+def _find_tor_binary():
+    """Locate an ALREADY-INSTALLED tor daemon. Never downloads anything —
+    launching a fetched binary would be a supply-chain risk the operator did
+    not consent to. PATH first, then a few well-known install locations."""
+    b = shutil.which("tor")
+    if b:
+        return b
+    home = os.path.expanduser("~")
+    cands = []
+    if sys.platform == "win32":
+        tb = os.path.join("Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe")
+        cands += [os.path.join(home, "Desktop", tb),
+                  os.path.join(home, "OneDrive", "Desktop", tb),
+                  os.path.join(home, "Downloads", tb),
+                  os.path.join(os.environ.get("PROGRAMFILES", "C:/Program Files"), "Tor", "tor.exe"),
+                  os.path.join(home, "tor", "tor.exe")]
+    else:
+        cands += ["/usr/bin/tor", "/usr/local/bin/tor", "/opt/homebrew/bin/tor",
+                  os.path.join(home, ".local", "bin", "tor")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def start_tor():
+    """Start an installed Tor daemon and return the verified SOCKS proxy.
+
+    Order: (1) if a Tor proxy is already working, use it — never launch a
+    duplicate; (2) if we launched one earlier and it's alive, re-verify it;
+    (3) otherwise find an installed tor binary and launch it (default config =
+    SOCKS on 127.0.0.1:9050), then poll until it bootstraps and verifies as
+    Tor. Only ever runs a binary already on the machine. Never raises.
+    """
+    global _TOR_PROC
+    d = detect_tor_proxy("")
+    if d.get("ok"):
+        return {"ok": True, "proxy": d["proxy"], "started": False,
+                "detail": "Tor was already running: " + d["proxy"]}
+    with _TOR_LOCK:
+        if _TOR_PROC is not None and _TOR_PROC.poll() is None:
+            d = detect_tor_proxy("socks5h://127.0.0.1:9050")
+            if d.get("ok"):
+                return {"ok": True, "proxy": d["proxy"], "started": True,
+                        "detail": "Tor (started here) is up: " + d["proxy"]}
+            return {"ok": False, "proxy": None, "started": True,
+                    "detail": "Tor was launched but has not finished bootstrapping "
+                              "yet — wait a moment and click 'Detect Tor port'."}
+        tor_bin = _find_tor_binary()
+        if not tor_bin:
+            hint = ("Open Tor Browser (then click 'Detect Tor port'), or install "
+                    "the Tor Expert Bundle from torproject.org."
+                    if sys.platform == "win32" else
+                    "Install it: 'sudo apt install tor' / 'brew install tor', or "
+                    "open Tor Browser and click 'Detect Tor port'.")
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": "No installed 'tor' binary found. " + hint}
+        try:
+            _TOR_PROC = subprocess.Popen(
+                [tor_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, cwd=os.path.dirname(tor_bin) or None)
+        except Exception as e:                        # noqa: BLE001
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": f"found tor at {tor_bin} but could not launch it: {str(e)[:100]}"}
+    # Poll (outside the lock) until tor bootstraps and a real Tor check passes.
+    for _ in range(60):
+        time.sleep(1)
+        if _TOR_PROC.poll() is not None:
+            return {"ok": False, "proxy": None, "started": False,
+                    "detail": f"tor exited immediately (code {_TOR_PROC.returncode}); "
+                              "it may already be running or its data dir is not writable."}
+        d = detect_tor_proxy("socks5h://127.0.0.1:9050")
+        if d.get("ok"):
+            return {"ok": True, "proxy": d["proxy"], "started": True,
+                    "detail": "Launched Tor and verified the exit: " + d["proxy"]}
+    return {"ok": False, "proxy": None, "started": True,
+            "detail": "Launched tor but it did not verify within 60s (still "
+                      "bootstrapping on a slow link?). Click 'Detect Tor port' shortly."}
+
+
+def mandatory_preflight(params: dict) -> dict:
+    """The NON-NEGOTIABLE OPSEC gate the pipeline cannot spend without.
+
+    Two leak-critical facts, verified live against the operator's own
+    machine every time, not offered as optional buttons:
+      * traffic really exits through Tor (verify against check.torproject.org),
+      * the daemon would not relay the transaction to raw-IP peers.
+
+    Returns {"ok": bool, "checks": {name: {ok, detail, ...}}}. Never raises:
+    validate_proxy / tor_recheck abort via SystemExit, which is caught here so
+    a FAILED check BLOCKS the spend rather than killing the console. A spend
+    is allowed only when every check is ok; the caller refuses otherwise.
+
+    This runs at BOTH /api/preflight (so the page can show status and gate its
+    own button) AND inside /run/run_pipeline (so a crafted request that skips
+    the page still cannot spend without passing). GhostSpiral re-checks the
+    same things at its own Stage 0 — this is a deliberate second, independent
+    gate at the console layer, not a replacement for it.
+    """
+    try:
+        gs = _gs_common()
+    except Exception as e:                              # noqa: BLE001
+        # gs_common pulls in tenacity / stem / requests / PySocks. If a
+        # dependency is not installed, say so clearly and BLOCK the spend
+        # (ok=False) rather than throw a raw 500 the operator cannot read.
+        missing = str(e)
+        hint = ("install the requirements: pip install -r requirements.txt"
+                if "No module named" in missing else missing[:120])
+        return {"ok": False, "checks": {"deps": {
+            "ok": False,
+            "detail": f"console cannot load its dependencies — {hint}"}}}
+    checks: dict = {}
+    tor = (params.get("tor_proxy") or "").strip()
+    if not tor:
+        checks["tor"] = {"ok": False, "detail": "no Tor proxy configured"}
+        return {"ok": False, "checks": checks}
+    try:
+        proxy = gs.validate_proxy(tor)
+        gs.tor_recheck(proxy, "console_preflight")   # single-shot; SystemExit on fail
+        checks["tor"] = {"ok": True, "state": "ok", "label": "Traffic exits via Tor",
+                         "detail": "traffic verified exiting via Tor"}
+    except SystemExit as e:
+        _d = (str(e).strip().splitlines() or ["Tor check failed"])[0][:150]
+        checks["tor"] = {"ok": False, "detail": _d + " — is Tor running? Click "
+                         "'Detect Tor port', or start Tor Browser (port 9150) or "
+                         "tor.exe (port 9050)."}
+        return {"ok": False, "checks": checks}
+    except Exception as e:                            # noqa: BLE001
+        checks["tor"] = {"ok": False, "detail": f"Tor check error: {str(e)[:120]} — is "
+                         "Tor running? Click 'Detect Tor port'."}
+        return {"ok": False, "checks": checks}
+
+    from urllib.parse import urlparse as _up
+    daemon = (params.get("rpc_daemon") or "http://127.0.0.1:18081")
+    host = (_up(daemon).hostname or "").lower()
+    proxies = proxy if host not in gs._LOCALHOST_NAMES else None
+    allow_clear = bool(params.get("allow_clearnet_relay"))
+    try:
+        eg = gs.check_daemon_relay_egress(daemon, proxies)
+    except Exception as e:                            # noqa: BLE001
+        eg = {"verdict": "unknown", "detail": f"egress probe error: {str(e)[:100]}"}
+    verdict = eg.get("verdict", "unknown")
+    # THREE STATES, NOT TWO. `ok` decides whether the spend is permitted;
+    # `state` decides what the operator is TOLD. Collapsing them made the page
+    # assert things that were not true:
+    #
+    #   * verdict "unknown" rendered as "✓ Relay egress not clearnet" -- and
+    #     unknown is the DEFAULT for a freshly started daemon ("no peer
+    #     connections yet"), a restricted RPC, or any probe error. The page
+    #     claimed a fact it had explicitly failed to establish.
+    #   * verdict "clearnet" WITH --allow-clearnet-relay also rendered as
+    #     "✓ Relay egress not clearnet", i.e. the exact opposite of the
+    #     measurement. Overriding is the operator's call; being told the
+    #     egress is clean while overriding it is not.
+    #
+    # GhostSpiral's Stage 0 proceeds on unknown with a printed warning, so the
+    # spend stays PERMITTED here for the same verdicts it permits -- diverging
+    # would push operators toward --allow-clearnet-relay, which switches the
+    # check off for the case it exists to catch. Only the honesty changes.
+    if verdict == "clearnet":
+        eok = allow_clear
+        state = "warn" if allow_clear else "fail"
+        label = "Relay egress IS CLEARNET"
+        detail = eg.get("detail", "relays to raw-IP peers")
+        if allow_clear:
+            detail += " — you overrode this with 'Allow clearnet relay'"
+    elif verdict == "offline":
+        eok, state = False, "fail"
+        label = "Daemon is offline"
+        detail = eg.get("detail", "daemon is --offline; the broadcast would go nowhere")
+    elif verdict == "tor":
+        eok, state = True, "ok"
+        label = "Relay egress not clearnet"
+        detail = eg.get("detail", verdict)
+    else:
+        eok, state = True, "warn"
+        label = "Relay egress NOT VERIFIED"
+        detail = (eg.get("detail", "could not observe where this daemon relays")
+                  + " — treat the broadcast as clearnet unless you set "
+                    "monerod --tx-proxy")
+    checks["egress"] = {"ok": eok, "state": state, "verdict": verdict,
+                        "label": label, "detail": detail}
+
+    return {"ok": all(c["ok"] for c in checks.values()),
+            "warn": any(c.get("state") == "warn" for c in checks.values()),
+            "checks": checks}
+
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        # Defense in depth for the token, which rides in the page URL (?t=...):
+        #  * no-referrer   -> the tokened URL is never sent as a Referer, so
+        #                     even a future edit that pulls in an external
+        #                     resource cannot leak the token off-box.
+        #  * CSP default-src 'self' + connect-src 'self' -> the page can only
+        #    ever talk back to this loopback origin; no script it might acquire
+        #    can exfiltrate output, tokens, or the composed argv to a remote host.
+        #  * frame-ancestors 'none' -> cannot be framed (clickjacking / rebinding
+        #    dressed up as an iframe).
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'unsafe-inline' 'self'; "
+                         "style-src 'unsafe-inline' 'self'; connect-src 'self'; "
+                         "img-src 'self' data:; base-uri 'none'; form-action 'none'; "
+                         "frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 64 * 1024:                       # nothing legitimate is larger
+            return {}
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
+    # ── gates. Any one failing rejects the request. ────────────────────────
+    def _host_ok(self):
+        """Host must name loopback. Blocks DNS rebinding: an attacker domain
+        that resolves to 127.0.0.1 still sends its own name here."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip()
+        return host in ALLOWED_HOSTS
+
+    def _origin_ok(self):
+        """Reject any cross-origin request. A same-origin fetch from our own
+        page sends either no Origin or our own; a hostile page cannot forge it."""
+        o = self.headers.get("Origin")
+        if not o:
+            return True                          # same-origin fetch / curl
+        return o.rsplit(":", 1)[0].removeprefix("http://").removeprefix("https://") \
+            in ALLOWED_HOSTS
+
+    def _token_ok(self):
+        """Constant-time token check. The token rides in a CUSTOM header, which
+        a cross-origin <form> cannot set -- so this alone defeats the CSRF path
+        even before the content-type gate."""
+        t = self.headers.get("X-GS-Token") or ""
+        if not t:                                # allow ?t= for the initial GET
+            from urllib.parse import urlparse, parse_qs
+            t = (parse_qs(urlparse(self.path).query).get("t") or [""])[0]
+        return hmac.compare_digest(t, TOKEN)
+
+    def _json_ct_ok(self):
+        """POST must be application/json. That content type is NOT CORS-simple,
+        so a cross-origin attempt needs a preflight, which we never answer."""
+        ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ct == "application/json"
+
+    def _guard(self, need_json):
+        if not self._host_ok():
+            self._send(403, json.dumps({"error": "host not loopback"})); return False
+        if not self._origin_ok():
+            self._send(403, json.dumps({"error": "cross-origin request refused"})); return False
+        if need_json and not self._json_ct_ok():
+            self._send(415, json.dumps({"error": "Content-Type must be application/json"})); return False
+        if not self._token_ok():
+            self._send(401, json.dumps({"error": "missing or bad console token"})); return False
+        return True
+
+    def do_GET(self):
+        base = self.path.split("?")[0]
+        if base == "/favicon.ico":
+            # The browser probes this automatically with no token; answering
+            # 204 keeps a legitimate load from logging a spurious 401.
+            return self._send(204, b"", "image/x-icon")
+        if not self._guard(need_json=False):
+            return
+        if base in ("/", "/index.html"):
+            meta = {k: {"label": v["label"], "desc": v["desc"],
+                        "group": v["group"], "risk": v["risk"]}
+                    for k, v in ACTIONS.items()}
+            page = PAGE.replace("__ACTIONS__", json.dumps(meta)) \
+                       .replace("__ARM__", json.dumps(ARM_PHRASE)) \
+                       .replace("__TOKEN__", json.dumps(TOKEN)) \
+                       .replace("__PWSET__", json.dumps(bool(os.environ.get("GS_WALLET_PASSWORD"))))
+            self._send(200, page, "text/html; charset=utf-8")
+        elif base.startswith("/job/"):
+            j = JOBS.get(base[5:])
+            if not j:
+                return self._send(404, json.dumps({"error": "no such job"}))
+            with LOCK:
+                self._send(200, json.dumps({
+                    "lines": j["lines"], "done": j["done"], "rc": j["rc"],
+                    "label": j["label"],
+                    "elapsed": j.get("elapsed", round(time.time() - j["started"], 1))}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        if not self._guard(need_json=True):
+            return
+        if self.path == "/api/preview":
+            c = clean(self._body().get("params"))
+            argv, why = pipeline_argv(c["params"])
+            return self._send(200, json.dumps({
+                "argv": argv, "pretty": " ".join(shlex.quote(x) for x in argv),
+                "problems": c["errors"] + why}))
+        if self.path == "/api/fees":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(
+                live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"),
+                          c["params"].get("tor_proxy", ""))))
+        if self.path == "/api/preflight":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(mandatory_preflight(c["params"])))
+        if self.path == "/api/detect-tor":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(
+                detect_tor_proxy(c["params"].get("tor_proxy", ""))))
+        if self.path == "/api/start-tor":
+            return self._send(200, json.dumps(start_tor()))
+        if self.path == "/api/detect-daemon":
+            c = clean(self._body().get("params"))
+            return self._send(200, json.dumps(detect_daemon(
+                c["params"].get("rpc_daemon", ""), c["params"].get("tor_proxy", ""))))
+        if self.path.startswith("/run/"):
+            aid = self.path[5:]
+            act = ACTIONS.get(aid)
+            if not act:
+                return self._send(400, json.dumps({"error": "unknown action"}))
+            body = self._body()
+            c = clean(body.get("params"))
+            if act["risk"] == "spends":
+                if body.get("arm") != ARM_PHRASE:
+                    return self._send(403, json.dumps(
+                        {"error": f"this action moves funds; it requires the arm phrase "
+                                  f"'{ARM_PHRASE}'"}))
+                argv, why = pipeline_argv(c["params"])
+                if c["errors"] or why:
+                    return self._send(400, json.dumps({"error": "; ".join(c["errors"] + why)}))
+                # NON-NEGOTIABLE: run the OPSEC preflight server-side and refuse
+                # to launch if Tor is not verified or the daemon would relay to
+                # clearnet. This is enforced HERE, not just in the page, so a
+                # request that bypasses the UI still cannot spend without it.
+                pf = mandatory_preflight(c["params"])
+                if not pf["ok"]:
+                    bad = "; ".join(f"{k}: {v.get('detail', 'failed')}"
+                                    for k, v in pf["checks"].items() if not v["ok"])
+                    try:
+                        _gs_common().integrity_log("console", "run_pipeline_BLOCKED_preflight")
+                    except Exception:
+                        pass
+                    return self._send(403, json.dumps(
+                        {"error": f"Preflight FAILED — refusing to spend. {bad}",
+                         "preflight": pf}))
+            else:
+                # Validation errors were previously ignored for `safe` actions.
+                # clean() DROPS a parameter it cannot validate, so a malformed
+                # Tor proxy or RPC URL silently became an empty argument and
+                # the action ran with different settings than the page showed.
+                # Refuse instead, and say which field is wrong.
+                if c["errors"]:
+                    return self._send(400, json.dumps({"error": "; ".join(c["errors"])}))
+                argv = act["build"](c["params"])
+            return self._send(200, json.dumps(
+                {"jid": start(argv, act["label"], action_id=aid,
+                              extra_env=secret_env(c["params"]))}))
+        if self.path.startswith("/stop/"):
+            return self._send(200, json.dumps({"stopped": stop(self.path[6:])}))
+        self._send(404, json.dumps({"error": "not found"}))
+
+    def log_message(self, *a):
+        pass
+
+
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>GhostSpiral Console</title>
+<style>
+:root{--bg:#F5F7F9;--sf:#fff;--sf2:#EDF1F4;--ink:#10151B;--ink2:#39434F;--mut:#64717F;
+--line:#D6DEE4;--line2:#C2CCD5;--acc:#A85A24;--accs:#F3E4D8;--ok:#136F52;--oks:#DCEFE7;
+--err:#97281F;--errs:#F7E0DD;--warn:#8A5D0F;--warns:#F6EAD2;--term:#0F151B;--ti:#D5DEE6}
+@media(prefers-color-scheme:dark){:root{--bg:#0C1015;--sf:#141A21;--sf2:#1B232C;--ink:#E8EDF2;
+--ink2:#B4C0CC;--mut:#7E8B99;--line:#25303B;--line2:#33404E;--acc:#E0894C;--accs:#3A2718;
+--ok:#4BC79B;--oks:#12332A;--err:#EE8177;--errs:#3A1D1A;--warn:#DFAE55;--warns:#332711;
+--term:#080B0E;--ti:#C9D4DD}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wrap{max-width:1500px;margin:0 auto;padding:22px 20px 60px}
+header{display:flex;gap:13px;align-items:baseline;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:18px}
+h1{margin:0;font-size:21px;font-weight:650;letter-spacing:-.02em}
+.eb{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--acc)}
+.hint{color:var(--mut);font-size:12px;margin-left:auto;font-family:ui-monospace,Menlo,monospace}
+.cols{display:grid;grid-template-columns:minmax(320px,410px) 1fr;gap:20px;align-items:start}
+@media(max-width:1000px){.cols{grid-template-columns:1fr}}
+.card{background:var(--sf);border:1px solid var(--line);border-radius:11px;padding:15px 16px;margin-bottom:14px}
+/* ── wizard ───────────────────────────────────────────────────────────── */
+.stepbar{list-style:none;display:flex;gap:6px;margin:0 0 16px;padding:0;flex-wrap:wrap}
+.stepbar li{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mut);cursor:pointer;
+padding:6px 10px;border-radius:8px;border:1px solid transparent;user-select:none}
+.stepbar li .sn{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;font-size:11px;
+font-weight:600;background:var(--sf2);color:var(--mut);border:1px solid var(--line2)}
+.stepbar li.on{color:var(--ink);border-color:var(--acc);background:var(--accs)}
+.stepbar li.on .sn{background:var(--acc);color:var(--sf);border-color:var(--acc)}
+.stepbar li.done{color:var(--ink2)}
+.stepbar li.done .sn{background:var(--ok);color:var(--sf);border-color:var(--ok)}
+.stepbar li.done .sn::after{content:"✓"}
+.stepbar li.done .sn{font-size:0}
+.stepbar li.done .sn::after{font-size:12px}
+.step{background:var(--sf);border:1px solid var(--line);border-radius:11px;padding:18px 18px 16px;margin-bottom:14px}
+.step[hidden]{display:none}
+.step>h2{color:var(--ink);font-size:15px;letter-spacing:-.01em;text-transform:none;font-family:inherit;margin:0 0 14px}
+.lead{color:var(--mut);font-size:12.5px;line-height:1.5;margin:0 0 14px}
+.choices{display:grid;gap:10px}
+.choice{text-align:left;cursor:pointer;background:var(--bg);border:1px solid var(--line2);border-radius:10px;
+padding:14px 15px;color:var(--ink);font:inherit;display:flex;flex-direction:column;gap:4px}
+.choice:hover{border-color:var(--acc)}
+.choice[aria-pressed=true]{border-color:var(--acc);background:var(--accs);box-shadow:0 0 0 1px var(--acc)}
+.choice .ct{font-size:15px;font-weight:650}
+.choice .cd{font-size:12px;color:var(--mut);line-height:1.45}
+.stepnav{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:18px}
+.stepnav button{font:inherit;font-size:13px;font-weight:600;padding:9px 16px;border-radius:9px;cursor:pointer;border:1px solid var(--line2);background:var(--bg);color:var(--ink)}
+.stepnav .nx{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.stepnav .nx:hover{background:var(--acc);border-color:var(--acc)}
+.stepnav .bk:hover{border-color:var(--acc)}
+.adv{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+.adv summary{cursor:pointer;font-size:12px;color:var(--mut);user-select:none}
+.adv summary:hover{color:var(--acc)}
+h2{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+color:var(--mut);font-weight:600;margin:0 0 12px}
+.seg{display:flex;gap:0;border:1px solid var(--line2);border-radius:9px;overflow:hidden;margin-bottom:13px}
+.seg button{flex:1;font:inherit;font-size:13px;padding:9px;border:0;background:var(--sf);color:var(--ink2);cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--bg);font-weight:600}
+.f{display:grid;grid-template-columns:112px 1fr;gap:8px 11px;align-items:center;margin-bottom:9px}
+.f label{font-size:12px;color:var(--mut)}
+.f input,.f select{font:inherit;font-size:12.5px;padding:6px 9px;border-radius:7px;width:100%;
+border:1px solid var(--line2);background:var(--bg);color:var(--ink);font-family:ui-monospace,Menlo,monospace}
+.f input:invalid{border-color:var(--err)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.chk{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;cursor:pointer;font-size:12.5px}
+.chk input{margin-top:2px}
+.chk .d{color:var(--mut);font-size:11.5px;display:block;line-height:1.35}
+.presets{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-bottom:10px}
+.presets button{font:inherit;font-size:12.5px;padding:9px 11px;border-radius:9px;cursor:pointer;text-align:left;
+border:1px solid var(--line2);background:var(--bg);color:var(--ink2);display:flex;flex-direction:column;gap:1px}
+.presets button .pn{font-weight:600}
+.presets button .pd{font-size:10.5px;color:var(--mut);font-family:ui-monospace,Menlo,monospace}
+.presets button:hover{border-color:var(--acc);color:var(--ink)}
+.presets button[aria-pressed=true]{background:var(--accs);border-color:var(--acc);color:var(--acc)}
+.presets button[data-p=paranoid]{border-color:var(--ok)}
+.presets button[data-p=paranoid][aria-pressed=true]{background:var(--oks);border-color:var(--ok);color:var(--ok)}
+.presets button[data-p=paranoid] .pn::after{content:"✓ safest";float:right;font-size:9.5px;font-weight:600;
+letter-spacing:.06em;text-transform:uppercase;color:var(--ok);background:var(--oks);padding:1px 6px;border-radius:99px}
+.fees{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}
+.fee.imp{border-color:var(--warn)}
+.fee.imp .v{color:var(--warn)}
+.noest{color:var(--mut);font-style:italic;font-size:11.5px}
+.fee{border:1px solid var(--line2);border-radius:8px;padding:7px 6px;text-align:center;cursor:pointer;background:var(--bg)}
+.fee[aria-pressed=true]{border-color:var(--acc);background:var(--accs)}
+.fee .p{font-size:10px;font-family:ui-monospace,Menlo,monospace;color:var(--mut);letter-spacing:.06em}
+.fee .v{font-size:12px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums}
+.fee[aria-pressed=true] .v{color:var(--acc)}
+.fsrc{font-size:11px;color:var(--mut);margin-top:7px;font-family:ui-monospace,Menlo,monospace}
+/* Operations as a compact GRID of tiles instead of stacked full-width rows,
+   so the four groups read as one dense board rather than list-after-list. */
+.ops{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:8px}
+.opgroup{grid-column:1/-1;font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;
+text-transform:uppercase;color:var(--mut);font-weight:600;margin:9px 0 -1px;display:flex;gap:7px;align-items:center}
+.opgroup:first-child{margin-top:0}
+.opgroup::after{content:"";flex:1;height:1px;background:var(--line)}
+.act{display:flex;flex-direction:column;gap:5px;text-align:left;cursor:pointer;background:var(--bg);
+border:1px solid var(--line);border-radius:9px;padding:10px 11px;color:var(--ink);font:inherit;min-height:80px}
+.act:hover{border-color:var(--acc)}
+.act:disabled{opacity:.5;cursor:not-allowed}
+.act .top{display:flex;gap:7px;align-items:center}
+.act .nm{font-size:12.5px;font-weight:600}
+.act .ds{font-size:11px;color:var(--mut);line-height:1.32}
+.act .go{margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:9px;letter-spacing:.08em;
+text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;background:var(--accs);color:var(--acc)}
+.act.spends{border-color:var(--err);grid-column:1/-1}
+.act.spends .go{background:var(--errs);color:var(--err)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--line2);flex:none}
+.dot.run{background:var(--warn);box-shadow:0 0 0 3px var(--warns);animation:p 1s infinite}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--oks)}
+.dot.err{background:var(--err);box-shadow:0 0 0 3px var(--errs)}
+@keyframes p{50%{opacity:.35}}
+@media(prefers-reduced-motion:reduce){.dot.run{animation:none}}
+pre.prev{margin:0;background:var(--term);color:var(--ti);padding:11px 13px;border-radius:8px;
+font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto}
+.probs{margin:9px 0 0;padding:0;list-style:none}
+.probs li{font-size:12px;color:var(--err);background:var(--errs);padding:6px 9px;border-radius:6px;margin-bottom:4px}
+.pfbox{margin-top:11px;border:1px solid var(--line);border-radius:9px;overflow:hidden;font-size:12px}
+.pfhead{padding:8px 11px;font-weight:600;font-size:12px}
+.pfhead.ok{background:var(--oks);color:var(--ok)}
+.pfhead.bad{background:var(--errs);color:var(--err)}
+.pfhead.run{background:var(--warns);color:var(--warn)}
+/* A preflight that PERMITTED the spend without VERIFYING the fact must not
+   look like one that verified it. Amber is its own state, not a shade of green. */
+.pfhead.warn{background:var(--warns);color:var(--warn)}
+.pfrow{display:flex;justify-content:space-between;gap:10px;padding:6px 11px;border-top:1px solid var(--line);align-items:baseline}
+.pfrow.ok span:first-child{color:var(--ok)}
+.pfrow.bad span:first-child{color:var(--err);font-weight:600}
+.pfrow.fail span:first-child{color:var(--err);font-weight:600}
+.pfrow.warn span:first-child{color:var(--warn);font-weight:600}
+.pfrow .pfd{color:var(--mut);font-size:11px;font-family:ui-monospace,Menlo,monospace;text-align:right;max-width:62%;word-break:break-word}
+.pfbtns{display:flex;gap:14px;margin-top:8px}
+.pfre{font-size:11.5px;color:var(--acc);background:none;border:0;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
+.pfre:disabled{color:var(--mut);cursor:default;text-decoration:none}
+.arm{margin-top:11px;padding:11px;border:1px dashed var(--err);border-radius:9px;background:var(--errs)}
+.arm p{margin:0 0 8px;font-size:12px;color:var(--err);line-height:1.45}
+.arm input{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;padding:6px 9px;border-radius:7px;
+border:1px solid var(--err);background:var(--bg);color:var(--ink);width:100%}
+.rightcol{display:flex;flex-direction:column;gap:14px;position:sticky;top:16px}
+.panel{background:var(--sf);border:1px solid var(--line);border-radius:11px;overflow:hidden}
+.pbar{display:flex;gap:11px;align-items:center;padding:10px 13px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.pt{font-size:13px;font-weight:650}
+.pm{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--mut)}
+.pill{font-family:ui-monospace,Menlo,monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
+padding:3px 8px;border-radius:5px;font-weight:600}
+.pill.run{background:var(--warns);color:var(--warn)}.pill.ok{background:var(--oks);color:var(--ok)}
+.pill.err{background:var(--errs);color:var(--err)}
+.pacts{margin-left:auto;display:flex;gap:6px}
+.pacts button{font:inherit;font-size:11.5px;padding:5px 10px;border-radius:7px;cursor:pointer;
+background:transparent;border:1px solid var(--line2);color:var(--ink2)}
+.pacts button:hover{border-color:var(--acc);color:var(--ink)}
+.pacts button.stop{color:var(--err);border-color:var(--err)}
+pre.out{margin:0;background:var(--term);color:var(--ti);padding:13px 15px;overflow:auto;
+max-height:min(70vh,760px);font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.out .d{color:#6B7A88}
+.rstep{display:flex;gap:12px;padding:14px 0;border-top:1px solid #1E2A36}
+.rstep:first-of-type{border-top:0}
+.rstep>div{flex:1;min-width:0}
+.rn{flex:0 0 26px;height:26px;border-radius:50%;background:#1E2A36;color:#8FA6BC;
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+.idle{padding:44px 20px;text-align:center;color:var(--mut);font-size:13px}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.warnbox{font-size:11.5px;color:var(--warn);background:var(--warns);padding:8px 10px;border-radius:7px;margin-top:9px;line-height:1.45}
+.subsec{margin-top:13px;border-top:1px solid var(--line);padding-top:12px}
+.subhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px}
+.subhead span:first-child{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);font-weight:600}
+.mut-s{font-size:10.5px;color:var(--mut)}
+</style></head><body><div class="wrap">
+<header><span class="eb">Console</span><h1>GhostSpiral</h1>
+<span class="hint">127.0.0.1 · argv composed server-side · funds need arming</span></header>
+<div class="cols">
+<div>
+  <!-- progress rail: one row, current step highlighted -->
+  <ol class="stepbar" id="stepbar">
+    <li data-s="1"><span class="sn">1</span>Action</li>
+    <li data-s="2"><span class="sn">2</span><span id="lbl2">Details</span></li>
+    <li data-s="3"><span class="sn">3</span>Privacy</li>
+    <li data-s="4"><span class="sn">4</span>Network</li>
+    <li data-s="5"><span class="sn">5</span>Run</li>
+  </ol>
+
+  <!-- STEP 1 — what are you doing -->
+  <section class="step" data-step="1">
+    <h2>Step 1 · What do you want to do?</h2>
+    <div class="choices" id="mode">
+      <button class="choice" data-m="send" aria-pressed="true">
+        <span class="ct">Send · BTC → XMR</span>
+        <span class="cd">Swap your BTC to Monero through ThorChain, then mix it across fresh subaddresses.</span></button>
+      <button class="choice" data-m="receive" aria-pressed="false">
+        <span class="ct">Receive · XMR in</span>
+        <span class="cd">Make a fresh receive address for a sender, then mix the Monero once it arrives.</span></button>
+    </div>
+    <div class="stepnav"><span></span><button class="nx" data-go="2">Next →</button></div>
+  </section>
+
+  <!-- STEP 2 — details (send) / receive -->
+  <section class="step" data-step="2" hidden>
+    <h2 id="h2-2">Step 2 · Payment</h2>
+    <div id="send-fields">
+      <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" placeholder="bc1q…"></div>
+      <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05"></div>
+      <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="20" value="1"></div>
+      <label class="chk"><input type="checkbox" id="joinmarket">
+        <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
+    </div>
+    <div id="recv-fields" hidden>
+      <p class="lead"><b>The sender pays Bitcoin. You receive Monero.</b> Three steps, in order —
+      each one needs the file the step before it wrote.</p>
+
+      <div class="rstep"><span class="rn">1</span><div>
+        <b>Make the Monero destination.</b> A fresh subaddress on your wallet, where the
+        swapped XMR will land. <b>This is not the address you give the sender</b> — it never
+        leaves your machine.
+        <div class="stepacts" data-acts="make_receive"></div>
+        <div class="f" style="margin-top:10px"><label for="receive_wallet">Wallet JSON <span class="d">from step 1</span></label>
+          <input id="receive_wallet" placeholder="wallet_ab12cd34.json"></div>
+      </div></div>
+
+      <div class="rstep"><span class="rn">2</span><div>
+        <b>Get the Bitcoin deposit address.</b> This quotes a BTC→XMR swap and prints the BTC
+        address <i>and memo</i> to hand the sender. The destination is read from the wallet JSON
+        above, so the 95-character Monero address is never retyped — the one field where a typo
+        is irreversible. The memo is checked to actually name your address before any
+        instructions are printed.
+        <div class="f" style="margin-top:10px"><label for="swap_btc">BTC amount the sender will pay</label>
+          <input id="swap_btc" placeholder="0.05"></div>
+        <div class="f"><label for="pairs_file">Save quote to</label>
+          <input id="pairs_file" placeholder="thor_pairs.json"></div>
+        <div class="stepacts" data-acts="swap_quote"></div>
+        <p class="lead" style="margin-top:8px">The swap provider necessarily learns
+        "this BTC deposit → this XMR address". Tor hides who asked, not the link itself —
+        that is exactly why the mix afterwards is not optional.</p>
+      </div></div>
+
+      <div class="rstep"><span class="rn">3</span><div>
+        <b>Wait for the payment.</b> Polls <b>your own wallet</b> only — no block explorer is
+        ever asked about that Bitcoin address, so no new party learns it is being watched.
+        Reads only, spends nothing; when the money lands it asks what you want to do with it.
+        With a quote file it waits for the quoted amount, otherwise for any balance at all.
+        <div class="stepacts" data-acts="watch_receive"></div>
+      </div></div>
+    </div>
+    <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>
+  </section>
+
+  <!-- STEP 3 — privacy -->
+  <section class="step" data-step="3" hidden>
+    <h2>Step 3 · Privacy level</h2>
+    <p class="lead">Pick a preset — it sets everything below. Higher privacy means more transactions,
+    higher fees and more waiting.</p>
+    <div class="presets" id="presets">
+      <button data-p="paranoid" aria-pressed="false"><span class="pn">Maximum safe</span><span class="pd">peel + DAG · two layers · slowest</span></button>
+      <button data-p="peel" aria-pressed="false"><span class="pn">Peeling chain</span><span class="pd">peel only · 1 dest per tx</span></button>
+      <button data-p="churn" aria-pressed="false"><span class="pn">Deep churn</span><span class="pd">20 wallets · depth 6 · DAG</span></button>
+      <button data-p="max" aria-pressed="false"><span class="pn">High privacy</span><span class="pd">25 wallets · depth 3 · DAG</span></button>
+      <button data-p="balanced" aria-pressed="true"><span class="pn">Balanced</span><span class="pd">12 wallets · depth 2 · DAG</span></button>
+      <button data-p="lowfee" aria-pressed="false"><span class="pn">Low fee</span><span class="pd">8 wallets · depth 2 · DAG · p1</span></button>
+      <button data-p="fast" aria-pressed="false"><span class="pn">Fast</span><span class="pd">3 wallets · depth 1 · no DAG</span></button>
+    </div>
+    <div id="preset-note" class="warnbox"></div>
+    <details class="adv"><summary>Fine-tune (advanced)</summary>
+      <div class="row2" style="margin-top:10px">
+        <div class="f" style="grid-template-columns:76px 1fr"><label for="wallets">Wallets</label><input id="wallets" type="number" min="3" max="60" value="10"></div>
+        <div class="f" style="grid-template-columns:56px 1fr"><label for="deep">Depth</label><input id="deep" type="number" min="1" max="6" value="2"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="dag_mixing" checked>
+        <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
+      <label class="chk"><input type="checkbox" id="peel">
+        <span>Peeling chain<span class="d">distribute ONE tx per destination (each spends the last one's change) instead of one fan-out — outputs are never co-created. MUCH slower: ~20 min per destination.</span></span></label>
+      <label class="chk"><input type="checkbox" id="allow_clearnet_relay">
+        <span style="color:var(--err)">Allow clearnet relay<span class="d">proceed even when monerod would broadcast to raw-IP peers — reveals your IP</span></span></label>
+    </details>
+    <div class="subsec">
+      <div class="subhead"><span>Fee priority</span><span class="mut-s">live from your daemon</span></div>
+      <div class="fees" id="fees"></div>
+      <div class="fsrc" id="fsrc">loading…</div>
+    </div>
+    <div class="subsec">
+      <div class="subhead"><span>Exit — where the money goes afterwards</span>
+        <span class="mut-s">optional</span></div>
+      <p class="lead">One Monero address per line. The mix ends with your funds spread
+      across many accounts on this wallet; the exit spends them out,
+      <b>one transaction per output</b>, never a single collecting sweep — the
+      inputs of a transaction are public, so spending them together would prove
+      they share an owner and undo the run.</p>
+      <div class="f" style="grid-template-columns:1fr">
+        <textarea id="exit_to" rows="3" spellcheck="false"
+          placeholder="4… or 8… (one per line; leave empty to withdraw nothing)"></textarea>
+      </div>
+      <p class="lead"><b>Leave it empty and nothing is withdrawn</b> — the funds
+      stay on this wallet and the run tells you so. Give <i>several</i> addresses
+      and the withdrawal is spread across them: sending everything to one address
+      re-joins off-chain exactly what the run separated on-chain, and no amount
+      of mixing undoes that.</p>
+      <p class="lead mut-s">Format is checked here; the full <b>checksum</b> is
+      verified by the pipeline before any funds move — a mistyped Monero address
+      is often still well-formed, and a send has no confirmation step and no
+      reversal.</p>
+      <div id="exitnote" class="warnbox" hidden></div>
+    </div>
+    <div class="stepnav"><button class="bk" data-go="2">← Back</button><button class="nx" data-go="4">Next →</button></div>
+  </section>
+
+  <!-- STEP 4 — network + preflight -->
+  <section class="step" data-step="4" hidden>
+    <h2>Step 4 · Network &amp; preflight</h2>
+    <div class="f"><label for="tor_proxy">Tor proxy</label><input id="tor_proxy" value="socks5h://127.0.0.1:9050"></div>
+    <div class="f"><label for="rpc_primary">Wallet RPC</label><input id="rpc_primary" value="http://127.0.0.1:18083"></div>
+    <div class="f"><label for="rpc_daemon">Daemon RPC</label><input id="rpc_daemon" value="http://127.0.0.1:18081"></div>
+    <div class="f"><label for="wallet_file">Wallet file</label><input id="wallet_file" value="offline.wallet"></div>
+    <div id="pwnote" class="warnbox"></div>
+    <div id="pfstatus" class="pfbox"></div>
+    <div class="pfbtns">
+      <button id="pfdetect" class="pfre" type="button">Detect Tor port</button>
+      <button id="pfstart" class="pfre" type="button">Start Tor</button>
+      <button id="pfre" class="pfre" type="button">re-run preflight now</button>
+    </div>
+    <p class="lead" style="margin-top:14px">Run the manual checks for detail (they change nothing):</p>
+    <div class="stepacts" data-acts="preflight_tor,preflight_egress,preflight_wallet,paranoia_dry"></div>
+    <div class="stepnav"><button class="bk" data-go="3">← Back</button><button class="nx" data-go="5">Next →</button></div>
+  </section>
+
+  <!-- STEP 5 — review + run -->
+  <section class="step" data-step="5" hidden>
+    <h2>Step 5 · Review &amp; run</h2>
+    <div class="subhead"><span>Command that will run</span><span class="mut-s">composed on the server</span></div>
+    <pre class="prev" id="prev">…</pre>
+    <ul class="probs" id="probs"></ul>
+    <div class="arm" id="armbox" style="display:none">
+      <p><strong>This moves funds.</strong> It signs and broadcasts real transactions. The OPSEC
+      preflight (step 4) must pass — it is re-verified on the server when you run, so it cannot be
+      skipped. Type <strong id="armword"></strong> to arm.</p>
+      <input id="arm" placeholder="type to arm" autocomplete="off">
+    </div>
+    <div class="stepacts" data-acts="run_pipeline" style="margin-top:12px"></div>
+    <details class="adv"><summary>Developer tools (tests &amp; wipe preview)</summary>
+      <div class="stepacts" data-acts="units,integration,ipleak,leakaudit,compile" style="margin-top:10px"></div>
+    </details>
+    <div class="stepnav"><button class="bk" data-go="4">← Back</button><span></span></div>
+  </section>
+</div>
+
+<div class="rightcol">
+  <div class="panel">
+    <div class="pbar"><span class="pt" id="pt">Nothing running</span>
+      <span class="pill" id="ppill" style="display:none"></span><span class="pm" id="pm"></span>
+      <span class="pacts"><button id="stop" class="stop">Stop</button><button id="copy">Copy</button></span></div>
+    <div id="out"><div class="idle">Follow the steps on the left. Output from any action shows here.</div></div>
+  </div>
+</div>
+</div></div><script>
+const A=__ACTIONS__, ARM=__ARM__, PWSET=__PWSET__, TOK=__TOKEN__;
+const HDR={'Content-Type':'application/json','X-GS-Token':TOK};
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+let cur=null,timer=null,mode='send',preset='balanced',armed=false;
+
+const PRESETS={
+ paranoid:{wallets:10,deep:2,dag_mixing:true,peel:true,fee_priority:3,clearnet:false,
+      note:'MAXIMUM SAFETY — the two strongest layers COMBINED. First a PEELING CHAIN: ~10 destinations plus a few decoys are each sent as their OWN transaction, spending the previous change, so nothing is ever co-created in a fan-out an analyst could cluster. THEN a DAG hop round mixes those outputs a second time. Clearnet relay forced OFF, highest priority. By far the SLOWEST — every peel AND every hop waits ~10 blocks, so many hours. Use for high-value sends where time is no object.'},
+ peel:{wallets:8,deep:1,dag_mixing:false,peel:true,fee_priority:2,clearnet:false,
+      note:'PEELING CHAIN ONLY (no second DAG round). ~8 destinations plus decoys are sent ONE TRANSACTION AT A TIME, each spending the previous change — no co-created fan-out. Strong graph unlinkability and faster than Maximum safe (one round, not two), but without the extra hop layer. Every peel waits ~10 blocks (~hours).'},
+ churn:{wallets:20,deep:6,dag_mixing:true,fee_priority:2,clearnet:false,
+      note:'DEEP CHURN. 20 subaddresses at maximum depth 6 — the longest hop chains, so the funds cross the most intermediate outputs before they settle. Emphasises trail length over breadth; slowest to finish.'},
+ max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,clearnet:false,
+      note:'25 subaddresses, depth 3, DAG hops on, priority 3, clearnet relay off. Wide anonymity set.'},
+ balanced:{wallets:12,deep:2,dag_mixing:true,fee_priority:2,clearnet:false,
+      note:'12 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts.'},
+ lowfee:{wallets:8,deep:2,dag_mixing:true,fee_priority:1,clearnet:false,
+      note:'8 subaddresses, depth 2, DAG hops on, priority 1 (cheapest fees). Real mixing on a budget — fewer hops means lower total fees, worth it for smaller amounts where fees would otherwise eat the balance.'},
+ fast:{wallets:3,deep:1,dag_mixing:false,fee_priority:1,clearnet:false,
+      note:'3 subaddresses, depth 1, no DAG round, priority 1. Fan-out only — least mixing, cheapest, no confirmation wait. Weakest privacy.'}};
+
+function applyPreset(p){
+ preset=p; const c=PRESETS[p];
+ $('#wallets').value=c.wallets; $('#deep').value=c.deep;
+ $('#dag_mixing').checked=c.dag_mixing; setFee(c.fee_priority);
+ // peel defaults OFF unless the preset asks for it, so switching away from the
+ // peel preset clears it rather than silently leaving the slow mode on.
+ $('#peel').checked=!!c.peel;
+ // Every preset leaves clearnet relay OFF — a preset should never quietly
+ // widen the IP exposure, and turning it on is a deliberate per-run override.
+ if('clearnet' in c) $('#allow_clearnet_relay').checked=c.clearnet;
+ $('#preset-note').textContent=c.note;
+ $$('#presets button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.p===p)));
+ sync();
+}
+$$('#presets button').forEach(b=>b.addEventListener('click',()=>applyPreset(b.dataset.p)));
+
+let feePriority=2, feeData=null;
+function renderFees(){
+ const names=['1 · default','2 · elevated','3 · priority','4 · flash'];
+ // feeData.xmr is null whenever the daemon could not supply an estimate --
+ // the console shows no number rather than a made-up one, so this must not
+ // assume an array. Indexing it blindly used to throw and kill the panel.
+ const vals=(feeData && Array.isArray(feeData.xmr))?feeData.xmr:null;
+ const imp=!!(feeData&&feeData.implausible);
+ $('#fees').innerHTML=names.map((n,i)=>`<button class="fee${imp?' imp':''}" data-p="${i+1}" aria-pressed="${feePriority===i+1}">
+   <div class="p">${esc(n)}</div><div class="v">${vals?esc(vals[i])+' XMR':'<span class="noest">no estimate</span>'}</div></button>`).join('');
+ $$('.fee').forEach(b=>b.addEventListener('click',()=>{setFee(+b.dataset.p);sync();}));
+ if(!feeData){$('#fsrc').textContent='loading…';return;}
+ $('#fsrc').innerHTML=(vals?'estimate per ~2 kB tx · ':'')+esc(feeData.source)
+   +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'')
+   +(vals?'':`<div style="margin-top:7px"><button id="dfind" class="pfre" type="button">Find my daemon</button></div>`);
+ const df=$('#dfind'); if(df) df.addEventListener('click',detectDaemon);
+}
+// "No estimate" almost always means the daemon field points somewhere nothing
+// is listening. Probe the usual loopback ports instead of making the operator
+// guess which one their node uses.
+async function detectDaemon(){
+ const b=$('#dfind'); if(b){b.disabled=true;b.textContent='looking…';}
+ let r=null;
+ try{ r=await fetch('/api/detect-daemon',{method:'POST',headers:HDR,
+   body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'lookup failed: '+e}; }
+ if(r&&r.ok&&r.daemon){ $('#rpc_daemon').value=r.daemon; await loadFees(); return; }
+ if(b){b.disabled=false;b.textContent='Find my daemon';}
+ $('#fsrc').innerHTML=esc((r&&r.detail)||'no daemon found');
+}
+function setFee(p){feePriority=p;renderFees();}
+async function loadFees(){
+ feeData=await fetch('/api/fees',{method:'POST',headers:HDR,
+   body:JSON.stringify({params:collect()})}).then(r=>r.json()).catch(()=>null);
+ renderFees();
+}
+
+function setMode(m){
+ mode=m;
+ $$('#mode button').forEach(o=>o.setAttribute('aria-pressed',String(o.dataset.m===m)));
+ $('#send-fields').hidden = mode!=='send';
+ $('#recv-fields').hidden = mode!=='receive';
+ $('#lbl2').textContent = mode==='send' ? 'Payment' : 'Receive';
+ $('#h2-2').textContent = mode==='send' ? 'Step 2 · Payment' : 'Step 2 · Receive';
+ sync();
+}
+$$('#mode button').forEach(b=>b.addEventListener('click',()=>setMode(b.dataset.m)));
+
+// Deliberately sends NO subaddress label. One used to be hardcoded in the
+// returned object, so every receive subaddress the GUI created was tagged with
+// the tool's own name -- in the wallet file, the one artifact paranoia_mode
+// never deletes. See the make_receive action for the full reasoning.
+function collect(){
+ const v=id=>$('#'+id)?.value.trim()||'';
+ const c=id=>!!$('#'+id)?.checked;
+ return {mode, btc_entry:v('btc_entry'), btc_amount:v('btc_amount'),
+  receive_wallet:v('receive_wallet'), pairs_file:v('pairs_file'),
+  swap_btc:v('swap_btc'), split:+v('split')||1,
+  wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
+  dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
+  allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),
+  rpc_primary:v('rpc_primary'), rpc_daemon:v('rpc_daemon'),
+  wallet_file:v('wallet_file'),
+  // Split on any whitespace/comma so paste-from-anywhere works. The server
+  // re-validates every entry against XMR_RE and drops unknown keys, so this
+  // is convenience only -- it is not the check.
+  exit_to:($('#exit_to')?.value||'').split(/[\s,]+/).filter(Boolean)};
+}
+
+// ── NON-NEGOTIABLE OPSEC preflight ─────────────────────────────────────────
+// Auto-runs on load and whenever the network config changes; the spend button
+// is disabled until it passes, and the SERVER re-verifies it on run so a
+// crafted request cannot skip it. Tor exit + relay egress are the leak-critical
+// facts, verified live rather than trusted.
+let preflightOk=false, pfBusy=false, pfSeq=0;
+function renderPreflight(r){
+ const c=(r&&r.checks)||{};
+ // THREE states. A check that passed the SPEND GATE is not necessarily a check
+ // that VERIFIED anything: an unknown relay egress permits the spend (matching
+ // the pipeline) but has established nothing, and an overridden clearnet egress
+ // permits it while the measurement says the opposite. Both used to render as a
+ // green tick reading "Relay egress not clearnet".
+ const head=!r||!r.ok
+  ? `<div class="pfhead bad">✕ OPSEC preflight FAILED — spend blocked until fixed</div>`
+  : (r.warn
+     ? `<div class="pfhead warn">! OPSEC preflight passed WITH WARNINGS — read them before spending</div>`
+     : `<div class="pfhead ok">✓ OPSEC preflight passed — spend permitted</div>`);
+ // The label comes from the SERVER, per verdict, so the page cannot assert a
+ // fact the check did not establish.
+ const row=k=>{const v=c[k]; if(!v) return '';
+  const st=v.state||(v.ok?'ok':'fail');
+  const mark=st==='ok'?'✓':(st==='warn'?'!':'✕');
+  return `<div class="pfrow ${st}"><span>${mark} ${esc(v.label||k)}</span>`
+    +`<span class="pfd">${esc(v.detail||'')}</span></div>`;};
+ $('#pfstatus').innerHTML=head+row('tor')+row('egress')+row('deps');
+}
+async function runPreflight(){
+ if(pfBusy) return; pfBusy=true; const seq=++pfSeq;
+ $('#pfstatus').innerHTML='<div class="pfhead run">⟳ running OPSEC preflight (verifying Tor + relay egress)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/preflight',{method:'POST',headers:HDR,
+      body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,checks:{tor:{ok:false,detail:'preflight request failed: '+e}}}; }
+ pfBusy=false;
+ if(seq!==pfSeq) return;            // a newer preflight superseded this one
+ preflightOk=!!(r&&r.ok); renderPreflight(r); sync();
+}
+// Find the Tor SOCKS port automatically (9050 tor.exe / 9150 Tor Browser) and
+// fill it in, so the operator never has to know which one their Tor uses.
+let detectBusy=false;
+async function detectTor(silent){
+ if(detectBusy) return; detectBusy=true;
+ const btn=$('#pfdetect'); if(btn){btn.disabled=true;btn.textContent='Detecting Tor…';}
+ if(!silent) $('#pfstatus').innerHTML='<div class="pfhead run">⟳ probing Tor ports (9050, 9150)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/detect-tor',{method:'POST',headers:HDR,
+      body:JSON.stringify({params:collect()})}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'detect request failed: '+e}; }
+ if(btn){btn.disabled=false;btn.textContent='Detect Tor port';}
+ detectBusy=false;
+ if(r&&r.ok&&r.proxy){
+  $('#tor_proxy').value=r.proxy;      // fill the working proxy
+  await runPreflight();               // and re-verify with it
+  return true;
+ }
+ if(!silent) $('#pfstatus').innerHTML=
+   `<div class="pfhead bad">✕ ${esc((r&&r.detail)||'no Tor proxy found')}</div>`;
+ return false;
+}
+// Start an INSTALLED Tor daemon (never downloads). Blocks while tor bootstraps.
+let startBusy=false;
+async function startTor(){
+ if(startBusy) return; startBusy=true;
+ const btn=$('#pfstart'); if(btn){btn.disabled=true;btn.textContent='Starting Tor…';}
+ $('#pfstatus').innerHTML='<div class="pfhead run">⟳ starting Tor (this can take up to a minute while it bootstraps)…</div>';
+ let r=null;
+ try{ r=await fetch('/api/start-tor',{method:'POST',headers:HDR,body:'{}'}).then(x=>x.json()); }
+ catch(e){ r={ok:false,detail:'start request failed: '+e}; }
+ if(btn){btn.disabled=false;btn.textContent='Start Tor';}
+ startBusy=false;
+ if(r&&r.ok&&r.proxy){ $('#tor_proxy').value=r.proxy; await runPreflight(); return; }
+ $('#pfstatus').innerHTML=`<div class="pfhead bad">✕ ${esc((r&&r.detail)||'could not start Tor')}</div>`;
+}
+// Debounce so editing a network field doesn't fire a Tor check per keystroke.
+let pfTimer=null;
+function schedulePreflight(){ preflightOk=false; sync();
+ clearTimeout(pfTimer); pfTimer=setTimeout(runPreflight,600); }
+
+async function sync(){
+ const r=await fetch('/api/preview',{method:'POST',headers:HDR,
+   body:JSON.stringify({params:collect()})}).then(r=>r.json());
+ $('#prev').textContent=r.pretty;
+ $('#probs').innerHTML=r.problems.map(p=>`<li>${esc(p)}</li>`).join('');
+ const ok=!r.problems.length;
+ $('#armbox').style.display=ok?'':'none';
+ const btn=document.querySelector('.act[data-id="run_pipeline"]');
+ // Spend requires: valid params, armed, AND a passing preflight. Any one
+ // missing keeps it disabled. The server enforces the preflight again on run.
+ if(btn) btn.disabled=!(ok&&armed&&preflightOk)||!!cur;
+}
+// Network/OPSEC fields re-trigger the preflight; everything else just re-syncs.
+const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
+$$('input,select').forEach(el=>el.addEventListener('input',()=>{
+ if(el.id==='arm') return;
+ if(PF_FIELDS.has(el.id)) schedulePreflight(); else sync();
+}));
+$('#pfre').addEventListener('click',runPreflight);
+$('#pfdetect').addEventListener('click',()=>detectTor(false));
+$('#pfstart').addEventListener('click',startTor);
+$('#arm').addEventListener('input',e=>{armed=e.target.value.trim()===ARM;sync();});
+$('#armword').textContent=ARM;
+$('#pwnote').innerHTML=PWSET
+ ? 'Wallet password found in <code>GS_WALLET_PASSWORD</code> — forwarded only to the signing child, never shown here.'
+ : 'No <code>GS_WALLET_PASSWORD</code> set. If your wallet has a password, restart the console with it exported — it is never accepted through this page.';
+
+// SAY WHAT THE EXIT FIELD WILL DO, as it is typed. Whether the run ends with
+// the money withdrawn or sitting on the wallet is the single most consequential
+// thing on this page, and leaving it empty is a legitimate choice -- so it must
+// read as a stated outcome rather than an unnoticed default.
+function syncExitNote(){
+ const box=$('#exitnote'); if(!box) return;
+ const raw=($('#exit_to')?.value||'').split(/[\s,]+/).filter(Boolean);
+ const uniq=[...new Set(raw)];
+ const bad=uniq.filter(a=>!/^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/.test(a));
+ box.hidden=false;
+ if(!raw.length){
+  box.innerHTML='<b>No exit set.</b> The mix will run and the funds will stay on '
+   +'this wallet, spread across the run\'s accounts. Nothing is withdrawn. '
+   +'Spend them one account at a time if you move them by hand.';
+ } else if(bad.length){
+  box.innerHTML='<b>'+bad.length+' address(es) are not a valid Monero format.</b> '
+   +'The run will refuse them before it starts: '+esc(bad[0].slice(0,16))+'…';
+ } else if(uniq.length<raw.length){
+  box.innerHTML='<b>A destination is repeated.</b> Repeating spreads the '
+   +'withdrawal, it does not send more to one place — the run will refuse it.';
+ } else if(uniq.length===1){
+  box.innerHTML='<b>All outputs go to ONE address.</b> Each still leaves in its '
+   +'own transaction, but a single destination re-joins them off-chain. Add more '
+   +'addresses to spread the withdrawal.';
+ } else {
+  box.innerHTML='<b>Exit armed: '+uniq.length+' destinations.</b> Every output '
+   +'is withdrawn in its own transaction, spread across them.';
+ }
+}
+$('#exit_to')?.addEventListener('input',syncExitNote);
+syncExitNote();
+
+// One grouped GRID, not a card per group. Group order is fixed so the board
+// reads Preflight -> Receive -> Pipeline -> Verify regardless of dict order.
+// Render each action into the wizard step that declares it via data-acts, so
+// buttons live in context (make receive in step 2, checks in step 4, run in
+// step 5) instead of one long grid. Server-composed argv + gates are unchanged.
+function actButton(id){
+ const a=A[id]; if(!a) return '';
+ return `<button class="act ${a.risk}" data-id="${id}" ${a.risk==='spends'?'disabled':''}>
+   <span class="top"><span class="dot" id="dot-${id}"></span><span class="nm">${esc(a.label)}</span>
+    <span class="go">${a.risk==='spends'?'Spends':'Run'}</span></span>
+   <span class="ds">${esc(a.desc)}</span></button>`;
+}
+$$('.stepacts').forEach(box=>{
+ box.classList.add('ops');
+ const ids=(box.dataset.acts||'').split(',').map(s=>s.trim()).filter(Boolean);
+ box.innerHTML=ids.map(actButton).join('');
+});
+$$('.act').forEach(b=>b.addEventListener('click',()=>run(b.dataset.id)));
+
+// ── step navigation ────────────────────────────────────────────────────────
+let step=1;
+function showStep(n){
+ step=Math.max(1,Math.min(5,n));
+ $$('.step').forEach(s=>{s.hidden = +s.dataset.step!==step;});
+ $$('#stepbar li').forEach(li=>{
+  const s=+li.dataset.s;
+  li.classList.toggle('on', s===step);
+  li.classList.toggle('done', s<step);
+ });
+ window.scrollTo({top:0,behavior:'smooth'});
+}
+$$('.nx,.bk').forEach(b=>b.addEventListener('click',()=>showStep(+b.dataset.go)));
+$$('#stepbar li').forEach(li=>li.addEventListener('click',()=>showStep(+li.dataset.s)));
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function colour(l){
+ const e=esc(l);
+ if(/FAIL|LEAK |\bERROR\b|Traceback|CLEARNET|\[!\].*(?:leak|refus|abort)/i.test(l)) return `<span class="r">${e}</span>`;
+ if(/RESULT:|ALL GREEN|SUCCESS|NO LEAKS|\[\+\]/.test(l)) return `<span class="g">${e}</span>`;
+ if(/\[!\]|WARN|SKIP/.test(l)) return `<span class="y">${e}</span>`;
+ if(/^\s*\[\*\]|^===/.test(l)) return `<span class="d">${e}</span>`;
+ return e;
+}
+async function run(id){
+ if(cur) return;
+ $$('.act').forEach(b=>b.disabled=true);
+ $('#dot-'+id).className='dot run';
+ $('#pt').textContent=A[id].label;
+ $('#ppill').style.display='';$('#ppill').className='pill run';$('#ppill').textContent='running';
+ $('#out').innerHTML='<pre class="out" id="pre"></pre>';
+ const res=await fetch('/run/'+id,{method:'POST',headers:HDR,
+   body:JSON.stringify({params:collect(),arm:armed?ARM:''})}).then(r=>r.json());
+ if(res.error){
+   $('#pre').innerHTML=`<span class="r">${esc(res.error)}</span>`;
+   $('#ppill').className='pill err';$('#ppill').textContent='refused';
+   $('#dot-'+id).className='dot err';
+   $$('.act').forEach(b=>b.disabled=false); sync(); return;
+ }
+ cur={jid:res.jid,id}; timer=setInterval(poll,400); poll();
+}
+async function poll(){
+ if(!cur) return;
+ const j=await fetch('/job/'+cur.jid,{headers:{'X-GS-Token':TOK}}).then(r=>r.json());
+ const pre=$('#pre');
+ if(pre){const stick=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-40;
+  pre.innerHTML=j.lines.map(colour).join('\n'); if(stick)pre.scrollTop=pre.scrollHeight;}
+ $('#pm').textContent=j.lines.length+' lines'+(j.elapsed?' · '+j.elapsed+'s':'');
+ if(j.done){clearInterval(timer);timer=null;
+  const ok=j.rc===0;
+  $('#ppill').className='pill '+(ok?'ok':'err');
+  $('#ppill').textContent=ok?'ok':'exit '+j.rc;
+  $('#dot-'+cur.id).className='dot '+(ok?'ok':'err');
+  cur=null; $$('.act').forEach(b=>b.disabled=false); sync();}
+}
+$('#stop').addEventListener('click',()=>{if(cur)fetch('/stop/'+cur.jid,{method:'POST',headers:HDR,body:'{}'});});
+$('#copy').addEventListener('click',()=>{const p=$('#pre');if(p)navigator.clipboard?.writeText(p.innerText);});
+
+setMode('send'); showStep(1); applyPreset('balanced'); loadFees(); sync();
+// On load, auto-detect the Tor port (silent); detectTor re-runs preflight when
+// it finds one, otherwise fall through to a normal preflight on the default.
+detectTor(true).then(found=>{ if(!found) runPreflight(); });
+$('#rpc_daemon').addEventListener('change',loadFees);
+</script></body></html>"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="GhostSpiral operator console")
+    ap.add_argument("--port", type=int, default=8765)
+    a = ap.parse_args()
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)      # loopback ONLY
+    print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}")
+    print( "  ^ open THIS url — the token is required, and it changes every run")
+    print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'")
+    print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopped")
+
+
+if __name__ == "__main__":
+    main()

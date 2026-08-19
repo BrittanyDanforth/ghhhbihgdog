@@ -1,7 +1,18 @@
 requests>=2.28
+# REQUIRED for socks5h:// proxying. Without it every Tor-routed request raises
+# InvalidSchema("Missing dependencies for SOCKS support") -- requests cannot
+# speak SOCKS on its own, so the whole toolchain refuses to run. It was missing
+# from this list, which meant a clean install could not use Tor at all.
+PySocks>=1.7.1
 tenacity>=8.0
 stem>=1.8
 monero>=0.8
 psutil>=5.9
 python-gnupg>=0.5
 PyYAML>=6.0
+# Dev/test only: the suite runs pyflakes over every shipped tool to prove no
+# undefined names. Coverage measured 214 warning/abort lines that no test ever
+# executes, so a NameError in one of them is invisible to the suite -- a static
+# check over all of them is the only realistic guarantee. The check SKIPS if
+# this is absent rather than failing.
+pyflakes>=3.0

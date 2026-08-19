@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""
+receive_watch - GhostSpiral companion: watch a receive address until paid
+=========================================================================
+Closes the one manual gap in the receiver flow. create_receive_wallet prints
+"3. Wait for sender's BTC to arrive and ThorChain to convert to XMR" and then
+leaves the operator refreshing something by hand. This waits for them, tells
+them when the money is really theirs, and then asks what to do with it.
+
+    receive_watch --receive-wallet wallet_ab12.json --pairs thor_pairs.json \
+                  --tor-proxy socks5h://127.0.0.1:9050
+
+WHAT IT WATCHES, AND WHY THAT SIDE
+----------------------------------
+The sender pays BITCOIN, so the obvious design is to watch the BTC deposit
+address. This tool deliberately does NOT, and will not be extended to:
+
+  * Asking mempool.space / blockstream / any explorer "has this address been
+    paid?" tells a party that did not previously know it that SOMEONE cares
+    about that address, at that moment, repeatedly, for as long as you wait.
+    Tor hides who is asking; it does not un-ask the question. The polling
+    pattern itself then times the arrival for that party.
+  * The BTC leg is not the event that matters anyway. BTC landing in a
+    ThorChain vault is not money you control -- the swap can still fail, be
+    refunded, or under-deliver. The event worth waiting for is XMR arriving,
+    confirmed and unlocked, on YOUR subaddress.
+
+So the watch runs entirely against YOUR OWN monero-wallet-rpc: the balance of
+one subaddress of a wallet you already hold. On the normal localhost setup
+that is a loopback socket and reaches no third party at all; the daemon behind
+it syncs over Tor exactly as it already did. Watching therefore adds ZERO new
+disclosure to anyone -- which is the only reason it is safe to poll for hours.
+
+The swap provider is a different case: it already created the BTC-deposit ->
+XMR-destination binding and cannot un-know it, so asking it about your own
+swap discloses nothing new. That is still not done here, because it is not
+needed -- the XMR side answers the question authoritatively.
+
+OPSEC hardening:
+  - Tor verified ONCE at start, never per poll (a check.torproject.org request
+    on every tick would be a far louder pattern than the thing being watched)
+  - Poll interval JITTERED, so a remote/observed RPC sees no fixed heartbeat
+  - Amounts never enter the integrity log (they are the most linkable value in
+    the whole pipeline); only state transitions are chained
+  - Addresses scrubbed in the log; printed in full to the terminal, because
+    the operator has to read them to use them
+  - Spends NOTHING, ever. It reports and prints the command it would suggest;
+    arming and running a spend stays where the rest of the toolchain puts it.
+"""
+from __future__ import annotations
+import argparse, json, secrets, shlex, sys, time
+from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
+
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, connect_rpc,
+    install_signal_handlers, shutdown_requested, scrub_address,
+    load_receive_bundle, RECEIVE_SCHEMA, memo_binds_destination,
+    env_or_argv, decimal_arg,
+)
+
+ATOMIC = Decimal("1000000000000")          # piconero per XMR
+PAIR_SCHEMA = "thor_pairs_v1"
+
+# Poll cadence. A fixed interval is a heartbeat an observer of a remote RPC can
+# lock onto, so the wait is jittered inside this band rather than ticking.
+POLL_MIN_S = 45
+POLL_MAX_S = 90
+
+# How long the balance may sit unchanged, AFTER something has arrived, before
+# we stop assuming more is coming. A swap that under-delivers (slippage, a
+# partial fill, a fee taken off the top) otherwise leaves the operator waiting
+# forever for a number that is never going to arrive.
+STALL_MINUTES_DEFAULT = 30
+
+#: How long the scan height may have been static before "the wallet is still
+#: following the chain" stops being a claim this tool is entitled to make.
+#:
+#: A healthy wallet sees a block every couple of minutes. The `not_syncing`
+#: verdict needs the height frozen for a FULL stall window, which is right --
+#: but the balance-stall timer starts when the money ARRIVES while the height
+#: timer restarts on the last block seen, so a wallet that dies shortly after
+#: the payment trips the balance branch first and used to be reported as
+#: sync="ok": "your wallet last scanned a new block 29 min ago, SO IT IS STILL
+#: FOLLOWING THE CHAIN -- this looks like the swap paying short". The advice
+#: that follows is to accept less money, and the very next line already
+#: admitted "29 min ago is a long gap though". It asserted a cause and
+#: contradicted it two lines later.
+#:
+#: Between this and a full window the honest answer is that the cause is
+#: undetermined, so the verdict is "stale" and the caller names neither cause.
+LIVENESS_DOUBT_S = 600
+
+# ── what counts as MONEY ARRIVING, as opposed to noise ─────────────────────
+#
+# Four separate decisions in watch() used to read "any non-zero balance" as
+# "the payment": setting seen_any, restarting the no-more-is-coming timer,
+# deciding something is still confirming, and firing --any. The receive
+# address is not a secret -- the swap memo names it in plaintext and the
+# sender puts that memo in a Bitcoin OP_RETURN -- so anyone reading the BTC
+# chain, the swap provider included, can send to it. One piconero was enough
+# to make the tool assert "the swap paid short" when nothing had arrived, and
+# a piconero every 25 minutes held the shortfall verdict off for a full day.
+#
+# The floor below is not a magic number, it is "an amount that cannot even pay
+# to move itself". A Monero output smaller than the fee needed to spend it is
+# not money the operator can act on -- mixing it costs more than it is worth --
+# so treating it as an arrival is wrong independently of any attacker. A
+# typical mainnet fee at default priority is a few times 1e-5 XMR; 5e-4 sits
+# comfortably above that and far below any real swap (ThorChain's own BTC->XMR
+# minimums are orders of magnitude larger).
+DUST_FLOOR_XMR = Decimal("0.0005")
+
+# ...and scaled for large swaps, so the attack does not simply get more
+# expensive-but-still-cheap as the amount grows. 0.1% of a 1000 XMR swap is
+# 1 XMR: an attacker must now spend real money to move the verdict.
+#
+# Erring HIGH is the safe direction here. Too high only delays a verdict --
+# the watch keeps waiting and the operator loses nothing. Too low produces a
+# CONFIDENT WRONG ANSWER about someone's money, which is the failure this
+# whole tool exists to avoid.
+ARRIVAL_FRACTION_OF_TARGET = Decimal("0.001")
+
+
+def arrival_floor(target: Decimal, override: Decimal = None) -> Decimal:
+    """The smallest balance this watch will treat as the payment arriving."""
+    if override is not None:
+        return override
+    if target > 0:
+        return max(DUST_FLOOR_XMR, target * ARRIVAL_FRACTION_OF_TARGET)
+    return DUST_FLOOR_XMR
+
+
+def to_xmr(atomic: int) -> Decimal:
+    """Atomic units -> XMR, truncated at 12dp (never rounded up: this number is
+    shown as 'you have', and rounding money up is how a plan is built on funds
+    that are not there)."""
+    return (Decimal(int(atomic)) / ATOMIC).quantize(Decimal("0.000000000001"),
+                                                    rounding=ROUND_DOWN)
+
+
+def load_pairs(path: str) -> list:
+    """Load a thor_pairs_v1 bundle (the list thor_swap_preparer writes)."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"pairs bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise ValueError(f"pairs bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, list) or not d:
+        raise ValueError("pairs bundle must be a non-empty JSON list")
+    for entry in d:
+        if not isinstance(entry, dict) or entry.get("schema") != PAIR_SCHEMA:
+            raise ValueError(f"every pair must carry schema {PAIR_SCHEMA}")
+    return d
+
+
+def pairs_for_dest(pairs: list, dest_addr: str) -> list:
+    """Only the pairs actually routed to THIS receive address.
+
+    A pairs file can hold several swaps to several destinations. Summing all of
+    them would set a target this subaddress is never going to reach, and the
+    watch would run until timeout on a payment that already completed.
+    """
+    return [p for p in pairs if p.get("dest_xmr") == dest_addr]
+
+
+def expected_total(pairs: list) -> tuple:
+    """Sum of quoted XMR output. Returns (total, n_unreadable).
+
+    An unreadable or zero quote used to be counted as 0 and never mentioned
+    again, on the grounds that thor_swap_preparer had already warned at quote
+    time -- a warning from a different run, hours earlier, on a different
+    screen. The effect: three swaps whose second and third quotes are
+    unreadable produce a target of ONLY THE FIRST, so the watch reports "PAID"
+    and offers to mix when one third of the money has arrived, and the operator
+    is never told the target was built from one pair out of three.
+
+    The count comes back so the caller can say so out loud. Deflating a target
+    silently is the one thing a tool that decides "has the money arrived?" must
+    not do.
+    """
+    tot = Decimal(0)
+    unreadable = 0
+    for p in pairs:
+        try:
+            v = Decimal(str(p.get("expected_xmr") or "0"))
+        except Exception:                                    # noqa: BLE001
+            v = Decimal(0)
+        if v > 0:
+            tot += v
+        else:
+            unreadable += 1
+    return tot, unreadable
+
+
+def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
+    """The amount at which we call the payment complete.
+
+    A swap essentially never delivers its quote to the digit -- the rate moves
+    between quote and execution and the network takes its cut. Waiting for the
+    exact quoted figure is waiting for something that will not happen, so the
+    gate sits a tolerance below it and the shortfall is shown honestly.
+    """
+    if target <= 0:
+        return Decimal(0)
+    if not (Decimal(0) <= tolerance < Decimal(1)):
+        raise ValueError("tolerance must be >= 0 and < 1")
+    return (target * (Decimal(1) - tolerance)).quantize(
+        Decimal("0.000000000001"), rounding=ROUND_DOWN)
+
+
+def poll_seconds(rng=None) -> int:
+    """A jittered poll interval inside [POLL_MIN_S, POLL_MAX_S]."""
+    r = rng or secrets.SystemRandom()
+    return r.randint(POLL_MIN_S, POLL_MAX_S)
+
+
+def fmt(x: Decimal) -> str:
+    """Render an XMR amount for a human.
+
+    str(Decimal) uses scientific notation for a quantized zero -- a balance of
+    nothing printed as "0E-12 XMR", which reads as a malfunction to someone
+    watching a payment they are anxious about. Fixed-point always, and trailing
+    zeros trimmed so 3.000000000000 shows as 3.
+    """
+    s = f"{x:f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def progress_line(unlocked: Decimal, total: Decimal, floor_: Decimal) -> str:
+    """One human line: what has landed, what is still locked, how far to go."""
+    pending = total - unlocked
+    if pending < 0:
+        pending = Decimal(0)
+    bits = [f"unlocked {fmt(unlocked)} XMR"]
+    if pending > 0:
+        bits.append(f"{fmt(pending)} still confirming")
+    if floor_ > 0:
+        remain = floor_ - unlocked
+        if remain > 0:
+            pct = (unlocked / floor_ * 100) if floor_ > 0 else Decimal(0)
+            bits.append(f"{fmt(remain)} to go ({pct.quantize(Decimal('0.1'))}%)")
+        else:
+            bits.append("target reached")
+    return " · ".join(bits)
+
+
+# ── what to do with it, once it is there ───────────────────────────────────
+# Kept in the same shape as the console's PRESETS, and asserted equal to them
+# by the test suite, so the menu can never drift into recommending a mix the
+# console would not actually run.
+CHOICES = [
+    {"key": "1", "id": "paranoid", "name": "Maximum safe (peel + DAG)",
+     "flags": {"wallets": 10, "deep": 2, "dag_mixing": True, "peel": True,
+               "fee_priority": 3},
+     "blurb": "Peeling chain first (one tx per destination, nothing co-created), "
+              "then a DAG hop round over those outputs. Strongest, slowest — hours."},
+    {"key": "2", "id": "peel", "name": "Peeling chain only",
+     "flags": {"wallets": 8, "deep": 1, "dag_mixing": False, "peel": True,
+               "fee_priority": 2},
+     "blurb": "One transaction per destination, each spending the previous "
+              "change. Strong graph unlinkability, one round instead of two."},
+    {"key": "3", "id": "balanced", "name": "Balanced",
+     "flags": {"wallets": 12, "deep": 2, "dag_mixing": True, "peel": False,
+               "fee_priority": 2},
+     "blurb": "12 subaddresses, depth 2, DAG hops on. Sensible for most amounts."},
+    {"key": "4", "id": "hold", "name": "Nothing yet — just leave it",
+     "flags": None,
+     "blurb": "The funds stay on the receive subaddress. Nothing is spent and "
+              "nothing is broadcast. Decide later."},
+]
+
+
+def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
+                      rpc_url: str = "") -> list:
+    """The exact argv for a chosen mix. Returns [] for the do-nothing choice.
+
+    Built as a list, never a string: it is printed for the operator to run, and
+    a quoted-string command is how a path with a space becomes two arguments.
+    """
+    f = choice.get("flags")
+    if not f:
+        return []
+    # Absolute path: this is the command the operator copies and runs, and a
+    # bare "GhostSpiral" only resolves if their shell happens to be sitting in
+    # the repo. Same reason the pipeline resolves its own children by path.
+    argv = [sys.executable,
+            str(Path(__file__).resolve().parent / "GhostSpiral"),
+            "--receive-wallet", receive_wallet,
+            "--tor-proxy", tor_proxy]
+    # Carry the endpoint this watch actually used. The docstring calls this
+    # "the exact argv for a chosen mix", but it omitted the RPC entirely:
+    # receive_watch resolves it from --rpc or the bundle's rpc_endpoint, while
+    # GhostSpiral falls back to its own default of 127.0.0.1:18083. An operator
+    # whose wallet-rpc is anywhere else got a command pointed at the wrong
+    # daemon -- from the tool that had just been talking to the right one.
+    if rpc_url:
+        argv += ["--rpc-primary", rpc_url]
+    argv += [
+            "--wallets", str(f["wallets"]),
+            "--deep", str(f["deep"]),
+            "--fee-priority", str(f["fee_priority"])]
+    if f.get("dag_mixing"):
+        argv.append("--dag-mixing")
+    if f.get("peel"):
+        argv.append("--peel")
+    return argv
+
+
+def format_mix_command(argv: list) -> str:
+    """Render an argv list as a line the operator can paste into a shell.
+
+    build_mix_command's own docstring says the command is "built as a list,
+    never a string" because "a quoted-string command is how a path with a space
+    becomes two arguments" -- and main() then printed " ".join(argv), producing
+    exactly that. Verified: with --receive-wallet '/home/op/My Wallets/w.json'
+    the printed line splits into '/home/op/My' plus a stray
+    'Wallets/w.json', so GhostSpiral is handed the wrong path and an unknown
+    positional. The care taken in building the list was thrown away by the one
+    place its output is consumed.
+
+    shlex.quote leaves ordinary paths untouched, so the common case still reads
+    as a plain command; only an argument that actually needs quoting gets it.
+    """
+    return " ".join(shlex.quote(str(a)) for a in argv)
+
+
+def render_choices() -> str:
+    out = ["", "  === THE MONEY IS YOURS. WHAT DO YOU WANT TO DO WITH IT? ===", ""]
+    for c in CHOICES:
+        out.append(f"  [{c['key']}] {c['name']}")
+        out.append(f"      {c['blurb']}")
+    return "\n".join(out)
+
+
+def choice_by_key(key: str):
+    for c in CHOICES:
+        if c["key"] == str(key).strip() or c["id"] == str(key).strip().lower():
+            return c
+    return None
+
+
+def _sleep_interruptible(secs) -> None:
+    """Sleep in short chunks so Ctrl-C is noticed within a couple of seconds.
+
+    The poll interval is 45-90s and the shutdown handler only sets a flag, so
+    an interrupt landed inside time.sleep() and — under PEP 475 — the sleep
+    RESUMED for its remaining duration after the handler returned. The banner
+    says "Ctrl-C is safe: nothing is pending, this only reads", which is true,
+    but the process still sat there for up to a minute and a half looking
+    ignored. broadcast_signed_xmr already sleeps in chunks for exactly this
+    reason; this is the same pattern, applied to its sibling.
+    """
+    waited = 0.0
+    while waited < secs:
+        if shutdown_requested():
+            return
+        chunk = min(2.0, secs - waited)
+        time.sleep(chunk)
+        waited += chunk
+
+
+def wallet_height(rpc):
+    """The wallet's own scanned height, or None if it cannot be read.
+
+    This exists because a frozen balance has TWO causes and they need opposite
+    responses. Verified against real monero-wallet-rpc 0.18.3.1 by killing the
+    daemon mid-poll: get_balance KEEPS ANSWERING, successfully, with the last
+    scanned value -- it does not raise, so the transient-error path in watch()
+    never fires -- while get_height stops advancing. From inside the balance
+    poll alone, "the swap sent no more money" and "my wallet stopped looking"
+    are the same picture.
+    """
+    try:
+        h = (rpc.raw_request("get_height", {}) or {}).get("height")
+        return int(h) if isinstance(h, int) and not isinstance(h, bool) else None
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
+          timeout_s: int, stall_s: int, sleep_fn=_sleep_interruptible,
+          clock=time.monotonic, rng=None, echo=print,
+          min_arrival: Decimal = DUST_FLOOR_XMR) -> dict:
+    """Poll one subaddress until it holds `floor_` unlocked XMR.
+
+    Returns a result dict rather than exiting, so the caller (and the tests)
+    can drive every outcome. Never raises on a transient RPC hiccup: a wallet
+    that is momentarily busy or resyncing is normal over a multi-hour wait, and
+    aborting the watch would lose the operator's place for no reason.
+
+    Outcomes: 'funded' (>= floor, unlocked), 'stalled' (money arrived, stopped
+    growing, and the wallet advanced at least one block inside the same window
+    -- so this is a shortfall rather than a stuck wallet), 'not_syncing' (the
+    height has not moved for a full window; says nothing about how much was
+    sent), 'timeout', 'interrupted'.
+
+    A 'stalled' result carries sync='ok'|'unknown' and, when 'ok',
+    last_scan_age_s -- how long ago the height last moved. Callers must report
+    that number rather than upgrade it to "the wallet kept scanning
+    throughout": one block inside the window satisfies the check, and the
+    advice that follows a shortfall is to accept less money.
+    """
+    started = clock()
+    seen_any = False
+    last_total = Decimal(-1)
+    last_unlocked = to_xmr(0)
+    last_change = started
+    ticks = 0
+    # The total as of the last MEANINGFUL move. Compared against this rather
+    # than against the previous tick, so a long run of sub-threshold increments
+    # that add up to a real amount still counts -- 58 dust drips of 0.0001 are
+    # 0.0058 XMR, and a naive `total - previous_tick >= min_arrival` test would
+    # never notice, which is exactly the hole the drip attack walks through.
+    marked_total = Decimal(0)
+    dust_reported = False
+    # WALLET LIVENESS, tracked continuously and independently of the balance.
+    #
+    # The first version of this sampled the height only at the last balance
+    # CHANGE and again at the stall check, then treated `h_now > h_at_change`
+    # as "the wallet kept scanning". That is satisfied by ONE block in thirty
+    # minutes -- a wallet that scanned a single block and then went blind for
+    # the rest of the window passed, and main() reported "your wallet has kept
+    # scanning throughout" and told the operator to accept less money.
+    # Demonstrated, on this code, before it was replaced.
+    #
+    # What is actually wanted is "the height moved RECENTLY", so track when it
+    # last moved and require that to be inside the same window used for the
+    # balance. A live wallet advances roughly every two minutes.
+    last_height = None
+    last_height_move = started
+    while True:
+        if shutdown_requested():
+            return {"state": "interrupted", "unlocked": last_unlocked,
+                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    "ticks": ticks}
+        try:
+            bal_atomic, unl_atomic = rpc.get_subaddress_balance(
+                account_index=account, address_index=sub_idx)
+        except Exception as e:                               # noqa: BLE001
+            # Transient by assumption: log the FACT, not the error text, and
+            # keep the place in the queue.
+            integrity_log("recv", "poll_error")
+            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:50]}); retrying.")
+            bal_atomic, unl_atomic = None, None
+
+        # Sample the height every tick, alongside the balance. One extra
+        # localhost RPC call per 45-90s poll; the wallet is already being asked
+        # for its balance on the same socket.
+        h_now = wallet_height(rpc)
+        if h_now is not None:
+            if last_height is None or h_now > last_height:
+                last_height = h_now
+                last_height_move = clock()
+
+        # THE WALLET-STOPPED-SCANNING CHECK, evaluated BEFORE and INDEPENDENTLY
+        # of any balance reasoning.
+        #
+        # It used to sit behind `not still_confirming`, so a wallet that froze
+        # during the ~10-block unlock window -- the twenty minutes right after
+        # the money lands, which is exactly when a watch is most likely to be
+        # running -- left `unlocked < total` true forever, the gate never
+        # opened, and the run went all the way to its 24-hour timeout with no
+        # diagnosis at all. Demonstrated on this code before it was moved.
+        # NOT gated on h_now. Whether the scan height has been frozen for a
+        # full window is decided by last_height_move, which needs no fresh
+        # sample -- and requiring one suppressed this verdict on exactly the
+        # ticks where the RPC was unhealthy. Control then fell through to the
+        # balance-stall branch, which returns sync="ok" and makes main() say
+        # "your wallet is still following the chain, so this looks like the
+        # swap paying short" about a wallet that had been dead for the whole
+        # window. Its recommended remedy is to re-run with --any and accept
+        # less money, so the false cause carries a costly fix.
+        #
+        # Reproduced: 2 XMR landed, wallet froze, get_height began raising --
+        # the exact asymmetry wallet_height's docstring exists for -- and the
+        # watch returned stalled/sync=ok with last_scan_age_s of 1740s.
+        #
+        # last_height is still required: without one successful read there is
+        # no baseline and "has not moved" means nothing.
+        if (last_height is not None
+                and (clock() - last_height_move) >= stall_s):
+            integrity_log("recv", "wallet_not_scanning")
+            return {"state": "not_syncing", "sync": "stuck",
+                    "unlocked": last_unlocked,
+                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    "ticks": ticks, "height": last_height}
+
+        if bal_atomic is not None:
+            total = to_xmr(bal_atomic)
+            unlocked = to_xmr(unl_atomic)
+            last_unlocked = unlocked
+            ticks += 1
+            if total != last_total:
+                last_total = total
+                # A MEANINGFUL increase is what "something arrived" means, and
+                # what restarts the no-more-is-coming timer. Any change at all
+                # used to do both: dust set seen_any (so a balance that never
+                # moved again was reported as "the swap paid short"), and a
+                # drip reset last_change forever (so the shortfall verdict
+                # could be suppressed for the whole 24 hours).
+                # `total > 0` FIRST. With --min-arrival 0 this read
+                # `0 >= 0 + 0` and fired on an EMPTY subaddress, so the very
+                # first tick set seen_any and the watch reported money that
+                # was never there. The neighbouring branch below already
+                # guards on `total > 0`; this one did not.
+                if total > 0 and total >= marked_total + min_arrival:
+                    marked_total = total
+                    last_change = clock()
+                    if not seen_any:
+                        seen_any = True
+                        integrity_log("recv", "first_funds_seen")
+                        echo("  [+] Something arrived. Waiting for it to "
+                             "confirm and unlock.")
+                elif total < marked_total:
+                    # Balance went DOWN (the operator spent from it, or a
+                    # reorg). Re-anchor so later arrivals are measured from
+                    # where things actually stand.
+                    marked_total = total
+                    last_change = clock()
+                elif total > 0 and not seen_any and not dust_reported:
+                    # Do not hide it. Something IS on the address; it is just
+                    # too small to be the payment being waited for.
+                    dust_reported = True
+                    integrity_log("recv", "sub_threshold_balance")
+                    echo(f"  [!] {fmt(total)} XMR is on this subaddress but that "
+                         f"is below the {fmt(min_arrival)} XMR arrival "
+                         f"threshold, so it is NOT being treated as the "
+                         f"payment. Anyone who has seen the swap memo can send "
+                         f"here; --min-arrival changes the threshold.")
+            echo(f"  [*] {progress_line(unlocked, total, floor_)}")
+
+            # Balance the wallet can SEE on this subaddress but that has not
+            # unlocked yet. A Monero output needs ~10 blocks, and a swap that
+            # arrives as two transactions has the second one sitting here for
+            # ~20 minutes after the first is spendable.
+            # `pending` stays the true figure for reporting; the DECISION
+            # uses the threshold. A single permanently-locked piconero used to
+            # pin `total > unlocked` true forever, which blocked the shortfall
+            # verdict just as effectively as the drip did.
+            pending = (total - unlocked) if total > unlocked else Decimal(0)
+            # `pending > 0` as well as the threshold. `pending >= min_arrival`
+            # alone is TRUE when both are zero, so with --min-arrival 0 nothing
+            # was ever "settled" and the shortfall verdict could never be
+            # reached -- the escape hatch silently broke the thing it was meant
+            # to restore. Caught by the real-binary control run, not by
+            # inspection.
+            still_confirming = pending > 0 and pending >= min_arrival
+
+            if floor_ > 0 and unlocked >= floor_:
+                # The target was met, so this IS the event -- but say what is
+                # still in flight. Mixing now spends only the unlocked part and
+                # leaves the rest sitting on the RECEIVE address, which is the
+                # one address the swap provider has already bound to a BTC
+                # payment. The caller prints this; it must not be silent.
+                integrity_log("recv", "funded")
+                return {"state": "funded", "unlocked": unlocked,
+                        "total": total, "pending": pending, "ticks": ticks}
+            # `unlocked > 0`: --any means any SETTLED balance, and its own
+            # warning promises a floor of "one piconero" -- not of nothing.
+            # With --min-arrival 0 this accepted an empty subaddress and main()
+            # printed "PAID: 0 XMR ... THE MONEY IS YOURS" on tick one.
+            if (floor_ <= 0 and unlocked > 0 and unlocked >= min_arrival
+                    and not still_confirming):
+                # --any: "any balance" has to mean any SETTLED balance.
+                #
+                # This fired on `unlocked > 0` alone, so a swap delivered as two
+                # transactions returned as soon as the FIRST unlocked -- while
+                # the wallet could already see the second on the same
+                # subaddress. Demonstrated: with 3.0 XMR visible and 0.5
+                # unlocked, --any reported "PAID: 0.5" and offered to mix. The
+                # 2.5 then stays on the receive address after the mix has
+                # already run: value stranded on a burned address, which is
+                # precisely what the mix exists to move it off.
+                #
+                # Nothing is lost by waiting -- the balance is already on-chain
+                # and the stall/timeout paths still bound the wait.
+                integrity_log("recv", "funded_any")
+                return {"state": "funded", "unlocked": unlocked,
+                        "total": total, "pending": Decimal(0), "ticks": ticks}
+            # "Stalled" means no MORE money is coming -- not that we are still
+            # waiting for what arrived to confirm. While unlocked < total there
+            # is balance in the confirmation pipeline, so calling that a
+            # shortfall would abandon a payment mid-confirmation.
+            if (seen_any and not still_confirming
+                    and (clock() - last_change) >= stall_s):
+                # Reaching here means the balance stopped moving AND the
+                # liveness check above did not fire, so the wallet has scanned
+                # within the last stall window. "No more is coming" is an
+                # established fact rather than a guess -- but only when the
+                # height was actually readable. When it never was, say so
+                # instead of picking the reassuring answer.
+                if last_height is None:
+                    integrity_log("recv", "stalled_sync_unknown")
+                    return {"state": "stalled", "sync": "unknown",
+                            "unlocked": unlocked, "total": total,
+                            "pending": pending, "ticks": ticks}
+                # Report HOW LONG AGO the wallet last advanced, and let the
+                # caller state that measured fact rather than a stronger one.
+                #
+                # The liveness threshold is deliberately the same window used
+                # for the balance, which means a wallet that last scanned just
+                # inside it -- 29 minutes ago, on a chain that produces a block
+                # every two -- is not flagged. That is the right threshold (a
+                # tighter one would cry wolf on a slow initial sync), but it
+                # does NOT support the sentence this used to produce: "your
+                # wallet has kept scanning throughout". One block inside the
+                # window satisfied that claim. Hand the caller the number and
+                # let it say what was actually measured.
+                _scan_age = int(clock() - last_height_move)
+                # "ok" only when the wallet demonstrably advanced RECENTLY. A
+                # height static for longer than LIVENESS_DOUBT_S has not
+                # established that the swap is the problem, so it does not get
+                # to say so.
+                _sync = "ok" if _scan_age <= LIVENESS_DOUBT_S else "stale"
+                integrity_log("recv", f"stalled_short:sync={_sync}")
+                return {"state": "stalled", "sync": _sync, "unlocked": unlocked,
+                        "total": total, "pending": pending, "ticks": ticks,
+                        "last_scan_age_s": _scan_age}
+
+        if (clock() - started) >= timeout_s:
+            integrity_log("recv", "timeout")
+            return {"state": "timeout",
+                    "unlocked": last_unlocked if seen_any else to_xmr(0),
+                    "total": last_total if last_total >= 0 else to_xmr(0),
+                    "ticks": ticks}
+        sleep_fn(poll_seconds(rng))
+
+
+def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> None:
+    """Re-print the BTC side: this is the 'receive address' the sender pays.
+
+    The memo binding is CHECKED AGAIN here, not trusted because
+    thor_swap_preparer checked it once.
+
+    The memo is the only thing routing the swap: the BTC goes to a shared
+    ThorChain inbound vault, and a memo naming someone else's XMR address
+    delivers the Monero to them, irreversibly. thor refuses to print such a
+    pair, and GhostSpiral's own swap stage refuses too -- but this tool read
+    the pairs JSON off disk hours later and re-printed whatever it found.
+    Between the two runs the file is an ordinary 0600 JSON that can be edited,
+    truncated or swapped, and this is the copy the operator actually pastes to
+    the sender. Validating in the tool that produces a value and not in the one
+    that hands it over is where this repo has been bitten repeatedly.
+
+    pairs_for_dest already matched on dest_xmr, but that is a different field:
+    an entry can name our address there while carrying a memo that routes
+    elsewhere.
+    """
+    if not matched:
+        return
+    if dest:
+        bad = [i for i, p in enumerate(matched)
+               if not memo_binds_destination(p.get("memo") or "", dest)]
+        if bad:
+            integrity_log("recv", f"memo_dest_mismatch:{len(bad)}")
+            sys.exit(
+                f"[!] {len(bad)} of {len(matched)} swap pair(s) carry a memo that does "
+                f"NOT name\n"
+                f"    your receive address {scrub_address(dest)}.\n"
+                f"    The memo is the only thing telling the network where to deliver "
+                f"the XMR,\n"
+                f"    so handing these to a sender could pay someone else and the "
+                f"payment is\n"
+                f"    irreversible. The pairs file has changed since "
+                f"thor_swap_preparer wrote it.\n"
+                f"    Re-run thor_swap_preparer rather than trusting this file.")
+    echo("")
+    echo("  ============================================================")
+    echo("  GIVE THIS TO THE BTC SENDER (this is the receive address):")
+    echo("  ============================================================")
+    for i, p in enumerate(matched):
+        echo(f"\n  --- Payment {i + 1} of {len(matched)} ---")
+        echo(f"  Send exactly: {p.get('btc_in')} BTC")
+        echo(f"  To address:   {p.get('deposit')}")
+        echo(f"  With memo:    {p.get('memo')}")
+        echo(f"  Expected XMR: ~{p.get('expected_xmr')}")
+    echo("")
+    echo("  The memo goes in the BTC transaction's OP_RETURN. Without it the")
+    echo("  swap is not routed to you. Quotes expire — the sender should pay")
+    echo("  promptly, or re-quote.")
+    echo("")
+    # SAME WARNING AS thor_swap_preparer, because this reprints the SAME
+    # values. thor gained an explicit disclosure block above its sender
+    # instructions; this tool re-prints the identical deposit address and memo
+    # -- and is the copy the operator actually has open while they message the
+    # sender, hours later, having long since scrolled thor's output away. A
+    # warning attached to only one of two identical outputs is a warning that
+    # is missed exactly when it matters.
+    echo("  The memo names your XMR address in plain text. Send it to the payer")
+    echo("  the way you would a password — never into a paste site, an issue, a")
+    echo("  support chat or a group thread. The swap provider already holds the")
+    echo("  BTC-payment-to-XMR-address link and cannot un-know it; posting the")
+    echo("  memo publicly turns a link one company has into one everybody has.")
+    echo("  Mixing afterwards hides what you do NEXT with the Monero. It cannot")
+    echo("  retract that link, so treat this receive address as burned: this one")
+    echo("  swap, then let the mix move the funds off it.")
+    echo("  ============================================================")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "receive_watch",
+        description="Watch a GhostSpiral receive subaddress until the payment "
+                    "lands, then choose what to do with it.")
+    ap.add_argument("--receive-wallet", required=True,
+                    help="gs_receive_wallet_v1 JSON from create_receive_wallet")
+    ap.add_argument("--pairs",
+                    help="thor_pairs_v1 JSON from thor_swap_preparer. Supplies the "
+                         "expected amount AND the BTC deposit address/memo to hand "
+                         "the sender.")
+    ap.add_argument("--expect-xmr", type=decimal_arg,
+                    help="target XMR to wait for; overrides the total from --pairs. "
+                         "Prefer GS_EXPECT_XMR=... : an argv amount is world-readable "
+                         "via ps and /proc/<pid>/cmdline (mode 444), and this process "
+                         "sits there for up to 24 hours advertising how much Monero "
+                         "is expected to arrive.")
+    ap.add_argument("--any", action="store_true",
+                    help="stop as soon as ANY unlocked balance appears, with no "
+                         "target amount")
+    ap.add_argument("--min-arrival", type=decimal_arg, default=None,
+                    help="smallest XMR balance treated as the payment arriving. "
+                         "Defaults to the larger of 0.0005 XMR and 0.1%% of the "
+                         "target. Anyone who has seen the swap memo knows this "
+                         "address and can send to it, so a balance below this is "
+                         "reported but not acted on. Lower it only for a "
+                         "genuinely tiny swap.")
+    ap.add_argument("--tolerance", type=decimal_arg, default=Decimal("0.10"),
+                    help="fraction under the target that still counts as paid, "
+                         "absorbing swap slippage (default 0.10 = accept 90%%)")
+    ap.add_argument("--timeout-min", type=int, default=1440,
+                    help="give up after this many minutes (default 1440 = 24h)")
+    ap.add_argument("--stall-min", type=int, default=STALL_MINUTES_DEFAULT,
+                    help="after funds arrive, how long the balance may sit "
+                         f"unchanged before reporting a shortfall (default {STALL_MINUTES_DEFAULT})")
+    ap.add_argument("--tor-proxy", required=True,
+                    help="socks5h://host:port — required, as everywhere else")
+    ap.add_argument("--rpc",
+                    help="monero-wallet-rpc endpoint (default: the one recorded "
+                         "in the receive bundle)")
+    ap.add_argument("--choice",
+                    help="answer the 'what now' question non-interactively "
+                         "(1-4, or paranoid/peel/balanced/hold). Still spends "
+                         "nothing — it prints the command.")
+    args = ap.parse_args()
+
+    # The expected amount is the same class of value as GS_SWAP_AMOUNTS,
+    # GS_BTC_AMOUNT and GS_EXIT_AMOUNT, and every sibling moved it off argv via
+    # gs_common.env_or_argv -- whose docstring says it exists precisely so "the
+    # next caller cannot half-apply the lesson". This tool imported eight names
+    # from gs_common and not that one. It is also the WORST place to leave an
+    # amount on a command line: the others are seconds-long invocations, and
+    # this one runs for up to 24 hours with the figure sitting in
+    # /proc/<pid>/cmdline (mode 0444) the entire time.
+    _expect = env_or_argv("GS_EXPECT_XMR",
+                          str(args.expect_xmr) if args.expect_xmr is not None else None,
+                          "The expected XMR amount")
+    if _expect is not None:
+        try:
+            args.expect_xmr = Decimal(str(_expect))
+        except Exception:                                    # noqa: BLE001
+            sys.exit("[!] GS_EXPECT_XMR is not a number.")
+
+    if args.tolerance < 0 or args.tolerance >= 1:
+        sys.exit("[!] --tolerance must be >= 0 and < 1.")
+    # --tolerance was validated twice; these two had no bounds at all.
+    # --stall-min 0 opens the stall gate on the very first tick, so a perfectly
+    # healthy wallet is declared stuck or short before it has had a chance to
+    # scan anything; --timeout-min 0 expires the watch before the first poll.
+    if args.stall_min < 1:
+        sys.exit("[!] --stall-min must be at least 1 minute. A zero stall window "
+                 "reports a healthy wallet as stuck on its first tick.")
+    if args.timeout_min < 1:
+        sys.exit("[!] --timeout-min must be at least 1 minute.")
+    if args.stall_min > args.timeout_min:
+        print(f"  [!] --stall-min ({args.stall_min}) exceeds --timeout-min "
+              f"({args.timeout_min}), so the shortfall check can never run — "
+              f"this watch can only ever time out.")
+
+    try:
+        bundle = load_receive_bundle(args.receive_wallet)
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {e}")
+
+    # Direct indexing, not .get(...) or 0: the loader has already guaranteed
+    # both indices are present and non-negative ints, and re-defaulting here
+    # would quietly resurrect the very fallback the loader exists to prevent.
+    dest = bundle["address"]
+    account = bundle["account_index"]
+    sub_idx = bundle["subaddress_index"]
+    rpc_url = args.rpc or bundle.get("rpc_endpoint") or "http://127.0.0.1:18083"
+
+    matched = []
+    target = Decimal(0)
+    if args.pairs:
+        try:
+            allp = load_pairs(args.pairs)
+        except Exception as e:                               # noqa: BLE001
+            sys.exit(f"[!] {e}")
+        matched = pairs_for_dest(allp, dest)
+        if not matched:
+            sys.exit(
+                f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
+                f"    this receive address ({scrub_address(dest)}).\n"
+                f"    Watching it would wait for a payment that is going somewhere else.")
+        target, _unreadable = expected_total(matched)
+        if _unreadable:
+            print(f"  [!] {_unreadable} of {len(matched)} swap pair(s) carry no "
+                  f"readable expected_xmr, so they contribute NOTHING to the "
+                  f"target.")
+            print(f"  [!] The target below is built from {len(matched) - _unreadable} "
+                  f"pair(s) only — the watch will report success once THOSE have "
+                  f"landed, even if the others never do.")
+            integrity_log("recv", f"quotes_unreadable:{_unreadable}_of_{len(matched)}")
+    if args.expect_xmr is not None:
+        target = args.expect_xmr
+    if args.any:
+        target = Decimal(0)
+
+    if target <= 0 and not args.any:
+        sys.exit(
+            "[!] No target amount. Pass --pairs (to take it from the swap quote),\n"
+            "    --expect-xmr, or --any to stop on any balance at all.")
+
+    floor_ = accept_floor(target, args.tolerance) if target > 0 else Decimal(0)
+
+    if args.min_arrival is not None and args.min_arrival < 0:
+        sys.exit("[!] --min-arrival cannot be negative.")
+    min_arrival = arrival_floor(target, args.min_arrival)
+    if floor_ > 0 and min_arrival > floor_:
+        sys.exit(
+            f"[!] --min-arrival ({fmt(min_arrival)} XMR) is above the amount that "
+            f"would count as paid\n"
+            f"    ({fmt(floor_)} XMR), so this watch could never succeed. Lower it, "
+            f"or raise the target.")
+    if args.min_arrival is not None and args.min_arrival == 0:
+        print("  [!] --min-arrival 0 restores the old behaviour: ANY balance, down "
+              "to one\n"
+              "      piconero, counts as the payment. The swap provider knows this "
+              "address\n"
+              "      from the memo, so a trivial send from anyone will now decide "
+              "this watch.")
+
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)          # ONCE. Not per poll — see the module docstring.
+
+    try:
+        rpc = connect_rpc(rpc_url, proxy_url=args.tor_proxy)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("recv", "rpc_connect_fail")
+        sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {str(e)[:80]}")
+
+    # The bundle says the wallet owns this address at this index. Confirm it
+    # still does before waiting hours on it -- a bundle from a different wallet
+    # would otherwise watch an index that exists here but holds someone else's
+    # (or no) payment, and report "nothing arrived" forever.
+    try:
+        res = rpc.raw_request("get_address",
+                              {"account_index": account, "address_index": [sub_idx]})
+        entries = (res or {}).get("addresses") or []
+        match = [e for e in entries if e.get("address_index") == sub_idx]
+        if not match or match[0].get("address") != dest:
+            integrity_log("recv", "addr_readback_mismatch")
+            sys.exit(
+                f"[!] This wallet does not report {scrub_address(dest)} at account "
+                f"{account} / index {sub_idx}.\n"
+                f"    The bundle and the open wallet disagree — refusing to watch an\n"
+                f"    address the wallet has not confirmed it owns.")
+    except SystemExit:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        # An index the wallet does not HAVE is the wrong-wallet case itself,
+        # not a reason to continue.
+        #
+        # Real monero-wallet-rpc 0.18.3.1 answers get_address for a missing
+        # account or subaddress with a JSON-RPC ERROR (-14 "account index is
+        # out of bound" / -15 "address index is out of bound"), which
+        # monero-python raises. That landed here, in the warn-and-continue
+        # branch -- so the one guard whose comment says it exists to catch "a
+        # bundle from a different wallet" failed open on precisely that. And
+        # the balance poll cannot recover it: get_balance for a nonexistent
+        # account returns (0, 0) with no error, so the watch simply never sees
+        # funds and 24 hours later blames the swap provider.
+        #
+        # create_receive_wallet.verify_receive_address and
+        # GhostSpiral.verify_spend_source both sys.exit on this same exception
+        # path. This runs once, before hours of waiting, so failing closed
+        # costs nothing.
+        _msg = str(e).lower()
+        if "out of bound" in _msg or "index" in _msg:
+            integrity_log("recv", "addr_readback_index_missing")
+            sys.exit(
+                f"[!] This wallet has no account {account} / subaddress {sub_idx} "
+                f"({str(e)[:60]}).\n"
+                f"    The bundle was written against a DIFFERENT wallet than the one\n"
+                f"    monero-wallet-rpc currently has open. Watching would report\n"
+                f"    'nothing arrived' forever while the payment lands in the other\n"
+                f"    wallet. Open the right wallet, or point --rpc at it.")
+        integrity_log("recv", "addr_readback_unavailable")
+        print(f"  [!] Could not read the address back from the wallet ({str(e)[:50]}). "
+              f"Continuing, but verify the wallet is the right one.")
+
+    integrity_log("recv", f"watch_start:{scrub_address(dest)}:idx={sub_idx}")
+
+    print(f"  [*] Watching {dest}")
+    print(f"      account {account} · subaddress {sub_idx} · via {rpc_url}")
+    if target > 0:
+        print(f"  [*] Target {fmt(target)} XMR; counting it paid at {fmt(floor_)} XMR "
+              f"(tolerance {args.tolerance * 100:.0f}% for swap slippage).")
+    else:
+        print("  [*] --any: stopping as soon as any unlocked balance appears.")
+    print(f"  [*] Polling your OWN wallet-rpc only — no explorer, no third party "
+          f"is told this address is being watched.")
+    print(f"  [*] Treating {fmt(min_arrival)} XMR or more as the payment arriving; "
+          f"anything smaller is reported but not acted on.")
+    print(f"  [*] Timeout {args.timeout_min} min. Ctrl-C is safe: nothing is "
+          f"pending, this only reads.")
+
+    _print_sender_instructions(matched, dest)
+
+    r = watch(rpc, account, sub_idx, floor_,
+              timeout_s=args.timeout_min * 60,
+              stall_s=args.stall_min * 60,
+              min_arrival=min_arrival)
+
+    state = r["state"]
+    if state == "interrupted":
+        print("\n  [!] Stopped. Nothing was spent; re-run to keep waiting.")
+        return 130
+    if state == "timeout":
+        print(f"\n  [!] Timed out after {args.timeout_min} min with "
+              f"{fmt(r['unlocked'])} XMR unlocked.")
+        print("  [!] The funds (if any) are safe on the receive subaddress. Re-run to "
+              "keep waiting, or check the swap with the provider.")
+        return 1
+    if state == "not_syncing":
+        # The balance froze because the WALLET stopped scanning, not because
+        # the swap stopped paying. Never recommend accepting less here: the
+        # rest of the money may already be on-chain and merely unseen.
+        print(f"\n  [!] The balance stopped changing, but your wallet has not scanned "
+              f"a single new block since it last moved.")
+        print(f"  [!] That is your wallet losing the daemon — NOT the swap "
+              f"under-delivering. Nothing here says how much was actually sent.")
+        print(f"      wallet scan height: {r.get('height', '?')}")
+        print(f"  [!] Check monero-wallet-rpc still has its --daemon-address, that "
+              f"monerod is running and synced, then re-run. The funds are safe "
+              f"either way; only this wallet's view of them is stale.")
+        print(f"  [!] Do NOT lower the target to get past this — you would be "
+              f"accepting a number your wallet has not finished counting.")
+        return 1
+    if state == "stalled":
+        short = floor_ - r["unlocked"]
+        print(f"\n  [!] {fmt(r['unlocked'])} XMR arrived and stopped growing for "
+              f"{args.stall_min} min — {fmt(short)} short of the {fmt(floor_)} XMR target.")
+        if r.get("sync") in ("unknown", "stale"):
+            # Say what was not established, instead of naming a cause. "stale"
+            # means the height WAS readable but has not moved for a long time:
+            # the tool cannot tell a short payment from a wallet that stopped
+            # following the chain, and the remedy it would otherwise recommend
+            # is to accept less money.
+            if r.get("sync") == "stale":
+                _sa = r.get("last_scan_age_s") or 0
+                print(f"  [!] Your wallet has not scanned a new block for "
+                      f"{_sa // 60} min. A healthy wallet sees one every couple "
+                      f"of minutes, so this may be the wallet falling behind "
+                      f"rather than the swap paying short — the two look "
+                      f"identical from here.")
+            else:
+                print("  [!] Your wallet's scan height could not be read, so this "
+                      "could also be the wallet falling behind rather than the "
+                      "swap paying short.")
+            print("  [!] Confirm monerod is running and synced BEFORE you accept "
+                  "a lower amount.")
+        else:
+            # State the MEASURED fact, not a stronger one. What was established
+            # is "the wallet advanced at some point inside the window", which
+            # can be a single block; saying it "kept scanning throughout" turns
+            # that into a guarantee it does not carry, and the advice that
+            # follows is to accept less money.
+            _age = r.get("last_scan_age_s")
+            if _age is None:
+                _when = "recently"
+            elif _age < 120:
+                _when = f"{_age}s ago"
+            else:
+                _when = f"{_age // 60} min ago"
+            print(f"  [!] Your wallet last scanned a new block {_when}, so it is "
+                  f"still following the chain — this looks like the swap paying "
+                  f"short (rate moved, or a partial fill) rather than a sync "
+                  f"problem. The money that DID arrive is yours and safe.")
+            # Honest about what this cannot establish. The floor makes a
+            # trivial send unable to reach this branch, but nothing here proves
+            # the balance came from the swap rather than from anyone else who
+            # has seen the memo.
+            print(f"  [!] This tool cannot tell WHO sent what is here — only "
+                  f"that {fmt(r['unlocked'])} XMR is on the address. If the swap "
+                  f"provider reports a different figure, believe the chain, not "
+                  f"this line.")
+            if _age is not None and _age > 600:
+                # Inside the threshold, but old enough to be worth doubting.
+                print(f"  [!] {_when} is a long gap though — a healthy wallet "
+                      f"follows a new block every couple of minutes. Confirm "
+                      f"monerod is synced before you accept a lower amount.")
+        print("  [!] Re-run with --any to accept it, or --expect-xmr to set a lower "
+              "target, once you have decided it is all that is coming.")
+        return 1
+
+    print(f"\n  [+] PAID: {fmt(r['unlocked'])} XMR unlocked on the receive subaddress.")
+    # Say what was QUOTED, not just what arrived.
+    #
+    # The floor sits --tolerance (default 10%) below the quote, so anything in
+    # that band printed as an unqualified "PAID" and the quoted figure was
+    # never mentioned again. Under Kerckhoffs the aggregator knows the default,
+    # and a provider that skims just inside it is indistinguishable here from
+    # one that paid in full -- across many swaps that is a systematic loss the
+    # operator is never shown. The tolerance exists because rates move; it is
+    # not a reason to stop reporting the difference.
+    if target > 0 and r["unlocked"] < target:
+        _short = target - r["unlocked"]
+        _pct = (_short / target * 100).quantize(Decimal("0.1"))
+        print(f"  [!] That is {fmt(_short)} XMR ({_pct}%) BELOW the {fmt(target)} XMR "
+              f"quoted — inside the {args.tolerance * 100:.0f}% tolerance, so it "
+              f"counts as paid, but it is a real shortfall.")
+        integrity_log("recv", "paid_under_quote")
+    _pending = r.get("pending") or Decimal(0)
+    if _pending > 0:
+        # The target was reached while more is still confirming. Mixing now
+        # spends the unlocked part and strands the rest on the receive address
+        # -- the address the swap provider has already tied to a BTC payment.
+        print(f"  [!] {fmt(_pending)} XMR MORE is on this subaddress but has not "
+              f"unlocked yet.")
+        print(f"  [!] If you mix now, only the {fmt(r['unlocked'])} XMR gets moved and "
+              f"that {fmt(_pending)} XMR is left sitting on the receive address —")
+        print(f"      the one address the swap provider already knows. Wait ~20 min "
+              f"and re-run to move all of it in one go.")
+    integrity_log("recv", "watch_complete")
+
+    print(render_choices())
+    pick = args.choice
+    if pick is None and sys.stdin.isatty():
+        try:
+            pick = input("\n  Choose [1-4]: ")
+        except (EOFError, KeyboardInterrupt):
+            pick = None
+    c = choice_by_key(pick) if pick is not None else None
+    if c is None:
+        print("\n  No choice made. The funds stay put — nothing was spent.")
+        print("  Re-run with --choice 1 (or 2/3) to see the exact mix command.")
+        return 0
+
+    if not c.get("flags"):
+        print(f"\n  [+] {c['name']}. Nothing spent; the funds stay on the receive "
+              f"subaddress.")
+        return 0
+
+    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy, rpc_url)
+    print(f"\n  [+] {c['name']} — run this to start the mix:\n")
+    print("      " + format_mix_command(argv))
+    print("\n  This tool does not spend. Nothing moves until you run that command,")
+    print("  or arm and launch the same preset from the console.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

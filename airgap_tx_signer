@@ -19,21 +19,17 @@ pending unsigned TXs, so 40 sequential transfer_split calls won't
 select the same outputs twice.
 
 Usage:
-  # On online machine (view-only wallet):
+  # Phase 1 — create unsigned TXs (online, view-only wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase create \
       --rpc http://127.0.0.1:18083 --tor-proxy socks5h://127.0.0.1:9050 \
-      --outdir unsigned_txs
+      --outdir tx_staging
 
-  # Transfer unsigned_txs/ to air-gapped machine via USB
-
-  # On offline machine (full wallet):
+  # Phase 2 — sign (offline, full wallet):
   python3 airgap_tx_signer unsigned_plan.json --phase sign \
-      --wallet-file /path/to/full_wallet --outdir signed_txs
-
-  # Transfer signed_txs/ back to online machine for broadcast
+      --wallet-file /path/to/full_wallet --outdir tx_staging
 """
 from __future__ import annotations
-import argparse, json, subprocess, hashlib, os, sys, time, shutil
+import argparse, json, subprocess, hashlib, os, re, sys, time, shutil, tempfile
 from pathlib import Path
 from decimal import Decimal
 from typing import List
@@ -41,25 +37,121 @@ from typing import List
 from gs_common import (
     integrity_log, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
-    connect_rpc, validate_proxy, verify_tor,
+    redact_addresses, env_or_argv,
+    connect_rpc, validate_proxy, verify_tor, secure_delete_file,
+    secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
 
-REQUIRED_TX_FIELDS = {"src": str, "dst": str, "amt": str}
+def _validate_plan(plan: List[dict], phase: str = "create") -> None:
+    """Validate each TX. A TX is either single-destination (dst+amt, used by DAG
+    hops) or multi-destination (destinations[], used by the one fan-out TX that
+    sends ENTRY's single input to many mix subaddresses at once).
 
-
-def _validate_plan(plan: List[dict]) -> None:
+    src_index handling is PHASE-AWARE, because only phase_create consumes it:
+      * create -- REQUIRED, non-negative int. This is the actual per-TX spend
+        selector (transfer_split receives it as subaddr_indices). phase_create
+        used to default a missing key to 0 via .get("src_index", 0), silently
+        spending from account 0 / subaddress 0 -- the wallet's PRIMARY address,
+        holding unrelated balance -- instead of the mix subaddress the plan
+        names. Fail closed so phase_create can read it without a default.
+      * sign -- type-checked IF PRESENT, but not required: phase_sign never
+        reads src_index (it signs the already-built unsigned tx sets, where the
+        source is fixed at creation time). An earlier version of this fix
+        required it in both phases, which rejected a legitimate sign-only run
+        on an older or hand-authored plan for no security benefit.
+    """
     if not plan:
         sys.exit("[!] Plan is empty - nothing to sign")
     for i, tx in enumerate(plan):
-        for k, typ in REQUIRED_TX_FIELDS.items():
-            if k not in tx or not isinstance(tx[k], typ):
-                sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
-        try:
-            val = Decimal(tx["amt"])
-            if val <= 0:
-                sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
-        except Exception:
-            sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
+        if not isinstance(tx.get("src"), str):
+            sys.exit(f"[!] Schema error at TX {i}: 'src' missing or wrong type")
+        si = tx.get("src_index")
+        if phase == "create":
+            if not isinstance(si, int) or isinstance(si, bool) or si < 0:
+                sys.exit(
+                    f"[!] Schema error at TX {i}: 'src_index' must be a non-negative "
+                    f"int (got {si!r}). Missing/negative would spend from the wallet's "
+                    f"primary address, not the mix subaddress this plan names.")
+        elif si is not None and (not isinstance(si, int) or isinstance(si, bool) or si < 0):
+            sys.exit(f"[!] Schema error at TX {i}: 'src_index' present but invalid "
+                     f"({si!r}); expected a non-negative int.")
+        # OPTIONAL per-TX account override. A peel chain runs every hop in its
+        # OWN account so each hop's change lands on a different subaddress 0 --
+        # see the peel planner. Without this every hop would share
+        # meta.account_index, all N change outputs would pile onto one
+        # subaddress 0, and the sweep that collects them would be a single
+        # N-input transaction: a public proof that all N peels are one owner,
+        # which is precisely what the peel chain exists to avoid.
+        #
+        # Validated exactly as strictly as meta.account_index, and NEVER
+        # defaulted to 0 -- account 0's subaddress 0 is the wallet's PRIMARY
+        # address, so a malformed value must stop the run, not silently spend
+        # the operator's identity.
+        ai = tx.get("account_index")
+        if ai is not None and (not isinstance(ai, int) or isinstance(ai, bool)
+                               or ai < 0):
+            sys.exit(f"[!] Schema error at TX {i}: 'account_index' present but "
+                     f"invalid ({ai!r}); expected a non-negative int. Refusing "
+                     f"to fall back to meta.account_index for a plan that "
+                     f"explicitly names an account.")
+        # A SWEEP carries no amount by design: sweep_all sends the whole
+        # subaddress balance minus the fee, which is exactly why it leaves no
+        # change. Requiring 'amt' here would reject the one plan shape that
+        # cannot produce a change output.
+        if tx.get("sweep"):
+            if not isinstance(tx.get("dst"), str) or not tx["dst"]:
+                sys.exit(f"[!] Schema error at TX {i}: a sweep needs a 'dst' address")
+            if tx.get("destinations"):
+                sys.exit(f"[!] Schema error at TX {i}: a sweep has ONE destination; "
+                         f"'destinations' and 'sweep' are mutually exclusive.")
+            if tx.get("amt") is not None:
+                sys.exit(f"[!] Schema error at TX {i}: a sweep must not carry 'amt' -- "
+                         f"it sends the whole subaddress balance, and an amount here "
+                         f"would be silently ignored while looking authoritative.")
+            continue
+        dests = tx.get("destinations")
+        if dests is not None:
+            if not isinstance(dests, list) or not dests:
+                sys.exit(f"[!] Schema error at TX {i}: 'destinations' must be a non-empty list")
+            for j, d in enumerate(dests):
+                if not isinstance(d.get("address"), str):
+                    sys.exit(f"[!] TX {i} dest {j}: 'address' missing or wrong type")
+                try:
+                    _amt = Decimal(str(d.get("amount")))
+                    # is_finite FIRST. Decimal("Infinity") <= 0 is False, so an
+                    # infinite amount passed the positivity test and was
+                    # ACCEPTED into a plan that builds real transactions.
+                    # ("NaN" was already caught, but only by accident: comparing
+                    # NaN raises InvalidOperation and landed in the except.)
+                    # This file's siblings already ruled on exactly this --
+                    # exit_strategy_simulator rejects both by name, and
+                    # gs_common.decimal_arg now does it at every CLI boundary --
+                    # so the one component that turns a plan into a signed spend
+                    # was the last place it could still get through.
+                    if not _amt.is_finite():
+                        sys.exit(f"[!] TX {i} dest {j}: amount is not finite "
+                                 f"({d.get('amount')!r}); 'NaN' and 'Infinity' "
+                                 f"parse as Decimals but are not amounts.")
+                    if _amt <= 0:
+                        sys.exit(f"[!] TX {i} dest {j}: amount must be positive")
+                except Exception:
+                    sys.exit(f"[!] TX {i} dest {j}: amount not parsable: {d.get('amount')}")
+        else:
+            for k in ("dst", "amt"):
+                if not isinstance(tx.get(k), str):
+                    sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
+            try:
+                _amt = Decimal(tx["amt"])
+                # See the destinations branch above: Infinity is finite-looking
+                # to a `<= 0` test and was accepted.
+                if not _amt.is_finite():
+                    sys.exit(f"[!] Amount is not finite at TX {i}: {tx['amt']!r}; "
+                             f"'NaN' and 'Infinity' parse as Decimals but are "
+                             f"not amounts.")
+                if _amt <= 0:
+                    sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
+            except Exception:
+                sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
 
 
 def _load_unsigned(path: Path) -> tuple:
@@ -76,11 +168,157 @@ def _load_unsigned(path: Path) -> tuple:
     sys.exit("[!] unsigned_v1 has unexpected format")
 
 
-def _compute_plan_fingerprint(plan: List[dict]) -> str:
-    h = hashlib.sha256()
+#: Bump when the fingerprint's covered fields or encoding change, so a stale
+#: manifest fails the comparison loudly instead of colliding by accident.
+PLAN_FP_VERSION = "gs-planfp-v2"
+
+#: Wallet output set exported by phase_create and imported by phase_sign, so the
+#: OFFLINE wallet can sign a spend of an output an earlier round created (a DAG
+#: hop's fan-out output, a peel's change). Without it those signatures fail with
+#: "Imported outputs omit more outputs that we know of".
+OUTPUTS_EXPORT_NAME = "outputs_export.hex"
+#: How many accounts the ONLINE wallet has, recorded beside the output export.
+#: The offline wallet must have at least this many before it can import them --
+#: see _ensure_offline_accounts.
+ACCOUNTS_COUNT_NAME = "accounts_count.txt"
+
+
+def _canonical_plan(plan: List[dict]) -> list:
+    """Normalise a plan to the fields that constitute its IDENTITY.
+
+    Deliberately explicit: every field here changes what gets spent, where it
+    goes, or when it is relayed. Anything not listed (e.g. 'src', which is a
+    cosmetic label read nowhere, or 'extra', which phase_create never forwards
+    to the RPC) is intentionally excluded so cosmetic edits do not invalidate a
+    manifest.
+      src_index    -- WHICH output is spent (becomes subaddr_indices)
+      dst / amt    -- single-destination DAG hop
+      destinations -- multi-destination fan-out, order-sensitive
+      delay        -- per-TX broadcast delay; broadcast reads it from the
+                      manifest, so a swapped delay changes relay timing, which
+                      is an OPSEC property worth detecting
+      sweep        -- whether this entry sends the WHOLE subaddress balance.
+                      It must be covered: flipping it turns a fixed-amount hop
+                      into "send everything", which is a completely different
+                      spend from the same src_index and dst, and the manifest
+                      would otherwise still verify.
+    """
+    out = []
     for tx in plan:
-        h.update(f"{tx.get('dst','')}:{tx.get('amt','')}".encode())
-    return h.hexdigest()[:32]
+        dests = tx.get("destinations")
+        entry = {
+            "src_index": tx.get("src_index"),
+            "account_index": tx.get("account_index"),
+            "delay": tx.get("delay"),
+            "sweep": bool(tx.get("sweep")),
+        }
+        if tx.get("sweep"):
+            # No amount exists to cover -- sweep_all sends the balance.
+            entry["dst"] = tx.get("dst")
+        elif dests:
+            entry["destinations"] = [
+                {"address": d.get("address"), "amount": str(d.get("amount"))}
+                for d in dests
+            ]
+        else:
+            entry["dst"] = tx.get("dst")
+            entry["amt"] = str(tx.get("amt")) if tx.get("amt") is not None else None
+        out.append(entry)
+    return out
+
+
+def _compute_plan_fingerprint(plan: List[dict]) -> str:
+    """Identity of a plan: detects that phase_sign was handed a manifest
+    belonging to a DIFFERENT plan than the one on disk.
+
+    REWRITTEN. Two independent defects made the old version unfit:
+
+      1. It omitted src_index entirely, so two plans spending from completely
+         different subaddresses hashed IDENTICALLY -- the guard was blind to
+         the one field that decides which output is spent.
+
+      2. It concatenated raw field values with no delimiters, length prefixes
+         or record boundaries:  h.update(f"{dst}:{amt}")  per TX and
+         f"{address}:{amount}" per destination, all into one stream. That is
+         ambiguous by construction: field values containing the separator, or
+         differently-grouped destination lists, can produce the same byte
+         stream from different plans. Patching a field into that scheme keeps
+         the ambiguity, so the encoding itself is replaced.
+
+    Now: normalise to an explicit structure (see _canonical_plan) and hash a
+    canonical JSON serialisation -- sorted keys, fixed separators, no
+    whitespace. JSON quotes and escapes every value, so no field content can
+    forge a record boundary. A version tag is hashed in so a future change to
+    the covered fields cannot silently collide with an old fingerprint.
+
+    COMPATIBILITY: this changes the fingerprint for every plan. A manifest
+    written by an older build MISMATCHES and aborts at sign time -- the
+    intended fail-closed direction. Re-run phase create rather than sign
+    against a manifest this build cannot vouch for.
+    """
+    payload = json.dumps(
+        {"v": PLAN_FP_VERSION, "txs": _canonical_plan(plan)},
+        sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def _validate_manifest_entries(entries: List[dict], outdir: Path) -> None:
+    """Validate the manifest's own fields before they are used as filesystem
+    paths. The manifest is the create->sign TRUST BOUNDARY, and its contents
+    were being used unchecked:
+
+      * entry["idx"] is interpolated into the OUTPUT filename
+        (signed_dir / f"tx_{idx}.signed"). A non-integer idx such as
+        "../../../tmp/EVIL" escapes signed_dir entirely -- verified to resolve
+        outside it -- giving a tampered or corrupted manifest a
+        write-where-I-want primitive.
+      * entry["file"] is an arbitrary path read from disk. It must stay inside
+        the staging dir; a stale manifest from another run (or a crafted one)
+        would otherwise make the signer read and sign content from anywhere on
+        the filesystem.
+
+    A legitimate manifest always satisfies both -- phase_create writes idx from
+    enumerate() and file as outdir/tx_N.unsigned -- so this only rejects
+    manifests that were tampered with, corrupted, or carried over from a
+    different run.
+    """
+    try:
+        outdir_res = outdir.resolve()
+    except OSError:
+        sys.exit(f"[!] Cannot resolve output dir {outdir}")
+
+    seen_idx = set()
+    for n, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            sys.exit(f"[!] Manifest entry {n} is not an object")
+
+        idx = entry.get("idx")
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+            sys.exit(f"[!] Manifest entry {n}: 'idx' must be a non-negative int, "
+                     f"got {idx!r}. A non-integer idx is interpolated into the "
+                     f"output filename and can escape the staging directory.")
+        if idx in seen_idx:
+            sys.exit(f"[!] Manifest entry {n}: duplicate idx {idx} -- two entries "
+                     f"would write the same tx_{idx}.signed, silently discarding one.")
+        seen_idx.add(idx)
+
+        raw = entry.get("file")
+        if not isinstance(raw, str) or not raw:
+            sys.exit(f"[!] Manifest entry {n}: 'file' missing or not a string")
+        try:
+            fres = Path(raw).resolve()
+        except OSError:
+            sys.exit(f"[!] Manifest entry {n}: unresolvable path {raw!r}")
+        if fres != outdir_res and outdir_res not in fres.parents:
+            sys.exit(f"[!] Manifest entry {n}: '{raw}' is outside the staging dir "
+                     f"{outdir_res}. Refusing to sign content from an unexpected "
+                     f"location -- regenerate the manifest with --phase create.")
+
+        h = entry.get("hash")
+        if not isinstance(h, str) or len(h) != 64:
+            sys.exit(f"[!] Manifest entry {n}: 'hash' must be a 64-char sha256 hex "
+                     f"digest, got {h!r}")
 
 
 def phase_create(args, plan: List[dict], meta: dict = None):
@@ -100,15 +338,50 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
     rpc = connect_rpc(args.rpc, proxy_url=proxy_url)
 
-    # Account index from the plan metadata (set by GhostSpiral based on
-    # receive wallet). Defaults to 0 for sender mode.
-    acct_idx = meta.get("account_index", 0)
+    # WHICH ACCOUNT EVERY SPEND COMES FROM. Required, never defaulted.
+    #
+    # This read `meta.get("account_index", 0)`, with a comment saying it
+    # "defaults to 0 for sender mode" -- true before the mix account was
+    # rotated, stale after. It is also the identical pattern this file already
+    # refuses for src_index a few hundred lines below, and for the same reason:
+    # a silent .get(..., 0) turns a missing key into a spend from account 0,
+    # whose subaddress 0 is the wallet's PRIMARY address. Nothing fails; the
+    # money simply moves from the wrong account and the change comes to rest on
+    # the operator's identity address.
+    #
+    # GhostSpiral always writes it. A plan without it is an old plan, a
+    # truncated write or a hand-authored one -- none of which is a reason to
+    # guess, and guessing wrong is unrecoverable.
+    acct_idx = meta.get("account_index")
+    if acct_idx is None:
+        integrity_log("signer", "missing_account_index")
+        sys.exit(
+            "[!] The plan carries no meta.account_index, so which account to "
+            "spend from is unknown.\n"
+            "    Refusing to assume 0: account 0's subaddress 0 is the wallet's "
+            "PRIMARY address,\n"
+            "    and spending from the wrong account would move funds that are "
+            "not part of this\n"
+            "    plan and leave its change on your identity address. Re-run "
+            "--phase create.")
+    if isinstance(acct_idx, bool) or not isinstance(acct_idx, int) or acct_idx < 0:
+        integrity_log("signer", "bad_account_index")
+        sys.exit(f"[!] meta.account_index must be a non-negative int, got "
+                 f"{acct_idx!r}.")
     integrity_log("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)
     if outdir.is_dir():
-        shutil.rmtree(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+        # SECURE wipe, not shutil.rmtree. Re-running phase create into an
+        # existing --outdir would otherwise merely unlink a previous attempt's
+        # tx_*.unsigned AND signed/tx_*.signed -- a recovered signed blob is a
+        # relayable transaction. Mirrors the finally-block cleanup below.
+        if not secure_delete_tree(outdir):
+            print(f"  [!] Could not securely erase the existing {outdir}; "
+                  f"a previous attempt's signed transactions may remain recoverable.")
+    # 0700: a 0755 staging dir lets any local user enumerate how many TXs
+    # were signed and when, even though the files inside are 0600.
+    secure_mkdir(outdir)
 
     manifest = []
     created = 0
@@ -119,22 +392,91 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [!] Shutdown at TX {idx}")
             break
 
-        dst = tx["dst"]
-        amt_atomic = int(Decimal(tx["amt"]) * Decimal(10 ** 12))
+        # _validate_plan has already required src_index to be a non-negative
+        # int; no default -- a silent .get(..., 0) here was the mechanism that
+        # made a missing key spend from the wallet's primary address.
+        src_index = tx["src_index"]
+        # Which account this ONE spend comes from. _validate_plan has already
+        # rejected a malformed override, so a present value is trustworthy and
+        # an absent one means "the plan's single account".
+        tx_acct = tx.get("account_index")
+        if tx_acct is None:
+            tx_acct = acct_idx
+        # Multi-destination (fan-out: one input -> many outputs) or single
+        # (DAG hop). transfer_split takes a destinations list either way.
+        # A SWEEP entry moves an ENTIRE subaddress balance to one destination.
+        # It is the correct primitive for a DAG hop and, unlike transfer_split,
+        # it produces NO CHANGE OUTPUT at all -- verified on a real chain: a
+        # 3.0 XMR source swept 2.998 with a 0.002 fee and returned nothing to
+        # the account. transfer_split cannot do that, because the fee is not
+        # known when the amount is chosen, so it always leaves a remainder that
+        # monerod returns to the account's subaddress 0.
+        if tx.get("sweep"):
+            dests = None
+            mani_dst = scrub_address(tx["dst"])
+            mani_amt = "sweep"
+            desc = f"SWEEP all of subaddr {tx['src_index']} -> {scrub_address(tx['dst'])}"
+        elif tx.get("destinations"):
+            dests = [
+                {"amount": int(Decimal(str(d["amount"])) * Decimal(10 ** 12)),
+                 "address": d["address"]}
+                for d in tx["destinations"]
+            ]
+            mani_dst = f"{len(dests)}_dests"
+            mani_amt = str(sum(Decimal(str(d["amount"])) for d in tx["destinations"]))
+            desc = f"{len(dests)} dests, {mani_amt} XMR total"
+        else:
+            dests = [{"amount": int(Decimal(tx["amt"]) * Decimal(10 ** 12)),
+                      "address": tx["dst"]}]
+            mani_dst = scrub_address(tx["dst"])
+            mani_amt = tx["amt"]
+            desc = f"{tx['amt']} XMR -> {scrub_address(tx['dst'])}"
 
-        print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: "
-              f"{tx['amt']} XMR -> {scrub_address(dst)}...")
+        print(f"  [*] Creating unsigned TX {idx}/{len(plan)-1}: {desc}...")
 
         try:
-            result = rpc.raw_request("transfer_split", {
-                "destinations": [{"amount": amt_atomic, "address": dst}],
-                "account_index": acct_idx,
-                "priority": args.fee_priority,
-                "get_tx_hex": False,
-                "do_not_relay": True,
-            })
+            if tx.get("sweep"):
+                # sweep_all takes ONE address and no amount: it sends whatever
+                # the subaddress holds, minus the fee. That is what makes it
+                # zero-change, and it is why a sweep entry carries no "amt".
+                result = rpc.raw_request("sweep_all", {
+                    "address": tx["dst"],
+                    "account_index": tx_acct,
+                    "subaddr_indices": [src_index],
+                    "priority": args.fee_priority,
+                    "get_tx_hex": False,
+                    "do_not_relay": True,
+                })
+            else:
+                # A peel pays its mix destination AND the next carrier, so
+                # transfer_split leaves a change output and the transaction is
+                # 1-in/3-out. Two outputs is by far the commonest shape on the
+                # network, so the obvious improvement is to spend the input
+                # EXACTLY and have no change -- which is what
+                # subtract_fee_from_outputs is for.
+                #
+                # DO NOT ADD IT. Monero v0.18.3.1 (wallet RPC 1.26) accepts the
+                # field and silently ignores it: measured, a transfer_split
+                # carrying subtract_fee_from_outputs delivered both
+                # destinations their FULL requested amounts, still produced the
+                # change output, and charged an identical fee -- and an
+                # out-of-range output index in that list is accepted without
+                # any error, which is how you can tell the field is never
+                # parsed. epee drops unknown JSON fields, so adding it would
+                # look like a fix, change nothing, and read as done.
+                result = rpc.raw_request("transfer_split", {
+                    "destinations": dests,
+                    "account_index": tx_acct,
+                    "subaddr_indices": [src_index],
+                    "priority": args.fee_priority,
+                    "get_tx_hex": False,
+                    "do_not_relay": True,
+                })
 
-            # The RPC returns unsigned_txset (base64-encoded)
+            # The RPC returns unsigned_txset as a HEX string (phase_sign decodes
+            # it back to the binary unsigned_monero_tx that wallet-cli expects).
+            # Do NOT "fix" this to base64-encode -- that would silently break
+            # signing, and short/all-hex payloads could even fromhex wrongly.
             unsigned_txset = result.get("unsigned_txset", "")
             if not unsigned_txset:
                 integrity_log("signer", f"no_unsigned_txset:idx={idx}")
@@ -144,16 +486,17 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
             # Save the unsigned TX set
             tx_file = outdir / f"tx_{idx}.unsigned"
-            tx_file.write_text(unsigned_txset)
-            secure_file_perms(tx_file)
+            # 0600 at creation -- write_text + chmod left it 0644 in between,
+            # and permanently 0644 if the process died in that window.
+            secure_write_text(tx_file, unsigned_txset)
 
             sha = hashlib.sha256(unsigned_txset.encode()).hexdigest()
             manifest.append({
                 "idx": idx,
                 "file": str(tx_file),
                 "hash": sha,
-                "dst": scrub_address(dst),
-                "amt": tx["amt"],
+                "dst": mani_dst,
+                "amt": mani_amt,
                 "delay": tx.get("delay", 0),
             })
             created += 1
@@ -163,6 +506,66 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")
             print(f"  [!] TX {idx} failed: {str(e)[:80]}")
             failed += 1
+
+    # ---- Output export for MULTI-ROUND cold signing -----------------------
+    # The offline wallet can only sign a spend of an output it KNOWS. It last
+    # synced before it went offline, so it has no record of any output created
+    # by an earlier round of this run -- the fan-out outputs a DAG hop spends,
+    # or the change a peel spends. Signing one of those fails with
+    #   "Failed to sign transaction: Imported outputs omit more outputs that we
+    #    know of. Try using export_outputs all."
+    # verified against real monero-wallet-cli 0.18. That made the DAG round --
+    # and the peel chain -- unsignable in the cold configuration this tool is
+    # built around: the failure lands AFTER the previous round already spent
+    # real fees on-chain.
+    #
+    # So export the online wallet's full output set here; phase_sign imports it
+    # into the offline wallet before signing. Verified end-to-end: with the
+    # import the round-2 signature succeeds and relays.
+    try:
+        _exp = rpc.raw_request("export_outputs", {"all": True}) or {}
+        _blob = _exp.get("outputs_data_hex", "")
+        if _blob:
+            secure_write_text(outdir / OUTPUTS_EXPORT_NAME, _blob)
+            integrity_log("signer", "outputs_exported")
+            print(f"  [+] Exported wallet outputs for offline signing "
+                  f"({OUTPUTS_EXPORT_NAME})")
+        else:
+            integrity_log("signer", "outputs_export_empty")
+            print("  [!] export_outputs returned nothing. Signing a round that spends "
+                  "an output created by an EARLIER round will fail on the offline "
+                  "wallet.")
+        # HOW MANY ACCOUNTS the online wallet has. The offline wallet derives
+        # subaddresses for a fixed lookahead of accounts (50 by default, set
+        # when it was CREATED and not changeable afterwards -- wallet-cli
+        # rejects --subaddress-lookahead alongside --wallet-file). GhostSpiral
+        # puts every output in its own account, so the online wallet passes 50
+        # accounts during the second run, and from then on the offline wallet
+        # cannot derive the keys for the exported outputs: import_outputs dies
+        # with "Failed to generate key image" and sign_transfer then produces
+        # nothing while still printing "Loaded 1 transactions". Measured.
+        #
+        # This is the count the OFFLINE side has to reach, and it is a property
+        # of the whole wallet, not of this plan: the export covers every output
+        # the online wallet holds, so a plan spending account 3 still fails if
+        # the wallet has an output in account 120.
+        try:
+            _accts = rpc.raw_request("get_accounts", {}) or {}
+            _n = len(_accts.get("subaddress_accounts", []) or [])
+            if _n:
+                secure_write_text(outdir / ACCOUNTS_COUNT_NAME, str(_n))
+                integrity_log("signer", f"accounts_count:{_n}")
+        except Exception as e:                              # noqa: BLE001
+            integrity_log("signer", f"accounts_count_fail:{str(e)[:40]}")
+            print(f"  [!] Could not read the wallet's account count "
+                  f"({str(e)[:60]}). If the offline wallet has fewer accounts "
+                  f"than this one, import_outputs will fail to generate key "
+                  f"images and the round will not sign.")
+    except Exception as e:                                  # noqa: BLE001
+        integrity_log("signer", f"outputs_export_fail:{str(e)[:40]}")
+        print(f"  [!] Could not export wallet outputs ({str(e)[:60]}). A first-round "
+              f"sign still works, but a DAG/peel round that spends this round's "
+              f"outputs will fail offline.")
 
     # Write manifest
     manifest_path = outdir / "unsigned_manifest.json"
@@ -177,7 +580,343 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     if failed:
         print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
         sys.exit(1)
-    print(f"  [+] Transfer {outdir}/ to the offline machine for signing.")
+    print(f"  [+] Unsigned TXs ready in {outdir}/ — run phase sign to continue.")
+
+
+def _load_signing_manifest(outdir, plan: list) -> list:
+    """Load the unsigned manifest and prove it still describes THIS plan.
+
+    The fingerprint check is the whole point of the phase split. The plan
+    travels to the offline machine on removable media, and the signer is
+    the last place anything is checked before a spend key is applied to it.
+    If the manifest and the plan disagree, something edited one of them
+    between phases -- a corrupted copy, the wrong batch, or an actual
+    tamper -- and signing would authorise transactions the operator never
+    planned. Refuse rather than reconcile: there is no safe way to guess
+    which side is right.
+
+    Returns the validated entries. Pulled out of phase_sign so this check
+    can be driven directly instead of only through a full signing run.
+    """
+    manifest_path = outdir / "unsigned_manifest.json"
+    if not manifest_path.exists():
+        sys.exit("[!] unsigned_manifest.json not found in output dir")
+
+    with open(manifest_path) as f:
+        manifest_data = json.load(f)
+
+    # The fingerprint is MANDATORY. The old guard was
+    #     if saved_fp and saved_fp != current_fp:
+    # so a manifest with the field missing, empty, or null skipped the check
+    # ENTIRELY -- deleting one JSON field disabled the only thing tying this
+    # manifest to the plan being signed, and the signer would happily sign a
+    # completely different plan (verified: a plan paying a different address a
+    # different amount was signed against an honest manifest). Hardening the
+    # hash while the gate using it stayed optional was no protection at all.
+    saved_fp = manifest_data.get("plan_fingerprint")
+    if not isinstance(saved_fp, str) or not saved_fp:
+        integrity_log("signer", "manifest_missing_fingerprint")
+        sys.exit(
+            "[!] Manifest has no usable 'plan_fingerprint'. Refusing to sign:\n"
+            "    nothing would tie this manifest to the plan you passed, so a\n"
+            "    swapped or truncated manifest could not be detected.\n"
+            "    Re-run --phase create to regenerate it."
+        )
+    current_fp = _compute_plan_fingerprint(plan)
+    if saved_fp != current_fp:
+        integrity_log("signer", "plan_fingerprint_mismatch")
+        sys.exit(
+            f"[!] Plan fingerprint mismatch: this manifest belongs to a DIFFERENT\n"
+            f"    plan than the one passed on the command line.\n"
+            f"    manifest={saved_fp}  plan={current_fp}\n"
+            f"    (A manifest written by an older build also mismatches -- the\n"
+            f"     covered fields changed. Re-run --phase create.)"
+        )
+
+    entries = manifest_data.get("entries", [])
+    if not entries:
+        sys.exit("[!] No unsigned TX entries in manifest")
+    _validate_manifest_entries(entries, outdir)
+
+    # The manifest must be COMPLETE, not merely authentic.
+    #
+    # The fingerprint above proves the PLAN is the one this manifest was built
+    # for. It proves nothing about the manifest's own entry list, because the
+    # fingerprint is computed over the plan -- so dropping entries leaves it
+    # matching perfectly. Two ways that happens, one accidental and one not:
+    #
+    #   * phase_create exits 1 when a TX fails to build, but it has ALREADY
+    #     written the manifest, and it writes only the entries that succeeded.
+    #     Carry that staging dir to the offline machine and every check here
+    #     passes: the plan is untouched, so the fingerprint matches; the
+    #     surviving entries are individually well-formed. phase_sign then signs
+    #     them, finds signed_count == len(entries), and reports success. Its
+    #     partial-batch guard compares against len(ENTRIES) -- the already
+    #     shrunken list -- so it cannot see a gap that was created upstream.
+    #
+    #   * anyone able to edit the manifest in transit can delete entries. That
+    #     needs no fingerprint forgery and no key. Deleting the hop that moves
+    #     funds away from an observed address leaves that hop unmade while the
+    #     operator is told the batch signed cleanly.
+    #
+    # Either way a peel chain or DAG round is silently truncated: the earlier
+    # transactions relay, the missing one never does, and the funds stop on an
+    # intermediate subaddress. Under Kerckhoffs that is worse than a loud
+    # failure -- an analyst who knows this tool sees n-1 outputs move on and
+    # one that does not, which is a class marker, and the operator believes the
+    # round completed.
+    #
+    # phase_create numbers entries with enumerate() over the plan, so a
+    # complete manifest is exactly {0 .. len(plan)-1}. Anything else is a
+    # truncated, extended or renumbered manifest. Refuse; do not reconcile.
+    expected = set(range(len(plan)))
+    got = {e["idx"] for e in entries}          # ints, deduped by the validator
+    if got != expected:
+        missing = sorted(expected - got)
+        extra = sorted(got - expected)
+        integrity_log("signer", f"manifest_incomplete:{len(got)}_of_{len(plan)}")
+        detail = ""
+        if missing:
+            detail += f"\n    missing TX indices: {missing}"
+        if extra:
+            detail += f"\n    unexpected TX indices (not in the plan): {extra}"
+        sys.exit(
+            f"[!] Manifest describes {len(got)} of the plan's {len(plan)} "
+            f"transactions.{detail}\n"
+            f"    Refusing to sign a partial batch: the plan's transactions are "
+            f"a chain, and\n"
+            f"    signing only some of them relays the early hops and strands "
+            f"the funds on an\n"
+            f"    intermediate subaddress while reporting success.\n"
+            f"    If phase create reported failures, fix the cause and re-run "
+            f"--phase create."
+        )
+    return entries
+
+
+def _pw_scratch_dir(fallback: str = None) -> str:
+    """Where a wallet-password file may be staged. Prefers tmpfs.
+
+    THE PREFERENCE WAS NOT APPLIED EVERYWHERE. The signing loop and the
+    output-import helper both stage the password in /dev/shm and this file's
+    comments make "the secret normally never touches a disk at all" an explicit
+    property -- but _offline_account_count and _ensure_offline_accounts called
+    tempfile.mkstemp(prefix=".gs_pw_") with NO dir=, so in those two paths the
+    spend-key password was written to $TMPDIR (physical disk) instead. Both
+    then hand it to monero-wallet-cli, so it is the same secret, just on a
+    medium secure_delete_file cannot reliably erase on a journalling FS or SSD.
+
+    One chooser rather than a third and fourth copy of the same conditional:
+    the copies are how the two paths came to disagree in the first place.
+
+    This is a PREFERENCE, not a guarantee -- on a host with no usable /dev/shm
+    it still falls back to disk, which is what the callers already did. The
+    file is 0600 from creation and securely deleted in a finally regardless.
+    """
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        return "/dev/shm"
+    return fallback or tempfile.gettempdir()
+
+
+def _offline_account_count(wallet_file: str, args) -> int:
+    """How many accounts the OFFLINE wallet has, via wallet-cli's `account`.
+
+    Returns 0 when it cannot be determined, which the caller treats as "top up
+    anyway" rather than "assume it is fine".
+    """
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=_pw_scratch_dir())
+    try:
+        os.fchmod(pw_fd, 0o600)
+        os.write(pw_fd, (args.wallet_password or "").encode())
+    finally:
+        os.close(pw_fd)
+    try:
+        r = subprocess.run(
+            [args.wallet_cli, "--wallet-file", wallet_file,
+             "--password-file", pw_path, "--command", "account"],
+            capture_output=True, text=True, timeout=300,
+            input=f"{args.wallet_password or ''}\n" + "y\n" * 3)
+        txt = (r.stdout or "") + (r.stderr or "")
+        # "        1 8Bmvo7        0.000000000000 ..." -- index then a
+        # truncated address. The primary row is marked with a leading '*'.
+        idx = [int(m) for m in
+               re.findall(r"^\s*\*?\s*(\d+)\s+\S{5,}\s+\d", txt, re.M)]
+        return (max(idx) + 1) if idx else 0
+    except Exception:                                        # noqa: BLE001
+        return 0
+    finally:
+        secure_delete_file(Path(pw_path))
+
+
+def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
+    """Give the offline wallet as many accounts as the online one, or the
+    outputs it is about to import cannot have their key images generated.
+
+    A wallet derives subaddresses for a bounded lookahead of accounts -- 50 by
+    default -- fixed when the wallet was CREATED. wallet-cli refuses
+    --subaddress-lookahead alongside --wallet-file, so an existing offline
+    wallet cannot simply be told a bigger number.
+
+    GhostSpiral gives every output its own account (that is what stops one
+    transaction merging the mix), which adds roughly twenty accounts per run.
+    The online wallet therefore passes 50 accounts during the SECOND run, and
+    from then on `import_outputs` fails with "Failed to generate key image" and
+    `sign_transfer` prints "Loaded 1 transactions" and writes nothing. The
+    money is not lost, but the round cannot be signed.
+
+    Creating the accounts explicitly fixes it: measured, an offline wallet at
+    the default lookahead could not sign a spend from account 120, and after
+    122 x `account new` the same import reported "147 outputs imported" and the
+    signature succeeded. It costs about half a second per account, once --
+    accounts persist -- so a wallet that is already large enough pays only the
+    cost of asking.
+
+    A wallet CREATED with `--subaddress-lookahead 400:50` never needs this at
+    all; OPSEC_SETUP.md says so. This exists for the wallets that already
+    exist.
+    """
+    marker = outdir / ACCOUNTS_COUNT_NAME
+    if not marker.exists():
+        return
+    try:
+        needed = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return
+    if needed <= 0:
+        return
+    have = _offline_account_count(wallet_file, args)
+    if have >= needed:
+        return
+    missing = needed - have
+    print(f"  [*] The offline wallet has {have or 'an unknown number of'} "
+          f"account(s); this run's wallet has {needed}. Creating {missing} so "
+          f"the outputs can be imported (~{missing // 2}s, once)...")
+    pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_", dir=_pw_scratch_dir())
+    try:
+        os.fchmod(pw_fd, 0o600)
+        os.write(pw_fd, (args.wallet_password or "").encode())
+    finally:
+        os.close(pw_fd)
+    try:
+        subprocess.run(
+            [args.wallet_cli, "--wallet-file", wallet_file,
+             "--password-file", pw_path],
+            capture_output=True, text=True,
+            timeout=max(600, missing * 5),
+            input=f"{args.wallet_password or ''}\n"
+                  + "account new\n" * missing + "exit\n")
+        after = _offline_account_count(wallet_file, args)
+        if after >= needed:
+            integrity_log("signer", f"offline_accounts_topped_up:{after}")
+            print(f"  [+] Offline wallet now has {after} accounts.")
+        else:
+            integrity_log("signer", "offline_accounts_topup_short")
+            print(f"  [!] The offline wallet still has {after} account(s), "
+                  f"short of {needed}. import_outputs will fail to generate "
+                  f"key images and this round will NOT sign. Recreate the "
+                  f"offline wallet from its seed with "
+                  f"--subaddress-lookahead {needed + 200}:50.")
+    except subprocess.TimeoutExpired:
+        integrity_log("signer", "offline_accounts_topup_timeout")
+        print("  [!] Timed out creating accounts on the offline wallet.")
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("signer", f"offline_accounts_topup_fail:{str(e)[:40]}")
+        print(f"  [!] Could not create accounts on the offline wallet "
+              f"({str(e)[:60]}).")
+    finally:
+        secure_delete_file(Path(pw_path))
+
+
+def _import_view_outputs(outdir, wallet_file: str, args) -> None:
+    """Teach the OFFLINE wallet about outputs it has never seen on-chain.
+
+    This is what makes a MULTI-ROUND cold-signing pipeline work at all. The
+    offline wallet is air-gapped, so it never syncs: it knows only the
+    outputs it knew when it was created. A peeling chain or a DAG round
+    spends change created by an EARLIER round of the same run -- outputs
+    that exist on-chain and in the view-only wallet, but are invisible to
+    the signer. Without importing them, round 2 fails to sign and the
+    operator is left with funds mid-chain and no obvious cause.
+
+    The blob is written by phase_create from the view-only wallet's
+    export_outputs. It carries no spend key -- it is output metadata, not
+    secrets -- but it does describe the operator's outputs, so it is
+    handled like everything else here: RAM-backed scratch where /dev/shm
+    exists, 0600, and removed after use rather than left in /tmp.
+
+    Absent file is not an error: a single-round plan has nothing to import.
+    """
+    _outs = outdir / OUTPUTS_EXPORT_NAME
+    if _outs.exists():
+        # The offline wallet must be able to DERIVE the subaddresses of every
+        # output in the blob before it can import them.
+        _ensure_offline_accounts(outdir, wallet_file, args)
+        # RAM-backed scratch (tmpfs) so the wallet OUTPUT-SET blob -- a map of
+        # this wallet's holdings -- and the password file never touch disk;
+        # fall back to /tmp only where /dev/shm is unavailable. Matches the
+        # signing loop's /dev/shm handling; the previous version put both in
+        # /tmp, and wrote the holdings blob with umask perms (0644) rather than
+        # 0600.
+        _shm = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        _iw = tempfile.mkdtemp(prefix="gs_impout_", dir=_shm)
+        _ipw = None
+        try:
+            _blob_path = Path(_iw) / "outputs_blob"
+            try:
+                secure_write_bytes(_blob_path, bytes.fromhex(_outs.read_text().strip()))
+            except ValueError:
+                _blob_path = None
+                print(f"  [!] {OUTPUTS_EXPORT_NAME} is not valid hex; skipping "
+                      f"output import. A round spending an earlier round's "
+                      f"outputs will fail to sign.")
+            if _blob_path is not None:
+                _pfd, _ipw = tempfile.mkstemp(prefix=".gs_pw_", dir=_iw)
+                try:
+                    os.fchmod(_pfd, 0o600)
+                    os.write(_pfd, (args.wallet_password or "").encode())
+                finally:
+                    os.close(_pfd)
+                _r = subprocess.run(
+                    [args.wallet_cli, "--wallet-file", wallet_file,
+                     "--password-file", _ipw,
+                     "--command", "import_outputs", str(_blob_path)],
+                    capture_output=True, text=True, timeout=300, cwd=_iw,
+                    input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
+                )
+                _txt = (_r.stdout or "") + (_r.stderr or "")
+                if "outputs imported" in _txt:
+                    n = _txt.split("outputs imported")[0].strip().split()[-1]
+                    integrity_log("signer", "outputs_imported")
+                    print(f"  [+] Imported {n} wallet outputs into the offline wallet "
+                          f"(needed to sign spends of earlier rounds' outputs).")
+                else:
+                    integrity_log("signer", "outputs_import_unconfirmed")
+                    # redact_addresses: this is monero-wallet-cli's own output,
+                    # which always contains "Opened wallet: <primary address>".
+                    print(f"  [!] import_outputs did not confirm success. If this round "
+                          f"spends an output an earlier round created, signing will "
+                          f"fail. Last output: "
+                          f"{redact_addresses(_txt.strip()[-160:])}")
+        except subprocess.TimeoutExpired:
+            integrity_log("signer", "outputs_import_timeout")
+            print("  [!] import_outputs timed out.")
+        except Exception as e:                              # noqa: BLE001
+            integrity_log("signer", f"outputs_import_fail:{str(e)[:40]}")
+            print(f"  [!] import_outputs failed: {str(e)[:80]}")
+        finally:
+            if _ipw:
+                secure_delete_file(Path(_ipw))
+            try:
+                for _lf in sorted(Path(_iw).rglob("*"), reverse=True):
+                    if _lf.is_file() or _lf.is_symlink():
+                        secure_delete_file(_lf)
+            except OSError:
+                pass
+            shutil.rmtree(_iw, ignore_errors=True)
+    else:
+        print(f"  [*] No {OUTPUTS_EXPORT_NAME} in the staging dir. Fine for a first "
+              f"round; a DAG/peel round that spends an earlier round's outputs "
+              f"needs it (phase_create writes it).")
 
 
 def phase_sign(args, plan: List[dict]):
@@ -190,22 +929,22 @@ def phase_sign(args, plan: List[dict]):
     if not outdir.is_dir():
         sys.exit(f"[!] Output dir not found: {outdir}")
 
+    # Narrow an outdir we did NOT create. phase_create makes it 0700, but this
+    # phase runs on the offline machine and the operator may well have made the
+    # directory by hand (`mkdir tx_staging` -> 0755). We are about to write
+    # signed transactions into it, and a world-listable directory reveals how
+    # many TXs were signed and when even though the files are 0600.
+    try:
+        _dmode = outdir.stat().st_mode & 0o777
+        if _dmode & 0o077:
+            os.chmod(outdir, 0o700)
+            print(f"  [*] Tightened staging dir {outdir} from {oct(_dmode)} to 0o700")
+            integrity_log("signer", f"tightened_outdir:{oct(_dmode)}")
+    except OSError:
+        pass
+
     # Load unsigned manifest
-    manifest_path = outdir / "unsigned_manifest.json"
-    if not manifest_path.exists():
-        sys.exit("[!] unsigned_manifest.json not found in output dir")
-
-    with open(manifest_path) as f:
-        manifest_data = json.load(f)
-
-    saved_fp = manifest_data.get("plan_fingerprint", "")
-    current_fp = _compute_plan_fingerprint(plan)
-    if saved_fp and saved_fp != current_fp:
-        sys.exit("[!] Plan fingerprint mismatch: manifest is from a different plan!")
-
-    entries = manifest_data.get("entries", [])
-    if not entries:
-        sys.exit("[!] No unsigned TX entries in manifest")
+    entries = _load_signing_manifest(outdir, plan)
 
     wallet_file = args.wallet_file
     if not wallet_file or not Path(wallet_file).exists():
@@ -213,7 +952,16 @@ def phase_sign(args, plan: List[dict]):
 
     # Create signed output directory
     signed_dir = outdir / "signed"
-    signed_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(signed_dir)      # owner-only; see phase_create's note
+
+    # ---- Teach the OFFLINE wallet about outputs created by earlier rounds ---
+    # See OUTPUTS_EXPORT_NAME. Without this, signing any round that spends an
+    # output an earlier round created (a DAG hop spending a fan-out output, a
+    # peel spending the previous peel's change) fails on real wallet-cli with
+    # "Imported outputs omit more outputs that we know of". import_outputs
+    # persists to the wallet cache, so one invocation before the signing loop
+    # covers every TX in this round.
+    _import_view_outputs(outdir, wallet_file, args)
 
     signed_manifest = []
     signed_count = 0
@@ -241,29 +989,95 @@ def phase_sign(args, plan: List[dict]):
 
         # Write unsigned data to a temp location wallet-cli can find
         # wallet-cli sign_transfer reads from unsigned_monero_tx in CWD
-        import tempfile
+        # (tempfile is imported at module scope -- a function-local `import
+        # tempfile` here made the name local to the WHOLE function, so the
+        # output-import block above raised UnboundLocalError.)
         work_dir = tempfile.mkdtemp(prefix="gs_sign_")
+        pw_files: list = []      # password files to securely erase in `finally`
         try:
+            # phase_create saved the RPC's `unsigned_txset`, which is a HEX
+            # string. wallet-cli's sign_transfer reads the BINARY
+            # unsigned_monero_tx file, so decode the hex back to bytes here --
+            # writing the hex text verbatim gave wallet-cli an unparseable file
+            # and signing silently produced nothing.
             unsigned_in = Path(work_dir) / "unsigned_monero_tx"
-            unsigned_in.write_text(unsigned_file.read_text())
+            _payload = unsigned_file.read_text().strip()
+            try:
+                unsigned_in.write_bytes(bytes.fromhex(_payload))
+            except ValueError:
+                # Defensive only (current wallet-rpc returns hex): try base64,
+                # and if that also fails, write the raw text but say loudly that
+                # wallet-cli will almost certainly fail to parse it -- do not
+                # pretend a text copy is a working fallback.
+                try:
+                    import base64
+                    unsigned_in.write_bytes(base64.b64decode(_payload, validate=True))
+                except Exception:
+                    integrity_log("signer", f"unsigned_decode_fail:idx={idx}")
+                    print(f"  [!] TX {idx}: unsigned payload is neither hex nor base64; "
+                          f"wallet-cli will likely reject it.")
+                    unsigned_in.write_text(_payload)
+
+            # --password-file, NOT --password. An argv password is readable by
+            # EVERY local user for the lifetime of the process, via `ps -eo args`
+            # or the world-readable /proc/<pid>/cmdline -- verified by observing
+            # the literal secret in ps output. This is the wallet's spend-key
+            # password, so that exposure is as bad as it gets on a shared box.
+            #
+            # The file is staged in /dev/shm (tmpfs -> RAM-backed, so the secret
+            # normally never touches a disk at all), falling back to the scratch
+            # dir when /dev/shm is unavailable, and is securely erased in the
+            # finally block below either way.
+            #
+            # Verified against real monero-wallet-cli 0.18.3.1 that this leaves
+            # the STDIN protocol below unchanged (wallet-cli does not prompt at
+            # startup when the password comes from a file) and that an EMPTY
+            # password file works, which is the common default. The stdin-only
+            # alternative (no password flag, password twice on stdin) also
+            # works but was rejected: it changes the exact stdin sequence whose
+            # mismatch caused the original "y taken as the password" bug, for
+            # no gain over a tmpfs-backed file.
+            pw_fd, pw_path = tempfile.mkstemp(prefix=".gs_pw_",
+                                              dir=_pw_scratch_dir(work_dir))
+            try:
+                os.fchmod(pw_fd, 0o600)
+                os.write(pw_fd, (args.wallet_password or "").encode())
+            finally:
+                os.close(pw_fd)
+            pw_files.append(pw_path)
 
             cmd = [
                 args.wallet_cli,
                 "--wallet-file", wallet_file,
-                "--password", args.wallet_password or "",
+                "--password-file", pw_path,
                 "--command", "sign_transfer",
             ]
+            # STDIN protocol, verified end-to-end against real monero-wallet-cli
+            # 0.18.3.1 (a full cold-signing round-trip on an isolated testnet --
+            # see tests/real_roundtrip_testnet.py): sign_transfer FIRST reads the
+            # wallet password from stdin (a spend re-confirmation, even though
+            # --password is on the CLI), and THEN shows the real prompt
+            # "...Is this okay?  (Y/Yes/N/No):" before writing signed_monero_tx.
+            # So the first line MUST be the password, then the affirmative. With
+            # a VALID unsigned tx this sequence produced "Transaction successfully
+            # signed to file signed_monero_tx". The old "y" first made every sign
+            # fail with "invalid password" (the 'y' was taken as the password).
+            # Extra trailing lines are harmless -- once --command finishes,
+            # wallet-cli ignores remaining stdin.
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=120, cwd=work_dir,
+                input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
             )
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"
             if signed_out.exists():
                 signed_data = signed_out.read_bytes()
-                signed_file.write_bytes(signed_data)
-                secure_file_perms(signed_file)
+                # This is a fully signed, relayable transaction. Created 0600
+                # up front rather than chmod'ed after -- a kill in that window
+                # left it world-readable on disk forever.
+                secure_write_bytes(signed_file, signed_data)
 
                 sha = hashlib.sha256(signed_data).hexdigest()
                 signed_manifest.append({
@@ -277,8 +1091,14 @@ def phase_sign(args, plan: List[dict]):
                 signed_count += 1
                 print(f"  [+] TX {idx} signed -> {signed_file.name}")
             else:
-                stderr = result.stderr[:200] if result.stderr else ""
-                stdout = result.stdout[:200] if result.stdout else ""
+                # Redact before slicing AND before printing: wallet-cli prints
+                # the wallet's PRIMARY ADDRESS on every run ("Opened wallet:
+                # ..."), and the primary address is what links the operator to
+                # every subaddress in the mix. Redacting first also means the
+                # slice can never cut an address in half and leave a fragment
+                # long enough to search for.
+                stderr = redact_addresses(result.stderr)[:200] if result.stderr else ""
+                stdout = redact_addresses(result.stdout)[:200] if result.stdout else ""
                 print(f"  [!] TX {idx} signing produced no output")
                 if stderr:
                     print(f"      stderr: {stderr}")
@@ -289,6 +1109,23 @@ def phase_sign(args, plan: List[dict]):
         except Exception as e:
             print(f"  [!] TX {idx} signing error: {e}")
         finally:
+            # The password file first -- it may live in /dev/shm, outside the
+            # scratch tree the rmtree below covers, so it would otherwise
+            # survive the whole run.
+            for _pw in pw_files:
+                secure_delete_file(Path(_pw))
+            # SECURE cleanup, not shutil.rmtree. This scratch dir held
+            # unsigned_monero_tx AND the wallet-cli-produced signed_monero_tx --
+            # a fully signed, relayable transaction. A plain rmtree only unlinks
+            # them, leaving the bytes recoverable in /tmp, which defeats the
+            # entire point of an air-gapped signer. Overwrite every file's full
+            # extent first, then remove the directory.
+            try:
+                for _leftover in sorted(Path(work_dir).rglob("*"), reverse=True):
+                    if _leftover.is_file() or _leftover.is_symlink():
+                        secure_delete_file(_leftover)
+            except OSError:
+                pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
     # Write signed manifest
@@ -297,7 +1134,32 @@ def phase_sign(args, plan: List[dict]):
 
     integrity_log("signer", f"sign_done:{signed_count}_signed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
-    print(f"  [+] Transfer {signed_dir}/ back to the online machine for broadcast.")
+    if signed_count < len(entries):
+        # Refuse a gapped batch. The original reason given here -- that a gap
+        # shifts every later TX's POSITION in the broadcast list and so
+        # misapplies the planned delays -- is no longer true: broadcast keys
+        # each delay on the manifest entry's own idx, not on list position, so
+        # a gap now costs the right delay on the right transaction.
+        #
+        # The reason that does still hold is the one that matters more. A plan
+        # is a CHAIN: a peel spends the previous peel's change, a DAG hop
+        # spends a fan-out output. Broadcasting the transactions that did sign
+        # relays the early links and leaves the funds parked on whichever
+        # intermediate subaddress the missing link was supposed to move them
+        # off -- with the operator told the round succeeded. A partial mix that
+        # stops in the middle is a distinctive on-chain shape, not a neutral
+        # outcome.
+        #
+        # _load_signing_manifest now also proves entries covers the WHOLE plan,
+        # so this is the second half of one invariant: every planned TX has an
+        # entry, and every entry gets signed.
+        integrity_log("signer", f"partial_sign:{signed_count}_of_{len(entries)}")
+        sys.exit(
+            f"[!] Only {signed_count}/{len(entries)} TXs signed. Aborting rather than "
+            f"broadcast a partial chain: the transactions that did sign would relay "
+            f"the early hops and strand the funds on an intermediate subaddress."
+        )
+    print(f"  [+] Signed TXs ready in {signed_dir}/ for broadcast.")
 
 
 def main():
@@ -321,25 +1183,39 @@ def main():
     cli.add_argument("--wallet-file",
                      help="Path to full wallet file (phase=sign only)")
     cli.add_argument("--wallet-password", default="",
-                     help="Wallet password (phase=sign only)")
+                     help="Wallet password (phase=sign only). PREFER the "
+                          "GS_WALLET_PASSWORD environment variable: an argv "
+                          "password is world-readable via ps / "
+                          "/proc/<pid>/cmdline (mode 444), while "
+                          "/proc/<pid>/environ is mode 400 (owner only).")
     cli.add_argument("--outdir", default="tx_staging",
                      help="Directory for TX files")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     args = cli.parse_args()
 
+    # Prefer the environment over argv for the wallet password. /proc/<pid>/
+    # cmdline is mode 444 -- any local user can read an argv password with
+    # `ps -eo args` for the whole run (up to 30 min for a signing batch).
+    # /proc/<pid>/environ is mode 400, readable only by the owner and root
+    # (verified: an unprivileged user is DENIED environ but ALLOWED cmdline).
+    # GhostSpiral passes the password this way when it spawns us.
+    # Shared helper -- see GhostSpiral.resolve_wallet_password for why the
+    # hand-rolled copies were retired. The warning is no longer gated on
+    # `phase == "sign"` either: a password typed on the command line is exposed
+    # in /proc/<pid>/cmdline whether or not THIS phase happens to read it, so
+    # staying quiet during --phase create told the operator their password was
+    # safe at the exact moment it was not.
+    args.wallet_password = env_or_argv(
+        "GS_WALLET_PASSWORD", args.wallet_password, "The wallet password",
+        allow_empty=True)
+
     plan_path = Path(args.unsigned_json)
     if not plan_path.exists():
         sys.exit(f"[!] File not found: {plan_path}")
 
     plan, meta = _load_unsigned(plan_path)
-    _validate_plan(plan)
-
-    if meta.get("mock"):
-        sys.exit(
-            "[!] This plan was generated with MOCK balance (no real funds).\n"
-            "    It CANNOT be signed or broadcast. Create a real plan first."
-        )
+    _validate_plan(plan, args.phase)
 
     if args.phase == "create":
         phase_create(args, plan, meta)

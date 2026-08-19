@@ -18,23 +18,71 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, shutil, socket, subprocess, sys, time
+import argparse, glob, os, random, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
-    shutdown_requested, secure_hex,
+    shutdown_requested, secure_hex, secure_delete_file, secure_write_bytes,
+    verify_integrity_chain,
 )
 
 # Paths to wipe
-SHELL_HISTORIES = [
-    Path.home() / ".bash_history",
-    Path.home() / ".zsh_history",
-    Path.home() / ".python_history",
-    Path.home() / ".lesshst",
-    Path.home() / ".wget-hsts",
-    Path.home() / ".viminfo",
-]
+def _shell_histories() -> list:
+    """Every history file this host might actually be using.
+
+    The old list named .bash_history and .zsh_history and stopped. That misses:
+
+      * FISH -- ~/.local/share/fish/fish_history, a completely different path,
+        and fish is a mainstream interactive shell. A fish user's wipe erased
+        nothing they had typed.
+      * $HISTFILE -- bash and zsh both honour it, so an operator who moved
+        their history anywhere kept it through every wipe.
+      * .zhistory (zsh's other conventional name), .sh_history (ksh),
+        .ash_history (ash/dash/busybox), .local/share/zsh/history.
+
+    That matters more here than it would elsewhere, because the phase's own
+    docstring names the stake: an operator who ran the pipeline with
+    `--wallet-password ...` has that password sitting in their history
+    verbatim. Missing their shell means missing the password while reporting
+    success.
+
+    Resolved at call time rather than at import so $HISTFILE and $HOME are read
+    from the environment the wipe actually runs in.
+    """
+    home = Path.home()
+    cands = [
+        home / ".bash_history",
+        home / ".zsh_history",
+        home / ".zhistory",
+        home / ".sh_history",
+        home / ".ash_history",
+        home / ".local/share/zsh/history",
+        home / ".local/share/fish/fish_history",
+        home / ".config/fish/fish_history",
+        home / ".python_history",
+        home / ".lesshst",
+        home / ".wget-hsts",
+        home / ".viminfo",
+    ]
+    # Wherever the operator actually pointed it.
+    hf = os.environ.get("HISTFILE")
+    if hf:
+        cands.append(Path(hf).expanduser())
+    out, seen = [], set()
+    for c in cands:
+        try:
+            key = str(c.resolve())
+        except OSError:
+            key = str(c)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+#: Kept as a module name for the tests and for anything that introspects it.
+SHELL_HISTORIES = _shell_histories()
 
 PYCACHE_GLOBS = [
     str(Path.home() / "**/__pycache__"),
@@ -42,23 +90,34 @@ PYCACHE_GLOBS = [
 ]
 
 
-def dns_check() -> None:
+def dns_check() -> int:
     """Verify basic network connectivity after MAC spoof.
 
     OPSEC: We must NOT resolve Tor-related domains (check.torproject.org)
     over clearnet DNS — that links the new MAC address to Tor usage in
     ISP DNS logs. Instead, resolve a benign, high-traffic domain that
     reveals nothing about the operator's intent.
+
+    It used to sys.exit(1) on failure, which ABANDONED THE ENTIRE WIPE: a MAC
+    spoof that dropped the link (the common failure) would make this check fail
+    and kill the process before shell histories, temp files, swap and the
+    GhostSpiral artifacts were ever touched -- leaving exactly the material
+    this tool exists to destroy. None of the wipe phases need the network, so
+    a failed connectivity probe is now a reported warning, not a hard stop.
     """
     try:
         res = socket.getaddrinfo("www.google.com", 443)
         if not res:
             raise RuntimeError("DNS returned empty")
         integrity_log("paranoia", "dns_check_ok")
-    except socket.gaierror as e:
+        print("  [+] Network reachable post-spoof")
+        return 0
+    except (socket.gaierror, OSError, RuntimeError) as e:
         integrity_log("paranoia", f"dns_fail:{e}")
-        print(f"  [!] DNS resolution failed post-spoof: {e}")
-        sys.exit(1)
+        print(f"  [!] DNS/connectivity failed post-spoof: {str(e)[:80]}")
+        print("  [!] The MAC spoof may have dropped the link — the WIPE CONTINUES "
+              "regardless (it needs no network).")
+        return 1
 
 
 def rand_mac() -> str:
@@ -69,106 +128,250 @@ def rand_mac() -> str:
 
 
 def spoof_mac(iface: str, dry: bool):
+    """Randomise an interface's MAC.
+
+    Two defects fixed here, both verified:
+
+    * THE INTERFACE WAS LEFT DOWN ON FAILURE. The sequence is down → set
+      address → up, and `set address` is exactly the step that fails without
+      root or on a driver that refuses. The exception skipped the `up`, so a
+      failed spoof killed the operator's networking with nothing saying so.
+      Bringing it back up now happens in a `finally`, so it runs on every path.
+
+    * THE NEW MAC WAS WRITTEN TO THE INTEGRITY LOG. `mac_spoof:wlan0->e2:03:...`
+      persisted the very value the spoof exists to make unlinkable — anyone who
+      later reads integrity_chain.log learns the address the machine used for
+      the operation. The log now records only THAT a spoof happened; the MAC
+      itself is printed to the terminal for the operator and never stored.
+    """
     new_mac = rand_mac()
     if dry:
         print(f"  [dry] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_dry:{iface}->{new_mac}")
-        return
+        integrity_log("paranoia", f"mac_dry:{iface}")     # value withheld
+        return 0
+
+    lowered = False
+    spoofed = False
     try:
         subprocess.run(["ip", "link", "set", iface, "down"], check=True,
-                       capture_output=True)
+                       capture_output=True, timeout=15)
+        lowered = True
         subprocess.run(["ip", "link", "set", iface, "address", new_mac],
-                       check=True, capture_output=True)
-        subprocess.run(["ip", "link", "set", iface, "up"], check=True,
-                       capture_output=True)
+                       check=True, capture_output=True, timeout=15)
+        spoofed = True
         print(f"  [+] MAC {iface} -> {new_mac}")
-        integrity_log("paranoia", f"mac_spoof:{iface}->{new_mac}")
+        integrity_log("paranoia", f"mac_spoof:{iface}:ok")
     except subprocess.CalledProcessError as e:
-        integrity_log("paranoia", f"mac_fail:{iface}:{e}")
-        print(f"  [!] MAC spoof failed: {e}")
+        detail = (e.stderr or b"").decode("utf-8", errors="ignore").strip()[:80]
+        integrity_log("paranoia", f"mac_fail:{iface}")
+        print(f"  [!] MAC spoof failed ({'needs root' if os.geteuid() != 0 else 'driver refused'})"
+              f"{': ' + detail if detail else ''}")
     except FileNotFoundError:
         integrity_log("paranoia", "mac_fail:ip_not_found")
         print("  [!] 'ip' command not found - cannot spoof MAC")
+    except subprocess.TimeoutExpired:
+        integrity_log("paranoia", f"mac_fail:{iface}:timeout")
+        print(f"  [!] MAC spoof timed out on {iface}")
+    finally:
+        # ALWAYS restore the link. Without this a failed spoof leaves the NIC
+        # administratively down and the operator offline with no explanation.
+        if lowered:
+            try:
+                subprocess.run(["ip", "link", "set", iface, "up"], check=True,
+                               capture_output=True, timeout=15)
+            except (subprocess.CalledProcessError, FileNotFoundError,
+                    subprocess.TimeoutExpired):
+                integrity_log("paranoia", f"mac_iface_still_down:{iface}")
+                print(f"  [!] {iface} could NOT be brought back up — "
+                      f"run: ip link set {iface} up")
+    # A failed spoof is a real failure to surface in the summary -- the MAC the
+    # operation ran under is unchanged and still links this host to it.
+    return 0 if spoofed else 1
 
 
 def wipe_shell_histories(dry: bool):
+    """Securely erase shell/history files.
+
+    These are high-value: an operator who ran the pipeline with
+    `--wallet-password ...` on the command line has that password sitting in
+    ~/.bash_history verbatim. The previous implementation called
+    hist.write_bytes(b""), which TRUNCATES -- it frees the old blocks without
+    overwriting them, so every recorded command stayed recoverable. That is the
+    same truncate-instead-of-overwrite defect already fixed in
+    _secure_delete_file itself, left behind in this caller.
+    """
     count = 0
-    for hist in SHELL_HISTORIES:
-        if hist.exists():
-            if dry:
-                print(f"  [dry] would wipe {hist}")
-            else:
-                try:
-                    hist.write_bytes(b"")
-                    count += 1
-                except (PermissionError, OSError):
-                    pass
-    integrity_log("paranoia", f"histories_wiped:{count}" if not dry else f"histories_dry:{count}")
+    failed = 0
+    for hist in _shell_histories():
+        if not hist.exists():
+            continue
+        if dry:
+            print(f"  [dry] would securely wipe {hist}")
+            count += 1
+            continue
+        if _secure_delete_file(hist):
+            # Recreate empty (0600) so the shell does not notice a missing
+            # history file and so the wipe is idempotent.
+            try:
+                secure_write_bytes(hist, b"")
+            except OSError:
+                pass
+            count += 1
+        else:
+            failed += 1
+    tail = f" ({failed} could not be wiped)" if failed else ""
+    integrity_log("paranoia",
+                  f"histories_wiped:{count}:failed={failed}" if not dry
+                  else f"histories_dry:{count}")
+    print(f"  [+] {'Would securely wipe' if dry else 'Securely wiped'} "
+          f"{count} history file(s){tail}")
+    _warn_history_will_be_rewritten(dry)
+    return failed
+
+
+def _warn_history_will_be_rewritten(dry: bool) -> None:
+    """Say the thing that makes this phase look like it worked when it did not.
+
+    A shell keeps its history IN MEMORY and writes it out when it exits. Wiping
+    the file from a script running inside that shell is therefore undone
+    seconds later, the moment the operator closes the terminal.
+
+    DEMONSTRATED, not assumed: a bash session with
+    `GhostSpiral --wallet-password s3cret...` in its history had the file wiped
+    to zero bytes by this phase, and on exit bash wrote the password back
+    verbatim. This tool cannot reach into another process's memory to prevent
+    that, so the only honest thing it can do is say so -- otherwise the phase
+    reports success, the run summary says "every phase reported success", and
+    the password is back before the operator has stood up.
+    """
+    shell = os.environ.get("SHELL", "")
+    name = os.path.basename(shell) or "your shell"
+    print(f"  [!] {'(dry run) ' if dry else ''}A shell keeps its history in MEMORY "
+          f"and writes it out when it EXITS.")
+    print(f"      Wiping the file does not touch that copy, so any shell still "
+          f"open will put its history BACK when you close it — including any "
+          f"command you typed with a password or an address in it.")
+    if name in ("fish",):
+        print(f"      In each open {name} window, run:  history clear")
+    elif name in ("zsh",):
+        print(f"      In each open {name} window, run:  history -p && "
+              f"exec zsh")
+    else:
+        print(f"      In each open {name} window, run:  history -c && history -w")
+    print(f"      ...or close every terminal FIRST and run this wipe from a "
+          f"fresh one. This phase cannot do it for you.")
 
 
 def wipe_pycache(dry: bool):
     count = 0
+    failed = 0
     for pattern in PYCACHE_GLOBS:
         for d in glob.glob(pattern, recursive=True):
             if dry:
                 print(f"  [dry] would remove {d}")
+                count += 1
             else:
                 try:
                     shutil.rmtree(d)
                     count += 1
                 except (PermissionError, OSError):
-                    pass
+                    failed += 1
     # Also .pyc in home
     for pyc in Path.home().rglob("*.pyc"):
         if dry:
-            pass
+            count += 1
         else:
             try:
                 pyc.unlink()
                 count += 1
             except (PermissionError, OSError):
-                pass
-    integrity_log("paranoia", f"pycache_wiped:{count}" if not dry else f"pycache_dry")
+                failed += 1
+    tail = f" ({failed} could not be removed)" if failed else ""
+    integrity_log("paranoia",
+                  f"pycache_wiped:{count}:failed={failed}" if not dry else "pycache_dry")
+    print(f"  [+] {'Would remove' if dry else 'Removed'} {count} pycache/pyc entr"
+          f"{'y' if count == 1 else 'ies'}{tail}")
+    return failed
 
 
 def wipe_system_logs(days: int, dry: bool):
+    """Securely erase /var/log/**/*.log entries older than `days`.
+
+    The previous version used `with open(f, "w"): pass`, i.e. truncate to zero.
+    Truncation frees the log's blocks without overwriting them, so the contents
+    stay forensically recoverable -- the same defect paranoia used to have on
+    the ARTIFACT wipe path. Overwrite via _secure_delete_file instead.
+    """
     cutoff = time.time() - days * 86400
     count = 0
+    failed = 0                    # was referenced below without init -> UnboundLocalError on the first failed wipe
     for f in glob.glob("/var/log/**/*.log", recursive=True):
         try:
             if os.path.getmtime(f) < cutoff:
                 if dry:
-                    print(f"  [dry] would truncate {f}")
+                    print(f"  [dry] would securely erase {f}")
+                    count += 1
+                elif _secure_delete_file(Path(f)):
+                    count += 1
                 else:
-                    with open(f, "w"):
-                        pass
-                count += 1
+                    failed += 1
         except (PermissionError, OSError):
-            pass
-    integrity_log("paranoia", f"logs_wiped:{count}" if not dry else f"logs_dry:{count}")
-    print(f"  [+] {'Would truncate' if dry else 'Truncated'} {count} log(s)")
+            failed += 1
+    tail = f" ({failed} could not be erased)" if failed else ""
+    integrity_log("paranoia",
+                  f"logs_wiped:{count}:failed={failed}" if not dry
+                  else f"logs_dry:{count}")
+    print(f"  [+] {'Would securely erase' if dry else 'Securely erased'} "
+          f"{count} log(s){tail}")
+    return failed
 
 
 def clear_journal(dry: bool):
-    """Clear systemd journal if journalctl is available."""
+    """Clear systemd journal if journalctl is available.
+
+    The old handler was `except (FileNotFoundError, CalledProcessError): pass`,
+    which silently no-op'd BOTH: journalctl missing (nothing to do) and a real
+    failure (typically non-root). A non-root run would then print "paranoia_mode
+    complete." with the journal untouched. Distinguish the two: no journalctl
+    is a clean skip, but a real failure is logged and reported honestly, in the
+    same spirit as wipe_swap_ram's no-root handling.
+    """
     if dry:
         print("  [dry] would run journalctl --vacuum-time=1s")
         integrity_log("paranoia", "journal_dry")
-        return
+        return 0
     try:
         subprocess.run(["journalctl", "--vacuum-time=1s"],
                        check=True, capture_output=True, timeout=30)
         integrity_log("paranoia", "journal_cleared")
         print("  [+] Journal cleared")
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+        return 0
+    except FileNotFoundError:
+        # journalctl absent is a clean skip (no journal exists to leak), NOT a
+        # failure -- do not inflate the summary's failure count for it.
+        integrity_log("paranoia", "journal_skip:journalctl_absent")
+        print("  [*] journalctl not installed; nothing to clear")
+        return 0
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode("utf-8", errors="ignore")[:120]
+        integrity_log("paranoia", f"journal_fail:{stderr[:40] or 'unknown'}")
+        needs_root = os.geteuid() != 0
+        print(f"  [!] Journal NOT cleared "
+              f"({'needs root' if needs_root else 'journalctl error'}): "
+              f"{stderr or 'no output'}")
+        return 1
+    except subprocess.TimeoutExpired:
+        integrity_log("paranoia", "journal_fail:timeout")
+        print("  [!] Journal clear timed out after 30s -- journal may be partially wiped")
+        return 1
 
 
 def flush_dns_cache(dry: bool):
     """Flush DNS resolver cache."""
     if dry:
         print("  [dry] would flush DNS cache")
-        return
+        return 0
+    saw_resolver = False
     for cmd in [
         ["resolvectl", "flush-caches"],
         ["systemd-resolve", "--flush-caches"],
@@ -177,80 +380,269 @@ def flush_dns_cache(dry: bool):
             subprocess.run(cmd, check=True, capture_output=True, timeout=10)
             integrity_log("paranoia", "dns_cache_flushed")
             print("  [+] DNS cache flushed")
-            return
-        except (FileNotFoundError, subprocess.CalledProcessError):
+            return 0
+        except FileNotFoundError:
+            continue                       # this resolver tool is not installed
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # The tool IS present but the flush failed -- a resolver cache may
+            # still hold the .onion / swap-host lookups from the run.
+            saw_resolver = True
             continue
+    if saw_resolver:
+        integrity_log("paranoia", "dns_cache_flush_failed")
+        print("  [!] DNS cache flush FAILED (resolver present but errored) — "
+              "cached lookups may persist.")
+        return 1
+    # No systemd resolver at all: nothing this tool can flush. Not a failure,
+    # but say so rather than silently claiming the cache is clean.
     integrity_log("paranoia", "dns_cache_skip:no_resolver")
+    print("  [*] No systemd resolver found; DNS cache not flushed by this tool.")
+    return 0
 
 
 def wipe_swap_ram(dry: bool):
+    """Deactivate swap (root only) and pressure tmpfs. HONEST about limits: it
+    does NOT zero the swap device, and it cannot overwrite freed RAM pages -- the
+    old code printed "Swap/SHM wipe complete" even on a non-root run where
+    swapoff silently failed and swap was never touched. We now report exactly
+    what happened."""
     if dry:
-        print("  [dry] would wipe swap+shm")
+        print("  [dry] would deactivate swap (root) + pressure tmpfs; will NOT zero the swap device")
         integrity_log("paranoia", "ram_dry")
-        return
+        return 0
 
-    try:
-        subprocess.run(["swapoff", "-a"], check=True, capture_output=True,
-                       timeout=30)
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        integrity_log("paranoia", f"swapoff_fail:{e}")
+    is_root = (os.getuid() == 0)
+    swap_done = False
+    if is_root:
+        try:
+            # swapoff -a pages swap back into RAM and frees the swap slots. It
+            # does NOT scrub the raw bytes on the swap device; a real scrub would
+            # need `dd` over the swap partition, which we will not do blind.
+            subprocess.run(["swapoff", "-a"], check=True, capture_output=True, timeout=30)
+            subprocess.run(["swapon", "-a"], check=False, capture_output=True, timeout=30)
+            swap_done = True
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            integrity_log("paranoia", f"swapoff_fail:{str(e)[:40]}")
 
+    shm_done = False
     wipe_file = "/dev/shm/gs_paranoia_wipe"
+    # SIZE THE WRITE TO WHAT IS FREE, instead of always asking for 128 MiB.
+    #
+    # /dev/shm is shared infrastructure: Chromium, PostgreSQL and PulseAudio
+    # keep live segments there, and it is a tmpfs, so filling it returns ENOSPC
+    # to whoever asks next -- not to us. The targeted-wipe phase in this same
+    # file reasons about exactly that hazard and refuses to touch other
+    # software's segments; this phase then filled the same tmpfs blind. Same
+    # tmpfs, same hazard, opposite treatment.
+    #
+    # Half of what is free keeps the pressure meaningful while leaving room for
+    # everything else. If nothing is free there is nothing to pressure, and
+    # saying so is better than an ENOSPC that reads as a failure of the wipe.
     try:
-        subprocess.run(
-            ["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M", "count=128"],
-            check=True, capture_output=True, timeout=60,
-        )
+        _st = os.statvfs("/dev/shm")
+        _free_mib = (_st.f_bavail * _st.f_frsize) // (1024 * 1024)
+    except OSError:
+        _free_mib = 0
+    _count = min(128, max(0, _free_mib // 2))
+    if _count <= 0:
+        integrity_log("paranoia", "shm_write_skipped:no_space")
+        print("  [!] /dev/shm has no free space to pressure; skipping the tmpfs "
+              "scratch write rather than pushing other software into ENOSPC.")
+    try:
+        if _count <= 0:
+            raise FileNotFoundError("no free tmpfs space")
+        subprocess.run(["dd", "if=/dev/zero", f"of={wipe_file}", "bs=1M",
+                        f"count={_count}"],
+                       check=True, capture_output=True, timeout=60)
         if os.path.exists(wipe_file):
             os.unlink(wipe_file)
-        subprocess.run(["sync"], check=True, capture_output=True, timeout=10)
-        integrity_log("paranoia", "ram_wipe_ok")
-        print("  [+] Swap/SHM wipe complete")
+        subprocess.run(["sync"], check=False, capture_output=True, timeout=10)
+        shm_done = True
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        integrity_log("paranoia", f"ram_wipe_fail:{e}")
-        print(f"  [!] RAM wipe failed: {e}")
+        integrity_log("paranoia", f"shm_write_fail:{str(e)[:40]}")
+
+    if not is_root:
+        integrity_log("paranoia", "ram_partial:no_root")
+        print("  [!] Swap NOT wiped — needs root (swapoff). Only a tmpfs scratch "
+              f"write {'ran' if shm_done else 'failed'}; freed RAM pages are untouched.")
+        # No root is an EXPECTED limitation, honestly reported and surfaced in
+        # the summary's caveats -- not counted as a hard failure.
+        return 0
+    elif swap_done:
+        integrity_log("paranoia", "swap_deactivated")
+        print(f"  [+] Swap deactivated (slots freed); tmpfs scratch {'ok' if shm_done else 'failed'}. "
+              "NOTE: swap device bytes and freed RAM are NOT zeroed.")
+        return 0
+    else:
+        integrity_log("paranoia", "swap_wipe_failed")
+        print("  [!] Swap wipe FAILED (swapoff error) — do not assume swap is clean.")
+        return 1
 
 
-def _secure_delete_file(path: Path):
-    """Overwrite file content with nulls before unlinking."""
-    try:
-        size = path.stat().st_size
-        with open(path, "wb") as f:
-            f.write(b"\x00" * min(size, 65536))
-            f.flush()
-            os.fsync(f.fileno())
-        path.unlink()
-    except (PermissionError, OSError):
-        pass
+def _secure_delete_file(path: Path) -> bool:
+    """Securely delete one file. Returns True on success.
+
+    Delegates to gs_common.secure_delete_file rather than keeping a second copy
+    of the overwrite logic: this module and thor_swap_preparer previously each
+    carried their own, so a fix to one silently left the other stale -- which is
+    exactly how the old truncate-then-64KB version survived here. One primitive,
+    one place to audit. It overwrites the file's full logical extent in place
+    (random then zeros, fsync'd), and never follows a symlink.
+
+    Honest caveat, unchanged: on CoW / journaling / SSD-wear-levelled
+    filesystems the physical blocks can still survive -- no userspace tool can
+    guarantee otherwise. This is a real best-effort, not a guarantee.
+    """
+    ok = secure_delete_file(path)
+    if not ok:
+        _chain_safe_log("paranoia", f"secure_delete_fail:{str(path)[-40:]}",
+                        f"could not securely delete {path}")
+    return ok
 
 
-def _secure_delete_dir(path: Path):
-    """Overwrite all files in a directory tree then remove it."""
+def _secure_delete_dir(path: Path) -> bool:
+    """Overwrite every file in a tree, then remove it. Returns True on success."""
     if not path.is_dir():
-        return
+        return False
+    ok = True
     for f in path.rglob("*"):
         if f.is_file():
-            _secure_delete_file(f)
-    shutil.rmtree(path, ignore_errors=True)
+            ok = _secure_delete_file(f) and ok
+    try:
+        shutil.rmtree(path)
+        return ok
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        return False
+
+
+# Module-level so they are a single introspectable source of truth: the
+# repo's .gitignore must cover every one of these, and tests/test_gitignore.py
+# ENFORCES that (a comment asking two lists to stay in sync is a hope, not a
+# guarantee -- they had already drifted once). Anything worth secure-deleting
+# is worth refusing to commit. Add a pattern here and the test tells you if
+# .gitignore is missing it.
+#: True while wipe_gs_artifacts is destroying the integrity chain.
+#:
+#: THE PHASE THAT DELETES THE CHAIN COULD RECREATE IT. wipe_gs_artifacts goes
+#: to deliberate lengths not to log after erasing integrity_chain.log -- its
+#: own comment explains that integrity_log() opens the file in append mode and
+#: would "resurrect the exact forensic artifact this phase exists to destroy",
+#: and main() repeats the point. But the per-FILE helper still logged on every
+#: failed delete, and it is called from inside that same loop.
+#:
+#: Reproduced: with one artifact whose secure delete fails (a root-owned
+#: monerod.log is the realistic case, and the patterns explicitly target files
+#: "created world-readable" that "we cannot change from here"), the wipe erased
+#: integrity_chain.log, then the next failure logged secure_delete_fail and
+#: brought BOTH the chain and its .lock back -- the new entry naming the path
+#: that failed. The failure count stayed honest; the artifact did not stay gone.
+#:
+#: A flag rather than a parameter because _secure_delete_dir also calls the
+#: helper, and any future logger inside this phase would reintroduce the same
+#: bug. The failure is still reported -- to the terminal, which leaves nothing
+#: behind.
+_WIPING_CHAIN = False
+
+
+def _chain_safe_log(stage: str, msg: str, human: str) -> None:
+    """integrity_log, unless we are mid-way through destroying the chain."""
+    if _WIPING_CHAIN:
+        print(f"  [!] {human}")
+        return
+    integrity_log(stage, msg)
+
+
+GS_ARTIFACT_FILE_PATTERNS = [
+    "unsigned_*.json", "signer_progress.json",
+    "broadcast_progress.json", "wallet_*.json",
+    # BOTH shapes. "thor_pairs_*.json" requires an underscore after "pairs",
+    # so it never matched the plain "thor_pairs.json" -- which is the DEFAULT
+    # filename gs_console writes ("--outfile", p.get("pairs_file") or
+    # "thor_pairs.json"), the name in receive_watch's own usage line, and the
+    # one OPSEC_SETUP.md lists among the secrets. The most common file in the
+    # whole receive flow survived every wipe, holding BTC deposit addresses,
+    # BTC amounts, and swap memos that carry the full 95-character XMR
+    # destination in plain text.
+    "thor_pairs.json", "thor_pairs.json.gpg",
+    "thor_pairs_*.json", "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+    "exitplan_*.json", "exitplan_v1.json",
+    "integrity_chain.log", "integrity.log",
+    "*.blob", "*.signed", "*.unsigned",
+    "signed_manifest_v1.json", "unsigned_manifest.json",
+    # The wallet OUTPUT SET the signer exports so the offline wallet can sign
+    # a spend of an earlier round's output. It maps this wallet's outputs --
+    # exactly the holdings picture a forensic reader wants -- so it must not
+    # survive the wipe. Written 0600, but 0600 is not gone.
+    "outputs_export.hex",
+    # The WALLET PASSWORD, in plaintext. airgap_tx_signer cannot hand a
+    # password to monero-wallet-cli on argv (/proc/<pid>/cmdline is mode 444 --
+    # any local user reads it), so it writes one 0600 file and feeds it via
+    # stdin redirection. It is deleted in a finally, but a SIGKILL runs no
+    # finally, and 0600 is not gone. Nothing here matched it before: the name
+    # starts with a dot and none of the patterns above are dotfile globs.
+    ".gs_pw_*",
+    ".ghostspiral.lock",
+    # integrity_log's serialisation lock (integrity_chain.log.lock). Holds no
+    # content, but it is a per-run artifact and its mere presence dates a run.
+    "*.log.lock",
+    # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
+    # Ctrl-C in that window leaves the partial file behind holding the SAME
+    # plaintext (deposit addresses, memos, XMR destinations) -- and none of the
+    # patterns above match a '.tmp' suffix, so it survived every wipe.
+    # gs_common now erases its own partial on failure; this is defence in depth
+    # for a hard kill (SIGKILL) that runs no cleanup at all.
+    "*.json.tmp", "*.tmp",
+    "unsigned_monero_tx", "signed_monero_tx",
+    # Monero's OWN logs. This pipeline requires monerod + monero-wallet-rpc, so
+    # it causes these files even though it does not write them. At the default
+    # log level they were checked and carry no addresses/keys/txids -- but at
+    # --log-level 2 monero-wallet-cli.log contains the FULL wallet address
+    # (verified), which is a deanonymisation link for a mixing tool. monerod's
+    # log is also created world-readable (0644, verified) and we cannot change
+    # that from here; wiping it is what we can do.
+    "monero-wallet-cli.log", "monero-wallet-rpc.log",
+    "monerod.log", "bitmonero.log",
+    "renamethis1",
+]
+GS_ARTIFACT_DIR_PATTERNS = [
+    "signed_blobs", "unsigned", "tx_staging",
+    # airgap_tx_signer's per-TX scratch dir (tempfile.mkdtemp(prefix="gs_sign_")),
+    # which holds unsigned_monero_tx and the signed_monero_tx wallet-cli writes.
+    "gs_sign_*",
+    # airgap_tx_signer's multi-round output-import scratch (prefix="gs_impout_"),
+    # which holds the wallet OUTPUT-SET blob. Normally /dev/shm (RAM) and wiped
+    # in a finally, but a SIGKILL before that -- or a host with no /dev/shm, so
+    # it falls back to $TMPDIR -- would leave the holdings map behind. Neither
+    # of those two locations is a search_root here, which is why the Temp files
+    # phase now sweeps them by prefix (_wipe_targeted_temp_roots); this pattern
+    # only catches a copy left in the cwd or under $HOME.
+    "gs_impout_*",
+]
 
 
 def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
     """Wipe ALL GhostSpiral output files. Searches cwd, home dir,
-    common subdirectories, and any --search-dir paths provided."""
-    file_patterns = [
-        "unsigned_*.json", "signer_progress.json",
-        "broadcast_progress.json", "wallet_*.json", "thor_pairs_*.json",
-        "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
-        "exitplan_*.json", "exitplan_v1.json",
-        "integrity_chain.log", "integrity.log",
-        "*.blob", "*.signed", "*.unsigned",
-        "signed_manifest_v1.json", "unsigned_manifest.json",
-        ".ghostspiral.lock",
-        "renamethis1",
-    ]
-    dir_patterns = [
-        "signed_blobs", "unsigned", "tx_staging",
-    ]
+    common subdirectories, and any --search-dir paths provided.
+
+    A REAL wipe runs with _WIPING_CHAIN set, so nothing inside it can write the
+    integrity chain back after erasing it -- see that flag. A DRY run leaves
+    logging on, because it deletes nothing and the chain is still meant to
+    record that the preview happened.
+    """
+    global _WIPING_CHAIN
+    _WIPING_CHAIN = not dry
+    try:
+        return _wipe_gs_artifacts_inner(dry, extra_dirs)
+    finally:
+        _WIPING_CHAIN = False
+
+
+def _wipe_gs_artifacts_inner(dry: bool, extra_dirs: list = None):
+    """The sweep itself. Split out so the flag above is released even if a
+    pattern raises, and so no future early return can leave it set."""
+    file_patterns = GS_ARTIFACT_FILE_PATTERNS
+    dir_patterns = GS_ARTIFACT_DIR_PATTERNS
 
     search_roots = list(set([
         Path("."),
@@ -259,72 +651,213 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
         Path.home() / "GhostSpiral",
     ] + [Path(d) for d in (extra_dirs or [])]))
 
+    # count = files ACTUALLY deleted; failed (e.g. permission-denied) deletes
+    # are NOT counted, so the reported number never overstates what happened.
     count = 0
+    failed = 0
     for root in search_roots:
         if not root.is_dir():
             continue
 
         for pattern in file_patterns:
-            for f in root.glob(pattern):
+            for f in list(root.glob(pattern)) + list(root.glob(f"*/{pattern}")):
                 if dry:
-                    print(f"  [dry] would securely delete {f}")
+                    print(f"  [dry] would securely delete {f}"); count += 1
+                elif _secure_delete_file(f):
+                    count += 1
                 else:
-                    _secure_delete_file(f)
-                count += 1
-            # Also search one level of subdirectories
-            for f in root.glob(f"*/{pattern}"):
-                if dry:
-                    print(f"  [dry] would securely delete {f}")
-                else:
-                    _secure_delete_file(f)
-                count += 1
+                    failed += 1
 
         for dirname in dir_patterns:
-            for d in root.glob(dirname):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
+            for d in list(root.glob(dirname)) + list(root.glob(f"*/{dirname}")):
+                if not d.is_dir():
+                    continue
+                if dry:
+                    print(f"  [dry] would securely delete dir {d}"); count += 1
+                elif _secure_delete_dir(d):
                     count += 1
-            for d in root.glob(f"*/{dirname}"):
-                if d.is_dir():
-                    if dry:
-                        print(f"  [dry] would securely delete dir {d}")
-                    else:
-                        _secure_delete_dir(d)
-                    count += 1
+                else:
+                    failed += 1
 
-    print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s)")
-    integrity_log("paranoia", f"gs_artifacts:{'dry' if dry else 'wiped'}:{count}")
+    tail = f" ({failed} could not be deleted)" if failed else ""
+    print(f"  [+] {'Would delete' if dry else 'Deleted'} {count} artifact(s){tail}")
+    # Only log in DRY mode. In a real wipe this function has just securely
+    # deleted integrity_chain.log; integrity_log() opens it in append mode and
+    # would RECREATE it with a fresh hash-chained line -- resurrecting the exact
+    # forensic artifact this phase exists to destroy (the file survived every
+    # real run with a single entry documenting its own wipe). main() already
+    # runs this phase last and logs nothing afterward; this keeps that promise.
+    if dry:
+        integrity_log("paranoia", f"gs_artifacts:dry:{count}")
+    return failed
+
+
+# Scratch names this toolchain creates OUTSIDE /tmp. Prefixes, not globs,
+# because these are matched with str.startswith against real directory entries.
+#   gs_sign_*   -- airgap_tx_signer's per-TX dir: holds unsigned_monero_tx and
+#                  the wallet-cli-produced signed_monero_tx (a RELAYABLE tx).
+#   gs_impout_* -- the multi-round output-import dir: holds the wallet
+#                  OUTPUT-SET blob, i.e. the holdings picture.
+#   .gs_pw_*    -- the wallet password in plaintext.
+GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_")
+
+#: The RAM-backed scratch root, as a name rather than a literal buried in
+#: _wipe_targeted_temp_roots.
+#:
+#: It is hoisted so a test can point the sweep somewhere harmless. It could
+#: not before: the function built ["/dev/shm", tempfile.gettempdir()], so
+#: patching gettempdir redirected only the SECOND root and the real /dev/shm
+#: was scanned regardless -- while test_shmwipe's own comment claimed it ran
+#: "without ever scanning the host's real /dev/shm". With dry=False that test
+#: securely DELETED any live gs_sign_*/gs_impout_*/.gs_pw_* it found there,
+#: which is exactly the scratch a concurrently running signer keeps in RAM.
+#: Observed: running the suite beside a real pipeline run made the entry count
+#: wrong, because the sweep had reached into the other run and erased its
+#: working directory.
+SHM_ROOT = "/dev/shm"
+
+
+def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
+    """Securely delete OUR scratch from temp roots we must not wipe wholesale.
+
+    Two roots were missed entirely, and both hold the worst material this
+    pipeline produces:
+
+    /dev/shm -- airgap_tx_signer PREFERS it for exactly the two files it most
+    wants gone quickly: the plaintext wallet password (.gs_pw_*) and the wallet
+    output-set scratch (gs_impout_*). Both are removed in a finally, so the
+    normal path was clean and the gap never showed in testing -- but a SIGKILL,
+    an OOM kill or a power loss runs no finally, and /dev/shm is a tmpfs that
+    survives every one of those short of the power loss. The module comment on
+    gs_impout_* already reasoned about precisely this SIGKILL case and then
+    named only /tmp as the fallback to cover, so the PREFERRED location went
+    uncovered. Choosing RAM-backed scratch made the file MORE sensitive to
+    leave behind, not less: it is the copy that exists when the crash happened.
+
+    $TMPDIR -- gs_sign_* is created with tempfile.mkdtemp(), which honours
+    TMPDIR. The blanket sweep hard-codes /tmp, so any operator with TMPDIR set
+    (common on shared hosts and inside some sandboxes) kept a signed, relayable
+    transaction on disk after a "successful" wipe.
+
+    These roots get PREFIX-TARGETED deletion, never the blanket uid-scoped
+    sweep /tmp gets. /dev/shm is shared infrastructure -- Chromium, PostgreSQL
+    and PulseAudio all keep live segments there owned by this same uid, and
+    wiping them would break running software. TMPDIR is worse: an operator can
+    legitimately point it at $HOME, and a blanket wipe would then destroy the
+    home directory. Matching our own prefixes is the only version of this that
+    is safe to run unattended.
+    """
+    count = 0
+    failed = 0
+    roots = [SHM_ROOT, tempfile.gettempdir()]
+    seen = set(os.path.realpath(d) for d in already_done)
+    for root in roots:
+        try:
+            real = os.path.realpath(root)
+        except OSError:
+            continue
+        if real in seen or not os.path.isdir(real):
+            continue
+        seen.add(real)
+        try:
+            entries = list(os.scandir(real))
+        except (PermissionError, OSError):
+            failed += 1
+            continue
+        for entry in entries:
+            if not entry.name.startswith(GS_TEMP_PREFIXES):
+                continue
+            try:
+                # lstat, so a symlink is judged by its OWN ownership rather
+                # than its target's -- otherwise a symlink planted by another
+                # user could aim this at a file we would then overwrite.
+                if os.lstat(entry.path).st_uid != uid:
+                    continue
+                if dry:
+                    print(f"  [dry] would securely remove {entry.path}")
+                    count += 1
+                    continue
+                p = Path(entry.path)
+                ok = (_secure_delete_dir(p)
+                      if entry.is_dir(follow_symlinks=False)
+                      else _secure_delete_file(p))
+                if ok:
+                    count += 1
+                else:
+                    failed += 1
+            except (PermissionError, OSError):
+                failed += 1
+    return count, failed
 
 
 def wipe_tmp_files(dry: bool):
-    """Remove user-owned files from temp directories."""
+    """SECURELY remove user-owned files from temp directories.
+
+    This used plain os.unlink / shutil.rmtree, which only drop directory
+    entries and leave the bytes recoverable -- in a module whose entire purpose
+    is that they are NOT recoverable, and which already had the overwrite
+    primitives right here. /tmp is exactly where the sensitive material lands:
+    airgap_tx_signer stages unsigned_monero_tx and the wallet-cli-produced
+    signed_monero_tx under /tmp/gs_sign_*, so a plain unlink here left a
+    relayable signed transaction on disk. Overwrite, then unlink.
+
+    Uses os.lstat (not entry.stat()) so a symlink in /tmp is judged by its own
+    ownership rather than its target's -- and _secure_delete_file refuses to
+    follow it regardless.
+
+    /tmp and /var/tmp get the blanket uid-scoped sweep. /dev/shm and $TMPDIR
+    are swept by PREFIX only -- see _wipe_targeted_temp_roots for why both are
+    real gaps and why neither may be wiped wholesale.
+    """
     uid = os.getuid()
     count = 0
-    for tmpdir in ["/tmp", "/var/tmp"]:
+    failed = 0
+    blanket = ["/tmp", "/var/tmp"]
+    for tmpdir in blanket:
         if not os.path.isdir(tmpdir):
             continue
         for entry in os.scandir(tmpdir):
             try:
-                if entry.stat().st_uid == uid:
-                    if dry:
-                        print(f"  [dry] would remove {entry.path}")
-                    else:
-                        if entry.is_dir(follow_symlinks=False):
-                            shutil.rmtree(entry.path, ignore_errors=True)
-                        else:
-                            os.unlink(entry.path)
+                if os.lstat(entry.path).st_uid != uid:
+                    continue
+                if dry:
+                    print(f"  [dry] would securely remove {entry.path}")
                     count += 1
+                    continue
+                p = Path(entry.path)
+                ok = (_secure_delete_dir(p)
+                      if entry.is_dir(follow_symlinks=False)
+                      else _secure_delete_file(p))
+                if ok:
+                    count += 1
+                else:
+                    failed += 1
             except (PermissionError, OSError):
-                pass
-    integrity_log("paranoia", f"tmp_wiped:{count}" if not dry else f"tmp_dry:{count}")
+                failed += 1
+
+    c2, f2 = _wipe_targeted_temp_roots(dry, uid, blanket)
+    count += c2
+    failed += f2
+
+    tail = f" ({failed} could not be removed)" if failed else ""
+    print(f"  [+] {'Would securely remove' if dry else 'Securely removed'} "
+          f"{count} temp entr{'y' if count == 1 else 'ies'}{tail}")
+    integrity_log("paranoia", f"tmp_wiped:{count}:failed={failed}"
+                  if not dry else f"tmp_dry:{count}")
+    return failed
 
 
 def wipe_clipboard(dry: bool):
-    """Clear clipboard contents from all common clipboard managers."""
+    """Clear clipboard contents from all common clipboard managers.
+
+    The clipboard is a real forensic target here: an operator copies an XMR
+    address or a swap memo through it. The old version counted only the tools
+    that ran and swallowed the case where a clipboard tool was PRESENT but
+    errored, so a genuine failure to clear reported nothing. Distinguish a
+    tool that is not installed (a clean skip -- that clipboard backend is not
+    in use) from a tool that ran and failed (a real, surfaced failure)."""
     count = 0
+    tool_errored = 0
     for cmd in [
         ["xclip", "-selection", "clipboard", "-i", "/dev/null"],
         ["xclip", "-selection", "primary", "-i", "/dev/null"],
@@ -339,9 +872,20 @@ def wipe_clipboard(dry: bool):
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=5)
             count += 1
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-    integrity_log("paranoia", f"clipboard:{'dry' if dry else 'wiped'}:{count}")
+        except FileNotFoundError:
+            continue                        # backend not installed -- not in use
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            tool_errored += 1
+    integrity_log("paranoia",
+                  f"clipboard:{'dry' if dry else 'wiped'}:{count}:errored={tool_errored}")
+    if not dry:
+        if tool_errored:
+            print(f"  [!] Clipboard: {count} selection(s) cleared, {tool_errored} tool(s) "
+                  f"errored — clipboard contents may persist.")
+        else:
+            print(f"  [+] Clipboard cleared ({count} selection(s))"
+                  if count else "  [*] No clipboard tool found; nothing to clear.")
+    return 1 if tool_errored else 0
 
 
 def wipe_xdg_traces(dry: bool):
@@ -364,22 +908,37 @@ def wipe_xdg_traces(dry: bool):
         Path.home() / ".local/share/Trash",
         Path.home() / ".local/share/tracker",
     ]
+    # count = targets ACTUALLY wiped. The previous version incremented on mere
+    # EXISTENCE and discarded the boolean _secure_delete_file/_secure_delete_dir
+    # return, so a permission-denied wipe still reported success -- the same
+    # overstating-the-wipe defect already fixed in wipe_gs_artifacts.
     count = 0
+    failed = 0
     for f in targets:
-        if f.exists():
-            if dry:
-                print(f"  [dry] would wipe {f}")
-            else:
-                _secure_delete_file(f)
+        if not f.exists():
+            continue
+        if dry:
+            print(f"  [dry] would wipe {f}")
             count += 1
+        elif _secure_delete_file(f):
+            count += 1
+        else:
+            failed += 1
     for d in dir_targets:
-        if d.is_dir():
-            if dry:
-                print(f"  [dry] would wipe dir {d}")
-            else:
-                _secure_delete_dir(d)
+        if not d.is_dir():
+            continue
+        if dry:
+            print(f"  [dry] would wipe dir {d}")
             count += 1
-    integrity_log("paranoia", f"xdg_traces:{'dry' if dry else 'wiped'}:{count}")
+        elif _secure_delete_dir(d):
+            count += 1
+        else:
+            failed += 1
+    tail = f" ({failed} could not be wiped)" if failed else ""
+    integrity_log("paranoia",
+                  f"xdg_traces:{'dry' if dry else 'wiped'}:{count}:failed={failed}")
+    print(f"  [+] {'Would wipe' if dry else 'Wiped'} {count} XDG trace(s){tail}")
+    return failed
 
 
 def scrub_env_vars(dry: bool):
@@ -394,14 +953,39 @@ def scrub_env_vars(dry: bool):
         "MONERO_RPC", "XMR_", "BTC_", "GHOSTSPIRAL", "GS_",
     ]
     count = 0
+    found = []
     for key in list(os.environ.keys()):
         if any(key.upper().startswith(p) for p in sensitive_prefixes):
+            found.append(key)
             if dry:
                 print(f"  [dry] would unset env {key}")
             else:
                 del os.environ[key]
             count += 1
     integrity_log("paranoia", f"env_vars:{'dry' if dry else 'scrubbed'}:{count}")
+    print(f"  [+] {'Would unset' if dry else 'Unset'} {count} sensitive env var(s) "
+          f"in this process")
+    # NAME THEM, and name the remedy.
+    #
+    # The docstring has always been correct that a process cannot change its
+    # parent's environment -- but the operator reads the terminal, not the
+    # docstring, and "Unset 5 sensitive env var(s) in this process" followed by
+    # "every phase reported success" reads as done. It is not: the shell that
+    # exported GS_WALLET_PASSWORD still has it, still hands it to everything
+    # launched from that terminal, and still shows it in
+    # /proc/<shell-pid>/environ for as long as the terminal is open.
+    #
+    # The variables are known here by name, so say which ones and give the
+    # exact command rather than leaving the operator to work it out.
+    if found:
+        print(f"  [!] These are still set in the SHELL that started this — this "
+              f"process cannot unset them there:")
+        print(f"        unset {' '.join(sorted(found))}")
+        print(f"      Until you do, that terminal keeps handing them to every "
+              f"command you run, and they stay readable in "
+              f"/proc/<shell-pid>/environ.")
+    # del os.environ[...] cannot fail here, so this phase has no failure mode.
+    return 0
 
 
 def main():
@@ -420,59 +1004,164 @@ def main():
     ap.add_argument("--search-dir", action="append", default=[],
                     help="additional directories to search for GhostSpiral artifacts "
                          "(can be specified multiple times)")
+    # This tool DESTROYS integrity_chain.log, so it is the operator's last
+    # chance to check it. Nothing in this toolchain verified the chain at all
+    # before now -- every header advertised "integrity hash-chain logging" and
+    # the chain was real, but no code ever recomputed it, which makes it an
+    # append-only log rather than tamper evidence.
+    ap.add_argument("--verify-chain", action="store_true",
+                    help="recompute integrity_chain.log and report the first "
+                         "broken link, then exit without wiping anything. "
+                         "Detects edits and mid-file deletions; tail "
+                         "truncation is undetectable by design.")
     args = ap.parse_args()
+
+    if args.verify_chain:
+        ok, bad, why = verify_integrity_chain()
+        if ok:
+            print(f"  [+] Integrity chain OK — {why}")
+            # Not logged: appending here would extend the very chain just
+            # verified, so the printed result and the file would disagree the
+            # moment anyone re-ran this.
+            #
+            # sys.exit, not `return`: main() is invoked bare at the bottom of
+            # this file, so a returned code is DISCARDED and the process exits
+            # 0. A failed verification that exits 0 is the exact fake-success
+            # this tool has already been corrected for twice.
+            sys.exit(0)
+        where = f" at line {bad}" if bad else ""
+        print(f"  [!] INTEGRITY CHAIN FAILED{where}: {why}")
+        print(f"  [!] A link does not recompute, so this log has been altered "
+              f"since it was written. Treat everything it says as unreliable.")
+        sys.exit(1)
 
     require_resources(min_disk_gb=1.0)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
 
-    print("  [*] Phase 1: MAC spoof")
-    spoof_mac(args.iface, args.dry_run)
+    # Each phase returns its FAILURE COUNT (0 = clean). They are collected so
+    # the final line can tell the truth: the old code printed
+    # "paranoia_mode complete." unconditionally, so an operator whose MAC spoof
+    # failed, whose swap was never wiped and whose artifacts were permission-
+    # denied still read "complete" and believed the host was clean. A wipe tool
+    # that reports success it did not achieve is worse than none.
+    #
+    # A phase raising unexpectedly must not abandon the phases after it (the
+    # artifact wipe is LAST and most important), so each is guarded and a crash
+    # counts as that phase failing.
+    failures: dict[str, int] = {}
+
+    def run_phase(n, name, fn, *a):
+        print(f"  [*] Phase {n}: {name}")
+        try:
+            failures[name] = int(fn(*a) or 0)
+        except SystemExit:
+            raise
+        except Exception as e:                      # noqa: BLE001
+            # Cannot integrity_log for the artifact phase safely, but every
+            # other phase is fine; keep it simple and just record + report.
+            print(f"  [!] Phase {n} ({name}) errored: {str(e)[:80]}")
+            failures[name] = 1
+
+    run_phase(1, "MAC spoof", spoof_mac, args.iface, args.dry_run)
 
     print("  [*] Phase 2: DNS check")
     if args.dry_run:
         print("  [dry] would check DNS connectivity (skipped to avoid DNS leak)")
+        failures["DNS check"] = 0
     else:
-        dns_check()
+        failures["DNS check"] = dns_check()
 
-    print("  [*] Phase 3: DNS cache flush")
-    flush_dns_cache(args.dry_run)
+    run_phase(3, "DNS cache flush", flush_dns_cache, args.dry_run)
+    run_phase(4, "Shell histories", wipe_shell_histories, args.dry_run)
+    run_phase(5, "Python cache", wipe_pycache, args.dry_run)
+    run_phase(6, "Temp files", wipe_tmp_files, args.dry_run)
+    run_phase(7, "System logs", wipe_system_logs, args.wipe_days, args.dry_run)
+    run_phase(8, "Journal", clear_journal, args.dry_run)
+    run_phase(9, "Swap/RAM", wipe_swap_ram, args.dry_run)
+    run_phase(10, "Clipboard", wipe_clipboard, args.dry_run)
+    run_phase(11, "XDG traces (recently-used, thumbnails, Trash, bookmarks)",
+              wipe_xdg_traces, args.dry_run)
+    run_phase(12, "Environment variables", scrub_env_vars, args.dry_run)
 
-    print("  [*] Phase 4: Shell histories")
-    wipe_shell_histories(args.dry_run)
+    # Artifacts MUST run LAST because it wipes integrity_chain.log. Any
+    # integrity_log() call after this point would RECREATE the file, leaving
+    # forensic evidence -- so the honest summary below prints only to the
+    # terminal and never logs.
+    run_phase(13, "GhostSpiral artifacts (runs last — wipes integrity log)",
+              wipe_gs_artifacts, args.dry_run, args.search_dir)
 
-    print("  [*] Phase 5: Python cache")
-    wipe_pycache(args.dry_run)
-
-    print("  [*] Phase 6: Temp files")
-    wipe_tmp_files(args.dry_run)
-
-    print("  [*] Phase 7: System logs")
-    wipe_system_logs(args.wipe_days, args.dry_run)
-
-    print("  [*] Phase 8: Journal")
-    clear_journal(args.dry_run)
-
-    print("  [*] Phase 9: Swap/RAM")
-    wipe_swap_ram(args.dry_run)
-
-    print("  [*] Phase 11: Clipboard")
-    wipe_clipboard(args.dry_run)
-
-    print("  [*] Phase 12: XDG traces (recently-used, thumbnails, Trash, bookmarks)")
-    wipe_xdg_traces(args.dry_run)
-
-    print("  [*] Phase 13: Environment variables")
-    scrub_env_vars(args.dry_run)
-
-    # Phase 14 (GhostSpiral artifacts) MUST run LAST because it wipes
-    # integrity_chain.log. Any integrity_log() calls after this point
-    # would recreate the file, leaving forensic evidence.
-    print("  [*] Phase 14: GhostSpiral artifacts (runs last — wipes integrity log)")
-    wipe_gs_artifacts(args.dry_run, extra_dirs=args.search_dir)
-
-    # DO NOT call integrity_log() here — it would recreate the wiped log file
-    print("\n  [+] paranoia_mode complete.")
+    # ── honest summary. NO integrity_log() past this point. ────────────────
+    bad = {k: v for k, v in failures.items() if v}
+    total = sum(bad.values())
+    print()
+    if args.dry_run:
+        print("  [+] paranoia_mode DRY RUN complete — nothing was changed. "
+              "Re-run without --dry-run to act.")
+    elif not bad:
+        print("  [+] paranoia_mode complete — every phase reported success.")
+        print("  [i] Best-effort caveats still apply: swap-device bytes and freed")
+        print("      RAM are not zeroed, and CoW/SSD filesystems can retain blocks.")
+        # THE BIGGEST THING THIS TOOL DOES NOT DO, said out loud.
+        #
+        # "Every phase reported success" reads like "the host is clean of the
+        # mix". It is not, and the gap is not a caveat about block remanence --
+        # it is the wallet, sitting in plain sight. This tool deletes the
+        # pipeline's ARTIFACTS; it deliberately never touches the wallet file,
+        # because that is the operator's money. A wallet holds the balances,
+        # the transaction history, and every subaddress the run created, which
+        # is the entire mix graph. An operator who reads "complete" and infers
+        # "nothing here connects me to the run" has been misled by silence.
+        print()
+        print("  [!] THE WALLET IS STILL HERE, and it is not an oversight: this tool")
+        print("      wipes the pipeline's artifacts, never the wallet file, because")
+        print("      that file is your money. It holds the balances, the transaction")
+        print("      history and every subaddress the run created — i.e. the whole")
+        print("      mix graph. Anyone who opens that wallet, or holds its view key,")
+        print("      sees the run regardless of how clean this host now looks.")
+        print("      Protecting it is disk encryption and where the keys live")
+        print("      (see OPSEC_SETUP.md), not this wipe.")
+        # THE TWO THINGS ONLY THE OPERATOR CAN DO.
+        #
+        # Both were printed by their own phases, thirteen phases and a lot of
+        # scrolling ago. The last thing on screen is "every phase reported
+        # success", and this file already decided -- when it added the wallet
+        # caveat above -- that letting a completion line stand alone misleads
+        # by silence. These belong in the same place, for the same reason: they
+        # are not caveats about what cannot be done, they are ACTIONS still
+        # outstanding, and a wipe that ends without naming them ends early.
+        _still = []
+        if any(h.exists() for h in _shell_histories()):
+            _still.append(
+                "Close every terminal that was open during the run, or run "
+                "`history -c && history -w`\n        in each one (fish: "
+                "`history clear`). A shell holds its history in MEMORY and "
+                "writes it\n        back out when it exits — including any "
+                "command you typed a password or address into.")
+        _envleft = [k for k in os.environ
+                    if k.upper().startswith(("GS_", "GHOSTSPIRAL", "XMR_", "BTC_"))]
+        if _envleft:
+            _still.append(
+                "Run `unset " + " ".join(sorted(_envleft)) + "` in the shell "
+                "that started this.\n        This process cannot unset them "
+                "there, and until you do that terminal keeps\n        handing "
+                "them to every command you run.")
+        if _still:
+            print()
+            print("  [!] STILL TO DO — this tool cannot do these for you:")
+            for _i, _t in enumerate(_still, 1):
+                print(f"      {_i}. {_t}")
+    else:
+        print(f"  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT known clean.")
+        for name, n in bad.items():
+            print(f"      - {name}: {n} failure(s)")
+        print(f"  [!] {total} item(s)/phase(s) did not complete. Many phases need root")
+        print(f"      (sudo) — re-run failed steps and verify before assuming clean.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit(main()), not a bare main(): a code returned from main() was
+    # silently dropped and the process exited 0 regardless. main() returns None
+    # on its normal path, and sys.exit(None) is still 0, so this changes
+    # nothing except that a non-zero return can no longer be lost.
+    sys.exit(main())

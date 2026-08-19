@@ -1,27 +1,77 @@
 #!/usr/bin/env python3
 """
-exit_strategy_simulator v10.0 - Off-Ramp Planner w/ Liquidity Probe
-====================================================================
+exit_strategy_simulator v10.1 - Off-Ramp Reference (measured values only)
+========================================================================
 Part of the GhostSpiral v10 tool-chain. Generates a schema-tagged
 exitplan_v1.json bundle.
 
+IT DOES NOT SIMULATE ANYTHING, AND IT NO LONGER PRETENDS TO. It reports what
+can actually be established and refuses to invent the rest. Two things it
+used to fabricate are gone:
+
+  * LIQUIDITY. There was a liquidity_estimate() that returned "LOW" / "MEDIUM"
+    / "OK — typical volume for P2P markets" from a three-branch `if` on the
+    trade size, bucketed at 10 and 50 XMR. It probed nothing. It was printed
+    beside live prices under a heading called "Liquidity", which is exactly
+    how an invented number gets read as a measurement. Bisq and Haveno are
+    P2P and have no queryable order book, so the honest output is to say the
+    depth is not knowable from here -- not to guess it and label the guess.
+    (It also leaked: the band is a pure function of the amount, so it gave
+    away the magnitude that --redact had just masked on the same screen.)
+
+  * SLIPPAGE. Each method carried a hard-coded slippage constant (1%, 0.8%,
+    3%) that was silently subtracted from the operator's net. Slippage is a
+    property of a live quote against a live book; nothing here has either.
+    It is now supplied by the operator (--slippage-pct) and defaults to ZERO,
+    so nothing invented ever reduces the figure they are shown.
+
+What IS real, and why each is allowed to stay:
+  * The PRICE is fetched live (CoinGecko, Bisq oracle fallback) or the tool
+    aborts. It never serves a made-up price.
+  * The FIAT VALUE is that live rate times the amount -- an actual
+    calculation over two real inputs.
+  * KYC is a checkable property of the venue, not an estimate.
+  * The venue FEE is a nominal published rate, and is now labelled as
+    UNCONFIRMED unless the operator passes --fee-pct with the rate their
+    venue actually quoted. The net is marked with which of the two it used.
+
+THIS TOOL IS NOT THE EXIT, and it is no longer wired in as one. It moves no
+XMR, contacts no venue and places no order; it reports what a holding is worth
+at a live rate. GhostSpiral used to run it as "Stage 5d: exit strategy", which
+made a valuation look like a withdrawal -- the pipeline announced completion
+while every output it had created was still sitting on the operator's wallet.
+
+The actual exit is GhostSpiral's --exit-to, which withdraws the mixed funds
+one transaction per output. This is a standalone reference the operator can
+run whenever they want a valuation.
+
 OPSEC hardening:
   - Tor verified before any API access
-  - No sensitive amounts or addresses leaked to terminal (redacted)
   - Atomic fsync-rename output with 0600 perms
-  - Integrity hash-chain logging
+  - Integrity hash-chain logging (amounts are NOT written to the chain)
   - KYC risk flagging
-  - Liquidity depth validation (warns if thin)
+  - --redact masks the figures on screen for shoulder-surfing / screen-sharing
+  - The amount comes from GS_EXIT_AMOUNT, NOT argv: /proc/<pid>/cmdline is
+    world-readable (0444) while /proc/<pid>/environ is owner-only (0400), so a
+    command-line amount tells every local account the size of the holding
+
+TERMINAL OUTPUT IS NOT REDACTED BY DEFAULT, and this header used to claim it
+was ("No sensitive amounts or addresses leaked to terminal (redacted)") while
+printing the exact holding and its exact fiat value. That claim was false: the
+figures ARE the output of an off-ramp reference and the operator needs to read
+them. Use --redact when someone may be looking, which masks the magnitudes on
+screen while the full plan still goes to the 0600 JSON file.
 """
 from __future__ import annotations
-import argparse, sys, time
+import argparse, os, sys, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Dict
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
-    atomic_write_json, install_signal_handlers,
+    atomic_write_json, install_signal_handlers, shutdown_requested,
+    env_or_argv, wipe_covers, decimal_arg,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -29,11 +79,24 @@ CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_cu
 # The Bisq price oracle is the closest to an official data source.
 BISQ_PRICE_URL = "https://price.bisq.wiz.biz/getAllMarketPrices"
 
+# NOMINAL published fee rates, and the venue's KYC status.
+#
+# `slippage` used to live here too, as a per-method constant (1%, 0.8%, 3%)
+# that was subtracted from the operator's net as though it had been measured.
+# Slippage only exists relative to a live quote against a live book; this tool
+# has neither, so inventing one produced a smaller, more precise-looking number
+# than anybody could actually know. It is now --slippage-pct, operator-supplied
+# and defaulting to zero.
+#
+# fee_pct stays because a venue's published rate is a real, checkable figure --
+# but it is what the venue ADVERTISES, not what this run was quoted, so it is
+# reported as UNCONFIRMED unless the operator passes --fee-pct. kyc is a plain
+# property of the venue and is never estimated.
 METHODS: Dict[str, Dict] = {
-    "bisq":   {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.01"),  "kyc": False},
-    "haveno": {"fee_pct": Decimal("0.003"), "slippage": Decimal("0.008"), "kyc": False},
-    "azteco": {"fee_pct": Decimal("0.05"),  "slippage": Decimal("0.00"),  "kyc": True},
-    "p2p":    {"fee_pct": Decimal("0.00"),  "slippage": Decimal("0.03"),  "kyc": False},
+    "bisq":   {"fee_pct": Decimal("0.003"), "kyc": False},
+    "haveno": {"fee_pct": Decimal("0.003"), "kyc": False},
+    "azteco": {"fee_pct": Decimal("0.05"),  "kyc": True},
+    "p2p":    {"fee_pct": Decimal("0.00"),  "kyc": False},
 }
 
 
@@ -41,13 +104,25 @@ def fetch_prices(proxy):
     """Fetch XMR and BTC prices. Falls back to Bisq price oracle if CoinGecko fails."""
     try:
         j = safe_get(CG_URL, proxy)
-        return {
+        out = {
             "xmr_usd": Decimal(str(j["monero"]["usd"])),
             "xmr_eur": Decimal(str(j["monero"]["eur"])),
             "btc_usd": Decimal(str(j["bitcoin"]["usd"])),
             "btc_eur": Decimal(str(j["bitcoin"]["eur"])),
-            "source": "coingecko",
         }
+        # Every rate must be POSITIVE. The Bisq branch below guards each field
+        # with `price > 0` and gs_common.btc_per_xmr_oracle raises on a
+        # non-positive rate -- this path, reading the same CoinGecko endpoint,
+        # took whatever number came back. A zero or negative rate would be
+        # served as a live price under a header promising the tool "never
+        # serves a made-up price", and a zero rate silently values the entire
+        # holding at 0.00. Falling through to Bisq is the right response, and
+        # is what the sibling would already have done.
+        bad = [k for k, v in out.items() if v <= 0]
+        if bad:
+            raise ValueError(f"non-positive rate(s) from CoinGecko: {bad}")
+        out["source"] = "coingecko"
+        return out
     except Exception as e:
         integrity_log("exit", f"coingecko_fail:{str(e)[:40]}")
 
@@ -59,66 +134,142 @@ def fetch_prices(proxy):
             code = entry.get("currencyCode", "")
             price = entry.get("price", 0)
             if code == "XMR" and price > 0:
+                # Bisq quotes altcoin markets as BTC-per-unit (BTC per XMR).
                 prices["xmr_btc"] = Decimal(str(price))
             elif code == "USD" and price > 0:
-                prices["btc_usd"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                # Bisq quotes fiat as fiat-per-BTC (USD per BTC). Do NOT invert:
+                # xmr_usd = xmr_btc[BTC/XMR] * btc_usd[USD/BTC] = USD/XMR. The
+                # old 1.0/price made btc_usd = BTC/USD, so the product came out
+                # ~9 orders of magnitude too small and quantized to 0.00.
+                prices["btc_usd"] = Decimal(str(price))
             elif code == "EUR" and price > 0:
-                prices["btc_eur"] = Decimal(str(1.0 / price)) if price else Decimal(0)
+                prices["btc_eur"] = Decimal(str(price))
 
         if "xmr_btc" in prices and "btc_usd" in prices:
             xmr_usd = prices["xmr_btc"] * prices["btc_usd"]
-            xmr_eur = prices["xmr_btc"] * prices.get("btc_eur", prices["btc_usd"])
-            integrity_log("exit", "bisq_price_oracle_ok")
-            return {
+            out = {
                 "xmr_usd": xmr_usd.quantize(Decimal("0.01")),
-                "xmr_eur": xmr_eur.quantize(Decimal("0.01")),
                 "btc_usd": prices["btc_usd"].quantize(Decimal("0.01")),
-                "btc_eur": prices.get("btc_eur", prices["btc_usd"]).quantize(Decimal("0.01")),
                 "source": "bisq_oracle",
             }
+            # Only emit EUR fields if Bisq actually returned a EUR/BTC price.
+            # The old code fell back to btc_usd for a missing EUR rate, which
+            # silently reported USD figures under a EUR label. If EUR wasn't
+            # quoted, leave it out — main() will refuse a --currency it lacks.
+            if "btc_eur" in prices:
+                out["xmr_eur"] = (prices["xmr_btc"] * prices["btc_eur"]).quantize(Decimal("0.01"))
+                out["btc_eur"] = prices["btc_eur"].quantize(Decimal("0.01"))
+            integrity_log("exit", "bisq_price_oracle_ok")
+            return out
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{str(e)[:40]}")
+        _bisq_err = e
 
+    # Name the ACTUAL failure. This always said "Check Tor connectivity", but
+    # the broad except above catches parse and type errors too -- a malformed
+    # or changed Bisq payload was reported to the operator as a network
+    # problem, sending them to debug Tor when Tor was fine.
+    _why = ""
+    try:
+        _e = _bisq_err
+    except NameError:
+        _e = None
+    if _e is not None and not isinstance(
+            _e, (OSError, ConnectionError, TimeoutError)):
+        _why = (f"\n    The Bisq fallback did not fail on the network: it failed "
+                f"parsing the\n    response ({type(_e).__name__}: {str(_e)[:60]}). "
+                f"That is a payload/format\n    problem, not a connectivity one.")
     sys.exit(
         "[!] All price oracles failed (CoinGecko + Bisq).\n"
-        "    Cannot generate exit plan without prices.\n"
+        "    Cannot generate exit plan without prices." + _why + "\n"
         "    Check Tor connectivity and retry."
     )
-
-
-def liquidity_estimate(method: str, amount_xmr: Decimal) -> str:
-    """Provide liquidity guidance based on method and amount.
-    P2P DEXs like Bisq/Haveno don't have queryable order books,
-    so we give heuristic guidance instead of fake API calls."""
-    if method in ("bisq", "haveno"):
-        if amount_xmr > Decimal("50"):
-            return "LOW — consider splitting across multiple trades over days"
-        elif amount_xmr > Decimal("10"):
-            return "MEDIUM — may take multiple trades to fill"
-        else:
-            return "OK — typical volume for P2P markets"
-    elif method == "p2p":
-        return "UNKNOWN — depends on your counterparty"
-    elif method == "azteco":
-        return "HIGH — voucher-based, no order book"
-    return "UNKNOWN"
 
 
 def main():
     install_signal_handlers()
 
     ap = argparse.ArgumentParser(
-        "exit_strategy_simulator v10.0",
-        description="Plan XMR off-ramp with liquidity analysis",
+        "exit_strategy_simulator v10.1",
+        # Not "liquidity analysis": nothing here analyses liquidity, and the
+        # function that claimed to has been removed.
+        description="XMR off-ramp reference: live valuation and venue facts. "
+                    "Moves no XMR and places no order.",
     )
-    ap.add_argument("amount", type=Decimal, help="XMR amount to off-ramp")
+    # The amount is read from GS_EXIT_AMOUNT by preference, and the positional
+    # is OPTIONAL so the pipeline never has to put it on a command line.
+    #
+    # /proc/<pid>/cmdline is mode 0444 -- world-readable by every account on
+    # the host, for the lifetime of the process. /proc/<pid>/environ is 0400,
+    # owner only. Both measured, not assumed.
+    #
+    # GhostSpiral invoked this as `exit_strategy_simulator <amount> ...`, so a
+    # second local user running `ps` learned the exact size of the holding
+    # being off-ramped. This repo already refuses argv for the wallet password
+    # for precisely that reason, and it strips amounts out of the integrity
+    # chain because "the amount deanonymises the hop it is meant to hide" --
+    # and then published the total on a command line. The environment is not a
+    # secret store either, but it is not broadcast to every process the way a
+    # command line is.
+    ap.add_argument("amount", type=decimal_arg, nargs="?", default=None,
+                    help="XMR amount to off-ramp. Prefer GS_EXIT_AMOUNT=... : an "
+                         "argv amount is world-readable via ps and "
+                         "/proc/<pid>/cmdline (mode 444).")
     ap.add_argument("--method", choices=list(METHODS.keys()), default="bisq")
     ap.add_argument("--currency", choices=["usd", "eur"], default="usd")
+    # Real numbers come from the operator, not from this file. Without these
+    # the fee falls back to the venue's NOMINAL published rate (reported as
+    # unconfirmed) and slippage is ZERO rather than an invented constant.
+    ap.add_argument("--fee-pct", type=decimal_arg, default=None,
+                    help="the fee rate your venue ACTUALLY quoted, as a "
+                         "fraction (0.003 = 0.3%%). Without it the venue's "
+                         "nominal published rate is used and the result is "
+                         "labelled UNCONFIRMED.")
+    ap.add_argument("--slippage-pct", type=decimal_arg, default=None,
+                    help="slippage from a real quote, as a fraction. Defaults "
+                         "to 0: slippage is only knowable against a live order "
+                         "book, and this tool has no quote, so it will not "
+                         "invent one.")
     ap.add_argument("--tor-proxy")
     ap.add_argument("--suppress-kyc", action="store_true")
+    ap.add_argument("--redact", action="store_true",
+                    help="mask amounts and values on the terminal (the full plan "
+                         "is still written to the 0600 JSON file). Use when "
+                         "screen-sharing or in a shoulder-surfing risk. It masks "
+                         "the DIGITS, not the digit COUNT -- a 3-digit holding "
+                         "still shows as ###.#### -- so it hides the exact figure, "
+                         "not the order of magnitude.")
     ap.add_argument("--outfile", default="exitplan_v1.json")
     args = ap.parse_args()
 
+    # Environment wins over argv, matching GhostSpiral's and the signer's rule
+    # for the wallet password, so the two agree.
+    # Shared helper -- see GhostSpiral.resolve_wallet_password. The hand-rolled
+    # copy here had the same hole: GS_EXIT_AMOUNT and a positional amount
+    # together produced no warning while the amount sat on argv, and the typed
+    # value was discarded without saying the two disagreed.
+    #
+    # No allow_empty: an empty GS_EXIT_AMOUNT is a shell unsetting a variable,
+    # not a request to off-ramp nothing.
+    _amt = env_or_argv("GS_EXIT_AMOUNT", args.amount, "The off-ramp amount")
+    if _amt is not None:
+        try:
+            args.amount = Decimal(str(_amt))
+        except Exception:                                    # noqa: BLE001
+            sys.exit(f"[!] The off-ramp amount is not a number: {str(_amt)[:40]!r}")
+    else:
+        args.amount = None
+
+    if args.amount is None:
+        sys.exit("[!] No amount. Set GS_EXIT_AMOUNT=<xmr> (preferred) or pass it "
+                 "as the positional argument.")
+    # Decimal ACCEPTS "NaN", "Infinity" and "1e400". NaN then makes the
+    # positivity test below raise InvalidOperation (a raw traceback instead of
+    # a message), and Infinity sails past it into the fee/net arithmetic and
+    # produces a plan file full of garbage. Reject them by name first.
+    if not args.amount.is_finite():
+        sys.exit(f"[!] Amount must be a finite number (got {args.amount}). "
+                 f"'NaN' and 'Infinity' parse as Decimals but are not amounts.")
     if args.amount <= 0:
         sys.exit("[!] Amount must be positive")
 
@@ -130,21 +281,61 @@ def main():
     proxy = validate_proxy(args.tor_proxy)
     verify_tor(proxy)
 
+    # HONOUR the handlers this installed. install_signal_handlers() replaces
+    # the default SIGINT/SIGTERM disposition with one that sets a flag -- so a
+    # tool that installs it and never checks the flag has SWALLOWED Ctrl-C
+    # outright: not slow to respond, unresponsive. Every other tool in the
+    # chain checks shutdown_requested(); this one imported the installer and
+    # not the predicate.
+    #
+    # Checked at the two points where stopping still means something: before
+    # the oracle fetch (which goes out over Tor) and before the plan is written
+    # to disk. An operator who hits Ctrl-C because the screen is being shared
+    # wants exactly those two things not to happen.
+    if shutdown_requested():
+        sys.exit("[!] Interrupted before contacting the price oracle. Nothing "
+                 "was fetched and no plan was written.")
+
     prices = fetch_prices(proxy)
 
     cfg = METHODS[args.method]
     gross = args.amount
-    fee = gross * cfg["fee_pct"]
-    slip = gross * cfg["slippage"]
+
+    # Every rate that reduces the operator's figure is either supplied by them
+    # or flagged as the venue's unconfirmed advertised rate. Nothing invented
+    # here shrinks the number they read.
+    fee_confirmed = args.fee_pct is not None
+    fee_pct = args.fee_pct if fee_confirmed else cfg["fee_pct"]
+    slip_pct = args.slippage_pct if args.slippage_pct is not None else Decimal("0")
+    for _label, _v in (("--fee-pct", args.fee_pct),
+                       ("--slippage-pct", args.slippage_pct)):
+        if _v is not None and (not _v.is_finite() or _v < 0 or _v >= 1):
+            sys.exit(f"[!] {_label} must be a fraction in [0, 1) -- 0.003 means "
+                     f"0.3%. Got {_v}.")
+
+    fee = gross * fee_pct
+    slip = gross * slip_pct
     net = gross - fee - slip
 
     if net <= 0:
         sys.exit(f"[!] Net amount after fees+slippage is non-positive: {net}")
 
-    fiat_rate = prices[f"xmr_{args.currency}"]
+    rate_key = f"xmr_{args.currency}"
+    if rate_key not in prices:
+        sys.exit(
+            f"[!] The active price oracle ({prices.get('source', '?')}) did not "
+            f"provide an {args.currency.upper()} rate for XMR.\n"
+            f"    Re-run with --currency usd, or use a source that quotes "
+            f"{args.currency.upper()}. Refusing to fabricate the rate."
+        )
+    fiat_rate = prices[rate_key]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
-    liq_guidance = liquidity_estimate(args.method, gross)
+    # Depth is stated as NOT KNOWN rather than guessed. This is a constant, so
+    # unlike the old size-bucketed guidance it cannot leak the magnitude that
+    # --redact masks on the same screen.
+    DEPTH_UNKNOWN = ("not known from here — Bisq/Haveno are P2P and expose no "
+                     "order book; check depth at the venue before committing")
 
     plan = {
         "schema": "exitplan_v1",
@@ -152,35 +343,127 @@ def main():
         "method": args.method,
         "kyc_required": cfg["kyc"],
         "amount_in_xmr": str(gross),
-        "fee_pct": str(cfg["fee_pct"]),
-        "slippage_pct": str(cfg["slippage"]),
+        "fee_pct": str(fee_pct),
+        # A machine reading this file must be able to tell a rate the operator
+        # confirmed from the venue's advertised one. Without these two flags
+        # both look identical, which is how an assumption gets consumed as a
+        # measurement downstream.
+        "fee_pct_confirmed": fee_confirmed,
+        "fee_pct_source": "operator" if fee_confirmed else "venue_nominal_unconfirmed",
+        "slippage_pct": str(slip_pct),
+        "slippage_pct_source": ("operator" if args.slippage_pct is not None
+                                else "not_supplied_assumed_zero"),
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
         "currency": args.currency,
         "amount_out_fiat": str(fiat_val),
-        "oracle_prices": {k: str(v) for k, v in prices.items()
-                          if k != "source"},
+        # COARSENED to whole currency units, to match the coarsened timestamp
+        # above. `timestamp` is floored to a 10-minute bucket specifically to
+        # blur when this plan was made -- and then this field recorded four
+        # live spot prices at full precision from that same instant. Spot
+        # prices move continuously, so anyone with price history can invert
+        # them to the minute and undo the coarsening, in the same file, two
+        # lines apart. Whole units are plenty for auditing which venue and rate
+        # the plan assumed.
+        "oracle_prices": {k: str(Decimal(str(v)).quantize(Decimal("1")))
+                          for k, v in prices.items() if k != "source"},
+        "oracle_prices_note": "rounded to whole units: full precision would "
+                              "re-establish the timestamp this plan coarsens",
         "price_source": prices.get("source", "unknown"),
-        "liquidity_guidance": liq_guidance,
+        # Was "liquidity_guidance", carrying a size-bucketed guess. A consumer
+        # reading that key got an invented verdict in the same shape as the
+        # real fields beside it. The key now states that the depth is unknown,
+        # which is the true answer, and there is no number to misread.
+        "liquidity_guidance": DEPTH_UNKNOWN,
+        "executed": False,
+        "executed_note": "this tool moves no XMR, contacts no venue and places "
+                         "no order; the off-ramp is manual",
     }
 
-    atomic_write_json(plan, Path(args.outfile))
+    if shutdown_requested():
+        sys.exit(f"[!] Interrupted before writing {args.outfile}. No plan file "
+                 f"was created.")
+    _out = Path(args.outfile)
+    # Say so when the plan is being written somewhere the wipe cannot reach.
+    # paranoia_mode globs fixed roots (cwd, $HOME, $HOME/ghostspiral,
+    # $HOME/GhostSpiral) at depth 0 and 1, so `--outfile /mnt/usb/plan.json`
+    # writes the holding size, its fiat value and the venue to a file no wipe
+    # will ever find -- and the operator has no reason to suspect it, because
+    # the tool reports "Plan saved" either way.
+    # gs_common.wipe_covers, not a fourth inline copy of the root list: this
+    # logic was here and GhostSpiral's --output had no equivalent, so the two
+    # tools disagreed about the same question and a wrong answer is silent.
+    if not wipe_covers(_out):
+        # _dir is computed HERE. Replacing the old inline coverage test with
+        # wipe_covers deleted the local this message interpolated, so the
+        # warning path raised NameError -- the branch that exists to stop a
+        # silent leak became the one that crashed. It survived the test suite
+        # because every case there wrote somewhere the wipe DOES cover, so the
+        # branch never ran; found by probing --redact against a /tmp outfile.
+        try:
+            _dir = _out.resolve().parent
+        except OSError:
+            _dir = _out.parent
+        print(f"  [!] {_out} is outside every directory paranoia_mode searches.")
+        print(f"  [!] This file holds the holding size, its fiat value and the "
+              f"venue. The wipe will NOT find it — erase it yourself, or pass "
+              f"--search-dir {_dir} to paranoia_mode.")
+        integrity_log("exit", "outfile_outside_wipe_roots")
+    atomic_write_json(plan, _out)
 
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
     integrity_log("exit", f"{args.method}|{kyc_tag}")
 
-    kyc_label = "KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"
+    def _m(v, unit=""):
+        """Mask a magnitude when --redact is on. Order of magnitude is kept so
+        the operator can still sanity-check the plan; the digits are not."""
+        if not args.redact:
+            return f"{v}{unit}"
+        d = len(str(int(Decimal(str(v)).copy_abs())))
+        return f"{'#' * d}.{'#' * 4}{unit} (redacted, {d}-digit)"
+
+    # THE LABEL IS ALWAYS THE TRUTH. --suppress-kyc silences the warning line
+    # below; it does not change what the method is.
+    #
+    # This read `"KYC" if cfg["kyc"] and not args.suppress_kyc else "No-KYC"`,
+    # so `--suppress-kyc --method azteco` printed
+    #     Method      : azteco (No-KYC)
+    # for a method this file's own METHODS table marks kyc=True -- while the
+    # exitplan_v1.json it wrote in the same run recorded kyc_required: true.
+    # The screen and the file contradicted each other and the screen is the one
+    # the operator reads.
+    #
+    # A flag named "suppress" reads as "stop nagging me", not "relabel the
+    # venue". KYC is the precise point where a pseudonymous chain position
+    # becomes a legal identity, so an off-ramp planner in a privacy toolchain
+    # calling a KYC venue No-KYC is the single worst false statement it can
+    # make. Suppress the WARNING, never the fact.
+    kyc_label = "KYC" if cfg["kyc"] else "No-KYC"
+    # Each derived line says where its rate came from. A number the operator
+    # confirmed and a number this file shipped as a default must never print
+    # the same way -- that equivalence is what made the old output read like a
+    # quote when it was an assumption.
+    _fee_src = "confirmed" if fee_confirmed else "NOMINAL, UNCONFIRMED"
+    _slip_src = "from your quote" if args.slippage_pct is not None \
+        else "not supplied, assumed 0"
     print(f"  Method      : {args.method} ({kyc_label})")
-    print(f"  Gross       : {gross} XMR")
-    print(f"  Fees        : {fee:.4f} XMR ({cfg['fee_pct'] * 100:.1f}%)")
-    print(f"  Slippage    : {slip:.4f} XMR")
+    print(f"  Gross       : {_m(gross, ' XMR')}")
+    print(f"  Fees        : {_m(round(fee, 4), ' XMR')} "
+          f"({fee_pct * 100:.1f}% — {_fee_src})")
+    print(f"  Slippage    : {_m(round(slip, 4), ' XMR')} ({_slip_src})")
     print(f"  ----------------------------------------")
-    print(f"  Net         : {net:.4f} XMR")
-    print(f"  Value       : {fiat_val} {args.currency.upper()}")
-    print(f"  Prices from : {prices.get('source', 'unknown')}")
-    print(f"  Liquidity   : {liq_guidance}")
+    print(f"  Net         : {_m(round(net, 4), ' XMR')}")
+    print(f"  Value       : {_m(fiat_val, ' ' + args.currency.upper())}")
+    print(f"  Prices from : {prices.get('source', 'unknown')} (live)")
+    print(f"  Depth       : {DEPTH_UNKNOWN}")
+    if not fee_confirmed:
+        print(f"  [!] The fee above is {args.method}'s advertised rate, not a "
+              f"quote for this trade. Pass --fee-pct with what your venue "
+              f"actually charges to make the net figure real.")
     if cfg["kyc"] and not args.suppress_kyc:
         print(f"  [!] WARNING: {args.method} requires KYC verification")
-    print(f"  [+] Plan saved -> {args.outfile}")
+    # Never "exit complete": nothing was sold and no XMR moved.
+    print(f"  [+] Reference saved -> {args.outfile} (no XMR moved; the "
+          f"off-ramp itself is manual)")
 
 
 if __name__ == "__main__":

@@ -1,2 +1,70 @@
 *.pyc
 __pycache__/
+tests/dashboard_data.json
+tests/status.json
+tests/dashboard.html
+
+# Runtime artifacts. These carry live operational data -- the integrity chain
+# logs MAC addresses and per-run traces; the TX/plan files carry deposit
+# addresses, memos, XMR destinations and subaddress indices. Committing any of
+# them would publish exactly what this toolchain exists to keep private.
+#
+# Kept in lockstep with paranoia_mode.wipe_gs_artifacts file/dir patterns:
+# anything worth secure-deleting is worth gitignoring. If you add a pattern
+# there, add it here too, and vice-versa. An earlier version of this list used
+# narrower patterns (e.g. exitplan_v1.json alone, thor_pairs_batch.json*) and
+# would have leaked any operator-renamed output.
+integrity_chain.log
+integrity.log
+unsigned_*.json
+signed_manifest_v1.json
+unsigned_manifest.json
+signer_progress.json
+broadcast_progress.json
+wallet_*.json
+# Both shapes: 'thor_pairs_*.json' needs an underscore after 'pairs', so it
+# never matched the plain 'thor_pairs.json' the console writes by default.
+thor_pairs.json
+thor_pairs.json.gpg
+thor_pairs_*.json
+thor_pairs_*.json.gpg
+exitplan_*.json
+*.unsigned
+*.signed
+*.blob
+*.wallet
+*.wallet.keys
+*.wallet.address.txt
+.ghostspiral.lock
+# integrity_log's serialisation lock
+*.log.lock
+# Partial writes from atomic_write_json/_text: same plaintext as the final
+# file, but no '*.json' pattern matches a '.json.tmp' suffix.
+*.json.tmp
+*.tmp
+# monero-wallet-cli's own staging names, and the signer's scratch dir. The
+# signed_monero_tx file is a fully signed, relayable transaction.
+unsigned_monero_tx
+signed_monero_tx
+gs_sign_*/
+gs_impout_*/
+# Monero's own logs. Clean at the default level, but monero-wallet-cli.log
+# carries the full wallet address at --log-level 2, and monerod's log is
+# created world-readable (0644).
+monero-wallet-cli.log
+monero-wallet-rpc.log
+monerod.log
+bitmonero.log
+unsigned/
+signed_blobs/
+tx_staging/
+.venv/
+
+# The wallet password, written 0600 by airgap_tx_signer because a password on
+# argv is world-readable via /proc/<pid>/cmdline. Deleted in a finally; a
+# SIGKILL leaves it, and it must never be committed if it does.
+.gs_pw_*
+
+# Wallet output-set export written by airgap_tx_signer phase_create so the
+# offline wallet can sign spends of earlier rounds. Maps the wallet holdings.
+outputs_export.hex

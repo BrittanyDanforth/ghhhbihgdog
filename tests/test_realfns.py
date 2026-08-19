@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Test the REAL exit_strategy_simulator.fetch_prices (rate-inversion fix) and
+paranoia_mode.wipe_gs_artifacts (BUG 4: log must not be recreated in a real
+wipe). Delete functions are no-op'd so NOTHING on disk is actually deleted."""
+import sys, os, json, shutil, tempfile, importlib.util, importlib.machinery
+from decimal import Decimal
+from pathlib import Path
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace(".py", ""), os.path.join(REPO, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec); loader.exec_module(mod); return mod
+
+gs = load("gs_common.py")
+esim = load("exit_strategy_simulator")
+para = load("paranoia_mode")
+os.chdir(tempfile.mkdtemp(prefix="gs_rf_"))
+
+PASS = 0; FAIL = 0; FAILURES = []
+def check(name, cond):
+    global PASS, FAIL
+    if cond: PASS += 1
+    else: FAIL += 1; FAILURES.append(name); print(f"  FAIL: {name}")
+
+# ---------------------------------------------------------------------------
+# exit_strategy_simulator.fetch_prices — Bisq fallback rate is NOT inverted
+# ---------------------------------------------------------------------------
+def fake_get(url, proxy):
+    if url == esim.CG_URL:
+        raise RuntimeError("coingecko down (force Bisq fallback)")
+    if url == esim.BISQ_PRICE_URL:
+        return {"data": [
+            {"currencyCode": "XMR", "price": 0.005},   # 0.005 BTC per XMR
+            {"currencyCode": "USD", "price": 60000},    # 60000 USD per BTC
+            {"currencyCode": "EUR", "price": 55000},
+        ]}
+    raise AssertionError("unexpected URL " + url)
+esim.safe_get = fake_get
+prices = esim.fetch_prices({"http": "socks5h://127.0.0.1:9050"})
+check("exit-sim: uses Bisq fallback", prices["source"] == "bisq_oracle")
+# xmr_usd must be xmr_btc * btc_usd = 0.005 * 60000 = 300.00, NOT 0.005/60000
+check("exit-sim: xmr_usd = 300.00 (not inverted)", prices["xmr_usd"] == Decimal("300.00"))
+check("exit-sim: xmr_eur = 275.00 (not inverted)", prices["xmr_eur"] == Decimal("275.00"))
+check("exit-sim: btc_usd = 60000 (not inverted)", prices["btc_usd"] == Decimal("60000.00"))
+# sanity: the OLD inverted math would have produced ~8.3e-8, quantized to 0.00
+check("exit-sim: not the old ~0 bug", prices["xmr_usd"] > Decimal("1"))
+
+# ---------------------------------------------------------------------------
+# paranoia_mode BUG 4 — a REAL (non-dry) wipe must NOT recreate integrity log,
+# but DRY mode still logs. Delete funcs no-op'd so nothing is truly deleted.
+# ---------------------------------------------------------------------------
+para._secure_delete_file = lambda path: None
+para._secure_delete_dir = lambda path: None
+LOG = Path(os.getcwd()) / "integrity_chain.log"
+
+# real wipe: must leave NO integrity_chain.log behind (the whole point of BUG 4)
+if LOG.exists():
+    LOG.unlink()
+para.wipe_gs_artifacts(dry=False, extra_dirs=[])
+check("paranoia: real wipe does NOT recreate integrity_chain.log", not LOG.exists())
+
+# dry wipe: SHOULD still write the integrity log (nothing was deleted)
+if LOG.exists():
+    LOG.unlink()
+para.wipe_gs_artifacts(dry=True, extra_dirs=[])
+check("paranoia: dry wipe still logs", LOG.exists())
+
+# ---------------------------------------------------------------------------
+# paranoia _secure_delete_file must OVERWRITE the file's FULL extent IN PLACE.
+# Proven with a hardlink: after deleting one link, the shared inode's bytes
+# (read via the other link) must be all-zero and the ORIGINAL full size -- not
+# 64 KB-capped, not left intact (the old truncate-then-64KB bug failed both).
+# ---------------------------------------------------------------------------
+para2 = load("paranoia_mode")        # fresh module: real _secure_delete_file,
+                                     # not the no-op the BUG-4 test patched in
+big = b"SECRETDATA" * 20000  # 200 KB, well over the old 64 KB cap
+fa = Path(os.getcwd()) / "sd_a.bin"; fb = Path(os.getcwd()) / "sd_b.bin"
+fa.write_bytes(big)
+os.link(str(fa), str(fb))            # hardlink: same inode + data blocks
+ok = para2._secure_delete_file(fa)
+check("secure_delete: returns True", ok is True)
+check("secure_delete: path unlinked", not fa.exists())
+residual = fb.read_bytes()           # the inode survives via fb; read its bytes
+check("secure_delete: full size overwritten (not 64KB-capped)", len(residual) == len(big))
+check("secure_delete: original bytes gone (zeroed in place)", b"SECRET" not in residual and set(residual) == {0})
+fb.unlink()
+check("secure_delete: missing file -> False",
+      para2._secure_delete_file(Path(os.getcwd()) / "nope_xyz_missing") is False)
+
+# ---------------------------------------------------------------------------
+# A symlink must NEVER be followed. Following it overwrites the LINK TARGET --
+# a file the operator never asked to wipe -- then unlinks only the link while
+# reporting success. wipe_gs_artifacts expands globs, so a symlink matching
+# '*.json' would silently zero whatever it pointed at.
+# ---------------------------------------------------------------------------
+victim = Path(os.getcwd()) / "sd_victim.txt"
+VICTIM_DATA = b"DO-NOT-TOUCH" * 100
+victim.write_bytes(VICTIM_DATA)
+link = Path(os.getcwd()) / "sd_link"
+os.symlink(str(victim), str(link))
+r_link = para2._secure_delete_file(link)
+check("secure_delete: symlink removed", not os.path.lexists(str(link)))
+check("secure_delete: symlink TARGET left intact (no collateral wipe)",
+      victim.exists() and victim.read_bytes() == VICTIM_DATA)
+check("secure_delete: symlink returns True (link itself is gone)", r_link is True)
+victim.unlink()
+
+# Non-regular files (fifo/device/socket) must be refused, not overwritten.
+fifo = Path(os.getcwd()) / "sd_fifo"
+os.mkfifo(str(fifo))
+check("secure_delete: fifo refused", para2._secure_delete_file(fifo) is False)
+check("secure_delete: fifo left in place", os.path.exists(str(fifo)))
+fifo.unlink()
+
+empty = Path(os.getcwd()) / "sd_empty.txt"
+empty.write_bytes(b"")
+check("secure_delete: zero-byte file deleted cleanly",
+      para2._secure_delete_file(empty) is True and not empty.exists())
+
+# ---------------------------------------------------------------------------
+# atomic_write_* must not leave a plaintext '.tmp' behind when interrupted.
+# A Ctrl-C between the write and the rename used to strand e.g.
+# 'thor_pairs_batch.json.tmp' holding the deposit address and memo, and NO
+# wipe pattern matched a '.json.tmp' suffix, so it was never cleaned up.
+# ---------------------------------------------------------------------------
+_real_replace = os.replace
+_atomic_dir = Path(os.getcwd()) / "atomicdir"
+_atomic_dir.mkdir(exist_ok=True)
+_target = _atomic_dir / "thor_pairs_batch.json"
+os.replace = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt("simulated Ctrl-C"))
+_raised = None
+try:
+    gs.atomic_write_json({"deposit": "bc1qSENSITIVE", "memo": "SECRET"}, _target)
+except BaseException as e:      # KeyboardInterrupt is the case that leaked
+    _raised = type(e).__name__
+finally:
+    os.replace = _real_replace
+check("atomic_write_json: interrupt still propagates", _raised == "KeyboardInterrupt")
+check("atomic_write_json: no partial .tmp left after interrupt",
+      list(_atomic_dir.glob("*.tmp")) == [])
+check("atomic_write_json: no target written on interrupt", not _target.exists())
+
+# Same guarantee for the text variant.
+_target2 = _atomic_dir / "notes.txt"
+os.replace = lambda a, b: (_ for _ in ()).throw(KeyboardInterrupt("simulated Ctrl-C"))
+try:
+    gs.atomic_write_text("SENSITIVE-MEMO", _target2)
+except BaseException:
+    pass
+finally:
+    os.replace = _real_replace
+check("atomic_write_text: no partial .tmp left after interrupt",
+      list(_atomic_dir.glob("*.tmp")) == [])
+
+# Sanity: the happy path still works and content round-trips.
+gs.atomic_write_json({"ok": 1}, _target)
+check("atomic_write_json: happy path still writes correctly",
+      _target.exists() and json.loads(_target.read_text())["ok"] == 1)
+check("atomic_write_json: happy path leaves no .tmp",
+      list(_atomic_dir.glob("*.tmp")) == [])
+check("atomic_write_json: final file is 0600", (_target.stat().st_mode & 0o777) == 0o600)
+
+# ---------------------------------------------------------------------------
+# Sensitive files must be 0600 FROM CREATION, not chmod'ed afterwards.
+# write_bytes()+chmod created them 0644 under the default umask and left them
+# 0644 PERMANENTLY if the process died in between -- which applied to
+# tx_*.signed, i.e. a fully signed, relayable transaction.
+# ---------------------------------------------------------------------------
+_perm_dir = Path(os.getcwd()) / "permdir"
+_perm_dir.mkdir(exist_ok=True)
+_old_umask = os.umask(0o022)
+try:
+    _pf = _perm_dir / "tx_0.signed"
+    gs.secure_write_bytes(_pf, b"Monero signed tx set FAKE")
+    check("secure_write_bytes: 0600 under umask 022",
+          (_pf.stat().st_mode & 0o777) == 0o600)
+    check("secure_write_bytes: not world-readable", not (_pf.stat().st_mode & 0o004))
+    check("secure_write_bytes: content intact", _pf.read_bytes() == b"Monero signed tx set FAKE")
+
+    # A permissive umask must not be able to widen it (umask only clears bits).
+    os.umask(0o000)
+    _pf2 = _perm_dir / "tx_1.signed"
+    gs.secure_write_bytes(_pf2, b"x")
+    check("secure_write_bytes: still 0600 under umask 000",
+          (_pf2.stat().st_mode & 0o777) == 0o600)
+
+    # O_CREAT leaves an EXISTING file's mode alone, so it must be narrowed too.
+    _pf3 = _perm_dir / "tx_2.signed"
+    _pf3.write_bytes(b"old"); os.chmod(_pf3, 0o666)
+    gs.secure_write_bytes(_pf3, b"NEW")
+    check("secure_write_bytes: narrows a pre-existing 0666 file",
+          (_pf3.stat().st_mode & 0o777) == 0o600 and _pf3.read_bytes() == b"NEW")
+
+    _pt = _perm_dir / "notes.txt"
+    gs.secure_write_text(_pt, "unsigned-hex")
+    check("secure_write_text: 0600 at creation", (_pt.stat().st_mode & 0o777) == 0o600)
+
+    # THE DISCRIMINATING CHECK. Asserting the final mode is 0600 does NOT catch
+    # the bug: write_bytes()+chmod also ENDS at 0600, so such a check passes on
+    # broken code (verified). What matters is that the mode is right BEFORE any
+    # chmod runs -- that is what survives a crash in the window. Disable the
+    # trailing chmod entirely: os.open(...,0o600) still yields 0600, whereas
+    # write_bytes()+chmod would be left at 0644.
+    _real_perms = gs.secure_file_perms
+    gs.secure_file_perms = lambda *a, **k: None
+    try:
+        _pf4 = _perm_dir / "nochmod.signed"
+        gs.secure_write_bytes(_pf4, b"SIGNED")
+        _m = _pf4.stat().st_mode & 0o777
+        check("secure_write_bytes: 0600 WITHOUT any chmod (survives a crash "
+              f"in the window; got {oct(_m)})", _m == 0o600)
+    finally:
+        gs.secure_file_perms = _real_perms
+finally:
+    os.umask(_old_umask)
+
+# ---------------------------------------------------------------------------
+# Core dumps must be forbidden. A core file is process memory written to DISK,
+# and these processes hold the wallet password in memory. Started from an
+# explicitly UNLIMITED limit so the check cannot pass just because the host
+# happened to already have dumps off (which would be a vacuous pass).
+# ---------------------------------------------------------------------------
+# Run in SUBPROCESSES: disable_core_dumps sets the HARD limit to 0 as well,
+# which a process can never raise again (that irreversibility is the point --
+# nothing later in the run can re-enable dumps). So each scenario needs a fresh
+# process, and each first RAISES the limit to unlimited so a pass cannot be
+# vacuous on a host that already had dumps off.
+import subprocess as _sp
+
+_CORE_PROBE = r'''
+import resource, sys, importlib.machinery, importlib.util
+def load(n):
+    l = importlib.machinery.SourceFileLoader(n.replace(".py",""), sys.argv[1] + "/" + n)
+    s = importlib.util.spec_from_loader(l.name, l)
+    m = importlib.util.module_from_spec(s); l.exec_module(m); return m
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY,)*2)
+except (ValueError, OSError):
+    print("CANNOT_RAISE"); raise SystemExit(0)
+before = resource.getrlimit(resource.RLIMIT_CORE)[0]
+gs = load("gs_common.py")
+getattr(gs, sys.argv[2])()
+after = resource.getrlimit(resource.RLIMIT_CORE)
+print("BEFORE=%s SOFT=%s HARD=%s" % (before, after[0], after[1]))
+'''
+
+
+def _core_probe(fn_name):
+    r = _sp.run([sys.executable, "-c", _CORE_PROBE, REPO, fn_name],
+                capture_output=True, text=True, timeout=60, cwd=os.getcwd())
+    return r.stdout.strip()
+
+
+for _fn, _label in [("disable_core_dumps", "disable_core_dumps()"),
+                    ("install_signal_handlers", "install_signal_handlers() (startup hook)")]:
+    _out = _core_probe(_fn)
+    if "CANNOT_RAISE" in _out:
+        print(f"  (skipped core-dump check for {_label}: host forbids raising RLIMIT_CORE)")
+        continue
+    check(f"core dumps: precondition - was unlimited before {_label}",
+          "BEFORE=-1" in _out)
+    check(f"core dumps: {_label} sets soft limit to 0", "SOFT=0" in _out)
+    check(f"core dumps: {_label} also drops the HARD limit "
+          "(cannot be re-enabled later)", "HARD=0" in _out)
+
+# ---------------------------------------------------------------------------
+# secure_write_bytes must NOT follow a symlink.
+#
+# Demonstrated before the fix: a planted `broadcast_progress.json -> victim.txt`
+# had victim.txt overwritten while the symlink survived, and the 0600 mode this
+# function exists to guarantee was applied to someone ELSE'S file. That is a
+# write-where-I-want primitive for any local user who can create a name in a
+# directory this toolchain writes to -- a staging dir made by hand under a
+# shared path, or simply running the relayer from /tmp, where
+# broadcast_progress.json has a completely predictable name.
+#
+# secure_delete_file in the same module already refused to follow symlinks and
+# documented exactly this reasoning. The write primitive beside it did not:
+# same threat, same file, one of the pair defended. This pins both halves.
+# ---------------------------------------------------------------------------
+_sym_dir = Path(tempfile.mkdtemp(prefix="gs_sym_"))
+_victim = _sym_dir / "victim.txt"
+_victim.write_text("IMPORTANT ORIGINAL CONTENT")
+os.chmod(_victim, 0o644)
+_victim_mode0 = _victim.stat().st_mode & 0o777
+_planted = _sym_dir / "broadcast_progress.json"
+os.symlink(str(_victim), str(_planted))
+
+_refused = False
+try:
+    gs.secure_write_bytes(_planted, b"WROTE THROUGH THE SYMLINK")
+except OSError as e:
+    _refused = "symbolic link" in str(e)
+check("secure_write_bytes REFUSES to write through a symlink", _refused)
+check("...and the symlink's target is untouched",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+check("...and the target did not inherit this function's 0600 "
+      "(the mode landed nowhere)",
+      _victim.stat().st_mode & 0o777 == _victim_mode0)
+
+# atomic_write_json is safe by a DIFFERENT mechanism, and the difference is
+# worth pinning rather than assuming: it writes to '<name>.tmp' and then
+# os.replace()s it into place, and rename does not follow a destination
+# symlink -- it REPLACES the link. So a planted link at the final name is
+# consumed, not written through, and no error is raised.
+_planted2 = _sym_dir / "unsigned_manifest.json"
+os.symlink(str(_victim), str(_planted2))
+gs.atomic_write_json({"a": 1}, _planted2)
+check("atomic_write_json does not write through a planted symlink",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+check("...it replaces the link instead of following it",
+      not _planted2.is_symlink() and json.loads(_planted2.read_text()) == {"a": 1})
+check("...and the result is 0600, not the target's mode",
+      _planted2.stat().st_mode & 0o777 == 0o600)
+_planted2.unlink()
+
+# The staging file it writes THROUGH is the attackable one, and that is where
+# the O_NOFOLLOW refusal has to bite: a planted '<name>.tmp' link.
+_planted3 = _sym_dir / "unsigned_manifest.json"
+os.symlink(str(_victim), str(_sym_dir / "unsigned_manifest.json.tmp"))
+_refused3 = False
+try:
+    gs.atomic_write_json({"a": 1}, _planted3)
+except OSError as e:
+    _refused3 = "symbolic link" in str(e)
+check("atomic_write_json REFUSES a planted '.tmp' symlink", _refused3)
+check("...target still untouched after the atomic path",
+      _victim.read_text() == "IMPORTANT ORIGINAL CONTENT")
+
+# The legitimate cases must all still work.
+_normal = _sym_dir / "normal.json"
+_normal.write_text("x")
+os.chmod(_normal, 0o644)                       # pre-existing, world-readable
+gs.secure_write_bytes(_normal, b'{"ok":1}')
+check("a pre-existing 0644 file is still narrowed to 0600",
+      _normal.stat().st_mode & 0o777 == 0o600)
+check("...and its content was actually written", _normal.read_text() == '{"ok":1}')
+
+_fresh = _sym_dir / "fresh.bin"
+gs.secure_write_bytes(_fresh, b"hello")
+check("a new file is created 0600 at creation",
+      _fresh.stat().st_mode & 0o777 == 0o600)
+
+# O_NOFOLLOW applies to the FINAL component only, so a symlinked staging
+# DIRECTORY -- staging onto another disk, a normal setup -- still works.
+_realdir = _sym_dir / "realstaging"; _realdir.mkdir()
+_linkdir = _sym_dir / "tx_staging"
+os.symlink(str(_realdir), str(_linkdir))
+gs.secure_write_bytes(_linkdir / "tx_0.unsigned", b"payload")
+check("a symlinked staging DIRECTORY still works (only the final component "
+      "is refused)", (_realdir / "tx_0.unsigned").read_bytes() == b"payload")
+
+shutil.rmtree(_sym_dir, ignore_errors=True)
+
+
+print(f"\nRESULT: {PASS} passed, {FAIL} failed")
+if FAILURES:
+    print("FAILED:", FAILURES); sys.exit(1)
+print("ALL GREEN")
