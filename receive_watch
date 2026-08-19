@@ -73,6 +73,24 @@ POLL_MAX_S = 90
 # forever for a number that is never going to arrive.
 STALL_MINUTES_DEFAULT = 30
 
+#: How long the scan height may have been static before "the wallet is still
+#: following the chain" stops being a claim this tool is entitled to make.
+#:
+#: A healthy wallet sees a block every couple of minutes. The `not_syncing`
+#: verdict needs the height frozen for a FULL stall window, which is right --
+#: but the balance-stall timer starts when the money ARRIVES while the height
+#: timer restarts on the last block seen, so a wallet that dies shortly after
+#: the payment trips the balance branch first and used to be reported as
+#: sync="ok": "your wallet last scanned a new block 29 min ago, SO IT IS STILL
+#: FOLLOWING THE CHAIN -- this looks like the swap paying short". The advice
+#: that follows is to accept less money, and the very next line already
+#: admitted "29 min ago is a long gap though". It asserted a cause and
+#: contradicted it two lines later.
+#:
+#: Between this and a full window the honest answer is that the cause is
+#: undetermined, so the verdict is "stale" and the caller names neither cause.
+LIVENESS_DOUBT_S = 600
+
 # ── what counts as MONEY ARRIVING, as opposed to noise ─────────────────────
 #
 # Four separate decisions in watch() used to read "any non-zero balance" as
@@ -448,7 +466,23 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
         # running -- left `unlocked < total` true forever, the gate never
         # opened, and the run went all the way to its 24-hour timeout with no
         # diagnosis at all. Demonstrated on this code before it was moved.
-        if (h_now is not None and last_height is not None
+        # NOT gated on h_now. Whether the scan height has been frozen for a
+        # full window is decided by last_height_move, which needs no fresh
+        # sample -- and requiring one suppressed this verdict on exactly the
+        # ticks where the RPC was unhealthy. Control then fell through to the
+        # balance-stall branch, which returns sync="ok" and makes main() say
+        # "your wallet is still following the chain, so this looks like the
+        # swap paying short" about a wallet that had been dead for the whole
+        # window. Its recommended remedy is to re-run with --any and accept
+        # less money, so the false cause carries a costly fix.
+        #
+        # Reproduced: 2 XMR landed, wallet froze, get_height began raising --
+        # the exact asymmetry wallet_height's docstring exists for -- and the
+        # watch returned stalled/sync=ok with last_scan_age_s of 1740s.
+        #
+        # last_height is still required: without one successful read there is
+        # no baseline and "has not moved" means nothing.
+        if (last_height is not None
                 and (clock() - last_height_move) >= stall_s):
             integrity_log("recv", "wallet_not_scanning")
             return {"state": "not_syncing", "sync": "stuck",
@@ -469,7 +503,12 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
                 # moved again was reported as "the swap paid short"), and a
                 # drip reset last_change forever (so the shortfall verdict
                 # could be suppressed for the whole 24 hours).
-                if total >= marked_total + min_arrival:
+                # `total > 0` FIRST. With --min-arrival 0 this read
+                # `0 >= 0 + 0` and fired on an EMPTY subaddress, so the very
+                # first tick set seen_any and the watch reported money that
+                # was never there. The neighbouring branch below already
+                # guards on `total > 0`; this one did not.
+                if total > 0 and total >= marked_total + min_arrival:
                     marked_total = total
                     last_change = clock()
                     if not seen_any:
@@ -521,7 +560,12 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
                 integrity_log("recv", "funded")
                 return {"state": "funded", "unlocked": unlocked,
                         "total": total, "pending": pending, "ticks": ticks}
-            if floor_ <= 0 and unlocked >= min_arrival and not still_confirming:
+            # `unlocked > 0`: --any means any SETTLED balance, and its own
+            # warning promises a floor of "one piconero" -- not of nothing.
+            # With --min-arrival 0 this accepted an empty subaddress and main()
+            # printed "PAID: 0 XMR ... THE MONEY IS YOURS" on tick one.
+            if (floor_ <= 0 and unlocked > 0 and unlocked >= min_arrival
+                    and not still_confirming):
                 # --any: "any balance" has to mean any SETTLED balance.
                 #
                 # This fired on `unlocked > 0` alone, so a swap delivered as two
@@ -567,10 +611,16 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
                 # wallet has kept scanning throughout". One block inside the
                 # window satisfied that claim. Hand the caller the number and
                 # let it say what was actually measured.
-                integrity_log("recv", "stalled_short")
-                return {"state": "stalled", "sync": "ok", "unlocked": unlocked,
+                _scan_age = int(clock() - last_height_move)
+                # "ok" only when the wallet demonstrably advanced RECENTLY. A
+                # height static for longer than LIVENESS_DOUBT_S has not
+                # established that the swap is the problem, so it does not get
+                # to say so.
+                _sync = "ok" if _scan_age <= LIVENESS_DOUBT_S else "stale"
+                integrity_log("recv", f"stalled_short:sync={_sync}")
+                return {"state": "stalled", "sync": _sync, "unlocked": unlocked,
                         "total": total, "pending": pending, "ticks": ticks,
-                        "last_scan_age_s": int(clock() - last_height_move)}
+                        "last_scan_age_s": _scan_age}
 
         if (clock() - started) >= timeout_s:
             integrity_log("recv", "timeout")
@@ -908,11 +958,25 @@ def main():
         short = floor_ - r["unlocked"]
         print(f"\n  [!] {fmt(r['unlocked'])} XMR arrived and stopped growing for "
               f"{args.stall_min} min — {fmt(short)} short of the {fmt(floor_)} XMR target.")
-        if r.get("sync") == "unknown":
-            # Say what was not established, instead of naming a cause.
-            print("  [!] Your wallet's scan height could not be read, so this could "
-                  "also be the wallet falling behind rather than the swap paying "
-                  "short. Confirm monerod is running and synced before deciding.")
+        if r.get("sync") in ("unknown", "stale"):
+            # Say what was not established, instead of naming a cause. "stale"
+            # means the height WAS readable but has not moved for a long time:
+            # the tool cannot tell a short payment from a wallet that stopped
+            # following the chain, and the remedy it would otherwise recommend
+            # is to accept less money.
+            if r.get("sync") == "stale":
+                _sa = r.get("last_scan_age_s") or 0
+                print(f"  [!] Your wallet has not scanned a new block for "
+                      f"{_sa // 60} min. A healthy wallet sees one every couple "
+                      f"of minutes, so this may be the wallet falling behind "
+                      f"rather than the swap paying short — the two look "
+                      f"identical from here.")
+            else:
+                print("  [!] Your wallet's scan height could not be read, so this "
+                      "could also be the wallet falling behind rather than the "
+                      "swap paying short.")
+            print("  [!] Confirm monerod is running and synced BEFORE you accept "
+                  "a lower amount.")
         else:
             # State the MEASURED fact, not a stronger one. What was established
             # is "the wallet advanced at some point inside the window", which

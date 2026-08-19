@@ -15,6 +15,7 @@ changed, and each check here fails if the old behaviour returns.
 No daemon, no wallet, no network: these are the decision paths, driven directly.
 """
 import contextlib
+from decimal import Decimal
 import importlib.machinery
 import importlib.util
 import io
@@ -305,6 +306,100 @@ check("memo: refuses OUR address under an ETH asset too",
       gs.memo_binds_destination(f"=:ETH.ETH:{_OURS}:0", _OURS) is False)
 check("memo: still accepts OUR address on the XMR chain",
       gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}:0", _OURS) is True)
+
+
+# ---------------------------------------------------------------------------
+# 6. receive_watch: the money-in detection must not report what it did not see.
+#
+# Two separate false claims, both reproduced before the change:
+#   * `--any --min-arrival 0` returned "funded" for a COMPLETELY EMPTY
+#     subaddress on the first tick, so main() printed "PAID: 0 XMR ... THE
+#     MONEY IS YOURS". The --any warning promises a floor of "one piconero";
+#     the code had a floor of nothing.
+#   * a wallet that died shortly after the payment was reported as
+#     sync="ok" -> "your wallet last scanned a block 29 min ago, SO IT IS
+#     STILL FOLLOWING THE CHAIN - this looks like the swap paying short",
+#     and the recommended remedy is to accept less money. The next line
+#     already admitted "29 min ago is a long gap though": it asserted a cause
+#     and contradicted it two lines later.
+# ---------------------------------------------------------------------------
+rw = _load("receive_watch")
+rw.integrity_log = lambda *a, **k: None
+
+
+class _Clk:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _RPC:
+    """watch() calls with KEYWORD args -- a stub with positional-only names
+    makes every balance read raise and silently reads as zero, which cost me a
+    false 'fixed' reading once already."""
+
+    def __init__(self, tot, unl, clk, die_at=None, frozen=False):
+        self.tot, self.unl, self.c = tot, unl, clk
+        self.die_at, self.frozen = die_at, frozen
+
+    def get_subaddress_balance(self, account_index, address_index):
+        return (self.tot, self.unl)
+
+    def raw_request(self, m, p=None):
+        if m == "get_height":
+            if self.die_at is not None and self.c.t >= self.die_at:
+                raise RuntimeError("height unreadable")
+            return {"height": 100 if self.frozen else 100 + int(self.c.t // 10)}
+        return {}
+
+
+def _watch(rpc, target, clk, **kw):
+    return rw.watch(rpc, 0, 1, target, stall_s=1800,
+                    sleep_fn=lambda _s: setattr(clk, "t", clk.t + 60),
+                    clock=clk, echo=lambda *a, **k: None, **kw)
+
+
+_A = 2 * 10 ** 12
+_c = _Clk()
+_empty = _watch(_RPC(0, 0, _c), Decimal(0), _c, timeout_s=600,
+                min_arrival=Decimal(0))
+check("receive: an EMPTY subaddress is never 'funded', even with "
+      "--any --min-arrival 0", _empty["state"] != "funded")
+_c = _Clk()
+_dust = _watch(_RPC(1, 1, _c), Decimal(0), _c, timeout_s=600,
+               min_arrival=Decimal(0))
+check("receive: ...but one piconero IS still accepted, as --any promises",
+      _dust["state"] == "funded")
+_c = _Clk()
+_norm = _watch(_RPC(3 * 10 ** 12, 3 * 10 ** 12, _c), Decimal(0), _c,
+               timeout_s=600)
+check("receive: a normal --any payment is still funded",
+      _norm["state"] == "funded")
+
+_c = _Clk()
+_live = _watch(_RPC(_A, _A, _c), Decimal("5.0"), _c, timeout_s=100000)
+check("receive: a LIVE wallet genuinely paid short still reports the "
+      "shortfall confidently",
+      _live["state"] == "stalled" and _live.get("sync") == "ok")
+_c = _Clk()
+_dead = _watch(_RPC(_A, _A, _c, die_at=120), Decimal("5.0"), _c,
+               timeout_s=100000)
+check("receive: a wallet that DIED after the payment is not called 'ok' "
+      f"(sync={_dead.get('sync')!r}, scan {_dead.get('last_scan_age_s')}s old)",
+      _dead.get("sync") == "stale")
+check("receive: ...and the shortfall CAUSE is therefore not asserted",
+      _dead.get("sync") != "ok")
+_c = _Clk()
+_frozen = _watch(_RPC(_A, _A, _c, frozen=True), Decimal("5.0"), _c,
+                 timeout_s=100000)
+check("receive: a height frozen for a FULL window is still 'not_syncing'",
+      _frozen["state"] == "not_syncing" and _frozen.get("sync") == "stuck")
+
+_rw_src = code_only(os.path.join(REPO, "receive_watch"))
+check("receive: main() treats a stale scan like an unreadable one — it names "
+      "no cause", '"unknown", "stale"' in _rw_src)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

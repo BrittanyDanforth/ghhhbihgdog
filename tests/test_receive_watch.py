@@ -408,8 +408,24 @@ check("...and warns against lowering the target to get past it",
 # short when the sync was actually verified.
 _st = _src[_src.index('if state == "stalled":'):]
 _st = _st[:_st.index("return 1")]
-check("the stalled message only blames the swap when sync was verified",
-      'r.get("sync") == "unknown"' in _st and "kept scanning throughout" in _st)
+# Asserted on the CONDITION, not on a literal spelling of it. This used to
+# match the exact string 'r.get("sync") == "unknown"' plus the phrase "kept
+# scanning throughout" -- which lives only in a COMMENT explaining what the
+# code deliberately does not print. Both went stale the moment the rule was
+# strengthened to cover a third verdict, and the test failed on code that had
+# become MORE correct.
+#
+# The rule now: the shortfall cause may be named only when the wallet
+# demonstrably advanced recently. "unknown" (height unreadable) and "stale"
+# (height readable but static for longer than LIVENESS_DOUBT_S) both take the
+# no-cause branch, because from here a slow wallet and a short payment look
+# identical -- and the advice attached to a shortfall is to accept less money.
+check("the stalled message blames the swap ONLY when the scan was recent",
+      'r.get("sync") in ("unknown", "stale")' in _st)
+check("...so an unreadable height does not get a cause", '"unknown"' in _st)
+check("...and neither does a long-stale one", '"stale"' in _st)
+check("...and the confident sentence is still reachable for a live wallet",
+      "still following the chain" in _st)
 
 
 # ---------------------------------------------------------------------------
