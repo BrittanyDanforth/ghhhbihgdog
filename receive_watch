@@ -56,7 +56,7 @@ from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
     install_signal_handlers, shutdown_requested, scrub_address,
     load_receive_bundle, RECEIVE_SCHEMA, memo_binds_destination,
-    env_or_argv,
+    env_or_argv, decimal_arg,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -665,7 +665,7 @@ def main():
                     help="thor_pairs_v1 JSON from thor_swap_preparer. Supplies the "
                          "expected amount AND the BTC deposit address/memo to hand "
                          "the sender.")
-    ap.add_argument("--expect-xmr", type=Decimal,
+    ap.add_argument("--expect-xmr", type=decimal_arg,
                     help="target XMR to wait for; overrides the total from --pairs. "
                          "Prefer GS_EXPECT_XMR=... : an argv amount is world-readable "
                          "via ps and /proc/<pid>/cmdline (mode 444), and this process "
@@ -674,14 +674,14 @@ def main():
     ap.add_argument("--any", action="store_true",
                     help="stop as soon as ANY unlocked balance appears, with no "
                          "target amount")
-    ap.add_argument("--min-arrival", type=Decimal, default=None,
+    ap.add_argument("--min-arrival", type=decimal_arg, default=None,
                     help="smallest XMR balance treated as the payment arriving. "
                          "Defaults to the larger of 0.0005 XMR and 0.1%% of the "
                          "target. Anyone who has seen the swap memo knows this "
                          "address and can send to it, so a balance below this is "
                          "reported but not acted on. Lower it only for a "
                          "genuinely tiny swap.")
-    ap.add_argument("--tolerance", type=Decimal, default=Decimal("0.10"),
+    ap.add_argument("--tolerance", type=decimal_arg, default=Decimal("0.10"),
                     help="fraction under the target that still counts as paid, "
                          "absorbing swap slippage (default 0.10 = accept 90%%)")
     ap.add_argument("--timeout-min", type=int, default=1440,

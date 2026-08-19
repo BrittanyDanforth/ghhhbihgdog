@@ -38,7 +38,7 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
     load_receive_bundle, memo_binds_destination, env_or_argv,
-    btc_per_xmr_oracle, quote_deviation,
+    btc_per_xmr_oracle, quote_deviation, decimal_arg,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -201,7 +201,7 @@ def main():
         "thor_swap_preparer v10.0",
         description="Fetch ThorChain BTC->XMR quotes with OPSEC hardening",
     )
-    ap.add_argument("--amounts", nargs="+", type=Decimal,
+    ap.add_argument("--amounts", nargs="+", type=decimal_arg,
                     help="BTC amounts to swap. Prefer GS_SWAP_AMOUNTS='0.05 0.03' : "
                          "an argv amount is world-readable via ps and "
                          "/proc/<pid>/cmdline (mode 444), and the amount is the "
@@ -224,7 +224,7 @@ def main():
                     help="SOCKS5 proxy (required for production use)")
     ap.add_argument("--gpg-recipient",
                     help="GPG recipient for encrypted output")
-    ap.add_argument("--max-slippage", type=Decimal, default=Decimal("0.25"),
+    ap.add_argument("--max-slippage", type=decimal_arg, default=Decimal("0.25"),
                     help="refuse a quote deviating more than this fraction from the "
                          "price oracle (default 0.25 = 25%%). A 5%% deviation still "
                          "only warns; this is the hard stop. Ignored when the oracle "

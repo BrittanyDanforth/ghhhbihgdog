@@ -65,7 +65,7 @@ from typing import Dict
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, shutdown_requested,
-    env_or_argv, wipe_covers,
+    env_or_argv, wipe_covers, decimal_arg,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -205,7 +205,7 @@ def main():
     # and then published the total on a command line. The environment is not a
     # secret store either, but it is not broadcast to every process the way a
     # command line is.
-    ap.add_argument("amount", type=Decimal, nargs="?", default=None,
+    ap.add_argument("amount", type=decimal_arg, nargs="?", default=None,
                     help="XMR amount to off-ramp. Prefer GS_EXIT_AMOUNT=... : an "
                          "argv amount is world-readable via ps and "
                          "/proc/<pid>/cmdline (mode 444).")
@@ -214,12 +214,12 @@ def main():
     # Real numbers come from the operator, not from this file. Without these
     # the fee falls back to the venue's NOMINAL published rate (reported as
     # unconfirmed) and slippage is ZERO rather than an invented constant.
-    ap.add_argument("--fee-pct", type=Decimal, default=None,
+    ap.add_argument("--fee-pct", type=decimal_arg, default=None,
                     help="the fee rate your venue ACTUALLY quoted, as a "
                          "fraction (0.003 = 0.3%%). Without it the venue's "
                          "nominal published rate is used and the result is "
                          "labelled UNCONFIRMED.")
-    ap.add_argument("--slippage-pct", type=Decimal, default=None,
+    ap.add_argument("--slippage-pct", type=decimal_arg, default=None,
                     help="slippage from a real quote, as a fraction. Defaults "
                          "to 0: slippage is only knowable against a live order "
                          "book, and this tool has no quote, so it will not "

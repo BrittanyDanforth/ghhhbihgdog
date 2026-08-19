@@ -43,7 +43,7 @@ from gs_common import (
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv,
     create_fresh_account, run_lock,
-    btc_per_xmr_oracle, quote_deviation, wipe_covers,
+    btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -1438,7 +1438,7 @@ def build_cli() -> argparse.ArgumentParser:
                      help="Enable JoinMarket tumble before ThorChain swap")
     cli.add_argument("--split", type=int, default=1,
                      help="Number of BTC chunks to split across ThorChain")
-    cli.add_argument("--btc-amount", type=Decimal,
+    cli.add_argument("--btc-amount", type=decimal_arg,
                      help="Total BTC amount for ThorChain swap "
                           "(required when --split > 0 in sender mode)")
     cli.add_argument("--wallets", type=int, default=10,
@@ -1523,7 +1523,7 @@ def build_cli() -> argparse.ArgumentParser:
                           "PREFER GS_WALLET_PASSWORD=... in the environment: an "
                           "argv password is world-readable via ps and "
                           "/proc/<pid>/cmdline (mode 444).")
-    cli.add_argument("--max-slippage", type=Decimal, default=Decimal("0.25"),
+    cli.add_argument("--max-slippage", type=decimal_arg, default=Decimal("0.25"),
                      help="refuse a swap quote deviating more than this fraction from "
                           "an independent price oracle (default 0.25 = 25%%). 5%% still "
                           "only warns; this is the hard stop. When the oracle is "
@@ -2289,6 +2289,12 @@ def main():
 
             if jm_utxos:
                 btc_chunks = jm_utxos
+            elif args.btc_amount is not None and args.btc_amount <= 0:
+                # Falling through the `> 0` test below landed in the manual-mode
+                # branch, which told the operator "No --btc-amount specified"
+                # for an amount they had plainly specified.
+                sys.exit(f"[!] --btc-amount must be positive (got "
+                         f"{args.btc_amount}).")
             elif args.btc_amount and args.btc_amount > 0:
                 num_splits = max(args.split, 1)
                 per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))

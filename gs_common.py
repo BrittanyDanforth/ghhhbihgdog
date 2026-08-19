@@ -17,6 +17,7 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
+import argparse
 import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal
 from pathlib import Path
@@ -123,6 +124,34 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             except OSError:
                 pass
     return h
+
+
+def decimal_arg(text: str) -> Decimal:
+    """argparse `type=` for a numeric amount. Use instead of type=Decimal.
+
+    type=Decimal LOOKS right and is not. argparse converts a failing type into
+    a clean "invalid value" message only for ValueError and TypeError, but
+    Decimal("abc") raises decimal.InvalidOperation, which is an ArithmeticError
+    -- so every numeric flag in this toolchain answered a typo with a raw
+    traceback out of argparse's internals. Ten arguments across five tools did
+    this, including the ones that size real spends.
+
+    It also rejects NaN and Infinity, which Decimal ACCEPTS. Those parse, pass
+    an `x > 0` test (NaN raises InvalidOperation on comparison; Infinity does
+    not), and then poison every downstream calculation -- an infinite amount
+    produces a plan full of garbage rather than an error. Rejecting them at the
+    parse boundary means no caller has to remember to re-check.
+    """
+    try:
+        v = Decimal(str(text))
+    except Exception:                                        # noqa: BLE001
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number") from None
+    if not v.is_finite():
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a finite number ('NaN' and 'Infinity' parse as "
+            f"Decimals but are not amounts)")
+    return v
 
 
 #: The roots paranoia_mode globs when it hunts artifacts, at depth 0 and 1.

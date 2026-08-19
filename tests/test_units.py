@@ -2513,6 +2513,48 @@ check("jm-parse: REGRESSION PROOF — the old same-line rule matches nothing in 
 # Plus a hang: tumbler.py's miner-fee question is a bare input() guarded by
 # `not options['restart']`, so --yes does NOT bypass it, and with stdin
 # inherited it would sit unread until the 3600s timeout.
+import argparse
+
+# type=Decimal IS AN ARGPARSE TRAP, AND TEN ARGUMENTS FELL INTO IT.
+#
+# argparse turns a failing `type=` into a clean "invalid value" message only
+# for ValueError and TypeError. Decimal("abc") raises decimal.InvalidOperation,
+# an ArithmeticError -- so every numeric flag in this toolchain answered a typo
+# with a raw traceback out of argparse's internals, including the ones that
+# size real spends (--btc-amount, --amounts, --expect-xmr).
+#
+# It bit the fix as well as the code: --fee-pct and --slippage-pct were added
+# in this same audit and inherited the identical defect, which is why this is
+# checked against the FUNCTION rather than any one call site.
+#
+# NaN and Infinity are rejected at the same boundary: Decimal accepts both,
+# Infinity survives an `x > 0` test, and it then poisons every downstream
+# calculation into a plan full of garbage.
+for _bad in ("abc", "", "1.2.3", "0x10", "NaN", "Infinity", "-Infinity", "nan"):
+    _raised = False
+    try:
+        _gsc.decimal_arg(_bad)
+    except argparse.ArgumentTypeError:
+        _raised = True
+    except Exception:                                        # noqa: BLE001
+        pass          # any OTHER exception is the bug; _raised stays False
+    check(f"decimal_arg: {_bad!r} raises ArgumentTypeError (argparse renders "
+          f"that cleanly; anything else is a traceback)", _raised)
+
+for _good, _want in (("0.003", Decimal("0.003")), ("0", Decimal("0")),
+                     ("12", Decimal("12")), ("-1.5", Decimal("-1.5")),
+                     ("1E-8", Decimal("1E-8"))):
+    check(f"decimal_arg: {_good!r} parses to {_want}",
+          _gsc.decimal_arg(_good) == _want)
+
+# And no tool may go back to the trap.
+for _tool_name in ("GhostSpiral", "thor_swap_preparer", "receive_watch",
+                   "exit_strategy_simulator"):
+    _tsrc = code_only(os.path.join(REPO, _tool_name))
+    check(f"{_tool_name}: uses decimal_arg, never the bare type=Decimal trap",
+          "type=Decimal," not in _tsrc)
+
+
 # THE STAGING ROOT MUST NOT OUTLIVE THE RUN. Every round wipes its own
 # subdirectory, which leaves tx_staging/ behind as an empty directory: it holds
 # nothing, but its existence and mtime date a run on a host that is meant to
@@ -2570,6 +2612,23 @@ _src_gs = code_only(os.path.join(REPO, "GhostSpiral"))
 check("stage4: GhostSpiral checks its --output against the wipe roots",
       "_warn_unwiped_outdir(outdir)" in _src_gs
       and callable(getattr(ghost, "_warn_unwiped_outdir", None)))
+
+# A NEGATIVE --btc-amount was reported as a MISSING one. It fell through the
+# `args.btc_amount > 0` test into the manual-mode branch, which printed "No
+# --btc-amount specified" for an amount the operator had plainly specified.
+# Nothing was spent, so this is an honesty defect rather than a money one --
+# but "you did not give me X" for an X that was given is the class of message
+# this audit keeps removing.
+#
+# Asserted at source level: the branch lives inside main(), which nothing
+# executes, and reaching it through the CLI requires passing Tor verification.
+check("stage2: a non-positive --btc-amount is rejected explicitly, not "
+      "misreported as 'not specified'",
+      "--btc-amount must be positive" in _src_gs)
+check("stage2: ...and that check precedes the `> 0` branch it used to fall "
+      "through",
+      _src_gs.index("--btc-amount must be positive")
+      < _src_gs.index("elif args.btc_amount and args.btc_amount > 0"))
 
 
 # THE INTEGRITY CHAIN HAD NO VERIFIER. Every tool's header advertises
