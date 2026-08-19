@@ -387,10 +387,20 @@ def main():
     # logic was here and GhostSpiral's --output had no equivalent, so the two
     # tools disagreed about the same question and a wrong answer is silent.
     if not wipe_covers(_out):
+        # _dir is computed HERE. Replacing the old inline coverage test with
+        # wipe_covers deleted the local this message interpolated, so the
+        # warning path raised NameError -- the branch that exists to stop a
+        # silent leak became the one that crashed. It survived the test suite
+        # because every case there wrote somewhere the wipe DOES cover, so the
+        # branch never ran; found by probing --redact against a /tmp outfile.
+        try:
+            _dir = _out.resolve().parent
+        except OSError:
+            _dir = _out.parent
         print(f"  [!] {_out} is outside every directory paranoia_mode searches.")
         print(f"  [!] This file holds the holding size, its fiat value and the "
               f"venue. The wipe will NOT find it — erase it yourself, or pass "
-              f"--search-dir {_res} to paranoia_mode.")
+              f"--search-dir {_dir} to paranoia_mode.")
         integrity_log("exit", "outfile_outside_wipe_roots")
     atomic_write_json(plan, _out)
 

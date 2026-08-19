@@ -155,15 +155,20 @@ def test_rand_mac_is_locally_administered_unicast():
 #    The header used to CLAIM terminal output was redacted while printing the
 #    exact holding and its exact fiat value.
 # --------------------------------------------------------------------------
-def _run_exit_sim(args, prices):
-    """Drive the real main() with the price oracle and Tor stubbed."""
+def _run_exit_sim(args, prices, outfile=None):
+    """Drive the real main() with the price oracle and Tor stubbed.
+
+    outfile is a PARAMETER rather than something a caller can pass inside
+    `args`: this helper appends its own --outfile last, and argparse takes the
+    last occurrence, so an --outfile in `args` was silently overridden.
+    """
     sim = load("exit_strategy_simulator")
     sim.verify_tor = lambda *a, **k: None
     sim.validate_proxy = lambda p: {"http": p, "https": p}
     sim.integrity_log = lambda *a, **k: None
     sim.install_signal_handlers = lambda *a, **k: None
     sim.fetch_prices = lambda proxy: prices
-    out = os.path.join(_scratch, "plan.json")
+    out = outfile or os.path.join(_scratch, "plan.json")
     sys.argv = ["exit_strategy_simulator", *args,
                 "--tor-proxy", "socks5h://127.0.0.1:9050", "--outfile", out]
     import io
@@ -258,6 +263,35 @@ def test_exit_tool_no_longer_simulates_what_it_cannot_measure():
     check("the file records that nothing was executed",
           plan.get("executed") is False)
     check("the tool never claims an exit happened", "no XMR moved" in out)
+
+
+import gs_common as _gsc_gap
+
+
+def test_exit_tool_warns_when_the_outfile_escapes_the_wipe():
+    """The warning branch itself must not crash, and only tests that write
+    somewhere the wipe CANNOT reach ever execute it.
+
+    Every other exit-tool test here writes under the scratch cwd, which
+    paranoia_mode's sweep does cover, so this branch never ran -- and when the
+    inline coverage check was replaced by gs_common.wipe_covers, the local that
+    the warning message interpolated was deleted with it. The branch that
+    exists to stop a silent leak became the one that raised NameError, and the
+    suite stayed green. Hence an explicitly UNCOVERED path.
+    """
+    import json
+    _outside = os.path.join(tempfile.mkdtemp(prefix="uncovered_"), "plan.json")
+    # Sanity: the premise of this test. If this ever becomes covered, the test
+    # below silently stops exercising the branch it exists for.
+    check("exit outfile test: the chosen path really is outside the wipe roots",
+          not _gsc_gap.wipe_covers(_outside))
+    code, out, _f = _run_exit_sim(["100", "--method", "bisq"], PRICES,
+                                  outfile=_outside)
+    check("exit: writing outside the wipe roots does not raise", code == 0)
+    check("exit: ...it warns that the wipe will never find the file",
+          "outside every directory paranoia_mode searches" in out)
+    check("exit: ...and names a directory to hand to --search-dir",
+          "--search-dir " in out and "None" not in out.split("--search-dir ")[1][:40])
 
 
 def test_exit_tool_uses_operator_rates_when_given():
