@@ -1102,18 +1102,44 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
         return []
     if not args.joinmarket_wallet:
         sys.exit("[!] --joinmarket-wallet required when --joinmarket is set")
+    # THE OLD INVOCATION COULD NOT HAVE RUN. Checked against JoinMarket-Org/
+    # joinmarket-clientserver at HEAD, not from memory:
+    #
+    #   1. it ran "tumble.py". The script is scripts/tumbler.py. There is no
+    #      tumble.py in the project.
+    #   2. it passed --socks5-host/--socks5-port. get_tumbler_parser() defines
+    #      no such options -- it has no socks, tor or proxy option at all, and
+    #      JoinMarket takes its Tor settings from joinmarket.cfg. The comment
+    #      beside the flags said exactly that and then passed them anyway.
+    #      optparse exits on an unknown option, so this died before doing
+    #      anything.
+    #   3. it passed "all" as a third positional. The usage is
+    #      "[wallet file] [destaddr(s)...]", so args[1:] are DESTINATIONS and
+    #      each is run through validate_address -- "all" fails that. There is
+    #      no positional amount/sweep argument; the schedule is controlled by
+    #      --mixdepth and friends.
+    #
+    # So: the real script name, no invented flags, and destinations only.
+    #
+    # --yes for the confirmations JoinMarket can ask. It is NOT sufficient on
+    # its own: tumbler.py guards its miner-fee question with `not
+    # options['restart']` rather than answeryes, so a bare input() still runs
+    # when expected fees exceed 5% of the tumble. Under the old call --
+    # capture_output=True with INHERITED stdin -- that prompt would sit unread
+    # for the full 3600s timeout. stdin=DEVNULL turns it into an immediate
+    # EOFError and a loud non-zero exit, which the handler below reports.
+    #
+    # NOT VALIDATED END TO END HERE. Running a real tumble needs a JoinMarket
+    # install, a Bitcoin node and live maker counterparties, which is outside
+    # what this work is allowed to touch. The invocation is corrected against
+    # upstream's actual CLI; it is not claimed to be exercised.
     try:
-        # JoinMarket has its own Tor config in joinmarket.cfg, but we pass
-        # --socks5-host/port to be explicit (JM >= 0.9 supports this).
-        # Without this, JM may resolve maker addresses over clearnet.
-        from urllib.parse import urlparse as _urlparse
-        _parsed_proxy = _urlparse(args.tor_proxy)
         result = subprocess.run(
-            ["python3", "tumble.py",
-             "--socks5-host", _parsed_proxy.hostname or "127.0.0.1",
-             "--socks5-port", str(_parsed_proxy.port or 9050),
-             args.joinmarket_wallet, btc_addr, "all"],
+            [args.joinmarket_python, args.joinmarket_tumbler,
+             "--yes",
+             args.joinmarket_wallet, btc_addr],
             check=True, capture_output=True, text=True, timeout=3600,
+            stdin=subprocess.DEVNULL,
             env=_child_env(),   # third-party child: password scrubbed
         )
         integrity_log("stage1", "JM_tumble_OK")
@@ -1132,7 +1158,7 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
         sys.exit(
             "[!] JoinMarket tumble completed but no output amount could be\n"
             "    parsed from its result. Refusing to continue as if the tumble\n"
-            "    fed nothing into the pipeline. Inspect tumble.py output; if the\n"
+            "    fed nothing into the pipeline. Inspect tumbler.py output; if the\n"
             "    coins did move, re-run supplying the tumbled total via\n"
             "    --btc-amount, or update parse_jm_amounts for your JM version."
         )
@@ -1141,10 +1167,23 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
         sys.exit("[!] JoinMarket tumble timed out after 1 hour")
     except FileNotFoundError:
         integrity_log("stage1", "JM_not_found")
-        sys.exit("[!] tumble.py not found - JoinMarket not installed?")
+        # Name what was actually looked for and how to point at it. This said
+        # "tumble.py not found", a file JoinMarket does not ship, so an
+        # operator who HAD installed JoinMarket correctly was told their
+        # install was missing.
+        sys.exit(f"[!] Could not run {args.joinmarket_tumbler!r} with "
+                 f"{args.joinmarket_python!r}. JoinMarket ships this as "
+                 f"scripts/tumbler.py inside its own virtualenv — pass "
+                 f"--joinmarket-tumbler /path/to/scripts/tumbler.py and "
+                 f"--joinmarket-python /path/to/jmvenv/bin/python.")
     except subprocess.CalledProcessError as e:
         integrity_log("stage1", f"JM_fail:{e.returncode}")
-        sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode})")
+        # optparse exits 2 on an unknown option, and tumbler.py exits on a
+        # destination that fails validate_address. Both used to be produced by
+        # this function's own argv rather than by anything the operator did.
+        sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode}). Its "
+                 f"stderr is above; a usage/option error means the tumbler "
+                 f"CLI has moved on from what this call expects.")
 
 
 def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
@@ -1331,6 +1370,19 @@ def build_cli() -> argparse.ArgumentParser:
                      help="Output directory for unsigned TX plans")
     cli.add_argument("--joinmarket-wallet",
                      help="JoinMarket wallet file for tumbles")
+    # JoinMarket is a SEPARATE project with its own virtualenv. Its tumbler is
+    # not a sibling of this file, so it cannot be resolved with _tool(), and it
+    # must be run by the interpreter that has JoinMarket's dependencies -- not
+    # this one. Both were previously implicit: the script was named on argv as
+    # a bare "tumble.py" (resolved against the CWD) and run with whatever
+    # "python3" meant on PATH.
+    cli.add_argument("--joinmarket-tumbler", default="tumbler.py",
+                     help="Path to JoinMarket's scripts/tumbler.py (default: "
+                          "'tumbler.py', resolved on PATH/CWD)")
+    cli.add_argument("--joinmarket-python", default="python3",
+                     help="Interpreter for JoinMarket's tumbler — must be the "
+                          "python from JoinMarket's own virtualenv, which is "
+                          "not this pipeline's interpreter")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--dag-mixing", action="store_true",

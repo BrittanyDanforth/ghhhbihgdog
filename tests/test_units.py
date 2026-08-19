@@ -2406,6 +2406,110 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
       "NOT what was planned" in _buf5.getvalue()
       and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
 
+# STAGE 1's JOINMARKET INVOCATION. Checked against JoinMarket-Org/
+# joinmarket-clientserver at HEAD, not from memory. The old argv could not have
+# run at all:
+#   * it invoked "tumble.py"; the project ships scripts/tumbler.py
+#   * it passed --socks5-host/--socks5-port; get_tumbler_parser defines no
+#     socks/tor/proxy option whatsoever (JM reads joinmarket.cfg), and optparse
+#     exits on an unknown option
+#   * it passed "all" as a third positional; usage is "[wallet] [destaddr(s)]"
+#     so that lands in destaddrs and fails validate_address
+# Plus a hang: tumbler.py's miner-fee question is a bare input() guarded by
+# `not options['restart']`, so --yes does NOT bypass it, and with stdin
+# inherited it would sit unread until the 3600s timeout.
+# THE RESOURCE SENTINEL, EXERCISED FOR REAL. psutil is a DECLARED dependency
+# (requirements.txt), but it was absent from the environment this repo was
+# audited in, so require_resources only ever took its "DISABLED" branch and the
+# measuring path had never run once. With psutil present it is checked against
+# the machine's actual figures: the same call must return True under generous
+# thresholds and False under impossible ones, which a constant or a stub cannot
+# do. Skipped, not faked, if psutil is genuinely unavailable.
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+if _psutil is not None:
+    check("sentinel: resource_check RUNS and returns a bool with psutil present",
+          isinstance(_gsc.resource_check(), bool))
+    check("sentinel: passes under generous thresholds",
+          _gsc.resource_check(min_disk_gb=0.0001, max_ram_pct=100.0) is True)
+    check("sentinel: FAILS when the disk threshold exceeds real free space "
+          "(so it reads the machine, not a constant)",
+          _gsc.resource_check(min_disk_gb=10 ** 6, max_ram_pct=100.0) is False)
+    check("sentinel: FAILS when the RAM threshold is below real usage",
+          _gsc.resource_check(min_disk_gb=0.0001, max_ram_pct=0.0001) is False)
+    _rc_code = None
+    try:
+        with _ctx.redirect_stdout(_io.StringIO()):
+            _gsc.require_resources(min_disk_gb=10 ** 6)
+    except SystemExit as _e:
+        _rc_code = _e.code
+    check("sentinel: require_resources really aborts when resources are low",
+          _rc_code is not None and "Resources low" in str(_rc_code))
+    _rb = _io.StringIO()
+    with _ctx.redirect_stdout(_rb):
+        _gsc.require_resources(min_disk_gb=0.0001, max_ram_pct=100.0)
+    check("sentinel: does NOT report itself DISABLED when psutil is installed",
+          "DISABLED" not in _rb.getvalue())
+
+
+import subprocess as _subprocess_mod
+
+_jm_argv = {}
+
+
+class _JMArgs:
+    joinmarket = True
+    joinmarket_wallet = "w.jmdat"
+    joinmarket_tumbler = "/jm/scripts/tumbler.py"
+    joinmarket_python = "/jmvenv/bin/python"
+    tor_proxy = "socks5h://127.0.0.1:9050"
+
+
+def _fake_jm_run(cmd, **kw):
+    _jm_argv["cmd"] = list(cmd)
+    _jm_argv["kw"] = kw
+    return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+_real_run, _real_log = ghost.subprocess.run, ghost.integrity_log
+ghost.subprocess.run, ghost.integrity_log = _fake_jm_run, lambda *a, **k: None
+try:
+    with _ctx.redirect_stdout(_io.StringIO()):
+        try:
+            ghost.stage1_joinmarket(_JMArgs(), "bc1qexampledest")
+        except SystemExit:
+            pass          # parse_jm_amounts finds nothing in "" and exits loudly
+finally:
+    ghost.subprocess.run, ghost.integrity_log = _real_run, _real_log
+
+_jc = _jm_argv.get("cmd", [])
+check("stage1: invokes the tumbler script the operator pointed at",
+      "/jm/scripts/tumbler.py" in _jc)
+check("stage1: never invokes 'tumble.py', which JoinMarket does not ship",
+      not any(str(x).endswith("tumble.py") for x in _jc))
+check("stage1: uses JoinMarket's OWN interpreter, not this pipeline's",
+      _jc and _jc[0] == "/jmvenv/bin/python")
+check("stage1: passes no --socks5-* option (JoinMarket has none; optparse "
+      "would exit 2)",
+      not any(str(x).startswith("--socks5") for x in _jc))
+check("stage1: passes no 'all' positional (it would be read as a destination "
+      "and fail validate_address)", "all" not in _jc)
+check("stage1: the destination is passed as a positional destaddr",
+      "bc1qexampledest" in _jc)
+check("stage1: wallet precedes the destination, matching "
+      "'[wallet file] [destaddr(s)...]'",
+      "w.jmdat" in _jc and _jc.index("w.jmdat") < _jc.index("bc1qexampledest"))
+check("stage1: answers JoinMarket's confirmations", "--yes" in _jc)
+check("stage1: closes the child's stdin so the miner-fee input() cannot hang "
+      "for the full 3600s timeout",
+      _jm_argv.get("kw", {}).get("stdin") == _subprocess_mod.DEVNULL)
+check("stage1: still bounds the child with a timeout",
+      _jm_argv.get("kw", {}).get("timeout") == 3600)
+
+
 # THE SPENT PLAN MUST NOT SURVIVE A COMPLETED RUN. Each unsigned_*.json holds
 # every hop's source, destination, amount and account index in PLAINTEXT. A
 # real run left them in --output after finishing: nothing erased them until the
