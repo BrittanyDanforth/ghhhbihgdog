@@ -42,6 +42,7 @@ from gs_common import (
     validate_xmr_address,
     decimal_env,
     finite_decimal,
+    wipe_covers,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -435,6 +436,28 @@ def main():
 
     _out = Path(args.outfile)
     atomic_write_json(pairs, _out)
+    # WIPE COVERAGE. gs_common.wipe_covers exists for precisely this, and names
+    # `--outfile /srv/exit.json` in its own docstring as the case it was
+    # written for -- and it was wired into GhostSpiral and
+    # exit_strategy_simulator only. This file is the worst one to leave
+    # uncovered: each pair carries the deposit address AND the memo, and the
+    # memo contains the destination XMR address in full. paranoia_mode globs
+    # fixed roots (cwd, $HOME, $HOME/ghostspiral, $HOME/GhostSpiral) at depth 0
+    # and 1, so anything written outside them is never looked at -- while this
+    # tool prints "Saved N pair(s)" identically wherever it wrote.
+    if not wipe_covers(_out):
+        try:
+            _wdir = _out.resolve().parent
+        except OSError:
+            _wdir = _out.parent
+        integrity_log("thor", "outfile_outside_wipe_roots")
+        print(f"  [!] {_wdir} is OUTSIDE the directories paranoia_mode sweeps, "
+              f"so this file will NOT be wiped with the rest of the run.")
+        print(f"      It holds every deposit address and every memo, and a "
+              f"memo contains the destination XMR address in full — it is the "
+              f"single artifact that ties the BTC side to the XMR side.")
+        print(f"      Delete it yourself, or write it under the working "
+              f"directory or $HOME so the sweep can find it.")
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
     print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
 

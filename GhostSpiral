@@ -636,6 +636,35 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
+def entry_output_count(rpc, account: int, index: int):
+    """How many separate outputs sit on one subaddress, or None if unknown.
+
+    build_entry_veil's entire shape argument depends on this being 1, and
+    nothing measured it. incoming_transfers is the only RPC that reports
+    OUTPUTS rather than a summed balance -- get_balance would say "2 XMR"
+    whether that is one output or five, which is precisely the distinction
+    that decides how many rings the veil transaction carries.
+
+    Returns None rather than a guess when the RPC cannot answer: "I do not
+    know how many inputs this will have" and "it will have one" are different
+    statements, and only the second is a claim.
+    """
+    try:
+        r = rpc.raw_request("incoming_transfers", {
+            "transfer_type": "available",
+            "account_index": int(account),
+            "subaddr_indices": [int(index)],
+        }) or {}
+    except Exception:                                        # noqa: BLE001
+        return None
+    xfers = r.get("transfers")
+    if not isinstance(xfers, list):
+        return None
+    return sum(1 for t in xfers
+               if isinstance(t, dict) and not t.get("spent")
+               and int(t.get("amount", 0) or 0) > 0)
+
+
 def build_entry_veil(rpc, entry_addr: str, entry_account: int,
                      entry_index: int, delay_window=None) -> tuple:
     """The first spend out of ENTRY, shaped like ordinary traffic.
@@ -671,7 +700,53 @@ def build_entry_veil(rpc, entry_addr: str, entry_account: int,
     It costs one transaction, one fee, and one confirmation wait. It also
     inherits --hop-delay, which matters more here than anywhere else: this is
     the only hop where an analyst knows both endpoints of the wait.
+
+    ONE INPUT IS THE PREMISE, AND IT IS NOT GUARANTEED. Every claim above
+    holds only while ENTRY carries exactly ONE output. sweep_all spends every
+    output on the subaddress, so if ENTRY holds N, this transaction has N
+    inputs -- and each of those N rings contains an output the public swap
+    memo names. Their intersection identifies this transaction, and therefore
+    the carrier it pays: the analyst can now enumerate the very output the
+    paragraph above promises he never sees. Under those conditions the veil
+    does not stop helping, it becomes the thing that gives the carrier away.
+
+    `--split N` used to guarantee exactly that, routing all N chunks to one
+    address; it is refused now (see resolve_split). Three ways in remain, and
+    none of them is the operator's mistake:
+
+      * receive mode, where the bundle's address may already have been paid
+        more than once;
+      * a swap that settles in more than one on-chain payment;
+      * ANYONE AT ALL, because the memo publishes the address -- a stranger
+        who sends dust to it adds an input to this transaction.
+
+    So the count is measured here rather than assumed, and reported when it is
+    not 1. Measuring is all this can do today: spending them separately needs
+    sweep_single per key image, which the signer has no transaction type for,
+    and building N carriers is the redesign the arrival wait, addr_index, the
+    exit hold and receive mode would all have to be rewritten around.
     """
+    _n_inputs = entry_output_count(rpc, entry_account, entry_index)
+    if _n_inputs is None:
+        print("  [!] Could not count the outputs on ENTRY, so it is not known "
+              "whether the veil below is the 1-input transaction its shape "
+              "argument depends on.")
+        integrity_log("stage4", "veil_input_count_unknown")
+    elif _n_inputs > 1:
+        integrity_log("stage4", "veil_multi_input")
+        print(f"  [!] ENTRY holds {_n_inputs} separate outputs, so the veil "
+              f"below will be a {_n_inputs}-INPUT transaction, not the "
+              f"1-in/2-out shape it is meant to be.")
+        print("      Each of those inputs is a ring containing an output the "
+              "public swap memo names, so an analyst can intersect them to "
+              "pick this transaction out — and with it the carrier the rest "
+              "of the run spends from. The veil cannot deliver its premise "
+              "here.")
+        print("      This is usually a swap that settled in several payments, "
+              "or someone else paying the address the memo publishes. If you "
+              "can, wait and run against a receive wallet that has been paid "
+              "once.")
+
     acct = create_fresh_account(rpc, label="")
     addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
     entry = {
@@ -1646,7 +1721,12 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--joinmarket", action="store_true",
                      help="Enable JoinMarket tumble before ThorChain swap")
     cli.add_argument("--split", type=int, default=1,
-                     help="Number of BTC chunks to split across ThorChain")
+                     help="Number of BTC chunks to swap. REFUSED above 1: "
+                          "every chunk would be routed to the SAME entry "
+                          "address, which links the swaps at the aggregator "
+                          "and makes the entry veil an N-input transaction. "
+                          "Use create_receive_wallet --count N and one run "
+                          "per chunk instead.")
     cli.add_argument("--btc-amount", type=decimal_arg,
                      help="Total BTC amount for ThorChain swap "
                           "(required when --split > 0 in sender mode)")
@@ -2445,6 +2525,75 @@ def resolve_hop_delay(args) -> tuple:
     return window
 
 
+def resolve_split(args) -> None:
+    """--split above 1 is REFUSED. One entry address cannot serve N swaps.
+
+    thor_swap_preparer already refuses exactly this, in resolve_destinations,
+    and its reasoning applies here verbatim -- GhostSpiral simply never asked
+    itself the question. Quoting it, because it is this toolchain's own ruling:
+
+      * "ThorChain (or any aggregator) sees three BTC deposits routed to one
+        Monero address, so the three payments -- and the people who made them
+        -- are linked to each other by the party that already has to know the
+        destination. Splitting the amount bought nothing and cost three sets
+        of fees."
+      * "It silently defeats the NEWNYM rotation between quotes ... A new Tor
+        circuit cannot help when every request body carries the same unique
+        95-character identifier. The rotation was theatre for any batch of
+        more than one."
+
+    Both are true of `--split N` as it stands: stage2_get_swap_quotes calls
+    newnym(required=True) before each chunk's quote and then posts the SAME
+    destinationAddress in every request body. Verified by reading the loop.
+
+    THERE IS A THIRD, AND IT IS WORSE. All N swap outputs land on one
+    subaddress, so build_entry_veil's sweep_all spends them in ONE transaction
+    with N inputs. Every one of those N rings contains an output the public
+    swap memo names, so their intersection identifies the veil transaction --
+    and with it the carrier it pays. The veil's whole premise is that "every
+    transaction after this one spends an output the analyst has never seen and
+    cannot enumerate"; under --split the analyst can enumerate it. The veil
+    does not merely stop helping, it becomes the thing that identifies the
+    carrier. That is the audit's G5.
+
+    REFUSED rather than warned about, for thor's stated reason: "by the time a
+    warning is read the quotes are already fetched and the aggregator already
+    has the linkage."
+
+    The honest fix is one entry subaddress per chunk, which is a redesign
+    rather than a patch: ENTRY appears in ~104 places -- the arrival wait, the
+    veil, addr_index, the exit hold, the exit account list, report_holdings and
+    receive mode all assume exactly one. It is not attempted here, and this
+    refusal is not pretending to be it. Splitting across genuinely separate
+    addresses is already supported today: create_receive_wallet --count N, then
+    one run per bundle, or thor_swap_preparer with N --dests.
+    """
+    n = getattr(args, "split", 1)
+    if n is None or n <= 1:
+        return
+    integrity_log("stage0", "split_refused")
+    sys.exit(
+        f"[!] --split {n} is refused: every chunk would be routed to the SAME "
+        f"entry address.\n"
+        f"    * The aggregator sees {n} deposits to one Monero address and "
+        f"links them —\n"
+        f"      thor_swap_preparer refuses the same thing for the same reason.\n"
+        f"    * The per-chunk Tor rotation becomes theatre: a new circuit "
+        f"cannot help\n"
+        f"      when every request body carries the same 95-character "
+        f"destination.\n"
+        f"    * The entry veil becomes an {n}-input transaction whose rings "
+        f"each contain\n"
+        f"      a publicly-named swap output, so their intersection identifies "
+        f"the carrier\n"
+        f"      the rest of the run spends from.\n"
+        f"\n"
+        f"    To split across addresses that are genuinely separate:\n"
+        f"      create_receive_wallet --count {n}   (one bundle per chunk)\n"
+        f"      then one run per bundle with --receive-wallet\n"
+        f"    or thor_swap_preparer --amounts ... --dests <{n} addresses>.")
+
+
 def resolve_swap_arrival(args) -> None:
     """Bounds-check the flags that decide when the swap has fully arrived.
 
@@ -2994,6 +3143,7 @@ def main():
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
     resolve_exit_destinations(args)
+    resolve_split(args)
     resolve_swap_arrival(args)
 
     resolve_wallet_password(args)

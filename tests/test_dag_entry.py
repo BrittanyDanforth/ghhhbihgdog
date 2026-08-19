@@ -28,6 +28,9 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import types
+import io
+import contextlib
 import secrets
 import sys
 from pathlib import Path
@@ -212,6 +215,116 @@ check("G7: ...and the success message says it moves once and rests",
 check("G7: ...and the docstring states WHY it cannot hop (the plan is "
       "pre-signed and the amount is not known until execution)",
       "BUILT AND SIGNED before this destination exists" in _g7_src)
+
+
+
+# ==========================================================================
+# G5: THE VEIL'S PREMISE IS ONE INPUT, AND NOTHING CHECKED
+# ==========================================================================
+print("\n=== the entry veil's input count ===")
+#
+# build_entry_veil argues its case entirely from transaction SHAPE: a 1-in/2-out
+# sweep is "the shape most of the network is making", so the distribution should
+# run from the carrier instead of advertising itself as 1-in/7-out. Every word
+# of that holds only while ENTRY carries exactly ONE output — sweep_all
+# (airgap_tx_signer:442, subaddr_indices=[src_index]) spends them all in one
+# transaction, so N outputs means N inputs.
+#
+# N inputs is worse than the shape it replaced: each ring contains an output the
+# public swap memo names, so intersecting them identifies this transaction and
+# therefore the carrier. The veil stops being protection and becomes the thing
+# that gives the carrier away.
+#
+# `--split N` guaranteed it (all N chunks to one address) and is refused now.
+# What remains is not the operator's doing: a swap settling in several payments,
+# a receive address already paid, or ANYONE sending dust to an address the memo
+# publishes.
+
+
+class _XferRPC:
+    def __init__(self, transfers, fail=False):
+        self._t = transfers
+        self._fail = fail
+
+    def raw_request(self, method, params=None):
+        if self._fail:
+            raise RuntimeError("rpc down")
+        if method == "incoming_transfers":
+            return {"transfers": self._t}
+        return {}
+
+    def new_subaddress_indexed(self, **k):
+        return ("8" + "A" * 94, 1)
+
+
+def _veil_out(transfers, fail=False):
+    _saved = ghost.create_fresh_account
+    try:
+        ghost.create_fresh_account = lambda rpc, label="": 41
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ghost.build_entry_veil(_XferRPC(transfers, fail), "ENTRY", 3, 1)
+        return buf.getvalue()
+    finally:
+        ghost.create_fresh_account = _saved
+
+
+_one = [{"amount": 1000, "spent": False}]
+_four = [{"amount": 1000, "spent": False} for _ in range(4)]
+
+check("G5: counts outputs, not balance — 4 outputs is 4 inputs",
+      ghost.entry_output_count(_XferRPC(_four), 3, 1) == 4)
+check("G5: a SPENT output is not an input", ghost.entry_output_count(
+    _XferRPC(_four + [{"amount": 9, "spent": True}]), 3, 1) == 4)
+check("G5: a zero-amount output is not an input", ghost.entry_output_count(
+    _XferRPC(_four + [{"amount": 0, "spent": False}]), 3, 1) == 4)
+check("G5: an unreachable RPC returns None, not a guess",
+      ghost.entry_output_count(_XferRPC([], fail=True), 3, 1) is None)
+
+check("G5: with ONE output the veil says nothing (its premise holds)",
+      _veil_out(_one).strip() == "")
+_m = _veil_out(_four)
+check("G5: with FOUR it says the veil will be a 4-INPUT transaction",
+      "4-INPUT" in _m)
+check("G5: ...and that the rings can be intersected to find the carrier",
+      "intersect" in _m and "carrier" in _m)
+check("G5: ...and does not claim the veil still delivers",
+      "cannot deliver its premise" in _m)
+_u = _veil_out([], fail=True)
+check("G5: an unknown count is reported as unknown, not as fine",
+      "not known whether" in _u)
+
+# The veil still WORKS in every case — this reports, it does not block. A run
+# that refuses to veil would spend ENTRY directly, which is strictly worse.
+_saved_cfa = ghost.create_fresh_account
+try:
+    ghost.create_fresh_account = lambda rpc, label="": 41
+    with contextlib.redirect_stdout(io.StringIO()):
+        _plan, _carrier = ghost.build_entry_veil(_XferRPC(_four), "ENTRY", 3, 1)
+    check("G5: ...and the veil is still built (reporting, not blocking)",
+          len(_plan) == 1 and _plan[0]["sweep"] is True)
+finally:
+    ghost.create_fresh_account = _saved_cfa
+
+# --split is refused outright, which is the one case the operator controls.
+_split_msg = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=4))
+except SystemExit as _e:
+    _split_msg = str(_e.code)
+check("G5: --split above 1 is REFUSED", _split_msg is not None)
+check("G5: ...naming the aggregator linkage", _split_msg and "links them" in _split_msg)
+check("G5: ...the newnym theatre", _split_msg and "theatre" in _split_msg)
+check("G5: ...the N-input veil", _split_msg and "input transaction" in _split_msg)
+check("G5: ...and the supported alternative",
+      _split_msg and "create_receive_wallet --count" in _split_msg)
+for _ok in (1, 0, None):
+    _r = None
+    try:
+        ghost.resolve_split(types.SimpleNamespace(split=_ok))
+    except SystemExit as _e:
+        _r = str(_e.code)
+    check(f"G5: --split {_ok!r} is allowed through", _r is None)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

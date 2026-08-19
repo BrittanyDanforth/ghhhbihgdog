@@ -37,6 +37,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import re
 import sys
 import types
 from decimal import Decimal as D
@@ -359,6 +360,97 @@ check("F9: ...and passes narrow_existing=False as a real keyword argument",
           and getattr(k.value, "value", None) is False
           for k in _calls[0].keywords))
 _sh2.rmtree(_d9, ignore_errors=True)
+
+
+
+# ==========================================================================
+# F5: THE WIPE-COVERAGE WARNING EXISTED, AND TWO OF FOUR TOOLS USED IT
+# ==========================================================================
+print("\n=== artifacts written outside paranoia_mode's reach ===")
+#
+# gs_common.wipe_covers was written for exactly this and names the case in its
+# own docstring: "Anything an operator redirects elsewhere -- `--output
+# /mnt/usb/plans`, `--outfile /srv/exit.json` -- is never looked at, and
+# nothing told them so, because both tools report success identically wherever
+# they wrote."
+#
+# It was wired into GhostSpiral (--output) and exit_strategy_simulator
+# (--outfile). thor_swap_preparer (--outfile) and create_receive_wallet
+# (--output-dir, default ".") never called it — and thor's file is the worst
+# one to leave uncovered: every pair carries the deposit address AND the memo,
+# and the memo contains the destination XMR address in full. It is the single
+# artifact tying the BTC side to the XMR side.
+check("F5: wipe_covers says a repo-local path IS covered",
+      _gsc.wipe_covers("thor_pairs_batch.json"))
+check("F5: ...and a redirected one is NOT",
+      not _gsc.wipe_covers("/mnt/usb/pairs.json"))
+
+_F5D = "8" + "A" + "1" * 93
+_F5DEP = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+
+
+def _run_thor(outfile):
+    """Drive the REAL thor main() to `outfile`, network stubbed."""
+    m = load("thor_swap_preparer")
+    for _stub in ("verify_tor", "newnym", "secure_delay",
+                  "install_signal_handlers", "integrity_log"):
+        setattr(m, _stub, lambda *a, **k: None)
+    m.validate_proxy = lambda p: {"http": p, "https": p}
+    m.shutdown_requested = lambda: False
+    m._validate_xmr_addr = lambda a: None
+    m.safe_get = lambda url, proxy=None: {"monero": {"btc": "0.005"}}
+    m.safe_post = lambda url, payload, proxy=None: {"routes": [{
+        "transaction": {"depositAddress": _F5DEP,
+                        "memo": f"=:XMR.XMR:{_F5D}:0/1/0"},
+        "expectedOutput": "1.0"}]}
+    _argv = sys.argv
+    sys.argv = ["thor", "--amounts", "0.005", "--dests", _F5D,
+                "--outfile", str(outfile),
+                "--tor-proxy", "socks5h://127.0.0.1:9050"]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            m.main()
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = _argv
+    return buf.getvalue()
+
+
+import tempfile as _tf5
+_away = os.path.join(_tf5.mkdtemp(prefix="f5_away_"), "pairs.json")
+_out_away = _run_thor(_away)
+check("F5: thor WARNS when its outfile is outside the wipe roots",
+      "OUTSIDE the directories" in _out_away)
+check("F5: ...and says what the file holds (the memo carries the XMR address)",
+      "memo contains the destination XMR address" in _out_away)
+check("F5: ...and the file really was written there",
+      os.path.exists(_away))
+
+# NON-VACUITY: writing somewhere the sweep DOES cover must NOT warn, or the
+# check above would pass on a tool that warns unconditionally.
+_cwd_out = os.path.join(os.getcwd(), "f5_probe_pairs.json")
+try:
+    _out_home = _run_thor(_cwd_out)
+    check("F5 control: writing under the working directory does NOT warn",
+          "OUTSIDE the directories" not in _out_home)
+finally:
+    if os.path.exists(_cwd_out):
+        os.remove(_cwd_out)
+
+# create_receive_wallet, same helper, same reason: the bundle names the receive
+# address and its (account, subaddress) -- the pair report_holdings refuses to
+# put on disk.
+_crw_src = open(os.path.join(REPO, "create_receive_wallet")).read()
+_crw_flat = re.sub(r"\s+", " ", _crw_src)
+_crw_flat = re.sub(r'"\s*f?"', "", _crw_flat)
+check("F5: create_receive_wallet consults wipe_covers on its bundle",
+      "wipe_covers(fname)" in _crw_flat)
+check("F5: ...and warns that the bundle will not be wiped",
+      "will NOT be wiped with the rest of the run" in _crw_flat)
+check("F5: ...naming what it discloses",
+      "names the receive address and its account/subaddress" in _crw_flat)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
