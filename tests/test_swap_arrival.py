@@ -751,6 +751,99 @@ for _qs in (["0.50", "0.30", "0.15", "0.05"], ["1.0"] * 12, ["2.5", "2.5"]):
           == _gsc.swap_arrival_floor(_tot, D("0.10"), _amts, len(_amts)))
 
 
+
+# ---- STAGE 4 WITH UNEQUAL CHUNKS ---------------------------------------
+#
+# Every stage4 check above uses EQUAL chunks, and that is why a one-line
+# regression survived a green suite: `chunk_amounts = []` whenever
+# --expect-total-xmr was set threw away the per-chunk breakdown, so the
+# unequal-chunk gate reverted to the plain tolerance at the exact moment the
+# operator supplied the total this tool asks them for. With equal chunks the
+# two floors are close enough that nothing noticed.
+#
+# --joinmarket is the path that produces unequal chunks: btc_chunks becomes
+# jm_utxos, the tumbler's own outputs.
+_UQ = ["0.50", "0.30", "0.15", "0.05"]        # total 1.00, smallest is 5%
+
+
+def _uq_quotes():
+    return [quote(x) for x in _UQ]
+
+
+# ...with quotes alone: the smallest chunk must hold the gate.
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("0.50"), D("0.50")), (D("0.80"), D("0.80")),
+     (D("0.95"), D("0.95"))] + [(D("0.95"), D("0.95"))] * 20,
+    deposits=_uq_quotes())
+check("UNEQUAL STAGE4: 0.95 of a 1.00 swap EXITS when the missing 0.05 is a "
+      "whole chunk", _exit is not None)
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("0.50"), D("0.50")), (D("0.95"), D("0.95")),
+     (D("1.00"), D("1.00"))], deposits=_uq_quotes())
+check("UNEQUAL STAGE4: ...and the complete delivery proceeds",
+      _exit is None and _res == (D("1.00"), D("1.00")))
+
+# THE REGRESSION. Supplying the true total must not weaken the gate: the total
+# corrects the magnitude, the quotes still describe the proportions.
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("1.90"), D("1.90"))] + [(D("1.90"), D("1.90"))] * 20,
+    deposits=_uq_quotes(), expect=D("2.00"))
+check("UNEQUAL STAGE4: --expect-total-xmr does NOT discard the per-chunk "
+      "breakdown (1.90 of 2.00 with a 0.10 chunk missing still exits)",
+      _exit is not None)
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("1.90"), D("1.90")), (D("2.00"), D("2.00"))],
+    deposits=_uq_quotes(), expect=D("2.00"))
+check("UNEQUAL STAGE4: ...and the full rescaled delivery still proceeds",
+      _exit is None and _res == (D("2.00"), D("2.00")))
+
+# Non-vacuity: on the SAME timeline the plain tolerance would have opened, so
+# these checks are about the breakdown and not about the numbers happening to
+# line up.
+check("control: the plain tolerance alone WOULD have accepted 1.90 of 2.00",
+      D("1.90") >= ghost.accept_floor(D("2.00"), D("0.10")))
+
+
+
+# ---- the floor must always be REACHABLE ---------------------------------
+#
+# swap_arrival_floor raises the floor to just above "everything except the
+# smallest chunk". A chunk smaller than one piconero -- a quote can carry one,
+# Decimal("0.0000000000001") is finite and positive and sum_quoted_xmr accepts
+# it -- pushed that above the TOTAL, so no arrival could ever satisfy the gate
+# and the run waited out its whole timeout and reported the swap short.
+_TINY = [D("1.0"), D("0.0000000000001")]
+_tf_, _tt_ = ghost.swap_arrival_floor(sum(_TINY), D("0.10"), _TINY, 2)
+check("FLOOR: a sub-piconero chunk cannot make the gate unreachable",
+      _tf_ <= sum(_TINY))
+check("FLOOR: ...and it falls back to the plain tolerance rather than "
+      "tightening to something impossible", not _tt_)
+
+# The floor is never above the total for any shape, checked over the sizes and
+# spreads this pipeline actually produces.
+_shapes = [[D(1)] * n for n in (1, 2, 3, 12, 20)] + [
+    [D("0.5"), D("0.3"), D("0.15"), D("0.05")],
+    [D("0.9999"), D("0.0001")],
+    [D("100"), D("0.01")],
+    [D("0.0001")] * 5,
+]
+for _sh in _shapes:
+    _t = sum(_sh)
+    for _tol in (D("0"), D("0.01"), D("0.10"), D("0.5"), D("0.99")):
+        _f, _ = ghost.swap_arrival_floor(_t, _tol, _sh, len(_sh))
+        if _f > _t:
+            check(f"FLOOR: unreachable for {[str(x) for x in _sh]} @ {_tol}",
+                  False)
+            break
+else:
+    check(f"FLOOR: never exceeds the total, over {len(_shapes)} shapes x 5 "
+          f"tolerances", True)
+
+check("FLOOR: a zero or negative total yields no floor at all",
+      ghost.swap_arrival_floor(D(0), D("0.10"), [], 3) == (D(0), False)
+      and ghost.swap_arrival_floor(D(-1), D("0.10"), [], 3) == (D(0), False))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

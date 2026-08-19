@@ -71,6 +71,45 @@ def test_memo_binding_logic():
           not thor._memo_binds_destination(
               f"=:XMR.XMR:{OTHER}:0".encode().hex(), DEST))
 
+    # EVERY NEGATIVE CASE ABOVE VARIES THE DESTINATION, so the destination
+    # check alone satisfies all of them and the other two fields are untested.
+    # Proven by mutation: deleting the ASSET check entirely left this file, and
+    # every other suite, green. The project's own audit recorded noticing this
+    # ("my 'wrong asset' case used the attacker's address -- the destination
+    # check rejected it either way") and the case was never added.
+    #
+    # These hold the destination CORRECT and vary one other field, which is the
+    # only shape that can test that field. A memo with our address but the
+    # wrong asset is not harmless: THORChain reads the fields positionally, so
+    # it describes a swap that does not deliver XMR to us.
+    for _asset in ("BTC.BTC", "ETH.ETH", "BTC", "XMRX", "DOGE.DOGE", ""):
+        check(f"memo with OUR address but asset {_asset!r} does not bind",
+              not thor._memo_binds_destination(
+                  f"=:{_asset}:{DEST}:0/1/0", DEST))
+    check("...while the same memo on the XMR chain does bind (so the checks "
+          "above are about the ASSET, not the shape)",
+          thor._memo_binds_destination(f"=:XMR.XMR:{DEST}:0/1/0", DEST))
+    check("a bare XMR asset still binds (THORChain accepts both spellings)",
+          thor._memo_binds_destination(f"=:XMR:{DEST}:0/1/0", DEST))
+
+    for _op in ("ADD", "WITHDRAW", "BOND", "LOAN+", "", "x"):
+        check(f"memo with OUR address but op {_op!r} does not bind",
+              not thor._memo_binds_destination(
+                  f"{_op}:XMR.XMR:{DEST}:0/1/0", DEST))
+
+    # The hex path must re-parse the FIELDS, not substring-match the decoded
+    # text -- decoding and then searching would reopen the original hole by a
+    # different door.
+    check("hex decoding to our address with the wrong ASSET does not bind",
+          not thor._memo_binds_destination(
+              f"=:BTC.BTC:{DEST}:0/1/0".encode().hex(), DEST))
+    check("hex decoding to our address with a non-swap OP does not bind",
+          not thor._memo_binds_destination(
+              f"ADD:XMR.XMR:{DEST}:0/1/0".encode().hex(), DEST))
+    check("...and a memo that merely CONTAINS our address does not bind",
+          not thor._memo_binds_destination(
+              f"=:XMR.XMR:{OTHER}:0/1/0:{DEST}:10", DEST))
+
 
 class ThorRun:
     """Drive thor_swap_preparer.main() with the network stubbed."""

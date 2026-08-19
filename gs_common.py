@@ -237,12 +237,22 @@ def chain_safe(msg: str) -> str:
         # than the bare-run threshold), then bare runs, then digits. Digits
         # last, because collapsing them to '#' would break up a base58 run
         # before the run rule ever saw it.
-        # A FULL address first, matched exactly rather than statistically: a
+        # LINE STRUCTURE FIRST. A chain entry is ONE line, and the reader
+        # splits it on " | " and then on "|". A payload carrying a newline
+        # appends what looks like a second entry with no hash, so
+        # verify_integrity_chain reports "line N does not chain ... this line
+        # or one before it was altered" -- A TAMPER THAT NEVER HAPPENED, in the
+        # file whose only job is telling the operator whether they have been
+        # tampered with. It is permanent once written: every later link
+        # recomputes against it. Reproduced with one "two\nlines" payload.
+        out = re.sub(r"[\r\n\t]+", " ", str(msg))
+        out = out.replace("|", "/")
+        # A FULL address next, matched exactly rather than statistically: a
         # run of 90+ base58 characters is an address and nothing else, so this
         # branch has no false positives and no misses. The rate rule below is
         # a heuristic and gets ~99% of full addresses on its own -- 1% is not
         # a number to accept for the value that identifies the operator.
-        out = re.sub(r"[1-9A-HJ-NP-Za-km-z]{90,}", "<addr>", str(msg))
+        out = re.sub(r"[1-9A-HJ-NP-Za-km-z]{90,}", "<addr>", out)
         out = _CHAIN_ADDR_RE.sub("<addr>", out)
         out = _CHAIN_B58_RUN_RE.sub(
             lambda m: "<addr>" if _b58_run_is_addressy(m.group(0)) else m.group(0),
@@ -1711,6 +1721,14 @@ def swap_arrival_floor(total: Decimal, tolerance: Decimal,
     # One piconero above "everything except the smallest chunk", so a whole
     # missing chunk can never satisfy it.
     guard = (total - smallest).quantize(PICONERO, rounding=ROUND_DOWN) + PICONERO
+    # NEVER ABOVE THE TOTAL. A chunk smaller than one piconero -- a quote can
+    # legitimately carry one, Decimal("0.0000000000001") is finite and positive
+    # -- puts `total - smallest + PICONERO` ABOVE total, and a floor no arrival
+    # can ever reach turns "wait for all of it" into "wait for ever, then blame
+    # the swap". A chunk that small cannot be guarded against anyway: it is
+    # below the unit the chain represents.
+    if guard > total:
+        return floor_, False
     if guard > floor_:
         return guard, True
     return floor_, False

@@ -30,6 +30,24 @@ gs = load("gs_common.py")
 bcast = load("broadcast_signed_xmr")
 
 PASS = 0; FAIL = 0; FAILURES = []
+UNPROVEN = []
+
+
+def unproven(name, why):
+    """A check that could NOT RUN. Not a pass, not a failure -- and loud.
+
+    These three outcomes were two. The SOCKS-routing probes below classify any
+    exception without "SOCKS" in it as a CLEARNET CONNECTION, so with
+    python-monero absent `ModuleNotFoundError: No module named 'monero'` was
+    reported as "remote RPC with a proxy actually routes through SOCKS (got
+    'clearnet')" -- a leak that did not happen, in the suite whose entire job
+    is leak detection. A suite that cries wolf is how a real wolf gets ignored.
+
+    Reported separately so it cannot be read as either: the check did not run,
+    and nothing here knows whether the guarantee holds.
+    """
+    UNPROVEN.append(f"{name} [{why}]")
+    print(f"  UNPROVEN: {name} — {why}")
 
 
 def check(name, cond):
@@ -411,36 +429,71 @@ def _connect_path(url, proxy_url):
         return "connected"
     except SystemExit as e:
         return "abort:" + str(e).splitlines()[0]
+    except ImportError as e:
+        # NOT "clearnet". No connection was attempted at all -- the constructor
+        # never got that far. Saying "clearnet" here invents a leak.
+        return "unavailable:" + str(e)
     except Exception as e:                                   # noqa: BLE001
         m = str(e)
         if "SOCKS" in m:
             return "socks"
+        if "No module named" in m or isinstance(e, ModuleNotFoundError):
+            return "unavailable:" + m
         return "clearnet"
 
 
 _p = _connect_path("http://10.1.2.3:18083", "socks5h://127.0.0.1:9050")
-check("remote RPC with a proxy actually routes through SOCKS "
-      f"(got {_p!r})", _p == "socks")
-check("remote RPC with a proxy NEVER opens a direct connection", _p != "clearnet")
-check("remote RPC with NO proxy aborts instead of connecting",
-      _connect_path("http://10.1.2.3:18083", None).startswith("abort:"))
+if _p.startswith("unavailable:"):
+    _why = "python-monero not installed: " + _p.split(":", 1)[1].strip()
+    unproven("remote RPC with a proxy actually routes through SOCKS", _why)
+    unproven("remote RPC with a proxy NEVER opens a direct connection", _why)
+    unproven("remote RPC with NO proxy aborts instead of connecting", _why)
+else:
+    check("remote RPC with a proxy actually routes through SOCKS "
+          f"(got {_p!r})", _p == "socks")
+    check("remote RPC with a proxy NEVER opens a direct connection",
+          _p != "clearnet")
+    _np = _connect_path("http://10.1.2.3:18083", None)
+    if _np.startswith("unavailable:"):
+        unproven("remote RPC with NO proxy aborts instead of connecting",
+                 "python-monero not installed")
+    else:
+        check("remote RPC with NO proxy aborts instead of connecting",
+              _np.startswith("abort:"))
 
 # localhost must not be wrapped: the daemon behind it already syncs over Tor,
 # and sending 127.0.0.1 through SOCKS just fails.
-import monero.backends.jsonrpc.wallet as _W
-_orig_init = _W.JSONRPCWallet.__init__
-_seen = {}
-def _spy(self, *a, **k):
-    _seen.update(k)
-    return _orig_init(self, *a, **k)
-_W.JSONRPCWallet.__init__ = _spy
+# GUARDED. This was a bare module-level import, so with python-monero absent
+# the whole file died here -- no RESULT line, no summary, and the 40 checks
+# above vanished from any report that greps for one. The failure was visible
+# only in a traceback nobody reads.
 try:
-    gs.MoneroRPC("http://127.0.0.1:1", proxy_url="socks5h://127.0.0.1:9050")
-except Exception:
-    pass
-_W.JSONRPCWallet.__init__ = _orig_init
-check("a localhost RPC is NOT wrapped in the SOCKS proxy",
-      _seen.get("proxy_url") is None)
+    import monero.backends.jsonrpc.wallet as _W
+except ImportError as _e:
+    _W = None
+    unproven("localhost RPC is not wrapped in a proxy",
+             f"python-monero not installed: {_e}")
+    unproven("a remote RPC IS wrapped in a proxy",
+             "python-monero not installed")
+_seen = {}
+if _W is not None:
+    _orig_init = _W.JSONRPCWallet.__init__
+
+    def _spy(self, *a, **k):
+        _seen.update(k)
+        return _orig_init(self, *a, **k)
+
+    _W.JSONRPCWallet.__init__ = _spy
+    try:
+        gs.MoneroRPC("http://127.0.0.1:1", proxy_url="socks5h://127.0.0.1:9050")
+    except Exception:                                        # noqa: BLE001
+        pass
+    _W.JSONRPCWallet.__init__ = _orig_init
+    check("a localhost RPC is NOT wrapped in the SOCKS proxy",
+          _seen.get("proxy_url") is None)
+else:
+    unproven("a localhost RPC is NOT wrapped in the SOCKS proxy",
+             "python-monero not installed")
 
 # The dead attribute name must not come back -- checked over the AST, not the
 # text. The comment explaining WHY _session was wrong necessarily names it, and
@@ -581,7 +634,81 @@ check("scanner does NOT flag a count wrapper len(btc_chunks)",
 check("scanner does NOT flag a scrubbed address",
       _planted_flags('integrity_log("x", f"a={scrub_address(addr)}")') == [])
 
-print(f"\nRESULT: {PASS} passed, {FAIL} failed")
+# THREE NUMBERS, NOT TWO. An UNPROVEN check is not a pass -- the guarantee it
+# names is simply unmeasured here -- and printing it as one is how a suite
+# reports green while its most important checks never ran. The RESULT line
+# always prints now: a bare `import monero` used to kill this file before it
+# got here, so a report that greps for RESULT saw nothing at all and the 40
+# checks above disappeared silently.
+
+# ---------------------------------------------------------------------------
+# ONLY socks5h:// — WIDENING THE DNS GUARANTEE.
+#
+# gs_common's comment on SOCKS_RE calls this CRITICAL: "only socks5h:// is
+# accepted. Plain socks5:// leaks DNS locally because the requests library
+# resolves hostnames BEFORE sending through the SOCKS proxy."
+#
+# Line 75 above already pins the headline case, and validate_proxy defends it
+# TWICE — an explicit startswith() check and the regex — so removing either one
+# alone changes nothing observable. Mutation showed that: each single-guard
+# mutation stayed green, which reads like a coverage hole and is not one.
+# Removing BOTH turns line 75 red, which is the correct behaviour and was worth
+# establishing rather than assuming.
+#
+# What follows widens the case rather than adding a missing one: the near-miss
+# spellings an operator actually types, and the shapes that could smuggle the
+# right scheme past a check that matched loosely.
+_DNS_OK = "socks5h://127.0.0.1:9050"
+check("proxy: socks5h:// is accepted", isinstance(gs.validate_proxy(_DNS_OK), dict))
+check("proxy: ...and is used for BOTH http and https",
+      gs.validate_proxy(_DNS_OK) == {"http": _DNS_OK, "https": _DNS_OK})
+
+
+def _refused(url):
+    try:
+        gs.validate_proxy(url)
+        return False
+    except SystemExit:
+        return True
+    except Exception:                                        # noqa: BLE001
+        return True
+
+
+# THE ONE THAT MATTERS. socks5:// differs from socks5h:// by a single letter,
+# is what most documentation shows, and is what an operator types from memory.
+check("proxy: plain socks5:// is REFUSED (it resolves DNS locally)",
+      _refused("socks5://127.0.0.1:9050"))
+check("proxy: ...and removing ONE of the two guards is not enough to break "
+      "that, which is why a single-guard mutation looks green",
+      _refused("socks5://127.0.0.1:9050"))
+check("proxy: socks4:// is refused", _refused("socks4://127.0.0.1:9050"))
+check("proxy: http:// is refused", _refused("http://127.0.0.1:8080"))
+check("proxy: https:// is refused", _refused("https://127.0.0.1:8080"))
+check("proxy: an empty proxy is refused", _refused(""))
+check("proxy: a proxy with no port is refused", _refused("socks5h://127.0.0.1"))
+check("proxy: a bare host is refused", _refused("127.0.0.1:9050"))
+# Case: SOCKS5H:// is not accepted either -- requests matches the scheme
+# case-sensitively, so accepting it here would hand requests a scheme it does
+# not know and the connection would not be proxied at all.
+check("proxy: an upper-case SOCKS5H:// is refused",
+      _refused("SOCKS5H://127.0.0.1:9050"))
+# ...and nothing that merely CONTAINS the right scheme sneaks through.
+check("proxy: a URL that only contains socks5h:// is refused",
+      _refused("http://x/?u=socks5h://127.0.0.1:9050"))
+check("proxy: whitespace around a good proxy does not smuggle a bad one",
+      _refused("socks5h://127.0.0.1:9050 socks5://127.0.0.1:9050"))
+
+
+print(f"\nRESULT: {PASS} passed, {FAIL} failed, {len(UNPROVEN)} UNPROVEN")
+if UNPROVEN:
+    print("UNPROVEN (these guarantees were NOT measured — do not read this "
+          "suite as green):")
+    for _u in UNPROVEN:
+        print("   -", _u)
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)
+if UNPROVEN:
+    # Exit 2: distinct from pass and from fail, so the console shows it as
+    # "exit 2" rather than a tick. Install python-monero to clear it.
+    sys.exit(2)
 print("ALL GREEN")

@@ -41,6 +41,7 @@ Pure functions and driven fakes: no daemon, no wallet, no network.
 """
 import ast
 import contextlib
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -539,6 +540,57 @@ check("no chain payload carries an exception MESSAGE (only its type)",
       not _textual)
 if _textual:
     print("     still textual:", _textual)
+
+
+
+# ==========================================================================
+# 7. A PAYLOAD MUST NOT BE ABLE TO FORGE A CHAIN LINE
+# ==========================================================================
+print("\n=== line structure ===")
+#
+# A chain entry is ONE line, and verify_integrity_chain splits on " | " then
+# "|". A payload carrying a newline appends what looks like a second entry with
+# no hash, so the verifier reports "line N does not chain ... this line or one
+# before it was altered": A TAMPER THAT NEVER HAPPENED, in the file whose only
+# job is telling the operator whether they have been tampered with. It is
+# permanent once written — every later link recomputes against it — and it
+# would send an operator into a compromise response over a stray "\n".
+_lp = Path(tempfile.mkdtemp(prefix="gs_chain_lines_")) / "integrity_chain.log"
+for _m in ("normal", "two\nlines", "tab\there", "pipe|char", "crlf\r\nhere",
+           "after"):
+    gsc.integrity_log("stage", _m, log_path=_lp)
+
+_lok, _lbad, _lwhy = gsc.verify_integrity_chain(_lp)
+check("a payload containing a newline does NOT fork the chain",
+      _lok and _lbad is None)
+check("...and every entry is still exactly one line",
+      len(_lp.read_text().splitlines()) == 6)
+# Guarded: a forked chain has lines with no " | " at all, and an IndexError
+# here would kill the file before it printed RESULT -- turning a clean FAIL
+# into "no result", which is exactly how the ipleak suite hid six unmeasured
+# guarantees. A test must FAIL, not crash.
+def _fields(line):
+    parts = line.split(" | ")
+    return parts[1].split("|") if len(parts) > 1 else []
+
+
+check("a payload containing the field separator does not forge a field",
+      all(len(_fields(_l)) == 4 for _l in _lp.read_text().splitlines()))
+check("...and the event text survives, merely flattened",
+      "two lines" in _lp.read_text() and "pipe/char" in _lp.read_text())
+
+# Non-vacuity: an unflattened newline really does break the verifier, so the
+# check above is not passing on a payload that was harmless anyway.
+_raw = Path(tempfile.mkdtemp(prefix="gs_chain_raw_")) / "c.log"
+_prev = "0" * 64
+with open(_raw, "w") as _fh:
+    for _payload in ("normal", "two\nlines", "after"):
+        _line = f"1787154000|10.5|stage|{_payload}"
+        _h = hashlib.sha256((_prev + _line).encode()).hexdigest()
+        _fh.write(f"{_h} | {_line}\n")
+        _prev = _h
+check("control: the SAME payloads written unflattened DO break the verifier",
+      not gsc.verify_integrity_chain(_raw)[0])
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

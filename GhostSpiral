@@ -1399,6 +1399,26 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
     # install, a Bitcoin node and live maker counterparties, which is outside
     # what this work is allowed to touch. The invocation is corrected against
     # upstream's actual CLI; it is not claimed to be exercised.
+    # THE ADDRESS IS ON THE CHILD'S ARGV, AND CANNOT NOT BE.
+    #
+    # tumbler.py takes the destination positionally; there is no environment or
+    # stdin form to use instead, and this toolchain does not get to change a
+    # third-party CLI. So for as long as the tumble runs -- upstream's own
+    # default schedule is hours -- the operator's Bitcoin address sits in
+    # /proc/<pid>/cmdline at mode 0444, readable by every account on the host.
+    #
+    # That is the exact exposure GS_BTC_ENTRY exists to prevent, and
+    # _child_env's default-deny (which strips every GS_ variable from this very
+    # call) does nothing about it: the environment was only ever half the
+    # channel. Said out loud rather than left for someone to find in `ps`,
+    # because the rest of the toolchain's promise not to put this value on a
+    # command line does not hold here.
+    print("  [!] JoinMarket's tumbler takes the destination address on its "
+          "COMMAND LINE, so your BTC address is readable via ps and "
+          "/proc/<pid>/cmdline (mode 444) for the whole tumble. Nothing here "
+          "can change that — it is upstream's CLI. Run this on a host where "
+          "you are the only user.")
+    integrity_log("stage1", "JM_dest_on_child_argv")
     try:
         result = subprocess.run(
             [args.joinmarket_python, args.joinmarket_tumbler,
@@ -2571,12 +2591,27 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
             integrity_log("stage4", "expect_total_below_quotes")
         quoted = args.expect_total_xmr
         unreadable = 0
-    # An explicit target replaces the quotes, so it replaces the per-chunk
-    # breakdown too -- there is no way to know how the operator's own swaps
-    # were sized. --split then stands in for the count, on an equal-chunk
-    # assumption stated out loud below.
+    # RESCALE the breakdown; do not throw it away.
+    #
+    # This read `chunk_amounts = []`, on the reasoning that an explicit target
+    # replaces the quotes so it replaces their breakdown too. That is wrong,
+    # and it undid the unequal-chunk protection at the exact moment the
+    # operator did what this tool asks them to do. With JoinMarket's quotes
+    # 0.50/0.30/0.15/0.05 the gate correctly held at 0.95 -- and passing
+    # --expect-total-xmr dropped the floor to 0.90 and called it PAID with a
+    # whole chunk in flight. Measured.
+    #
+    # The operator's total corrects the MAGNITUDE. It says nothing about the
+    # proportions, and the quotes remain the only evidence of those, so the
+    # breakdown is scaled onto the new total rather than discarded. With no
+    # quotes at all (manual mode) there is genuinely nothing to scale, and the
+    # count-only path below says so out loud.
     if args.expect_total_xmr is not None:
-        chunk_amounts = []
+        if quoted > 0 and chunk_amounts:
+            _scale = args.expect_total_xmr / quoted
+            chunk_amounts = [_a * _scale for _a in chunk_amounts]
+        else:
+            chunk_amounts = []
     # Keyed on the SMALLEST chunk, not on how many there are -- see
     # swap_arrival_floor for the two paths the count-based version missed.
     floor_, _tightened = swap_arrival_floor(quoted, args.swap_tolerance,
