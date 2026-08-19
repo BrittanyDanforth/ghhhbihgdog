@@ -421,13 +421,44 @@ swap. It does not hide the link, and nothing in this toolchain can retract it.
 The mixing that follows hides what you do **next** with the Monero. That is
 the whole and only claim. So:
 
-- **One fresh receive address per swap.** `thor_swap_preparer` now *refuses* a
+- **One fresh receive address per swap.** `thor_swap_preparer` *refuses* a
   batch that routes two swaps to the same address — reusing one hands the
   aggregator a link between those BTC payments, which is exactly what
   splitting the amount was meant to avoid, and it silently defeats the NEWNYM
   rotation between quotes (a new circuit cannot disguise identical request
   bodies). Mint them with `create_receive_wallet --count N` and pass every
   bundle to `--dest-from-receive-wallet`.
+- **`--split N` obeys the same rule now, and it used to be refused for
+  breaking it.** GhostSpiral routed every chunk of a split to ONE entry
+  address, which cost all three of the above *and* something worse on-chain:
+  the entry veil swept all N chunks in a single transaction whose N input
+  rings each contained a publicly-known swap output, so intersecting them
+  identified the carrier the rest of the run spends from. A split run now
+  mints **one entry address per chunk**, quotes each chunk to its own address,
+  veils each into its own carrier, and gives each carrier its own fan-out over
+  its own slice of the mix subaddresses. The invariant that makes it safe is
+  stronger than "the veil has one input":
+
+  > **No transaction ever spends value derived from two different swap
+  > chunks.**
+
+  Veiling the chunks separately into a *shared* carrier would not be enough —
+  the convergence would simply move to the distribution, where the same
+  intersection works. So there is no convergence transaction at all. `--split`
+  is capped at 8 (every chunk costs a swap fee, a veil transaction and a
+  wallet account, and the offline signing wallet derives subaddresses for a
+  bounded number of accounts), and it is **not supported with `--peel`**: each
+  chunk would need its own sequential, confirmation-gated chain.
+- **Spending one output of an address holding several is not available, and
+  that is structural.** `sweep_single` names its target by key image, and the
+  online wallet is **view-only** — it cannot compute key images at all.
+  Obtaining them would need a third air-gap crossing, offline → online,
+  ordered *before* the phase it feeds; `sweep_single` also takes no
+  `account_index`, so the one-account-per-hop invariant would stop being
+  enforceable; and the signing fingerprint has no key-image field, so two
+  plans naming different outputs would hash identically. The signer refuses
+  such a plan outright rather than letting it fall through to an ordinary
+  transfer that ignores the key image.
 - **Treat the receive address as burned** once the swap is arranged. Let the
   mix move the funds off it; do not reuse it for anything.
 - **Keep the memo off anything public.** It names your XMR address in plain

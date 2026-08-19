@@ -94,6 +94,53 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                      f"invalid ({ai!r}); expected a non-negative int. Refusing "
                      f"to fall back to meta.account_index for a plan that "
                      f"explicitly names an account.")
+        # PER-OUTPUT SPENDING IS REFUSED HERE, EXPLICITLY.
+        #
+        # A plan entry naming a key image -- a sweep_single, the primitive that
+        # would spend exactly ONE of several outputs on a subaddress -- was
+        # already rejected, but only by accident: it fell through to the
+        # transfer branch and died on "field 'amt' missing". That message
+        # invites precisely the wrong fix. Add `amt` and the entry builds as an
+        # ordinary transfer_split, which picks its own inputs and ignores the
+        # key image entirely -- the "looks authoritative, is ignored" failure
+        # this validator refuses for sweep+amt three lines below, arrived at by
+        # following its own error message.
+        #
+        # It cannot work here in any case, and the reasons are structural:
+        #   * phase_create talks to a VIEW-ONLY wallet, which cannot compute
+        #     key images at all (they need the spend key), and sweep_single
+        #     resolves its target by key image and nothing else;
+        #   * obtaining them needs a third air-gap crossing, offline -> online,
+        #     ordered BEFORE the phase it feeds, inverting create -> sign;
+        #   * sweep_single takes no account_index and no subaddr_indices, so
+        #     the one-account-per-hop invariant the peel chain rests on would
+        #     become unenforceable;
+        #   * _canonical_plan has no key_image field, so two plans naming
+        #     DIFFERENT outputs would fingerprint identically and the signing
+        #     gate would pass a swapped plan;
+        #   * the RPC currently picks and reserves outputs, which is what stops
+        #     one plan double-spending; with the plan naming them, two entries
+        #     carrying one key image both build and the daemon only objects at
+        #     relay, after the first has paid its fee.
+        #
+        # GhostSpiral's build_entry_veils documents the same refusal from the
+        # planning side. This is the enforcement, so the prose cannot rot into
+        # a shape the validator quietly accepts.
+        if tx.get("key_image") is not None or tx.get("sweep_single"):
+            sys.exit(
+                f"[!] Schema error at TX {i}: this plan names a key image "
+                f"(a sweep_single).\n"
+                f"    Refusing: phase 1 runs against a VIEW-ONLY wallet, which "
+                f"cannot compute key\n"
+                f"    images, so nothing here could have produced a real one. "
+                f"Adding 'amt' to make\n"
+                f"    this validate would build an ordinary transfer_split "
+                f"that picks its own inputs\n"
+                f"    and ignores the key image -- authoritative-looking and "
+                f"inert. See the note above\n"
+                f"    this check, and build_entry_veils in GhostSpiral, for "
+                f"the four other reasons.")
+
         # A SWEEP carries no amount by design: sweep_all sends the whole
         # subaddress balance minus the fee, which is exactly why it leaves no
         # change. Requiring 'amt' here would reject the one plan shape that

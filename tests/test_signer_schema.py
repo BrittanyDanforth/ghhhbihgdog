@@ -93,4 +93,59 @@ ck("sign phase tolerates a missing src_index (source fixed at create time)",
    rejects([{k:v for k,v in GOOD.items() if k!="src_index"}], "sign")[0] is False)
 ck("sign phase STILL refuses an invalid src_index",
    rejects([{**GOOD,"src_index":-5}], "sign")[0])
+
+# ==========================================================================
+# PER-OUTPUT SPENDING IS REFUSED, AND REFUSED ON PURPOSE.
+#
+# sweep_single -- spend exactly ONE of several outputs on a subaddress, named
+# by its key image -- is the primitive that would let a multi-output entry
+# address be veiled as N one-input transactions. It cannot work here: phase 1
+# runs against a VIEW-ONLY wallet, which cannot compute key images at all.
+#
+# It was already rejected, but only by ACCIDENT: such an entry fell through to
+# the transfer branch and died on "field 'amt' missing". Follow that message,
+# add `amt`, and the entry builds as an ordinary transfer_split which picks its
+# own inputs and ignores the key image -- authoritative-looking and inert,
+# which is the exact failure this validator refuses for sweep+amt.
+#
+# So the refusal is explicit now, and this is what stops it rotting back into
+# an accident.
+# ==========================================================================
+_NO_AMT = {k: v for k, v in GOOD.items() if k != "amt"}
+for bad, label in [({**GOOD, "sweep_single": True}, "a sweep_single flag"),
+                   ({**GOOD, "key_image": "aa" * 32}, "a key_image field"),
+                   ({**GOOD, "key_image": "aa" * 32},
+                    "a key_image WITH an amt (following the old message)"),
+                   ({**_NO_AMT, "key_image": "aa" * 32},
+                    "a key_image and no amt"),
+                   ({**GOOD, "key_image": ""}, "an EMPTY key_image")]:
+    r, msg = rejects([bad])
+    ck(f"refuses {label} ({msg[:44]})", r)
+
+# The message must say WHY, or an implementer follows it into the wrong fix.
+def _full_refusal(plan):
+    """The WHOLE abort message. `rejects` slices to 70 chars for its labels,
+    which is fine for identifying an error and useless for asserting on what
+    it explains."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            a._validate_plan(plan, "create")
+        return ""
+    except SystemExit as e:
+        return str(e.code)
+
+
+_m = _full_refusal([{**GOOD, "key_image": "aa" * 32}])
+ck("...and the refusal names the view-only wallet, not a missing field",
+   "VIEW-ONLY" in _m or "view-only" in _m)
+ck("...and warns that adding 'amt' would build an inert transfer",
+   "ignores the key image" in _m)
+
+# NON-VACUITY: the two real shapes still validate.
+ck("control: an ordinary SWEEP still validates",
+   rejects([{"src": "84AAA", "src_index": 1, "dst": "84BBB",
+             "sweep": True}])[0] is False)
+ck("control: an ordinary dst/amt transfer still validates",
+   rejects([GOOD])[0] is False)
+
 print(f"\n{P} passed, {F} failed"); sys.exit(1 if F else 0)

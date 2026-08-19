@@ -482,13 +482,16 @@ def drive_stage4(steps, deposits=None, receive_mode=False, expect=None,
                  unlocked_now=D(0), total_now=D(0)):
     """Run the REAL stage4_await_swap. Returns (result, stdout, exited)."""
     tl = Timeline(steps, 30)
-    saved = (ghost.xmr_balance, ghost.integrity_log, ghost.time,
+    saved = (ghost.entry_set_balance, ghost.integrity_log, ghost.time,
              ghost.XMR_ARRIVAL_STALL)
     out = io.StringIO()
     exited = None
     res = None
     try:
-        ghost.xmr_balance = lambda rpc, acct, idx: tl.balance()
+        # entry_set_balance, not xmr_balance: the gate now sums across the
+        # whole entry set, because --split N lands the chunks on N different
+        # subaddresses. Faking the SUM is what the wait actually consumes.
+        ghost.entry_set_balance = lambda rpc, pairs: tl.balance()
         ghost.integrity_log = lambda *a, **k: None
         # A clock the wait can actually advance, and a stall short enough that
         # a missing chunk resolves inside the test rather than in two hours.
@@ -505,12 +508,13 @@ def drive_stage4(steps, deposits=None, receive_mode=False, expect=None,
         with contextlib.redirect_stdout(out):
             try:
                 res = ghost.stage4_await_swap(
-                    args, object(), 3, 1, "4" + "A" * 94, deposits or [],
+                    args, object(), [(3, 1)] * max(1, split),
+                    ["4" + "A" * 94] * max(1, split), deposits or [],
                     receive_mode, total_now, unlocked_now)
             except SystemExit as e:
                 exited = e
     finally:
-        (ghost.xmr_balance, ghost.integrity_log, ghost.time,
+        (ghost.entry_set_balance, ghost.integrity_log, ghost.time,
          ghost.XMR_ARRIVAL_STALL) = saved
     return res, out.getvalue(), exited
 
@@ -862,6 +866,88 @@ check("MANUAL CLAIM: ...and does not claim to know the smallest chunk",
       "smallest quoted chunk" not in _out.lower())
 check("MANUAL CLAIM: ...and warns the real smallest may be smaller",
       "may be smaller" in _out)
+
+
+# ==========================================================================
+# THE GATE SUMS ACROSS THE WHOLE ENTRY SET.
+#
+# --split N lands the chunks on N DIFFERENT subaddresses (create_entry_set),
+# minutes to hours apart. "Has the swap arrived" is therefore a question about
+# the SUM -- watching any one of them finishes the moment that chunk lands,
+# which is the first-chunk defect this whole file exists to close, reopened
+# one level up.
+#
+# entry_set_balance is what stage 4 calls, so drive THAT with a fake wallet
+# rather than asserting on the closure's shape.
+# ==========================================================================
+print("\n=== the arrival gate sums across N entry addresses ===")
+
+
+class _MultiBalRPC:
+    """A wallet holding a different balance on each entry subaddress."""
+
+    def __init__(self, per_sub):
+        self.per_sub = per_sub          # {(acct, idx): (total, unlocked)}
+        self.asked = []
+
+    def raw_request(self, method, params=None):
+        if method == "refresh":
+            return {}
+        raise AssertionError(method)
+
+    def get_subaddress_balance(self, account_index=0, address_index=0):
+        self.asked.append((account_index, address_index))
+        return self.per_sub.get((account_index, address_index), (0, 0))
+
+
+_PAIRS = [(10, 1), (11, 1), (12, 1)]
+_M = _MultiBalRPC({(10, 1): (2 * 10**12, 2 * 10**12),
+                   (11, 1): (3 * 10**12, 1 * 10**12),
+                   (12, 1): (5 * 10**12, 5 * 10**12)})
+_tot, _unl = ghost.entry_set_balance(_M, _PAIRS)
+check("multi: the total is the SUM over every entry address, not one of them",
+      _tot == D("10"))
+check("multi: ...and so is the unlocked figure", _unl == D("8"))
+check("multi: EVERY entry address is polled, not just the first",
+      sorted(set(_M.asked)) == sorted(_PAIRS))
+
+# The breakdown the distribution needs.
+_rows = ghost.entry_set_balances(_M, _PAIRS)
+check("multi: the per-entry breakdown keeps chunk order",
+      [u for _t, u in _rows] == [D("2"), D("1"), D("5")])
+
+
+class _HalfDeadRPC(_MultiBalRPC):
+    def get_subaddress_balance(self, account_index=0, address_index=0):
+        if account_index == 11:
+            raise RuntimeError("rpc hiccup")
+        return super().get_subaddress_balance(account_index, address_index)
+
+
+_tot2, _unl2 = ghost.entry_set_balance(_HalfDeadRPC(_M.per_sub), _PAIRS)
+check("multi: an unreadable entry reads as ZERO — under-reporting makes the "
+      "gate stricter, and a poll loop must survive an RPC hiccup",
+      _unl2 == D("7"))
+
+# NON-VACUITY: one entry behaves exactly as it did before.
+_one_rpc = _MultiBalRPC({(10, 1): (4 * 10**12, 4 * 10**12)})
+check("control: with ONE entry the sum is that entry's balance, unchanged",
+      ghost.entry_set_balance(_one_rpc, [(10, 1)]) == (D("4"), D("4")))
+check("control: ...and a balance elsewhere in the wallet is NOT counted",
+      ghost.entry_set_balance(
+          _MultiBalRPC({(10, 1): (4 * 10**12, 4 * 10**12),
+                        (99, 1): (99 * 10**12, 99 * 10**12)}),
+          [(10, 1)]) == (D("4"), D("4")))
+
+# And the gate itself: three chunks, two landed. It must NOT fire.
+_res3, _out3, _exit3 = drive_stage4(
+    [(D("1"), D("1")), (D("2"), D("2")), (D("2"), D("2")), (D("2"), D("2"))],
+    deposits=_Q3, split=3)
+check("multi: with 3 chunks quoted at 1 XMR each, 2 XMR summed across the set "
+      "does NOT satisfy the gate", _exit3 is not None)
+check("multi: ...and the shortfall names what is missing",
+      _exit3 and "short by" in str(_exit3.code))
+
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

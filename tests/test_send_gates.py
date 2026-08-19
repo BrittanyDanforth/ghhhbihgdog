@@ -459,7 +459,8 @@ def _drive_main(exit_to, receive=False):
     saved = {n: getattr(ghost, n) for n in
              ("verify_tor", "require_resources", "check_daemon_relay_egress",
               "connect_rpc", "stage0_preflight", "stage1_joinmarket",
-              "resolve_mix_account", "create_subs", "newnym", "tor_recheck",
+              "resolve_mix_account", "create_subs", "create_entry_set",
+              "newnym", "tor_recheck",
               "validate_xmr_address", "resolve_wallet_password",
               "resolve_sensitive_inputs", "run_lock", "integrity_log")}
     _argv = sys.argv[:]
@@ -474,6 +475,9 @@ def _drive_main(exit_to, receive=False):
         ghost.resolve_mix_account = lambda *a, **k: None
         ghost.create_subs = lambda *a, **k: (list(subs_fixture),
                                              dict(idx_fixture), set())
+        # The entry set is minted separately now (create_entry_set), so the
+        # fixture supplies it rather than letting main() steal subs[0].
+        ghost.create_entry_set = lambda rpc, n: [(subs_fixture[0], 10, 1)]
         ghost.newnym = lambda *a, **k: None
         ghost.validate_xmr_address = lambda *a, **k: None
         ghost.resolve_wallet_password = lambda *a, **k: None
@@ -640,6 +644,131 @@ for _i, (_ac, _ad) in enumerate(zip([1, 2, 3, 4, 5], _d)):
 check("control: a duplicate really does collapse addr_index while subs keeps "
       "both — the silent state the refusal exists to stop",
       len(_subs_raw) == 5 and len(_idx_raw) == 4)
+
+
+# ==========================================================================
+# --split 3 THROUGH THE REAL main(), as far as the swap.
+#
+# Every check above drives one function. This drives the pipeline: the real
+# main(), with the network, the wallet and Tor faked, up to the point where it
+# would ask the operator to send BTC. What it proves is the thing the unit
+# tests cannot -- that the entry set is minted, sized and THREADED, and that
+# each chunk's quote carries its own destination.
+#
+# The old code posted one address in every chunk's request body. That is the
+# defect (G5), and it is invisible to any test that does not look at what
+# actually went on the wire.
+# ==========================================================================
+print("\n=== --split 3 through the real main() ===")
+
+
+class _SplitStop(Exception):
+    """Raised from the quote poster once every chunk has been quoted."""
+
+
+def _drive_split(n_chunks, wallets=6):
+    """Run the REAL main() to the swap quotes. Returns the posted payloads."""
+    posted = []
+    subs_fixture = [_addr(2000 + i) for i in range(wallets + 4)]
+    idx_fixture = {a: (30 + i, 1) for i, a in enumerate(subs_fixture)}
+    entry_fixture = [(_addr(3000 + i), 60 + i, 1) for i in range(n_chunks)]
+    saved = {n: getattr(ghost, n) for n in
+             ("verify_tor", "require_resources", "check_daemon_relay_egress",
+              "connect_rpc", "stage0_preflight", "stage1_joinmarket",
+              "resolve_mix_account", "create_subs", "create_entry_set",
+              "newnym", "tor_recheck", "validate_xmr_address",
+              "resolve_wallet_password", "resolve_sensitive_inputs",
+              "run_lock", "integrity_log", "safe_post", "btc_per_xmr_oracle",
+              "secure_delay", "reject_self_exit")}
+    _argv = sys.argv[:]
+    try:
+        ghost.verify_tor = lambda *a, **k: None
+        ghost.require_resources = lambda *a, **k: None
+        ghost.check_daemon_relay_egress = lambda *a, **k: {
+            "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
+        ghost.connect_rpc = lambda *a, **k: object()
+        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage1_joinmarket = lambda *a, **k: []
+        ghost.resolve_mix_account = lambda *a, **k: None
+        ghost.create_subs = lambda *a, **k: (list(subs_fixture),
+                                             dict(idx_fixture), set())
+        ghost.create_entry_set = lambda rpc, n: list(entry_fixture[:n])
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.validate_xmr_address = lambda *a, **k: None
+        ghost.resolve_wallet_password = lambda *a, **k: None
+        ghost.resolve_sensitive_inputs = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost.btc_per_xmr_oracle = lambda *a, **k: None
+        ghost.reject_self_exit = lambda *a, **k: None
+
+        @contextlib.contextmanager
+        def _nolock(*a, **k):
+            yield None
+        ghost.run_lock = _nolock
+
+        def _post(url, payload, proxy):
+            posted.append(dict(payload))
+            if len(posted) >= n_chunks:
+                # Everything this test is about has happened by now; stop
+                # before the arrival wait, which would block for hours.
+                raise _SplitStop()
+            # depositAddress and memo live under `transaction` -- see
+            # parse_swap_route, which reads them from there.
+            return {"routes": [{
+                "expectedOutput": "1.0",
+                "transaction": {
+                    "memo": "=:XMR.XMR:" + payload["destinationAddress"]
+                            + ":0/1/0::0",
+                    "depositAddress":
+                        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+        ghost.safe_post = _post
+
+        sys.argv = ["GhostSpiral", "--btc-entry",
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                    "--btc-amount", "0.6",
+                    "--split", str(n_chunks),
+                    "--wallets", str(wallets),
+                    "--tor-proxy", "socks5h://127.0.0.1:9050"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ghost.main()
+        except _SplitStop:
+            pass
+        except SystemExit as e:
+            return posted, str(e.code)
+        return posted, None
+    finally:
+        for n, v in saved.items():
+            setattr(ghost, n, v)
+        sys.argv = _argv
+
+
+_posted, _err = _drive_split(3)
+check(f"e2e: a --split 3 run reaches the quote stage (err={_err})",
+      len(_posted) == 3)
+check("e2e: THREE quotes were posted, one per chunk", len(_posted) == 3)
+_dests = [p["destinationAddress"] for p in _posted]
+check("e2e: ...each naming a DIFFERENT destination — this is G5",
+      len(set(_dests)) == 3)
+check("e2e: ...and they are the run's own entry addresses, in chunk order",
+      _dests == [_addr(3000 + i) for i in range(3)])
+check("e2e: the BTC amount was split three ways",
+      len({p["sellAmount"] for p in _posted}) <= 2       # remainder on chunk 0
+      and all(D(p["sellAmount"]) > 0 for p in _posted))
+
+# CONTROL: one chunk still posts one address, exactly as before.
+_p1, _e1 = _drive_split(1)
+check("control: a one-chunk run posts ONE quote", len(_p1) == 1)
+check("control: ...to the single entry address",
+      _p1[0]["destinationAddress"] == _addr(3000))
+
+# THE REGRESSION THIS EXISTS FOR: if the destination ever goes back to being
+# one shared value, the check above turns red. Show what that looked like.
+check("control: three chunks sharing one destination would be visible here — "
+      "the set of posted destinations would collapse to one",
+      len({_addr(3000)}) == 1 and len(set(_dests)) == 3)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

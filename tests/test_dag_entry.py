@@ -32,7 +32,9 @@ import types
 import io
 import contextlib
 import secrets
+import secrets as _secretsmod
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -253,17 +255,27 @@ class _XferRPC:
             return {"transfers": self._t}
         return {}
 
-    def new_subaddress_indexed(self, **k):
-        return ("8" + "A" * 94, 1)
+    def new_subaddress_indexed(self, account_index=0, **k):
+        # PER ACCOUNT, like a real wallet. A fake that answers with one
+        # constant address made three carriers look identical, which hid the
+        # fact that nothing verified they were distinct -- see the carrier
+        # check in build_entry_veils, which this fixture's honesty produced.
+        return ("8" + "A" * 93 + str(account_index % 10), 1)
 
 
-def _veil_out(transfers, fail=False):
+def _veil_out(transfers, fail=False, n=1):
     _saved = ghost.create_fresh_account
     try:
-        ghost.create_fresh_account = lambda rpc, label="": 41
+        _acct = [40]
+
+        def _fresh(rpc, label=""):
+            _acct[0] += 1
+            return _acct[0]
+        ghost.create_fresh_account = _fresh
         buf = io.StringIO()
+        entries = [(f"ENTRY{i}", 3 + i, 1) for i in range(n)]
         with contextlib.redirect_stdout(buf):
-            ghost.build_entry_veil(_XferRPC(transfers, fail), "ENTRY", 3, 1)
+            ghost.build_entry_veils(_XferRPC(transfers, fail), entries)
         return buf.getvalue()
     finally:
         ghost.create_fresh_account = _saved
@@ -288,8 +300,18 @@ check("G5: with FOUR it says the veil will be a 4-INPUT transaction",
       "4-INPUT" in _m)
 check("G5: ...and that the rings can be intersected to find the carrier",
       "intersect" in _m and "carrier" in _m)
-check("G5: ...and does not claim the veil still delivers",
-      "cannot deliver its premise" in _m)
+
+# THE TWO CASES ARE NOT THE SAME, and the message has to say which is which.
+# Two publicly-known swap outputs give an analyst two candidate sets to
+# intersect; one swap output plus a stranger's dust gives him nothing to
+# intersect against. Reporting them identically overstates the second and
+# understates the first.
+check("G5: ...it names the SERIOUS case — more than one swap on one address",
+      "two swaps" in _m or "two payments" in _m)
+check("G5: ...and separately the MILD one — dust sent by somebody else",
+      "dust" in _m and "milder" in _m)
+check("G5: ...and admits it cannot tell them apart from here",
+      "tell the two apart" in _m)
 _u = _veil_out([], fail=True)
 check("G5: an unknown count is reported as unknown, not as fine",
       "not known whether" in _u)
@@ -300,31 +322,324 @@ _saved_cfa = ghost.create_fresh_account
 try:
     ghost.create_fresh_account = lambda rpc, label="": 41
     with contextlib.redirect_stdout(io.StringIO()):
-        _plan, _carrier = ghost.build_entry_veil(_XferRPC(_four), "ENTRY", 3, 1)
+        _plan, _carriers = ghost.build_entry_veils(
+            _XferRPC(_four), [("ENTRY", 3, 1)])
     check("G5: ...and the veil is still built (reporting, not blocking)",
           len(_plan) == 1 and _plan[0]["sweep"] is True)
 finally:
     ghost.create_fresh_account = _saved_cfa
 
-# --split is refused outright, which is the one case the operator controls.
-_split_msg = None
+
+# ==========================================================================
+# G5, THE REAL FIX: one entry address per chunk, and NO CONVERGENCE.
+#
+# --split N used to be refused because every chunk was routed to one address.
+# It is supported now, and what makes it safe is not "the veil has one input"
+# but the stronger invariant build_entry_veils states:
+#
+#     NO TRANSACTION EVER SPENDS VALUE FROM TWO DIFFERENT SWAP CHUNKS.
+#
+# One input per veil is not sufficient on its own: veil the chunks separately
+# into a SHARED carrier and the distribution becomes the convergence instead,
+# and the analyst intersects there. So the test is on the whole plan, not on
+# the veil.
+# ==========================================================================
+print("\n=== G5: N chunks, N entries, no convergence ===")
+
+
+class _EntrySetRPC:
+    """A wallet that numbers accounts and addresses like the real one."""
+
+    def __init__(self):
+        self.acct = 0
+        self.made = []
+
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            self.acct += 1
+            self.made.append(self.acct)
+            return {"account_index": self.acct}
+        if method == "incoming_transfers":
+            return {"transfers": [{"amount": 1000, "spent": False}]}
+        raise AssertionError(method)
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return (f"ADDR_{account_index}", 1)
+
+
+_es = ghost.create_entry_set(_EntrySetRPC(), 4)
+check("split: --split 4 mints FOUR entry addresses", len(_es) == 4)
+check("split: ...all distinct", len({a for a, _, _ in _es}) == 4)
+check("split: ...each in its OWN account, so no transaction can spend two",
+      len({c for _, c, _ in _es}) == 4)
+check("split: ...and none of them is account 0 (the wallet's primary)",
+      all(c != 0 for _, c, _ in _es))
+
+
+class _DupEntryRPC(_EntrySetRPC):
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        return ("SAME", 1)
+
+
+_dup = None
 try:
-    ghost.resolve_split(types.SimpleNamespace(split=4))
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost.create_entry_set(_DupEntryRPC(), 3)
 except SystemExit as _e:
-    _split_msg = str(_e.code)
-check("G5: --split above 1 is REFUSED", _split_msg is not None)
-check("G5: ...naming the aggregator linkage", _split_msg and "links them" in _split_msg)
-check("G5: ...the newnym theatre", _split_msg and "theatre" in _split_msg)
-check("G5: ...the N-input veil", _split_msg and "input transaction" in _split_msg)
-check("G5: ...and the supported alternative",
-      _split_msg and "create_receive_wallet --count" in _split_msg)
-for _ok in (1, 0, None):
+    _dup = str(_e.code)
+check("split: a wallet handing out the same entry address twice is REFUSED",
+      _dup is not None)
+check("split: ...and the refusal says what it would have cost",
+      _dup and "linkage" in _dup)
+
+
+class _DupAcctRPC(_EntrySetRPC):
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            return {"account_index": 7}
+        return super().raw_request(method, params)
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        _DupAcctRPC._n = getattr(_DupAcctRPC, "_n", 0) + 1
+        return (f"A{_DupAcctRPC._n}", 1)
+
+
+_dupa = None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost.create_entry_set(_DupAcctRPC(), 3)
+except SystemExit as _e:
+    _dupa = str(_e.code)
+check("split: two entries in ONE account is REFUSED — a transaction CAN "
+      "spend two subaddresses of one account", _dupa is not None)
+
+# -- N veils, N carriers, and never a shared one ---------------------------
+_saved_cfa = ghost.create_fresh_account
+try:
+    _c = [50]
+
+    def _fresh2(rpc, label=""):
+        _c[0] += 1
+        return _c[0]
+    ghost.create_fresh_account = _fresh2
+    with contextlib.redirect_stdout(io.StringIO()):
+        _vplan, _vcar = ghost.build_entry_veils(
+            _XferRPC(_one), [("E0", 10, 1), ("E1", 11, 1), ("E2", 12, 1)])
+finally:
+    ghost.create_fresh_account = _saved_cfa
+
+check("split: three entries produce THREE veil transactions", len(_vplan) == 3)
+check("split: each veil spends exactly ONE entry, naming its own account",
+      [(t["src"], t["account_index"], t["src_index"]) for t in _vplan]
+      == [("E0", 10, 1), ("E1", 11, 1), ("E2", 12, 1)])
+check("split: every veil is a sweep (whole balance, zero change)",
+      all(t.get("sweep") is True for t in _vplan))
+check("split: THREE SEPARATE CARRIERS — a shared one would just move the "
+      "convergence to the distribution, where the same intersection works",
+      len({a for a, _, _ in _vcar}) == 3
+      and len({d for _, _, d in _vcar}) == 3)
+check("split: no veil pays a carrier another veil also pays",
+      len({t["dst"] for t in _vplan}) == 3)
+
+# ...and that is ENFORCED, not merely true of this fixture. A wallet that
+# handed out one carrier address twice would merge two chunks into one output
+# and nothing downstream would notice: the distribution would see one funded
+# source instead of two and the run would report success.
+class _OneCarrierRPC(_XferRPC):
+    def new_subaddress_indexed(self, account_index=0, **k):
+        return ("8" + "C" * 94, 1)
+
+
+_merged = None
+_saved_cfa2 = ghost.create_fresh_account
+try:
+    _c2 = [60]
+
+    def _fresh3(rpc, label=""):
+        _c2[0] += 1
+        return _c2[0]
+    ghost.create_fresh_account = _fresh3
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost.build_entry_veils(_OneCarrierRPC(_one),
+                                [("E0", 10, 1), ("E1", 11, 1)])
+except SystemExit as _e:
+    _merged = str(_e.code)
+finally:
+    ghost.create_fresh_account = _saved_cfa2
+check("split: two veils paying ONE carrier is REFUSED, not silently merged",
+      _merged is not None)
+check("split: ...and the refusal names it as the convergence it is",
+      _merged and "convergence" in _merged)
+
+# -- the distribution is N transactions, one per carrier -------------------
+_VA2 = types.SimpleNamespace
+
+
+def _dist(sources, slices, by_addr, peel=False):
+    _args = _VA2(peel=peel, dag_mixing=False)
+    _ai = {a: (c, i) for a, c, i in sources}
+    with contextlib.redirect_stdout(io.StringIO()):
+        return ghost.build_distribution_plan(
+            _args, None, _ai, sources, [d for sl in slices for d in sl],
+            by_addr, slices, Decimal("0.0024"), sources[0][1],
+            sum(len(sl) for sl in slices), (0, 0), _secretsmod)
+
+
+_SRC = [("C0", 20, 1), ("C1", 21, 1), ("C2", 22, 1)]
+_SLICES = [["m0", "m1"], ["m2", "m3"], ["m4", "m5"]]
+_BY = {f"m{i}": Decimal("1") for i in range(6)}
+_plan, _chg, _mode = _dist(_SRC, _SLICES, _BY)
+check("split: the distribution is THREE transactions, one per chunk",
+      len(_plan) == 3 and _mode == "fanout")
+check("split: each spends its OWN carrier",
+      [t["src"] for t in _plan] == ["C0", "C1", "C2"])
+check("split: ...naming that carrier's own account, not a shared one",
+      [t["account_index"] for t in _plan] == [20, 21, 22])
+check("split: each fan-out pays only ITS slice of the mix targets",
+      [[d["address"] for d in t["destinations"]] for t in _plan] == _SLICES)
+
+# THE INVARIANT, checked on the plan as a whole rather than tx by tx: trace
+# every destination back to the chunk that funded it and confirm no two chunks
+# ever meet in one transaction.
+_owner = {}
+for _i, _t in enumerate(_plan):
+    for _d in _t["destinations"]:
+        _owner.setdefault(_d["address"], set()).add(_i)
+check("split: NO mix subaddress is funded by two different chunks — the "
+      "invariant, checked over the whole plan",
+      all(len(v) == 1 for v in _owner.values()))
+check("split: every change location is its own carrier's account, so no "
+      "change sweep merges two chunks either",
+      sorted(_chg) == [20, 21, 22])
+
+# CONTROL: with one chunk this is exactly the old single fan-out.
+_p1, _c1, _m1 = _dist([("C0", 20, 1)], [["m0", "m1", "m2"]],
+                      {f"m{i}": Decimal("1") for i in range(3)})
+check("control: ONE chunk is still ONE fan-out transaction", len(_p1) == 1)
+check("control: ...over all of the targets", 
+      [d["address"] for d in _p1[0]["destinations"]] == ["m0", "m1", "m2"])
+check("control: ...with one change location", _c1 == [20])
+
+# -- --split with --peel is refused, and says why --------------------------
+_peel_msg = None
+try:
+    _dist(_SRC, _SLICES, _BY, peel=True)
+except SystemExit as _e:
+    _peel_msg = str(_e.code)
+check("split: --split with --peel is REFUSED", _peel_msg is not None)
+check("split: ...because merging the chains would re-create the convergence",
+      _peel_msg and "convergence" in _peel_msg)
+check("split: ...and N sequential chains is the time cost, stated",
+      _peel_msg and "20 minutes" in _peel_msg)
+check("control: ONE chunk with --peel is NOT refused by that check",
+      "convergence" not in str(
+          (lambda: [_dist([("C0", 20, 1)], [["m0"]], {"m0": Decimal("1")},
+                          peel=True)] and "")() or ""))
+
+# -- the budget follows the money -----------------------------------------
+_slices, _su, _amts = ghost.size_distribution(
+    ["m0", "m1", "m2", "m3"], [Decimal("3"), Decimal("1")], Decimal("8"),
+    Decimal("0.0024"), False, _secretsmod.SystemRandom())
+check("split: destinations are sliced by each chunk's OWN arrived balance, "
+      "not equally — chunks are not equal",
+      [len(x) for x in _slices] == [3, 1])
+check("split: ...and each slice's budget is that chunk's share of usable",
+      _su[0] > _su[1] * 2)
+check("split: ...so the amounts sum to no more than the chunk can spend",
+      sum(_amts[:3]) <= _su[0] and sum(_amts[3:]) <= _su[1])
+check("split: a chunk with NO destinations comes back empty rather than "
+      "silently dropped",
+      ghost.size_distribution(["m0"], [Decimal("1"), Decimal("1")],
+                              Decimal("8"), Decimal("0.0024"), False,
+                              _secretsmod.SystemRandom())[2] == [])
+
+# -- --split bounds --------------------------------------------------------
+for _ok in (1, 2, 8, None):
     _r = None
     try:
         ghost.resolve_split(types.SimpleNamespace(split=_ok))
     except SystemExit as _e:
         _r = str(_e.code)
-    check(f"G5: --split {_ok!r} is allowed through", _r is None)
+    check(f"split: --split {_ok!r} is allowed", _r is None)
+_too_many = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=99))
+except SystemExit as _e:
+    _too_many = str(_e.code)
+check("split: --split 99 is refused (fees, veils and the offline wallet's "
+      "account lookahead all scale with it)", _too_many is not None)
+check("split: ...and the refusal names the lookahead, which is the "
+      "measured limit", _too_many and "accounts" in _too_many)
+_neg = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=0))
+except SystemExit as _e:
+    _neg = str(_e.code)
+check("split: --split 0 is refused", _neg is not None)
+
+# -- a chunk that never arrived is dropped, not left to sink the run -------
+#
+# The arrival gate compares the SUM against the target, so a chunk can be
+# missing while the total clears: one swap overshooting its quote covers
+# another that has not landed, and --accept-partial-swap allows a shortfall
+# outright. Before this, that chunk's empty entry made size_distribution return
+# no amounts, which main() reported as "usable balance too small to fan out ...
+# use fewer wallets, or fund the wallet more" — wrong in every particular.
+_ES3 = [("E0", 10, 1), ("E1", 11, 1), ("E2", 12, 1)]
+with contextlib.redirect_stdout(io.StringIO()) as _fb:
+    _fe, _fu = ghost.select_funded_entries(
+        _ES3, [Decimal("2"), Decimal("0"), Decimal("3")])
+check("unfunded: the chunk that never arrived is dropped",
+      [a for a, _c, _i in _fe] == ["E0", "E2"])
+check("unfunded: ...and its weight goes with it, so the slices stay aligned",
+      _fu == [Decimal("2"), Decimal("3")])
+
+_fb2 = io.StringIO()
+with contextlib.redirect_stdout(_fb2):
+    ghost.select_funded_entries(_ES3, [Decimal("2"), Decimal("0"), Decimal("3")])
+_msg = _fb2.getvalue()
+check("unfunded: the operator is told a SWAP has not arrived — not that their "
+      "balance is too small or that they should use fewer wallets",
+      "NOT arrived" in _msg and "wallets" not in _msg)
+check("unfunded: ...and that the missing value is not mixed by this run",
+      "NOT mixed by this run" in _msg)
+check("unfunded: ...and that its address is held back from the exit, which is "
+      "what stops a late chunk leaving in one hop",
+      "held back from the exit" in _msg)
+check("unfunded: ...and how to mix it afterwards",
+      "--receive-wallet" in _msg)
+
+# Dust is not an arrival. Somebody can send a piconero to an address the swap
+# memo publishes, and that must not count as the chunk landing.
+with contextlib.redirect_stdout(io.StringIO()):
+    _fe2, _ = ghost.select_funded_entries(_ES3, [Decimal("2"), ghost.DUST_XMR,
+                                                 Decimal("3")])
+check("unfunded: a DUST balance is not an arrival",
+      [a for a, _c, _i in _fe2] == ["E0", "E2"])
+
+# Nothing at all is the caller's decision, signalled by an empty return.
+with contextlib.redirect_stdout(io.StringIO()):
+    check("unfunded: when NOTHING arrived it returns empty for the caller to "
+          "make fatal", ghost.select_funded_entries(
+              _ES3, [Decimal(0)] * 3) == ([], []))
+
+# CONTROL: the ordinary run is untouched — same list back, and SILENT.
+_fb3 = io.StringIO()
+with contextlib.redirect_stdout(_fb3):
+    _ok = ghost.select_funded_entries(_ES3, [Decimal("1")] * 3)
+check("control: with every chunk funded nothing is dropped",
+      _ok == (_ES3, [Decimal("1")] * 3))
+check("control: ...and nothing is printed — no warning on a healthy run",
+      _fb3.getvalue() == "")
+
+# -- the entry set is sized before the quotes, from the same three inputs ---
+check("split: JoinMarket's UTXOs are the chunk count when it ran",
+      ghost.planned_chunk_count(types.SimpleNamespace(split=1),
+                                ["u1", "u2", "u3"]) == 3)
+check("split: otherwise --split is", 
+      ghost.planned_chunk_count(types.SimpleNamespace(split=4), []) == 4)
+check("split: and it is never zero",
+      ghost.planned_chunk_count(types.SimpleNamespace(split=None), []) == 1)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

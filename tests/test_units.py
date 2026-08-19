@@ -408,8 +408,10 @@ _calls_guard = [n for n in ast.walk(_gs_ast)
                 and n.func.id == "validate_swap_route"]
 check("swap: GhostSpiral actually CALLS the route guard (not just defines it)",
       len(_calls_guard) == 1)
-check("swap: the guard is called with the operator's own xmr_dest",
-      _calls_guard and any(isinstance(a, ast.Name) and a.id == "xmr_dest"
+check("swap: the guard is called with THIS CHUNK's own destination -- not a "
+      "single shared one, which is what routed every chunk of a --split to "
+      "one address",
+      _calls_guard and any(isinstance(a, ast.Name) and a.id == "chunk_dest"
                            for a in _calls_guard[0].args))
 # thor and GhostSpiral must agree on every case, not merely both have a check.
 for _m, _d in ((f"=:XMR.XMR:{_MDEST}", True), (f"=:XMR.XMR:{_MOTHER}", False),
@@ -804,8 +806,8 @@ check("spend account: it is READ BACK from ENTRY, not assigned from a branch",
       "_src_account(addr_index, entry_addr)" in _gs_src3)
 check("spend account: no branch assigns it from a shared mix account",
       "bal_account = sub_account" not in _gs_src3)
-check("spend account: main() gets the pair from the resolver, not a literal",
-      "bal_account, entry_index = resolve_entry_account(" in _gs_src3)
+check("spend account: main() gets its pairs from the resolver, not a literal",
+      "ENTRY_PAIRS = resolve_entry_accounts(" in _gs_src3)
 # The confirmation-wait must watch the same place the plan spends from. Each
 # address now carries its OWN account, so this is per-address, not one shared
 # value -- drive create_subs rather than grepping for a variable name.
@@ -890,23 +892,45 @@ class _EntryRpc:
         if method == "get_address":
             return {"addresses": [{"address": "ENTRY_ADDR"}]}
         raise AssertionError(method)
+
+
+class _EntryRpc2:
+    """Answers get_address for a THREE-entry run (--split 3)."""
+    def raw_request(self, method, params=None):
+        if method == "get_address":
+            _a = int((params or {}).get("account_index", 0))
+            return {"addresses": [{"address": {11: "E1", 12: "E2",
+                                               13: "E3"}.get(_a, "?")}]}
+        raise AssertionError(method)
 _real_vss = ghost.verify_spend_source
 try:
     ghost.verify_spend_source = lambda rpc, a, i, addr: _calls.append((a, i, addr))
     _ai3 = {"ENTRY_ADDR": (9, 4)}
-    _got = ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", None)
+    _got = ghost.resolve_entry_accounts(_EntryRpc(), _ai3, ["ENTRY_ADDR"], None)
     check("spend guard: the resolver returns ENTRY's own (account, index)",
-          _got == (9, 4))
+          _got == [(9, 4)])
     check("spend guard: it verifies that exact pair before returning it",
           _calls == [(9, 4, "ENTRY_ADDR")])
-    _got2 = ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", 9)
+    _got2 = ghost.resolve_entry_accounts(_EntryRpc(), _ai3, ["ENTRY_ADDR"], 9)
     check("spend guard: a bundle that AGREES with the wallet is accepted",
-          _got2 == (9, 4))
+          _got2 == [(9, 4)])
     try:
-        ghost.resolve_entry_account(_EntryRpc(), _ai3, "ENTRY_ADDR", 3)
+        ghost.resolve_entry_accounts(_EntryRpc(), _ai3, ["ENTRY_ADDR"], 3)
         check("spend guard: a bundle that DISAGREES with the wallet aborts", False)
     except SystemExit:
         check("spend guard: a bundle that DISAGREES with the wallet aborts", True)
+    # PLURAL, and EVERY pair verified. --split N mints one entry per chunk, so
+    # a resolver that verified only the first would leave the rest unproven --
+    # and an unverified pair does not crash, it plans against a different
+    # subaddress's balance.
+    del _calls[:]
+    _ai_multi = {"E1": (11, 1), "E2": (12, 1), "E3": (13, 1)}
+    _gotN = ghost.resolve_entry_accounts(_EntryRpc2(), _ai_multi,
+                                         ["E1", "E2", "E3"], None)
+    check("spend guard: three entries resolve to three pairs, in chunk order",
+          _gotN == [(11, 1), (12, 1), (13, 1)])
+    check("spend guard: ...and EVERY one of them was verified, not just the first",
+          _calls == [(11, 1, "E1"), (12, 1, "E2"), (13, 1, "E3")])
 finally:
     ghost.verify_spend_source = _real_vss
 # It must verify BEFORE the balance is read, or a wrong account still sizes a
@@ -914,9 +938,9 @@ finally:
 # balance from what it returned, so ordering is structural now rather than a
 # question of which line comes first.
 check("spend guard: the balance is read from the resolver's answer",
-      "xmr_balance(rpc_primary, bal_account, entry_index)" in _gs_src3
-      and _gs_src3.index("bal_account, entry_index = resolve_entry_account(")
-      < _gs_src3.index("xmr_balance(rpc_primary, bal_account, entry_index)"))
+      "entry_set_balance(rpc_primary, ENTRY_PAIRS)" in _gs_src3
+      and _gs_src3.index("ENTRY_PAIRS = resolve_entry_accounts(")
+      < _gs_src3.index("entry_set_balance(rpc_primary, ENTRY_PAIRS)"))
 
 
 # ---------------------------------------------------------------------------
@@ -2986,8 +3010,9 @@ class _VeilRpc:
         return (f"VEIL_{account_index}", 1)
 
 _vr = _VeilRpc()
-_vplan, (_va, _vi, _vaddr) = ghost.build_entry_veil(_vr, "ENTRY_ADDR", 3, 7,
-                                                    (100, 101))
+_vplan, _vcarriers = ghost.build_entry_veils(
+    _vr, [("ENTRY_ADDR", 3, 7)], (100, 101))
+(_va, _vi, _vaddr) = _vcarriers[0]
 check("veil: it is a SWEEP -- whole balance, zero change, two outputs",
       len(_vplan) == 1 and _vplan[0].get("sweep") is True)
 check("veil: a sweep carries no amount (that is what makes it zero-change)",
@@ -3012,9 +3037,10 @@ class _VA:
 _ai4 = {"ENTRY_ADDR": (3, 7)}
 _buf6 = _io.StringIO()
 with _ctx.redirect_stdout(_buf6):
-    _p, _sa, _ac, _ix, _b = ghost.resolve_entry_veil(
-        _VeilRpc(), _VA(entry_veil=True), _ai4, "ENTRY_ADDR", 3, 7,
+    _p, _srcs, _b = ghost.resolve_entry_veils(
+        _VeilRpc(), _VA(entry_veil=True), _ai4, [("ENTRY_ADDR", 3, 7)],
         Decimal("10"), Decimal("0.0024"), (100, 101))
+    _sa, _ac, _ix = _srcs[0]
 check("veil: ON -- the distribution spends the CARRIER, not ENTRY",
       _sa != "ENTRY_ADDR" and (_ac, _ix) == (41, 1))
 check("veil: ON -- the carrier is registered so its account can be resolved",
@@ -3026,13 +3052,17 @@ check("veil: ON -- a plan is produced", len(_p) == 1)
 _ai5 = {"ENTRY_ADDR": (3, 7)}
 _buf7 = _io.StringIO()
 with _ctx.redirect_stdout(_buf7):
-    _p2, _sa2, _ac2, _ix2, _b2 = ghost.resolve_entry_veil(
-        _VeilRpc(), _VA(entry_veil=False), _ai5, "ENTRY_ADDR", 3, 7,
+    _p2, _srcs2, _b2 = ghost.resolve_entry_veils(
+        _VeilRpc(), _VA(entry_veil=False), _ai5, [("ENTRY_ADDR", 3, 7)],
         Decimal("10"), Decimal("0.0024"), (100, 101))
 check("veil: OFF -- the distribution spends ENTRY unchanged",
-      (_p2, _sa2, _ac2, _ix2, _b2) == ([], "ENTRY_ADDR", 3, 7, Decimal("10")))
-check("veil: OFF -- and the operator is told what that costs them",
-      "DIRECTLY" in _buf7.getvalue() and "memo is public" in _buf7.getvalue())
+      (_p2, _srcs2, _b2) == ([], [("ENTRY_ADDR", 3, 7)], Decimal("10")))
+check("veil: OFF -- and the operator is told what that costs them: the "
+      "distribution's own shape identifies it, because the swap's settlement "
+      "hands an analyst the output it spends",
+      "DIRECTLY" in _buf7.getvalue()
+      and "settlement is public" in _buf7.getvalue()
+      and "output count" in _buf7.getvalue())
 check("veil: OFF -- no carrier is registered",
       _ai5 == {"ENTRY_ADDR": (3, 7)})
 
@@ -3043,7 +3073,7 @@ check("veil: stage 5 runs it as its own round, before the distribution",
       _s5v.index("veil_file") < _s5v.index("distribution_mode ==")
       if "distribution_mode ==" in _s5v else True)
 check("veil: stage 5 waits for the carrier to confirm and unlock",
-      "_wait_for_carrier(args, _vacct, _vidx, veil_need" in _s5v)
+      "_wait_for_carrier(args, _vacct, _vidx, _needs[_vi]" in _s5v)
 check("veil: a veil that never confirms stops the run instead of distributing",
       "nothing was distributed" in _s5v)
 

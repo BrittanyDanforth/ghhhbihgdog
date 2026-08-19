@@ -209,7 +209,8 @@ finally:
 
 _txs = [t for r in rec.rounds for t in r]
 check("exit: withdrew every funded output (4 of them)",
-      relayed == 4 and failed == 0 and skipped == 0 and held == 0)
+      relayed == 4 and failed == 0 and skipped == 0
+      and sum(held.values()) == 0)
 check("exit: ONE transaction per round -- never a collecting sweep",
       all(len(r) == 1 for r in rec.rounds) and len(rec.rounds) == 4)
 check("exit: every withdrawal is a SWEEP (leaves no change behind)",
@@ -258,7 +259,8 @@ try:
     _held_out = io.StringIO()
     with contextlib.redirect_stdout(_held_out):
         _r2, _f2, _s2, _h2, _u2 = ghost._run_exit_withdrawals(
-            _args, [7, 9], [A1, A2], _stg2, None, {}, (0, 0), hold=[(9, 0)])
+            _args, [7, 9], [A1, A2], _stg2, None, {}, (0, 0), hold=[(9, 0)],
+            entry_pairs=[(9, 0)])
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
      ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
@@ -268,7 +270,14 @@ _txs2 = [t for r in rec2.rounds for t in r]
 check("exit: the held ENTRY output is NOT withdrawn",
       (9, 0) not in [(t["account_index"], t["src_index"]) for t in _txs2])
 check("exit: ...and is reported as held, not as a silent success",
-      _h2 == 1 and _r2 == 2 and _f2 == 0 and _s2 == 0)
+      sum(_h2.values()) == 1 and _r2 == 2 and _f2 == 0 and _s2 == 0)
+# WHICH KIND, not just how many. The caller words its report from this: an
+# ENTRY hold and a distribution-CHANGE hold are different addresses with
+# different reasons and different remedies, and the report used to assert
+# ENTRY for both -- sending the operator to look at an address the swap does
+# not name.
+check("exit: ...and the breakdown says it was an ENTRY hold, not a change one",
+      _h2 == {"entry": 1, "change": 0})
 check("exit: ...while every MIXED output still leaves",
       sorted((t["account_index"], t["src_index"]) for t in _txs2)
       == [(7, 1), (9, 1)])
@@ -409,13 +418,15 @@ try:
     os.makedirs(_hstg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()) as _hout:
         _hr, _hf, _hs, _hh, _hu = ghost._run_exit_withdrawals(
-            _args, [3], [A1], _hstg, None, {}, (0, 0), hold=[(3, 1)])
+            _args, [3], [A1], _hstg, None, {}, (0, 0), hold=[(3, 1)],
+            entry_pairs=[(3, 1)])
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
      ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
      ghost.secure_delay) = _saved5
 check("ALL HELD: when the held ENTRY output is the ONLY funded one the hold is "
-      "still reported, not a silent clean exit", _hh == 1 and _hr == 0)
+      "still reported, not a silent clean exit",
+      _hh == {"entry": 1, "change": 0} and _hr == 0)
 check("ALL HELD: ...and the operator is told nothing was withdrawn",
       "nothing was withdrawn" in _hout.getvalue())
 
@@ -566,7 +577,8 @@ try:
     os.makedirs(_mstg, exist_ok=True)
     with contextlib.redirect_stdout(_mbuf):
         ghost._run_exit_withdrawals(_args, [3], [A1], _mstg, None, {}, (0, 0),
-                                    hold=[(3, 1), (3, 0)], entry_pair=(3, 1))
+                                    hold=[(3, 1), (3, 0)],
+                                    entry_pairs=[(3, 1)])
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
      ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
