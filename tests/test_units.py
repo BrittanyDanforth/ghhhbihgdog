@@ -2616,10 +2616,84 @@ for _tool_name in ("GhostSpiral", "thor_swap_preparer", "receive_watch",
 # failed to clean is left visible rather than silently destroyed.
 _stg = Path(tempfile.mkdtemp(prefix="stgroot_")) / "tx_staging"
 _stg.mkdir()
-_gs_src_stage = code_only(os.path.join(REPO, "GhostSpiral"))
-check("stage5: the staging root is rmdir'd, not recursively deleted",
-      "Path(staging_dir).rmdir()" in _gs_src_stage
-      and "secure_delete_tree(Path(staging_dir))" not in _gs_src_stage)
+# DRIVEN, not grepped. This asserted that the literal "Path(staging_dir).rmdir()"
+# appears in the source and that "secure_delete_tree(Path(staging_dir))" does
+# not — a substring search that never enters GhostSpiral. Proven vacuous by
+# mutation: wrapping the real call in an always-false guard
+# (`if os.environ.get("GS_NEVER_SET_X"):`) leaves BOTH substrings in place, so
+# the check passed while the directory stayed on disk. The asserts that follow
+# it exercise Python's own rmdir on a directory this test created, which
+# demonstrates stdlib semantics rather than the tool's.
+class _StgArgs:
+    """Minimal args namespace. _VA is defined ~350 lines below this point."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+_stg_live = Path(tempfile.mkdtemp(prefix="stgrun_")) / "tx_staging"
+_stg_live.mkdir()
+_saved_s5 = (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+             ghost._run_change_sweeps, ghost._wait_for_fanout_confirm,
+             ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+             ghost.secure_delay)
+try:
+    ghost._run_round = lambda *a, **k: 1
+    ghost._wait_for_carrier = lambda *a, **k: True
+    ghost._run_peel_chain = lambda *a, **k: 0
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _pf_stage = str(_stg_live.parent / "fanout.json")
+    with open(_pf_stage, "w") as _fh:
+        json.dump({"meta": {}, "txs": []}, _fh)
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost._stage5_run(_StgArgs(dag_mixing=False), _pf_stage, None, [],
+                          str(_stg_live), None, Decimal("9"),
+                          distribution_mode="fanout", change_target=(4, 0),
+                          change_sweep_jobs=[])
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost._run_change_sweeps, ghost._wait_for_fanout_confirm,
+     ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+     ghost.secure_delay) = _saved_s5
+check("stage5: a completed run REMOVES its now-empty staging root",
+      not _stg_live.exists())
+
+# ...and a staging root that still holds a failed round's directory is LEFT,
+# so the failure stays visible rather than being silently destroyed.
+_stg_dirty = Path(tempfile.mkdtemp(prefix="stgdirty_")) / "tx_staging"
+_stg_dirty.mkdir()
+(_stg_dirty / "round_that_failed").mkdir()
+try:
+    ghost._run_round = lambda *a, **k: 1
+    ghost._wait_for_carrier = lambda *a, **k: True
+    ghost._run_peel_chain = lambda *a, **k: 0
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _pf_d = str(_stg_dirty.parent / "fanout.json")
+    with open(_pf_d, "w") as _fh:
+        json.dump({"meta": {}, "txs": []}, _fh)
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost._stage5_run(_StgArgs(dag_mixing=False), _pf_d, None, [],
+                          str(_stg_dirty), None, Decimal("9"),
+                          distribution_mode="fanout", change_target=(4, 0),
+                          change_sweep_jobs=[])
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost._run_change_sweeps, ghost._wait_for_fanout_confirm,
+     ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+     ghost.secure_delay) = _saved_s5
+check("stage5: ...and LEAVES one that still holds a failed round's directory",
+      _stg_dirty.exists() and (_stg_dirty / "round_that_failed").exists())
+shutil.rmtree(_stg_dirty.parent, ignore_errors=True)
 # rmdir's real semantics are the whole reason this is safe: it refuses a
 # non-empty directory instead of destroying evidence of a failed cleanup.
 (_stg / "leftover").mkdir()

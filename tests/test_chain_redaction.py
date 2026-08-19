@@ -555,16 +555,42 @@ print("\n=== line structure ===")
 # job is telling the operator whether they have been tampered with. It is
 # permanent once written — every later link recomputes against it — and it
 # would send an operator into a compromise response over a stray "\n".
+# THE CHARACTER SET IS DISCOVERED, NOT LISTED.
+#
+# The first version of this swept "normal / two\nlines / tab\there /
+# pipe|char / crlf\r\nhere" — which is exactly the set the implementation
+# already handled, so it could not fail. str.splitlines() breaks on TEN
+# characters and the writer scrubbed three; the other seven still forked the
+# chain, reachable through `paranoia_mode --iface $'wlan0\x0bEXTRA'` (argv,
+# unvalidated) into the real spoof_mac.
+#
+# Asking Python which characters it splits on removes the author's imagination
+# from the test entirely: whatever the runtime considers a line boundary is
+# what gets swept, today and after any future Unicode revision.
+_BOUNDARIES = [chr(_c) for _c in range(0x110000)
+               if len((chr(_c) + "x").splitlines()) > 1]
+check(f"(python treats {len(_BOUNDARIES)} characters as line boundaries)",
+      len(_BOUNDARIES) >= 8)
+
 _lp = Path(tempfile.mkdtemp(prefix="gs_chain_lines_")) / "integrity_chain.log"
-for _m in ("normal", "two\nlines", "tab\there", "pipe|char", "crlf\r\nhere",
-           "after"):
+for _m in ["normal", "tab\there", "pipe|char", "after"] + \
+          [f"two{_b}lines" for _b in _BOUNDARIES]:
     gsc.integrity_log("stage", _m, log_path=_lp)
+
+# The invariant, stated directly: no payload may survive as more than one line.
+_multi = [hex(ord(_b)) for _b in _BOUNDARIES
+          if len(gsc.chain_safe(f"a{_b}b").splitlines()) > 1]
+check(f"NO line boundary survives chain_safe ({len(_BOUNDARIES)} checked)",
+      not _multi)
+if _multi:
+    print("     survived:", _multi)
 
 _lok, _lbad, _lwhy = gsc.verify_integrity_chain(_lp)
 check("a payload containing a newline does NOT fork the chain",
       _lok and _lbad is None)
+_expected_entries = 4 + len(_BOUNDARIES)
 check("...and every entry is still exactly one line",
-      len(_lp.read_text().splitlines()) == 6)
+      len(_lp.read_text().splitlines()) == _expected_entries)
 # Guarded: a forked chain has lines with no " | " at all, and an IndexError
 # here would kill the file before it printed RESULT -- turning a clean FAIL
 # into "no result", which is exactly how the ipleak suite hid six unmeasured

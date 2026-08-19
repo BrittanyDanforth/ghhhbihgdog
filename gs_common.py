@@ -245,8 +245,23 @@ def chain_safe(msg: str) -> str:
         # file whose only job is telling the operator whether they have been
         # tampered with. It is permanent once written: every later link
         # recomputes against it. Reproduced with one "two\nlines" payload.
-        out = re.sub(r"[\r\n\t]+", " ", str(msg))
-        out = out.replace("|", "/")
+        # DERIVED FROM THE READER, not enumerated. This was
+        # re.sub(r"[\r\n\t]+", " ", ...) -- three characters, chosen because
+        # they are the three anyone thinks of. Both readers (integrity_log's
+        # `prev` lookup and verify_integrity_chain) use str.splitlines(), which
+        # breaks on ELEVEN: the eight not in that class -- VT, FF, FS, GS, RS,
+        # NEL, U+2028, U+2029 -- passed straight through and still forked the
+        # chain. Driven end to end: `paranoia_mode --iface $'wlan0\x0bEXTRA'`
+        # (argv, unvalidated) reaches integrity_log through the real spoof_mac
+        # and leaves verify_integrity_chain permanently reporting a tamper on a
+        # file nobody edited.
+        #
+        # So the writer now uses the READERS' OWN definition of a line. A
+        # character class cannot drift from splitlines(); this cannot, because
+        # it IS splitlines(). The test that missed this swept exactly the three
+        # characters the implementation already handled.
+        out = " ".join(str(msg).splitlines())
+        out = out.replace("\t", " ").replace("|", "/")
         # A FULL address next, matched exactly rather than statistically: a
         # run of 90+ base58 characters is an address and nothing else, so this
         # branch has no false positives and no misses. The rate rule below is
