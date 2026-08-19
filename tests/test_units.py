@@ -997,7 +997,7 @@ check("changesweep: stage 5 takes the sweep jobs as a parameter",
 # The destinations must be provisioned BEFORE the spend, or a sweep has
 # nowhere to go at the moment it is needed.
 _prov = _gs_code[_gs_code.index("change_sweep_jobs = []"):
-                 _gs_code.index("incomplete = _stage5_run(")]
+                 _gs_code.index("incomplete, withheld = _stage5_run(")]
 check("changesweep: the destinations are created before the distribution runs",
       "new_subaddress_indexed(" in _prov)
 check("changesweep: failing to create one warns that the change stays unmixed",
@@ -1019,9 +1019,14 @@ import io as _io, contextlib as _ctx
 _swept = []
 _real_cs = ghost._run_change_sweep
 try:
+    # **_kw rather than every parameter spelled out: this stub exists to record
+    # WHICH locations the loop sweeps, and re-stating the whole signature made
+    # it fail on a keyword added to the real function for an unrelated reason
+    # (the integrity-chain redaction's `outcomes` collector). A stub that breaks
+    # on a signature it does not care about reports a defect that is not there.
     ghost._run_change_sweep = (lambda args, account, change_index, dest_addr,
                                dest_index, staging_dir, proxy, meta,
-                               label="change sweep", seq=0, delay_window=None:
+                               label="change sweep", seq=0, **_kw:
                                _swept.append((account, change_index, dest_addr,
                                               seq)) or account != 99)
     _jobs = [(5, 0, "DST5", 50), (6, 0, "DST6", 60), (99, 0, "DSTX", 70),
@@ -2690,11 +2695,16 @@ _vc_dir = Path(tempfile.mkdtemp(prefix="vchain_"))
 _vc = _vc_dir / "integrity_chain.log"
 
 
+# LETTERS, not event0..event5. integrity_log redacts every digit out of a
+# payload before it is hashed (see chain_safe -- the chain must not carry the
+# run's account numbers or output counts), so numbered payloads all land as
+# "event#" and the edit below became a no-op search-and-replace: the check
+# passed a tampered chain because it had not actually tampered with it.
 def _build_chain(n=6):
     if _vc.exists():
         _vc.unlink()
     for _i in range(n):
-        _gsc.integrity_log("stage", f"event{_i}", log_path=_vc)
+        _gsc.integrity_log("stage", f"event{chr(ord('A') + _i)}", log_path=_vc)
 
 
 _build_chain()
@@ -2705,7 +2715,8 @@ check("chain: ...and reports how many links it checked", "6 links verified" in _
 # An EDIT to a middle line must break every link after it.
 _ls = _vc.read_text().splitlines()
 _h, _rest = _ls[2].split(" | ", 1)
-_ls[2] = _h + " | " + _rest.replace("event2", "eventX")
+_ls[2] = _h + " | " + _rest.replace("eventC", "eventX")
+assert "eventX" in _ls[2], "the tamper edit must actually change the line"
 _vc.write_text("\n".join(_ls) + "\n")
 _ok, _bad, _why = _gsc.verify_integrity_chain(_vc)
 check("chain: an EDITED line is detected, at the right line number",
@@ -3117,7 +3128,9 @@ try:
     ghost.newnym = lambda **k: None
     ghost.tor_recheck = lambda *a, **k: None
     with _ctx.redirect_stdout(_io.StringIO()):
-        _inc = ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg",
+        # _stage5_run returns (incomplete, withheld): a deliberately withheld
+        # output is not a failed run -- see report_completion.
+        _inc, _wh = ghost._stage5_run(_VA(dag_mixing=False), _pf, None, [], "stg",
                                  None, Decimal("9"), distribution_mode="peel",
                                  change_target=(4, 0), change_sweep_jobs=[],
                                  veil_file=_vf, veil_target=(7, 2),

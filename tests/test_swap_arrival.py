@@ -31,7 +31,7 @@ AttributeError on import -- red, but a demonstration of nothing. The OLD GATE
 section reproduces the old loop condition verbatim and drives it down the same
 timeline the fix is tested on, so the defect is shown rather than asserted.
 """
-import importlib.machinery, importlib.util, io, os, sys, contextlib
+import importlib.machinery, importlib.util, io, os, sys, contextlib, types
 from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +189,80 @@ check("SPLIT: money that has arrived but not UNLOCKED is not 'funded'",
       _res["state"] != "funded")
 
 
+# ---- THE TOLERANCE MUST NOT BE WORTH A WHOLE CHUNK ----------------------
+#
+# The first version of this fix took the slippage tolerance off the SUMMED
+# target and opened at `unlocked >= total * (1 - tolerance)`. The tolerance is
+# meant to absorb the slippage on ONE swap; charged against the whole pot it
+# absorbs an entire chunk the moment a chunk is worth less than it:
+#
+#     --split 12, 1 XMR each, tolerance 0.10 -> floor 10.8
+#     11 chunks arrive IN FULL = 11.0 >= 10.8 -> "the swap has arrived"
+#
+# So at --split 10 or more, on DEFAULT flags and with no operator mistake, the
+# gate opened with a whole chunk still in flight -- G6 rebuilt inside the fix
+# for G6. Found by driving the shipped loop, not by reading it.
+_SPLITS = (3, 5, 10, 12, 20, 50)
+for _n in _SPLITS:
+    _tol = ghost.chunk_safe_tolerance(D("0.10"), _n)
+    _flr = ghost.accept_floor(D(_n), _tol)          # N chunks of 1 XMR
+    check(f"CHUNK GATE: at --split {_n}, {_n - 1} full chunks do NOT satisfy "
+          f"the gate", D(_n - 1) < _flr)
+check("CHUNK GATE: ...while the full delivery still does",
+      all(D(_n) >= ghost.accept_floor(
+          D(_n), ghost.chunk_safe_tolerance(D("0.10"), _n)) for _n in _SPLITS))
+
+# Non-vacuity: the UNCAPPED tolerance really does admit a missing chunk, or
+# every check above would pass against a gate that never had the defect.
+check("control: the UNCAPPED tolerance admits a whole missing chunk at N=12",
+      D(11) >= ghost.accept_floor(D(12), D("0.10")))
+
+check("CHUNK GATE: one chunk leaves the operator's tolerance untouched",
+      ghost.chunk_safe_tolerance(D("0.10"), 1) == D("0.10")
+      and ghost.chunk_safe_tolerance(D("0.10"), 0) == D("0.10"))
+check("CHUNK GATE: a tolerance already tighter than the cap is left alone",
+      ghost.chunk_safe_tolerance(D("0.01"), 12) == D("0.01"))
+
+# ...and through the REAL loop, on the timeline that used to pass it.
+_f12 = ghost.accept_floor(D(12), ghost.chunk_safe_tolerance(D("0.10"), 12))
+_res, _ = run([(0, 0)] + [(i, i) for i in range(1, 12)] + [(11, 11)] * 30,
+              _f12, chunks=12, stall_s=300)
+check("CHUNK GATE: the real loop HOLDS at 11 of 12 chunks",
+      _res["state"] != "funded" and _res["unlocked"] == D("11"))
+_res, _ = run([(0, 0)] + [(i, i) for i in range(1, 13)] + [(12, 12)] * 5,
+              _f12, chunks=12, stall_s=300)
+check("CHUNK GATE: ...and completes when the twelfth lands",
+      _res["state"] == "funded")
+
+
+# ---- Infinity and NaN, straight off the quote JSON ----------------------
+#
+# expected_xmr comes off the network. Decimal("NaN") > 0 RAISES rather than
+# returning False, so a NaN quote escaped swap_expected_total instead of being
+# counted unreadable -- the one thing its docstring promises. Infinity converts
+# cleanly, compares greater than zero and becomes a target no balance can ever
+# reach: the run waits out its whole timeout and blames the swap.
+check("quotes: a NaN expected_xmr is counted UNREADABLE, not raised",
+      ghost.swap_expected_total([quote("NaN"), quote("1.0")]) == (D("1.0"), 1))
+check("quotes: an Infinity expected_xmr is counted UNREADABLE, not summed",
+      ghost.swap_expected_total([quote("Infinity"), quote("1.0")])
+      == (D("1.0"), 1))
+check("quotes: -Infinity too",
+      ghost.swap_expected_total([quote("-Infinity")]) == (D(0), 1))
+
+
+# ---- a transient balance DROP must not raise the bar --------------------
+#
+# `marked` only ever moved up, so one low reading -- a wallet mid-rescan, a
+# reorg, an RPC answering from a stale cache -- permanently raised what counted
+# as the next arrival, and the run stalled out with money still landing.
+# receive_watch's loop has carried the re-anchor branch for the same reason.
+_res, _ = run([(0, 0), (5, 5), (0, 0), (5, 5), (8, 8), (11, 11), (12, 12)],
+              _f12, chunks=12, stall_s=300)
+check("DROP: a transient drop to zero does not strand the wait",
+      _res["state"] == "funded")
+
+
 # ---- the two clocks -----------------------------------------------------
 #
 # The stall clock restarts on every real arrival, which is what lets N chunks
@@ -224,12 +298,19 @@ _res, _tl = run(_drip, "2.7", stall_s=300, timeout_s=86400, poll=30)
 check("drip: sub-threshold dust does NOT hold the stall clock open",
       _res["state"] == "stalled")
 
-# ...while genuine increments below the step still add up: 58 arrivals of
-# 0.0001 are 0.0058 XMR, and comparing against the previous TICK rather than
-# the last marked total would never notice.
-_creep = [(D("0.05") * i, D("0.05") * i) for i in range(1, 60)]
-_res, _ = run(_creep, "2.7", stall_s=120, timeout_s=86400, poll=30)
-check("drip: ...but real increments that accumulate to a chunk do count",
+# ...while genuine increments BELOW the step still add up. The step for a 2.7
+# floor is max(dust, 2.7 * 0.001) = 0.0027, so the increments here must be
+# smaller than that or the check cannot distinguish "compares against the last
+# MARKED total" (correct) from "compares against the previous tick" (the hole
+# `marked` exists to close). An earlier version of this check used 0.05 -- 18x
+# the step -- so it passed either way and proved nothing.
+_STEP = ghost.swap_arrival_step(D("2.7"))
+_CREEP = D("0.001")
+check("drip: (the creep increment really is below the arrival step)",
+      _CREEP < _STEP)
+_creep = [(_CREEP * i, _CREEP * i) for i in range(1, 2800)]
+_res, _ = run(_creep, "2.7", stall_s=300, timeout_s=10 ** 7, poll=30)
+check("drip: ...but sub-step increments that ACCUMULATE past it do count",
       _res["state"] == "funded")
 
 check("drip: the arrival step scales with the target (0.1%)",
@@ -345,6 +426,127 @@ check("wiring: main() actually calls the arrival wait",
       "stage4_await_swap(" in _code[_main_at:])
 check("wiring: ...and the helper is the only thing driving the wait loop",
       callable(getattr(ghost, "stage4_await_swap", None)))
+
+
+# ---- stage4_await_swap: the orchestration, EXECUTED ---------------------
+#
+# Everything above drives the pure functions. That is not enough, and a
+# mutation sweep proved it: stage4_await_swap -- which contains this whole
+# path's headline guarantee, "a shortfall EXITS rather than being inherited
+# silently" -- was reached by nothing. Deleting the sys.exit outright, or
+# skipping the wait altogether, left this file at 36 passed / 0 failed. The
+# checks that mentioned it searched source text and asked `callable(...)`,
+# which is the "214 warning/abort lines no test executes" hole in miniature.
+#
+# So: call it. Only xmr_balance and the clock are faked.
+print()
+
+
+def drive_stage4(steps, deposits=None, receive_mode=False, expect=None,
+                 tolerance=None, accept_partial=False, split=1,
+                 unlocked_now=D(0), total_now=D(0)):
+    """Run the REAL stage4_await_swap. Returns (result, stdout, exited)."""
+    tl = Timeline(steps, 30)
+    saved = (ghost.xmr_balance, ghost.integrity_log, ghost.time,
+             ghost.XMR_ARRIVAL_STALL)
+    out = io.StringIO()
+    exited = None
+    res = None
+    try:
+        ghost.xmr_balance = lambda rpc, acct, idx: tl.balance()
+        ghost.integrity_log = lambda *a, **k: None
+        # A clock the wait can actually advance, and a stall short enough that
+        # a missing chunk resolves inside the test rather than in two hours.
+        ghost.time = types.SimpleNamespace(sleep=tl.sleep,
+                                           monotonic=tl.clock)
+        ghost.XMR_ARRIVAL_STALL = 300
+        args = types.SimpleNamespace(
+            split=split,
+            expect_total_xmr=expect,
+            swap_tolerance=(tolerance if tolerance is not None
+                            else ghost.SWAP_TOLERANCE_DEFAULT),
+            accept_partial_swap=accept_partial,
+            entry_veil=True)
+        with contextlib.redirect_stdout(out):
+            try:
+                res = ghost.stage4_await_swap(
+                    args, object(), 3, 1, "4" + "A" * 94, deposits or [],
+                    receive_mode, total_now, unlocked_now)
+            except SystemExit as e:
+                exited = e
+    finally:
+        (ghost.xmr_balance, ghost.integrity_log, ghost.time,
+         ghost.XMR_ARRIVAL_STALL) = saved
+    return res, out.getvalue(), exited
+
+
+_Q3 = [quote("1.0")] * 3          # 3 chunks, 3 XMR quoted
+
+# THE HEADLINE GUARANTEE. Two of three chunks land and stop.
+_res, _out, _exit = drive_stage4([(0, 0), (1, 1), (2, 2)], deposits=_Q3)
+check("STAGE4: a shortfall EXITS rather than being inherited silently",
+      _exit is not None)
+check("STAGE4: ...and the message says what arrived and what was expected",
+      "NOT fully arrived" in str(_exit) and "NOTHING HAS BEEN SPENT" in str(_exit))
+check("STAGE4: ...and does not tell the operator to re-run first, which would "
+      "strand what did arrive",
+      "BEFORE re-running" in str(_exit))
+
+# The full delivery proceeds, and returns the balance the plan is sized from.
+_res, _out, _exit = drive_stage4([(0, 0), (1, 1), (2, 2), (3, 3)], deposits=_Q3)
+check("STAGE4: a complete arrival returns normally", _exit is None)
+check("STAGE4: ...with the full balance, not the first chunk's",
+      _res == (D(3), D(3)))
+
+# --accept-partial-swap is the ONLY way past a shortfall, and it must say so.
+_res, _out, _exit = drive_stage4([(0, 0), (1, 1), (2, 2)], deposits=_Q3,
+                                 accept_partial=True)
+check("STAGE4: --accept-partial-swap proceeds instead of exiting",
+      _exit is None and _res == (D(2), D(2)))
+check("STAGE4: ...and warns that later arrivals are never mixed",
+      "NOT mixed by this run" in _out)
+check("STAGE4: ...and that the exit will not withdraw them",
+      "will NOT withdraw" in _out)
+
+# Receiver mode: nothing to wait for -- but the flags must not be swallowed.
+_res, _out, _exit = drive_stage4([(9, 9)], deposits=_Q3, receive_mode=True,
+                                 unlocked_now=D(9), total_now=D(9),
+                                 expect=D("5.0"))
+check("STAGE4: receiver mode returns the balance it was given",
+      _exit is None and _res == (D(9), D(9)))
+check("STAGE4: ...and SAYS the arrival flags are ignored rather than "
+      "discarding them in silence",
+      "NO EFFECT in receiver mode" in _out)
+
+# Manual mode: no quotes, so no target. The warning must not be conditional on
+# --split, which does nothing in manual mode.
+_res, _out, _exit = drive_stage4([(0, 0), (1, 1)], deposits=[], split=1)
+check("STAGE4: manual mode warns that the wait cannot tell one chunk from all",
+      "NO EXPECTED TOTAL" in _out)
+check("STAGE4: ...even at the default --split 1, where the old warning was "
+      "silent", "--expect-total-xmr" in _out)
+
+# The chunk-safe cap must be announced, not applied behind the operator's back.
+_res, _out, _exit = drive_stage4(
+    [(0, 0)] + [(i, i) for i in range(1, 13)] + [(12, 12)] * 3,
+    deposits=[quote("1.0")] * 12)
+check("STAGE4: the capped tolerance is announced", "capped at" in _out)
+check("STAGE4: ...and the run still completes on a full delivery",
+      _exit is None and _res == (D(12), D(12)))
+
+# ...and at --split 12 a missing chunk must NOT pass, through the real
+# orchestration rather than the pure floor arithmetic.
+_res, _out, _exit = drive_stage4(
+    [(0, 0)] + [(i, i) for i in range(1, 12)] + [(11, 11)] * 20,
+    deposits=[quote("1.0")] * 12)
+check("STAGE4: 11 of 12 chunks exits, through the real orchestration",
+      _exit is not None)
+
+# An explicit target below the quotes lowers the bar -- say so.
+_res, _out, _exit = drive_stage4([(0, 0), (1, 1), (2, 2)], deposits=_Q3,
+                                 expect=D("2.0"))
+check("STAGE4: an --expect-total-xmr below the quoted sum is called out",
+      "BELOW" in _out)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

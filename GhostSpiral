@@ -1233,15 +1233,60 @@ def swap_expected_total(deposits: list) -> tuple:
     total = Decimal(0)
     unreadable = 0
     for dep in deposits:
+        # The COMPARISON is inside the try, not just the conversion. It was
+        # outside, and Decimal("NaN") > 0 raises InvalidOperation rather than
+        # returning False -- so a NaN in the quote JSON (which comes off the
+        # network) escaped this function instead of being counted as
+        # unreadable, which is the one thing the docstring promises. Infinity
+        # is worse: it converts, compares greater than zero, and becomes a
+        # target no balance can ever reach, so the run waits out its whole
+        # timeout and blames the swap.
         try:
             v = Decimal(str((dep or {}).get("expected_xmr") or "0"))
+            readable = v.is_finite() and v > 0
         except Exception:                                    # noqa: BLE001
-            v = Decimal(0)
-        if v > 0:
+            v, readable = Decimal(0), False
+        if readable:
             total += v
         else:
             unreadable += 1
     return total, unreadable
+
+
+def chunk_safe_tolerance(tolerance: Decimal, chunks: int) -> Decimal:
+    """A slippage tolerance that CANNOT be satisfied by a whole missing chunk.
+
+    THE SUMMED FLOOR DOES NOT MEAN WHAT IT LOOKS LIKE. accept_floor takes the
+    tolerance off the TOTAL of every quote and the wait opens at
+    `unlocked >= total * (1 - tolerance)`. The tolerance is there to absorb the
+    slippage on ONE swap between quote and settlement -- but charged against
+    the whole pot it absorbs an entire chunk as soon as a chunk is worth less
+    than the tolerance:
+
+        --split 12, 1 XMR per chunk, tolerance 0.10
+        floor = 12 * 0.90 = 10.8
+        11 chunks arrive IN FULL = 11.0 >= 10.8  ->  "the swap has arrived"
+
+    So at --split 10 or more, on the DEFAULT tolerance and with no operator
+    error, the gate opened with a whole chunk still in flight -- G6 itself,
+    rebuilt inside the fix for G6. Measured on the real loop, not reasoned
+    about: it returned 'funded' at 11 of 12 chunks.
+
+    A total-only comparison cannot tell "all N arrived, each a little short"
+    from "N-1 arrived and one never came" once the tolerance reaches 1/N: they
+    are the same number. Nothing here reads per-chunk arrivals, so the only
+    honest move is to keep the tolerance strictly below one chunk's share.
+    1/(N+1) puts the floor above what N-1 full chunks give, for every N:
+
+        floor/target = N/(N+1)  >  (N-1)/N      because N^2 > N^2 - 1
+
+    Fails CLOSED: a swap that really does under-deliver by more than the capped
+    tolerance stalls instead of proceeding, and the operator decides with
+    --accept-partial-swap. Nothing has been spent at that point.
+    """
+    if chunks <= 1:
+        return tolerance
+    return min(tolerance, Decimal(1) / Decimal(int(chunks) + 1))
 
 
 def swap_arrival_step(target: Decimal, dust: Decimal = DUST_XMR) -> Decimal:
@@ -1263,7 +1308,7 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
                           timeout_s: int = XMR_ARRIVAL_TIMEOUT,
                           poll_s: int = XMR_ARRIVAL_POLL,
                           step: Decimal = None, dust: Decimal = DUST_XMR,
-                          sleep_fn=time.sleep, clock=time.monotonic,
+                          sleep_fn=None, clock=None,
                           echo=print) -> dict:
     """Wait for ALL of the swapped XMR to arrive and unlock on ENTRY.
 
@@ -1292,6 +1337,14 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
     """
     if step is None:
         step = swap_arrival_step(floor_ if floor_ > 0 else Decimal(0), dust)
+    # Resolved HERE, not in the signature. `sleep_fn=time.sleep` as a default
+    # binds the real function when this module is imported, so a caller that
+    # cannot pass them -- stage4_await_swap does not -- was untestable: a test
+    # replacing the module's `time` got the captured originals and slept for
+    # real. That is how the orchestration around this loop came to have no test
+    # at all while the loop itself had thirty.
+    sleep_fn = sleep_fn or time.sleep
+    clock = clock or time.monotonic
     started = clock()
     # The total as of the last MEANINGFUL arrival -- compared against this and
     # not against the previous tick, so a long run of sub-step increments that
@@ -1324,6 +1377,16 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
                      f"across {chunks} chunk(s); still waiting.")
             else:
                 echo(f"  [*] {total} XMR on ENTRY so far; still waiting.")
+        elif total < marked:
+            # RE-ANCHOR ON A DECREASE. `marked` only ever moved up, so one
+            # transient low reading -- a wallet mid-rescan, a reorg, an RPC
+            # answering from a stale cache -- permanently raised the bar for
+            # what counts as the next arrival: every later chunk was measured
+            # against a total the wallet no longer reported, the step was never
+            # cleared again, and the run stalled out with money still landing.
+            # receive_watch's loop has carried this branch for the same reason.
+            marked = total
+            last_arrival = clock()
         elif total > dust and unlocked <= dust and not locked_reported:
             echo(f"  [*] Seen {total} XMR total; waiting for it to unlock...")
             locked_reported = True
@@ -1605,7 +1668,11 @@ def build_cli() -> argparse.ArgumentParser:
     # XMR arrived on ENTRY? Under --split N that is a real question with a
     # wrong answer available (see wait_for_swap_arrival).
     cli.add_argument("--expect-total-xmr", type=decimal_arg,
-                     help="Total XMR expected across ALL swap chunks. Only "
+                     help="Total XMR expected across ALL swap chunks. PREFER "
+                          "GS_EXPECT_TOTAL_XMR=... in the environment: an argv "
+                          "amount is world-readable via ps and "
+                          "/proc/<pid>/cmdline (mode 444) for the whole run. "
+                          "Only "
                           "needed in MANUAL mode (no --btc-amount, quotes "
                           "fetched by thor_swap_preparer instead): without a "
                           "target this run cannot tell the first chunk of N "
@@ -2075,6 +2142,54 @@ def verify_spend_source(rpc_primary, account: int, index: int,
     integrity_log("stage4", f"spend_source_ok:acct={account}:idx={index}")
 
 
+def build_dag_adjacency(subs: list, entry_addr: str, deep: int, rng) -> dict:
+    """The hop graph: {subaddress: [candidate destinations]}.
+
+    ENTRY IS NEVER A HOP DESTINATION, and that is the whole reason this is a
+    function rather than eight lines in main().
+
+    The adjacency was built over all of `subs`, and subs contains ENTRY.
+    assign_hop_destinations prefers a source's own adjacency
+    (`dag.get(s, mix_targets)`) and falls back to mix_targets only when that is
+    exhausted -- and mix_targets is the list that excludes ENTRY. So the
+    exclusion existed and the primary path walked straight past it. Measured
+    over 400 planning runs per size, driving the real assign_hop_destinations:
+
+        wallets=10 deep=2   350/400 runs (87.5%) paid a hop to ENTRY
+        wallets= 6 deep=2   341/400 runs (85.2%)
+        wallets=20 deep=3   355/400 runs (88.8%)
+
+    ENTRY is the address the ThorChain memo names in plaintext, in a Bitcoin
+    OP_RETURN, to anyone who reads the BTC chain. build_entry_veil exists
+    because that output is "THE ONE OUTPUT AN ANALYST GETS FOR FREE", and its
+    premise is that ENTRY is spent ONCE into a fresh carrier and then
+    abandoned. Paying a MIXED output back to it gives an analyst a second look
+    at the one address they already have -- this time holding value that has
+    been through the mix. Nine runs in ten.
+
+    Excluding it here takes that to 0/400 at every size. The fan-out already
+    excluded it (mix_targets); only the hop graph did not.
+    """
+    dag = {}
+    for a in subs:
+        others = [b for b in subs if b != a and b != entry_addr]
+        if not others:
+            # Nothing legal to point at. An empty adjacency is handled by
+            # assign_hop_destinations' mix_targets fallback; randbelow(0)
+            # raises ValueError instead.
+            dag[a] = []
+            continue
+        max_k = len(others)
+        k = min((rng.randbelow(3) + 1) * deep, max_k)
+        k = max(k, 1)
+        chosen = []
+        pool = list(others)
+        for _ in range(k):
+            chosen.append(pool.pop(rng.randbelow(len(pool))))
+        dag[a] = chosen
+    return dag
+
+
 def assign_hop_destinations(sources: list, dag: dict, mix_targets: list,
                             rng) -> dict:
     """One destination per hop source, and NO destination used twice.
@@ -2322,16 +2437,56 @@ def resolve_swap_arrival(args) -> None:
     the gate would open on the first piconero and the run would be back to the
     defect this whole path exists to fix, silently.
     """
+    # GS_EXPECT_TOTAL_XMR FIRST, argv only with a warning.
+    #
+    # /proc/<pid>/cmdline is mode 0444 -- readable by every account on the host
+    # for the whole life of a run that lasts hours -- and this value is the
+    # total XMR the swap is delivering. It is precisely the class of number the
+    # integrity chain redacts and report_holdings refuses to write to disk, and
+    # env_or_argv exists because it kept reappearing on argv anyway: the
+    # off-ramp amount, then the BTC entry ADDRESS, then the swap amounts. Its
+    # docstring says it is there "so the next caller cannot half-apply the
+    # lesson". This flag was the next caller, and did.
+    #
+    # Cast here rather than through env_or_argv's `cast`, so a bad environment
+    # value produces this tool's own message instead of a raw traceback.
+    _exp = env_or_argv(
+        "GS_EXPECT_TOTAL_XMR",
+        str(args.expect_total_xmr) if args.expect_total_xmr is not None else None,
+        "The expected total XMR")
+    if _exp is not None:
+        try:
+            args.expect_total_xmr = Decimal(str(_exp))
+        except Exception:                                    # noqa: BLE001
+            sys.exit("[!] GS_EXPECT_TOTAL_XMR is not a number.")
+
     tol = getattr(args, "swap_tolerance", SWAP_TOLERANCE_DEFAULT)
     if not (Decimal(0) <= tol < Decimal(1)):
         sys.exit(f"[!] --swap-tolerance must be >= 0 and < 1 (got {tol}). It is "
                  f"the FRACTION of the expected total that may be missing and "
                  f"still count as fully arrived, so 0.10 means 10%.")
     exp = getattr(args, "expect_total_xmr", None)
-    if exp is not None and exp <= 0:
-        sys.exit(f"[!] --expect-total-xmr must be positive (got {exp}). A "
-                 f"non-positive target is no target: the run would stop waiting "
-                 f"on the first chunk of however many are coming.")
+    if exp is not None:
+        # NOT just `<= 0`. decimal_arg accepts "Infinity" and "NaN" -- they are
+        # valid Decimal literals -- and both defeat this gate in different
+        # ways: Infinity is a target no balance ever reaches, so the run waits
+        # out its whole timeout and blames the swap; NaN makes every
+        # comparison False, so the gate never opens either and `<= 0` does not
+        # catch it because NaN <= 0 is False.
+        if not exp.is_finite():
+            sys.exit(f"[!] --expect-total-xmr must be a real number (got "
+                     f"{exp}). Infinity and NaN are valid Decimal literals and "
+                     f"neither is an amount the wallet can ever reach: the run "
+                     f"would wait out its whole timeout and report the swap as "
+                     f"short.")
+        if exp <= 0:
+            sys.exit(f"[!] --expect-total-xmr must be positive (got {exp}). A "
+                     f"non-positive target is no target: the run would stop "
+                     f"waiting on the first chunk of however many are coming.")
+        try:
+            accept_floor(exp, tol)
+        except ValueError as e:
+            sys.exit(f"[!] --expect-total-xmr {exp} is unusable: {e}.")
     if getattr(args, "accept_partial_swap", False):
         integrity_log("stage0", "accept_partial_swap")
 
@@ -2408,9 +2563,34 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
         # An explicit target overrides the quotes: in manual mode there are
         # none, and where there are both, the operator holding the
         # thor_swap_preparer bundle knows what was actually sent.
+        #
+        # LOUDLY when it is SMALLER, though. A target below what the quotes
+        # already promise lowers the gate this whole path exists to raise, and
+        # the difference is money that will arrive after the run has planned.
+        # resolve_swap_arrival can only check the flag is positive; the quotes
+        # do not exist yet when it runs.
+        if quoted > 0 and args.expect_total_xmr < quoted:
+            print(f"  [!] --expect-total-xmr ({args.expect_total_xmr} XMR) is "
+                  f"BELOW the {quoted} XMR the swap quotes promise. Using the "
+                  f"lower number lowers the bar for 'the swap has arrived' — "
+                  f"anything between the two lands after this run has planned "
+                  f"and is never mixed.")
+            integrity_log("stage4", "expect_total_below_quotes")
         quoted = args.expect_total_xmr
         unreadable = 0
-    floor_ = accept_floor(quoted, args.swap_tolerance)
+    # Capped so a whole missing chunk cannot satisfy it -- see
+    # chunk_safe_tolerance. This is the defect the first version of this fix
+    # shipped with.
+    tol = chunk_safe_tolerance(args.swap_tolerance, n_chunks)
+    if tol < args.swap_tolerance:
+        print(f"  [*] Slippage tolerance capped at {tol * 100:.1f}% for "
+              f"{n_chunks} chunks (you asked for "
+              f"{args.swap_tolerance * 100:.0f}%). At the wider figure "
+              f"{n_chunks - 1} chunks arriving in full would have counted as "
+              f"all {n_chunks}, because the tolerance is charged against the "
+              f"total and one chunk is worth less than it.")
+        integrity_log("stage4", "swap_tolerance_capped_for_chunks")
+    floor_ = accept_floor(quoted, tol)
 
     # ENTERED ON A SHORTFALL, not only on an empty ENTRY. The guard used to
     # read `unlocked_bal <= DUST_XMR` alone, which is sound only while ENTRY is
@@ -2418,8 +2598,23 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
     # assumption that makes the wait skippable the moment something upstream
     # changes. With a target in hand, "not enough has arrived yet" is the
     # condition that actually matters.
-    if receive_mode or not (unlocked_bal <= DUST_XMR
-                            or (floor_ > 0 and unlocked_bal < floor_)):
+    if receive_mode:
+        # The funds are already on ENTRY by definition, so there is nothing to
+        # wait for -- but say so when the operator has passed flags that only
+        # this wait consults, rather than accepting them, validating them and
+        # then discarding them in silence.
+        if (args.expect_total_xmr is not None
+                or args.accept_partial_swap
+                or args.swap_tolerance != SWAP_TOLERANCE_DEFAULT):
+            print("  [!] --expect-total-xmr / --swap-tolerance / "
+                  "--accept-partial-swap have NO EFFECT in receiver mode: the "
+                  "XMR is already on the entry address, so there is no arrival "
+                  "to wait for. Use receive_watch before this run if you need "
+                  "to wait for a swap to land.")
+            integrity_log("stage4", "arrival_flags_ignored_receive_mode")
+        return total_bal, unlocked_bal
+    if not (unlocked_bal <= DUST_XMR
+            or (floor_ > 0 and unlocked_bal < floor_)):
         return total_bal, unlocked_bal
 
     if unreadable:
@@ -2432,21 +2627,32 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
                                 f"{unreadable}_of_{len(swap_deposits)}")
     if floor_ > 0:
         print(f"  [*] Waiting for ~{floor_} XMR ({n_chunks} chunk(s), "
-              f"{args.swap_tolerance * 100:.0f}% slippage tolerance) to "
+              f"{tol * 100:.1f}% slippage tolerance) to "
               f"arrive+unlock on ENTRY {scrub_address(entry_addr)}...")
     else:
-        # No target: nothing here can distinguish "all of it" from "the first
-        # of several", so say that rather than implying a check that is not
-        # happening.
+        # NO TARGET AT ALL, which means the gate below is `unlocked > DUST_XMR`
+        # -- the pre-fix condition, verbatim. Say so unconditionally.
+        #
+        # This warning used to sit behind `if n_chunks > 1`, and in manual mode
+        # n_chunks falls back to `max(args.split, 1)` -- a flag that does
+        # NOTHING in manual mode, because manual mode is defined by there being
+        # no --btc-amount for --split to divide. So the default manual run
+        # (--split unset, i.e. 1) printed nothing at all and quietly reverted
+        # to first-chunk behaviour: the exact defect this function was written
+        # to remove, hidden behind a condition that looked like it was about
+        # chunk count.
         print(f"  [*] Waiting for swapped XMR to arrive+unlock on ENTRY "
               f"{scrub_address(entry_addr)}...")
-        if n_chunks > 1:
-            print(f"  [!] NO EXPECTED TOTAL is known for this run, but "
-                  f"{n_chunks} chunks are expected. This run will plan against "
-                  f"WHATEVER HAS LANDED when the first chunk unlocks; anything "
-                  f"arriving later is never mixed. Pass --expect-total-xmr "
-                  f"<total> to wait for all of it.")
-            integrity_log("stage4", f"arrival_no_target:{n_chunks}_chunks")
+        print("  [!] NO EXPECTED TOTAL is known for this run, so this wait "
+              "CANNOT tell one chunk from all of them: it finishes as soon as "
+              "any balance above dust unlocks. Anything arriving after that is "
+              "never mixed by this run. ENTRY is named in plaintext by the "
+              "public swap memo, so a stranger can trip this gate for the cost "
+              "of dust.")
+        print("      Pass --expect-total-xmr <total XMR> to wait for all of "
+              "it. With --btc-amount the target is summed from the quotes "
+              "automatically.")
+        integrity_log("stage4", "arrival_no_target")
 
     arrival = wait_for_swap_arrival(
         lambda: xmr_balance(rpc, bal_account, entry_index), floor_, n_chunks)
@@ -2491,29 +2697,33 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
             f"one hop\n"
             f"    from that address to your --exit-to destination.\n"
             f"\n"
-            f"    Wait for the rest and re-run, or pass --accept-partial-swap "
-            f"to mix what\n"
-            f"    arrived and deal with the remainder yourself.")
+            f"    WAIT for the rest to land, then run this again. Do that\n"
+            f"    BEFORE re-running: a send-mode run mints a NEW ENTRY every\n"
+            f"    time, so re-running now leaves what did arrive stranded on\n"
+            f"    the address above with nothing pointed at it.\n"
+            f"\n"
+            f"    If the rest is never coming, --accept-partial-swap mixes what\n"
+            f"    arrived. To mix the stranded remainder afterwards: mint a\n"
+            f"    fresh receive wallet (create_receive_wallet), send the ENTRY\n"
+            f"    balance to it as ONE ordinary transfer — that hop is the\n"
+            f"    entry veil, done by hand, and its destination appears in no\n"
+            f"    public memo — then run this with --receive-wallet on that\n"
+            f"    bundle. A bundle cannot be made for ENTRY itself:\n"
+            f"    create_receive_wallet mints a new subaddress, it does not\n"
+            f"    describe an existing one.")
     print(f"  [!] --accept-partial-swap: proceeding with {unlocked_bal} XMR "
           f"after {why}.")
     if floor_ > 0:
         print(f"  [!] That is {short} XMR short of the ~{floor_} expected.")
     print("  [!] ANYTHING THAT ARRIVES FROM HERE ON is NOT mixed by this run. "
           "It stays on ENTRY, which the swap memo names in public.")
-    # Conditional because it is only TRUE with the veil on -- _exit_hold_list
-    # holds nothing under --no-entry-veil, where the operator has already
-    # accepted that the swap's output is spent in the open. Printing the
-    # reassurance unconditionally would be the pipeline telling the operator it
-    # was protecting an output it is about to sweep.
-    if getattr(args, "entry_veil", True):
-        print("      The exit will NOT withdraw it — that would be a one-hop "
-              "link from the swap to your destination. Mix it with a fresh run "
-              "instead.")
-    else:
-        print("      --no-entry-veil: the exit WILL withdraw it, in one hop "
-              "from the address the swap memo names to your --exit-to "
-              "destination. Withdraw it by hand from a fresh run instead, or "
-              "drop --no-entry-veil.")
+    # Unconditional, because the hold is now unconditional -- see
+    # _exit_hold_list. This used to branch on --no-entry-veil and tell that
+    # operator the exit WOULD sweep it, which was true of the code and wrong
+    # as a design: the link being avoided is swap -> destination, and nobody
+    # consented to that by turning off the veil.
+    print("      The exit will NOT withdraw it — that would be a one-hop link "
+          "from the swap to your destination.")
     integrity_log("stage4", "arrival_partial_accepted")
     return total_bal, unlocked_bal
 
@@ -2588,7 +2798,8 @@ def report_holdings(rpc, accounts) -> list:
     return funded
 
 
-def report_completion(rpc, incomplete, accounts, spent_plans=()) -> None:
+def report_completion(rpc, incomplete, accounts, spent_plans=(),
+                      withheld=()) -> None:
     """Say what actually happened, then say where the money is. Exits non-zero
     on an incomplete run.
 
@@ -2606,6 +2817,16 @@ def report_completion(rpc, incomplete, accounts, spent_plans=()) -> None:
     the one place that knows the run completed, so it is the one place that can
     tell a plan that is SPENT from a plan the operator still needs. See
     _wipe_spent_plans. Default empty so every other caller is unaffected.
+
+    `withheld` is NOT `incomplete`, and conflating them costs more than it
+    looks. Withheld means the pipeline did everything it planned and then
+    deliberately declined to spend something -- the exit refusing to sweep an
+    unmixed ENTRY balance to a public destination. That is the pipeline
+    working. Routed through `incomplete` it took the branch above: no holdings
+    report, exit 1, and -- because this is the only place that knows a plan is
+    spent -- EVERY PLAN FILE LEFT ON DISK, each carrying its hops'
+    destinations and amounts in plaintext. So it is reported, prominently,
+    after a run that still counts as complete.
     """
     print()
     if incomplete:
@@ -2620,6 +2841,17 @@ def report_completion(rpc, incomplete, accounts, spent_plans=()) -> None:
     _wipe_spent_plans(*spent_plans)
     integrity_log("main", "pipeline_complete")
     print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
+    if withheld:
+        integrity_log("main", "value_withheld_from_exit")
+        print()
+        print("  [!] ...but value was DELIBERATELY LEFT ON THIS WALLET:")
+        for w in withheld:
+            print(f"      - {w}")
+        print("      This is the exit doing its job, not a failure. Do NOT "
+              "sweep it by hand to")
+        print("      the same destination — that is the transaction being "
+              "avoided. See the exit")
+        print("      messages above for what to do with it.")
 
 
 def resolve_entry_veil(rpc, args, addr_index: dict, entry_addr: str,
@@ -2827,18 +3059,7 @@ def main():
                 print(f"          --tor-proxy {args.tor_proxy}")
                 print(f"  [!] Then wait for XMR to arrive at ENTRY before proceeding.")
 
-        dag = {}
-        for a in subs:
-            others = [b for b in subs if b != a]
-            max_k = len(others)
-            k = min((_secrets.randbelow(3) + 1) * args.deep, max_k)
-            k = max(k, 1)
-            chosen = []
-            pool = list(others)
-            for _ in range(k):
-                idx = _secrets.randbelow(len(pool))
-                chosen.append(pool.pop(idx))
-            dag[a] = chosen
+        dag = build_dag_adjacency(subs, ENTRY, args.deep, _secrets)
         integrity_log("stage3", "dag_built")
 
         ###########################################################################
@@ -3122,7 +3343,8 @@ def main():
             change_sweep_jobs.append((_acct, 0, _csa, _csi))
 
         # All four veil/delay kwargs below are required -- see _stage5_run.
-        incomplete = _stage5_run(args, fanout_file, dag_file, fanout_targets_indexed,
+        incomplete, withheld = _stage5_run(args, fanout_file, dag_file,
+                                 fanout_targets_indexed,
                                  staging_dir, proxy, usable,
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
@@ -3137,7 +3359,8 @@ def main():
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
-                          spent_plans=(veil_file, fanout_file, dag_file))
+                          spent_plans=(veil_file, fanout_file, dag_file),
+                          withheld=withheld)
 
 
 def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
@@ -3342,6 +3565,43 @@ def _run_round(args, plan_file, staging_dir, label, wipe: bool = True):
                   f"manually.")
 
 
+#: Round events already recorded, as (event, role). One entry per KIND, not
+#: per round.
+#:
+#: A run drives _run_round once per peel, once per change sweep, once per exit
+#: withdrawal, plus the veil, the fan-out and the DAG -- and each success wrote
+#: three chain lines carrying the round's label. Redacting the digits out of
+#: "Exit 7/11" gives "exit #/#", which is fine on its own and useless as a
+#: defence: an analyst counts the `broadcast_ok:exit` lines instead and has the
+#: number of outputs the run holds, which is exactly what removing the
+#: per-output `withdrawn:<acct>/<sub>` lines from the exit was meant to take
+#: away. Cardinality survives redaction whenever a loop writes a line per turn.
+#:
+#: So the chain records THAT peels were created, signed and broadcast, and that
+#: one of them failed if one did. How many, and which, are printed to the
+#: terminal, where they reach the operator and stop.
+#:
+#: Process-scoped, which is run-scoped: one GhostSpiral process is one run, and
+#: the run lock guarantees it.
+_ROUND_EVENTS_LOGGED = set()
+
+
+def _round_role(label: str) -> str:
+    """"Peel 3/6" -> "peel". The role is what the chain may keep; the ordinal
+    is the part that counts the run."""
+    return re.sub(r"[\d/]+", " ", str(label)).strip().lower() or "round"
+
+
+def _round_log(event: str, label: str, detail: str = "") -> None:
+    """Record a round event ONCE per (event, role). See _ROUND_EVENTS_LOGGED."""
+    role = _round_role(label)
+    key = (event, role)
+    if key in _ROUND_EVENTS_LOGGED:
+        return
+    _ROUND_EVENTS_LOGGED.add(key)
+    integrity_log("stage5", f"{event}:{role}" + (f":{detail}" if detail else ""))
+
+
 def _run_round_body(args, plan_file, staging_dir, label):
     """The three phases themselves. Split out only so _run_round can wrap
     them in the staging wipe without re-indenting all of this; nothing else
@@ -3358,19 +3618,19 @@ def _run_round_body(args, plan_file, staging_dir, label):
             check=True, timeout=1800,
             env=_child_env(),       # create phase never signs: password scrubbed
         )
-        integrity_log("stage5", f"create_unsigned_ok:{label}")
+        _round_log("create_unsigned_ok", label)
 
         unsigned_count = len(list(Path(staging_dir).glob("*.unsigned")))
         if unsigned_count == 0:
-            integrity_log("stage5", f"no_unsigned_txs_created:{label}")
+            _round_log("no_unsigned_txs_created", label)
             sys.exit(f"[!] {label}: phase 'create' produced no unsigned TX files. "
                      f"Check RPC and balance.")
         print(f"  [+] {label}: {unsigned_count} unsigned TXs created.")
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", f"create_timeout:{label}")
+        _round_log("create_timeout", label)
         sys.exit(f"[!] {label}: unsigned TX creation timed out after 30 min")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"create_fail:{label}:{e.returncode}")
+        _round_log("create_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: unsigned TX creation failed (exit {e.returncode})")
 
     newnym()
@@ -3391,20 +3651,20 @@ def _run_round_body(args, plan_file, staging_dir, label):
              "--outdir", staging_dir],
             check=True, timeout=1800, env=_sign_env,
         )
-        integrity_log("stage5", f"sign_ok:{label}")
+        _round_log("sign_ok", label)
 
         signed_dir = Path(staging_dir) / "signed"
         signed_count = len(list(signed_dir.glob("*.signed"))) if signed_dir.is_dir() else 0
         if signed_count == 0:
-            integrity_log("stage5", f"no_signed_txs:{label}")
+            _round_log("no_signed_txs", label)
             sys.exit(f"[!] {label}: phase 'sign' produced no signed TX files. "
                      f"Check wallet file and password.")
         print(f"  [+] {label}: {signed_count} TXs signed.")
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", f"sign_timeout:{label}")
+        _round_log("sign_timeout", label)
         sys.exit(f"[!] {label}: signing timed out after 30 min")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"sign_fail:{label}:{e.returncode}")
+        _round_log("sign_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: signing failed (exit {e.returncode})")
 
     newnym()
@@ -3431,12 +3691,12 @@ def _run_round_body(args, plan_file, staging_dir, label):
         if args.allow_clearnet_relay:
             _bcast_cmd.append("--allow-clearnet-relay")
         subprocess.run(_bcast_cmd, check=True, timeout=7200, env=_child_env())
-        integrity_log("stage5", f"broadcast_ok:{label}")
+        _round_log("broadcast_ok", label)
     except subprocess.TimeoutExpired:
-        integrity_log("stage5", f"broadcast_timeout:{label}")
+        _round_log("broadcast_timeout", label)
         sys.exit(f"[!] {label}: broadcast timed out after 2 hours")
     except subprocess.CalledProcessError as e:
-        integrity_log("stage5", f"broadcast_fail:{label}:{e.returncode}")
+        _round_log("broadcast_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: broadcast failed (exit {e.returncode})")
 
     return signed_count
@@ -3733,15 +3993,18 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
     on one hop is bad, but skipping the rest would strand the others too.
     """
     failed = 0
+    _outcomes = set()
     for n, (account, change_index, dest_addr, dest_index) in enumerate(jobs, 1):
         label = f"change sweep {n}/{len(jobs)}"
         if not _run_change_sweep(args, account, change_index, dest_addr,
                                  dest_index, staging_dir, proxy, meta,
                                  label=label, seq=n,
-                                 delay_window=delay_window):
+                                 delay_window=delay_window,
+                                 outcomes=_outcomes):
             failed += 1
+    if _outcomes:
+        integrity_log("stage5", "change_sweeps:" + ",".join(sorted(_outcomes)))
     if len(jobs) > 1:
-        integrity_log("stage5", f"change_sweeps:{len(jobs) - failed}_of_{len(jobs)}")
         print(f"  [+] Change swept in {len(jobs) - failed}/{len(jobs)} SEPARATE "
               f"transactions — no single transaction spends more than one of "
               f"them, so none of them are publicly linked to each other.")
@@ -3750,7 +4013,7 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
 
 def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                       staging_dir, proxy, meta, label="change sweep", seq=0,
-                      delay_window=None):
+                      delay_window=None, outcomes=None):
     """Sweep ONE change location into the mix, leaving nothing behind.
 
     Neither distribution can allocate its input exactly, because the fee is not
@@ -3787,10 +4050,22 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
 
     Returns True if the change was swept (or there was nothing to sweep).
     """
+    # OUTCOME KIND, not "which account". A peel chain calls this once per
+    # hop, so one chain line per call counted the peels -- and the account
+    # number is the grouping report_holdings refuses to write to disk. The
+    # caller collapses these to one line; every detail below still reaches
+    # the operator on the terminal. `outcomes is None` keeps this callable
+    # on its own, which the tests do.
+    def _note(kind):
+        if outcomes is None:
+            integrity_log("stage5", f"change_sweep:{kind}")
+        else:
+            outcomes.add(kind)
+
     # Wait for the change to actually exist and unlock -- it is an output of
     # the distribution transaction, so it is locked for the usual ~10 blocks.
     if not _wait_for_change_settled(args, account, change_index, proxy, label)[0]:
-        integrity_log("stage5", f"change_sweep_skipped:not_confirmed:{account}")
+        _note("skipped_not_confirmed")
         print(f"  [!] The change on account {account} did not confirm in time, so "
               f"it was NOT swept into the mix. It is safe on account {account}, "
               f"subaddress {change_index} — but it is UNMIXED, and it is an "
@@ -3821,12 +4096,12 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         # of the distribution that never moves.
         _left = _change_residue(args, account, change_index)
         if _left is None:
-            integrity_log("stage5", f"change_swept_unverified:{account}")
+            _note("swept_unverified")
             print("  [+] The change sweep was relayed, but the balance could not "
                   "be re-read to confirm the address is now empty. Check "
                   f"account {account} / subaddr {change_index} yourself.")
         elif _left > 0:
-            integrity_log("stage5", f"change_sweep_residual:{account}")
+            _note("swept_residual")
             print(f"  [!] The change sweep relayed, but "
                   f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on account "
                   f"{account} / subaddr {change_index} — change that had not "
@@ -3834,7 +4109,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                   f"take it. It is safe, but it is UNMIXED and it is the one "
                   f"output that never moves. Sweep it by hand once it unlocks.")
         else:
-            integrity_log("stage5", f"change_swept_into_mix:{account}")
+            _note("swept_into_mix")
             print(f"  [+] The change on account {account} was swept into the mix; "
                   f"verified nothing is parked on that change address.")
         return True
@@ -3868,29 +4143,32 @@ def _exit_account_list(addr_index, change_accounts, bal_account) -> list:
 def _exit_hold_list(args, addr_index, entry_addr) -> list:
     """The outputs the exit must refuse to withdraw: ENTRY, and only ENTRY.
 
-    The entry veil swept ENTRY once, at the start of stage 5, so a balance
-    there when the exit runs arrived afterwards -- under --split N, a swap
-    chunk that settled late. It has been through none of the mixing, and its
-    funding transaction is named by a public ThorChain memo, so one sweep to
-    --exit-to would publish the link the whole run exists to break.
+    ENTRY is spent once -- by the veil, or by the distribution under
+    --no-entry-veil -- and then abandoned. A balance on it when the exit runs
+    therefore arrived AFTERWARDS: under --split N, a swap chunk that settled
+    late. It has been through none of the mixing, and the transaction that
+    funded it is named by a public ThorChain memo in a Bitcoin OP_RETURN, so
+    one sweep to --exit-to publishes swap -> destination in a single hop. That
+    is the link the entire pipeline exists to break, and no later transaction
+    retracts it.
 
-    A SECOND WAY MONEY REACHES ENTRY IS STILL OPEN, and this is deliberately
-    not claiming otherwise: the DAG round picks hop destinations from the mix
-    subaddress list, which still contains ENTRY, so a hop can pay a MIXED
-    output back to the address the memo names. That is a separate defect and
-    it is not fixed here. Its effect on this function is that a held output is
-    not always a late swap chunk -- sometimes it is mixed value that came home.
-    Holding it back is still the right side of that trade: the cost is funds
-    left on the wallet with the reason printed, and the alternative is
-    publishing a link that no later transaction can retract.
+    HELD IN EVERY MODE, including --no-entry-veil. That flag was a carve-out
+    here, on the reasoning that an operator who accepts ENTRY being spent in
+    the open has accepted this too. They have not: --no-entry-veil publishes
+    ENTRY -> the mix, which is a graph an analyst still has to unpick.
+    Sweeping a late chunk publishes ENTRY -> YOUR DESTINATION, which is not a
+    graph, it is the answer. Two different links, and only one of them was
+    consented to. The carve-out also cost nothing to remove: under
+    --no-entry-veil the distribution's change goes to the spending account's
+    subaddress 0, not to ENTRY, so ENTRY is empty on the ordinary path and the
+    hold fires only on the late-chunk case it is written for.
 
-    NOT held under --no-entry-veil: there ENTRY is the address the distribution
-    spends from, so the operator has already accepted (loudly, at stage 4) that
-    the swap's output is spent in the open. Holding funds back at that point
-    buys nothing and only strands them.
+    (An earlier version of this note said the DAG could also pay a MIXED
+    output back here, and blamed `mix_targets` for containing ENTRY.
+    mix_targets never contained ENTRY -- build_dag_adjacency did, and
+    assign_hop_destinations prefers that adjacency over mix_targets. It is
+    fixed there now, so a held output is a late swap chunk and nothing else.)
     """
-    if not getattr(args, "entry_veil", True):
-        return []
     if entry_addr not in addr_index:
         return []
     return [addr_index[entry_addr]]
@@ -3965,8 +4243,12 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                                                    for a, i in (hold or ())}]
     if held:
         targets = [t for t in targets if t not in held]
+        # Once, outside the loop, and naming nothing: one line per held output
+        # would count them, and the account/subaddress pair is the grouping
+        # report_holdings refuses to put on disk. The operator gets both, in
+        # full, on the terminal below.
+        integrity_log("exit", "withheld_unmixed_entry")
         for _ha, _hi, _hamt in held:
-            integrity_log("exit", f"withheld_unmixed_entry:{_ha}/{_hi}")
             print(f"  [!] EXIT: {Decimal(_hamt) / Decimal(10 ** 12)} XMR is on "
                   f"ENTRY (account {_ha} / subaddr {_hi}) and was NOT "
                   f"withdrawn.")
@@ -3975,9 +4257,13 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   "in public, so sending it to your exit destination would tie "
                   "the two together in one hop — which is what the rest of "
                   "this run spent hours preventing.")
-            print("      It is safe where it is. Mix it with a fresh run "
-                  "(create_receive_wallet + --receive-wallet) rather than "
-                  "spending it by hand.")
+            print("      It is safe where it is. To mix it: mint a fresh "
+                  "receive wallet (create_receive_wallet), send this balance "
+                  "to it as ONE ordinary transfer — that hop is the entry "
+                  "veil done by hand, and its destination is in no public "
+                  "memo — then run this again with --receive-wallet on that "
+                  "bundle. Note the account and subaddress above; nothing "
+                  "writes them down for you.")
     if not targets:
         if held:
             print("  [!] EXIT: nothing was withdrawn — the only funded output "
@@ -4005,9 +4291,23 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     integrity_log("exit", f"withdraw_start:{total}_outputs:{len(dest_pool)}_dests")
 
     relayed = failed = skipped = 0
+    # ONE CHAIN LINE PER OUTCOME KIND, not one per output.
+    #
+    # Redacting the numbers out of `withdrawn:<acct>/<sub>` is not enough
+    # here: eleven redacted lines still count to eleven, and the number of
+    # outputs the distribution created is the on-chain search key the entry
+    # veil exists to hide (see build_entry_veil -- an analyst picks the
+    # transaction out of the ring candidates by its output count). This loop
+    # visits every output the run holds, so its line count WAS that number.
+    #
+    # A set, so the chain still records that a residual or a failure
+    # happened -- which is what a later reader needs -- without recording
+    # how many, or to which account. Every per-output detail is printed to
+    # the terminal below, where it reaches the operator and stops.
+    _outcomes = set()
     for n, (acct, sub, amt) in enumerate(targets, 1):
         if shutdown_requested():
-            integrity_log("exit", f"withdraw_shutdown_at_{n}")
+            _outcomes.add("interrupted")
             skipped = total - (n - 1)
             print(f"  [!] EXIT interrupted: {relayed} withdrawn, {skipped} NOT "
                   f"sent. The remainder is still on this wallet.")
@@ -4016,7 +4316,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         label = f"exit {n}/{total}"
         # Settle first, for the reason sweep_all makes unavoidable.
         if not _wait_for_change_settled(args, acct, sub, proxy, label)[0]:
-            integrity_log("exit", f"withdraw_unsettled:{acct}/{sub}")
+            _outcomes.add("unsettled")
             print(f"  [!] {label}: account {acct} / subaddr {sub} did not settle "
                   f"in time, so it was NOT withdrawn. It is safe where it is.")
             failed += 1
@@ -4039,18 +4339,18 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             _run_round(args, path, stage, label.capitalize())
             _left = _change_residue(args, acct, sub)
             if _left is None:
-                integrity_log("exit", f"withdrawn_unverified:{acct}/{sub}")
+                _outcomes.add("relayed_unverified")
                 print(f"  [+] {label}: relayed, but the balance could not be "
                       f"re-read to confirm account {acct} / subaddr {sub} is "
                       f"empty. Check it yourself.")
             elif _left > 0:
-                integrity_log("exit", f"withdraw_residual:{acct}/{sub}")
+                _outcomes.add("relayed_residual")
                 print(f"  [!] {label}: relayed, but "
                       f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on "
                       f"account {acct} / subaddr {sub} — it had not unlocked "
                       f"when the sweep was built. Withdraw it once it unlocks.")
             else:
-                integrity_log("exit", f"withdrawn:{acct}/{sub}")
+                _outcomes.add("emptied")
                 print(f"  [+] {label}: account {acct} / subaddr {sub} emptied.")
             relayed += 1
         except SystemExit:
@@ -4058,7 +4358,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             # loop over independent transactions and the rest are still
             # withdrawable, so one failure must not strand them -- and it must
             # not be silent either.
-            integrity_log("exit", f"withdraw_failed:{acct}/{sub}")
+            _outcomes.add("failed")
             print(f"  [!] {label}: FAILED. Account {acct} / subaddr {sub} was "
                   f"NOT withdrawn and its funds are still on this wallet.")
             failed += 1
@@ -4067,7 +4367,8 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             _es = Path(stage)
             if _es.is_dir() and not secure_delete_tree(_es):
                 print(f"  [!] Could not securely wipe {stage}; remove it manually.")
-    integrity_log("exit", f"withdraw_done:{relayed}_of_{total}:failed={failed}")
+    integrity_log("exit", "withdraw_done:" +
+                  (",".join(sorted(_outcomes)) or "nothing_attempted"))
     return (relayed, failed, skipped, len(held))
 
 
@@ -4099,6 +4400,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     # The distribution cannot be created until this has confirmed and unlocked
     # -- it spends the carrier -- so the wait is not optional politeness.
     incomplete = []
+    withheld = []
     if veil_file:
         print("  [*] === Round 0: entry veil ===")
         newnym(required=True)
@@ -4113,7 +4415,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                   f"account {_vacct}, subaddress {_vidx} — but they are "
                   "UNDISTRIBUTED. Re-run once it confirms, or distribute by "
                   "hand.")
-            return ["the entry sweep did not confirm, so nothing was distributed"]
+            return ["the entry sweep did not confirm, so nothing was distributed"], withheld
 
     if distribution_mode == "peel":
         try:
@@ -4202,18 +4504,26 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
             _exit_meta, delay_window, hold=exit_hold or ())
         if _held:
-            # Reported separately from a failure because it is not one: the
-            # exit deliberately refused to spend an unmixed output out of
-            # ENTRY. It is still money left behind, so it still belongs in the
-            # completion report -- with the reason attached, or the operator
-            # reads it as a bug and sweeps it by hand, which is the exact
-            # transaction being avoided.
-            incomplete.append(
-                f"{_held} unmixed output(s) on ENTRY were NOT withdrawn — they "
-                f"arrived after the run had planned, and the swap memo names "
-                f"that address in public, so withdrawing them would link the "
-                f"swap to your exit destination in one hop. Mix them with a "
-                f"fresh run")
+            # WITHHELD, NOT INCOMPLETE, and the distinction is not cosmetic.
+            #
+            # This started life in `incomplete`, which reads as "the mix is not
+            # what was planned" -- and report_completion answers that by
+            # skipping the holdings report, skipping _wipe_spent_plans and
+            # exiting 1. So a run that did every single thing it planned, and
+            # then deliberately declined to publish one link, was reported as a
+            # failed run AND LEFT ITS PLAN FILES ON DISK: every hop's
+            # destination and amount, in plaintext, because the one place that
+            # knows a plan is spent had been told the run did not finish.
+            #
+            # The exit refusing to withdraw is the pipeline working. It is
+            # money left behind, so it is reported -- loudly, with the reason,
+            # or the operator reads it as a bug and sweeps it by hand, which is
+            # the exact transaction being avoided.
+            withheld.append(
+                "unmixed value on ENTRY was NOT withdrawn — it arrived after "
+                "the run had planned, and the swap memo names that address in "
+                "public, so withdrawing it would link the swap to your exit "
+                "destination in one hop")
         if _failed or _skipped:
             incomplete.append(
                 f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
@@ -4242,7 +4552,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         pass
 
     integrity_log("stage5", f"stage5_done:incomplete={len(incomplete)}")
-    return incomplete
+    return incomplete, withheld
 
 
 if __name__ == "__main__":

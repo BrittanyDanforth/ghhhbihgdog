@@ -19,7 +19,7 @@ OPSEC design principles
 from __future__ import annotations
 import argparse
 import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
@@ -70,6 +70,111 @@ def secure_delay(lo: float = 2.0, hi: float = 8.0) -> None:
 #  Integrity hash-chain logger
 # ---------------------------------------------------------------------------
 
+#: Payload patterns that describe THE RUN'S STRUCTURE rather than what happened.
+#:
+#: THE CHAIN IS A FORENSIC ARTIFACT. That is not an outside opinion; it is this
+#: toolchain's own position, stated in three places and acted on in one:
+#:
+#:   * create_subs stopped labelling subaddresses because "labels are written
+#:     into the WALLET FILE, and the wallet file is the one artifact
+#:     paranoia_mode deliberately never deletes". What labels handed an
+#:     adversary, it says, is "which outputs are decoys, which are real mix
+#:     targets, which are peel carriers AND IN WHAT ORDER, which is the change
+#:     sweep, and -- via 'GhostSpiral_entry' -- the name of the tool".
+#:   * report_holdings prints the run's account grouping to the terminal and
+#:     tells the operator, in as many words, "Not written to disk: a file
+#:     naming this run's accounts would hand anyone who reads the machine the
+#:     grouping". It logs a count and no numbers.
+#:   * paranoia_mode's wipe calls integrity_chain.log "the exact forensic
+#:     artifact this phase exists to destroy", and its mac_spoof fix already
+#:     established the remedy: "The log now records only THAT a spoof happened;
+#:     the MAC itself is printed to the terminal for the operator and never
+#:     stored."
+#:
+#: Every one of those defences was then undone by the chain itself, which
+#: recorded the ENTRY account and subaddress, every change-sweep account, every
+#: peel carrier index in order, and one `withdrawn:<acct>/<sub>` line per
+#: withdrawn output -- so the grouping report_holdings refuses to write, the
+#: roles and ORDER the labels were removed to hide, and (by counting those
+#: lines) the number of outputs the distribution created, were all on disk
+#: anyway. The tool name and version are on every line of the file.
+#:
+#: So the same remedy, applied at the chokepoint instead of one call site at a
+#: time: the chain records THAT a thing happened. Which account it happened to,
+#: and how many there were, goes to the terminal and stays there.
+#:
+#: A chokepoint and not 73 careful call sites, because 73 careful call sites is
+#: what this was: each one HAD been considered individually -- the fan-out logs
+#: its destination COUNT under a comment explaining that the AMOUNT would be
+#: linkable -- and that count is the on-chain search key build_entry_veil
+#: exists to hide. Judgement per call site is precisely what failed.
+#:
+#: DEFAULT-DENY, for the same reason create_subs gives one account per output:
+#: "makes the merge IMPOSSIBLE rather than merely discouraged". The first
+#: version of this was a denylist of the structural shapes actually seen --
+#: acct=N, N/M, N_outputs -- and it was whack-a-mole by construction: it missed
+#: `change_swept_into_mix:12`, `accounts_count:19`, and the numerator of
+#: `11_of_11` on the first pass over the real payloads. A denylist of the
+#: leaks somebody already noticed is the same fragility one level up.
+#:
+#: So: NO PAYLOAD MAY CARRY A NUMBER. Not "no account number" -- no number.
+#: That is checkable in one line by any future test, and a call site written
+#: the obvious way cannot defeat it.
+#:
+#: Each RUN of digits collapses to a single '#', never one '#' per digit: the
+#: width of the redaction would otherwise leak the magnitude, and "between 10
+#: and 99 outputs" is most of the answer.
+_CHAIN_DIGITS_RE = re.compile(r"\d+")
+
+#: A scrub_address() fragment: `4AdUndZS...9kQjMdKr`.
+#:
+#: DIGIT REDACTION DOES NOT COVER THIS, and it is the worst thing on the chain.
+#: scrub_address keeps 8 leading and 8 trailing base58 characters, and callers
+#: pass it to integrity_log precisely because its docstring says that is the
+#: safe form. It is safe for a TERMINAL. On the persistent chain it is a JOIN
+#: KEY: ENTRY is the address the ThorChain memo carries verbatim, in plaintext,
+#: in a Bitcoin OP_RETURN that anybody can read -- so 16 characters of it turn
+#: a seized disk and the public Bitcoin chain into one dataset. Sixteen base58
+#: characters is ~94 bits; nothing else on earth matches by accident.
+#:
+#: Stripping the digits out leaves 14 of them, which is still unique. The whole
+#: fragment goes.
+_CHAIN_ADDR_RE = re.compile(
+    r"[1-9A-HJ-NP-Za-km-z]{4,}\.\.\.[1-9A-HJ-NP-Za-km-z]{4,}")
+
+
+def chain_safe(msg: str) -> str:
+    """Strip every number out of a chain payload, keeping the event.
+
+    `withdrawn:4/1` becomes `withdrawn:#/#`; `fanout_plan:1_tx:9_dests` becomes
+    `fanout_plan:#_tx:#_dests`; `spend_source_ok:acct=3:idx=1` becomes
+    `spend_source_ok:acct=#:idx=#`; and a scrub_address fragment such as
+    `entry=4AdUndZS...9kQjMdKr` becomes `entry=<addr>`. WHAT happened survives
+    in full; which output or address it happened to, and how many there were,
+    does not.
+
+    Nothing is lost that the operator needs. Every quantity worth having --
+    the slippage deviation, the balances, the account grouping, the failure
+    counts -- is already printed to the terminal at the moment it is computed,
+    and several are in the abort message too. This is the remedy paranoia_mode
+    settled on for the spoofed MAC, applied where every tool passes through:
+    "the log now records only THAT a spoof happened; the [value] is printed to
+    the terminal for the operator and never stored."
+
+    Only the message is redacted, not the stage: stages come from a fixed
+    vocabulary (stage0..stage5, exit, main, fee, recv, swap, paranoia) and
+    carry no run data.
+
+    Pure and total -- it never raises, so a logging call can never become the
+    thing that aborts a run mid-pipeline.
+    """
+    try:
+        out = _CHAIN_ADDR_RE.sub("<addr>", str(msg))
+        return _CHAIN_DIGITS_RE.sub("#", out)
+    except Exception:                                        # noqa: BLE001
+        return "REDACTED"
+
+
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     """Append a SHA-256-chained line to the integrity log. Returns the hash.
 
@@ -113,7 +218,10 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             if lines:
                 prev = lines[-1].split(" | ")[0].strip()
         ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
-        line = f"{ts}|{VERSION}|{stage}|{msg}"
+        # REDACTED HERE, at the one place every tool passes through, so a call
+        # site added later cannot reintroduce the leak by being written the
+        # obvious way. See chain_safe.
+        line = f"{ts}|{VERSION}|{stage}|{chain_safe(msg)}"
         h = hashlib.sha256((prev + line).encode()).hexdigest()
         _append_chain_line(log_path, h, line)
     finally:
@@ -1431,8 +1539,20 @@ def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
         return Decimal(0)
     if not (Decimal(0) <= tolerance < Decimal(1)):
         raise ValueError("tolerance must be >= 0 and < 1")
-    return (target * (Decimal(1) - tolerance)).quantize(
-        Decimal("0.000000000001"), rounding=ROUND_DOWN)
+    try:
+        return (target * (Decimal(1) - tolerance)).quantize(
+            Decimal("0.000000000001"), rounding=ROUND_DOWN)
+    except InvalidOperation:
+        # quantize to 12dp needs 12 fractional digits plus the integer ones,
+        # and the default decimal context carries 28 -- so a target above
+        # ~1.7e16 raises rather than returning a floor. Nothing sets a wider
+        # context. A number that large is not a swap quote, it is a typo or a
+        # hostile bundle, and raising ValueError puts it on the same path as
+        # every other bad tolerance instead of a traceback out of a logging
+        # helper hours into a run.
+        raise ValueError(
+            "target is too large to compute an acceptance floor for "
+            "(more than ~1.7e16 XMR); the total Monero supply is ~1.8e7")
 
 
 # ---------------------------------------------------------------------------

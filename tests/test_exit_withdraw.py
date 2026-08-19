@@ -22,7 +22,7 @@ What matters here, and why each is a test rather than a comment:
 Pure-function checks: no daemon, no wallet, no binaries. The end-to-end proof
 that value really leaves the wallet is a separate regtest run.
 """
-import importlib.machinery, importlib.util, io, os, sys, contextlib, types
+import importlib.machinery, importlib.util, io, os, sys, contextlib, types, json
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -289,15 +289,135 @@ _hold_on = ghost._exit_hold_list(types.SimpleNamespace(entry_veil=True),
 check("hold: ENTRY is held back when the entry veil ran", _hold_on == [(3, 1)])
 check("hold: ...and nothing else is",
       (4, 1) not in _hold_on)
-# --no-entry-veil spends the swap's output in the open by the operator's own
-# explicit choice, announced at stage 4. Holding funds back there buys nothing
-# and only strands them.
-check("hold: nothing is held under --no-entry-veil",
+# --no-entry-veil is NOT a carve-out. It publishes ENTRY -> the mix, which an
+# analyst still has to unpick; sweeping a late chunk publishes ENTRY -> the
+# operator's destination, which is the answer rather than a graph. Two
+# different links, and only the first was consented to.
+check("hold: ENTRY is held under --no-entry-veil too",
       ghost._exit_hold_list(types.SimpleNamespace(entry_veil=False),
-                            _ai, "ENTRYADDR") == [])
+                            _ai, "ENTRYADDR") == [(3, 1)])
 check("hold: an ENTRY that is not in addr_index holds nothing (no crash)",
       ghost._exit_hold_list(types.SimpleNamespace(entry_veil=True),
                             _ai, "unknown") == [])
+
+# ---- THE WIRING, executed ------------------------------------------------
+#
+# The checks above test _exit_hold_list alone, and _run_exit_withdrawals with a
+# hold passed in by hand. Nothing joined them, and a mutation sweep showed what
+# that costs: emptying the hold at EITHER call site restores the exact
+# ENTRY -> --exit-to sweep this exists to prevent, and both test files stayed
+# green. A producer and a consumer that are each correct in isolation is not a
+# wired pipeline.
+#
+# So drive _stage5_run, where main() joins them, and assert on the transactions
+# that actually reach _run_round.
+_wire = _Recorder()
+_saved3 = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+           ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+_ENTRY = "ENTRY_ADDRESS"
+_addr_index = {_ENTRY: (3, 1), "mix": (4, 1)}
+_plan = os.path.join(_tf.mkdtemp(prefix="wireplan_"), "fanout.json")
+with open(_plan, "w") as _pfh:
+    json.dump({"meta": {}, "txs": []}, _pfh)
+_wargs = types.SimpleNamespace(
+    rpc_primary="http://127.0.0.1:18083", tor_proxy=None,
+    rpc_daemon="http://127.0.0.1:18081", wallet_file="w",
+    wallet_password="", fee_priority=1, allow_clearnet_relay=False,
+    exit_to=[A1], entry_veil=True, dag_mixing=False, peel=False,
+    output="./unsigned")
+
+
+def _drive_stage5(args_ns, recorder):
+    """Drive the REAL _stage5_run exit path. ENTRY (3/1) is funded -- a swap
+    chunk that landed after the run had planned -- alongside a mixed output."""
+    saved = (ghost._run_round, ghost._wait_for_change_settled,
+             ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+             ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+             ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+    try:
+        ghost._run_round = recorder
+        ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+        ghost._change_residue = lambda *a, **k: 0
+        ghost.connect_rpc = lambda *a, **k: _BalRPC(
+            {3: {1: 2_000_000_000_000}, 4: {1: 5_000_000_000_000}})
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost._wait_for_fanout_confirm = lambda *a, **k: True
+        ghost._run_change_sweeps = lambda *a, **k: 0
+        stg = os.path.join(_tf.mkdtemp(prefix="wire_"), "tx_staging")
+        os.makedirs(stg, exist_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ghost._stage5_run(
+                args_ns, _plan, None, [], stg, None, 1,
+                distribution_mode="fanout", change_target=(4, 0),
+                change_sweep_jobs=None, delay_window=(0, 0),
+                exit_accounts=ghost._exit_account_list(_addr_index, [], 3),
+                exit_hold=ghost._exit_hold_list(args_ns, _addr_index, _ENTRY))
+    finally:
+        (ghost._run_round, ghost._wait_for_change_settled,
+         ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+         ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+         ghost._wait_for_fanout_confirm, ghost._run_change_sweeps) = saved
+
+
+_inc, _wh = _drive_stage5(_wargs, _wire)
+_wsrc = [(t["account_index"], t["src_index"])
+         for r in _wire.rounds for t in r]
+check("WIRING: the funded ENTRY output is NOT swept to --exit-to",
+      (3, 1) not in _wsrc)
+check("WIRING: ...while the mixed output still leaves", (4, 1) in _wsrc)
+check("WIRING: ...and the hold is reported as WITHHELD, not as an incomplete "
+      "run (an incomplete run skips the plan-file wipe)",
+      _wh and not _inc)
+
+# Non-vacuity: the SAME drive with the hold removed MUST sweep ENTRY, or the
+# check above would pass on a pipeline where nothing was ever wired. The lever
+# is _exit_hold_list itself -- --no-entry-veil is no longer a carve-out, so it
+# cannot serve as the control any more.
+_wire2 = _Recorder()
+_real_hold = ghost._exit_hold_list
+try:
+    ghost._exit_hold_list = lambda *a, **k: []
+    _drive_stage5(_wargs, _wire2)
+finally:
+    ghost._exit_hold_list = _real_hold
+_wsrc2 = [(t["account_index"], t["src_index"])
+          for r in _wire2.rounds for t in r]
+check("WIRING control: with the hold emptied the SAME drive DOES sweep ENTRY, "
+      "so the check above is not vacuous", (3, 1) in _wsrc2)
+
+
+# ---- everything held: the run must not read as clean ---------------------
+_saved5 = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+try:
+    ghost._run_round = _Recorder()
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _BalRPC({3: {1: 2_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _hstg = os.path.join(_tf.mkdtemp(prefix="allheld_"), "tx_staging")
+    os.makedirs(_hstg, exist_ok=True)
+    with contextlib.redirect_stdout(io.StringIO()) as _hout:
+        _hr, _hf, _hs, _hh = ghost._run_exit_withdrawals(
+            _args, [3], [A1], _hstg, None, {}, (0, 0), hold=[(3, 1)])
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _saved5
+check("ALL HELD: when the held ENTRY output is the ONLY funded one the hold is "
+      "still reported, not a silent clean exit", _hh == 1 and _hr == 0)
+check("ALL HELD: ...and the operator is told nothing was withdrawn",
+      "nothing was withdrawn" in _hout.getvalue())
+
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
