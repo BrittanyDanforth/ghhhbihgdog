@@ -26,6 +26,11 @@ python3 tests/test_receive_wallet_cli.py
                                     #   covered, the repo's lowest). The gates were
                                     #   already correct -- this locks them in rather
                                     #   than fixing anything
+python3 tests/test_exit_withdraw.py  # THE EXIT: --exit-to actually spends the mixed
+                                    #   funds off the wallet, ONE TRANSACTION PER
+                                    #   OUTPUT (never a collecting sweep), to
+                                    #   validated destinations. Stage 5d used to run
+                                    #   a price valuation and move nothing
 python3 tests/test_signer_schema.py # LAST GATE BEFORE MONEY MOVES: airgap_tx_signer's
                                     #   plan validator against malformed plans. Coverage
                                     #   put the signer at 57% with 45 abort lines never

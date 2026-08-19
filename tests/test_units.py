@@ -639,8 +639,17 @@ _bc_a = open(os.path.join(REPO, "broadcast_signed_xmr")).read()
 #    integrity chain, for exactly that reason.
 check("exit: the pipeline no longer puts the amount on the child's argv",
       '"exit_strategy_simulator", str(spendable_amount)' not in _gs_a)
-check("exit: the amount is handed over in the environment instead",
-      'GS_EXIT_AMOUNT' in _gs_a and 'GS_EXIT_AMOUNT' in _exit_src)
+# The pipeline no longer SPAWNS the valuation tool at all -- stage 5d performs
+# the real withdrawal instead -- so there is no child of GhostSpiral that could
+# carry the holding size on its argv. The hazard is gone by removal rather than
+# by careful handling, which is the stronger outcome. The environment path is
+# still asserted in exit_strategy_simulator, which remains a standalone tool an
+# operator can run for a valuation.
+check("exit: the amount never reaches a child's argv (no valuation child is "
+      "spawned any more)",
+      "exit_strategy_simulator" not in code_only(os.path.join(REPO, "GhostSpiral")))
+check("exit: the standalone valuation tool still takes its amount from the "
+      "environment", 'GS_EXIT_AMOUNT' in _exit_src)
 check("exit: the positional amount is optional, so argv need never carry it",
       'nargs="?"' in _exit_src)
 # Asserted by DRIVING the tool, not by grepping for a literal. The old check

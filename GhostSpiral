@@ -44,6 +44,7 @@ from gs_common import (
     load_receive_bundle, memo_binds_destination, env_or_argv,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
+    validate_xmr_address,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -1466,6 +1467,16 @@ def build_cli() -> argparse.ArgumentParser:
                      help="Interpreter for JoinMarket's tumbler — must be the "
                           "python from JoinMarket's own virtualenv, which is "
                           "not this pipeline's interpreter")
+    # THE EXIT. Repeatable, because sending every withdrawal to ONE address
+    # hands whoever controls it the whole set -- the run separated these
+    # outputs on-chain and a single destination re-joins them off-chain, which
+    # no amount of mixing can undo. See report_holdings.
+    cli.add_argument("--exit-to", action="append", metavar="XMR_ADDRESS",
+                     help="Withdraw the mixed funds to this address when the "
+                          "mix completes, ONE TRANSACTION PER OUTPUT. Repeat "
+                          "the flag to spread the withdrawal across several "
+                          "destinations. Without it nothing is withdrawn and "
+                          "the funds stay on this wallet.")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
     cli.add_argument("--dag-mixing", action="store_true",
@@ -1974,6 +1985,35 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
     return dag_plan
 
 
+def resolve_exit_destinations(args) -> None:
+    """Validate every --exit-to address, HERE, before anything happens.
+
+    Checked at flag-parse time rather than at the withdrawal, which is hours
+    later on a peel chain. A typo found then would be found after the mix has
+    fully executed, with the operator watching an exit fail on the last step
+    of a run they cannot repeat -- and the alternative, discovering it only
+    when the wallet accepts a well-formed address nobody holds the key to, is
+    unrecoverable. There is no confirmation step and no reversal on Monero.
+
+    Duplicates are rejected too: passing the same address twice looks like a
+    request to spread the withdrawal while actually sending more of it to one
+    place, which is the opposite of what repeating the flag is for.
+    """
+    dests = getattr(args, "exit_to", None)
+    if not dests:
+        return
+    seen = set()
+    for d in dests:
+        if d in seen:
+            sys.exit(f"[!] --exit-to {scrub_address(d)} was given more than "
+                     f"once. Repeating the flag is for SPREADING the "
+                     f"withdrawal; the same address twice just sends more of "
+                     f"it to one place.")
+        seen.add(d)
+        validate_xmr_address(d, "--exit-to address")
+    integrity_log("exit", f"exit_destinations_validated:{len(dests)}")
+
+
 def resolve_hop_delay(args) -> tuple:
     """Turn --hop-delay into a window, exiting on a bad spec.
 
@@ -2185,6 +2225,7 @@ def main():
     # Purely syntactic flag validation, so a typo is reported before anything
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
+    resolve_exit_destinations(args)
 
     resolve_wallet_password(args)
     resolve_sensitive_inputs(args)
@@ -2662,7 +2703,9 @@ def main():
                                  delay_window=_delay_window,
                                  veil_file=veil_file,
                                  veil_target=(bal_account, entry_index),
-                                 veil_need=usable)
+                                 veil_need=usable,
+                                 exit_accounts=([a for a, _ in addr_index.values()]
+                                                + list(change_accounts)))
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
@@ -3374,11 +3417,153 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
             print(f"  [!] Could not securely wipe {stage}; remove it manually.")
 
 
+def _funded_subaddresses(rpc, accounts) -> list:
+    """Every (account, subaddress, atomic_balance) in `accounts` holding money.
+
+    The exit spends per SUBADDRESS, not per account, because that is the unit a
+    Monero sweep takes and because it keeps the guarantee the whole run is
+    built on: one transaction never spends two of these outputs. Reading the
+    per_subaddress breakdown (rather than assuming subaddress 1) is what makes
+    it find swept change and any dust the operator does not know about -- an
+    exit that silently leaves money behind is the same defect as a wipe that
+    silently leaves files behind.
+    """
+    found = []
+    for acct in sorted(set(int(a) for a in accounts)):
+        try:
+            bal = rpc.raw_request("get_balance", {"account_index": acct,
+                                                  "all_accounts": False}) or {}
+        except Exception:                                    # noqa: BLE001
+            continue
+        for sub in bal.get("per_subaddress", []) or []:
+            amt = int(sub.get("balance", 0) or 0)
+            if amt > 0:
+                found.append((acct, int(sub.get("address_index", 0)), amt))
+    return found
+
+
+def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
+                          delay_window=None) -> tuple:
+    """ACTUALLY SPEND THE MIXED FUNDS OUT. Returns (relayed, failed, skipped).
+
+    THIS IS THE EXIT, and it moves real value. Everything before it only
+    rearranges coins inside one wallet; until this runs, the operator still
+    holds every output the run created and nothing has left. The stage that
+    used to sit here computed a fiat valuation and printed it -- useful, but it
+    moved nothing, so the pipeline's last step was a report rather than an exit.
+
+    ONE TRANSACTION PER (ACCOUNT, SUBADDRESS), never a collecting sweep. A
+    transaction's inputs are public: spending N of these outputs together is
+    permanent proof they share an owner, and they are exactly the outputs the
+    run spent hours separating. A Monero transaction cannot spend across
+    accounts, so the wallet enforces most of this for us -- but two subaddresses
+    inside one account COULD be merged, and this refuses to.
+
+    Destinations are consumed round-robin over a SHUFFLED list, and the outputs
+    are visited in shuffled order, so neither the order money leaves nor the
+    pairing of output to destination follows the order the run created them.
+
+    Each withdrawal waits for its output to settle first: sweep_all can only
+    spend UNLOCKED outputs, so sweeping early sweeps less than everything and
+    reports success (proven on a real chain -- see _wait_for_change_settled).
+    """
+    targets = _funded_subaddresses(connect_rpc(args.rpc_primary,
+                                               proxy_url=args.tor_proxy),
+                                   accounts)
+    if not targets:
+        print("  [!] EXIT: no funded output was found on this run's accounts, "
+              "so nothing was withdrawn. If you expected funds here, do NOT "
+              "assume they are gone — check the wallet before re-running.")
+        integrity_log("exit", "no_funded_outputs")
+        return (0, 0, 0)
+
+    # `secrets`, the module-level import -- NOT `_secrets`, which is a local
+    # alias created inside main() and passed around as a parameter. Writing the
+    # local's name here parsed fine and would have raised NameError the first
+    # time a withdrawal ran. Caught by the pyflakes gate added earlier in this
+    # audit, which is the whole reason that gate exists.
+    _rng = secrets.SystemRandom()
+    _rng.shuffle(targets)
+    dest_pool = list(dests)
+    _rng.shuffle(dest_pool)
+
+    total = len(targets)
+    print(f"  [*] === EXIT: withdrawing {total} output(s) in {total} SEPARATE "
+          f"transactions to {len(dest_pool)} destination(s) ===")
+    integrity_log("exit", f"withdraw_start:{total}_outputs:{len(dest_pool)}_dests")
+
+    relayed = failed = skipped = 0
+    for n, (acct, sub, amt) in enumerate(targets, 1):
+        if shutdown_requested():
+            integrity_log("exit", f"withdraw_shutdown_at_{n}")
+            skipped = total - (n - 1)
+            print(f"  [!] EXIT interrupted: {relayed} withdrawn, {skipped} NOT "
+                  f"sent. The remainder is still on this wallet.")
+            break
+        dst = dest_pool[(n - 1) % len(dest_pool)]
+        label = f"exit {n}/{total}"
+        # Settle first, for the reason sweep_all makes unavoidable.
+        if not _wait_for_change_settled(args, acct, sub, proxy, label)[0]:
+            integrity_log("exit", f"withdraw_unsettled:{acct}/{sub}")
+            print(f"  [!] {label}: account {acct} / subaddr {sub} did not settle "
+                  f"in time, so it was NOT withdrawn. It is safe where it is.")
+            failed += 1
+            continue
+        tx = {
+            "src": f"exit(acct {acct}/sub {sub})",
+            "src_index": sub,
+            "account_index": acct,
+            "dst": dst,
+            "sweep": True,
+            "delay": hop_delay(delay_window),
+            "extra": secure_hex(16),
+        }
+        path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"
+        atomic_write_json({"meta": meta, "txs": [tx]}, path)
+        stage = f"{staging_dir}/exit{n}"
+        try:
+            newnym(required=True)
+            tor_recheck(proxy, f"exit_{n}")
+            _run_round(args, path, stage, label.capitalize())
+            _left = _change_residue(args, acct, sub)
+            if _left is None:
+                integrity_log("exit", f"withdrawn_unverified:{acct}/{sub}")
+                print(f"  [+] {label}: relayed, but the balance could not be "
+                      f"re-read to confirm account {acct} / subaddr {sub} is "
+                      f"empty. Check it yourself.")
+            elif _left > 0:
+                integrity_log("exit", f"withdraw_residual:{acct}/{sub}")
+                print(f"  [!] {label}: relayed, but "
+                      f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on "
+                      f"account {acct} / subaddr {sub} — it had not unlocked "
+                      f"when the sweep was built. Withdraw it once it unlocks.")
+            else:
+                integrity_log("exit", f"withdrawn:{acct}/{sub}")
+                print(f"  [+] {label}: account {acct} / subaddr {sub} emptied.")
+            relayed += 1
+        except SystemExit:
+            # _run_round aborts the PROCESS on a failed round. An exit is a
+            # loop over independent transactions and the rest are still
+            # withdrawable, so one failure must not strand them -- and it must
+            # not be silent either.
+            integrity_log("exit", f"withdraw_failed:{acct}/{sub}")
+            print(f"  [!] {label}: FAILED. Account {acct} / subaddr {sub} was "
+                  f"NOT withdrawn and its funds are still on this wallet.")
+            failed += 1
+        finally:
+            secure_delete_file(path)
+            _es = Path(stage)
+            if _es.is_dir() and not secure_delete_tree(_es):
+                print(f"  [!] Could not securely wipe {stage}; remove it manually.")
+    integrity_log("exit", f"withdraw_done:{relayed}_of_{total}:failed={failed}")
+    return (relayed, failed, skipped)
+
+
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
                 change_target=(0, 0), change_sweep_jobs=None,
                 delay_window=None, veil_file=None, veil_target=None,
-                veil_need=None):
+                veil_need=None, exit_accounts=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -3484,30 +3669,40 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     newnym()
     secure_delay(5.0, 15.0)
 
-    try:
-        print("  [*] Stage 5d: Off-ramp reference (no XMR is moved here)...")
-        # The amount goes in the ENVIRONMENT, never on argv. A command line is
-        # world-readable through /proc/<pid>/cmdline (0444); the environment is
-        # owner-only (0400). Putting the total on a command line told every
-        # local account the size of the holding being off-ramped -- the same
-        # exposure this pipeline refuses for the wallet password, and the same
-        # value it deliberately keeps out of the integrity chain.
-        _exit_env = _child_env()
-        _exit_env["GS_EXIT_AMOUNT"] = str(spendable_amount)
-        subprocess.run(
-            [sys.executable, _tool("exit_strategy_simulator"),
-             "--method", "bisq", "--tor-proxy", args.tor_proxy],
-            check=True, timeout=300,
-            env=_exit_env,          # no password needed; amount passed here
-        )
-        integrity_log("stage5", "exit_sim_ok")
-    except Exception as e:
-        integrity_log("stage5", f"exit_sim_warn:{str(e)[:40]}")
-        # Non-fatal on purpose: this step moves no money, so its failure
-        # cannot leave the mix half-executed. Say that, rather than letting a
-        # bare "failed" read as a lost exit.
-        print(f"  [!] Off-ramp reference failed (non-fatal — no XMR moved, the "
-              f"mix is unaffected): {e}")
+    # -- Stage 5d: THE EXIT. This is the step that moves value off this wallet.
+    #
+    # It used to run exit_strategy_simulator, which fetches a price and prints
+    # a valuation. That is a report, not an exit: every output the run created
+    # was still sitting on this wallet when the pipeline announced it was
+    # complete. The exit is the withdrawal, so the withdrawal is what runs here.
+    #
+    # It is opt-in through --exit-to because a withdrawal needs a destination
+    # and there is no safe default for one. When it is not given, say so
+    # plainly -- an operator who thinks the pipeline exited when it did not is
+    # exactly the confusion the old step created.
+    if getattr(args, "exit_to", None):
+        try:
+            with open(fanout_file) as _ef:
+                _exit_meta = json.load(_ef).get("meta", {})
+        except Exception:                                    # noqa: BLE001
+            _exit_meta = {}
+        _relayed, _failed, _skipped = _run_exit_withdrawals(
+            args, exit_accounts or [], args.exit_to, staging_dir, proxy,
+            _exit_meta, delay_window)
+        if _failed or _skipped:
+            incomplete.append(
+                f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
+                f"were NOT sent — that value is still on this wallet")
+        elif _relayed:
+            print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
+                  f"its own transaction. Nothing left on this run's accounts.")
+    else:
+        integrity_log("exit", "no_exit_to:not_withdrawn")
+        print("  [*] Stage 5d: NO EXIT PERFORMED — --exit-to was not given, so "
+              "the mixed funds are still on this wallet. They are yours and "
+              "they are safe; they have simply not left. Re-run with "
+              "--exit-to <address> (repeatable) to withdraw them, and read the "
+              "holdings note below before spending them by hand.")
 
     # Every round wipes its OWN staging subdir, which leaves the parent behind
     # as an empty directory. It holds nothing, but its existence and mtime date

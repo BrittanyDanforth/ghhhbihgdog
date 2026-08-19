@@ -35,9 +35,15 @@ What IS real, and why each is allowed to stay:
     UNCONFIRMED unless the operator passes --fee-pct with the rate their
     venue actually quoted. The net is marked with which of the two it used.
 
-This tool moves NO XMR, contacts no venue, and places no order. The exit
-itself is manual, and report_holdings in GhostSpiral carries the rule that
-matters when performing it: spend the accounts one at a time.
+THIS TOOL IS NOT THE EXIT, and it is no longer wired in as one. It moves no
+XMR, contacts no venue and places no order; it reports what a holding is worth
+at a live rate. GhostSpiral used to run it as "Stage 5d: exit strategy", which
+made a valuation look like a withdrawal -- the pipeline announced completion
+while every output it had created was still sitting on the operator's wallet.
+
+The actual exit is GhostSpiral's --exit-to, which withdraws the mixed funds
+one transaction per output. This is a standalone reference the operator can
+run whenever they want a valuation.
 
 OPSEC hardening:
   - Tor verified before any API access

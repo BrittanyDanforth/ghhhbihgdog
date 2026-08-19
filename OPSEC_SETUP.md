@@ -222,8 +222,13 @@ consensus, six mix outputs in one account:
 A transaction's inputs are public. Spending six outputs together is permanent
 proof that all six have one owner — no ring analysis, the input count is right
 there — and those six are exactly what the peel chain spent six transactions
-and several hours separating. The off-ramp planner does not help with this: it
-plans *where* to sell, not how to spend.
+and several hours separating.
+
+`--exit-to <address>` performs the withdrawal for you, **one transaction per
+output**, so the merge never happens by accident. Repeat the flag to spread the
+withdrawal across several destinations. Without it nothing is withdrawn and the
+funds simply stay on the wallet — the run tells you so rather than implying it
+exited.
 
 Every output the run creates now lives in **its own account**. That makes the
 merge impossible rather than merely discouraged, because a Monero transaction
@@ -235,8 +240,14 @@ than reasoning about it.
 
 What this does **not** solve: sending all six to one exchange deposit address
 tells that exchange they are yours. That is a custodial link, not a chain
-link, and no on-chain structure can remove it — it is what the off-ramp
-planner's split-across-venues guidance is for.
+link, and no on-chain structure can remove it — which is why `--exit-to` is
+repeatable, and why splitting across venues and over time is the operator's
+call rather than something the software can do for them.
+
+`exit_strategy_simulator` is a **standalone valuation reference**, not the
+exit. It fetches a live price and reports what a holding is worth; it moves no
+XMR, contacts no venue and places no order, and the pipeline no longer runs it.
+The exit is `--exit-to`.
 
 **Create the offline spend wallet with a large subaddress lookahead.** A
 Monero wallet only derives subaddresses for a bounded number of accounts — 50

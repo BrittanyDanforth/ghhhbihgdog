@@ -126,6 +126,56 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     return h
 
 
+#: Standard Monero address: 95 chars, base58 (no 0OIl), 4/8 mainnet prefix.
+#: Integrated (106) and subaddress forms are deliberately NOT matched loosely
+#: here -- see validate_xmr_address.
+XMR_ADDR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+
+
+def validate_xmr_address(addr: str, what: str = "XMR address") -> None:
+    """Abort unless `addr` is a well-formed Monero address WITH a valid checksum.
+
+    Format alone is not enough and never was. Base58 addresses carry a
+    four-byte checksum precisely because a transposed or mistyped character
+    produces a string that still looks like an address; the regex accepts it
+    and the money goes to a key nobody holds. That is unrecoverable in a way
+    almost nothing else in this toolchain is -- there is no confirmation step
+    and no reversal -- so the checksum is verified, not assumed.
+
+    Shared because the withdrawal destination needs exactly the check the swap
+    destination already had. thor_swap_preparer validated its --dest and
+    GhostSpiral had nothing for --exit-to, which is the address the ENTIRE
+    mixed balance is sent to.
+    """
+    if not isinstance(addr, str) or not XMR_ADDR_RE.match(addr):
+        sys.exit(f"[!] Bad {what} format: {scrub_address(str(addr))}")
+    # monero.address.address(), the FACTORY -- not the Address CLASS.
+    #
+    # Address() accepts only STANDARD addresses: it raises "Invalid address
+    # netbyte 42" on a subaddress, and 42 is the mainnet subaddress netbyte.
+    # Every address this toolchain hands around is a subaddress --
+    # create_receive_wallet mints one for the receive, and an exchange deposit
+    # address is normally one too -- so validating with the class rejected the
+    # ordinary case while reporting it as "checksum invalid", which points the
+    # operator at the one thing that is not wrong.
+    #
+    # Measured against a real subaddress from a live wallet: address() returns
+    # SubAddress, Address() raises. The factory also covers integrated
+    # addresses, which carry a payment ID and are equally legitimate here.
+    try:
+        from monero.address import address as _xmr_address
+    except ImportError:
+        sys.exit(f"[!] python-monero is missing, so the {what} CHECKSUM cannot "
+                 f"be verified (pip install monero). Refusing to send to an "
+                 f"unverified address.")
+    try:
+        _xmr_address(addr)
+    except Exception:                                        # noqa: BLE001
+        sys.exit(f"[!] {what} checksum invalid: {scrub_address(addr)}. A "
+                 f"mistyped character passes the format check but not this "
+                 f"one, and funds sent there are unrecoverable.")
+
+
 def decimal_arg(text: str) -> Decimal:
     """argparse `type=` for a numeric amount. Use instead of type=Decimal.
 

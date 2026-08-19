@@ -39,6 +39,7 @@ from gs_common import (
     bech32_checksum_ok, secure_delete_file, secure_write_text,
     load_receive_bundle, memo_binds_destination, env_or_argv,
     btc_per_xmr_oracle, quote_deviation, decimal_arg,
+    validate_xmr_address,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -178,20 +179,22 @@ def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
 
 
 def _validate_xmr_addr(addr: str) -> None:
-    """Validate XMR address format and checksum."""
-    if not _XMR_RE.match(addr):
-        sys.exit(f"[!] Bad XMR address format: {scrub_address(addr)}")
-    # Lazy import: only the actual checksum validation needs python-monero, so
-    # --help / arg parsing still work without the (heavy) dependency installed.
-    try:
-        from monero.address import Address as XMRAddress
-    except ImportError:
-        sys.exit("[!] python-monero missing - pip install monero "
-                 "(required to validate the XMR address checksum)")
-    try:
-        XMRAddress(addr)
-    except Exception:
-        sys.exit(f"[!] XMR checksum invalid: {scrub_address(addr)}")
+    """Validate an XMR destination. Delegates to the shared checker.
+
+    THIS REJECTED EVERY SUBADDRESS, which broke this repo's own documented
+    money-in flow. It validated with monero.address.Address, the STANDARD
+    address class, which raises "Invalid address netbyte 42" on a subaddress --
+    and create_receive_wallet mints a SUBADDRESS, so
+    `--dest-from-receive-wallet` fed this function an address it always
+    refused. The operator saw "XMR checksum invalid" naming the one thing that
+    was not wrong.
+
+    gs_common.validate_xmr_address uses the address() FACTORY, which accepts
+    standard, sub and integrated addresses and still verifies the checksum.
+    Shared rather than re-fixed here, because the withdrawal destination needs
+    exactly the same check and two copies is how they came to disagree.
+    """
+    validate_xmr_address(addr, "XMR address")
 
 
 def main():
