@@ -19,7 +19,14 @@ python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-d
                                     #   submit-time hash re-verify, resume/progress
                                     #   migration, manifest trust boundary
 python3 tests/test_gapfixes.py      # paranoia_mode MAC-spoof restore + MAC-not-logged,
-                                    #   exit_strategy_simulator --redact
+                                    #   exit_strategy_simulator --redact and its
+                                    #   de-simulation (no invented liquidity/slippage)
+python3 tests/test_signer_schema.py # LAST GATE BEFORE MONEY MOVES: airgap_tx_signer's
+                                    #   plan validator against malformed plans. Coverage
+                                    #   put the signer at 57% with 45 abort lines never
+                                    #   executed; driving them found that an INFINITE
+                                    #   amount was accepted (Decimal("Infinity") <= 0
+                                    #   is False, so it passed the positivity test)
 python3 tests/test_swap_receive.py  # MONEY PATH: the swap memo must name your own
                                     #   XMR address, catastrophic slippage must
                                     #   abort, and the receive subaddress must be

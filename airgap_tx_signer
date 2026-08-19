@@ -117,7 +117,22 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                 if not isinstance(d.get("address"), str):
                     sys.exit(f"[!] TX {i} dest {j}: 'address' missing or wrong type")
                 try:
-                    if Decimal(str(d.get("amount"))) <= 0:
+                    _amt = Decimal(str(d.get("amount")))
+                    # is_finite FIRST. Decimal("Infinity") <= 0 is False, so an
+                    # infinite amount passed the positivity test and was
+                    # ACCEPTED into a plan that builds real transactions.
+                    # ("NaN" was already caught, but only by accident: comparing
+                    # NaN raises InvalidOperation and landed in the except.)
+                    # This file's siblings already ruled on exactly this --
+                    # exit_strategy_simulator rejects both by name, and
+                    # gs_common.decimal_arg now does it at every CLI boundary --
+                    # so the one component that turns a plan into a signed spend
+                    # was the last place it could still get through.
+                    if not _amt.is_finite():
+                        sys.exit(f"[!] TX {i} dest {j}: amount is not finite "
+                                 f"({d.get('amount')!r}); 'NaN' and 'Infinity' "
+                                 f"parse as Decimals but are not amounts.")
+                    if _amt <= 0:
                         sys.exit(f"[!] TX {i} dest {j}: amount must be positive")
                 except Exception:
                     sys.exit(f"[!] TX {i} dest {j}: amount not parsable: {d.get('amount')}")
@@ -126,7 +141,14 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                 if not isinstance(tx.get(k), str):
                     sys.exit(f"[!] Schema error at TX {i}: field '{k}' missing or wrong type")
             try:
-                if Decimal(tx["amt"]) <= 0:
+                _amt = Decimal(tx["amt"])
+                # See the destinations branch above: Infinity is finite-looking
+                # to a `<= 0` test and was accepted.
+                if not _amt.is_finite():
+                    sys.exit(f"[!] Amount is not finite at TX {i}: {tx['amt']!r}; "
+                             f"'NaN' and 'Infinity' parse as Decimals but are "
+                             f"not amounts.")
+                if _amt <= 0:
                     sys.exit(f"[!] Amount must be positive at TX {i}: {tx['amt']}")
             except Exception:
                 sys.exit(f"[!] Amount not parsable at TX {i}: {tx['amt']}")
