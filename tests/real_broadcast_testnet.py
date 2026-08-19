@@ -29,6 +29,11 @@ for b in ("monerod", "monero-wallet-rpc", "monero-wallet-cli"):
         print(f"SKIP: {b} not on PATH (install monero to run this test)")
         sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -46,6 +51,7 @@ airgap = load("airgap_tx_signer")
 bcast = load("broadcast_signed_xmr")       # <-- the SHIPPED relay loop
 
 BASE = tempfile.mkdtemp(prefix="rb_")
+lab = MoneroLab(BASE, 30101, 30103)
 DR = "http://127.0.0.1:30101"; D = DR + "/json_rpc"
 WBASE = "http://127.0.0.1:30103"; WR = WBASE + "/json_rpc"
 
@@ -60,21 +66,11 @@ def check(name, cond):
         FAIL += 1; FAILURES.append(name); print(f"  FAIL {name}")
 
 
-def dj(m, p=None):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(D, json=b, timeout=40).json()
+dj = lab.dj
 
+draw = lab.draw
 
-def draw(path, body=None):
-    return requests.post(DR + path, json=body or {}, timeout=40).json()
-
-
-def wj(m, p=None, t=120):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
-
+wj = lab.wj
 
 def pool_size():
     r = draw("/get_transaction_pool")
@@ -133,29 +129,7 @@ def run_broadcast(path, progfile, extra=()):
 
 result = "INCOMPLETE"
 try:
-    L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30101", "--p2p-bind-port", "30100",
-       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-       "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None:
-                break
-        except Exception:
-            pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30101", "--trusted-daemon",
-       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30103", "--rpc-bind-ip", "127.0.0.1",
-       "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"],
-      os.path.join(BASE, "w.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"):
-                break
-        except Exception:
-            pass
-
+    lab.start()
     step("1. fund a FULL wallet on the isolated testnet")
     wj("create_wallet", {"filename": "full", "password": "", "language": "English"})
     faddr = wj("get_address", {"account_index": 0})["result"]["address"]
@@ -196,7 +170,7 @@ try:
                                 "dst": faddr, "amt": "0.3", "delay": 0}]}, f)
     shim = os.path.join(BASE, "wcli-testnet")
     with open(shim, "w") as f:
-        f.write('#!/bin/sh\nexec monero-wallet-cli --testnet --offline "$@"\n')
+        f.write('#!/bin/sh\nexec monero-wallet-cli --offline "$@"\n')
     os.chmod(shim, 0o755)
     os.chdir(BASE)
     airgap.phase_sign(Args(outdir=outdir, wallet_cli=shim,
@@ -275,14 +249,7 @@ try:
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
     os.chdir("/")
-    for p in procs:
-        try:
-            p.terminate(); p.wait(timeout=10)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
+    lab.stop()
     shutil.rmtree(BASE, ignore_errors=True)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

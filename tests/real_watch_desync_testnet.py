@@ -30,6 +30,11 @@ for b in ("monerod", "monero-wallet-rpc"):
     if shutil.which(b) is None:
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -46,21 +51,16 @@ import gs_common
 
 BASE = tempfile.mkdtemp(prefix="wdesync_")
 DPORT, WPORT = 31681, 31683
-DR = f"http://127.0.0.1:{DPORT}"
-WR = f"http://127.0.0.1:{WPORT}/json_rpc"
+lab = MoneroLab(BASE, DPORT, WPORT)
+DR = lab.DR
+WR = lab.WR
 procs = {}
 
 
-def dj(m, p=None):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(DR + "/json_rpc", json=b, timeout=40).json()
+# The suite's helpers, pointed at the lab. Assertions unchanged.
+dj = lab.dj
+wj = lab.wj
 
-
-def wj(m, p=None, t=180):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
 
 
 PASS = 0; FAIL = 0; FAILS = []
@@ -79,31 +79,8 @@ class Clock:
 
 result = "INCOMPLETE"
 try:
-    procs["d"] = subprocess.Popen(
-        ["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-         "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", str(DPORT),
-         "--p2p-bind-port", str(DPORT - 1), "--no-igd", "--hide-my-port",
-         "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"],
-        stdout=open(os.path.join(BASE, "d.out"), "w"), stderr=subprocess.STDOUT)
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-
-    procs["w"] = subprocess.Popen(
-        ["monero-wallet-rpc", "--testnet", "--daemon-address", f"127.0.0.1:{DPORT}",
-         "--trusted-daemon", "--wallet-dir", os.path.join(BASE, "w"),
-         "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
-         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"),
-         "--log-level", "0"],
-        stdout=open(os.path.join(BASE, "w.out"), "w"), stderr=subprocess.STDOUT)
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
+    lab.start()
+    procs["d"] = lab.daemon_proc
 
     wj("create_wallet", {"filename": "d", "password": "", "language": "English"})
     PRIMARY = wj("get_address", {"account_index": 0})["result"]["address"]
@@ -111,29 +88,27 @@ try:
     RECV, RIDX = sub["address"], sub["address_index"]
 
     # Mine so the wallet has a real balance and a real, advancing scan height.
-    target = dj("get_info")["result"]["height"] + 80
-    requests.post(DR + "/start_mining", json={
-        "miner_address": PRIMARY, "threads_count": 2,
-        "do_background_mining": False, "ignore_battery": True}, timeout=40)
-    while dj("get_info")["result"]["height"] < target:
-        time.sleep(2)
-    requests.post(DR + "/stop_mining", json={}, timeout=40)
-    wj("refresh")
+    # generateblocks, not start_mining: /stop_mining is asynchronous, so blocks
+    # keep landing after it returns -- and this suite's whole subject is a scan
+    # height that STOPS. A chain still producing blocks in the background is
+    # the one thing that would make it prove nothing.
+    lab.gen(PRIMARY, 100)
 
     # Pay the watched subaddress a small, deliberately SHORT amount, so the
     # watch is genuinely below its floor either way and the only thing that can
     # change the verdict is whether the wallet keeps scanning.
-    wj("transfer", {"destinations": [{"amount": int(Decimal("0.5") * 10**12),
-                                      "address": RECV}],
-                    "account_index": 0, "get_tx_key": False}, t=240)
-    tgt = dj("get_info")["result"]["height"] + 15
-    requests.post(DR + "/start_mining", json={
-        "miner_address": PRIMARY, "threads_count": 2,
-        "do_background_mining": False, "ignore_battery": True}, timeout=40)
-    while dj("get_info")["result"]["height"] < tgt:
-        time.sleep(2)
-    requests.post(DR + "/stop_mining", json={}, timeout=40)
-    wj("refresh")
+    _fund = int(wj("get_balance", {"account_index": 0})["result"]["unlocked_balance"])
+    if _fund <= 0:
+        raise SystemExit(f"[!] setup: nothing unlocked after mining 100 blocks "
+                         f"(coinbase lock is 60). Cannot fund the watch.")
+    _pay = wj("transfer", {"destinations": [{"amount": int(Decimal("0.5") * 10**12),
+                                             "address": RECV}],
+                           "account_index": 0, "get_tx_key": False}, t=240)
+    if "error" in _pay:
+        raise SystemExit(f"[!] setup: the short payment failed: {_pay['error']}. "
+                         f"The suite would otherwise run against a zero balance "
+                         f"and report which verdict it got, proving nothing.")
+    lab.gen(PRIMARY, 15)
 
     rpc = gs_common.connect_rpc(f"http://127.0.0.1:{WPORT}")
     tot, unl = rpc.get_subaddress_balance(account_index=0, address_index=RIDX)
@@ -145,16 +120,20 @@ try:
           isinstance(h_live, int) and h_live > 0)
 
     # ---- (A) daemon ALIVE, balance short and static -> a REAL shortfall -----
-    # Mine in the background so the wallet's height genuinely advances during
-    # the watch, exactly as it would on a live chain.
-    requests.post(DR + "/start_mining", json={
-        "miner_address": PRIMARY, "threads_count": 1,
-        "do_background_mining": False, "ignore_battery": True}, timeout=40)
+    # The wallet's height must genuinely advance during the watch, exactly as
+    # it would on a live chain -- that is the ONLY difference between run A and
+    # run B, so if it does not happen this suite proves nothing.
+    #
+    # This used background start_mining plus a real 2s sleep per tick and hoped
+    # blocks landed. Generating one block per tick makes the premise a fact
+    # rather than a race, which matters here more than anywhere: the premises
+    # are asserted below, and a flaky premise turns a real regression into an
+    # intermittent one.
     clk = Clock()
 
     def sleep_a(_s):
         clk.t += 600            # jump the virtual clock past the stall window
-        time.sleep(2)           # real time, so blocks actually get mined
+        lab.gen(PRIMARY, 1)     # ...and the chain really advances
         try: wj("refresh")
         except Exception: pass
 

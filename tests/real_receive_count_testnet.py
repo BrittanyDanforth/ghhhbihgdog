@@ -31,6 +31,11 @@ for b in ("monerod", "monero-wallet-rpc"):
     if shutil.which(b) is None:
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -47,23 +52,16 @@ thor = load("thor_swap_preparer")        # the SHIPPED resolver
 import gs_common
 
 BASE = tempfile.mkdtemp(prefix="recvcnt_")
+lab = MoneroLab(BASE, 30191, 30193)
 DR = "http://127.0.0.1:30191"
 WPORT = 30193
 WR = f"http://127.0.0.1:{WPORT}/json_rpc"
 procs = []
 
 
-def dj(m, p=None):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(DR + "/json_rpc", json=b, timeout=40).json()
+dj = lab.dj
 
-
-def wj(m, p=None, t=180):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
-
+wj = lab.wj
 
 def Lp(cmd, log):
     procs.append(subprocess.Popen(cmd, stdout=open(log, "w"),
@@ -81,29 +79,7 @@ def check(name, cond):
 
 result = "INCOMPLETE"
 try:
-    Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30191",
-        "--p2p-bind-port", "30190", "--no-igd", "--hide-my-port",
-        "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"],
-       os.path.join(BASE, "d.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30191",
-        "--trusted-daemon", "--wallet-dir", os.path.join(BASE, "w"),
-        "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
-        "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"),
-        "--log-level", "0"], os.path.join(BASE, "w.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     wj("create_wallet", {"filename": "rc", "password": "", "language": "English"})
     PRIMARY = wj("get_address", {"account_index": 0})["result"]["address"]
     print(f"  wallet primary = ...{PRIMARY[-8:]}")
@@ -190,13 +166,7 @@ try:
 
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
-    for p in procs:
-        try: p.terminate()
-        except Exception: pass
-    time.sleep(1)
-    for p in procs:
-        try: p.kill()
-        except Exception: pass
+    lab.stop()
     shutil.rmtree(BASE, ignore_errors=True)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

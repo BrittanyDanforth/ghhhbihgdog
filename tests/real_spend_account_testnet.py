@@ -28,6 +28,11 @@ for b in ("monerod", "monero-wallet-rpc"):
     if shutil.which(b) is None:
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
@@ -42,26 +47,17 @@ def load(name):
 ghost = load("GhostSpiral")
 
 BASE = tempfile.mkdtemp(prefix="spendacct_")
+lab = MoneroLab(BASE, 30231, 30233)
 DR = "http://127.0.0.1:30231"; D = DR + "/json_rpc"; WP = 30233
 WR = f"http://127.0.0.1:{WP}/json_rpc"
 A = Decimal(10) ** 12
 
 
-def dj(m, p=None):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(D, json=b, timeout=60).json()
+dj = lab.dj
 
+draw = lab.draw
 
-def draw(p, b=None):
-    return requests.post(DR + p, json=b or {}, timeout=60).json()
-
-
-def wj(m, p=None, t=300):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
-
+wj = lab.wj
 
 procs = []
 
@@ -70,14 +66,7 @@ def Lp(c, l):
     procs.append(subprocess.Popen(c, stdout=open(l, "w"), stderr=subprocess.STDOUT))
 
 
-def mine(a, n):
-    t = dj("get_info")["result"]["height"] + n
-    draw("/start_mining", {"miner_address": a, "threads_count": 2,
-                           "do_background_mining": False, "ignore_battery": True})
-    while dj("get_info")["result"]["height"] < t:
-        time.sleep(2)
-    draw("/stop_mining"); wj("refresh")
-
+mine = lab.gen
 
 PASS = 0; FAIL = 0; FAILS = []
 
@@ -116,26 +105,7 @@ class A_:
 
 result = "INCOMPLETE"
 try:
-    Lp(["monerod", "--testnet", "--offline", "--data-dir", BASE + "/n",
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30231",
-        "--p2p-bind-port", "30230", "--no-igd", "--hide-my-port",
-        "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-        "--log-file", BASE + "/d.log", "--log-level", "0"], BASE + "/d.out")
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30231",
-        "--trusted-daemon", "--wallet-dir", BASE + "/w", "--rpc-bind-port", str(WP),
-        "--rpc-bind-ip", "127.0.0.1", "--disable-rpc-login",
-        "--log-file", BASE + "/w.log", "--log-level", "0"], BASE + "/w.out")
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     wj("create_wallet", {"filename": "s", "password": "", "language": "English"})
     primary = wj("get_address", {"account_index": 0})["result"]["address"]
     mine(primary, 90)
@@ -294,11 +264,7 @@ try:
 
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
-    for p in procs:
-        try: p.terminate(); p.wait(timeout=10)
-        except Exception:
-            try: p.kill()
-            except Exception: pass
+    lab.stop()
     shutil.rmtree(BASE, ignore_errors=True)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

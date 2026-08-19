@@ -24,7 +24,13 @@ for b in ("monerod", "monero-wallet-rpc", "monero-wallet-cli"):
         print(f"SKIP: {b} not on PATH (install monero to run this real round-trip test)")
         sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 BASE = tempfile.mkdtemp(prefix="rt_")
+lab = MoneroLab(BASE, 30211, 30213)
 DR = "http://127.0.0.1:30211"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30213/json_rpc"
 
 def dj(m, p=None):
@@ -32,9 +38,7 @@ def dj(m, p=None):
     return requests.post(D, json=b, timeout=40).json()
 def draw(path, body=None):
     return requests.post(DR + path, json=body or {}, timeout=40).json()
-def wj(m, p=None, t=120):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}; b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
+wj = lab.wj
 
 procs = []
 def L(cmd, log):
@@ -43,24 +47,7 @@ def step(s): print("\n===", s, "===")
 
 result = "INCOMPLETE"
 try:
-    L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30211", "--p2p-bind-port", "30210",
-       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-       "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30211", "--trusted-daemon",
-       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30213", "--rpc-bind-ip", "127.0.0.1",
-       "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"], os.path.join(BASE, "w.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     step("1. create + fund FULL wallet (mine on isolated testnet)")
     wj("create_wallet", {"filename": "full", "password": "", "language": "English"})
     faddr = wj("get_address", {"account_index": 0})["result"]["address"]
@@ -90,7 +77,7 @@ try:
     open(os.path.join(work, "unsigned_monero_tx"), "wb").write(bytes.fromhex(uts))
     password = ""
     p = subprocess.run(
-        ["monero-wallet-cli", "--testnet", "--offline", "--wallet-file", os.path.join(BASE, "w", "full"),
+        ["monero-wallet-cli", "--offline", "--wallet-file", os.path.join(BASE, "w", "full"),
          "--password", password, "--command", "sign_transfer"],
         input=f"{password}\n" + "y\n" * 3,   # phase_sign's password-first fix
         capture_output=True, text=True, timeout=90, cwd=work)
@@ -116,11 +103,7 @@ try:
     assert on_chain and in_pool is False, "tx not confirmed on-chain"
     result = "SUCCESS"
 finally:
-    for p in procs:
-        try: p.send_signal(signal.SIGTERM); p.wait(timeout=8)
-        except Exception:
-            try: p.kill()
-            except Exception: pass
+    lab.stop()
     shutil.rmtree(BASE, ignore_errors=True)
 
 print("\n>>> REAL COLD-SIGNING ROUND-TRIP:", result)

@@ -12,7 +12,13 @@ for b in ("monerod", "monero-wallet-rpc"):
     if shutil.which(b) is None:
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 BASE = tempfile.mkdtemp(prefix="dag_")
+lab = MoneroLab(BASE, 30111, 30113)
 DR = "http://127.0.0.1:30111"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30113/json_rpc"
 def dj(m, p=None):
     b = {"jsonrpc": "2.0", "id": "0", "method": m}; b.update({"params": p} if p is not None else {})
@@ -38,24 +44,7 @@ def check(name, cond):
     else: FAIL += 1; FAILS.append(name); print("  FAIL:", name)
 
 try:
-    Lp(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-        "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30111", "--p2p-bind-port", "30110",
-        "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-        "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-    Lp(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30111", "--trusted-daemon",
-        "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30113", "--rpc-bind-ip", "127.0.0.1",
-        "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"], os.path.join(BASE, "w.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     wj("create_wallet", {"filename": "w", "password": "", "language": "English"})
     primary = wj("get_address", {"account_index": 0})["result"]["address"]
     mine(primary, 85)

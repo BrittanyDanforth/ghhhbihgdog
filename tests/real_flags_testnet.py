@@ -12,7 +12,13 @@ for b in ("monerod", "monero-wallet-rpc", "monero-wallet-cli"):
     if shutil.which(b) is None:
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
+import os as _os, sys as _sys                              # noqa: E402
+_sys.path.insert(0, _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tests"))
+from monerolab import MoneroLab                              # noqa: E402
+
 BASE = tempfile.mkdtemp(prefix="rf_")
+lab = MoneroLab(BASE, 30131, 30133)
 DR = "http://127.0.0.1:30131"; D = DR + "/json_rpc"; WR = "http://127.0.0.1:30133/json_rpc"
 PW = "s3cret"   # non-empty wallet password, exercised through sign_transfer
 
@@ -20,9 +26,7 @@ def dj(m, p=None):
     b = {"jsonrpc": "2.0", "id": "0", "method": m}; b.update({"params": p} if p is not None else {})
     return requests.post(D, json=b, timeout=40).json()
 def draw(path, body=None): return requests.post(DR + path, json=body or {}, timeout=40).json()
-def wj(m, p=None, t=120):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}; b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
+wj = lab.wj
 
 procs = []
 def L(cmd, log): procs.append(subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT))
@@ -34,24 +38,7 @@ def check(name, cond):
     else: FAIL += 1; FAILS.append(name); print("  FAIL:", name)
 
 try:
-    L(["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "node"),
-       "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", "30131", "--p2p-bind-port", "30130",
-       "--no-igd", "--hide-my-port", "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-       "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"], os.path.join(BASE, "d.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-    L(["monero-wallet-rpc", "--testnet", "--daemon-address", "127.0.0.1:30131", "--trusted-daemon",
-       "--wallet-dir", os.path.join(BASE, "w"), "--rpc-bind-port", "30133", "--rpc-bind-ip", "127.0.0.1",
-       "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"), "--log-level", "0"], os.path.join(BASE, "w.out"))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     step("fund PASSWORD-PROTECTED full wallet")
     wj("create_wallet", {"filename": "full", "password": PW, "language": "English"})
     faddr = wj("get_address", {"account_index": 0})["result"]["address"]
@@ -78,14 +65,22 @@ try:
         fees[pr] = fee
         print(f"  priority {pr}: unsigned_txset len {len(uts)}, fee {fee}")
         check(f"fp{pr}:unsigned_txset", bool(uts))
-    # Fee behavior is FORK-dependent. This isolated testnet sits at an early fork
-    # where per-priority fees are not monotonic (observed 2/4/6/2). What matters
-    # for the pipeline: every priority is accepted and yields a valid unsigned tx,
-    # and they are not all identical. Mainnet's monotonic per-priority fees[]
-    # (1.2M/4.7M/19M/240M) is verified separately via get_fee_estimate -- see
-    # REAL_MONERO_VERIFICATION.md -- which is exactly why fetch_fee_from_daemon
-    # reads the daemon's fees[] rather than assuming a fixed multiplier table.
+    # Fee behaviour is FORK-dependent, and this suite used to run on a chain at
+    # hard fork v1, where the per-priority fees are not monotonic (observed
+    # 2/4/6/2). The assertion was weakened to ">=2 distinct fees" to survive
+    # that -- i.e. the environment was wrong and the test was relaxed to match
+    # it, which is the wrong way round.
+    #
+    # On current consensus they ARE monotonic (measured here: 2.6M / 10.2M /
+    # 41.2M / 521M), so assert what the pipeline actually depends on:
+    # fee_priority selects a strictly higher fee. fetch_fee_from_daemon reads
+    # the daemon's fees[] rather than a fixed multiplier table, and this is the
+    # property that makes that reading meaningful.
+    _ordered = [fees[k] for k in sorted(fees)]
     check("fee-priority yields >=2 distinct fees", len(set(fees.values())) >= 2)
+    check("fee-priority is STRICTLY MONOTONIC on current consensus "
+          f"({'/'.join(str(f) for f in _ordered)})",
+          all(_ordered[i] < _ordered[i + 1] for i in range(len(_ordered) - 1)))
 
     step("MULTI-DEST FAN-OUT round-trip (3 outputs) with password-protected signing")
     dests = [wj("create_address", {"account_index": 0})["result"]["address"] for _ in range(3)]
@@ -99,7 +94,7 @@ try:
     open(os.path.join(work, "unsigned_monero_tx"), "wb").write(bytes.fromhex(uts))
     # phase_sign with a NON-EMPTY password: password-first stdin
     p = subprocess.run(
-        ["monero-wallet-cli", "--testnet", "--offline", "--wallet-file", os.path.join(BASE, "w", "full"),
+        ["monero-wallet-cli", "--offline", "--wallet-file", os.path.join(BASE, "w", "full"),
          "--password", PW, "--command", "sign_transfer"],
         input=f"{PW}\n" + "y\n" * 3, capture_output=True, text=True, timeout=90, cwd=work)
     signed = os.path.join(work, "signed_monero_tx")

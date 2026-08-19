@@ -67,8 +67,16 @@ class MoneroLab:
         """Daemon non-json_rpc endpoint, e.g. /get_transactions."""
         return requests.post(self.DR + path, json=body or {}, timeout=180).json()
 
-    def wj(self, method, params=None, timeout=600):
-        """Wallet json_rpc."""
+    def wj(self, method, params=None, timeout=600, t=None):
+        """Wallet json_rpc.
+
+        `t` is accepted as an alias for `timeout` because the suites this
+        replaced defined `wj(m, p=None, t=120)`. Keeping the alias is what
+        lets their call sites -- and therefore their assertions -- stay
+        untouched while the chain underneath them changes.
+        """
+        if t is not None:
+            timeout = t
         body = {"jsonrpc": "2.0", "id": "0", "method": method}
         if params is not None:
             body["params"] = params
@@ -101,6 +109,38 @@ class MoneroLab:
                 raise RuntimeError(f"generateblocks failed: {r['error']}")
             left -= step
         self.wj("refresh")
+
+    def mine(self, address, target_height):
+        """Mine until the chain reaches `target_height`. Drop-in for the
+        `mine(addr, target)` helper the older suites define.
+
+        They used start_mining and polled: that overshoots by however many
+        blocks land before the stop request is seen, which is enough to make a
+        locked-output test inconclusive. It also does not work here at all --
+        current consensus mines with RandomX, and this environment cannot
+        allocate its cache. generateblocks is exact and instant.
+        """
+        have = self.height()
+        if target_height > have:
+            self.gen(address, target_height - have)
+        else:
+            self.wj("refresh")
+
+    def bind(self, namespace):
+        """Point a suite's dj/draw/wj/mine helpers at this lab.
+
+        The suites were written around module-level helper functions and a
+        hand-rolled launch block. Rebinding them is what lets the SUITE's
+        assertions stay exactly as they were while the chain underneath them
+        changes from hard fork v1 to current consensus -- which is the whole
+        point: if an assertion only held because of pre-RingCT rules, it must
+        now fail rather than be quietly rewritten.
+        """
+        namespace["dj"] = self.dj
+        namespace["draw"] = self.draw
+        namespace["wj"] = self.wj
+        namespace["mine"] = self.mine
+        return self
 
     def tx_shapes(self, hashes):
         """(n_in, n_out, extra_len, ring_sizes, fee) for each hash, as an
@@ -139,6 +179,10 @@ class MoneroLab:
             stderr=subprocess.STDOUT))
         for _ in range(60):
             time.sleep(1)
+            if self.procs[-1].poll() is not None:
+                raise RuntimeError(
+                    f"monerod exited immediately (code {self.procs[-1].returncode}). "
+                    f"See {os.path.join(self.base, 'd.out')}.")
             try:
                 if self.dj("get_info").get("result", {}).get("height") is not None:
                     break
@@ -146,6 +190,22 @@ class MoneroLab:
                 pass
         else:
             raise RuntimeError("monerod did not come up")
+
+        # IS THIS OUR DAEMON? Waiting for "something answers on the port" is
+        # not the same question. A leftover daemon from an earlier run holds
+        # the port, answers happily, and the suite then tests against a chain
+        # it did not create -- which surfaced as
+        # "Daemon response did not include the requested real output" from a
+        # wallet whose outputs belonged to a different chain, an error that
+        # says nothing about ports. A freshly started regtest node is at
+        # height 1; anything else is not ours.
+        h = self.height()
+        if h > 1:
+            raise RuntimeError(
+                f"port {self.dp} is already serving a chain at height {h}. A "
+                f"daemon from an earlier run is still alive, and this suite "
+                f"would have tested against ITS chain. Kill it and re-run; do "
+                f"not run two real-binary suites on the same ports at once.")
 
         # ASSERT the consensus rules, do not assume them. The whole point of
         # this class is that the chain is not the one --testnet gives you, and
@@ -181,6 +241,15 @@ class MoneroLab:
             except Exception:                                # noqa: BLE001
                 pass
         raise RuntimeError("monero-wallet-rpc did not come up")
+
+    @property
+    def daemon_proc(self):
+        """The monerod process, for suites that deliberately kill it.
+
+        Failure injection needs a handle, not just an RPC url -- a suite that
+        can only ask the daemon nicely cannot test what happens when it dies.
+        """
+        return self.procs[0] if self.procs else None
 
     def stop(self):
         for p in self.procs:

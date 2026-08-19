@@ -17,7 +17,11 @@ A fake RPC can only encode what the test author already believed about how a
 wallet reports a 1-piconero output. This sends one, on a real chain, through a
 real wallet, and drives the SHIPPED watch() against the result.
 
-Isolated testnet (monerod --offline --fixed-difficulty 1). SKIPs if absent.
+Runs on `monerod --regtest` via tests/monerolab.py, which is hard fork v16 --
+RingCT, ring 16, current fee rules -- NOT `--testnet --offline`, where a fresh
+chain sits at hard fork v1 and outputs, fees and ring sizes are all different.
+This suite asserts on dust thresholds and fees, so that distinction decides
+whether any of it means anything. SKIPs if the binaries are absent.
 """
 import subprocess, time, os, shutil, tempfile, sys
 import importlib.machinery, importlib.util
@@ -29,7 +33,9 @@ for b in ("monerod", "monero-wallet-rpc"):
         print(f"SKIP: {b} not on PATH"); sys.exit(0)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "tests"))
 sys.path.insert(0, REPO)
+from monerolab import MoneroLab                              # noqa: E402
 
 
 def load(name):
@@ -44,8 +50,9 @@ import gs_common
 
 BASE = tempfile.mkdtemp(prefix="dust_")
 DPORT, WPORT = 30250, 30253
-DR = f"http://127.0.0.1:{DPORT}"
-WR = f"http://127.0.0.1:{WPORT}/json_rpc"
+lab = MoneroLab(BASE, DPORT, WPORT)
+DR = lab.DR
+WR = lab.WR
 procs = []
 PASS = 0; FAIL = 0; FAILS = []
 
@@ -56,27 +63,12 @@ def check(name, cond):
     else: FAIL += 1; FAILS.append(name); print("  FAIL:", name)
 
 
-def dj(m, p=None):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(DR + "/json_rpc", json=b, timeout=40).json()
-
-
-def wj(m, p=None, t=240):
-    b = {"jsonrpc": "2.0", "id": "0", "method": m}
-    b.update({"params": p} if p is not None else {})
-    return requests.post(WR, json=b, timeout=t).json()
-
-
-def mine(addr, n):
-    tgt = dj("get_info")["result"]["height"] + n
-    requests.post(DR + "/start_mining", json={
-        "miner_address": addr, "threads_count": 2,
-        "do_background_mining": False, "ignore_battery": True}, timeout=40)
-    while dj("get_info")["result"]["height"] < tgt:
-        time.sleep(2)
-    requests.post(DR + "/stop_mining", json={}, timeout=40)
-    wj("refresh")
+# The suite's own helpers, pointed at the lab. The ASSERTIONS below are
+# unchanged on purpose: if one of them only held under pre-RingCT rules, it has
+# to fail here rather than be quietly rewritten to match the new chain.
+dj = lab.dj
+wj = lab.wj
+mine = lab.gen          # this suite's mine(addr, n) mines n blocks, not to a height
 
 
 class Clock:
@@ -86,32 +78,7 @@ class Clock:
 
 result = "INCOMPLETE"
 try:
-    procs.append(subprocess.Popen(
-        ["monerod", "--testnet", "--offline", "--data-dir", os.path.join(BASE, "n"),
-         "--rpc-bind-ip", "127.0.0.1", "--rpc-bind-port", str(DPORT),
-         "--p2p-bind-port", str(DPORT - 1), "--no-igd", "--hide-my-port",
-         "--fixed-difficulty", "1", "--non-interactive", "--no-zmq",
-         "--log-file", os.path.join(BASE, "d.log"), "--log-level", "0"],
-        stdout=open(os.path.join(BASE, "d.out"), "w"), stderr=subprocess.STDOUT))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if dj("get_info").get("result", {}).get("height") is not None: break
-        except Exception: pass
-
-    procs.append(subprocess.Popen(
-        ["monero-wallet-rpc", "--testnet", "--daemon-address", f"127.0.0.1:{DPORT}",
-         "--trusted-daemon", "--wallet-dir", os.path.join(BASE, "w"),
-         "--rpc-bind-port", str(WPORT), "--rpc-bind-ip", "127.0.0.1",
-         "--disable-rpc-login", "--log-file", os.path.join(BASE, "w.log"),
-         "--log-level", "0"],
-        stdout=open(os.path.join(BASE, "w.out"), "w"), stderr=subprocess.STDOUT))
-    for _ in range(45):
-        time.sleep(1)
-        try:
-            if "result" in wj("get_version"): break
-        except Exception: pass
-
+    lab.start()
     wj("create_wallet", {"filename": "d", "password": "", "language": "English"})
     PRIMARY = wj("get_address", {"account_index": 0})["result"]["address"]
     sub = wj("create_address", {"account_index": 0})["result"]
@@ -153,15 +120,13 @@ try:
 
         def _sleep(_s):
             clk.t += 60
-            requests.post(DR + "/start_mining", json={
-                "miner_address": PRIMARY, "threads_count": 1,
-                "do_background_mining": False, "ignore_battery": True}, timeout=40)
-            time.sleep(1.5)
-            requests.post(DR + "/stop_mining", json={}, timeout=40)
-            try:
-                wj("refresh", t=60)
-            except Exception:
-                pass
+            # generateblocks, not start_mining. start_mining is asynchronous in
+            # both directions -- blocks keep landing after /stop_mining -- so
+            # the OLD harness kept this test green by accident: the chain was
+            # still advancing when it was supposed to be idle. It also does not
+            # work under current consensus here, which mines with RandomX.
+            # One block per simulated minute is what a real chain does.
+            lab.gen(PRIMARY, 1)
 
         return rw.watch(rpc, 0, RIDX, FLOOR, timeout_s=timeout_s, stall_s=stall_s,
                         sleep_fn=_sleep, clock=clk, echo=lambda *a, **k: None,
@@ -197,13 +162,7 @@ try:
 
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
-    for p in procs:
-        try: p.terminate()
-        except Exception: pass
-    time.sleep(1)
-    for p in procs:
-        try: p.kill()
-        except Exception: pass
+    lab.stop()
     shutil.rmtree(BASE, ignore_errors=True)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
