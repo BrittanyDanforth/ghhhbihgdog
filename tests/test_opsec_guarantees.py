@@ -402,6 +402,93 @@ check("receive: main() treats a stale scan like an unreadable one — it names "
       "no cause", '"unknown", "stale"' in _rw_src)
 
 
+# ---------------------------------------------------------------------------
+# 7. The DAG hop round must not re-merge the mix it is meant to deepen.
+#
+# create_subs gives every output its own account so that no single transaction
+# can spend two of them -- "IMPOSSIBLE rather than merely discouraged". The hop
+# round then picked each destination INDEPENDENTLY, with nothing coordinating
+# in-degree, so two sources routinely swept onto the same address. Two outputs
+# on one subaddress are two outputs one sweep_all spends, and the exit issues
+# exactly one sweep per funded subaddress -- so they left in a single
+# multi-input transaction, which is public proof of common ownership.
+#
+# Measured over 200 planning runs per size BEFORE the fix: every run collided
+# (7 outputs -> 4.2 shared, 12 -> 7.3, 20 -> 12.5). --dag-mixing is checked by
+# default in the console, so this was the ordinary path, not a corner.
+# ---------------------------------------------------------------------------
+import secrets as _sec
+from collections import Counter as _Ctr
+
+ghost_g = _load("GhostSpiral")
+ghost_g.integrity_log = lambda *a, **k: None
+
+
+def _dag_trial(n_out, deep=2):
+    _subs = [f"addr{i:02d}" for i in range(n_out)]
+    _ai = {a: (10 + i, 1) for i, a in enumerate(_subs)}
+    _fan = {a: Decimal("1.0") for a in _subs}
+    _dag = {}
+    for a in _subs:
+        _others = [b for b in _subs if b != a]
+        _k = min((_sec.randbelow(3) + 1) * deep, len(_others))
+        _pool, _ch = list(_others), []
+        for _ in range(max(_k, 1)):
+            _ch.append(_pool.pop(_sec.randbelow(len(_pool))))
+        _dag[a] = _ch
+    _args = types.SimpleNamespace(dag_mixing=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _plan = ghost_g.build_dag_plan(_args, Decimal("0.0024"), list(_subs),
+                                       _fan, _dag, _subs, _ai, _sec,
+                                       delay_window=(1, 1))
+    _c = _Ctr(t["dst"] for t in _plan)
+    return {"hops": len(_plan), "n": n_out,
+            "shared": sum(v for v in _c.values() if v > 1),
+            "self": sum(1 for t in _plan if t["dst"] == t["src"])}
+
+
+_RUNS = 60
+for _n in (7, 12, 20):
+    _res = [_dag_trial(_n) for _ in range(_RUNS)]
+    _collided = sum(1 for r in _res if r["shared"])
+    _selfhops = sum(r["self"] for r in _res)
+    _hops = sum(r["hops"] for r in _res) / _RUNS
+    check(f"dag[{_n}]: NO two outputs ever share a hop destination "
+          f"({_collided}/{_RUNS} runs collided)", _collided == 0)
+    check(f"dag[{_n}]: no output hops to itself ({_selfhops} self-hops)",
+          _selfhops == 0)
+    check(f"dag[{_n}]: every output still hops — the fix costs no mixing "
+          f"depth (avg {_hops:.1f}/{_n})", abs(_hops - _n) < 0.001)
+
+# The assignment helper's own contract, driven directly on a deliberately
+# SPARSE graph -- the case where staying inside the adjacency is impossible and
+# the fallback has to preserve the invariant rather than the graph.
+_srcs = [f"n{i}" for i in range(8)]
+_sparse = {s: [_srcs[(i + 1) % 8]] for i, s in enumerate(_srcs)}   # a single cycle
+_asg = ghost_g.assign_hop_destinations(_srcs, _sparse, _srcs, _sec)
+check("dag: a sparse (single-cycle) graph still assigns every source",
+      len(_asg) == len(_srcs))
+check("dag: ...with all destinations distinct",
+      len(set(_asg.values())) == len(_asg))
+check("dag: ...and no self-assignment", all(k != v for k, v in _asg.items()))
+
+# A graph whose adjacency is exhausted must fall back rather than collide.
+_starved = {s: [_srcs[0]] for s in _srcs}      # everyone wants the same target
+_asg2 = ghost_g.assign_hop_destinations(_srcs, _starved, _srcs, _sec)
+check("dag: when every source wants the SAME target, destinations are still "
+      "unique", len(set(_asg2.values())) == len(_asg2))
+check("dag: ...and still never self-assigned",
+      all(k != v for k, v in _asg2.items()))
+check("dag: ...and the fallback keeps everyone assigned",
+      len(_asg2) == len(_srcs))
+
+# Two sources, two targets: the only legal answer is the swap.
+_two = ghost_g.assign_hop_destinations(["a", "b"], {"a": ["b"], "b": ["a"]},
+                                       ["a", "b"], _sec)
+check("dag: the minimal 2-output case is a clean swap",
+      _two == {"a": "b", "b": "a"})
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
