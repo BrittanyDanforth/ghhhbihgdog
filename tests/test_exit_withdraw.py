@@ -149,6 +149,17 @@ check("exit: ...including swept change on a subaddress that is not index 1 "
 check("exit: an account with no subaddresses contributes nothing",
       6 not in [a for a, _, _ in _found])
 
+# WHICH accounts the exit is even told to look at. bal_account is the one that
+# is easy to leave out: a FAN-OUT's change lands there, so if its change sweep
+# fails that value sits on it, and an exit that never looked would abandon it
+# silently -- the same defect as a wipe that misses a file.
+_al = ghost._exit_account_list({"addrA": (11, 1), "addrB": (12, 1)}, [20, 21], 9)
+check("exit: the account list covers the mix/veil/sweep-destination accounts",
+      11 in _al and 12 in _al)
+check("exit: ...the per-hop change accounts a peel chain leaves behind",
+      20 in _al and 21 in _al)
+check("exit: ...and bal_account, where a fan-out's change lands", 9 in _al)
+
 
 # ---- the withdrawal loop -------------------------------------------------
 class _Recorder:

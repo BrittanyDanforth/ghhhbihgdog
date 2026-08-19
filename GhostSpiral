@@ -16,7 +16,11 @@ End-to-end pipeline:
            something this executes.
   Stage 3: Build wallets & DAG mixing graph
   Stage 4: Build unsigned TX plan with fee-aware amounts
-  Stage 5: Auto-sign + broadcast
+  Stage 5: Auto-sign + broadcast the mixing rounds, then EXIT: with
+           --exit-to <address> the mixed funds are withdrawn off this wallet,
+           ONE TRANSACTION PER OUTPUT. Without it nothing is withdrawn and the
+           run says so -- this step used to be a price valuation that moved no
+           money while the pipeline reported completion.
 
 OPSEC hardening (v10.5):
   - All traffic forced through Tor with leak checks at every stage
@@ -2704,8 +2708,8 @@ def main():
                                  veil_file=veil_file,
                                  veil_target=(bal_account, entry_index),
                                  veil_need=usable,
-                                 exit_accounts=([a for a, _ in addr_index.values()]
-                                                + list(change_accounts)))
+                                 exit_accounts=_exit_account_list(
+                                     addr_index, change_accounts, bal_account))
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
@@ -3415,6 +3419,26 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         _cs = Path(stage)
         if _cs.is_dir() and not secure_delete_tree(_cs):
             print(f"  [!] Could not securely wipe {stage}; remove it manually.")
+
+
+def _exit_account_list(addr_index, change_accounts, bal_account) -> list:
+    """Every account this run could be holding money in, for the exit to empty.
+
+    Three sources, and the third is the one that is easy to miss:
+      * addr_index -- every mix subaddress, the veil carrier and each change
+        sweep destination.
+      * change_accounts -- the per-hop accounts a peel chain leaves change on.
+      * bal_account -- where a FAN-OUT's change lands. If its change sweep
+        fails, that value sits there and an exit that did not look would leave
+        it behind silently, which is the same defect as a wipe that misses a
+        file.
+
+    Duplicates cost nothing: _funded_subaddresses sorts a set and skips
+    anything with no balance.
+    """
+    return ([a for a, _ in addr_index.values()]
+            + list(change_accounts)
+            + [bal_account])
 
 
 def _funded_subaddresses(rpc, accounts) -> list:
