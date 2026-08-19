@@ -199,11 +199,13 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
             a += [flag, p[key]]
     if p.get("allow_clearnet_relay"):
         a.append("--allow-clearnet-relay")
-    # THE EXIT. Repeated once per destination, which is how GhostSpiral spreads
-    # the withdrawal. Absent, nothing is withdrawn and the run says so -- the
-    # console must not imply otherwise, so there is no default here.
-    for d in p.get("exit_to") or []:
-        a += ["--exit-to", d]
+    # THE EXIT goes in GS_EXIT_TO -- see secret_env(). It is NOT put on argv:
+    # /proc/<pid>/cmdline is world-readable for the life of the run, and this
+    # is the operator's final destination, the one address the whole pipeline
+    # exists to keep unlinked from the public swap memo. It used to be composed
+    # here, which put it in `ps` and in the command preview the page shows.
+    # Absent, nothing is withdrawn and the run says so -- the console must not
+    # imply otherwise, so there is still no default.
     return a, why
 
 
@@ -422,6 +424,18 @@ def secret_env(params: dict) -> dict:
     Keeping them out of argv also keeps them out of the command PREVIEW the
     page renders, which is the same rule the wallet password already follows:
     the preview shows the real argv, and the real argv has no secrets on it.
+
+    THE EXIT DESTINATION WAS THE EXCEPTION, and it is the value with the most
+    to lose. pipeline_argv composed `--exit-to <address>` onto the command line
+    while everything above went by environment, so the operator's FINAL
+    address -- the one the entire pipeline exists to keep unlinkable from the
+    public ThorChain memo -- was in `ps` output and in the preview this
+    docstring says has no secrets on it. OPSEC_SETUP.md repeated the claim.
+    Even thor_swap_preparer's swap destinations, which the swap provider is
+    told anyway, already had GS_SWAP_DESTS.
+
+    Space-separated, because --exit-to is repeatable; GhostSpiral splits on
+    whitespace or commas.
     """
     env = {}
     if params.get("btc_entry"):
@@ -430,6 +444,8 @@ def secret_env(params: dict) -> dict:
         env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
     if params.get("swap_btc"):
         env["GS_SWAP_AMOUNTS"] = str(params["swap_btc"])
+    if params.get("exit_to"):
+        env["GS_EXIT_TO"] = " ".join(params["exit_to"])
     return env
 
 

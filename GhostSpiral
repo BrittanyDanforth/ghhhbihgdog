@@ -53,6 +53,10 @@ from gs_common import (
 
 DUST_XMR = Decimal("0.0001")
 
+#: One piconero, the smallest amount Monero represents. Used to put a gate
+#: strictly ABOVE a computed quantity rather than merely at it.
+PICONERO = Decimal("0.000000000001")
+
 # How many fee-widths to hold back per remaining peel when sizing what a peel
 # forwards to the next rotating carrier. See the reserve comment in the peel
 # planner: under-reserving strands funds mid-chain, over-reserving only
@@ -1217,7 +1221,8 @@ def xmr_balance(rpc_primary, bal_account: int,
 
 
 def swap_expected_total(deposits: list) -> tuple:
-    """How much XMR this run is waiting for. Returns (total, n_unreadable).
+    """How much XMR this run is waiting for.
+    Returns (total, n_unreadable, per_chunk_amounts).
 
     Sums the quoted output of EVERY chunk, because that -- not the first
     deposit to settle -- is what "the swap arrived" means under --split N.
@@ -1227,11 +1232,16 @@ def swap_expected_total(deposits: list) -> tuple:
     route's expected output, but that warning scrolls past hours before this
     number is used, and a target silently built from 2 of 3 chunks is a target
     the run will reach while a third of the money is still in flight -- which
-    is the exact failure the summed target exists to prevent. Same reasoning,
-    and the same (total, unreadable) shape, as receive_watch.expected_total.
+    is the exact failure the summed target exists to prevent. Same reasoning as
+    receive_watch.expected_total, which returns (total, unreadable).
+
+    The per-chunk amounts come back too, and they are not decoration: the gate
+    has to know the SMALLEST chunk, not just how many there are. See
+    swap_arrival_floor.
     """
     total = Decimal(0)
     unreadable = 0
+    amounts = []
     for dep in deposits:
         # The COMPARISON is inside the try, not just the conversion. It was
         # outside, and Decimal("NaN") > 0 raises InvalidOperation rather than
@@ -1248,45 +1258,73 @@ def swap_expected_total(deposits: list) -> tuple:
             v, readable = Decimal(0), False
         if readable:
             total += v
+            amounts.append(v)
         else:
             unreadable += 1
-    return total, unreadable
+    return total, unreadable, amounts
 
 
-def chunk_safe_tolerance(tolerance: Decimal, chunks: int) -> Decimal:
-    """A slippage tolerance that CANNOT be satisfied by a whole missing chunk.
+def swap_arrival_floor(total: Decimal, tolerance: Decimal,
+                       chunk_amounts=None, chunks: int = 1) -> tuple:
+    """The unlocked balance at which every chunk has certainly arrived.
 
-    THE SUMMED FLOOR DOES NOT MEAN WHAT IT LOOKS LIKE. accept_floor takes the
-    tolerance off the TOTAL of every quote and the wait opens at
-    `unlocked >= total * (1 - tolerance)`. The tolerance is there to absorb the
-    slippage on ONE swap between quote and settlement -- but charged against
-    the whole pot it absorbs an entire chunk as soon as a chunk is worth less
-    than the tolerance:
+    Returns (floor, tightened) -- tightened is True when the slippage
+    tolerance had to be overruled, so the caller can say so.
 
-        --split 12, 1 XMR per chunk, tolerance 0.10
-        floor = 12 * 0.90 = 10.8
-        11 chunks arrive IN FULL = 11.0 >= 10.8  ->  "the swap has arrived"
+    THE GATE MUST NOT OPEN WHILE ANY ONE CHUNK COULD BE ENTIRELY ABSENT. That
+    is the whole requirement, and stating it that way is what the previous
+    attempt got wrong.
 
-    So at --split 10 or more, on the DEFAULT tolerance and with no operator
-    error, the gate opened with a whole chunk still in flight -- G6 itself,
-    rebuilt inside the fix for G6. Measured on the real loop, not reasoned
-    about: it returned 'funded' at 11 of 12 chunks.
+    accept_floor takes the tolerance off the summed total, so the floor sits
+    `total * tolerance` below the target -- and if any chunk is worth less than
+    that, the chunk can be missing and the gate still opens. The first fix
+    capped the tolerance at 1/(N+1), which is correct ONLY IF every chunk is
+    worth 1/N of the pot. Two shipped paths break that, and both were
+    reproduced:
 
-    A total-only comparison cannot tell "all N arrived, each a little short"
-    from "N-1 arrived and one never came" once the tolerance reaches 1/N: they
-    are the same number. Nothing here reads per-chunk arrivals, so the only
-    honest move is to keep the tolerance strictly below one chunk's share.
-    1/(N+1) puts the floor above what N-1 full chunks give, for every N:
+      * --joinmarket sets btc_chunks = jm_utxos, the tumbler's own outputs,
+        which are arbitrarily unequal. Quotes of 0.50/0.30/0.15/0.05 (total
+        1.00) give a floor of 0.90 under a 10% tolerance -- and the count-based
+        cap does not bind at N=4 -- so the 0.05 chunk can be absent, 0.95
+        arrives, and the gate opens.
+      * Manual mode has no quotes, so `n_chunks = len(swap_deposits) or
+        max(args.split, 1)` falls back to --split, which defaults to 1, and the
+        cap returns the tolerance UNCAPPED however many swaps were really sent.
+        Twelve manual swaps with --expect-total-xmr 12 gives floor 10.8 and
+        returns 'funded' at 11.0: verbatim the worked example in the old
+        docstring, through the one door the cap did not cover.
 
-        floor/target = N/(N+1)  >  (N-1)/N      because N^2 > N^2 - 1
+    So the floor is keyed on the SMALLEST chunk, not on how many there are:
 
-    Fails CLOSED: a swap that really does under-deliver by more than the capped
-    tolerance stalls instead of proceeding, and the operator decides with
-    --accept-partial-swap. Nothing has been spent at that point.
+        floor = max(total * (1 - tolerance),  total - smallest + 1 piconero)
+
+    With real quotes `chunk_amounts` gives the smallest exactly. With only a
+    total and a count, equal chunks are assumed (total/chunks) -- which is the
+    old behaviour, now stated as the assumption it is. With neither, there is
+    nothing to key on and the tolerance stands alone; the caller must say so,
+    because that is the case where a missing swap is undetectable.
+
+    Fails CLOSED. When the smallest chunk is smaller than the slippage
+    tolerance the two are indistinguishable by total alone, and this prefers
+    stalling -- nothing has been spent, and --accept-partial-swap is there for
+    an operator who knows the rest is not coming.
     """
-    if chunks <= 1:
-        return tolerance
-    return min(tolerance, Decimal(1) / Decimal(int(chunks) + 1))
+    if total <= 0:
+        return Decimal(0), False
+    floor_ = accept_floor(total, tolerance)
+    smallest = None
+    if chunk_amounts:
+        smallest = min(chunk_amounts)
+    elif chunks and int(chunks) > 1:
+        smallest = total / Decimal(int(chunks))
+    if smallest is None or smallest <= 0:
+        return floor_, False
+    # One piconero above "everything except the smallest chunk", so a whole
+    # missing chunk can never satisfy it.
+    guard = (total - smallest).quantize(PICONERO, rounding=ROUND_DOWN) + PICONERO
+    if guard > floor_:
+        return guard, True
+    return floor_, False
 
 
 def swap_arrival_step(target: Decimal, dust: Decimal = DUST_XMR) -> Decimal:
@@ -2390,7 +2428,40 @@ def resolve_exit_destinations(args) -> None:
     Duplicates are rejected too: passing the same address twice looks like a
     request to spread the withdrawal while actually sending more of it to one
     place, which is the opposite of what repeating the flag is for.
+
+    GS_EXIT_TO FIRST, argv only with a warning, and this was the LAST sensitive
+    input in the toolchain without an environment path -- while being the most
+    sensitive one there is. The exit destination is the operator's final
+    address: the single value the whole pipeline exists to unlink from the
+    public ThorChain memo. /proc/<pid>/cmdline is mode 0444, readable by every
+    local account for the whole multi-hour run.
+
+    Every less-sensitive input already had this: GS_BTC_ENTRY, GS_BTC_AMOUNT,
+    GS_SWAP_AMOUNTS, GS_WALLET_PASSWORD, and GS_SWAP_DESTS -- which covers
+    thor_swap_preparer's swap destinations, an address the swap provider is
+    told anyway. The one address nobody is supposed to be able to tie to the
+    swap went on argv.
+
+    gs_console made it worse rather than better: it composes --exit-to onto
+    GhostSpiral's argv while passing the others by environment, and
+    OPSEC_SETUP.md describes that arrangement as "the console hands its
+    children the sensitive values through the environment, not argv ... which
+    is why no secret appears in it". The command preview it shows contains the
+    exit address.
+
+    Separator is whitespace or commas, so several destinations fit one
+    variable: GS_EXIT_TO="addr1 addr2".
     """
+    # The argv value is handed to env_or_argv, not withheld from it: that is
+    # what makes it WARN when the destination came from the command line. A
+    # None here would have taken the environment silently and said nothing
+    # about argv, which is the half of the helper that matters.
+    _argv_dests = getattr(args, "exit_to", None)
+    _env_dests = env_or_argv("GS_EXIT_TO",
+                             " ".join(_argv_dests) if _argv_dests else None,
+                             "The exit destination(s)")
+    if _env_dests:
+        args.exit_to = [d for d in re.split(r"[\s,]+", str(_env_dests)) if d]
     dests = getattr(args, "exit_to", None)
     if not dests:
         return
@@ -2558,7 +2629,7 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
     afterwards is money nothing in the pipeline will ever mix.
     """
     n_chunks = len(swap_deposits) or max(args.split, 1)
-    quoted, unreadable = swap_expected_total(swap_deposits)
+    quoted, unreadable, chunk_amounts = swap_expected_total(swap_deposits)
     if args.expect_total_xmr is not None:
         # An explicit target overrides the quotes: in manual mode there are
         # none, and where there are both, the operator holding the
@@ -2578,19 +2649,35 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
             integrity_log("stage4", "expect_total_below_quotes")
         quoted = args.expect_total_xmr
         unreadable = 0
-    # Capped so a whole missing chunk cannot satisfy it -- see
-    # chunk_safe_tolerance. This is the defect the first version of this fix
-    # shipped with.
-    tol = chunk_safe_tolerance(args.swap_tolerance, n_chunks)
-    if tol < args.swap_tolerance:
-        print(f"  [*] Slippage tolerance capped at {tol * 100:.1f}% for "
-              f"{n_chunks} chunks (you asked for "
-              f"{args.swap_tolerance * 100:.0f}%). At the wider figure "
-              f"{n_chunks - 1} chunks arriving in full would have counted as "
-              f"all {n_chunks}, because the tolerance is charged against the "
-              f"total and one chunk is worth less than it.")
-        integrity_log("stage4", "swap_tolerance_capped_for_chunks")
-    floor_ = accept_floor(quoted, tol)
+    # An explicit target replaces the quotes, so it replaces the per-chunk
+    # breakdown too -- there is no way to know how the operator's own swaps
+    # were sized. --split then stands in for the count, on an equal-chunk
+    # assumption stated out loud below.
+    if args.expect_total_xmr is not None:
+        chunk_amounts = []
+    # Keyed on the SMALLEST chunk, not on how many there are -- see
+    # swap_arrival_floor for the two paths the count-based version missed.
+    floor_, _tightened = swap_arrival_floor(quoted, args.swap_tolerance,
+                                            chunk_amounts, n_chunks)
+    if _tightened:
+        print(f"  [*] Arrival gate tightened to {floor_} XMR, above the "
+              f"{args.swap_tolerance * 100:.0f}% slippage tolerance would "
+              f"allow. The smallest chunk is worth less than that tolerance, "
+              f"so at the wider figure it could have been missing entirely and "
+              f"still counted as a complete swap.")
+        integrity_log("stage4", "arrival_gate_tightened_for_smallest_chunk")
+    # NO CHUNK COUNT, NO GUARANTEE. In manual mode swap_deposits is empty, so
+    # n_chunks falls back to --split -- which is 1 by default and does nothing
+    # else in manual mode. An operator who sent twelve swaps by hand and passed
+    # only --expect-total-xmr gets the plain tolerance, and one of the twelve
+    # can be absent inside it. Say so; do not let it pass as a checked run.
+    if (quoted > 0 and not chunk_amounts and n_chunks <= 1):
+        print(f"  [!] The number of swaps is UNKNOWN to this run, so the gate "
+              f"below can only check the TOTAL: any single swap worth less "
+              f"than {args.swap_tolerance * 100:.0f}% of it could be missing "
+              f"and still count as complete. If you sent more than one, pass "
+              f"--split <how many> as well.")
+        integrity_log("stage4", "arrival_chunk_count_unknown")
 
     # ENTERED ON A SHORTFALL, not only on an empty ENTRY. The guard used to
     # read `unlocked_bal <= DUST_XMR` alone, which is sound only while ENTRY is
@@ -2627,7 +2714,7 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
                                 f"{unreadable}_of_{len(swap_deposits)}")
     if floor_ > 0:
         print(f"  [*] Waiting for ~{floor_} XMR ({n_chunks} chunk(s), "
-              f"{tol * 100:.1f}% slippage tolerance) to "
+              f"{args.swap_tolerance * 100:.0f}% slippage tolerance) to "
               f"arrive+unlock on ENTRY {scrub_address(entry_addr)}...")
     else:
         # NO TARGET AT ALL, which means the gate below is `unlocked > DUST_XMR`
@@ -2728,7 +2815,7 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
     return total_bal, unlocked_bal
 
 
-def report_holdings(rpc, accounts) -> list:
+def report_holdings(rpc, accounts, entry_account=None) -> list:
     """Tell the operator WHERE their money is, and how to spend it without
     undoing the run. Returns the funded (account, balance_atomic) pairs.
 
@@ -2787,6 +2874,36 @@ def report_holdings(rpc, accounts) -> list:
     print("      exchange they are yours. That link is not on-chain and no")
     print("      structure here can remove it — split across venues and time.")
 
+    if entry_account is not None and entry_account in [a for a, _ in funded]:
+        # THE ONE ACCOUNT THIS ADVICE MUST NOT COVER.
+        #
+        # Everything above says "spend them one account at a time" -- correct
+        # for a mixed output, and exactly wrong for this one. A balance on
+        # ENTRY is a swap chunk that landed after the run had planned: it has
+        # been through none of the mixing, and its funding transaction is named
+        # in plaintext by the public ThorChain memo. Sending it anywhere the
+        # operator is going to send the rest publishes swap -> destination in
+        # one hop.
+        #
+        # The exit already refuses to withdraw it (see _exit_hold_list) -- but
+        # the exit only runs with --exit-to, and on the DEFAULT run this report
+        # is the last thing the operator is told. It was listing ENTRY as
+        # ordinary spendable money and closing with instructions to spend it.
+        print()
+        print(f"  [!] ACCOUNT {entry_account} IS THE SWAP ENTRY. Do NOT spend "
+              f"it with the rest.")
+        print("      It holds value that arrived after this run had planned, "
+              "so nothing here")
+        print("      mixed it — and the swap memo names that address in "
+              "public. Sending it to")
+        print("      the same place as the others ties your destination to "
+              "the swap in one hop.")
+        print("      To mix it: mint a fresh receive wallet "
+              "(create_receive_wallet), send this")
+        print("      balance to it as ONE ordinary transfer, then run again "
+              "with --receive-wallet.")
+        integrity_log("main", "holdings_entry_flagged")
+
     print("      Not written to disk: a file naming this run's accounts would")
     print("      hand anyone who reads the machine the grouping, which is the")
     print("      one thing the wallet does not already show. Note the account")
@@ -2799,7 +2916,7 @@ def report_holdings(rpc, accounts) -> list:
 
 
 def report_completion(rpc, incomplete, accounts, spent_plans=(),
-                      withheld=()) -> None:
+                      withheld=(), entry_account=None) -> None:
     """Say what actually happened, then say where the money is. Exits non-zero
     on an incomplete run.
 
@@ -2837,7 +2954,7 @@ def report_completion(rpc, incomplete, accounts, spent_plans=(),
         print("  [!] Funds are safe in the wallet, but do NOT assume the full "
               "mixing depth was applied.")
         sys.exit(1)
-    report_holdings(rpc, accounts)
+    report_holdings(rpc, accounts, entry_account=entry_account)
     _wipe_spent_plans(*spent_plans)
     integrity_log("main", "pipeline_complete")
     print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
@@ -3029,7 +3146,7 @@ def main():
             if btc_chunks:
                 swap_deposits = stage2_get_swap_quotes(args, proxy, btc_chunks, ENTRY)
                 integrity_log("stage2", "swap_quotes_generated")
-                total_expected, _unreadable_quotes = swap_expected_total(swap_deposits)
+                total_expected, _unreadable_quotes, _ = swap_expected_total(swap_deposits)
                 print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
                 print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
                 print()
@@ -3360,7 +3477,8 @@ def main():
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
                           spent_plans=(veil_file, fanout_file, dag_file),
-                          withheld=withheld)
+                          withheld=withheld,
+                          entry_account=_src_account(addr_index, ENTRY))
 
 
 def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
@@ -3461,11 +3579,25 @@ def _child_env(wallet_password: str = None) -> dict:
     and the exit simulator. None of them need it, and a third-party child that
     logs or dumps its environment would leak it.
 
-    So: pass wallet_password only for the sign child; every other child gets an
-    environment with the variable removed.
+    EVERY GS_ VARIABLE, not just the password. This popped GS_WALLET_PASSWORD
+    alone, under a docstring whose own argument -- "a third-party child that
+    logs or dumps its environment would leak it" -- applies word for word to
+    the rest of them. Verified by calling this function: JoinMarket's tumbler
+    was handed GS_BTC_ENTRY (the operator's Bitcoin address), GS_BTC_AMOUNT,
+    and GS_EXPECT_TOTAL_XMR under the comment "third-party child: password
+    scrubbed".
+
+    GS_EXPECT_TOTAL_XMR is the sharpest version of the mistake, because it was
+    added to get the swapped total OFF argv -- world-readable via
+    /proc/<pid>/cmdline -- and landed it in an environment passed verbatim to a
+    third-party program. That is not a fix, it is a change of address.
+
+    Default-deny is free here: nothing GhostSpiral spawns reads a GS_ variable
+    except the SIGN phase, which reads GS_WALLET_PASSWORD. Checked by grepping
+    every child -- airgap_tx_signer reads only GS_WALLET_PASSWORD,
+    broadcast_signed_xmr reads none.
     """
-    env = dict(os.environ)
-    env.pop(GS_PW_ENV, None)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GS_")}
     if wallet_password is not None:
         env[GS_PW_ENV] = wallet_password
     return env

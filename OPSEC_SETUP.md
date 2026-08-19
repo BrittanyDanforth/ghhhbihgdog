@@ -340,9 +340,17 @@ hop returned nothing to the account.
 running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
 console hands its children the sensitive values through the environment, not
 argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
-`GS_SWAP_AMOUNTS`, `GS_EXIT_AMOUNT`, and `GS_WALLET_PASSWORD` as before. The
-command preview the page shows you is the real argv, which is why no secret
-appears in it.
+`GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination), `GS_EXIT_AMOUNT`,
+and `GS_WALLET_PASSWORD` as before. The command preview the page shows you is
+the real argv, which is why no secret appears in it.
+
+`GS_EXIT_TO` was missing from that list for as long as the list existed, and
+the sentence above was false because of it: the console composed
+`--exit-to <address>` onto GhostSpiral's command line. That is your FINAL
+destination — the one address this whole pipeline exists to keep unlinkable
+from the public ThorChain memo — and it sat in `ps` output, and in the preview,
+for the several hours a run takes. Running GhostSpiral by hand, `--exit-to`
+still works and warns.
 
 Running a tool by hand still accepts the flags — it warns and logs when you do.
 

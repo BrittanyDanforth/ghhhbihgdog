@@ -28,6 +28,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import importlib.machinery
+import importlib.util
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -116,6 +118,15 @@ try:
     def preview(params):
         return post("/api/preview", {"params": params})
 
+    # The console module itself, for the half of the wiring the HTTP preview
+    # deliberately does NOT expose: the environment. The preview shows argv
+    # only, which is the point -- so the destination has to be checked here.
+    _cld = importlib.machinery.SourceFileLoader(
+        "gs_console", os.path.join(REPO, "gs_console"))
+    console_mod = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_cld.name, _cld))
+    _cld.exec_module(console_mod)
+
     base_params = {"mode": "receive", "receive_wallet": "wallet_a.json",
                    "tor_proxy": "socks5h://127.0.0.1:9050"}
 
@@ -149,15 +160,26 @@ try:
           f"({_hostip})", _reachable is False or _hostip.startswith("127."))
 
     # ---- the exit wiring ----------------------------------------------
+    #
+    # THE DESTINATION MUST NOT BE ON THE ARGV, and these checks used to require
+    # that it was. /proc/<pid>/cmdline is mode 0444 for the whole multi-hour
+    # run, and this is the operator's FINAL address -- the one value the
+    # pipeline exists to keep unlinked from the public ThorChain memo. It goes
+    # in GS_EXIT_TO now, like every other sensitive input, and the argv this
+    # endpoint returns is the same string the page renders as a preview.
     st, r = preview(dict(base_params, exit_to=[A1, A2]))
     argv = r.get("argv", [])
-    check("exit: --exit-to is repeated once per destination",
-          argv.count("--exit-to") == 2)
-    check("exit: both destinations reach the argv", A1 in argv and A2 in argv)
-    check("exit: each --exit-to is immediately followed by its address",
-          all(argv[i + 1] in (A1, A2)
-              for i, x in enumerate(argv) if x == "--exit-to"))
-    check("exit: no problems reported for a valid pair", not r.get("problems"))
+    check("exit: the destinations are NOT composed onto the argv",
+          "--exit-to" not in argv)
+    check("exit: ...and appear nowhere in the rendered command",
+          A1 not in " ".join(argv) and A2 not in " ".join(argv)
+          and A1 not in r.get("pretty", "") and A2 not in r.get("pretty", ""))
+    check("exit: a valid pair is still accepted (no problems reported)",
+          not r.get("problems"))
+    # ...and they DO reach the child, by the channel that is not world-readable.
+    _senv = console_mod.secret_env(dict(base_params, exit_to=[A1, A2]))
+    check("exit: both destinations reach the child through GS_EXIT_TO",
+          _senv.get("GS_EXIT_TO") == f"{A1} {A2}")
 
     st, r = preview(base_params)
     check("exit: absent when no destination is given (nothing is withdrawn)",
@@ -165,7 +187,8 @@ try:
 
     st, r = preview(dict(base_params, exit_to=[SUB]))
     check("exit: a real SUBADDRESS is accepted (exchange deposits are usually "
-          "subaddresses)", SUB in r.get("argv", []))
+          "subaddresses)", not r.get("problems"))
+    check("exit: ...and it is not on the argv either", SUB not in r.get("pretty", ""))
 
     st, r = preview(dict(base_params, exit_to=[A1, A1]))
     check("exit: a repeated destination is refused",
@@ -185,7 +208,10 @@ try:
 
     st, r = preview(dict(base_params, exit_to=f"{A1}\n{A2}"))
     check("exit: a newline-separated paste is accepted too",
-          r.get("argv", []).count("--exit-to") == 2)
+          not r.get("problems"))
+    check("exit: ...and still reaches the child by environment, both of them",
+          console_mod.secret_env(
+              {"exit_to": [A1, A2]}).get("GS_EXIT_TO") == f"{A1} {A2}")
 
     # ---- injection: the browser must never supply a command ------------
     st, r = preview(dict(base_params, exit_to=[f"{A1}; rm -rf /"]))

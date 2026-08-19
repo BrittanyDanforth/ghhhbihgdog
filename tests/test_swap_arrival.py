@@ -105,21 +105,21 @@ def run(steps, floor_, chunks=3, stall_s=7200, timeout_s=86400, poll=30):
 
 
 # ---- the target: every chunk, not the first one -------------------------
-_tot, _bad = ghost.swap_expected_total([quote("1.0"), quote("1.0"), quote("1.0")])
+_tot, _bad, _amts = ghost.swap_expected_total([quote("1.0")] * 3)
 check("target: sums the quoted output of EVERY chunk, not just the first",
       _tot == D("3.0") and _bad == 0)
 check("target: no quotes at all is no target (manual mode)",
-      ghost.swap_expected_total([]) == (D(0), 0))
+      ghost.swap_expected_total([]) == (D(0), 0, []))
 
 # An unreadable quote deflates the target, which would let the wait finish
 # while a third of the money is still in flight. It must be COUNTED so the
 # caller can say so -- receive_watch.expected_total learned this the same way.
-_tot, _bad = ghost.swap_expected_total([quote("3.0"), quote("junk"), quote("0")])
+_tot, _bad, _amts = ghost.swap_expected_total([quote("3.0"), quote("junk"), quote("0")])
 check("target: an unreadable quote contributes nothing...", _tot == D("3.0"))
 check("target: ...and is counted, so the caller can say the target is partial",
       _bad == 2)
 check("target: a missing expected_xmr key counts as unreadable",
-      ghost.swap_expected_total([{"chunk": 0}]) == (D(0), 1))
+      ghost.swap_expected_total([{"chunk": 0}]) == (D(0), 1, []))
 
 # The gate sits a tolerance below the quotes: swaps never pay to the digit.
 check("gate: the floor is the summed target less the tolerance",
@@ -203,28 +203,62 @@ check("SPLIT: money that has arrived but not UNLOCKED is not 'funded'",
 # gate opened with a whole chunk still in flight -- G6 rebuilt inside the fix
 # for G6. Found by driving the shipped loop, not by reading it.
 _SPLITS = (3, 5, 10, 12, 20, 50)
+
+
+def _floor_for(n, amounts=None, chunks=None, tol="0.10"):
+    amts = amounts if amounts is not None else [D(1)] * n
+    total = sum(amts) if amts else D(n)
+    return ghost.swap_arrival_floor(total, D(tol), amts,
+                                    chunks if chunks is not None else n)[0]
+
+
 for _n in _SPLITS:
-    _tol = ghost.chunk_safe_tolerance(D("0.10"), _n)
-    _flr = ghost.accept_floor(D(_n), _tol)          # N chunks of 1 XMR
+    _flr = _floor_for(_n)                            # N chunks of 1 XMR
     check(f"CHUNK GATE: at --split {_n}, {_n - 1} full chunks do NOT satisfy "
           f"the gate", D(_n - 1) < _flr)
 check("CHUNK GATE: ...while the full delivery still does",
-      all(D(_n) >= ghost.accept_floor(
-          D(_n), ghost.chunk_safe_tolerance(D("0.10"), _n)) for _n in _SPLITS))
+      all(D(_n) >= _floor_for(_n) for _n in _SPLITS))
 
 # Non-vacuity: the UNCAPPED tolerance really does admit a missing chunk, or
 # every check above would pass against a gate that never had the defect.
 check("control: the UNCAPPED tolerance admits a whole missing chunk at N=12",
       D(11) >= ghost.accept_floor(D(12), D("0.10")))
 
-check("CHUNK GATE: one chunk leaves the operator's tolerance untouched",
-      ghost.chunk_safe_tolerance(D("0.10"), 1) == D("0.10")
-      and ghost.chunk_safe_tolerance(D("0.10"), 0) == D("0.10"))
-check("CHUNK GATE: a tolerance already tighter than the cap is left alone",
-      ghost.chunk_safe_tolerance(D("0.01"), 12) == D("0.01"))
+check("CHUNK GATE: a single chunk leaves the plain tolerance floor",
+      ghost.swap_arrival_floor(D(1), D("0.10"), [D(1)], 1)
+      == (ghost.accept_floor(D(1), D("0.10")), False))
+check("CHUNK GATE: a tolerance already tighter than the guard is left alone",
+      ghost.swap_arrival_floor(D(12), D("0.01"), [D(1)] * 12, 12)
+      == (ghost.accept_floor(D(12), D("0.01")), False))
+
+# UNEQUAL CHUNKS. The count-based cap assumed every chunk was worth 1/N of the
+# pot; --joinmarket sets btc_chunks = jm_utxos, the tumbler's own outputs,
+# which are nothing of the kind. Reproduced: 0.50/0.30/0.15/0.05 under a 10%
+# tolerance gave floor 0.90, so the 0.05 chunk could be absent and 0.95 opened
+# the gate.
+_UNEQ = [D("0.50"), D("0.30"), D("0.15"), D("0.05")]
+_uf, _ut = ghost.swap_arrival_floor(sum(_UNEQ), D("0.10"), _UNEQ, len(_UNEQ))
+check("UNEQUAL: the gate is keyed on the SMALLEST chunk, not the count", _ut)
+for _m in _UNEQ:
+    check(f"UNEQUAL: a missing {_m} chunk does NOT satisfy the gate",
+          sum(_UNEQ) - _m < _uf)
+check("UNEQUAL: ...and the complete delivery still does", sum(_UNEQ) >= _uf)
+check("control: the count-keyed floor DID admit the smallest chunk",
+      sum(_UNEQ) - min(_UNEQ) >= ghost.accept_floor(sum(_UNEQ), D("0.10")))
+
+# MANUAL MODE. swap_deposits is empty, so n_chunks falls back to --split --
+# which is 1 by default and does nothing else in manual mode. Twelve real
+# swaps with --expect-total-xmr 12 gave floor 10.8 and opened at 11.0.
+_mf, _mt = ghost.swap_arrival_floor(D(12), D("0.10"), [], 1)
+check("MANUAL: with no chunk count the gate cannot detect a missing swap",
+      D(11) >= _mf and not _mt)
+_mf12, _mt12 = ghost.swap_arrival_floor(D(12), D("0.10"), [], 12)
+check("MANUAL: ...and passing --split 12 restores the guarantee",
+      D(11) < _mf12 and _mt12)
+check("MANUAL: ...while a full delivery still passes", D(12) >= _mf12)
 
 # ...and through the REAL loop, on the timeline that used to pass it.
-_f12 = ghost.accept_floor(D(12), ghost.chunk_safe_tolerance(D("0.10"), 12))
+_f12 = _floor_for(12)
 _res, _ = run([(0, 0)] + [(i, i) for i in range(1, 12)] + [(11, 11)] * 30,
               _f12, chunks=12, stall_s=300)
 check("CHUNK GATE: the real loop HOLDS at 11 of 12 chunks",
@@ -243,12 +277,13 @@ check("CHUNK GATE: ...and completes when the twelfth lands",
 # cleanly, compares greater than zero and becomes a target no balance can ever
 # reach: the run waits out its whole timeout and blames the swap.
 check("quotes: a NaN expected_xmr is counted UNREADABLE, not raised",
-      ghost.swap_expected_total([quote("NaN"), quote("1.0")]) == (D("1.0"), 1))
+      ghost.swap_expected_total([quote("NaN"), quote("1.0")])
+      == (D("1.0"), 1, [D("1.0")]))
 check("quotes: an Infinity expected_xmr is counted UNREADABLE, not summed",
       ghost.swap_expected_total([quote("Infinity"), quote("1.0")])
-      == (D("1.0"), 1))
+      == (D("1.0"), 1, [D("1.0")]))
 check("quotes: -Infinity too",
-      ghost.swap_expected_total([quote("-Infinity")]) == (D(0), 1))
+      ghost.swap_expected_total([quote("-Infinity")]) == (D(0), 1, []))
 
 
 # ---- a transient balance DROP must not raise the bar --------------------
@@ -530,7 +565,7 @@ check("STAGE4: ...even at the default --split 1, where the old warning was "
 _res, _out, _exit = drive_stage4(
     [(0, 0)] + [(i, i) for i in range(1, 13)] + [(12, 12)] * 3,
     deposits=[quote("1.0")] * 12)
-check("STAGE4: the capped tolerance is announced", "capped at" in _out)
+check("STAGE4: the tightened gate is announced", "tightened" in _out)
 check("STAGE4: ...and the run still completes on a full delivery",
       _exit is None and _res == (D(12), D(12)))
 
@@ -547,6 +582,23 @@ _res, _out, _exit = drive_stage4([(0, 0), (1, 1), (2, 2)], deposits=_Q3,
                                  expect=D("2.0"))
 check("STAGE4: an --expect-total-xmr below the quoted sum is called out",
       "BELOW" in _out)
+
+# The manual-mode hole, driven end to end: a total with no chunk count cannot
+# detect a missing swap, and the run must SAY that rather than pass it off as
+# a checked arrival.
+_res, _out, _exit = drive_stage4([(0, 0), (12, 12)], deposits=[],
+                                 expect=D(12), split=1)
+check("STAGE4: a target with no chunk count warns that a missing swap is "
+      "undetectable", "number of swaps is UNKNOWN" in _out)
+check("STAGE4: ...and names the flag that fixes it", "--split" in _out)
+_res, _out, _exit = drive_stage4([(0, 0), (12, 12)], deposits=[],
+                                 expect=D(12), split=12)
+check("STAGE4: ...and does NOT warn once --split says how many",
+      "number of swaps is UNKNOWN" not in _out)
+_res, _out, _exit = drive_stage4([(0, 0)] + [(11, 11)] * 20, deposits=[],
+                                 expect=D(12), split=12)
+check("STAGE4: 11 of 12 manual swaps exits once --split is given",
+      _exit is not None)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
