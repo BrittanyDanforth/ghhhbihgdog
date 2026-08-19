@@ -10,3 +10,9 @@ monero>=0.8
 psutil>=5.9
 python-gnupg>=0.5
 PyYAML>=6.0
+# Dev/test only: the suite runs pyflakes over every shipped tool to prove no
+# undefined names. Coverage measured 214 warning/abort lines that no test ever
+# executes, so a NameError in one of them is invisible to the suite -- a static
+# check over all of them is the only realistic guarantee. The check SKIPS if
+# this is absent rather than failing.
+pyflakes>=3.0

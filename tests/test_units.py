@@ -2513,6 +2513,45 @@ check("jm-parse: REGRESSION PROOF — the old same-line rule matches nothing in 
 # Plus a hang: tumbler.py's miner-fee question is a bare input() guarded by
 # `not options['restart']`, so --yes does NOT bypass it, and with stdin
 # inherited it would sit unread until the 3600s timeout.
+# NO UNDEFINED NAMES IN ANY SHIPPED TOOL.
+#
+# This exists because of a real one. Replacing an inline wipe-coverage check
+# with gs_common.wipe_covers deleted the local that the warning message
+# interpolated, so exit_strategy_simulator's "the wipe will never find this
+# file" branch raised NameError instead of warning. The branch that exists to
+# stop a silent leak became the one that crashed.
+#
+# THE SUITE COULD NOT HAVE CAUGHT IT, and that is the point. Measured with
+# coverage across all 14 suites: 214 warning/abort lines in these tools are
+# never executed by any test -- error paths only fire in configurations the
+# tests do not create. Writing a test per branch is not realistic; a static
+# check over ALL of them is, and it is a strictly stronger guarantee than any
+# number of hand-written cases for this particular defect.
+#
+# Verified to catch the actual bug: reintroducing `_res` makes pyflakes report
+# "undefined name '_res'", and removing it goes clean. Skipped, not faked, if
+# pyflakes is not installed.
+try:
+    import pyflakes.api as _pf_api
+    import pyflakes.reporter as _pf_rep
+except ImportError:
+    _pf_api = None
+
+if _pf_api is not None:
+    import io as _pf_io
+    for _tool_f in ("GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
+                    "create_receive_wallet", "exit_strategy_simulator",
+                    "gs_common.py", "gs_console", "paranoia_mode",
+                    "receive_watch", "thor_swap_preparer"):
+        _errbuf, _outbuf = _pf_io.StringIO(), _pf_io.StringIO()
+        _pf_api.checkPath(os.path.join(REPO, _tool_f),
+                          _pf_rep.Reporter(_outbuf, _errbuf))
+        _undef = [ln for ln in _outbuf.getvalue().splitlines()
+                  if "undefined name" in ln]
+        check(f"pyflakes: {_tool_f} has no undefined names "
+              f"({_undef[0] if _undef else 'clean'})", not _undef)
+
+
 import argparse
 
 # type=Decimal IS AN ARGPARSE TRAP, AND TEN ARGUMENTS FELL INTO IT.
