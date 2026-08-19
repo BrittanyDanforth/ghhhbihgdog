@@ -12,6 +12,7 @@ the real source. Claims about hardware, BIOS, routers and Mullvad are the
 operator's to verify -- those are listed at the bottom as explicitly untested,
 so nobody mistakes this file for covering them.
 """
+from pathlib import Path
 import sys, os, re, ast, inspect
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -83,8 +84,44 @@ check("§1: thor writes the deposit/memo slip through that path",
       "atomic_write_json(pairs" in THOR)
 check("§4: create_receive_wallet writes the bundle through that path",
       "atomic_write_json(out" in CRW)
-check("create_receive_wallet's output dir is owner-only",
-      "secure_mkdir(outdir)" in CRW)
+# BEHAVIOURAL, and the guarantee is narrower than it was. This asserted the
+# literal "secure_mkdir(outdir)" appears in the source — a substring search
+# that broke the moment a keyword argument was added, and that was enforcing
+# the F9 defect: --output-dir defaults to ".", and secure_mkdir NARROWS a
+# pre-existing directory, so every run chmod'ed the operator's working
+# directory to 0700. The tool no longer modifies a directory it did not create.
+#
+# What survives, and what §1/§4 actually depend on: the bundle FILE is 0600, so
+# its contents stay private wherever it lands; a directory the tool creates is
+# still 0700; and the operator is warned when the directory they chose is
+# listable by others.
+import stat as _st, tempfile as _tfd, shutil as _shd
+_dd = _tfd.mkdtemp(prefix="opsecdir_")
+_pre = os.path.join(_dd, "theirs")
+os.mkdir(_pre); os.chmod(_pre, 0o755)
+gsc.secure_mkdir(_pre, narrow_existing=False)
+check("create_receive_wallet does NOT re-permission a directory the operator "
+      "already had", _st.S_IMODE(os.stat(_pre).st_mode) == 0o755)
+_new = os.path.join(_dd, "ours")
+gsc.secure_mkdir(_new)
+check("...while a directory it CREATES is owner-only",
+      _st.S_IMODE(os.stat(_new).st_mode) == 0o700)
+_bundle = os.path.join(_pre, "b.json")
+gsc.atomic_write_json({"x": 1}, Path(_bundle))
+check("...and the bundle FILE is 0600 wherever it lands, which is what keeps "
+      "its contents private", _st.S_IMODE(os.stat(_bundle).st_mode) == 0o600)
+# Whitespace-normalised, and the adjacent string literals joined: the warning
+# is written across three source lines as implicitly-concatenated strings, so a
+# plain substring search finds nothing and reports a missing warning that is
+# right there. This repo's audit lists that exact failure ("a line-based count
+# missed a call that wrapped to a second line") among the tests that were
+# wrong about working code.
+_crw_flat = re.sub(r"\s+", " ", CRW)
+# join implicitly-concatenated literals, including the f-prefixed continuations
+_crw_flat = re.sub(r'"\s*f?"', "", _crw_flat)
+check("create_receive_wallet warns when the chosen directory is listable",
+      "other local accounts can list it" in _crw_flat)
+_shd.rmtree(_dd, ignore_errors=True)
 check("secure_mkdir is 0700 by default",
       inspect.signature(gsc.secure_mkdir).parameters["mode"].default == 0o700)
 

@@ -29,7 +29,7 @@ next line. The operator has to read the address to use it, so it is shown; the
 scrubbed form is what goes into the persistent integrity log.
 """
 from __future__ import annotations
-import argparse, sys, time
+import argparse, stat, sys, time
 from pathlib import Path
 
 from gs_common import (
@@ -203,7 +203,26 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     }
 
     outdir = Path(args.output_dir)
-    secure_mkdir(outdir)          # 0700: owner-only output dir
+    # narrow_existing=False: --output-dir defaults to ".", so this chmod'ed
+    # the operator's current working directory to 0700 on every run. It only
+    # ever narrowed, so nothing leaked — but silently changing the permissions
+    # of a directory you were merely asked to write a file into is not this
+    # tool's business. A directory it CREATES is still made owner-only.
+    _pre_existing = outdir.exists()
+    secure_mkdir(outdir, narrow_existing=False)
+    if _pre_existing:
+        try:
+            _mode = stat.S_IMODE(outdir.stat().st_mode)
+        except OSError:
+            _mode = 0
+        if _mode & 0o077:
+            print(f"  [!] {outdir} is mode {_mode:o}: other local accounts can "
+                  f"list it. The bundle itself is written 0600, so its "
+                  f"CONTENTS stay private — but the filename, its size and its "
+                  f"timestamp are visible, which dates a receive-wallet "
+                  f"operation on this host. chmod 700 it yourself if that "
+                  f"matters; this tool no longer changes a directory you "
+                  f"chose.")
     fname = outdir / f"wallet_{secure_hex(8)}.json"
     atomic_write_json(out, fname)
 

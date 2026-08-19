@@ -46,6 +46,7 @@ from gs_common import (
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
+    decimal_env, XMR_ABSURD_TOTAL,
     swap_arrival_floor,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
@@ -1809,10 +1810,9 @@ def resolve_sensitive_inputs(args) -> None:
                        str(args.btc_amount) if args.btc_amount is not None else None,
                        "The BTC amount")
     if _amt is not None:
-        try:
-            args.btc_amount = Decimal(str(_amt))
-        except Exception:                                    # noqa: BLE001
-            sys.exit("[!] GS_BTC_AMOUNT is not a number.")
+        # decimal_env: --btc-amount is type=decimal_arg, this was a bare
+        # Decimal, and this is the path the tool tells operators to prefer.
+        args.btc_amount = decimal_env("GS_BTC_AMOUNT", _amt, positive=True)
 
     # Exactly one entry mode. argparse enforced this while --btc-entry was a
     # required mutually-exclusive member; it cannot once the value may come
@@ -2468,10 +2468,9 @@ def resolve_swap_arrival(args) -> None:
         str(args.expect_total_xmr) if args.expect_total_xmr is not None else None,
         "The expected total XMR")
     if _exp is not None:
-        try:
-            args.expect_total_xmr = Decimal(str(_exp))
-        except Exception:                                    # noqa: BLE001
-            sys.exit("[!] GS_EXPECT_TOTAL_XMR is not a number.")
+        args.expect_total_xmr = decimal_env(
+            "GS_EXPECT_TOTAL_XMR", _exp, positive=True,
+            max_value=XMR_ABSURD_TOTAL)
 
     tol = getattr(args, "swap_tolerance", SWAP_TOLERANCE_DEFAULT)
     if not (Decimal(0) <= tol < Decimal(1)):

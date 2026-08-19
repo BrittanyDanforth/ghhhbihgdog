@@ -414,6 +414,50 @@ def decimal_arg(text: str) -> Decimal:
     return v
 
 
+def decimal_env(label: str, text, positive: bool = False,
+                max_value: Decimal = None) -> Decimal:
+    """decimal_arg's rules, for a value that came from the ENVIRONMENT.
+
+    THE ENV PATH BYPASSED THE ARGV PATH'S VALIDATION. Every numeric flag in
+    this toolchain is declared `type=decimal_arg`, which exists because
+    `type=Decimal` answers a typo with a raw traceback out of argparse's
+    internals, and because Decimal ACCEPTS "NaN" and "Infinity" -- values that
+    parse, survive an `x > 0` test, and then poison everything downstream.
+
+    Then the same tools grew GS_* environment variables, preferred over argv
+    because /proc/<pid>/cmdline is world-readable -- and every one of them
+    re-parsed with a bare `Decimal(...)`. So the PREFERRED path was the
+    unvalidated one. Four sites: GS_EXPECT_XMR, GS_SWAP_AMOUNTS,
+    GS_BTC_AMOUNT and GS_EXPECT_TOTAL_XMR. Measured:
+    `GS_EXPECT_XMR=Infinity receive_watch ...` produced an uncaught traceback
+    out of accept_floor, hours of setup after the operator set it.
+
+    sys.exit rather than an exception, because this runs at startup where
+    argparse would have exited too -- the operator gets one line naming the
+    variable, not a stack.
+
+    LABEL FIRST, then the value: every call site reads
+    decimal_env("GS_EXPECT_XMR", value), and the first version of this took
+    them the other way round. Every call then tried to parse the NAME as a
+    number and aborted on valid input -- caught only because a test asserted
+    on the parsed VALUE rather than on the absence of an error message.
+    """
+    try:
+        v = Decimal(str(text))
+    except Exception:                                        # noqa: BLE001
+        sys.exit(f"[!] {label} is not a number: {str(text)[:40]!r}")
+    if not v.is_finite():
+        sys.exit(f"[!] {label} is not a finite number ({v}). 'NaN' and "
+                 f"'Infinity' parse as Decimals but are not amounts, and "
+                 f"neither is a target any balance can reach.")
+    if positive and v <= 0:
+        sys.exit(f"[!] {label} must be positive (got {v}).")
+    if max_value is not None and v > max_value:
+        sys.exit(f"[!] {label} is implausibly large ({v}); the limit is "
+                 f"{max_value}. Check the value rather than raising it.")
+    return v
+
+
 #: The roots paranoia_mode globs when it hunts artifacts, at depth 0 and 1.
 #: Named ONCE, here, because three places now need to agree about them: the
 #: wipe itself, and the two tools that write operator-chosen paths which the
@@ -745,7 +789,8 @@ def check_daemon_relay_egress(daemon_url: str,
     return out
 
 
-def secure_mkdir(path: Path, mode: int = 0o700) -> None:
+def secure_mkdir(path: Path, mode: int = 0o700,
+                 narrow_existing: bool = True) -> None:
     """Create a directory owner-only, including any parents.
 
     plain mkdir() produces 0755 -- world-readable and traversable. The FILES
@@ -761,14 +806,26 @@ def secure_mkdir(path: Path, mode: int = 0o700) -> None:
         level is therefore chmod'ed explicitly.
       * exist_ok=True silently keeps a pre-existing directory's mode, so an
         already-0755 staging dir would stay 0755. It is narrowed too.
+
+    narrow_existing=False for a directory the OPERATOR chose rather than one
+    this toolchain created. create_receive_wallet's --output-dir defaults to
+    ".", so running it chmod'ed the operator's current working directory to
+    0700 — measured, 755 -> 700. It only ever narrows, so nothing leaked; it
+    silently changed a directory that has nothing to do with this tool, and
+    "it was only tightened" is not a defence for modifying something you were
+    merely asked to write a file into. A directory this tool CREATES is its
+    own business; one that already existed is not.
     """
     path = Path(path)
     created = []
     for parent in list(path.parents)[::-1]:
         if not parent.exists():
             created.append(parent)
+    _pre_existing = path.exists()
     path.mkdir(mode=mode, parents=True, exist_ok=True)
-    for d in created + [path]:
+    targets = created + ([] if (_pre_existing and not narrow_existing)
+                         else [path])
+    for d in targets:
         try:
             if d.is_dir():
                 os.chmod(d, mode)

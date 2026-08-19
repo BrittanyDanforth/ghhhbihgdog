@@ -40,6 +40,7 @@ from gs_common import (
     load_receive_bundle, memo_binds_destination, env_or_argv,
     btc_per_xmr_oracle, quote_deviation, decimal_arg,
     validate_xmr_address,
+    decimal_env,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -249,10 +250,10 @@ def main():
     if not _amts:
         sys.exit("[!] No amounts. Set GS_SWAP_AMOUNTS='0.05 0.03' (preferred) or "
                  "pass --amounts.")
-    try:
-        args.amounts = [Decimal(x) for x in str(_amts).split()]
-    except Exception:                                        # noqa: BLE001
-        sys.exit("[!] GS_SWAP_AMOUNTS must be space-separated numbers.")
+    # decimal_env per amount, matching --amounts' own type=decimal_arg. A bare
+    # Decimal() here accepted "Infinity", which then went into a swap quote.
+    args.amounts = [decimal_env("GS_SWAP_AMOUNTS", x, positive=True)
+                    for x in str(_amts).split()]
     if not args.amounts:
         sys.exit("[!] No amounts given.")
 

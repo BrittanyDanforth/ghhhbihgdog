@@ -39,6 +39,7 @@ import io
 import os
 import sys
 import types
+from decimal import Decimal as D
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -53,6 +54,7 @@ def load(name):
     return mod
 
 
+import gs_common as _gsc
 ghost = load("GhostSpiral")
 console = load("gs_console")
 
@@ -212,6 +214,151 @@ check("nothing sensitive is left anywhere in the rendered command",
 _doc = open(os.path.join(REPO, "OPSEC_SETUP.md"), encoding="utf-8").read()
 check("OPSEC_SETUP lists GS_EXIT_TO among the values passed by environment",
       "GS_EXIT_TO" in _doc)
+
+
+
+# ==========================================================================
+# F8: THE ENVIRONMENT PATH BYPASSED THE ARGV PATH'S VALIDATION
+# ==========================================================================
+print("\n=== numeric values from the environment ===")
+#
+# Every numeric flag is declared type=decimal_arg, which exists because
+# type=Decimal answers a typo with a raw traceback and because Decimal ACCEPTS
+# "NaN" and "Infinity". Then the same tools grew GS_* variables, PREFERRED over
+# argv because /proc/<pid>/cmdline is world-readable — and every one re-parsed
+# with a bare Decimal(). The preferred path was the unvalidated one.
+#
+# Measured before the fix: `GS_EXPECT_XMR=Infinity receive_watch ...` produced
+# an uncaught ValueError traceback out of accept_floor.
+import subprocess as _sp2, json as _json2, tempfile as _tf2
+
+_RWA = ("83Ss8Wx9CmH4EaWkan3bdGhAybs7r3xgHZnMeWMNgwwdW3BJc6nfjTbFL9V4Go9Lx"
+        "ZjUvDCX9H416cHR68m8aLc6FUZFVRJ")
+_bdir = _tf2.mkdtemp(prefix="f8_")
+_bundle = os.path.join(_bdir, "b.json")
+with open(_bundle, "w") as _fh:
+    _json2.dump({"schema": "gs_receive_wallet_v1", "address": _RWA,
+                 "account_index": 3, "subaddress_index": 1, "wallet_file": "w",
+                 "nettype": "mainnet", "created": "2026-01-01T00:00:00Z"}, _fh)
+
+
+def _run_env(tool, env_name, value, extra):
+    e = dict(os.environ)
+    e[env_name] = value
+    e.pop("GS_EXIT_TO", None)
+    p = _sp2.run([sys.executable, os.path.join(REPO, tool)] + extra,
+                 capture_output=True, text=True, timeout=90, env=e, cwd=_bdir)
+    return (p.stdout + p.stderr)
+
+
+_CASES = [
+    ("receive_watch", "GS_EXPECT_XMR",
+     ["--receive-wallet", _bundle, "--tor-proxy", "socks5h://127.0.0.1:9050"]),
+    ("thor_swap_preparer", "GS_SWAP_AMOUNTS",
+     ["--dests", _RWA, "--tor-proxy", "socks5h://127.0.0.1:9050"]),
+]
+for _tool, _var, _extra in _CASES:
+    for _bad, _why in (("Infinity", "finite"), ("NaN", "finite"),
+                       ("notanumber", "number")):
+        _out = _run_env(_tool, _var, _bad, _extra)
+        check(f"F8: {_var}={_bad} is refused by name, not by traceback",
+              _var in _out and "Traceback" not in _out and _why in _out)
+    # ...and a VALID value must still get through. Asserting the ABSENCE of an
+    # error is not enough: the first version of decimal_env took (text, label)
+    # instead of (label, text), so every call parsed the variable NAME and
+    # aborted on valid input — and a check that only grepped for "Traceback"
+    # passed it.
+    _ok = _run_env(_tool, _var, "2.5", _extra)
+    check(f"F8: {_var}=2.5 is ACCEPTED (the tool proceeds past parsing)",
+          "is not a number" not in _ok and "not a finite" not in _ok
+          and "must be positive" not in _ok)
+
+# GhostSpiral's two, same shape.
+_GSE = ["--tor-proxy", "socks5h://127.0.0.1:9050"]
+_gs_env = dict(os.environ)
+for _var in ("GS_BTC_AMOUNT", "GS_EXPECT_TOTAL_XMR"):
+    _e = dict(os.environ)
+    _e["GS_BTC_ENTRY"] = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    _e[_var] = "Infinity"
+    _e.pop("GS_EXIT_TO", None)
+    _p = _sp2.run([sys.executable, os.path.join(REPO, "GhostSpiral")] + _GSE,
+                  capture_output=True, text=True, timeout=90, env=_e, cwd=_bdir)
+    _o = _p.stdout + _p.stderr
+    check(f"F8: {_var}=Infinity is refused by name, not by traceback",
+          _var in _o and "Traceback" not in _o and "finite" in _o)
+
+# The helper itself, directly — including the argument order that was wrong.
+check("F8: decimal_env takes (label, value), not (value, label)",
+      _gsc.decimal_env("GS_X", "2.5") == D("2.5"))
+for _v in ("Infinity", "NaN", "abc"):
+    _r = None
+    try:
+        _gsc.decimal_env("GS_X", _v)
+    except SystemExit as _e:
+        _r = str(_e)
+    check(f"F8: decimal_env refuses {_v!r}", _r is not None and "GS_X" in _r)
+check("F8: ...and its rules match decimal_arg's, which the argv path uses",
+      not D("Infinity").is_finite() and not D("NaN").is_finite())
+
+
+
+# ==========================================================================
+# F9: THE TOOL CHMOD'ED THE DIRECTORY YOU RAN IT IN
+# ==========================================================================
+print("\n=== operator-chosen directories are not this tool's to modify ===")
+#
+# create_receive_wallet's --output-dir defaults to ".", and secure_mkdir
+# deliberately NARROWS a pre-existing directory's mode (its docstring says so:
+# "exist_ok=True silently keeps a pre-existing directory's mode ... It is
+# narrowed too"). So every run chmod'ed the operator's current working
+# directory to 0700. Measured: 755 -> 700.
+#
+# It only ever narrows, so nothing leaked. Silently changing the permissions of
+# a directory you were merely asked to write a file into is still not the
+# tool's business, and "it was only tightened" is not a defence.
+import stat as _stat2, shutil as _sh2
+
+_d9 = _tf2.mkdtemp(prefix="f9_")
+_theirs = os.path.join(_d9, "operator_dir")
+os.mkdir(_theirs)
+os.chmod(_theirs, 0o755)
+_gsc.secure_mkdir(_theirs, narrow_existing=False)
+check("F9: a directory that ALREADY existed keeps its mode",
+      _stat2.S_IMODE(os.stat(_theirs).st_mode) == 0o755)
+
+# ...while one this toolchain CREATES is still made owner-only: the metadata
+# leak secure_mkdir exists to close is real for staging dirs.
+_ours = os.path.join(_d9, "made_by_us", "nested")
+_gsc.secure_mkdir(_ours)
+check("F9: a directory the tool CREATES is still 0700",
+      _stat2.S_IMODE(os.stat(_ours).st_mode) == 0o700)
+check("F9: ...including the parents it had to create",
+      _stat2.S_IMODE(os.stat(os.path.dirname(_ours)).st_mode) == 0o700)
+
+# Non-vacuity: the default still narrows, so the parameter is what changed the
+# behaviour and not some unrelated edit.
+_theirs2 = os.path.join(_d9, "operator_dir2")
+os.mkdir(_theirs2)
+os.chmod(_theirs2, 0o755)
+_gsc.secure_mkdir(_theirs2)
+check("control: secure_mkdir STILL narrows by default (the old behaviour is "
+      "intact for callers that want it)",
+      _stat2.S_IMODE(os.stat(_theirs2).st_mode) == 0o700)
+
+# And the caller uses it. Checked over the AST, not by grepping for a string:
+# a substring search would pass on `secure_mkdir(outdir)  # narrow_existing=False`.
+import ast as _ast9
+_crw = _ast9.parse(open(os.path.join(REPO, "create_receive_wallet")).read())
+_calls = [n for n in _ast9.walk(_crw)
+          if isinstance(n, _ast9.Call)
+          and getattr(n.func, "id", None) == "secure_mkdir"]
+check("F9: create_receive_wallet calls secure_mkdir exactly once",
+      len(_calls) == 1)
+check("F9: ...and passes narrow_existing=False as a real keyword argument",
+      any(k.arg == "narrow_existing"
+          and getattr(k.value, "value", None) is False
+          for k in _calls[0].keywords))
+_sh2.rmtree(_d9, ignore_errors=True)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

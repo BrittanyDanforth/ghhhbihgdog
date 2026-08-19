@@ -59,6 +59,7 @@ from gs_common import (
     env_or_argv, decimal_arg, accept_floor,
     sum_quoted_xmr,
     swap_arrival_floor,
+    decimal_env, XMR_ABSURD_TOTAL,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -754,10 +755,12 @@ def main():
                           str(args.expect_xmr) if args.expect_xmr is not None else None,
                           "The expected XMR amount")
     if _expect is not None:
-        try:
-            args.expect_xmr = Decimal(str(_expect))
-        except Exception:                                    # noqa: BLE001
-            sys.exit("[!] GS_EXPECT_XMR is not a number.")
+        # decimal_env, not a bare Decimal: the argv path is type=decimal_arg
+        # and this one was not, so the PREFERRED path was the unvalidated one.
+        # GS_EXPECT_XMR=Infinity parsed, passed every downstream test, and blew
+        # up as an uncaught traceback out of accept_floor.
+        args.expect_xmr = decimal_env("GS_EXPECT_XMR", _expect, positive=True,
+                                      max_value=XMR_ABSURD_TOTAL)
 
     if args.tolerance < 0 or args.tolerance >= 1:
         sys.exit("[!] --tolerance must be >= 0 and < 1.")
