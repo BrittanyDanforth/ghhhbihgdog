@@ -63,6 +63,13 @@ URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:\d{1,5})?$")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")
 DEC_RE = re.compile(r"^\d{1,10}(\.\d{1,12})?$")
+#: Monero address: 95 chars, base58 (no 0OIl), 4/8 prefix. Standard AND
+#: subaddress forms both start 4/8 and both are legitimate exit destinations --
+#: an exchange deposit address is normally a subaddress. This is a FORMAT check
+#: only; the CHECKSUM is verified by GhostSpiral's resolve_exit_destinations
+#: before anything moves, because a stdlib-only console cannot compute Monero's
+#: keccak variant and inventing a weaker check here would be worse than none.
+XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
 
 SCHEMA = {
     "mode":         ("choice", ["send", "receive"]),
@@ -85,7 +92,15 @@ SCHEMA = {
     "wallet_file":  ("re", PATH_RE),
     "output":       ("re", PATH_RE),
     "label":        ("re", re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")),
+    #: THE EXIT DESTINATIONS. A list, because --exit-to is repeatable and
+    #: spreading the withdrawal is the point: one address re-joins off-chain
+    #: everything the run separated on-chain.
+    "exit_to":      ("list_re", XMR_RE),
 }
+
+#: Most destinations anyone can sensibly hand-manage, and a hard bound on how
+#: much a single request can make this compose.
+MAX_EXIT_DESTS = 16
 
 
 def clean(params: dict) -> dict:
@@ -115,6 +130,32 @@ def clean(params: dict) -> dict:
                     errs.append(f"{k} is not a valid {k.replace('_',' ')}: {s[:48]}")
                 elif s:
                     out[k] = s
+            elif kind == "list_re":
+                # Accept a JSON array or a newline/comma separated string, so
+                # the field works whether the page sends a list or raw text.
+                raw = v if isinstance(v, list) else re.split(r"[\s,]+", str(v))
+                items, seen = [], set()
+                for it in raw:
+                    t = str(it).strip()
+                    if not t:
+                        continue
+                    if not spec.match(t):
+                        errs.append(f"{k}: not a valid Monero address: {t[:16]}…")
+                        continue
+                    if t in seen:
+                        # Same reasoning as GhostSpiral.resolve_exit_destinations:
+                        # repeating an address looks like spreading while
+                        # actually concentrating the withdrawal.
+                        errs.append(f"{k}: {t[:12]}… is listed more than once — "
+                                    f"repeating spreads the withdrawal, it does "
+                                    f"not send more to one place")
+                        continue
+                    seen.add(t)
+                    items.append(t)
+                if len(items) > MAX_EXIT_DESTS:
+                    errs.append(f"{k}: at most {MAX_EXIT_DESTS} destinations")
+                elif items:
+                    out[k] = items
         except (TypeError, ValueError):
             errs.append(f"{k} is not readable")
     return {"params": out, "errors": errs}
@@ -158,6 +199,11 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
             a += [flag, p[key]]
     if p.get("allow_clearnet_relay"):
         a.append("--allow-clearnet-relay")
+    # THE EXIT. Repeated once per destination, which is how GhostSpiral spreads
+    # the withdrawal. Absent, nothing is withdrawn and the run says so -- the
+    # console must not imply otherwise, so there is no default here.
+    for d in p.get("exit_to") or []:
+        a += ["--exit-to", d]
     return a, why
 
 
@@ -239,7 +285,9 @@ ACTIONS = {
 
     # the pipeline itself — this one moves money
     "run_pipeline":    {"group": "Pipeline", "label": "Run pipeline", "risk": "spends",
-                        "desc": "fan-out, optional DAG hops, sign and broadcast",
+                        "desc": "fan-out, optional DAG hops, sign and broadcast — "
+                                "and, with exit destinations set, WITHDRAW the "
+                                "mixed funds off this wallet",
                         "build": lambda p: pipeline_argv(p)[0]},
 
     # verification
@@ -1339,6 +1387,29 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <div class="fees" id="fees"></div>
       <div class="fsrc" id="fsrc">loading…</div>
     </div>
+    <div class="subsec">
+      <div class="subhead"><span>Exit — where the money goes afterwards</span>
+        <span class="mut-s">optional</span></div>
+      <p class="lead">One Monero address per line. The mix ends with your funds spread
+      across many accounts on this wallet; the exit spends them out,
+      <b>one transaction per output</b>, never a single collecting sweep — the
+      inputs of a transaction are public, so spending them together would prove
+      they share an owner and undo the run.</p>
+      <div class="f" style="grid-template-columns:1fr">
+        <textarea id="exit_to" rows="3" spellcheck="false"
+          placeholder="4… or 8… (one per line; leave empty to withdraw nothing)"></textarea>
+      </div>
+      <p class="lead"><b>Leave it empty and nothing is withdrawn</b> — the funds
+      stay on this wallet and the run tells you so. Give <i>several</i> addresses
+      and the withdrawal is spread across them: sending everything to one address
+      re-joins off-chain exactly what the run separated on-chain, and no amount
+      of mixing undoes that.</p>
+      <p class="lead mut-s">Format is checked here; the full <b>checksum</b> is
+      verified by the pipeline before any funds move — a mistyped Monero address
+      is often still well-formed, and a send has no confirmation step and no
+      reversal.</p>
+      <div id="exitnote" class="warnbox" hidden></div>
+    </div>
     <div class="stepnav"><button class="bk" data-go="2">← Back</button><button class="nx" data-go="4">Next →</button></div>
   </section>
 
@@ -1489,7 +1560,11 @@ function collect(){
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),
   rpc_primary:v('rpc_primary'), rpc_daemon:v('rpc_daemon'),
-  wallet_file:v('wallet_file')};
+  wallet_file:v('wallet_file'),
+  // Split on any whitespace/comma so paste-from-anywhere works. The server
+  // re-validates every entry against XMR_RE and drops unknown keys, so this
+  // is convenience only -- it is not the check.
+  exit_to:($('#exit_to')?.value||'').split(/[\s,]+/).filter(Boolean)};
 }
 
 // ── NON-NEGOTIABLE OPSEC preflight ─────────────────────────────────────────
@@ -1586,6 +1661,38 @@ $('#armword').textContent=ARM;
 $('#pwnote').innerHTML=PWSET
  ? 'Wallet password found in <code>GS_WALLET_PASSWORD</code> — forwarded only to the signing child, never shown here.'
  : 'No <code>GS_WALLET_PASSWORD</code> set. If your wallet has a password, restart the console with it exported — it is never accepted through this page.';
+
+// SAY WHAT THE EXIT FIELD WILL DO, as it is typed. Whether the run ends with
+// the money withdrawn or sitting on the wallet is the single most consequential
+// thing on this page, and leaving it empty is a legitimate choice -- so it must
+// read as a stated outcome rather than an unnoticed default.
+function syncExitNote(){
+ const box=$('#exitnote'); if(!box) return;
+ const raw=($('#exit_to')?.value||'').split(/[\s,]+/).filter(Boolean);
+ const uniq=[...new Set(raw)];
+ const bad=uniq.filter(a=>!/^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/.test(a));
+ box.hidden=false;
+ if(!raw.length){
+  box.innerHTML='<b>No exit set.</b> The mix will run and the funds will stay on '
+   +'this wallet, spread across the run\'s accounts. Nothing is withdrawn. '
+   +'Spend them one account at a time if you move them by hand.';
+ } else if(bad.length){
+  box.innerHTML='<b>'+bad.length+' address(es) are not a valid Monero format.</b> '
+   +'The run will refuse them before it starts: '+esc(bad[0].slice(0,16))+'…';
+ } else if(uniq.length<raw.length){
+  box.innerHTML='<b>A destination is repeated.</b> Repeating spreads the '
+   +'withdrawal, it does not send more to one place — the run will refuse it.';
+ } else if(uniq.length===1){
+  box.innerHTML='<b>All outputs go to ONE address.</b> Each still leaves in its '
+   +'own transaction, but a single destination re-joins them off-chain. Add more '
+   +'addresses to spread the withdrawal.';
+ } else {
+  box.innerHTML='<b>Exit armed: '+uniq.length+' destinations.</b> Every output '
+   +'is withdrawn in its own transaction, spread across them.';
+ }
+}
+$('#exit_to')?.addEventListener('input',syncExitNote);
+syncExitNote();
 
 // One grouped GRID, not a card per group. Group order is fixed so the board
 // reads Preflight -> Receive -> Pipeline -> Verify regardless of dict order.

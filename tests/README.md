@@ -26,6 +26,11 @@ python3 tests/test_receive_wallet_cli.py
                                     #   covered, the repo's lowest). The gates were
                                     #   already correct -- this locks them in rather
                                     #   than fixing anything
+python3 tests/test_console_exit.py   # the CONSOLE's exit wiring, over REAL HTTP:
+                                    #   token/origin/content-type gates, the arm
+                                    #   phrase, server-side OPSEC preflight, and that
+                                    #   collect() actually SENDS the field (a form can
+                                    #   look complete and never post the parameter)
 python3 tests/test_exit_withdraw.py  # THE EXIT: --exit-to actually spends the mixed
                                     #   funds off the wallet, ONE TRANSACTION PER
                                     #   OUTPUT (never a collecting sweep), to
