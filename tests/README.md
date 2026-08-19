@@ -21,6 +21,11 @@ python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-d
 python3 tests/test_gapfixes.py      # paranoia_mode MAC-spoof restore + MAC-not-logged,
                                     #   exit_strategy_simulator --redact and its
                                     #   de-simulation (no invented liquidity/slippage)
+python3 tests/test_receive_wallet_cli.py
+                                    # create_receive_wallet's argument gates (40%
+                                    #   covered, the repo's lowest). The gates were
+                                    #   already correct -- this locks them in rather
+                                    #   than fixing anything
 python3 tests/test_signer_schema.py # LAST GATE BEFORE MONEY MOVES: airgap_tx_signer's
                                     #   plan validator against malformed plans. Coverage
                                     #   put the signer at 57% with 45 abort lines never
