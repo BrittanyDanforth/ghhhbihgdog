@@ -84,12 +84,23 @@ real_gettempdir = tempfile.gettempdir
 para.tempfile.gettempdir = lambda: str(tmpd)
 _orig_roots = None
 
-# Redirect the /dev/shm literal by monkeypatching the helper's view of it:
-# the function builds ["/dev/shm", gettempdir()], so run it twice -- once with
-# gettempdir pointing at the fake shm, once at the fake TMPDIR -- and assert
-# the same contract each time. That exercises the identical code path the real
-# /dev/shm entry takes without ever scanning the host's real /dev/shm.
+# BOTH roots are redirected, and the /dev/shm one has to be.
+#
+# This previously patched only tempfile.gettempdir and claimed it therefore ran
+# "without ever scanning the host's real /dev/shm". That was FALSE: the helper
+# built ["/dev/shm", gettempdir()] with the first entry as a literal, so the
+# real /dev/shm was scanned on every iteration no matter what gettempdir said.
+# With dry=False this test then SECURELY DELETED any live
+# gs_sign_*/gs_impout_*/.gs_pw_* it found there -- which is precisely the
+# scratch a concurrently running signer keeps in RAM. Running the suite beside
+# a real pipeline run made the count wrong, because the sweep had reached into
+# the other run and erased its working directory.
+#
+# paranoia_mode.SHM_ROOT exists so this is patchable. Each iteration points
+# BOTH roots at the same fake directory, so the assertions below describe only
+# files this test created.
 for label, root in (("shm-like", shm), ("tmpdir", tmpd)):
+    para.SHM_ROOT = str(root)
     para.tempfile.gettempdir = lambda r=root: str(r)
     count, failed = para._wipe_targeted_temp_roots(
         dry=False, uid=os.getuid(), already_done=["/tmp", "/var/tmp"])
@@ -213,6 +224,40 @@ check("wipe_tmp_files calls the targeted sweep", "args" in called)
 check("...passing the dry flag through", called.get("args", (None,))[0] is True)
 check("...and telling it which roots were already blanket-swept",
       set(called.get("args", (0, 0, []))[2]) == {"/tmp", "/var/tmp"})
+
+# THE SUITE MUST NOT REACH INTO THE HOST'S REAL /dev/shm.
+#
+# This is the regression guard for a defect in this very file. It patched only
+# tempfile.gettempdir while the helper hard-coded "/dev/shm" as its first root,
+# so every run scanned the real one -- with dry=False, i.e. it SECURELY DELETED
+# whatever matched there. The matching names are a live signer's RAM scratch:
+# gs_impout_* (the wallet output-set blob) and .gs_pw_* (the wallet password in
+# plaintext). Running the suite beside a real pipeline erased another run's
+# working directory, and the comment above claimed the opposite.
+#
+# Proven both ways before this was added: with the literal restored the decoy
+# below is destroyed; with SHM_ROOT patchable it survives.
+_decoy = Path("/dev/shm/gs_impout_SUITE_DECOY")
+_decoy_ok = None
+try:
+    _decoy.mkdir(parents=True, exist_ok=True)
+    (_decoy / "outputs.bin").write_text("a concurrently running signer's scratch")
+    para.SHM_ROOT = str(shm)
+    para.tempfile.gettempdir = lambda: str(tmpd)
+    para._wipe_targeted_temp_roots(dry=False, uid=os.getuid(),
+                                   already_done=["/tmp", "/var/tmp"])
+    _decoy_ok = (_decoy / "outputs.bin").exists()
+except OSError:
+    _decoy_ok = None          # no /dev/shm on this host: skip, never fake
+finally:
+    _sh0 = __import__("shutil")
+    _sh0.rmtree(_decoy, ignore_errors=True)
+
+if _decoy_ok is None:
+    print("  skip  /dev/shm is unavailable; real-root isolation not checked")
+else:
+    check("the sweep does NOT touch the host's real /dev/shm "
+          "(a live signer's gs_impout_* scratch survives)", _decoy_ok)
 
 import shutil as _sh
 _sh.rmtree(sandbox, ignore_errors=True)

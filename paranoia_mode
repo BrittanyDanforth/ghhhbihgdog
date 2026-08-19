@@ -652,6 +652,21 @@ def wipe_gs_artifacts(dry: bool, extra_dirs: list = None):
 #   .gs_pw_*    -- the wallet password in plaintext.
 GS_TEMP_PREFIXES = ("gs_sign_", "gs_impout_", ".gs_pw_")
 
+#: The RAM-backed scratch root, as a name rather than a literal buried in
+#: _wipe_targeted_temp_roots.
+#:
+#: It is hoisted so a test can point the sweep somewhere harmless. It could
+#: not before: the function built ["/dev/shm", tempfile.gettempdir()], so
+#: patching gettempdir redirected only the SECOND root and the real /dev/shm
+#: was scanned regardless -- while test_shmwipe's own comment claimed it ran
+#: "without ever scanning the host's real /dev/shm". With dry=False that test
+#: securely DELETED any live gs_sign_*/gs_impout_*/.gs_pw_* it found there,
+#: which is exactly the scratch a concurrently running signer keeps in RAM.
+#: Observed: running the suite beside a real pipeline run made the entry count
+#: wrong, because the sweep had reached into the other run and erased its
+#: working directory.
+SHM_ROOT = "/dev/shm"
+
 
 def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
     """Securely delete OUR scratch from temp roots we must not wipe wholesale.
@@ -685,7 +700,7 @@ def _wipe_targeted_temp_roots(dry: bool, uid: int, already_done: list):
     """
     count = 0
     failed = 0
-    roots = ["/dev/shm", tempfile.gettempdir()]
+    roots = [SHM_ROOT, tempfile.gettempdir()]
     seen = set(os.path.realpath(d) for d in already_done)
     for root in roots:
         try:
