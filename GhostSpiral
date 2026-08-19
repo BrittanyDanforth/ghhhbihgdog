@@ -1976,7 +1976,7 @@ def report_holdings(rpc, accounts) -> list:
     return funded
 
 
-def report_completion(rpc, incomplete, accounts) -> None:
+def report_completion(rpc, incomplete, accounts, spent_plans=()) -> None:
     """Say what actually happened, then say where the money is. Exits non-zero
     on an incomplete run.
 
@@ -1989,6 +1989,11 @@ def report_completion(rpc, incomplete, accounts) -> None:
     accounts are mid-flight: value is sitting on carriers that were meant to
     forward it, and listing balances then would read as "here is your result"
     when the result is a half-executed chain.
+
+    spent_plans is wiped for the same reason and on the same condition: this is
+    the one place that knows the run completed, so it is the one place that can
+    tell a plan that is SPENT from a plan the operator still needs. See
+    _wipe_spent_plans. Default empty so every other caller is unaffected.
     """
     print()
     if incomplete:
@@ -2000,6 +2005,7 @@ def report_completion(rpc, incomplete, accounts) -> None:
               "mixing depth was applied.")
         sys.exit(1)
     report_holdings(rpc, accounts)
+    _wipe_spent_plans(*spent_plans)
     integrity_log("main", "pipeline_complete")
     print("  [+] GhostSpiral v10.5 pipeline complete — every planned round ran.")
 
@@ -2533,8 +2539,32 @@ def main():
                                  veil_need=usable)
 
         report_completion(rpc_primary, incomplete,
-                          [a for a, _ in addr_index.values()]
-                          + list(change_accounts))
+                          [a for a, _ in addr_index.values()] + list(change_accounts),
+                          spent_plans=(veil_file, fanout_file, dag_file))
+
+
+def _wipe_spent_plans(*plan_files):
+    """Securely erase the unsigned plan files after a fully complete run.
+
+    Each unsigned_*.json holds every hop's source, destination, amount and
+    account index in plaintext -- the most sensitive artifact this pipeline
+    writes. On a complete run every transaction it describes has been
+    broadcast, so the plan is spent and has no resume value. Left behind, it
+    sat in ./unsigned (or --output) until the START of the next run, when
+    _stage5_cleanup finally erased it -- and forever if there was no next run.
+    paranoia_mode also globs it, but that is a separate step an operator can
+    forget, and it misses a plan written under a --output outside its four
+    search roots.
+
+    Called only past report_completion's incomplete-run sys.exit, so an
+    INCOMPLETE run KEEPS its plan on purpose: those accounts are mid-flight and
+    the operator may need to see what was meant to happen. The staging blobs
+    are already gone -- each _run_round wipes its own.
+    """
+    for pf in plan_files:
+        if pf and Path(pf).exists() and not secure_delete_file(pf):
+            print(f"  [!] Could not securely erase the spent plan {pf}; it holds "
+                  f"every hop's destination and amount. Remove it by hand.")
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.

@@ -2406,6 +2406,48 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
       "NOT what was planned" in _buf5.getvalue()
       and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
 
+# THE SPENT PLAN MUST NOT SURVIVE A COMPLETED RUN. Each unsigned_*.json holds
+# every hop's source, destination, amount and account index in PLAINTEXT. A
+# real run left them in --output after finishing: nothing erased them until the
+# START of the next run (_stage5_cleanup), and nothing at all if there was no
+# next run. Observed on an end-to-end run, alongside the staging blobs that
+# _run_round now wipes.
+#
+# The condition matters as much as the wipe: an INCOMPLETE run must KEEP its
+# plan, because those accounts are mid-flight and the plan is the only record
+# of what was supposed to happen. report_completion is the one place that knows
+# which case this is, which is why the wipe lives there.
+_pw = Path(tempfile.mkdtemp(prefix="planwipe_"))
+
+
+def _mkplan(_n):
+    _p = _pw / _n
+    _p.write_text(json.dumps({"meta": {}, "txs": [{"dst": "84AAA", "amount": "1.0"}]}))
+    return _p
+
+
+_pv, _pf, _pd = _mkplan("unsigned_veil_x.json"), _mkplan("unsigned_fanout_x.json"), None
+with _ctx.redirect_stdout(_io.StringIO()):
+    ghost.report_completion(_BalRpc({4: 1}), [], [4], spent_plans=(_pv, _pf, _pd))
+check("spent plans: a COMPLETE run securely erases the veil plan", not _pv.exists())
+check("spent plans: a COMPLETE run securely erases the distribution plan", not _pf.exists())
+
+_pv2, _pf2 = _mkplan("unsigned_veil_y.json"), _mkplan("unsigned_fanout_y.json")
+try:
+    with _ctx.redirect_stdout(_io.StringIO()):
+        ghost.report_completion(_BalRpc({4: 1}), ["DAG round was SKIPPED"], [4],
+                                spent_plans=(_pv2, _pf2))
+except SystemExit:
+    pass
+check("spent plans: an INCOMPLETE run KEEPS the veil plan", _pv2.exists())
+check("spent plans: an INCOMPLETE run KEEPS the distribution plan", _pf2.exists())
+
+# The kwarg defaults to empty, so no existing caller changed behaviour.
+with _ctx.redirect_stdout(_io.StringIO()):
+    ghost.report_completion(_BalRpc({4: 1}), [], [4])
+check("spent plans: report_completion is still callable without spent_plans", True)
+shutil.rmtree(_pw, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # THE ENTRY VEIL. A ThorChain memo is public, so the output that funded the run
