@@ -1049,6 +1049,20 @@ def _quotes(chunks, dests):
             return ghost.stage2_get_swap_quotes(_a, None, chunks, dests), None
     except SystemExit as e:
         return None, str(e.code)
+    except Exception as e:                                   # noqa: BLE001
+        # A CRASH IS NOT A PASS AND IT IS NOT A CATCH EITHER.
+        #
+        # Without the length guard, xmr_dests[i] raises IndexError on the
+        # third chunk -- so this helper died and took the whole FILE with it,
+        # printing a traceback and no RESULT line. A mutation sweep scores
+        # that as NO-RESULT, correctly: a suite that crashed proves nothing
+        # about its checks, and a reader sees a broken test rather than a
+        # broken guarantee.
+        #
+        # Returned as an error string instead, so the check below FAILS with
+        # its own words. The same pathology bit test_ipleak earlier in this
+        # audit; it is the reason that convention exists.
+        return None, f"{type(e).__name__}: {e}"
     finally:
         (ghost.safe_post, ghost.btc_per_xmr_oracle, ghost.newnym,
          ghost.secure_delay, ghost.integrity_log) = saved
@@ -1061,8 +1075,10 @@ _r, _m = _quotes(_CH, [_E1, _E2])
 check("gap: THREE chunks with TWO destinations is REFUSED — a short list "
       "would re-use an address for the rest, which is the linkage the split "
       "removes", _m is not None)
-check("gap: ...and it refuses before any quote is fetched, not after",
-      _m and "Refusing to quote" in _m)
+check("gap: ...and it refuses DELIBERATELY, with a reason — not by crashing "
+      "on an index it never checked",
+      _m is not None and "Refusing to quote" in _m
+      and "IndexError" not in _m)
 
 _r, _m = _quotes(_CH, [_E1, _E2, _E1])
 check("gap: two chunks sharing a destination is REFUSED", _m is not None)
