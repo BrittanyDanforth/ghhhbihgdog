@@ -2504,6 +2504,100 @@ def resolve_exit_destinations(args) -> None:
     integrity_log("exit", f"exit_destinations_validated:{len(dests)}")
 
 
+def reject_self_exit(args, addr_index: dict, entry_addr: str) -> None:
+    """Refuse an --exit-to that names an address THIS RUN itself created.
+
+    resolve_exit_destinations validates the exit addresses at flag-parse time,
+    which is the right moment to catch a typo. But at that moment the run has
+    created nothing, so it cannot yet ask the question that matters most: is
+    the destination somewhere the money already is? This is that question,
+    asked as soon as ENTRY and the mix subaddresses exist and still BEFORE the
+    swap is quoted -- so a run that would end by undoing itself dies before a
+    single satoshi is deposited, rather than hours later on its last step.
+
+    NOTHING CHECKED THIS. The exit destination was validated for FORM (base58,
+    checksum, network byte) and for DUPLICATES, and then swept to. A
+    well-formed address the operator already owns passes both tests, and there
+    are two ways to arrive at one:
+
+      * GS_EXIT_TO IS AN ENVIRONMENT VARIABLE, so it is the kind of value that
+        gets set once in a shell profile and reused. The receive bundle's
+        address changes every run (create_receive_wallet mints a fresh
+        account per receive). A GS_EXIT_TO left over from a previous receive
+        wallet is a 95-character string that still validates perfectly.
+      * In receive mode the operator handles ENTRY by hand -- it is the
+        address they paste to whoever is paying them. Pasting the wrong
+        clipboard entry into an exit destination is the ordinary failure mode
+        of 95-character base58, not an exotic one.
+
+    THE ENTRY CASE IS THE WORST OUTCOME THIS PIPELINE HAS. ENTRY is the
+    address the ThorChain memo names in a public Bitcoin OP_RETURN. The exit
+    holds ENTRY as a SOURCE for exactly that reason (see _exit_hold_list:
+    "sweeping it would be ... the one link the entire pipeline exists to
+    break"). Holding it as a source while allowing it as a DESTINATION covers
+    one direction of the same edge: every mixed output would be swept back
+    onto the memo address, in N transactions that all converge there. The run
+    would spend hours and N fees separating those outputs and then publish
+    them, together, on the one address an analyst already has.
+
+    A MIX SUBADDRESS IS THE SECOND CASE, and it defeats the run's other
+    defence plus lies about it. Each output gets its own account so that no
+    later transaction can merge two of them (see create_subs -- "makes the
+    merge IMPOSSIBLE rather than merely discouraged"). Sweeping every output
+    to one mix subaddress merges all of them by hand, on purpose. It also
+    corrupts the report: _run_exit_withdrawals reads _change_residue right
+    after each sweep, so the destination is measured before the later sweeps
+    refill it and the operator is told it was "emptied" while the balance
+    climbs behind them.
+
+    REFUSED, NOT WARNED. Both outcomes are unrecoverable -- Monero has no
+    reversal -- and neither has a legitimate use: an exit destination is by
+    definition somewhere other than the wallet being emptied.
+
+    SCOPE, STATED PLAINLY. `addr_index` is every subaddress this run created,
+    which is ENTRY plus every mix and extra output, and it is known LOCALLY --
+    no RPC, so this check cannot fail open the way a wallet lookup would if
+    monero-wallet-rpc were unreachable. It does NOT cover a subaddress
+    elsewhere in the same wallet that this run did not create, including the
+    accounts' own subaddress 0 change sinks. Those are never printed and never
+    handed to the operator, so there is no path by which they reach a
+    clipboard; the addresses that DO reach one are exactly the ones checked
+    here.
+    """
+    dests = getattr(args, "exit_to", None)
+    if not dests:
+        return
+    for d in dests:
+        if d not in addr_index:
+            continue
+        acct, idx = addr_index[d]
+        if d == entry_addr:
+            integrity_log("exit", "SELF_EXIT_REFUSED:entry")
+            sys.exit(
+                f"[!] The exit destination {scrub_address(d)} is this run's "
+                f"ENTRY address.\n"
+                f"    That is the address the ThorChain memo publishes in a "
+                f"Bitcoin OP_RETURN. Withdrawing\n"
+                f"    to it would sweep every mixed output back onto the one "
+                f"address an analyst already\n"
+                f"    has, which is the exact link this run exists to break.\n"
+                f"    Use an address outside this wallet. If GS_EXIT_TO is set "
+                f"in your shell profile,\n"
+                f"    it is probably a leftover from an earlier receive wallet "
+                f"— check it.")
+        integrity_log("exit", "SELF_EXIT_REFUSED:mix_output")
+        sys.exit(
+            f"[!] The exit destination {scrub_address(d)} is one of this run's "
+            f"own mix subaddresses\n"
+            f"    (account {acct} / subaddr {idx}). Every output would be "
+            f"swept onto it, merging by hand\n"
+            f"    the outputs this run gives separate accounts so they can "
+            f"NEVER be merged — and the\n"
+            f"    exit would report them 'emptied' while the balance piles up "
+            f"behind it.\n"
+            f"    Use an address outside this wallet.")
+
+
 def resolve_hop_delay(args) -> tuple:
     """Turn --hop-delay into a window, exiting on a bad spec.
 
@@ -3233,6 +3327,12 @@ def main():
 
         import secrets as _secrets
         _secrets.SystemRandom().shuffle(subs)
+
+        # BEFORE THE SWAP, not at the exit. ENTRY and every mix subaddress now
+        # exist, so this is the first moment the run can ask whether --exit-to
+        # points back at itself -- and it is still the last moment before any
+        # money moves. See reject_self_exit.
+        reject_self_exit(args, addr_index, ENTRY)
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)

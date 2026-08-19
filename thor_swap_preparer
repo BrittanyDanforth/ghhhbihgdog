@@ -95,7 +95,8 @@ def _dest_from_bundle(path: str) -> str:
 
 
 def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
-    """Decide where each swap delivers. ONE FRESH ADDRESS PER SWAP, enforced.
+    """Decide where each swap delivers. ONE FRESH ADDRESS PER SWAP, and NEVER
+    THE ADDRESS THE MIX EXITS TO. Both enforced, both refusals.
 
     This is the most dangerous field in the tool -- whatever lands here goes
     into the swap memo and the XMR is delivered to it irreversibly -- and it
@@ -160,6 +161,56 @@ def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
 
     if len(out) != len(amounts):
         sys.exit(f"[!] Mismatch: {len(amounts)} amounts vs {len(out)} dests")
+
+    # AND IT MUST NOT BE THE OPERATOR'S EXIT ADDRESS.
+    #
+    # This is the worst outcome the whole toolchain has, and nothing checked
+    # it. The swap memo is written into a Bitcoin OP_RETURN -- public,
+    # permanent, and it names the XMR destination in full. Put the FINAL
+    # address there and the memo publishes it directly: there is no mixing to
+    # follow and no ring to unpick, the answer is simply printed on the
+    # Bitcoin chain. GhostSpiral's every defence -- the entry veil, the
+    # per-output accounts, the peel chain, the exit's refusal to sweep ENTRY
+    # -- exists to stop an analyst deriving that address, and none of them
+    # retract a memo.
+    #
+    # It is an ordinary mistake to make. --dests asks "where does the XMR
+    # go?", and the honest answer an operator holds in their head is their own
+    # wallet; that the answer here must be a THROWAWAY is a property of the
+    # design, not of the question. The tool prefers
+    # --dest-from-receive-wallet, but --dests takes any address and said
+    # nothing.
+    #
+    # WHAT THIS CAN AND CANNOT SEE, stated so it is not mistaken for more.
+    # GS_EXIT_TO is where the exit destination lives (GhostSpiral's
+    # resolve_exit_destinations made it the canonical home, precisely so it
+    # stays off argv), so a setup that follows OPSEC_SETUP.md has it set and
+    # this catches the collision. An operator who has not set it yet is not
+    # protected here -- this tool has nothing to compare against and does not
+    # pretend otherwise. That is a smaller check than none, not a substitute
+    # for reading the flag.
+    _exit_env = os.environ.get("GS_EXIT_TO") or ""
+    _exit_set = {x for x in re.split(r"[\s,]+", _exit_env) if x}
+    for i, d in enumerate(out):
+        if d in _exit_set:
+            integrity_log("thor", "SWAP_DEST_IS_EXIT_DEST")
+            sys.exit(
+                f"[!] Swap {i} would deliver to {scrub_address(d)}, which is "
+                f"also in GS_EXIT_TO —\n"
+                f"    the address you withdraw to at the END of the mix.\n"
+                f"    The swap memo goes into a Bitcoin OP_RETURN, in public "
+                f"and for ever, and it\n"
+                f"    names this address in full. Sending the swap straight "
+                f"there publishes your\n"
+                f"    final destination on the Bitcoin chain: nothing "
+                f"downstream can retract it,\n"
+                f"    and every later hop becomes decoration.\n"
+                f"    The swap destination is a THROWAWAY that GhostSpiral "
+                f"then mixes away from:\n"
+                f"        python3 create_receive_wallet --count "
+                f"{len(amounts)} --tor-proxy <SOCKS5H_PROXY>\n"
+                f"    and pass the bundle(s) with "
+                f"--dest-from-receive-wallet.")
 
     # The invariant, checked on the FINAL list so it holds however the
     # addresses were supplied -- bundles, --dests, or the environment.

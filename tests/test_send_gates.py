@@ -340,6 +340,197 @@ check("control: a good quote still passes stage 2",
       run_stage2(D("200"), D("0.005")) is None)
 
 
+# ==========================================================================
+# 4. reject_self_exit -- the exit destination must not be an address THIS RUN
+#    created.
+#
+# resolve_exit_destinations checks FORM and DUPLICATES. A well-formed address
+# the operator already owns passes both, and GS_EXIT_TO is an environment
+# variable -- the kind of value that survives in a shell profile after the
+# receive wallet it named has been replaced. Sweeping every mixed output onto
+# ENTRY publishes them all on the address the ThorChain memo names; sweeping
+# them onto a mix subaddress merges by hand the outputs create_subs gives
+# separate accounts specifically so they can never be merged.
+#
+# Driven directly AND through the real main(), because a guard that is not
+# called is not a guard -- which is the failure this whole file exists for.
+# ==========================================================================
+print("\n=== reject_self_exit ===")
+
+_B58A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _addr(seed: int) -> str:
+    """A distinct 95-char base58 string. Checksums are validate_xmr_address's
+    job (tested above); this section is about IDENTITY, so only distinctness
+    and shape matter."""
+    out = []
+    v = seed + 7
+    for _ in range(95):
+        v = (v * 1103515245 + 12345) % (2 ** 31)
+        out.append(_B58A[v % len(_B58A)])
+    return "4" + "".join(out[1:])
+
+
+ENTRY_A, MIX_A, MIX_B, FOREIGN = (_addr(1), _addr(2), _addr(3), _addr(4))
+check("fixture: the four addresses are distinct",
+      len({ENTRY_A, MIX_A, MIX_B, FOREIGN}) == 4)
+
+# ENTRY at account 9/1 so the mix message's numbers are unambiguous.
+IDX = {ENTRY_A: (9, 1), MIX_A: (11, 1), MIX_B: (12, 1)}
+
+
+def _rse(dests):
+    """Run the REAL guard with `dests` as --exit-to. Returns the abort msg."""
+    return aborts(ghost.reject_self_exit,
+                  types.SimpleNamespace(exit_to=dests), dict(IDX), ENTRY_A)
+
+
+# -- the two unrecoverable outcomes ---------------------------------------
+_m = _rse([ENTRY_A])
+check("self-exit: --exit-to ENTRY aborts", _m is not None)
+check("self-exit: ...and says it is ENTRY, not just 'your own address'",
+      _m is not None and "ENTRY" in _m)
+check("self-exit: ...and names WHY that one is the worst case (the public "
+      "memo), so the operator cannot read it as pedantry",
+      _m is not None and "memo" in _m.lower() and "OP_RETURN" in _m)
+
+_m = _rse([MIX_A])
+check("self-exit: --exit-to a mix subaddress aborts", _m is not None)
+check("self-exit: ...and locates it (account 11 / subaddr 1), which is what "
+      "the operator needs to tell WHICH address they pasted",
+      _m is not None and "11" in _m and "subaddr 1" in _m)
+check("self-exit: ...and says what it costs -- the merge create_subs exists "
+      "to make impossible",
+      _m is not None and "merg" in _m.lower())
+
+# The two messages must not be one generic message. They describe different
+# unrecoverable outcomes and different remedies.
+_e, _x = _rse([ENTRY_A]), _rse([MIX_A])
+check("self-exit: ENTRY and mix produce DIFFERENT messages", _e != _x)
+check("self-exit: the mix message does NOT claim the memo risk (it is not "
+      "true of a mix subaddress, and a wrong reason teaches the wrong lesson)",
+      _x is not None and "OP_RETURN" not in _x)
+
+# -- NON-VACUITY: it must let a real destination through -------------------
+check("control: a FOREIGN address does not abort", _rse([FOREIGN]) is None)
+check("control: several foreign addresses do not abort",
+      _rse([FOREIGN, _addr(5), _addr(6)]) is None)
+check("control: no --exit-to at all does not abort", _rse(None) is None)
+check("control: an empty --exit-to list does not abort", _rse([]) is None)
+
+# -- EVERY element, not just the first -------------------------------------
+# A guard written as `if dests[0] in addr_index` passes every check above.
+check("self-exit: ENTRY in the SECOND position still aborts",
+      _rse([FOREIGN, ENTRY_A]) is not None)
+check("self-exit: ...with the ENTRY message, not the mix one",
+      (_rse([FOREIGN, ENTRY_A]) or "").count("OP_RETURN") == 1)
+check("self-exit: a mix subaddress LAST in a longer list still aborts",
+      _rse([FOREIGN, _addr(5), MIX_B]) is not None)
+check("self-exit: ...and names THAT one's account (12), not the first "
+      "entry's",
+      "12" in (_rse([FOREIGN, _addr(5), MIX_B]) or ""))
+
+# -- the abort must not print the address it is complaining about ----------
+# The message goes to a terminal and into the operator's scrollback. ENTRY is
+# the one string this pipeline exists to keep off the record.
+for _label, _msg in (("ENTRY", _rse([ENTRY_A])), ("mix", _rse([MIX_A]))):
+    _full = ENTRY_A if _label == "ENTRY" else MIX_A
+    check(f"self-exit: the {_label} abort SCRUBS the address rather than "
+          f"echoing all 95 characters", _msg is not None and _full not in _msg)
+
+
+# -- WIRED: the real main() must reach this before the swap ----------------
+#
+# The guard is only worth anything if main() calls it, and calls it while the
+# money is still in Bitcoin. Drive the real main() to that point with the
+# network, the wallet and Tor stubbed, and use tor_recheck's OWN stage label
+# to prove where execution got to: "stage2_exec" is the first thing after the
+# call site, so reaching it means the guard ran and let the run continue.
+class _PastGuard(Exception):
+    pass
+
+
+def _drive_main(exit_to, receive=False):
+    """Run the REAL main() to the swap. Returns ('past', None) if the guard
+    allowed the run through, or ('abort', msg) if it stopped it."""
+    subs_fixture = [ENTRY_A, MIX_A, MIX_B, _addr(5), _addr(6)]
+    idx_fixture = {a: (10 + i, 1) for i, a in enumerate(subs_fixture)}
+    saved = {n: getattr(ghost, n) for n in
+             ("verify_tor", "require_resources", "check_daemon_relay_egress",
+              "connect_rpc", "stage0_preflight", "stage1_joinmarket",
+              "resolve_mix_account", "create_subs", "newnym", "tor_recheck",
+              "validate_xmr_address", "resolve_wallet_password",
+              "resolve_sensitive_inputs", "run_lock", "integrity_log")}
+    _argv = sys.argv[:]
+    try:
+        ghost.verify_tor = lambda *a, **k: None
+        ghost.require_resources = lambda *a, **k: None
+        ghost.check_daemon_relay_egress = lambda *a, **k: {
+            "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
+        ghost.connect_rpc = lambda *a, **k: object()
+        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage1_joinmarket = lambda *a, **k: []
+        ghost.resolve_mix_account = lambda *a, **k: None
+        ghost.create_subs = lambda *a, **k: (list(subs_fixture),
+                                             dict(idx_fixture), set())
+        ghost.newnym = lambda *a, **k: None
+        ghost.validate_xmr_address = lambda *a, **k: None
+        ghost.resolve_wallet_password = lambda *a, **k: None
+        ghost.resolve_sensitive_inputs = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+
+        @contextlib.contextmanager
+        def _nolock(*a, **k):
+            yield None
+        ghost.run_lock = _nolock
+
+        def _tr(_proxy, stage):
+            if stage == "stage2_exec":
+                raise _PastGuard()
+        ghost.tor_recheck = _tr
+
+        sys.argv = ["GhostSpiral", "--btc-entry",
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                    "--tor-proxy", "socks5h://127.0.0.1:9050",
+                    "--exit-to", exit_to]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ghost.main()
+        except _PastGuard:
+            return "past", None
+        except SystemExit as e:
+            return "abort", str(e.code)
+        return "returned", None
+    finally:
+        for n, v in saved.items():
+            setattr(ghost, n, v)
+        sys.argv = _argv
+
+
+# ENTRY is subs[0] in send mode, and the fixture puts ENTRY_A there.
+_state, _msg = _drive_main(ENTRY_A)
+check("wired: the REAL main() aborts on --exit-to == its own ENTRY",
+      _state == "abort")
+check("wired: ...with the self-exit message, not some other abort",
+      _state == "abort" and _msg is not None and "OP_RETURN" in _msg)
+
+_state, _msg = _drive_main(MIX_B)
+check("wired: the REAL main() aborts on --exit-to == one of its own mix "
+      "subaddresses", _state == "abort")
+check("wired: ...with the merge message", _state == "abort"
+      and _msg is not None and "merg" in _msg.lower())
+
+# AND IT ABORTS BEFORE ANY MONEY MOVES. Reaching stage2_exec is the swap being
+# executed; the guard must fire strictly before that, so the two runs above
+# must NOT be 'past'. This control proves 'past' is reachable at all -- without
+# it, a guard that aborted on everything would look identical.
+_state, _msg = _drive_main(FOREIGN)
+check("control: a FOREIGN --exit-to lets the real main() run ON to the swap "
+      "(so the two aborts above are the guard, not a broken fixture)",
+      _state == "past")
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

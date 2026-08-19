@@ -588,6 +588,131 @@ def test_count_mints_independent_receives():
     check("thor accepts the three bundles --count wrote", got == addrs)
 
 
+def test_swap_dest_must_not_be_the_exit_address():
+    """THE SWAP MEMO MUST NOT NAME THE ADDRESS THE MIX EXITS TO.
+
+    resolve_destinations enforced ONE FRESH ADDRESS PER SWAP and validated the
+    form, and a well-formed fresh address that happens to be the operator's
+    FINAL destination passed both. The memo goes into a Bitcoin OP_RETURN --
+    public, permanent, and carrying the 95-character XMR address in full -- so
+    that combination prints the answer the entire pipeline exists to withhold.
+    Nothing downstream retracts it: the entry veil, the per-output accounts,
+    the peel chain and the exit's own refusal to sweep ENTRY all become
+    decoration.
+
+    GS_EXIT_TO is where GhostSpiral keeps the exit destination (deliberately,
+    to keep it off argv), so it is what this can compare against.
+
+    Every check here manipulates the REAL environment around the REAL
+    resolver, and the controls below are the point: the guard must fire on a
+    collision and must NOT fire otherwise, or it would refuse every ordinary
+    run.
+    """
+    from decimal import Decimal as D
+    import json as _json
+
+    _saved = os.environ.get("GS_EXIT_TO")
+
+    def resolve(amounts, dests=None, bundles=None, exit_to=None):
+        if exit_to is None:
+            os.environ.pop("GS_EXIT_TO", None)
+        else:
+            os.environ["GS_EXIT_TO"] = exit_to
+        try:
+            return thor.resolve_destinations([D(x) for x in amounts],
+                                             dests or [], bundles or [])
+        except SystemExit as e:
+            return "REFUSED:" + str(e.code or "")
+        finally:
+            if _saved is None:
+                os.environ.pop("GS_EXIT_TO", None)
+            else:
+                os.environ["GS_EXIT_TO"] = _saved
+
+    try:
+        # -- the defect ---------------------------------------------------
+        r = resolve(["0.01"], dests=[DEST], exit_to=DEST)
+        check("a swap delivering to the GS_EXIT_TO address is REFUSED",
+              str(r).startswith("REFUSED"))
+        check("...and says WHY it is unrecoverable: the memo is a public "
+              "Bitcoin OP_RETURN",
+              "OP_RETURN" in str(r))
+        check("...and names GS_EXIT_TO, so the operator knows which value to "
+              "look at", "GS_EXIT_TO" in str(r))
+        check("...and says what a swap destination is supposed to be",
+              "throwaway" in str(r).lower())
+        check("...and tells them how to mint one",
+              "create_receive_wallet" in str(r))
+        check("...without echoing the address it is complaining about",
+              DEST not in str(r))
+
+        # -- CONTROLS: it must not fire on an ordinary run -----------------
+        # Without these, a resolver that refused everything would look
+        # identical to a working guard.
+        check("control: GS_EXIT_TO UNSET resolves normally",
+              resolve(["0.01"], dests=[DEST], exit_to=None) == [DEST])
+        check("control: GS_EXIT_TO EMPTY resolves normally",
+              resolve(["0.01"], dests=[DEST], exit_to="") == [DEST])
+        check("control: a GS_EXIT_TO that is a DIFFERENT address resolves "
+              "normally",
+              resolve(["0.01"], dests=[DEST], exit_to=OTHER) == [DEST])
+        check("control: a whole batch of non-colliding dests resolves",
+              resolve(["1", "2"], dests=[DEST, OTHER], exit_to=THIRD)
+              == [DEST, OTHER])
+
+        # -- every position, and every separator GhostSpiral accepts -------
+        # GS_EXIT_TO holds SEVERAL addresses (GhostSpiral splits on whitespace
+        # or commas). Reading only the first would leave the others unchecked.
+        check("a collision at the END of a batch is caught",
+              str(resolve(["1", "2"], dests=[OTHER, DEST],
+                          exit_to=DEST)).startswith("REFUSED"))
+        check("...and the refusal names THAT swap's position",
+              "Swap 1" in str(resolve(["1", "2"], dests=[OTHER, DEST],
+                                      exit_to=DEST)))
+        check("a SPACE-separated GS_EXIT_TO is read in full, not just its "
+              "first address",
+              str(resolve(["1"], dests=[DEST],
+                          exit_to=f"{OTHER} {DEST}")).startswith("REFUSED"))
+        check("a COMMA-separated GS_EXIT_TO is read in full too",
+              str(resolve(["1"], dests=[DEST],
+                          exit_to=f"{OTHER},{DEST}")).startswith("REFUSED"))
+
+        # -- however the destination was supplied --------------------------
+        # The check is on the RESOLVED list, so a bundle is no way around it.
+        d = tempfile.mkdtemp(prefix="gs_exitcoll_")
+
+        def bundle(name, addr):
+            p = os.path.join(d, name)
+            with open(p, "w") as fh:
+                _json.dump({"schema": "gs_receive_wallet_v1", "address": addr,
+                            "account_index": 1, "subaddress_index": 1}, fh)
+            return p
+
+        _b = bundle("x.json", DEST)
+        check("a RECEIVE BUNDLE holding the exit address is refused too — the "
+              "rule is on the resolved list, not on how it was typed",
+              str(resolve(["0.01"], bundles=[_b],
+                          exit_to=DEST)).startswith("REFUSED"))
+        check("control: the same bundle resolves when it is NOT the exit "
+              "address", resolve(["0.01"], bundles=[_b], exit_to=OTHER)
+              == [DEST])
+
+        # -- which refusal wins ---------------------------------------------
+        # A batch can break both rules at once. The exit collision is the
+        # worse outcome (a duplicate links two swaps; this publishes the
+        # answer), so it is the one the operator must be told about.
+        _both = str(resolve(["1", "2"], dests=[DEST, DEST], exit_to=DEST))
+        check("a batch that is BOTH duplicated and the exit address is "
+              "refused", _both.startswith("REFUSED"))
+        check("...naming the exit collision, which is the worse of the two",
+              "OP_RETURN" in _both)
+    finally:
+        if _saved is None:
+            os.environ.pop("GS_EXIT_TO", None)
+        else:
+            os.environ["GS_EXIT_TO"] = _saved
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

@@ -244,6 +244,32 @@ link, and no on-chain structure can remove it — which is why `--exit-to` is
 repeatable, and why splitting across venues and over time is the operator's
 call rather than something the software can do for them.
 
+**The exit address must be somewhere else, and both tools now refuse
+otherwise.** Two mistakes are unrecoverable and, until this was added, nothing
+looked for either:
+
+* `--exit-to` naming an address **this run created** — its ENTRY, or one of
+  its mix subaddresses. ENTRY is what the ThorChain memo publishes in a
+  Bitcoin `OP_RETURN`, so withdrawing to it sweeps every mixed output back
+  onto the one address an analyst already has. A mix subaddress is the other
+  half: every output would land on one address, undoing by hand the
+  one-account-per-output separation above. GhostSpiral checks this in stage 3
+  — after the addresses exist, and still before the swap is quoted, so the run
+  dies before any Bitcoin is deposited.
+* A **swap destination that is your exit address**. `thor_swap_preparer`
+  refuses when the resolved XMR destination appears in `GS_EXIT_TO`. The swap
+  memo is written into a public, permanent Bitcoin `OP_RETURN` naming the XMR
+  address in full — put your final address there and it is simply printed on
+  the Bitcoin chain, with no mixing to follow and nothing downstream able to
+  retract it. This one only works if `GS_EXIT_TO` is set (below); with the
+  variable unset the tool has nothing to compare against and says so rather
+  than implying it checked.
+
+The swap destination is a **throwaway** that GhostSpiral then mixes away from
+— that is what `create_receive_wallet` mints and what
+`--dest-from-receive-wallet` passes. It is not where you want the money to end
+up.
+
 `exit_strategy_simulator` is a **standalone valuation reference**, not the
 exit. It fetches a live price and reports what a holding is worth; it moves no
 XMR, contacts no venue and places no order, and the pipeline no longer runs it.
