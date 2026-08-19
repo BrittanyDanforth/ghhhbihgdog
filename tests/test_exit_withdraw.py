@@ -23,6 +23,7 @@ Pure-function checks: no daemon, no wallet, no binaries. The end-to-end proof
 that value really leaves the wallet is a separate regtest run.
 """
 import importlib.machinery, importlib.util, io, os, sys, contextlib, types, json
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -199,7 +200,7 @@ try:
     _stg = os.path.join(_tf.mkdtemp(prefix="exitwd_"), "tx_staging")
     os.makedirs(_stg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()):
-        relayed, failed, skipped, held = ghost._run_exit_withdrawals(
+        relayed, failed, skipped, held, unclean = ghost._run_exit_withdrawals(
             _args, [7, 8, 9], [A1, A2], _stg, None, {}, (0, 0))
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
@@ -256,7 +257,7 @@ try:
     os.makedirs(_stg2, exist_ok=True)
     _held_out = io.StringIO()
     with contextlib.redirect_stdout(_held_out):
-        _r2, _f2, _s2, _h2 = ghost._run_exit_withdrawals(
+        _r2, _f2, _s2, _h2, _u2 = ghost._run_exit_withdrawals(
             _args, [7, 9], [A1, A2], _stg2, None, {}, (0, 0), hold=[(9, 0)])
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
@@ -407,7 +408,7 @@ try:
     _hstg = os.path.join(_tf.mkdtemp(prefix="allheld_"), "tx_staging")
     os.makedirs(_hstg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()) as _hout:
-        _hr, _hf, _hs, _hh = ghost._run_exit_withdrawals(
+        _hr, _hf, _hs, _hh, _hu = ghost._run_exit_withdrawals(
             _args, [3], [A1], _hstg, None, {}, (0, 0), hold=[(3, 1)])
 finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
@@ -417,6 +418,77 @@ check("ALL HELD: when the held ENTRY output is the ONLY funded one the hold is "
       "still reported, not a silent clean exit", _hh == 1 and _hr == 0)
 check("ALL HELD: ...and the operator is told nothing was withdrawn",
       "nothing was withdrawn" in _hout.getvalue())
+
+
+
+# ---- "EXIT COMPLETE" MUST NOT FOLLOW "XMR IS STILL ON ..." --------------
+#
+# _run_exit_withdrawals collapsed three per-output results into one `relayed`
+# counter: emptied; relayed-but-residue-left (sweep_all cannot take an output
+# that has not unlocked); and relayed-but-the-balance-could-not-be-re-read.
+# _stage5_run's condition was `_relayed and not _held`, so the exit printed
+# "0.000005 XMR is STILL on account 4 / subaddr 1" and the very next line said
+# "EXIT COMPLETE ... Nothing left on this run's accounts" -- and the run exited
+# 0. Reproduced end to end before the fix.
+_saved6 = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+
+
+def _exit_with_residue(residue):
+    """Drive the real exit where the sweep leaves `residue` atomic units."""
+    try:
+        ghost._run_round = lambda *a, **k: 1
+        ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+        ghost._change_residue = lambda *a, **k: residue
+        ghost.connect_rpc = lambda *a, **k: _BalRPC({4: {1: 5_000_000_000_000}})
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        stg = os.path.join(_tf.mkdtemp(prefix="unclean_"), "tx_staging")
+        os.makedirs(stg, exist_ok=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = ghost._run_exit_withdrawals(
+                _args, [4], [A1], stg, None, {}, (0, 0))
+        return res, buf.getvalue()
+    finally:
+        (ghost._run_round, ghost._wait_for_change_settled,
+         ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+         ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay) = _saved6
+
+
+(_ur, _uf, _us, _uh, _uu), _uout = _exit_with_residue(5_000_000)
+check("UNCLEAN: an output that relayed with value STILL on it is counted",
+      _uu == 1)
+check("UNCLEAN: ...and is not silently folded into the relayed count",
+      _ur == 1 and _uu == 1)
+check("UNCLEAN control: the exit really did report the residue to the operator",
+      "STILL on account" in _uout)
+
+# ...and the same drive with a clean sweep must report zero, or the check
+# above would pass on a counter that is always 1.
+(_cr, _cf, _cs, _ch, _cu), _cout = _exit_with_residue(0)
+check("UNCLEAN control: a fully emptied output counts as clean",
+      _cr == 1 and _cu == 0)
+
+# An unverifiable balance is unclean too: "I could not check" is not "it is
+# empty", and it was being reported as the latter.
+(_nr, _nf, _ns, _nh, _nu), _nout = _exit_with_residue(None)
+check("UNCLEAN: an output whose balance could not be re-read is unclean too",
+      _nu == 1)
+
+# THE SENTENCE ITSELF. _stage5_run is where the claim is printed, so the claim
+# is what has to be tested -- a counter that is right while the message is
+# still wrong fixes nothing.
+_s5src = Path(REPO, "GhostSpiral").read_text()
+_branch = _s5src[_s5src.index("elif _unclean:"):
+                 _s5src.index("EXIT COMPLETE")]
+check("UNCLEAN: the EXIT COMPLETE branch is guarded by the unclean count",
+      "_unclean" in _s5src.split("elif _relayed and not _held:")[0][-800:])
+check("UNCLEAN: ...and the unclean branch says the value has NOT left",
+      "has NOT left the wallet" in _branch)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

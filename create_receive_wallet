@@ -350,7 +350,7 @@ def main():
     try:
         wallet_rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
     except Exception as e:
-        integrity_log("wallet", f"rpc_connect_fail:{str(e)[:60]}")
+        integrity_log("wallet", f"rpc_connect_fail:{type(e).__name__}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
 
     # A subaddress can only be created on an already-open wallet. The old code

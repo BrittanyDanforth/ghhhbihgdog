@@ -327,7 +327,7 @@ def main():
         except Exception as e:
             if proxy:
                 newnym()
-            integrity_log("thor", f"quote_fail_{i}:{str(e)[:40]}")
+            integrity_log("thor", f"quote_fail_{i}:{type(e).__name__}")
             # Abort cleanly with an OPSEC-safe message instead of re-raising a
             # raw requests traceback (which every other abort here avoids).
             sys.exit(f"[!] SwapKit quote failed for pair {i}: {str(e)[:60]}")

@@ -34,6 +34,10 @@ from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 VERSION = "10.5"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
 INTEGRITY_LOG = Path("integrity_chain.log")
+
+#: One piconero, the smallest amount Monero represents. Used to put a gate
+#: strictly ABOVE a computed quantity rather than merely at it.
+PICONERO = Decimal("0.000000000001")
 SOCKS_RE = re.compile(r"^socks5h://[^\s:]+:\d{1,5}$")
 # CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
 # because the requests library resolves hostnames BEFORE sending through
@@ -142,6 +146,66 @@ _CHAIN_DIGITS_RE = re.compile(r"\d+")
 _CHAIN_ADDR_RE = re.compile(
     r"[1-9A-HJ-NP-Za-km-z]{4,}\.\.\.[1-9A-HJ-NP-Za-km-z]{4,}")
 
+#: A bare run of base58, for the addresses that arrive WITHOUT the scrub form.
+#:
+#: THE FRAGMENT RULE ABOVE IS NOT ENOUGH, because it only recognises what
+#: scrub_address produces. Nineteen chain payloads across the shipped tools are
+#: built from EXCEPTION TEXT -- `f"rpc_err:{str(e)[:40]}"` and friends -- and
+#: monero-wallet-rpc puts addresses in its error messages:
+#:
+#:     "Invalid destination address: 4AdUndZSHcJ..."  ->  chain gets 11 chars
+#:     "could not resolve 4AdUndZSHcJ1nUAWkMHNTZ"     ->  chain gets 22 chars
+#:
+#: Stripping the digits leaves the letters, and twenty-two base58 characters is
+#: ~129 bits. ENTRY is named in plaintext by the public ThorChain memo, so any
+#: recognisable slice of it is the same join key between a seized disk and the
+#: Bitcoin chain that the fragment rule exists to remove -- reached by a path
+#: the fragment rule never looked at.
+#:
+#: Discriminating an address slice from an English word: a run of at least 12
+#: base58 characters carrying at least TWO uppercase AND TWO lowercase. Monero
+#: addresses alternate case densely; prose does not. "Authentication" is 14
+#: base58-legal characters but has one capital, so it survives. Event names are
+#: lowercase_with_underscores or UPPER_SNAKE, and the underscore is not in the
+#: alphabet, so it breaks every run well below 12.
+_CHAIN_B58_RUN_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{10,}")
+
+
+def _b58_run_is_addressy(run: str) -> bool:
+    """Dense case ALTERNATION is what separates an address from a word.
+
+    Counting uppercase and lowercase separately is not enough: "ConnectionError"
+    is fifteen base58-legal characters with two capitals and thirteen
+    lowercase, and chain payloads now carry exception TYPE names for exactly
+    the reason this function exists -- so a rule that ate them would delete the
+    diagnostic it was introduced to protect.
+
+    A Monero address is random base58, so its case flips roughly every other
+    character. CamelCase flips once per word, so the RATE is what separates
+    them -- not the count. "ConnectionRefusedError" reaches five flips purely
+    by being three words long, and a flat threshold ate it; over its
+    twenty-two characters that is a rate of 0.23, against ~0.5 for an address.
+
+    Two of the commonest exception names cannot even form a run: base58
+    excludes I and l, so "InvalidOperation" and "CalledProcessError" break
+    apart before this is called.
+
+    Conservative on purpose. Exception TEXT no longer reaches the chain at all
+    (the call sites log type(e).__name__), so this is the second line of
+    defence against a call site added later -- and a rule that occasionally
+    misses a short slice is better than one that deletes the diagnostics, which
+    is how a redactor gets switched off.
+    """
+    cased = [c for c in run if c.isalpha()]
+    if len(cased) < 8:
+        return False
+    if sum(1 for c in cased if c.isupper()) < 2:
+        return False
+    if sum(1 for c in cased if c.islower()) < 2:
+        return False
+    flips = sum(1 for a, b in zip(cased, cased[1:]) if a.isupper() != b.isupper())
+    return flips >= 4 and flips / len(cased) >= 0.35
+
 
 def chain_safe(msg: str) -> str:
     """Strip every number out of a chain payload, keeping the event.
@@ -169,7 +233,20 @@ def chain_safe(msg: str) -> str:
     thing that aborts a run mid-pipeline.
     """
     try:
-        out = _CHAIN_ADDR_RE.sub("<addr>", str(msg))
+        # Order matters: the scrub_address form first (its halves are shorter
+        # than the bare-run threshold), then bare runs, then digits. Digits
+        # last, because collapsing them to '#' would break up a base58 run
+        # before the run rule ever saw it.
+        # A FULL address first, matched exactly rather than statistically: a
+        # run of 90+ base58 characters is an address and nothing else, so this
+        # branch has no false positives and no misses. The rate rule below is
+        # a heuristic and gets ~99% of full addresses on its own -- 1% is not
+        # a number to accept for the value that identifies the operator.
+        out = re.sub(r"[1-9A-HJ-NP-Za-km-z]{90,}", "<addr>", str(msg))
+        out = _CHAIN_ADDR_RE.sub("<addr>", out)
+        out = _CHAIN_B58_RUN_RE.sub(
+            lambda m: "<addr>" if _b58_run_is_addressy(m.group(0)) else m.group(0),
+            out)
         return _CHAIN_DIGITS_RE.sub("#", out)
     except Exception:                                        # noqa: BLE001
         return "REDACTED"
@@ -781,7 +858,7 @@ def verify_tor(proxy: Dict[str, str]) -> None:
             f"    Aborting rather than risk a clearnet connection."
         )
     except requests.RequestException as e:
-        integrity_log("tor", f"verify_fail:{str(e)[:40]}")
+        integrity_log("tor", f"verify_fail:{type(e).__name__}")
         sys.exit(f"[!] Cannot verify Tor (network error): {str(e)[:80]}. Aborting for safety.")
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
@@ -874,7 +951,7 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
         except Exception as e:                               # noqa: BLE001
             last_err = e
             if attempt < attempts:
-                integrity_log("tor", f"NEWNYM_retry:{attempt}:{str(e)[:40]}")
+                integrity_log("tor", f"NEWNYM_retry:{attempt}:{type(e).__name__}")
                 time.sleep(_NEWNYM_RETRY_BACKOFF * attempt)
 
     _NEWNYM_CONSECUTIVE_FAILURES += 1
@@ -1491,7 +1568,7 @@ def btc_per_xmr_oracle(proxies: Optional[Dict[str, str]] = None, getter=None):
         integrity_log("swap", "price_oracle_ok")
         return rate
     except Exception as e:                                   # noqa: BLE001
-        integrity_log("swap", f"price_oracle_fail:{str(e)[:40]}")
+        integrity_log("swap", f"price_oracle_fail:{type(e).__name__}")
         return None
 
 
@@ -1518,6 +1595,125 @@ def quote_deviation(expected_out, amount_in, rate_in_per_out):
     if oracle_out <= 0:
         return None
     return abs(exp - oracle_out) / oracle_out
+
+
+#: A quote larger than this is not a swap, it is a broken or hostile feed.
+#: Monero's supply is ~18.4M XMR plus tail emission of ~157k/year, so 100M is
+#: unreachable for centuries -- while being far below the ~1.7e16 point where
+#: quantize() runs out of the default 28-digit decimal context and accept_floor
+#: raises instead of returning a floor.
+XMR_ABSURD_TOTAL = Decimal("100000000")
+
+
+def sum_quoted_xmr(items, key: str = "expected_xmr") -> tuple:
+    """Sum the quoted XMR across swap quotes. Returns (total, unreadable, amounts).
+
+    ONE IMPLEMENTATION, because there were two and they drifted. GhostSpiral's
+    swap_expected_total and receive_watch's expected_total were the same
+    function written twice; a fix to the first left the second holding every
+    defect it started with. Both now call this.
+
+    Three ways a quote is not a number, and all three arrive over the network
+    or out of thor_pairs*.json, which is a file on disk that anything able to
+    write it can shape:
+
+      * NaN. `Decimal("NaN") > 0` RAISES InvalidOperation rather than returning
+        False, so the comparison has to be inside the try -- it was outside in
+        both copies, and a single NaN quote killed the caller with a traceback
+        instead of being counted unreadable.
+      * Infinity. It converts cleanly and compares greater than zero, so it was
+        summed as a READABLE quote and became a target no balance can ever
+        reach: the wait runs its full timeout and blames the swap.
+      * An absurd finite value. Anything past ~1.7e16 makes accept_floor's
+        quantize raise, hours into a run, from inside a helper the caller has
+        no reason to guard.
+
+    All three are the same thing -- a quote that is not an amount -- so all
+    three are COUNTED unreadable and contribute nothing. Counted, not dropped:
+    a silently deflated target is how a tool that decides "has the money
+    arrived?" reports PAID on a third of it.
+
+    The per-chunk amounts come back because the arrival gate needs the SMALLEST
+    chunk, not just how many there are (see GhostSpiral.swap_arrival_floor).
+    """
+    total = Decimal(0)
+    unreadable = 0
+    amounts = []
+    for item in items or ():
+        try:
+            v = Decimal(str((item or {}).get(key) or "0"))
+            readable = v.is_finite() and Decimal(0) < v <= XMR_ABSURD_TOTAL
+        except Exception:                                    # noqa: BLE001
+            v, readable = Decimal(0), False
+        if readable:
+            total += v
+            amounts.append(v)
+        else:
+            unreadable += 1
+    return total, unreadable, amounts
+
+
+def swap_arrival_floor(total: Decimal, tolerance: Decimal,
+                       chunk_amounts=None, chunks: int = 1) -> tuple:
+    """The unlocked balance at which every chunk has certainly arrived.
+
+    Returns (floor, tightened) -- tightened is True when the slippage
+    tolerance had to be overruled, so the caller can say so.
+
+    THE GATE MUST NOT OPEN WHILE ANY ONE CHUNK COULD BE ENTIRELY ABSENT. That
+    is the whole requirement, and stating it that way is what the previous
+    attempt got wrong.
+
+    accept_floor takes the tolerance off the summed total, so the floor sits
+    `total * tolerance` below the target -- and if any chunk is worth less than
+    that, the chunk can be missing and the gate still opens. The first fix
+    capped the tolerance at 1/(N+1), which is correct ONLY IF every chunk is
+    worth 1/N of the pot. Two shipped paths break that, and both were
+    reproduced:
+
+      * --joinmarket sets btc_chunks = jm_utxos, the tumbler's own outputs,
+        which are arbitrarily unequal. Quotes of 0.50/0.30/0.15/0.05 (total
+        1.00) give a floor of 0.90 under a 10% tolerance -- and the count-based
+        cap does not bind at N=4 -- so the 0.05 chunk can be absent, 0.95
+        arrives, and the gate opens.
+      * Manual mode has no quotes, so `n_chunks = len(swap_deposits) or
+        max(args.split, 1)` falls back to --split, which defaults to 1, and the
+        cap returns the tolerance UNCAPPED however many swaps were really sent.
+        Twelve manual swaps with --expect-total-xmr 12 gives floor 10.8 and
+        returns 'funded' at 11.0: verbatim the worked example in the old
+        docstring, through the one door the cap did not cover.
+
+    So the floor is keyed on the SMALLEST chunk, not on how many there are:
+
+        floor = max(total * (1 - tolerance),  total - smallest + 1 piconero)
+
+    With real quotes `chunk_amounts` gives the smallest exactly. With only a
+    total and a count, equal chunks are assumed (total/chunks) -- which is the
+    old behaviour, now stated as the assumption it is. With neither, there is
+    nothing to key on and the tolerance stands alone; the caller must say so,
+    because that is the case where a missing swap is undetectable.
+
+    Fails CLOSED. When the smallest chunk is smaller than the slippage
+    tolerance the two are indistinguishable by total alone, and this prefers
+    stalling -- nothing has been spent, and --accept-partial-swap is there for
+    an operator who knows the rest is not coming.
+    """
+    if total <= 0:
+        return Decimal(0), False
+    floor_ = accept_floor(total, tolerance)
+    smallest = None
+    if chunk_amounts:
+        smallest = min(chunk_amounts)
+    elif chunks and int(chunks) > 1:
+        smallest = total / Decimal(int(chunks))
+    if smallest is None or smallest <= 0:
+        return floor_, False
+    # One piconero above "everything except the smallest chunk", so a whole
+    # missing chunk can never satisfy it.
+    guard = (total - smallest).quantize(PICONERO, rounding=ROUND_DOWN) + PICONERO
+    if guard > floor_:
+        return guard, True
+    return floor_, False
 
 
 def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:

@@ -503,7 +503,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             print(f"  [+] TX {idx} -> {tx_file.name}")
 
         except Exception as e:
-            integrity_log("signer", f"create_fail:idx={idx}:{str(e)[:40]}")
+            integrity_log("signer", f"create_fail:idx={idx}:{type(e).__name__}")
             print(f"  [!] TX {idx} failed: {str(e)[:80]}")
             failed += 1
 
@@ -556,13 +556,13 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                 secure_write_text(outdir / ACCOUNTS_COUNT_NAME, str(_n))
                 integrity_log("signer", f"accounts_count:{_n}")
         except Exception as e:                              # noqa: BLE001
-            integrity_log("signer", f"accounts_count_fail:{str(e)[:40]}")
+            integrity_log("signer", f"accounts_count_fail:{type(e).__name__}")
             print(f"  [!] Could not read the wallet's account count "
                   f"({str(e)[:60]}). If the offline wallet has fewer accounts "
                   f"than this one, import_outputs will fail to generate key "
                   f"images and the round will not sign.")
     except Exception as e:                                  # noqa: BLE001
-        integrity_log("signer", f"outputs_export_fail:{str(e)[:40]}")
+        integrity_log("signer", f"outputs_export_fail:{type(e).__name__}")
         print(f"  [!] Could not export wallet outputs ({str(e)[:60]}). A first-round "
               f"sign still works, but a DAG/peel round that spends this round's "
               f"outputs will fail offline.")
@@ -820,7 +820,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
         integrity_log("signer", "offline_accounts_topup_timeout")
         print("  [!] Timed out creating accounts on the offline wallet.")
     except Exception as e:                                   # noqa: BLE001
-        integrity_log("signer", f"offline_accounts_topup_fail:{str(e)[:40]}")
+        integrity_log("signer", f"offline_accounts_topup_fail:{type(e).__name__}")
         print(f"  [!] Could not create accounts on the offline wallet "
               f"({str(e)[:60]}).")
     finally:
@@ -901,7 +901,7 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
             integrity_log("signer", "outputs_import_timeout")
             print("  [!] import_outputs timed out.")
         except Exception as e:                              # noqa: BLE001
-            integrity_log("signer", f"outputs_import_fail:{str(e)[:40]}")
+            integrity_log("signer", f"outputs_import_fail:{type(e).__name__}")
             print(f"  [!] import_outputs failed: {str(e)[:80]}")
         finally:
             if _ipw:

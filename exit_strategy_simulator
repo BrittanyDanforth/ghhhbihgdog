@@ -124,7 +124,7 @@ def fetch_prices(proxy):
         out["source"] = "coingecko"
         return out
     except Exception as e:
-        integrity_log("exit", f"coingecko_fail:{str(e)[:40]}")
+        integrity_log("exit", f"coingecko_fail:{type(e).__name__}")
 
     # Fallback: Bisq price oracle (returns all market prices)
     try:
@@ -162,7 +162,7 @@ def fetch_prices(proxy):
             integrity_log("exit", "bisq_price_oracle_ok")
             return out
     except Exception as e:
-        integrity_log("exit", f"bisq_oracle_fail:{str(e)[:40]}")
+        integrity_log("exit", f"bisq_oracle_fail:{type(e).__name__}")
         _bisq_err = e
 
     # Name the ACTUAL failure. This always said "Check Tor connectivity", but

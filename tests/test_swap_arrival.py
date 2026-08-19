@@ -600,6 +600,157 @@ _res, _out, _exit = drive_stage4([(0, 0)] + [(11, 11)] * 20, deposits=[],
 check("STAGE4: 11 of 12 manual swaps exits once --split is given",
       _exit is not None)
 
+
+# ---- ONE SUMMER, TWO CALLERS, AND THEY MUST NOT DRIFT -------------------
+#
+# receive_watch.expected_total and GhostSpiral.swap_expected_total were the
+# same function written twice. GhostSpiral's was fixed for NaN and Infinity;
+# receive_watch's was not, and nothing noticed, because test_receive_watch.py
+# contained no NaN, no Infinity and no is_finite check anywhere -- the word
+# does not appear in the file. A NaN quote RAISED InvalidOperation straight out
+# of it, and its pairs come from thor_pairs*.json, a file on disk.
+#
+# Both now call gs_common.sum_quoted_xmr. These checks drive BOTH and compare,
+# so the next divergence fails here rather than in a run.
+import importlib.machinery as _im, importlib.util as _iu
+_rwld = _im.SourceFileLoader("receive_watch", os.path.join(REPO, "receive_watch"))
+_rw = _iu.module_from_spec(_iu.spec_from_loader(_rwld.name, _rwld))
+_rwld.exec_module(_rw)
+import gs_common as _gsc
+
+_HOSTILE = [
+    ("a NaN quote",            "NaN"),
+    ("an Infinity quote",      "Infinity"),
+    ("a -Infinity quote",      "-Infinity"),
+    ("an absurd finite quote", "1e20"),
+    ("a negative quote",       "-5"),
+    ("a non-numeric quote",    "junk"),
+    ("an empty quote",         ""),
+]
+for _label, _v in _HOSTILE:
+    _pairs = [{"expected_xmr": _v}, {"expected_xmr": "1.0"}]
+    # GhostSpiral
+    try:
+        _g_tot, _g_bad, _g_amt = ghost.swap_expected_total(_pairs)
+        _g = (_g_tot, _g_bad)
+    except Exception as _e:                                  # noqa: BLE001
+        _g = f"RAISED {type(_e).__name__}"
+    # receive_watch
+    try:
+        _r = _rw.expected_total(_pairs)
+    except Exception as _e:                                  # noqa: BLE001
+        _r = f"RAISED {type(_e).__name__}"
+    check(f"SUMMER: {_label} is counted unreadable, not raised (GhostSpiral)",
+          _g == (D("1.0"), 1))
+    check(f"SUMMER: ...and receive_watch agrees exactly", _r == _g)
+
+# The absurd-value bound exists because accept_floor RAISES past ~1.7e16, and
+# the caller has no reason to guard a logging helper. Without it a hostile or
+# broken quote produced a traceback hours into a run.
+check("SUMMER: an absurd quote cannot reach accept_floor at all",
+      ghost.swap_expected_total([{"expected_xmr": "1e20"}])[0] == D(0))
+_big = _gsc.XMR_ABSURD_TOTAL
+check("SUMMER: the bound sits far above any real amount and far below the "
+      "precision cliff", D("18400000") < _big < D("1e15"))
+check("SUMMER: a large-but-real amount is still accepted",
+      ghost.swap_expected_total([{"expected_xmr": "1000000"}])[0] == D("1000000"))
+
+# Non-vacuity: the pre-fix body really did raise, so these are not passing on
+# a case that was never broken.
+def _prefix_expected_total(pairs):
+    """receive_watch's body as it shipped, verbatim."""
+    tot, unreadable = D(0), 0
+    for p in pairs:
+        try:
+            v = D(str(p.get("expected_xmr") or "0"))
+        except Exception:                                    # noqa: BLE001
+            v = D(0)
+        if v > 0:                    # <-- outside the try: NaN raises here
+            tot += v
+        else:
+            unreadable += 1
+    return tot, unreadable
+
+
+_raised = False
+try:
+    _prefix_expected_total([{"expected_xmr": "NaN"}])
+except Exception:                                            # noqa: BLE001
+    _raised = True
+check("control: the pre-fix body DID raise on a NaN quote", _raised)
+check("control: ...and DID sum an Infinity quote as readable",
+      _prefix_expected_total([{"expected_xmr": "Infinity"}])[1] == 0)
+
+
+
+# ---- receive_watch's gate is the SAME gate, wired end to end -------------
+#
+# receive_watch's arrival gate kept the pre-G6 floor (plain accept_floor) after
+# GhostSpiral's was hardened, and nothing noticed because they were two gates
+# rather than one. On the same 4-chunk swap (0.50/0.30/0.15/0.05, 10%
+# tolerance) GhostSpiral waited while receive_watch reported PAID with the 0.05
+# chunk still in flight; on twelve equal chunks it reported PAID at eleven.
+# That is the worse copy: GhostSpiral's gate decides what a run plans against,
+# this one is what TELLS THE OPERATOR the money has landed.
+#
+# Driven as a SUBPROCESS against the real argv, not grepped for and not
+# unit-called: the defect was in main()'s wiring, so only running main() proves
+# the wiring. It aborts at the Tor check a moment later, which is fine -- the
+# gate is announced first.
+import json as _json, subprocess as _sp, tempfile as _tf, os as _os
+
+_RW_ADDR = ("83Ss8Wx9CmH4EaWkan3bdGhAybs7r3xgHZnMeWMNgwwdW3BJc6nfjTbFL9V4"
+            "Go9LxZjUvDCX9H416cHR68m8aLc6FUZFVRJ")
+
+
+def _run_receive_watch(quotes, tolerance="0.10"):
+    """Run the shipped receive_watch on a pairs file. Returns its stdout."""
+    d = _tf.mkdtemp(prefix="rw_gate_")
+    pairs = _os.path.join(d, "pairs.json")
+    bundle = _os.path.join(d, "bundle.json")
+    with open(pairs, "w") as fh:
+        _json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _RW_ADDR,
+                     "expected_xmr": q} for q in quotes], fh)
+    with open(bundle, "w") as fh:
+        _json.dump({"schema": "gs_receive_wallet_v1", "address": _RW_ADDR,
+                    "account_index": 3, "subaddress_index": 1,
+                    "wallet_file": "w", "nettype": "mainnet",
+                    "created": "2026-01-01T00:00:00Z"}, fh)
+    p = _sp.run([sys.executable, os.path.join(REPO, "receive_watch"),
+                 "--receive-wallet", bundle, "--pairs", pairs,
+                 "--tolerance", tolerance,
+                 "--tor-proxy", "socks5h://127.0.0.1:9050"],
+                capture_output=True, text=True, timeout=120, cwd=d)
+    return p.stdout + p.stderr
+
+
+_UNEQ_Q = ["0.50", "0.30", "0.15", "0.05"]
+_out = _run_receive_watch(_UNEQ_Q)
+_want, _ = ghost.swap_arrival_floor(D("1.00"), D("0.10"),
+                                    [D(q) for q in _UNEQ_Q], 4)
+check("RW GATE: receive_watch tightens the gate for an unequal split swap",
+      "tightened" in _out)
+check("RW GATE: ...to exactly the floor the shared helper computes",
+      str(_want) in _out)
+check("RW GATE: ...and the announced floor really does hold back the "
+      "smallest chunk", D("0.95") < _want)
+
+# CONTROL: equal chunks where the tolerance is already safe must NOT tighten,
+# or the check above would pass on a gate that tightens unconditionally.
+_out2 = _run_receive_watch(["1.0", "1.0"])
+check("RW GATE control: an equal 2-chunk swap is NOT tightened "
+      "(so the check above is not vacuous)", "tightened" not in _out2)
+
+# ...and the gate it uses is the shared one, so GhostSpiral and receive_watch
+# cannot disagree about whether the same swap has arrived.
+for _qs in (["0.50", "0.30", "0.15", "0.05"], ["1.0"] * 12, ["2.5", "2.5"]):
+    _amts = [D(q) for q in _qs]
+    _tot = sum(_amts)
+    check(f"RW GATE: both tools compute one floor for {len(_qs)} chunks",
+          ghost.swap_arrival_floor(_tot, D("0.10"), _amts, len(_amts))
+          == _gsc.swap_arrival_floor(_tot, D("0.10"), _amts, len(_amts)))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

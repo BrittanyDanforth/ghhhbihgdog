@@ -340,8 +340,11 @@ hop returned nothing to the account.
 running process's arguments — while `/proc/<pid>/environ` is **0400**. So the
 console hands its children the sensitive values through the environment, not
 argv: `GS_BTC_ENTRY` (your Bitcoin address), `GS_BTC_AMOUNT`,
-`GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination), `GS_EXIT_AMOUNT`,
-and `GS_WALLET_PASSWORD` as before. The command preview the page shows you is
+`GS_SWAP_AMOUNTS`, `GS_EXIT_TO` (your withdrawal destination), and
+`GS_WALLET_PASSWORD` as before. (`GS_EXIT_AMOUNT` was listed here too and never
+was: `exit_strategy_simulator` reads it when you run that tool by hand, but the
+console has never set it. A list of protections is worth nothing if entries can
+sit on it unearned, which is the same defect as the sentence below once was.) The command preview the page shows you is
 the real argv, which is why no secret appears in it.
 
 `GS_EXIT_TO` was missing from that list for as long as the list existed, and

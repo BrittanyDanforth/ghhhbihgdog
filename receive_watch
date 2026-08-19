@@ -57,6 +57,8 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     load_receive_bundle, RECEIVE_SCHEMA, memo_binds_destination,
     env_or_argv, decimal_arg, accept_floor,
+    sum_quoted_xmr,
+    swap_arrival_floor,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -180,19 +182,18 @@ def expected_total(pairs: list) -> tuple:
     The count comes back so the caller can say so out loud. Deflating a target
     silently is the one thing a tool that decides "has the money arrived?" must
     not do.
+
+    The body is gs_common.sum_quoted_xmr, SHARED with GhostSpiral. This was the
+    second of two independent copies of one function, and it kept every defect
+    the first one was fixed for: a NaN quote RAISED out of it (the `v > 0` test
+    sat outside the try, and Decimal("NaN") > 0 raises rather than returning
+    False), an Infinity quote was summed as READABLE and became a target no
+    balance can ever reach, and an absurd finite quote made accept_floor raise
+    downstream at the caller. pairs come from thor_pairs*.json, a file on disk.
+    Two copies is what let one of them stay broken.
     """
-    tot = Decimal(0)
-    unreadable = 0
-    for p in pairs:
-        try:
-            v = Decimal(str(p.get("expected_xmr") or "0"))
-        except Exception:                                    # noqa: BLE001
-            v = Decimal(0)
-        if v > 0:
-            tot += v
-        else:
-            unreadable += 1
-    return tot, unreadable
+    total, unreadable, _amounts = sum_quoted_xmr(pairs)
+    return total, unreadable
 
 
 # accept_floor -- "how much counts as the payment complete" -- now lives in
@@ -789,6 +790,11 @@ def main():
 
     matched = []
     target = Decimal(0)
+    # Bound HERE, beside target, not only inside the branches that set
+    # it. An unbound local reached by one flag combination is exactly
+    # the NameError class that shipped three always-fatal defects in
+    # this toolchain past a fully green suite.
+    _chunk_amounts: list = []
     if args.pairs:
         try:
             allp = load_pairs(args.pairs)
@@ -800,7 +806,7 @@ def main():
                 f"[!] None of the {len(allp)} swap pair(s) in {args.pairs} are routed to\n"
                 f"    this receive address ({scrub_address(dest)}).\n"
                 f"    Watching it would wait for a payment that is going somewhere else.")
-        target, _unreadable = expected_total(matched)
+        target, _unreadable, _chunk_amounts = sum_quoted_xmr(matched)
         if _unreadable:
             print(f"  [!] {_unreadable} of {len(matched)} swap pair(s) carry no "
                   f"readable expected_xmr, so they contribute NOTHING to the "
@@ -810,16 +816,51 @@ def main():
                   f"landed, even if the others never do.")
             integrity_log("recv", f"quotes_unreadable:{_unreadable}_of_{len(matched)}")
     if args.expect_xmr is not None:
+        # An explicit total replaces the quotes, so it replaces the per-chunk
+        # breakdown too: there is no way to know how the operator's swaps were
+        # sized.
         target = args.expect_xmr
+        _chunk_amounts = []
     if args.any:
         target = Decimal(0)
+        _chunk_amounts = []
 
     if target <= 0 and not args.any:
         sys.exit(
             "[!] No target amount. Pass --pairs (to take it from the swap quote),\n"
             "    --expect-xmr, or --any to stop on any balance at all.")
 
-    floor_ = accept_floor(target, args.tolerance) if target > 0 else Decimal(0)
+    # THE SAME GATE GhostSpiral's stage 4 USES, and for the same reason.
+    #
+    # This was plain accept_floor(target * (1 - tolerance)) -- the pre-G6 floor.
+    # GhostSpiral's copy was hardened to key on the SMALLEST chunk because a
+    # tolerance charged against the summed total also covers a whole chunk as
+    # soon as one chunk is worth less than it; this copy was not, and nothing
+    # noticed, because they were two gates rather than one. Measured on the
+    # same 4-chunk swap (0.50/0.30/0.15/0.05, 10% tolerance): GhostSpiral
+    # waited, and this reported PAID with the 0.05 chunk still in flight. On
+    # twelve equal chunks it reported PAID at eleven.
+    #
+    # That is worse here than there. GhostSpiral's gate decides what a run
+    # plans against; this one is what TELLS THE OPERATOR the money has landed.
+    floor_, _tightened = swap_arrival_floor(
+        target, args.tolerance, _chunk_amounts, len(_chunk_amounts) or 1)
+    if _tightened:
+        print(f"  [*] Arrival gate tightened to {fmt(floor_)} XMR, above what "
+              f"the {args.tolerance * 100:.0f}% tolerance alone would allow: "
+              f"the smallest quoted chunk is worth less than that tolerance, "
+              f"so at the wider figure it could be missing entirely and this "
+              f"watch would still report PAID.")
+        integrity_log("recv", "arrival_gate_tightened_for_smallest_chunk")
+    elif target > 0 and not _chunk_amounts:
+        # --expect-xmr with no --pairs: a total and no idea how many swaps
+        # make it up, so a missing one is undetectable. Say so.
+        print(f"  [!] The number of swaps behind this target is UNKNOWN "
+              f"(--expect-xmr without --pairs), so this watch can only check "
+              f"the TOTAL: any single swap worth less than "
+              f"{args.tolerance * 100:.0f}% of it could be missing and still "
+              f"count as paid.")
+        integrity_log("recv", "arrival_chunk_count_unknown")
 
     if args.min_arrival is not None and args.min_arrival < 0:
         sys.exit("[!] --min-arrival cannot be negative.")

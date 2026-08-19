@@ -866,7 +866,7 @@ def main():
                 # and this goes to BOTH the terminal and the integrity chain
                 # (which is a file on disk).
                 _emsg = redact_addresses(str(e))
-                integrity_log("broadcast", f"error:idx={real_idx}:{_emsg[:40]}")
+                integrity_log("broadcast", f"error:idx={real_idx}:{type(e).__name__}")
                 print(f"  [!] Error: {_emsg[:80]}")
 
             attempts -= 1

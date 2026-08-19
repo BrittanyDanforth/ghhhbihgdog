@@ -45,7 +45,8 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
-    load_receive_bundle, memo_binds_destination, env_or_argv,
+    load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
+    swap_arrival_floor,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     validate_xmr_address, accept_floor,
@@ -1238,93 +1239,14 @@ def swap_expected_total(deposits: list) -> tuple:
     The per-chunk amounts come back too, and they are not decoration: the gate
     has to know the SMALLEST chunk, not just how many there are. See
     swap_arrival_floor.
+
+    The body is gs_common.sum_quoted_xmr, SHARED with receive_watch. These were
+    two separate implementations of the same function, and fixing this one left
+    receive_watch's holding every defect it started with -- a NaN quote raising
+    out of it, an Infinity quote summed as readable. Two copies is what let
+    them drift.
     """
-    total = Decimal(0)
-    unreadable = 0
-    amounts = []
-    for dep in deposits:
-        # The COMPARISON is inside the try, not just the conversion. It was
-        # outside, and Decimal("NaN") > 0 raises InvalidOperation rather than
-        # returning False -- so a NaN in the quote JSON (which comes off the
-        # network) escaped this function instead of being counted as
-        # unreadable, which is the one thing the docstring promises. Infinity
-        # is worse: it converts, compares greater than zero, and becomes a
-        # target no balance can ever reach, so the run waits out its whole
-        # timeout and blames the swap.
-        try:
-            v = Decimal(str((dep or {}).get("expected_xmr") or "0"))
-            readable = v.is_finite() and v > 0
-        except Exception:                                    # noqa: BLE001
-            v, readable = Decimal(0), False
-        if readable:
-            total += v
-            amounts.append(v)
-        else:
-            unreadable += 1
-    return total, unreadable, amounts
-
-
-def swap_arrival_floor(total: Decimal, tolerance: Decimal,
-                       chunk_amounts=None, chunks: int = 1) -> tuple:
-    """The unlocked balance at which every chunk has certainly arrived.
-
-    Returns (floor, tightened) -- tightened is True when the slippage
-    tolerance had to be overruled, so the caller can say so.
-
-    THE GATE MUST NOT OPEN WHILE ANY ONE CHUNK COULD BE ENTIRELY ABSENT. That
-    is the whole requirement, and stating it that way is what the previous
-    attempt got wrong.
-
-    accept_floor takes the tolerance off the summed total, so the floor sits
-    `total * tolerance` below the target -- and if any chunk is worth less than
-    that, the chunk can be missing and the gate still opens. The first fix
-    capped the tolerance at 1/(N+1), which is correct ONLY IF every chunk is
-    worth 1/N of the pot. Two shipped paths break that, and both were
-    reproduced:
-
-      * --joinmarket sets btc_chunks = jm_utxos, the tumbler's own outputs,
-        which are arbitrarily unequal. Quotes of 0.50/0.30/0.15/0.05 (total
-        1.00) give a floor of 0.90 under a 10% tolerance -- and the count-based
-        cap does not bind at N=4 -- so the 0.05 chunk can be absent, 0.95
-        arrives, and the gate opens.
-      * Manual mode has no quotes, so `n_chunks = len(swap_deposits) or
-        max(args.split, 1)` falls back to --split, which defaults to 1, and the
-        cap returns the tolerance UNCAPPED however many swaps were really sent.
-        Twelve manual swaps with --expect-total-xmr 12 gives floor 10.8 and
-        returns 'funded' at 11.0: verbatim the worked example in the old
-        docstring, through the one door the cap did not cover.
-
-    So the floor is keyed on the SMALLEST chunk, not on how many there are:
-
-        floor = max(total * (1 - tolerance),  total - smallest + 1 piconero)
-
-    With real quotes `chunk_amounts` gives the smallest exactly. With only a
-    total and a count, equal chunks are assumed (total/chunks) -- which is the
-    old behaviour, now stated as the assumption it is. With neither, there is
-    nothing to key on and the tolerance stands alone; the caller must say so,
-    because that is the case where a missing swap is undetectable.
-
-    Fails CLOSED. When the smallest chunk is smaller than the slippage
-    tolerance the two are indistinguishable by total alone, and this prefers
-    stalling -- nothing has been spent, and --accept-partial-swap is there for
-    an operator who knows the rest is not coming.
-    """
-    if total <= 0:
-        return Decimal(0), False
-    floor_ = accept_floor(total, tolerance)
-    smallest = None
-    if chunk_amounts:
-        smallest = min(chunk_amounts)
-    elif chunks and int(chunks) > 1:
-        smallest = total / Decimal(int(chunks))
-    if smallest is None or smallest <= 0:
-        return floor_, False
-    # One piconero above "everything except the smallest chunk", so a whole
-    # missing chunk can never satisfy it.
-    guard = (total - smallest).quantize(PICONERO, rounding=ROUND_DOWN) + PICONERO
-    if guard > floor_:
-        return guard, True
-    return floor_, False
+    return sum_quoted_xmr(deposits)
 
 
 def swap_arrival_step(target: Decimal, dust: Decimal = DUST_XMR) -> Decimal:
@@ -2051,7 +1973,7 @@ def stage0_preflight(args, proxy) -> tuple:
                 if h1 > 0:
                     break
         except Exception as e:
-            integrity_log("stage0", f"rpc_height_err:{str(e)[:40]}")
+            integrity_log("stage0", f"rpc_height_err:{type(e).__name__}")
         time.sleep(10)
     else:
         sys.exit("[!] RPC nodes out of sync after 5 min; abort.")
@@ -3478,7 +3400,19 @@ def main():
                           [a for a, _ in addr_index.values()] + list(change_accounts),
                           spent_plans=(veil_file, fanout_file, dag_file),
                           withheld=withheld,
-                          entry_account=_src_account(addr_index, ENTRY))
+                          # .get, NOT _src_account: that helper aborts on a
+                          # miss (it guards TX BUILDING, where guessing an
+                          # account spends the wrong output). Here the value
+                          # only decides whether one warning prints, and this
+                          # is an ARGUMENT to report_completion -- so a miss
+                          # would sys.exit before the holdings report and
+                          # before _wipe_spent_plans, leaving every plan file
+                          # on disk at the end of a run that fully succeeded.
+                          # That is the same defect as folding a withheld
+                          # output into `incomplete`, through a new door.
+                          # _exit_hold_list, three lines up, already treats a
+                          # missing ENTRY as "nothing to hold".
+                          entry_account=(addr_index.get(ENTRY) or (None,))[0])
 
 
 def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
@@ -3848,7 +3782,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
     try:
         rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     except Exception as e:
-        integrity_log("stage5", f"confirm_rpc_connect_fail:{str(e)[:40]}")
+        integrity_log("stage5", f"confirm_rpc_connect_fail:{type(e).__name__}")
         print(f"  [!] Could not connect wallet-rpc to await fan-out confirmation: {e}")
         return False
 
@@ -3872,7 +3806,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
                 if unlk and int(unlk) > 0:
                     unlocked += 1
             except Exception as e:
-                integrity_log("stage5", f"confirm_poll_err:{str(e)[:30]}")
+                integrity_log("stage5", f"confirm_poll_err:{type(e).__name__}")
         if unlocked >= len(targets):
             integrity_log("stage5", f"fanout_confirmed:{unlocked}_targets")
             print(f"  [+] All {unlocked} fan-out output(s) confirmed and unlocked.")
@@ -3900,7 +3834,7 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
     try:
         rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     except Exception as e:
-        integrity_log("stage5", f"carrier_rpc_connect_fail:{str(e)[:40]}")
+        integrity_log("stage5", f"carrier_rpc_connect_fail:{type(e).__name__}")
         print(f"  [!] {label}: cannot connect wallet-rpc to await the carrier: {e}")
         return False
     need_atomic = int((Decimal(str(min_unlocked_xmr)) * Decimal(10 ** 12)).to_integral_value())
@@ -3920,7 +3854,7 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
                 print(f"  [+] {label}: carrier funded and unlocked.")
                 return True
         except Exception as e:
-            integrity_log("stage5", f"carrier_poll_err:{str(e)[:30]}")
+            integrity_log("stage5", f"carrier_poll_err:{type(e).__name__}")
         time.sleep(FANOUT_CONFIRM_POLL)
         waited += FANOUT_CONFIRM_POLL
     integrity_log("stage5", "carrier_confirm_timeout")
@@ -4067,7 +4001,7 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
     try:
         rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
     except Exception as e:                                   # noqa: BLE001
-        integrity_log("stage5", f"change_settle_rpc_fail:{str(e)[:40]}")
+        integrity_log("stage5", f"change_settle_rpc_fail:{type(e).__name__}")
         print(f"  [!] {label}: cannot connect wallet-rpc to await the change: {e}")
         return False, 0
     print(f"  [*] {label}: waiting for the change on account {account} / subaddr "
@@ -4086,7 +4020,7 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
                 integrity_log("stage5", "change_settled")
                 return True, tot
         except Exception as e:                               # noqa: BLE001
-            integrity_log("stage5", f"change_settle_poll_err:{str(e)[:30]}")
+            integrity_log("stage5", f"change_settle_poll_err:{type(e).__name__}")
         time.sleep(FANOUT_CONFIRM_POLL)
         waited += FANOUT_CONFIRM_POLL
     integrity_log("stage5", "change_settle_timeout")
@@ -4400,12 +4334,12 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         if held:
             print("  [!] EXIT: nothing was withdrawn — the only funded output "
                   "is the unmixed one on ENTRY described above.")
-            return (0, 0, 0, len(held))
+            return (0, 0, 0, len(held), 0)
         print("  [!] EXIT: no funded output was found on this run's accounts, "
               "so nothing was withdrawn. If you expected funds here, do NOT "
               "assume they are gone — check the wallet before re-running.")
         integrity_log("exit", "no_funded_outputs")
-        return (0, 0, 0, 0)
+        return (0, 0, 0, 0, 0)
 
     # `secrets`, the module-level import -- NOT `_secrets`, which is a local
     # alias created inside main() and passed around as a parameter. Writing the
@@ -4422,7 +4356,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
           f"transactions to {len(dest_pool)} destination(s) ===")
     integrity_log("exit", f"withdraw_start:{total}_outputs:{len(dest_pool)}_dests")
 
-    relayed = failed = skipped = 0
+    relayed = failed = skipped = unclean = 0
     # ONE CHAIN LINE PER OUTCOME KIND, not one per output.
     #
     # Redacting the numbers out of `withdrawn:<acct>/<sub>` is not enough
@@ -4472,11 +4406,13 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             _left = _change_residue(args, acct, sub)
             if _left is None:
                 _outcomes.add("relayed_unverified")
+                unclean += 1
                 print(f"  [+] {label}: relayed, but the balance could not be "
                       f"re-read to confirm account {acct} / subaddr {sub} is "
                       f"empty. Check it yourself.")
             elif _left > 0:
                 _outcomes.add("relayed_residual")
+                unclean += 1
                 print(f"  [!] {label}: relayed, but "
                       f"{Decimal(_left) / Decimal(10 ** 12)} XMR is STILL on "
                       f"account {acct} / subaddr {sub} — it had not unlocked "
@@ -4501,7 +4437,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                 print(f"  [!] Could not securely wipe {stage}; remove it manually.")
     integrity_log("exit", "withdraw_done:" +
                   (",".join(sorted(_outcomes)) or "nothing_attempted"))
-    return (relayed, failed, skipped, len(held))
+    return (relayed, failed, skipped, len(held), unclean)
 
 
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
@@ -4632,7 +4568,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 _exit_meta = json.load(_ef).get("meta", {})
         except Exception:                                    # noqa: BLE001
             _exit_meta = {}
-        _relayed, _failed, _skipped, _held = _run_exit_withdrawals(
+        _relayed, _failed, _skipped, _held, _unclean = _run_exit_withdrawals(
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
             _exit_meta, delay_window, hold=exit_hold or ())
         if _held:
@@ -4660,6 +4596,24 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             incomplete.append(
                 f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
                 f"were NOT sent — that value is still on this wallet")
+        elif _unclean:
+            # NOT "COMPLETE", and this is why the count is returned at all.
+            # `relayed` collapsed three different per-output results into one
+            # number: emptied, relayed-but-residue-left (sweep_all could not
+            # take an output that had not unlocked), and relayed-but-the-
+            # balance-could-not-be-re-read. So the exit printed
+            # "X XMR is STILL on account N / subaddr M" and this line then
+            # printed "Nothing left on this run's accounts" immediately after
+            # it, and the run exited 0. Reproduced end to end.
+            print(f"  [!] EXIT INCOMPLETE: {_relayed} output(s) were relayed, "
+                  f"but {_unclean} of them still hold value or could not be "
+                  f"re-read to confirm they are empty — see the lines above. "
+                  f"That value has NOT left the wallet.")
+            print("      It is safe where it is. Withdraw it once it unlocks; "
+                  "do not assume this run finished the job.")
+            withheld.append(
+                f"{_unclean} withdrawn output(s) still hold value or could not "
+                f"be verified empty")
         elif _relayed and not _held:
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
                   f"its own transaction. Nothing left on this run's accounts.")

@@ -422,7 +422,7 @@ def wipe_swap_ram(dry: bool):
             subprocess.run(["swapon", "-a"], check=False, capture_output=True, timeout=30)
             swap_done = True
         except (FileNotFoundError, subprocess.CalledProcessError) as e:
-            integrity_log("paranoia", f"swapoff_fail:{str(e)[:40]}")
+            integrity_log("paranoia", f"swapoff_fail:{type(e).__name__}")
 
     shm_done = False
     wipe_file = "/dev/shm/gs_paranoia_wipe"
@@ -459,7 +459,7 @@ def wipe_swap_ram(dry: bool):
         subprocess.run(["sync"], check=False, capture_output=True, timeout=10)
         shm_done = True
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        integrity_log("paranoia", f"shm_write_fail:{str(e)[:40]}")
+        integrity_log("paranoia", f"shm_write_fail:{type(e).__name__}")
 
     if not is_root:
         integrity_log("paranoia", "ram_partial:no_root")

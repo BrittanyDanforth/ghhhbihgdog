@@ -39,12 +39,14 @@ does not give you:
 
 Pure functions and driven fakes: no daemon, no wallet, no network.
 """
+import ast
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import os
 import re
+import secrets as _secretsmod
 import sys
 import tempfile
 import types
@@ -80,6 +82,7 @@ def check(name, cond):
 
 
 DIGIT = re.compile(r"\d")
+_rand = _secretsmod.SystemRandom()
 
 
 def payloads(log_path):
@@ -251,7 +254,7 @@ def _exit_chain_lines(n_outputs):
         stg = os.path.join(tempfile.mkdtemp(prefix="exit_stg_"), "tx_staging")
         os.makedirs(stg, exist_ok=True)
         with contextlib.redirect_stdout(io.StringIO()):
-            relayed, _f, _s, _held = ghost._run_exit_withdrawals(
+            relayed, _f, _s, _held, _u = ghost._run_exit_withdrawals(
                 args, list(range(3, 3 + n_outputs)), [A1], stg, None, {}, (0, 0))
     finally:
         (ghost._run_round, ghost._wait_for_change_settled,
@@ -440,6 +443,103 @@ check("...with no ordinal left in it",
 _mixed = _round_chain_lines("Peel", 3)
 check("a different KIND of round is still recorded",
       any("peel" in p for p in _mixed))
+
+
+# ==========================================================================
+# 6. ADDRESSES THAT NEVER PASSED THROUGH scrub_address
+# ==========================================================================
+print("\n=== addresses arriving by paths the fragment rule never saw ===")
+#
+# The fragment rule only recognises what scrub_address emits. Twenty-two chain
+# payloads across the shipped tools were built from EXCEPTION TEXT --
+# f"rpc_err:{str(e)[:40]}" and friends -- and monero-wallet-rpc puts addresses
+# in its error messages, while a connection error carries host='...'. Stripping
+# the digits left the letters: "could not resolve 4AdUndZSHcJ1nUAWkMHNTZ" put
+# 22 base58 characters (~129 bits) of a publicly-memo-named address on disk.
+#
+# Two defences, and the first one is the real fix: those call sites now log
+# type(e).__name__, so the message never reaches the chain at all. The rule
+# below is the backstop for a call site added later.
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_FULL = ("4AdUndZSHcJ1nUAWkMHNTZLQmqCLpEJXqUq5bpvHzXvMhSmSbxJ9kQjMdKr"
+         "TeSqnAzWkMHNTZLQmqCLpEJXqUq5bpvHzXvMhSmSbxJ")[:95]
+
+check("a FULL address in a payload is redacted whole",
+      gsc.chain_safe(f"created:{_FULL}") == "created:<addr>")
+check("...300 random full addresses, all of them",
+      all("<addr>" in gsc.chain_safe("err:" + "".join(
+          _rand.choice(_B58) for _ in range(95))) for _ in range(300)))
+
+# THE CHECK ABOVE DOES NOT TEST THE EXACT MATCHER. Random 95-char addresses
+# alternate case densely, so the STATISTICAL rule catches essentially all of
+# them on its own -- deleting the exact 90+ match left the suite green, which
+# mutation testing caught and which is precisely the "very specific test that
+# is secretly not testing anything" failure. A discriminating case must have
+# LOW case-alternation, so only a length-based match can see it.
+_FLAT = "A" * 48 + "b" * 47            # 95 base58 chars, one case flip
+check("control: the statistical rule alone does NOT recognise a flat "
+      "low-alternation address", not gsc._b58_run_is_addressy(_FLAT))
+check("a full address is redacted by LENGTH, whatever its case pattern",
+      gsc.chain_safe(f"created:{_FLAT}") == "created:<addr>")
+check("a long slice of one is redacted too",
+      "<addr>" in gsc.chain_safe(f"rpc_err:could not resolve {_FULL[:22]}"))
+
+# THE DIAGNOSTICS MUST SURVIVE. The call sites now log exception TYPE names,
+# and an early version of this rule ate "ConnectionRefusedError" -- deleting
+# the very diagnostic the primary fix introduced. A redactor that destroys
+# what the operator needs is a redactor that gets turned off.
+_EXC = ["ConnectionError", "TimeoutError", "JSONDecodeError", "InvalidOperation",
+        "CalledProcessError", "ValueError", "OSError", "HTTPError", "KeyError",
+        "TimeoutExpired", "ConnectionRefusedError", "RuntimeError", "TypeError",
+        "ReadTimeout", "SSLError", "ProxyError", "DecodeError",
+        "ChunkedEncodingError", "RemoteDisconnected", "IncompleteRead",
+        "SubprocessError", "BrokenPipeError"]
+_eaten = [e for e in _EXC if "<addr>" in gsc.chain_safe(f"rpc_err:{e}")]
+check(f"no exception TYPE name is mistaken for an address ({len(_EXC)} checked)",
+      not _eaten)
+
+# ...and no REAL payload in the repo is damaged. Rendered from the actual
+# format strings at every call site, with realistic substitutions -- a
+# hand-written list would only test the shapes I happened to think of.
+_rendered, _damaged = 0, []
+for _tool in ("GhostSpiral", "gs_common.py", "receive_watch",
+              "thor_swap_preparer", "create_receive_wallet",
+              "broadcast_signed_xmr", "airgap_tx_signer", "paranoia_mode",
+              "gs_console", "exit_strategy_simulator"):
+    _src = Path(REPO, _tool).read_text()
+    for _node in ast.walk(ast.parse(_src)):
+        if not (isinstance(_node, ast.Call)
+                and getattr(_node.func, "id", None) == "integrity_log"
+                and len(_node.args) >= 2):
+            continue
+        _seg = ast.get_source_segment(_src, _node.args[1]) or ""
+        for _sv in ("3", "12", "ConnectionError", "Peel 3/6", "Entry veil",
+                    "wlan0", "clearnet", "0.2500", "TimeoutExpired", "funded"):
+            _lit = re.sub(r"\{[^}]*\}", _sv, _seg).strip("f\"'")
+            _rendered += 1
+            if "<addr>" in gsc.chain_safe(_lit):
+                _damaged.append((_tool, _node.lineno, _lit))
+check(f"no real call-site payload is damaged by the address rule "
+      f"({_rendered} rendered from the actual format strings)", not _damaged)
+if _damaged:
+    print("     damaged:", _damaged[:5])
+
+# The primary fix: no chain payload is built from exception TEXT any more.
+_textual = []
+for _tool in ("GhostSpiral", "gs_common.py", "receive_watch",
+              "thor_swap_preparer", "create_receive_wallet",
+              "broadcast_signed_xmr", "airgap_tx_signer", "paranoia_mode",
+              "gs_console", "exit_strategy_simulator"):
+    _src = Path(REPO, _tool).read_text()
+    for _i, _line in enumerate(_src.split("\n"), 1):
+        if "integrity_log(" in _line and re.search(
+                r"\{(str\(e\)|str\(exc\)|_?emsg)\[", _line):
+            _textual.append(f"{_tool}:{_i}")
+check("no chain payload carries an exception MESSAGE (only its type)",
+      not _textual)
+if _textual:
+    print("     still textual:", _textual)
+
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
