@@ -717,6 +717,22 @@ class MoneroRPC:
         if not isinstance(addr, str) or not addr:
             raise RuntimeError(
                 f"create_address returned no address for account {account_index}")
+        # AND IT MUST LOOK LIKE AN ADDRESS. "not empty" was the whole check, so
+        # any non-empty string came back as a destination: found by feeding
+        # malformed-but-successful RPC answers to every function that consumes
+        # one. The wallet is not expected to lie, but the failure mode if it
+        # does is the bad kind -- the planner builds a whole distribution
+        # around the value and monerod only rejects it at transfer time, by
+        # which point earlier hops have already relayed.
+        #
+        # Length and alphabet only. Full checksum validation lives in
+        # validate_address and needs an RPC round trip per address; this is the
+        # cheap invariant that a subaddress is 95 base58 characters.
+        if len(addr) < 90 or len(addr) > 110 or any(c not in _B58 for c in addr):
+            raise RuntimeError(
+                f"create_address returned {addr[:12]!r}... for account "
+                f"{account_index}, which is not a Monero address (length "
+                f"{len(addr)}). Refusing to plan a distribution around it.")
         if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
             raise RuntimeError(
                 f"create_address returned no usable address_index "

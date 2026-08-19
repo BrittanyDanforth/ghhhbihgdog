@@ -2832,6 +2832,59 @@ finally:
     os.environ.pop("GS_PROBE_BOTH", None)
 
 
+# ---------------------------------------------------------------------------
+# MALFORMED SUCCESS. The RPC does not throw -- it answers, and the answer is
+# missing a field, null, the wrong type, or empty. That is the shape of the
+# account-index bug: .get(..., 0) turned a shrug into a decision.
+#
+# Every function that consumes an RPC answer to decide WHERE money goes or HOW
+# MUCH, fed hostile-but-successful responses.
+# ---------------------------------------------------------------------------
+class _Answers:
+    def __init__(self, resp): self.resp = resp
+    def raw_request(self, m, p=None): return self.resp
+
+def _refuses(fn):
+    try:
+        fn()
+        return False
+    except (RuntimeError, ValueError, TypeError, KeyError, AttributeError,
+            IndexError, SystemExit):
+        return True
+
+_GOODA = {"address": "4" + "A" * 94, "address_index": 3}
+for _lbl, _resp in (("{}", {}), ("None", None), ("[]", []),
+                    ("address=None", dict(_GOODA, address=None)),
+                    ("address=''", dict(_GOODA, address="")),
+                    ("address=True", dict(_GOODA, address=True)),
+                    ("address='not-an-address'", dict(_GOODA, address="nope")),
+                    ("address too short", dict(_GOODA, address="4" + "A" * 10)),
+                    ("address non-base58", dict(_GOODA, address="4" + "A" * 93 + "!")),
+                    ("address_index=None", dict(_GOODA, address_index=None)),
+                    ("address_index=True", dict(_GOODA, address_index=True)),
+                    ("address_index=-1", dict(_GOODA, address_index=-1)),
+                    ("address_index='3'", dict(_GOODA, address_index="3"))):
+    check(f"malformed success: new_subaddress_indexed refuses {_lbl}",
+          _refuses(lambda r=_resp: gs.MoneroRPC.new_subaddress_indexed(
+              _Answers(r), 0, "")))
+check("malformed success: ...and a WELL-FORMED answer is still accepted",
+      gs.MoneroRPC.new_subaddress_indexed(_Answers(_GOODA), 0, "")
+      == ("4" + "A" * 94, 3))
+
+_GOODC = {"account_index": 5}
+for _lbl, _resp in (("{}", {}), ("None", None), ("[]", []),
+                    ("account_index=None", dict(_GOODC, account_index=None)),
+                    ("account_index=''", dict(_GOODC, account_index="")),
+                    ("account_index=True", dict(_GOODC, account_index=True)),
+                    ("account_index='5'", dict(_GOODC, account_index="5")),
+                    ("account_index=-1", dict(_GOODC, account_index=-1)),
+                    ("account_index=0", dict(_GOODC, account_index=0))):
+    check(f"malformed success: create_fresh_account refuses {_lbl}",
+          _refuses(lambda r=_resp: gs.create_fresh_account(_Answers(r))))
+check("malformed success: ...and a WELL-FORMED answer is still accepted",
+      gs.create_fresh_account(_Answers(_GOODC)) == 5)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)
