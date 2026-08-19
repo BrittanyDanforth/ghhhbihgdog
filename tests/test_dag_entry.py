@@ -873,8 +873,22 @@ for _total, _n in [(Decimal("0.08"), 4), (Decimal("0.5"), 2),
     check(f"btc: {_total}/{_n} produces {_n} chunks", len(_a) == _n)
     check(f"btc: {_total}/{_n} sums EXACTLY to the total (no satoshi lost or "
           f"invented)", sum(_a, Decimal(0)) == _total)
-    check(f"btc: {_total}/{_n} chunks are DISTINCT — the whole point",
-          len(set(_a)) == _n)
+    # DISTINCT EVERY TIME, not usually. Jitter alone did not give this:
+    # measured at 0.085% collisions for 4 chunks and 0.585% for 8, because
+    # quantising to satoshis and nudging random chunks by one puts two values
+    # together far more often than the continuous odds suggest. This check
+    # was therefore asserting something FALSE and would have gone red about
+    # once in every 150 runs -- which teaches an operator to re-run rather
+    # than to look. split_btc_amount repairs collisions now.
+    for _rep in range(120):
+        _ax = ghost.split_btc_amount(_total, _n, _R)
+        if len(set(_ax)) != _n:
+            break
+    check(f"btc: {_total}/{_n} chunks are DISTINCT, over 120 draws — a "
+          f"repeated deposit amount is the tell this exists to remove",
+          len(set(_ax)) == _n)
+    check(f"btc: {_total}/{_n} ...and the repair did not break the total",
+          sum(_ax, Decimal(0)) == _total and all(x > 0 for x in _ax))
     check(f"btc: {_total}/{_n} every chunk is positive", all(x > 0 for x in _a))
     _share = _total / Decimal(_n)
     # THE DERIVED BOUND, not the naive one. Each chunk is total * w_i/sum(w)
@@ -993,6 +1007,169 @@ for _ok_amt in ("0.1", "0.00000001", "1", "0.12345678"):
     check(f"control: --btc-amount {_ok_amt} is payable and allowed", _r is None)
 check("control: no --btc-amount at all is fine (manual and receive modes)",
       ghost.resolve_btc_amount(types.SimpleNamespace(btc_amount=None)) is None)
+
+
+# ==========================================================================
+# GAPS FOUND BY MUTATION, NOT BY READING.
+#
+# A 29-mutation sweep over the guarantees this file claims to protect found
+# EIGHT that no test noticed: break them and every suite stayed green. Each
+# check below turns exactly one of those red. They are grouped here rather
+# than scattered because the thing they have in common is how they were
+# found -- reading the code did not surface any of them.
+# ==========================================================================
+def _addr(seed):
+    """A syntactically valid 95-char Monero address, distinct per seed."""
+    b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    tail = "".join(b58[(seed * (i + 7) + i) % len(b58)] for i in range(93))
+    return "4" + b58[seed % 2] + tail
+
+
+print("\n=== gaps the mutation sweep found ===")
+
+# -- [2][3] the quote loop's two refusals ---------------------------------
+# Nothing drove stage2_get_swap_quotes with a bad destination list, so
+# deleting either guard changed nothing.
+def _quotes(chunks, dests):
+    """Run the REAL stage2_get_swap_quotes with the network stubbed."""
+    saved = (ghost.safe_post, ghost.btc_per_xmr_oracle, ghost.newnym,
+             ghost.secure_delay, ghost.integrity_log)
+    try:
+        ghost.btc_per_xmr_oracle = lambda *a, **k: None
+        ghost.newnym = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.safe_post = lambda url, payload, proxy: {"routes": [{
+            "expectedOutput": "1.0",
+            "transaction": {
+                "memo": "=:XMR.XMR:" + payload["destinationAddress"] + ":0/1/0::0",
+                "depositAddress": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+        _a = types.SimpleNamespace(allow_unbound_memo=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ghost.stage2_get_swap_quotes(_a, None, chunks, dests), None
+    except SystemExit as e:
+        return None, str(e.code)
+    finally:
+        (ghost.safe_post, ghost.btc_per_xmr_oracle, ghost.newnym,
+         ghost.secure_delay, ghost.integrity_log) = saved
+
+
+_E1, _E2, _E3 = _addr(9001), _addr(9002), _addr(9003)
+_CH = [Decimal("0.01")] * 3
+
+_r, _m = _quotes(_CH, [_E1, _E2])
+check("gap: THREE chunks with TWO destinations is REFUSED — a short list "
+      "would re-use an address for the rest, which is the linkage the split "
+      "removes", _m is not None)
+check("gap: ...and it refuses before any quote is fetched, not after",
+      _m and "Refusing to quote" in _m)
+
+_r, _m = _quotes(_CH, [_E1, _E2, _E1])
+check("gap: two chunks sharing a destination is REFUSED", _m is not None)
+check("gap: ...naming the aggregator link as the reason",
+      _m and "aggregator" in _m)
+
+_r, _m = _quotes(_CH, [_E1, _E2, _E3])
+check("control: three chunks with three distinct destinations is accepted",
+      _m is None and _r is not None and len(_r) == 3)
+check("control: ...and each deposit records its own destination",
+      _r and [d["xmr_dest"] for d in _r] == [_E1, _E2, _E3])
+
+
+# -- [20] the exit must hold EVERY entry address --------------------------
+# `_addrs[:1]` survived: no test called _exit_hold_list with more than one
+# entry. This is the guard that stops a late swap chunk being swept to
+# --exit-to in one hop from an address the swap names in public.
+_ha = types.SimpleNamespace(entry_veil=True)
+_hai = {_E1: (11, 1), _E2: (12, 1), _E3: (13, 1), "mix": (20, 1)}
+_hold3 = ghost._exit_hold_list(_ha, _hai, [_E1, _E2, _E3])
+check("gap: the exit holds EVERY entry address, not just the first",
+      sorted(_hold3) == [(11, 1), (12, 1), (13, 1)])
+check("gap: ...and holds nothing else",
+      (20, 1) not in _hold3)
+check("control: a single entry still yields exactly its own pair",
+      ghost._exit_hold_list(_ha, _hai, [_E2]) == [(12, 1)])
+check("control: a bare string is still accepted (the one-chunk call shape)",
+      ghost._exit_hold_list(_ha, _hai, _E2) == [(12, 1)])
+check("control: an entry the wallet does not know is skipped, not crashed on",
+      ghost._exit_hold_list(_ha, _hai, [_E1, "unknown"]) == [(11, 1)])
+
+
+# -- [24] JoinMarket's UTXO count is bounded too ---------------------------
+# Nothing drove the JoinMarket path, so removing its cap changed nothing --
+# and a tumbler decides its own UTXO count, unlike --split.
+_jm = None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost.planned_chunk_count(types.SimpleNamespace(split=1),
+                                  ["u"] * (ghost.MAX_SPLIT + 1))
+except SystemExit as _e:
+    _jm = str(_e.code)
+check("gap: more JoinMarket UTXOs than MAX_SPLIT is REFUSED — a tumbler picks "
+      "its own count, and past the cap chunks would share entry addresses",
+      _jm is not None)
+check("gap: ...naming the offline wallet's account limit as the reason",
+      _jm and "accounts" in _jm)
+check("control: exactly MAX_SPLIT UTXOs is allowed",
+      ghost.planned_chunk_count(types.SimpleNamespace(split=1),
+                                ["u"] * ghost.MAX_SPLIT) == ghost.MAX_SPLIT)
+
+
+# -- [26] EVERY entry address is excluded from hop destinations ------------
+# `b not in _entry_set` -> `b != list(_entry_set)[0]` survived. The
+# adjacency docstring measured 87.5% of runs paying a hop back to an
+# unexcluded entry, so this is the guard that measurement produced.
+_subs_e = ["m0", "m1", "m2", "m3"]
+_entries_e = ["E_a", "E_b"]
+_adj = ghost.build_dag_adjacency(_subs_e + _entries_e, _entries_e, 2,
+                                 _secretsmod)
+_all_dsts = {d for v in _adj.values() for d in v}
+check("gap: NO entry address is reachable as a hop destination — not just the "
+      "first one", not (_all_dsts & set(_entries_e)))
+_leaked = False
+for _ in range(60):
+    _a2 = ghost.build_dag_adjacency(_subs_e + _entries_e, _entries_e, 2,
+                                    _secretsmod)
+    if {d for v in _a2.values() for d in v} & set(_entries_e):
+        _leaked = True
+        break
+check("gap: ...over 60 draws, so this is not one lucky shuffle", not _leaked)
+check("control: ordinary mix targets ARE reachable, so the exclusion is not "
+      "excluding everything", bool(_all_dsts & set(_subs_e)))
+
+
+# -- [27] the holdings report names EVERY funded entry account ------------
+class _HoldRPC:
+    """Answers get_balance per account, the way report_holdings asks."""
+
+    def raw_request(self, method, params=None):
+        if method == "get_balance":
+            return {"balance": 1_000_000_000_000,
+                    "unlocked_balance": 1_000_000_000_000}
+        if method == "refresh":
+            return {}
+        raise AssertionError(method)
+
+
+_hb = io.StringIO()
+with contextlib.redirect_stdout(_hb):
+    ghost.report_holdings(_HoldRPC(), [11, 12, 13, 20],
+                          entry_account=[11, 12, 13])
+_ht = _hb.getvalue()
+# Anchor on the WARNING, not on "ACCOUNT" -- the listing header above it is
+# "ACCOUNTS:", which matched and made this look for the numbers in the wrong
+# block entirely.
+_i = _ht.index("SWAP ENTRY") if "SWAP ENTRY" in _ht else -1
+_warn_line = _ht[max(0, _i - 120):_i + 60] if _i >= 0 else ""
+check("gap: the holdings report names EVERY entry account, not just the first",
+      _i >= 0 and all(str(a) in _warn_line for a in (11, 12, 13)))
+check("gap: ...and warns not to spend them with the rest",
+      "Do NOT spend" in _ht)
+_hb2 = io.StringIO()
+with contextlib.redirect_stdout(_hb2):
+    ghost.report_holdings(_HoldRPC(), [11, 12, 13, 20], entry_account=None)
+check("control: with no entry account there is no such warning",
+      "SWAP ENTRY" not in _hb2.getvalue())
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

@@ -768,6 +768,90 @@ check("e2e: ...and NO two chunks carry the same BTC amount, so the deposits "
 check("e2e: ...while still summing to exactly what was asked for",
       sum((D(p["sellAmount"]) for p in _posted), D(0)) == D("0.6"))
 
+# MANUAL MODE MUST LIST EVERY ENTRY ADDRESS. It prints a thor_swap_preparer
+# command for the operator to run by hand; printing only the first --dests
+# would be this whole defect reissued as an instruction, and a mutation that
+# did exactly that survived every suite.
+def _drive_manual(n_chunks, wallets=6):
+    """Run main() with no --btc-amount, so it prints the manual instructions."""
+    subs_fixture = [_addr(4000 + i) for i in range(wallets + 4)]
+    idx_fixture = {a: (30 + i, 1) for i, a in enumerate(subs_fixture)}
+    entry_fixture = [(_addr(5000 + i), 70 + i, 1) for i in range(n_chunks)]
+    saved = {n: getattr(ghost, n) for n in
+             ("verify_tor", "require_resources", "check_daemon_relay_egress",
+              "connect_rpc", "stage0_preflight", "stage1_joinmarket",
+              "resolve_mix_account", "create_subs", "create_entry_set",
+              "newnym", "tor_recheck", "validate_xmr_address",
+              "resolve_wallet_password", "resolve_sensitive_inputs",
+              "run_lock", "integrity_log", "secure_delay", "reject_self_exit",
+              "resolve_entry_accounts")}
+    _argv = sys.argv[:]
+    try:
+        ghost.verify_tor = lambda *a, **k: None
+        ghost.require_resources = lambda *a, **k: None
+        ghost.check_daemon_relay_egress = lambda *a, **k: {
+            "verdict": "tor", "onion": 4, "clear": 0, "detail": "ok"}
+        ghost.connect_rpc = lambda *a, **k: object()
+        ghost.stage0_preflight = lambda *a, **k: (object(), object(), D("0.001"))
+        ghost.stage1_joinmarket = lambda *a, **k: []
+        ghost.resolve_mix_account = lambda *a, **k: None
+        ghost.create_subs = lambda *a, **k: (list(subs_fixture),
+                                             dict(idx_fixture), set())
+        ghost.create_entry_set = lambda rpc, n: list(entry_fixture[:n])
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.validate_xmr_address = lambda *a, **k: None
+        ghost.resolve_wallet_password = lambda *a, **k: None
+        ghost.resolve_sensitive_inputs = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost.reject_self_exit = lambda *a, **k: None
+        # Stop right after the manual block, before the arrival wait.
+        ghost.resolve_entry_accounts = lambda *a, **k: (_ for _ in ()).throw(
+            _SplitStop())
+
+        @contextlib.contextmanager
+        def _nolock(*a, **k):
+            yield None
+        ghost.run_lock = _nolock
+
+        sys.argv = ["GhostSpiral", "--btc-entry",
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                    "--split", str(n_chunks), "--wallets", str(wallets),
+                    "--tor-proxy", "socks5h://127.0.0.1:9050"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                ghost.main()
+        except (_SplitStop, SystemExit):
+            pass
+        return buf.getvalue(), [a for a, _c, _i in entry_fixture[:n_chunks]]
+    finally:
+        for n, v in saved.items():
+            setattr(ghost, n, v)
+        sys.argv = _argv
+
+
+_mout, _ments = _drive_manual(3)
+check("manual: the instructions are printed at all",
+      "MANUAL MODE" in _mout and "--dests" in _mout)
+_dline = [l for l in _mout.split("\n") if "--dests" in l]
+check("manual: ALL THREE entry addresses are listed on --dests, not just the "
+      "first — printing one would tell the operator to route three swaps to "
+      "one address",
+      _dline and all(ghost.scrub_address(a) in _dline[0] for a in _ments))
+check("manual: ...and the operator is told to use one per swap, never twice",
+      "One per swap" in _mout)
+check("manual: ...and where to read the full addresses, since these are scrubbed",
+      "subaddress 1 of accounts" in _mout)
+
+_mout1, _ments1 = _drive_manual(1)
+_dline1 = [l for l in _mout1.split("\n") if "--dests" in l]
+check("control: a one-chunk manual run lists exactly one address",
+      _dline1 and ghost.scrub_address(_ments1[0]) in _dline1[0])
+check("control: ...and does not print the multi-chunk guidance",
+      "One per swap" not in _mout1)
+
 # CONTROL: one chunk still posts one address, exactly as before.
 _p1, _e1 = _drive_split(1)
 check("control: a one-chunk run posts ONE quote", len(_p1) == 1)

@@ -278,6 +278,44 @@ check("exit: ...and is reported as held, not as a silent success",
 # not name.
 check("exit: ...and the breakdown says it was an ENTRY hold, not a change one",
       _h2 == {"entry": 1, "change": 0})
+
+# THE OTHER SIDE OF THE BREAKDOWN. Every held-output test passed a pair that
+# WAS an entry, so hard-coding the counter to "entry" survived a mutation
+# sweep -- the branch that classifies a hold as CHANGE was never taken. That
+# is the case where getting it wrong costs the most: the operator is sent to
+# look at an address the swap memo does not name, with the wrong remedy.
+_saved_chg = (ghost._run_round, ghost._wait_for_change_settled,
+              ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+              ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+try:
+    ghost._run_round = lambda *a, **k: 1
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {7: {1: 3_000_000_000_000}, 9: {0: 1_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _cstg2 = os.path.join(_tf.mkdtemp(prefix="chgkind_"), "tx_staging")
+    os.makedirs(_cstg2, exist_ok=True)
+    _chg_out = io.StringIO()
+    with contextlib.redirect_stdout(_chg_out):
+        _cr2, _cf2, _cs2, _ch2, _cu2 = ghost._run_exit_withdrawals(
+            _args, [7, 9], [A1], _cstg2, None, {}, (0, 0),
+            hold=[(9, 0)], entry_pairs=[(3, 1)])     # 9/0 is CHANGE, not entry
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _saved_chg
+check("exit: a held output that is NOT an entry is counted as CHANGE",
+      _ch2 == {"entry": 0, "change": 1})
+check("exit: ...and described as a distribution change address, not as ENTRY",
+      "distribution CHANGE" in _chg_out.getvalue()
+      and "swap ENTRY" not in _chg_out.getvalue())
+check("exit: ...with the remedy that fits it — the remainder the distribution "
+      "could not allocate, not a late swap chunk",
+      "remainder the distribution could not allocate" in _chg_out.getvalue())
 check("exit: ...while every MIXED output still leaves",
       sorted((t["account_index"], t["src_index"]) for t in _txs2)
       == [(7, 1), (9, 1)])
