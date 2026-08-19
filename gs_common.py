@@ -1081,7 +1081,15 @@ class MoneroRPC:
                                           proxy_url=proxy_url)
             applied = getattr(self._backend, "proxies", None) or {}
             if not any(str(v) == str(proxy_url) for v in applied.values()):
-                integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_VERIFY_FAILED")
+                # THE HOST ITSELF STAYS OFF THE CHAIN. This wrote
+                # `non_local_rpc:<host>:<port>` — the operator's remote node,
+                # which is very often a v3 onion service they run. chain_safe
+                # strips digits and recognises Monero addresses; a lowercase
+                # base32 onion name is neither, so it survived intact onto a
+                # file that persists. The host is in the abort message below,
+                # on the terminal, where the operator needs it; the chain
+                # records only THAT a non-local RPC was refused.
+                integrity_log("rpc", "non_local_rpc:proxy_VERIFY_FAILED")
                 sys.exit(
                     f"[!] The proxy did not attach to the RPC client for "
                     f"{host}:{port}.\n"
@@ -1089,7 +1097,7 @@ class MoneroRPC:
                     f"    would leak your IP to that node. Tunnel the RPC externally\n"
                     f"    (socat/ssh) and point at 127.0.0.1 instead."
                 )
-            integrity_log("rpc", f"non_local_rpc:{host}:{port}:proxy_applied")
+            integrity_log("rpc", "non_local_rpc:proxy_applied")
 
         self._wallet = XMRWallet(self._backend)
 

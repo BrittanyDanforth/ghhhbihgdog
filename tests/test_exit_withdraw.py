@@ -491,6 +491,95 @@ check("UNCLEAN: ...and the unclean branch says the value has NOT left",
       "has NOT left the wallet" in _branch)
 
 
+
+# ---- THE CHANGE ADDRESS IS HELD BACK TOO --------------------------------
+#
+# The hold covered ENTRY's own subaddress only. A distribution cannot allocate
+# its input exactly, so monerod returns the remainder as change to subaddress 0
+# of the SPENDING account — and the exit swept that straight to --exit-to.
+# Reproduced: ENTRY at 3/1 held, fan-out change at 3/0 withdrawn.
+#
+# That output is what the change sweep exists to push into the mix, and
+# _run_change_sweep's own failure message calls what it leaves behind "UNMIXED
+# ... the one output that never moves". It is also an output of the transaction
+# that spent the swapped funds, so withdrawing it publishes that link in one
+# hop — the same publication the ENTRY hold refuses, on the same run.
+_cg = _Recorder()
+_savedC = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+           ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+try:
+    ghost._run_round = _cg
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    # 3/0 is the fan-out change, 3/1 is ENTRY, 5/1 is a mixed output.
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {3: {0: 2_000_000_000_000, 1: 1_000_000_000_000},
+         5: {1: 4_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost._run_change_sweeps = lambda *a, **k: 1        # the sweep FAILED
+    _cai = {"ENTRY": (3, 1), "mix": (5, 1)}
+    _cargs = types.SimpleNamespace(**{**vars(_wargs), "entry_veil": True})
+    _cstg = os.path.join(_tf.mkdtemp(prefix="chg_"), "tx_staging")
+    os.makedirs(_cstg, exist_ok=True)
+    with contextlib.redirect_stdout(io.StringIO()) as _cout:
+        ghost._stage5_run(
+            _cargs, _plan, None, [], _cstg, None, 1,
+            distribution_mode="fanout", change_target=(3, 0),
+            change_sweep_jobs=[(3, 0, "DST", 9)], delay_window=(0, 0),
+            exit_accounts=ghost._exit_account_list(_cai, [], 3),
+            exit_hold=ghost._exit_hold_list(_cargs, _cai, "ENTRY"))
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay, ghost._wait_for_fanout_confirm,
+     ghost._run_change_sweeps) = _savedC
+
+_csrc = [(t["account_index"], t["src_index"]) for r in _cg.rounds for t in r]
+check("CHANGE HOLD: unswept distribution change is NOT withdrawn to --exit-to",
+      (3, 0) not in _csrc)
+check("CHANGE HOLD: ...ENTRY is still held too", (3, 1) not in _csrc)
+check("CHANGE HOLD: ...and the MIXED output still leaves", (5, 1) in _csrc)
+
+# The message must name what it actually is. Calling change "ENTRY" sends the
+# operator to an address with nothing on it and describes the wrong risk.
+_mbuf = io.StringIO()
+_savedM = (ghost._run_round, ghost._wait_for_change_settled,
+           ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+           ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay)
+try:
+    ghost._run_round = lambda *a, **k: 1
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {3: {0: 2_000_000_000_000, 1: 1_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _mstg = os.path.join(_tf.mkdtemp(prefix="msg_"), "tx_staging")
+    os.makedirs(_mstg, exist_ok=True)
+    with contextlib.redirect_stdout(_mbuf):
+        ghost._run_exit_withdrawals(_args, [3], [A1], _mstg, None, {}, (0, 0),
+                                    hold=[(3, 1), (3, 0)], entry_pair=(3, 1))
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _savedM
+_mtxt = _mbuf.getvalue()
+check("CHANGE HOLD: the ENTRY output is described as ENTRY",
+      "the swap ENTRY address (account 3 / subaddr 1)" in _mtxt)
+check("CHANGE HOLD: the change output is described as CHANGE, not ENTRY",
+      "a distribution CHANGE address (account 3 / subaddr 0)" in _mtxt)
+check("CHANGE HOLD: ...and the change explanation is the change one",
+      "the change sweep is what pushes it into" in _mtxt)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

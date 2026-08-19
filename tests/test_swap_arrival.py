@@ -566,6 +566,8 @@ _res, _out, _exit = drive_stage4(
     [(0, 0)] + [(i, i) for i in range(1, 13)] + [(12, 12)] * 3,
     deposits=[quote("1.0")] * 12)
 check("STAGE4: the tightened gate is announced", "tightened" in _out)
+check("STAGE4: ...and with real quotes it says the SMALLEST QUOTED chunk, "
+      "a fact it actually has", "smallest quoted chunk" in _out.lower())
 check("STAGE4: ...and the run still completes on a full delivery",
       _exit is None and _res == (D(12), D(12)))
 
@@ -843,6 +845,23 @@ check("FLOOR: a zero or negative total yields no floor at all",
       ghost.swap_arrival_floor(D(0), D("0.10"), [], 3) == (D(0), False)
       and ghost.swap_arrival_floor(D(-1), D("0.10"), [], 3) == (D(0), False))
 
+
+
+# ---- the gate must not assert what it does not know ---------------------
+#
+# With a total and a count but no quotes, "the smallest chunk is worth less
+# than that tolerance" is not a measurement — the sizes are ASSUMED EQUAL. The
+# message stated it as fact, which is the same class of defect as the rest of
+# this audit: a claim the code never established.
+_res, _out, _exit = drive_stage4(
+    [(0, 0)] + [(D(i), D(i)) for i in range(1, 13)] + [(D(12), D(12))] * 3,
+    deposits=[], expect=D(12), split=12)
+check("MANUAL CLAIM: with no quotes the gate says the sizes are ASSUMED equal",
+      "assumes your" in _out and "EQUAL" in _out)
+check("MANUAL CLAIM: ...and does not claim to know the smallest chunk",
+      "smallest quoted chunk" not in _out.lower())
+check("MANUAL CLAIM: ...and warns the real smallest may be smaller",
+      "may be smaller" in _out)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

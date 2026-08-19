@@ -2617,11 +2617,22 @@ def stage4_await_swap(args, rpc, bal_account: int, entry_index: int,
     floor_, _tightened = swap_arrival_floor(quoted, args.swap_tolerance,
                                             chunk_amounts, n_chunks)
     if _tightened:
-        print(f"  [*] Arrival gate tightened to {floor_} XMR, above the "
-              f"{args.swap_tolerance * 100:.0f}% slippage tolerance would "
-              f"allow. The smallest chunk is worth less than that tolerance, "
-              f"so at the wider figure it could have been missing entirely and "
-              f"still counted as a complete swap.")
+        # "The smallest chunk" is only KNOWN when the quotes are. With a total
+        # and a count alone the size is assumed equal, and this said otherwise
+        # — asserting a measured fact about the operator's swaps that nothing
+        # here measured. Say which of the two it is.
+        _basis = ("The smallest quoted chunk is" if chunk_amounts
+                  else f"Split equally, each of the {n_chunks} chunks would be")
+        print(f"  [*] Arrival gate tightened to {floor_} XMR, above what the "
+              f"{args.swap_tolerance * 100:.0f}% slippage tolerance alone "
+              f"would allow. {_basis} worth less than that tolerance, so at "
+              f"the wider figure a whole chunk could be missing and still "
+              f"count as a complete swap.")
+        if not chunk_amounts:
+            print(f"      That assumes your {n_chunks} swaps were EQUAL. If "
+                  f"they were not, the smallest one may be smaller than this "
+                  f"gate allows for — pass --pairs, or check the arrival "
+                  f"yourself before the run plans.")
         integrity_log("stage4", "arrival_gate_tightened_for_smallest_chunk")
     # NO CHUNK COUNT, NO GUARANTEE. In manual mode swap_deposits is empty, so
     # n_chunks falls back to --split -- which is 1 by default and does nothing
@@ -2921,11 +2932,21 @@ def report_completion(rpc, incomplete, accounts, spent_plans=(),
         print("  [!] ...but value was DELIBERATELY LEFT ON THIS WALLET:")
         for w in withheld:
             print(f"      - {w}")
-        print("      This is the exit doing its job, not a failure. Do NOT "
-              "sweep it by hand to")
-        print("      the same destination — that is the transaction being "
-              "avoided. See the exit")
-        print("      messages above for what to do with it.")
+        print("      This is the exit doing its job, not a failure — but the "
+              "two kinds are not")
+        print("      the same, and the exit messages above say which you have:")
+        print("        * UNMIXED value (a late swap chunk on ENTRY, or a "
+              "distribution change")
+        print("          the sweep did not reach). Do NOT send it to your exit "
+              "destination —")
+        print("          that is the one hop this run exists to avoid. Mix it "
+              "first.")
+        print("        * MIXED value that relayed but could not be confirmed "
+              "empty. That is")
+        print("          yours to withdraw normally once it unlocks; it is not "
+              "a link risk.")
+        print("      Blanket advice not to move it would strand the second "
+              "kind for ever.")
 
 
 def resolve_entry_veil(rpc, args, addr_index: dict, entry_addr: str,
@@ -4301,7 +4322,7 @@ def _funded_subaddresses(rpc, accounts) -> list:
 
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
-                          delay_window=None, hold=()) -> tuple:
+                          delay_window=None, hold=(), entry_pair=None) -> tuple:
     """ACTUALLY SPEND THE MIXED FUNDS OUT.
     Returns (relayed, failed, skipped, held).
 
@@ -4348,16 +4369,33 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         # would count them, and the account/subaddress pair is the grouping
         # report_holdings refuses to put on disk. The operator gets both, in
         # full, on the terminal below.
-        integrity_log("exit", "withheld_unmixed_entry")
+        integrity_log("exit", "withheld_unmixed")
         for _ha, _hi, _hamt in held:
+            # NOT ALWAYS "ENTRY". The hold also covers every change location
+            # now, because a distribution returns its remainder to subaddress 0
+            # of the spending account and the exit was sweeping that out.
+            # Calling both cases ENTRY sends the operator to look at an address
+            # that has nothing on it, and describes the wrong risk.
+            _is_entry = bool(entry_pair) and (_ha, _hi) == (
+                int(entry_pair[0]), int(entry_pair[1]))
             print(f"  [!] EXIT: {Decimal(_hamt) / Decimal(10 ** 12)} XMR is on "
-                  f"ENTRY (account {_ha} / subaddr {_hi}) and was NOT "
+                  f"{'the swap ENTRY' if _is_entry else 'a distribution CHANGE'}"
+                  f" address (account {_ha} / subaddr {_hi}) and was NOT "
                   f"withdrawn.")
-            print("      It landed after the run had planned — usually a swap "
-                  "chunk that settled late. The swap memo names that address "
-                  "in public, so sending it to your exit destination would tie "
-                  "the two together in one hop — which is what the rest of "
-                  "this run spent hours preventing.")
+            if _is_entry:
+                print("      It landed after the run had planned — usually a "
+                      "swap chunk that settled late. The swap memo names that "
+                      "address in public, so sending it to your exit "
+                      "destination would tie the two together in one hop — "
+                      "which is what the rest of this run spent hours "
+                      "preventing.")
+            else:
+                print("      This is the remainder the distribution could not "
+                      "allocate, and the change sweep is what pushes it into "
+                      "the mix. It did not get there, so it is UNMIXED — and "
+                      "it is an output of the transaction that spent your "
+                      "swapped funds. Withdrawing it publishes that link in "
+                      "one hop.")
             print("      It is safe where it is. To mix it: mint a fresh "
                   "receive wallet (create_receive_wallet), send this balance "
                   "to it as ONE ordinary transfer — that hop is the entry "
@@ -4603,9 +4641,33 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 _exit_meta = json.load(_ef).get("meta", {})
         except Exception:                                    # noqa: BLE001
             _exit_meta = {}
+        # EVERY CHANGE LOCATION IS HELD TOO, unconditionally.
+        #
+        # The hold covered ENTRY's own subaddress only. A distribution cannot
+        # allocate its input exactly, so monerod returns the remainder as
+        # change to subaddress 0 of the SPENDING account -- and the exit was
+        # sweeping that straight to --exit-to. Reproduced: with ENTRY at
+        # account 3 / subaddr 1 held, the fan-out change at 3/0 was withdrawn.
+        #
+        # That output is the one the change sweep exists to push INTO the mix,
+        # and _run_change_sweep's own failure message calls what it leaves
+        # behind "UNMIXED ... the one output that never moves". Withdrawing it
+        # is the same publication the ENTRY hold refuses, on the same run.
+        #
+        # Unconditional rather than conditional on the sweep having failed: a
+        # swept change address is EMPTY, so _funded_subaddresses never returns
+        # it and holding it costs nothing. Keying it off the sweep's own return
+        # code would trust the bookkeeping of the step being checked, and would
+        # miss the residual case where the sweep relayed but left value behind.
+        _hold = list(exit_hold or ())
+        for _cj in (change_sweep_jobs or ()):
+            _hold.append((int(_cj[0]), int(_cj[1])))
+        if change_target:
+            _hold.append((int(change_target[0]), int(change_target[1])))
         _relayed, _failed, _skipped, _held, _unclean = _run_exit_withdrawals(
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
-            _exit_meta, delay_window, hold=exit_hold or ())
+            _exit_meta, delay_window, hold=_hold,
+            entry_pair=(exit_hold or [(None, None)])[0])
         if _held:
             # WITHHELD, NOT INCOMPLETE, and the distinction is not cosmetic.
             #
