@@ -42,7 +42,7 @@ from gs_common import (
     validate_xmr_address,
     decimal_env,
     finite_decimal,
-    wipe_covers,
+    wipe_covers, fmt_btc,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -470,7 +470,12 @@ def main():
 
         pair = {
             "schema": PAIR_SCHEMA,
-            "btc_in": str(amt),
+            # fmt_btc, not str(): a Decimal renders a small amount in
+            # scientific notation, and this string is printed verbatim as
+            # "Send exactly: <x> BTC". GhostSpiral had the same defect on the
+            # same line of the same instruction; the formatter lives in
+            # gs_common so the two swap paths cannot drift again.
+            "btc_in": fmt_btc(amt),
             "deposit": deposit,
             "memo": memo,
             "dest_xmr": dest,

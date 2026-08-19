@@ -51,6 +51,7 @@ from gs_common import (
     swap_arrival_floor,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
+    MAX_SPLIT, fmt_btc, SATOSHI_BTC,
     validate_xmr_address, accept_floor,
 )
 
@@ -230,12 +231,12 @@ FANOUT_FEE_BUFFER_MULT = Decimal("3")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
 
+#: How far each --split chunk may stray from the equal share, either way.
+#: 0.18 keeps every chunk inside +/-18% -- enough that N deposits are not one
+#: repeated number, not so much that one chunk is conspicuous. See
+#: split_btc_amount for what equal chunks cost on the Bitcoin side.
+SPLIT_JITTER = Decimal("0.18")
 MIN_WALLETS = 3
-#: Most swap chunks --split will accept. Each costs a swap fee, a veil
-#: transaction and a wallet account, and the offline signer derives
-#: subaddresses for a bounded number of accounts (OPSEC_SETUP.md measures the
-#: default 50 being passed during the second run). See resolve_split.
-MAX_SPLIT = 8
 MIN_DEEP = 1
 # Extra mix outputs beyond `wallets`, chosen RANDOMLY per run within this range.
 # A fixed count (the old NUM_DECOYS = 4) makes the total output count a
@@ -548,9 +549,11 @@ def size_distribution(fanout_dests: list, entry_unlocked: list,
                       rng) -> tuple:
     """Split the mix targets and the budget across the swap chunks.
 
-    Returns (dest_slices, slice_usable, fanout_amounts) -- one slice of
-    destinations and one share of `usable` per chunk, plus the flat list of
-    per-destination amounts in the same order as `fanout_dests`.
+    Returns (dest_slices, slice_usable, fanout_amounts, unfundable_index) --
+    one slice of destinations and one share of `usable` per chunk, plus the
+    flat list of per-destination amounts in the same order as `fanout_dests`,
+    plus the index of the first chunk whose share could not fund its slice (or
+    None). The caller drops that chunk and asks again.
 
     PER CARRIER, NOT GLOBALLY, and getting this wrong is not visible until
     monerod refuses the transaction. With one chunk there is one carrier
@@ -569,13 +572,15 @@ def size_distribution(fanout_dests: list, entry_unlocked: list,
     dest_slices with an empty entry so the caller can say which chunk and how
     many targets it had.
 
-    An amounts list SHORTER than the destination list means one chunk's share
-    could not fund its slice; the whole thing comes back empty, because a
-    partial distribution silently drops that chunk's destinations.
+    A chunk whose share cannot fund its slice comes back NAMED rather than as a
+    bare empty result. It used to abort the entire run -- under a message about
+    the wallet balance being too small, which it was not -- when one small
+    chunk arrived above dust but below what even one mix output costs. Every
+    other chunk was fine. The caller drops the named one and re-sizes.
     """
     slices = split_by_weight(fanout_dests, entry_unlocked)
     if any(not sl for sl in slices):
-        return slices, [], []
+        return slices, [], [], None
     total = sum(entry_unlocked, Decimal(0)) or Decimal(1)
     slice_usable = [usable * (u / total) for u in entry_unlocked]
     amounts = []
@@ -583,9 +588,116 @@ def size_distribution(fanout_dests: list, entry_unlocked: list,
         got = compute_fanout_amounts(slice_usable[i], len(sl), fee_xmr,
                                      dag_enabled, rng)
         if len(got) != len(sl):
-            return slices, slice_usable, []
+            # WHICH slice could not be funded, so the caller can drop that
+            # chunk and try again rather than losing the whole run to it.
+            # Returning a bare [] made one small chunk abort a run in which
+            # every other chunk was fine, under a message about the wallet
+            # balance being too small -- which it was not.
+            return slices, slice_usable, [], i
         amounts.extend(got)
-    return slices, slice_usable, amounts
+    return slices, slice_usable, amounts, None
+
+
+def split_btc_amount(total: Decimal, n: int, rng) -> list:
+    """Divide the BTC across n swap chunks, UNEQUALLY. Returns n amounts.
+
+    EQUAL CHUNKS UNDO THE SPLIT ON THE BITCOIN SIDE. This was
+
+        per_chunk = (total / n).quantize(SATOSHI_BTC)
+        btc_chunks = [per_chunk] * n
+
+    which is N deposits of an identical amount, made within minutes of each
+    other, each carrying an OP_RETURN that names a different Monero address.
+    The Monero side of --split is careful: separate entry addresses, separate
+    veils, separate distributions, no transaction spending two chunks. None of
+    that helps if the BITCOIN chain hands an observer the grouping for free --
+    "four deposits of exactly 0.02 BTC to the same vault inside an hour" is a
+    cluster, and the memos then read out all four destination addresses.
+
+    So the chunks are jittered the way the fan-out's are, and for the same
+    reason (see compute_fanout_amounts): identical values give an analyst one
+    number and one shape to cluster on.
+
+    THE BOUND, stated as what it actually is. Each chunk is total * w_i / sum(w)
+    with every w_i drawn from [1-j, 1+j] for j = SPLIT_JITTER, so a chunk lands
+    between (1-j)/(1+j) and (1+j)/(1-j) of the equal share -- about 0.70x to
+    1.44x at j = 0.18, not 0.82x to 1.18x. Normalising is what widens it, and
+    normalising is also what keeps the sum exact, so the wider band is the
+    price of no chunk carrying the whole imbalance. It is still bounded and
+    still symmetric-ish in log terms, which is what "no chunk is conspicuous"
+    needs; a test pins the derived figure rather than the naive one.
+
+    The total is EXACT: the sub-satoshi remainder from quantisation is spread a
+    satoshi at a time over randomly chosen chunks rather than dumped on the
+    first, which would make chunk 0 identifiable as "the odd one" every run.
+
+    An operator sending by hand still sends what they are told; this only
+    changes what they are told.
+    """
+    n = max(1, int(n))
+    if n == 1:
+        return [total]
+    # WEIGHTS FIRST, NORMALISED, THEN QUANTISED -- in that order, and the order
+    # is the point.
+    #
+    # The first version jittered each share independently and then put the
+    # whole difference from `total` onto one chunk. That difference is not a
+    # rounding remainder, it is the ACCUMULATED jitter imbalance, which for
+    # eight chunks at +/-18% runs to several percent of the total -- so the
+    # correction pushed one chunk far outside the band and made it the
+    # conspicuous one, which is exactly what jittering was for. Caught by the
+    # test that checks no chunk is conspicuous, not by reading this.
+    #
+    # Normalising the weights first means every chunk stays inside the band and
+    # only the sub-satoshi quantisation remainder is left to place.
+    weights = [Decimal(1) + SPLIT_JITTER
+               * ((Decimal(rng.randrange(0, 2001)) / Decimal(1000)) - Decimal(1))
+               for _ in range(n)]
+    wsum = sum(weights, Decimal(0))
+    amounts = [(total * (w / wsum)).quantize(SATOSHI_BTC, rounding=ROUND_DOWN)
+               for w in weights]
+    # The remainder is now at most n-1 satoshis. Spread it ONE SATOSHI AT A
+    # TIME over randomly chosen chunks rather than dumping it on chunk 0 --
+    # "the one that is not a round fraction" would otherwise name chunk 0 in
+    # every run.
+    drift = total - sum(amounts, Decimal(0))
+    steps = int((drift / SATOSHI_BTC).to_integral_value())
+    for _ in range(max(0, steps)):
+        amounts[rng.randrange(n)] += SATOSHI_BTC
+    # Whatever is left is below a satoshi and cannot be sent; give it to a
+    # random chunk so the total is still exact.
+    left = total - sum(amounts, Decimal(0))
+    if left != 0:
+        amounts[rng.randrange(n)] += left
+    # REPAIR the boundary rather than raise on it. At (or just above) n
+    # satoshis every chunk must be exactly one satoshi, so there is no room to
+    # jitter: quantising ROUND_DOWN sends them all to zero and the drift loop
+    # then hands the satoshis out at random, which can put two on one chunk and
+    # none on another. Move one from the largest to each empty chunk -- the sum
+    # is preserved and the result is sendable.
+    for _ in range(n):
+        if all(a_ > 0 for a_ in amounts):
+            break
+        _lo = amounts.index(min(amounts))
+        _hi = amounts.index(max(amounts))
+        if amounts[_hi] <= SATOSHI_BTC:
+            break                      # nothing left to give
+        amounts[_hi] -= SATOSHI_BTC
+        amounts[_lo] += SATOSHI_BTC
+    if any(a_ <= 0 for a_ in amounts):
+        # A total too small to give every chunk at least one satoshi. The old
+        # fallback here divided equally and put the difference on chunk 0,
+        # which for 1 satoshi across 3 chunks produced [-1, 1, 1] -- a NEGATIVE
+        # amount, i.e. an instruction to send less than nothing, summing
+        # correctly and passing every other check. resolve_btc_amount refuses
+        # the pair up front so this is unreachable from the CLI; it raises
+        # rather than inventing a number, because there is no correct answer
+        # and a wrong one here is a payment instruction.
+        raise ValueError(
+            f"{total} BTC cannot be split {n} ways: every chunk needs at "
+            f"least one satoshi, so {n} chunks need at least "
+            f"{SATOSHI_BTC * Decimal(n)} BTC.")
+    return amounts
 
 
 def peel_carrier_reserves(amounts: list, hop_headroom: Decimal) -> list:
@@ -737,6 +849,25 @@ def entry_output_count(rpc, account: int, index: int):
                and int(t.get("amount", 0) or 0) > 0)
 
 
+def _veil_window(window, n_entries: int):
+    """Widen the broadcast-delay window in proportion to the chunk count.
+
+    N veils relaying in one round with the ordinary per-hop jitter puts N
+    spends inside the window meant for one, which is a joint timing constraint
+    an analyst can use across all N known swap outputs at once. Scaling the
+    window keeps the expected spacing between consecutive veils about what it
+    would be for a single veil.
+
+    Returns the window unchanged for a one-chunk run, so the ordinary path is
+    untouched.
+    """
+    lo, hi = window or DEFAULT_HOP_DELAY
+    n = max(1, int(n_entries))
+    if n == 1:
+        return (lo, hi)
+    return (lo, hi * n)
+
+
 def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
     """The first spend out of each entry output, shaped like ordinary traffic.
 
@@ -776,19 +907,48 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
         NO TRANSACTION MAY EVER SPEND VALUE DERIVED FROM TWO DIFFERENT SWAP
         CHUNKS.
 
-    "One input per veil" is not sufficient, because the intersection attack
-    works at ANY depth. Suppose two chunks are veiled separately but into ONE
-    shared carrier, and the distribution then spends both carrier outputs. The
-    analyst has candidate sets S_1 and S_2 (sixteen veils each, so ~32
-    candidate outputs each). The distribution is the unique transaction whose
-    input rings touch BOTH sets -- a transaction that happens to touch S_1
-    essentially never also touches S_2 -- so it is identified, and the veil has
-    bought nothing. Convergence leaks wherever it is put; the only fix is not
-    to converge. So N chunks get N carriers and N distributions, and no
-    transaction in the run ever holds value from two of them.
+    "One input per veil" is not sufficient, because the intersection works at
+    ANY depth. Suppose two chunks are veiled separately but into ONE shared
+    carrier, and the distribution then spends both carrier outputs. For each
+    chunk the analyst holds a candidate set: every transaction whose ring
+    happens to reference that chunk's known output. The distribution is a
+    transaction whose input rings touch BOTH sets, and a transaction that
+    touches one set has no reason to touch the other, so very few candidates
+    survive being in both. Convergence is where the two sets meet; N chunks
+    therefore get N carriers and N distributions, and no transaction in the run
+    ever holds value from two of them.
 
-    At N == 1 the same test yields ~32 candidates and the anonymity set GROWS
-    with depth, which is the veil working as intended.
+    WHAT THE CANDIDATE SET IS NOT: SIXTEEN. An earlier version of this note
+    sized it as the ring size, which is the wrong quantity and points the wrong
+    way. Sixteen is how many members hide the real input OF A KNOWN
+    TRANSACTION. The attack here runs the other way -- from a known OUTPUT to
+    "which transaction spent it" -- and the size of THAT set is how many
+    transactions on the chain happened to draw this output as a decoy, which
+    is not a constant and is not sixteen. It depends on the output's age when
+    it is spent, through Monero's decoy-selection distribution, and this
+    pipeline spends the entry output within minutes of its arrival, when few
+    transactions have had the chance to reference it. That cuts BOTH ways and
+    neither is quantified here: the set may be small, which makes the veil
+    weaker than the shape argument alone suggests, and it makes an intersection
+    correspondingly more decisive. The design conclusion is unchanged and the
+    number was never load-bearing -- one known output gives the analyst nothing
+    to intersect against, two give him something -- but a confident figure that
+    measures the wrong thing is worse than no figure, so it is gone rather than
+    corrected.
+
+    For the same reason "convergence leaks wherever it is put" is stated here
+    as a design rule rather than a theorem. How much it leaks depends on that
+    same age-dependent set; with outputs held for days before spending, the
+    intersection can carry real false positives. This pipeline does not hold
+    them for days, and a rule that does not depend on an unmeasured
+    distribution is the one worth building on.
+
+    A further understatement worth keeping honest: a swap settlement usually
+    has TWO outputs, the payment and the provider's change, and a chain
+    observer cannot tell which is which. So the analyst carries both forward
+    and his starting set is twice what is assumed above. That makes the attack
+    somewhat harder than described, not easier -- the argument is written to
+    the pessimistic side on purpose.
 
     TWO KNOWN OUTPUTS IS THE DANGER; ONE KNOWN PLUS DUST IS NOT. An earlier
     version of this note listed three ways an entry address ends up with more
@@ -800,11 +960,20 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
         swaps, or one swap settling in two payments. Sweeping them together
         gives the analyst two sets to intersect. CATASTROPHIC, and the reason
         this function exists in the plural.
-      * ONE KNOWN OUTPUT PLUS UNKNOWN ONES -- a stranger sending dust to an
-        address the memo named, which nobody can prevent. He knows only the one
-        output, so there is no second set to intersect with; all he learns is
-        that the true transaction has more than one input, and 2-in/2-out is a
-        common shape. MILD. Worth reporting, not worth refusing a run over.
+      * ONE KNOWN OUTPUT PLUS OUTPUTS THE ANALYST DID NOT CREATE -- dust from
+        a stranger, which nobody can prevent. He knows only the one output, so
+        there is no second set to intersect with; all he learns is that the
+        true transaction has more than one input, and 2-in/2-out is a common
+        shape. MILD.
+
+        BUT ONLY IF THE DUSTER IS NOT THE ANALYST, and the party with the
+        motive to dust this address is exactly the analyst: the swap memo hands
+        him the entry address in plaintext, and sending a piconero to it costs
+        nothing. He then knows BOTH outputs, has two candidate sets, and the
+        intersection is back -- deliberately, for a fee. There is no way from
+        inside the wallet to tell a stranger's dust from a poisoned output;
+        they are the same event. So "mild" describes the accidental case only,
+        and the report below says so instead of reassuring.
 
     So the count is measured per entry address and reported when it is not 1,
     with the two cases described differently rather than as one alarm.
@@ -861,13 +1030,20 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
                   "was paid by two swaps, or when a single swap settled in two "
                   "payments.")
             print("      If the extras are dust somebody sent to the address "
-                  "the memo publishes, it is much milder: the analyst knows "
-                  "only the one swap output, has nothing to intersect it "
-                  "against, and learns only that this transaction has more "
-                  "than one input — a shape most of the network also makes.")
-            print("      Nothing here can tell the two apart. If you can, wait "
-                  "and run against a receive wallet that was paid once "
-                  "(create_receive_wallet mints a fresh one).")
+                  "the memo publishes, it is milder: a stranger's dust is an "
+                  "output the analyst does not know, so he has nothing to "
+                  "intersect against and learns only that this transaction "
+                  "has more than one input — a shape most of the network also "
+                  "makes.")
+            print("      That holds only while the duster is NOT the analyst. "
+                  "The swap memo gives him this address in plaintext and a "
+                  "piconero costs him nothing, so poisoning it to create a "
+                  "second known input is cheap and deliberate. Nothing inside "
+                  "this wallet can tell the two apart — they are the same "
+                  "event.")
+            print("      If you can, wait and run against a receive wallet "
+                  "that was paid once (create_receive_wallet mints a fresh "
+                  "one).")
 
         acct = create_fresh_account(rpc, label="")
         addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
@@ -877,7 +1053,23 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
             "account_index": acct_in,
             "dst": addr,
             "sweep": True,
-            "delay": hop_delay(delay_window),
+            # SPREAD WIDER THE MORE CHUNKS THERE ARE.
+            #
+            # The N veils relay in ONE round, and with the default 3-12 minute
+            # jitter N of them land inside one narrow window. That hands the
+            # analyst something the single-veil design never gave him: a joint
+            # constraint. Holding N known swap outputs, he keeps only the
+            # N-tuples of candidate transactions that all fall in one short
+            # window, and a coincidence that is unremarkable once is not
+            # unremarkable N times over.
+            #
+            # Multiplying the window by the chunk count keeps the EXPECTED gap
+            # between consecutive veils roughly what it is for a single one,
+            # instead of compressing N spends into the space of one. It costs
+            # wall-clock and nothing else -- the veils are independent, so a
+            # later one does not block an earlier one, and Round 0 waits for
+            # all of them anyway.
+            "delay": hop_delay(_veil_window(delay_window, len(entries))),
             "extra": secure_hex(16),
         })
         carriers.append((acct, idx, addr))
@@ -2029,7 +2221,10 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         payload = {
             "sellAsset": "BTC.BTC",
             "buyAsset": "XMR.XMR",
-            "sellAmount": str(amt),
+            # Fixed notation here too: this crosses the wire to the
+            # aggregator, and an API that parses "3E-8" as a decimal string is
+            # not something to rely on for a payment amount.
+            "sellAmount": fmt_btc(amt),
             "destinationAddress": chunk_dest,
         }
 
@@ -2112,7 +2307,11 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
 
         deposit_info = {
             "chunk": i,
-            "btc_amount": str(amt),
+            # fmt_btc, not str(): Decimal renders a small amount in
+            # scientific notation, and this string is printed verbatim as
+            # "Send exactly: <x> BTC". "Send exactly: 3E-8 BTC" is not
+            # something an operator can enter into a wallet.
+            "btc_amount": fmt_btc(amt),
             "deposit_address": deposit_addr,
             "memo": str(memo),
             "expected_xmr": str(expected_dec),
@@ -2788,12 +2987,44 @@ def assign_hop_destinations(sources: list, dag: dict, mix_targets: list,
 
 def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                    mix_targets, addr_index, _secrets,
-                   delay_window=None) -> list:
+                   delay_window=None, dest_slices=None) -> list:
     """Plan the DAG hop round: one SWEEP per fan-out output.
 
     Returns the hop plan (empty when DAG mixing is off or nothing can fund
     a hop). Extracted from stage 4 so the hop shape -- which is where the
     per-hop change leak lived -- can be read and tested on its own.
+
+    A HOP NEVER CROSSES SWAP CHUNKS, and without that the entry-set invariant
+    ("no transaction ever spends value from two different chunks") is false --
+    quietly, in the exit, hours later.
+
+    The round is a permutation, so every target that hops its own output away
+    ends holding exactly one output and it does not matter whose it is. But TWO
+    kinds of target do NOT hop and are still eligible to RECEIVE one:
+
+      * a source whose fan-out output is so small that compute_hop_amount lands
+        at or below dust (_unfundable below), and
+      * a source that could not be given a destination of its own
+        (_unassigned below).
+
+    Such a target keeps its original output AND takes delivery of the incoming
+    hop. With one chunk that is harmless -- both outputs are the same money.
+    With N chunks, if the two came from different chunks, the exit's per-
+    subaddress sweep_all then spends BOTH IN ONE TRANSACTION, which is exactly
+    the convergence the entry set exists to prevent, reached by a route that
+    has nothing to do with the entry addresses.
+
+    Found by tracing the round by hand rather than by a failing test: it needs
+    a small-enough fan-out output or an exhausted candidate pool, so it is
+    occasional rather than reliable -- which is worse, not better.
+
+    `dest_slices` is the per-chunk partition of the mix targets
+    (size_distribution). Destinations are drawn from the source's OWN slice, so
+    a hop cannot cross chunks whatever happens to the target afterwards. It
+    costs nothing real: the chunks are already unlinkable to each other, so
+    interleaving them adds no mixing an analyst could not already be denied --
+    it only adds the merge risk. With one chunk the single slice IS mix_targets
+    and the behaviour is unchanged.
     """
     dag_plan = []
     if args.dag_mixing:
@@ -2829,9 +3060,69 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                 continue
             _fundable.append(s)
         # One destination each, none used twice -- see assign_hop_destinations
-        # for what independent picking did to the no-merge invariant.
-        _dsts = assign_hop_destinations(_fundable, dag, mix_targets, _secrets)
+        # for what independent picking did to the no-merge invariant. Assigned
+        # PER CHUNK, so a hop cannot cross chunks; see the docstring.
+        _slices = [list(sl) for sl in (dest_slices or []) if sl]
+        # ANY SOURCE NOT IN A SLICE STILL HOPS.
+        #
+        # The first version of this iterated the slices only, so a fundable
+        # source that belonged to no slice was silently given no destination
+        # and never hopped -- a whole round quietly doing nothing, reported as
+        # success. Every source IS in a slice on the real path (the slices
+        # partition fanout_dests, and hop_sources_real == fanout_dests), which
+        # is exactly why the omission would not have shown up in a run: it
+        # needed a caller that passes no slices, or an inconsistent one.
+        #
+        # So the leftovers are collected into their own group over the targets
+        # no slice claimed. With dest_slices absent that group is EVERYTHING,
+        # which is the behaviour this had before chunks existed.
+        _claimed = {d for sl in _slices for d in sl}
+        _residual = [d for d in mix_targets if d not in _claimed]
+        _groups = _slices + ([_residual] if _residual else [])
+        if not _groups:
+            _groups = [list(mix_targets)]
+        _dsts = {}
+        _placed = set()
+        for _grp in _groups:
+            _grp_set = set(_grp)
+            _grp_srcs = [s for s in _fundable
+                         if s not in _placed and s in _grp_set]
+            if not _grp_srcs:
+                continue
+            _placed.update(_grp_srcs)
+            # The adjacency is restricted to this group too, or the graph
+            # fallback would reach across it and undo the point.
+            _grp_dag = {k: [d for d in v if d in _grp_set]
+                        for k, v in dag.items() if k in _grp_set}
+            _dsts.update(assign_hop_destinations(_grp_srcs, _grp_dag, _grp,
+                                                 _secrets))
+        # A source in NO group at all (a caller whose slices and mix_targets
+        # disagree) would otherwise never hop and never be reported. Give it
+        # the whole target list -- correctness of the round first; the
+        # same-chunk restriction is meaningless for a source no chunk claims.
+        _orphans = [s for s in _fundable if s not in _placed]
+        if _orphans:
+            _dsts.update(assign_hop_destinations(_orphans, dag, mix_targets,
+                                                 _secrets))
         _unassigned = [s for s in _fundable if s not in _dsts]
+        # A SLICE OF ONE CANNOT HOP AT ALL, and with several chunks and few
+        # wallets that is most of them. A hop's destination must differ from
+        # its source and must belong to the same chunk (see the docstring), so
+        # a chunk holding a single mix subaddress has nowhere legal to send it.
+        # The round then reports "N output(s) could not be given a hop
+        # destination" without saying that the shape of the run guaranteed it.
+        _thin = [len(g_) for g_ in _groups if len(g_) < 2]
+        if _thin and len(_groups) > 1:
+            integrity_log("stage4", f"dag_slices_too_thin:{len(_thin)}")
+            print(f"  [!] {len(_thin)} of {len(_groups)} swap chunk(s) have "
+                  f"fewer than two mix subaddresses, so their outputs have "
+                  f"nowhere to hop: a hop cannot leave its own chunk (that is "
+                  f"what stops two chunks meeting in one transaction) and it "
+                  f"cannot pay itself.")
+            print(f"      Those chunks get the fan-out but not the second "
+                  f"mixing round. For --dag-mixing to do anything for every "
+                  f"chunk, use at least {len(_groups) * 2} --wallets, or fewer "
+                  f"--split chunks.")
         if _unassigned:
             integrity_log("stage4", f"dag_unassigned:{len(_unassigned)}")
             print(f"  [!] {len(_unassigned)} output(s) could not be given a hop "
@@ -3080,6 +3371,53 @@ def resolve_hop_delay(args) -> tuple:
     return window
 
 
+def resolve_btc_amount(args) -> None:
+    """Refuse a --btc-amount finer than a satoshi.
+
+    Bitcoin's smallest unit is 10^-8 BTC. decimal_arg guards argv against
+    non-numbers, NaN and Infinity, but 0.123456789 parses cleanly and is not a
+    payable amount -- and every path downstream then hands the operator an
+    instruction they cannot follow: the deposit line says "Send exactly
+    0.123456789 BTC", the quote was fetched for an amount that cannot be paid,
+    and split_btc_amount has a sub-satoshi remainder it must put SOMEWHERE,
+    which lands as a chunk that is not a whole number of satoshis either.
+
+    REFUSED rather than rounded. Rounding silently changes how much of the
+    operator's money is swapped, and the number they typed is the number they
+    meant; a run that quietly swaps a different amount than it was asked to is
+    the kind of surprise this toolchain exists not to spring. Found by a test
+    asserting every chunk is a whole number of satoshis, which cannot be true
+    of a total that is not.
+    """
+    amt = getattr(args, "btc_amount", None)
+    if amt is None:
+        return
+    n = max(1, int(getattr(args, "split", 1) or 1))
+    if n > 1 and amt < SATOSHI_BTC * Decimal(n):
+        # EVERY CHUNK NEEDS A SATOSHI. Below that split_btc_amount has no
+        # correct answer, and the version before this invented one: 1 satoshi
+        # across 3 chunks came out as [-1, 1, 1] satoshis -- a negative amount,
+        # summing correctly, passing every other check, and reaching the
+        # operator as "send exactly -0.00000001 BTC".
+        integrity_log("stage0", "btc_amount_too_small_to_split")
+        sys.exit(
+            f"[!] --btc-amount {fmt_btc(amt)} cannot be split {n} ways: every chunk "
+            f"needs at least one\n"
+            f"    satoshi, so {n} chunks need at least "
+            f"{fmt_btc(SATOSHI_BTC * Decimal(n))} BTC. Use fewer --split chunks.")
+    if amt != amt.quantize(SATOSHI_BTC):
+        integrity_log("stage0", "btc_amount_subsatoshi")
+        sys.exit(
+            f"[!] --btc-amount {amt} is finer than one satoshi "
+            f"(0.00000001 BTC).\n"
+            f"    Refusing rather than rounding: rounding would swap a "
+            f"different amount than you\n"
+            f"    asked for, and the deposit instructions would name a figure "
+            f"no wallet can send.\n"
+            f"    Use {fmt_btc(amt.quantize(SATOSHI_BTC, rounding=ROUND_DOWN))} or "
+            f"{fmt_btc(amt.quantize(SATOSHI_BTC, rounding=ROUND_DOWN) + SATOSHI_BTC)}.")
+
+
 def resolve_split(args) -> None:
     """Bounds-check --split. It is SUPPORTED now; it used to be refused.
 
@@ -3136,6 +3474,29 @@ def resolve_split(args) -> None:
             f"    (50 by default, fixed when it was created — see "
             f"OPSEC_SETUP.md). Past this point an\n"
             f"    extra run buys more than an extra chunk.")
+    if n > 1 and getattr(args, "peel", False):
+        # HERE, NOT AT THE DISTRIBUTION. This refusal used to live in
+        # build_distribution_plan, which runs after the quotes are fetched,
+        # after the deposit instructions are printed, and therefore possibly
+        # after the operator has already sent Bitcoin -- at which point
+        # "refused" means their money is mid-swap with no run to receive it.
+        # Both flags are known at parse time, so the answer is known at parse
+        # time. build_distribution_plan keeps its check as a backstop for a
+        # caller that reaches it another way.
+        integrity_log("stage0", "split_peel_refused")
+        sys.exit(
+            f"[!] --split {n} with --peel is not supported.\n"
+            f"    Each chunk needs its own peel chain — merging them into one "
+            f"would re-create\n"
+            f"    exactly the convergence that splitting the swap exists to "
+            f"avoid — and a peel\n"
+            f"    chain is sequential and confirmation-gated, so {n} of them "
+            f"would take\n"
+            f"    {n} x hops x ~20 minutes with no resume if one stops "
+            f"part-way.\n"
+            f"    Use --split with the fan-out distribution (drop --peel), or "
+            f"--peel with a\n"
+            f"    single chunk.")
     if n > 1:
         integrity_log("stage0", f"split:{n}_chunks")
 
@@ -3863,6 +4224,18 @@ def establish_entry_set(args, rpc_primary, addr_index, jm_utxos,
                       receive_subaddress_index)]
         addr_index[receive_entry_addr] = (receive_account_index,
                                           receive_subaddress_index)
+        if int(getattr(args, "split", 1) or 1) > 1:
+            # SAID, not silently ignored. --split divides --btc-amount, which
+            # receive mode does not have, and a bundle describes exactly one
+            # address -- so the flag cannot do anything here. Accepting a flag,
+            # validating it and then discarding it in silence is how an
+            # operator comes to believe a run split when it did not.
+            integrity_log("stage3", "split_ignored_receive_mode")
+            print(f"  [!] --split {args.split} has NO EFFECT in receiver mode: "
+                  f"a receive bundle describes exactly one address, and there "
+                  f"is no --btc-amount to divide. For N genuinely separate "
+                  f"entries, mint N bundles (create_receive_wallet --count N) "
+                  f"and run once per bundle.")
         integrity_log("stage3", "entry_reused_from_receive_wallet")
         print(f"  [+] ENTRY (from receive wallet): "
               f"{scrub_address(receive_entry_addr)}")
@@ -3955,6 +4328,90 @@ def select_funded_entries(entry_set: list, entry_unlocked: list) -> tuple:
     return [e for e, _u in funded], [u for _e, u in funded]
 
 
+def size_and_prune_chunks(args, entries: list, unlocked: list,
+                          fanout_dests: list, bal_before_veils: Decimal,
+                          fee_xmr: Decimal, rng) -> tuple:
+    """Fit the distribution to the chunks that arrived. Returns
+    (entries, unlocked, bal, usable, dest_slices, slice_usable, amounts).
+
+    SIZE BEFORE VEILING, so a chunk that turns out to be too small to
+    distribute is dropped BEFORE a veil spends it. Ordering matters and getting
+    it wrong is invisible to a test that calls the pieces separately: veil
+    first, and the dropped chunk has already been swept to a carrier nothing
+    then distributes -- an orphan output on an account the exit does not hold,
+    which is strictly worse than leaving it on the entry address where the hold
+    covers it.
+
+    A chunk can arrive above dust and still be too small to fund even one mix
+    output. select_funded_entries only knows about DUST_XMR; the real
+    requirement is a whole fan-out output plus its fee, and that is not known
+    until the slices exist. That used to abort the entire run under a message
+    about the wallet balance being too small, while every other chunk was fine.
+
+    Dropping a chunk changes N, which changes the veil-fee reserve, which
+    changes `usable` -- so the whole budget is recomputed each round rather than
+    patched. Bounded by the chunk count; dropping one gives the rest a larger
+    share, so it converges.
+    """
+    # SIZE BEFORE VEILING, so a chunk that turns out to be too small to
+    # distribute is dropped BEFORE a veil spends it.
+    #
+    # Ordering matters here and getting it wrong is not visible in a test
+    # that calls the pieces separately: veil first and the dropped chunk
+    # has already been swept to a carrier that nothing then distributes --
+    # an orphan output on an account the exit does not hold, which is
+    # strictly worse than leaving it on the entry address where the hold
+    # covers it.
+    #
+    # Dropping a chunk changes N, which changes the veil-fee reserve, which
+    # changes `usable`, so the whole budget is recomputed each round rather
+    # than patched. Bounded by the chunk count; dropping one gives the rest
+    # a larger share, so it converges.
+    for _attempt in range(max(1, len(entries))):
+        # `bal` here is the balance AFTER the veils will have paid their fees,
+        # which is what the distribution can actually spend. It is local: the
+        # value returned is the caller's untouched `bal_before_veils`, because
+        # resolve_entry_veils subtracts the same reserve itself. Returning the
+        # netted figure subtracted it TWICE -- silently, since the result is
+        # merely conservative -- and left `bal` meaning something different
+        # either side of the veil call. Caught by re-reading the diff, not by a
+        # test: nothing fails, the peel fit just quietly tightens.
+        _veil_cost = (hop_fee_reserve(fee_xmr) * len(entries)
+                      if getattr(args, "entry_veil", True) else Decimal(0))
+        bal = bal_before_veils - _veil_cost
+        if bal <= DUST_XMR:
+            sys.exit(f"[!] Balance {bal} XMR left after the entry "
+                     f"sweep's fee reserve. Fund the wallet more.")
+        usable, total_fees, rounds = compute_fee_budget(
+            bal, fee_xmr, args.wallets, args.deep)
+        if usable <= DUST_XMR:
+            sys.exit(
+                f"[!] Balance {bal} XMR insufficient.\n"
+                f"    Estimated fees: {total_fees} XMR for {rounds} "
+                f"rounds.\n"
+                f"    Usable after fees: {usable} XMR")
+        _sl, _su, _amts, _bad = size_distribution(
+            fanout_dests, unlocked, usable, fee_xmr,
+            args.dag_mixing, rng)
+        if _bad is None or len(entries) <= 1:
+            break
+        _dropped = entries[_bad]
+        integrity_log("stage4", "chunk_too_small_to_distribute")
+        print("  [!] One swap chunk arrived with too little to fund even "
+              "one mix output, so it is left undistributed and the rest of "
+              "the run continues without it.")
+        print(f"      Its value stays on its entry address (account "
+              f"{_dropped[1]}), which the exit holds back — so nothing "
+              f"sweeps it to your destination in one hop. Nothing "
+              f"distributes it either.")
+        entries = [e for i, e in enumerate(entries)
+                            if i != _bad]
+        unlocked = [u for i, u in enumerate(unlocked)
+                           if i != _bad]
+    # bal_before_veils, NOT the netted `bal` -- see the note in the loop.
+    return (entries, unlocked, bal_before_veils, usable, _sl, _su, _amts)
+
+
 def main():
     install_signal_handlers()
 
@@ -3965,6 +4422,7 @@ def main():
     # semantic (a wallet password prompt, a bech32 checksum) can mask it.
     _delay_window = resolve_hop_delay(args)
     resolve_exit_destinations(args)
+    resolve_btc_amount(args)
     resolve_split(args)
     resolve_swap_arrival(args)
 
@@ -4087,17 +4545,17 @@ def main():
                          f"{args.btc_amount}).")
             elif args.btc_amount and args.btc_amount > 0:
                 num_splits = max(args.split, 1)
-                per_chunk = (args.btc_amount / Decimal(num_splits)).quantize(Decimal("0.00000001"))
-                btc_chunks = [per_chunk] * num_splits
-                remainder = args.btc_amount - (per_chunk * num_splits)
-                if remainder > 0:
-                    btc_chunks[0] += remainder
+                btc_chunks = split_btc_amount(args.btc_amount, num_splits,
+                                              secrets.SystemRandom())
                 # COUNT only, never the per-chunk BTC amount: the integrity log
                 # persists, and the exact BTC-per-swap correlates directly with the
                 # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
                 # the fan-out/hop amounts stay off the chain.
                 integrity_log("stage2", f"btc_split:{num_splits}_chunks")
-                print(f"\n  [*] Splitting {args.btc_amount} BTC into {num_splits} chunk(s) of ~{per_chunk} BTC")
+                print(f"\n  [*] Splitting {args.btc_amount} BTC into "
+                      f"{num_splits} UNEQUAL chunk(s) — equal deposits made "
+                      f"minutes apart are one cluster on the Bitcoin chain, "
+                      f"and their memos read out every destination.")
 
             if btc_chunks:
                 # ONE DESTINATION PER CHUNK. ENTRY_ADDRS is in chunk
@@ -4106,6 +4564,25 @@ def main():
                 # than silently re-using an address.
                 swap_deposits = stage2_get_swap_quotes(
                     args, proxy, btc_chunks, ENTRY_ADDRS)
+                # READ BACK what each chunk was actually quoted to. The
+                # deposits carry the destination they used (xmr_dest), and
+                # until this existed nothing consumed it -- the binding
+                # between "chunk 2's quote" and "entry address 2" was list
+                # POSITION and a comment claiming that mattered. A reordering
+                # anywhere between here and the arrival wait would pair a
+                # chunk with another chunk's address, which is the merge the
+                # split exists to prevent, reached by a bookkeeping slip.
+                _quoted_dests = [d.get("xmr_dest") for d in swap_deposits]
+                if _quoted_dests != ENTRY_ADDRS[:len(_quoted_dests)]:
+                    integrity_log("stage2", "QUOTE_DEST_MISMATCH")
+                    sys.exit(
+                        "[!] The quotes were not fetched against this run's "
+                        "entry addresses, in order.\n"
+                        "    Refusing to issue deposit instructions: a chunk "
+                        "quoted to another chunk's\n"
+                        "    address would route two swaps to one entry, "
+                        "which links them at the\n"
+                        "    aggregator and merges them on-chain.")
                 integrity_log("stage2", "swap_quotes_generated")
                 total_expected, _unreadable_quotes, _ = swap_expected_total(swap_deposits)
                 print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
@@ -4221,27 +4698,6 @@ def main():
                 f"    Nothing has been spent. Wait for the swap(s) to settle "
                 f"and run again.")
 
-        veil_plan, SPEND_SOURCES, bal = resolve_entry_veils(
-            rpc_primary, args, addr_index, ENTRY_SET_FUNDED, bal, fee_xmr,
-            _delay_window)
-        # The first source is the run's "home" for the one or two things that
-        # genuinely have exactly one (the peel planner's change fallback).
-        SPEND_ADDR, bal_account, entry_index = SPEND_SOURCES[0]
-        if bal <= DUST_XMR:
-            sys.exit(f"[!] Balance {bal} XMR left after the entry sweep's fee "
-                     f"reserve. Fund the wallet more.")
-
-        usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
-                                                        args.deep)
-        if usable <= DUST_XMR:
-            sys.exit(
-                f"[!] Balance {bal} XMR insufficient.\n"
-                f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
-                f"    Usable after fees: {usable} XMR"
-            )
-
-        integrity_log("stage4", "plan_calculated")
-
         # -- Phase A: Fan-out -------------------------------------------------
         # Distribute funds from ENTRY into mix subaddresses. In receiver mode ALL
         # funds sit on ENTRY; in sender mode ThorChain deposits to ENTRY. Either
@@ -4270,38 +4726,37 @@ def main():
                      f"(got {len(mix_targets)}). Cannot build a plan.")
         # Unequal, jittered amounts -- see compute_fanout_amounts: identical splits
         # give a chain analyst one value and one shape to cluster and follow.
-        _dest_slices, _slice_usable, fanout_amounts = size_distribution(
-            fanout_dests, _entry_unlocked, usable, fee_xmr, args.dag_mixing,
-            _secrets.SystemRandom())
+        (ENTRY_SET_FUNDED, _entry_unlocked, bal, usable,
+         _dest_slices, _slice_usable, fanout_amounts) = size_and_prune_chunks(
+            args, ENTRY_SET_FUNDED, _entry_unlocked, fanout_dests, bal,
+            fee_xmr, _secrets.SystemRandom())
 
-        # A peel chain has to leave every hop its own fee, so it can distribute
-        # less than an equal fan-out. Size that here -- discovering it mid-chain
-        # means real money has already moved and is stranded on a carrier.
-        if args.peel and fanout_amounts:
-            _hf = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
-            try:
-                fanout_amounts, _frac = fit_peel_distribution(
-                    fanout_amounts, bal, usable, fanout_count, fee_xmr,
-                    args.dag_mixing, _secrets.SystemRandom(), _hf)
-            except PeelBudgetError as exc:
-                integrity_log("stage4", "peel_budget_impossible")
-                sys.exit(
-                    f"[!] A {fanout_count}-hop peel chain cannot be funded from "
-                    f"{bal} XMR.\n"
-                    f"    Each hop spends nearly all of what the previous one "
-                    f"forwarded, and every hop\n"
-                    f"    needs {exc.hop_headroom} XMR of headroom for the wallet "
-                    f"to build it at all — {exc.hops} hops\n"
-                    f"    is {exc.hop_headroom * exc.hops} XMR before anything is "
-                    f"distributed. Use fewer --wallets,\n"
-                    f"    drop --peel for a one-shot fan-out, or fund the wallet "
-                    f"more.")
-            if _frac is not None:
-                integrity_log("stage4", f"peel_budget_reduced:{_frac}")
-                print(f"  [*] Peel chain: reduced the distribution to "
-                      f"{_frac * 100:.0f}% of usable so every hop keeps the "
-                      f"headroom a wallet needs to build the next one "
-                      f"({_hf} XMR per hop, {fanout_count - 1} hops).")
+        veil_plan, SPEND_SOURCES, bal = resolve_entry_veils(
+            rpc_primary, args, addr_index, ENTRY_SET_FUNDED, bal, fee_xmr,
+            _delay_window)
+        # The first source is the run's "home" for the one or two things that
+        # genuinely have exactly one (the peel planner's change fallback).
+        SPEND_ADDR, bal_account, entry_index = SPEND_SOURCES[0]
+        if bal <= DUST_XMR:
+            sys.exit(f"[!] Balance {bal} XMR left after the entry sweep's fee "
+                     f"reserve. Fund the wallet more.")
+
+        # Recomputed from the POST-veil balance, and it must agree with what
+        # size_and_prune_chunks used to size the slices -- it does, because
+        # that function returns the pre-veil balance and resolve_entry_veils
+        # subtracts the same reserve exactly once. Kept rather than reused so
+        # the dust guards below run against the balance that actually exists
+        # after the veil plan was built, not the one projected before it.
+        usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
+                                                        args.deep)
+        if usable <= DUST_XMR:
+            sys.exit(
+                f"[!] Balance {bal} XMR insufficient.\n"
+                f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
+                f"    Usable after fees: {usable} XMR"
+            )
+
+        integrity_log("stage4", "plan_calculated")
 
         _empty_slices = [i for i, sl in enumerate(_dest_slices) if not sl]
         if _empty_slices:
@@ -4354,7 +4809,8 @@ def main():
         # separate confirmation-gated round in Stage 5 (see _stage5_run).
         dag_plan = build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,
                                   dag, mix_targets, addr_index, _secrets,
-                              delay_window=_delay_window)
+                                  delay_window=_delay_window,
+                                  dest_slices=_dest_slices)
 
         meta = {
             "schema": "unsigned_v1",
@@ -4429,7 +4885,10 @@ def main():
                                  veil_file=veil_file,
                                  veil_target=[(_a, _i) for _d, _a, _i
                                               in SPEND_SOURCES],
-                                 veil_need=list(_slice_usable),
+                                 veil_need=[
+                                     min(_su, _eu - hop_fee_reserve(fee_xmr))
+                                     for _su, _eu in zip(_slice_usable,
+                                                         _entry_unlocked)],
                                  exit_accounts=_exit_account_list(
                                      addr_index, change_accounts, bal_account),
                                  exit_hold=_exit_hold_list(args, addr_index,
@@ -5337,7 +5796,12 @@ def _funded_subaddresses(rpc, accounts) -> list:
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                           delay_window=None, hold=(), entry_pairs=()) -> tuple:
     """ACTUALLY SPEND THE MIXED FUNDS OUT.
-    Returns (relayed, failed, skipped, held).
+    Returns (relayed, failed, skipped, held, unclean), where `held` is a
+    {"entry": n, "change": n} breakdown -- NOT a count. The caller words its
+    report from it: an ENTRY hold and a distribution-CHANGE hold are different
+    addresses with different reasons and different remedies. Test the numbers,
+    never the dict: a two-key dict is always truthy, and `not held` in the
+    caller silenced the clean-exit message entirely.
 
     THIS IS THE EXIT, and it moves real value. Everything before it only
     rearranges coins inside one wallet; until this runs, the operator still
@@ -5591,6 +6055,17 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # own chunk, which is recoverable by hand.
         _targets = (list(veil_target) if isinstance(veil_target, list)
                     else [tuple(veil_target)])
+        # WHAT EACH CARRIER WILL ACTUALLY HOLD, not a proportional slice of the
+        # run's budget. The first plural version passed slice_usable, which is
+        # `usable` split in proportion to each chunk -- but the sweep fee a
+        # carrier pays is ABSOLUTE, not proportional. For an unequal split (the
+        # case the design exists to handle: quotes differ, JoinMarket's UTXOs
+        # differ) the small chunk's proportional share exceeds what its carrier
+        # can possibly hold after one fee, so the wait could never be satisfied
+        # and _stage5_run sat out the full timeout before reporting "the entry
+        # sweep did not confirm" -- about a chunk that had confirmed perfectly.
+        # main() now passes min(share, arrived - fee reserve), which is
+        # `usable` unchanged for a single chunk.
         _needs = (list(veil_need) if isinstance(veil_need, list)
                   else [veil_need] * len(_targets))
         for _vi, (_vacct, _vidx) in enumerate(_targets):
@@ -5805,7 +6280,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             withheld.append(
                 f"{_unclean} withdrawn output(s) still hold value or could not "
                 f"be verified empty")
-        elif _relayed and not _held:
+        # NOT `not _held`. _held is a {"entry": n, "change": n} breakdown now,
+        # and a two-key dict is ALWAYS truthy -- so this branch, the only place
+        # a clean exit is announced, could never be reached after the return
+        # type changed. Count, never test the container.
+        elif _relayed and not (_held_entry or _held_change):
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
                   f"its own transaction. Nothing left on this run's accounts.")
     else:

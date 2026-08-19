@@ -845,6 +845,58 @@ def test_daemon_detection_fixes_no_estimate():
         c.live_fees = real
 
 
+def test_split_bound_is_one_number():
+    """The console's --split ceiling must EQUAL gs_common.MAX_SPLIT.
+
+    The console offered up to 20 while GhostSpiral refuses above 8, so the web
+    form accepted a value the pipeline rejected -- after the operator had
+    filled it in. gs_common owns the number now; SCHEMA carries a literal
+    because it is built at import time and the console loads gs_common lazily.
+    This is what stops the literal drifting: a comment asking two numbers to
+    stay in sync is a hope, not a guarantee, and these two had already drifted.
+    """
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "gs_common_bound", os.path.join(REPO, "gs_common.py"))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(m)
+    _lo, _hi = c.SCHEMA["split"][1]
+    check("split bound: the console ceiling EQUALS gs_common.MAX_SPLIT",
+          _hi == m.MAX_SPLIT)
+    check("split bound: ...and the HTML number input offers the same maximum",
+          f'id="split" type="number" min="1" max="{m.MAX_SPLIT}"'
+          in open(os.path.join(REPO, "gs_console")).read())
+    # Behavioural, not just the constant: clean() drops an out-of-range int.
+    check("split bound: a value ABOVE it never reaches an argv",
+          c.clean({"split": m.MAX_SPLIT + 1})["params"].get("split") is None)
+    check("split bound: ...and the maximum itself does",
+          c.clean({"split": m.MAX_SPLIT})["params"].get("split") == m.MAX_SPLIT)
+    check("split bound: --split 1 (the default) is accepted",
+          c.clean({"split": 1})["params"].get("split") == 1)
+    check("split bound: 0 is rejected",
+          c.clean({"split": 0})["params"].get("split") is None)
+    # And the value actually reaches the pipeline argv when > 1.
+    # pipeline_argv returns (argv, errors) -- take the argv.
+    argv = c.pipeline_argv({"split": 3, "wallets": 6,
+                            "tor_proxy": "socks5h://127.0.0.1:9050"})[0]
+    check("split bound: a valid split is passed through to the pipeline",
+          "--split" in argv and argv[argv.index("--split") + 1] == "3")
+    # ...and an out-of-range one is DROPPED by clean(), which is the only way
+    # params reach pipeline_argv in the server (every handler passes
+    # clean(...)["params"], and the ACTIONS build lambdas are called with
+    # c["params"] too). pipeline_argv itself does no range checking, so this
+    # goes through the real path rather than calling it with raw input --
+    # asserting on raw input would report a bug the shipped code does not have.
+    _bad = c.clean({"split": m.MAX_SPLIT + 1, "wallets": 6,
+                    "tor_proxy": "socks5h://127.0.0.1:9050"})
+    check("split bound: an out-of-range split is dropped with a stated reason",
+          "split" not in _bad["params"]
+          and any("split" in e for e in _bad["errors"]))
+    check("split bound: ...so it reaches no argv, and does not silently become "
+          "some other number either",
+          "--split" not in c.pipeline_argv(_bad["params"])[0])
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

@@ -438,6 +438,45 @@ check("split: THREE SEPARATE CARRIERS — a shared one would just move the "
       "convergence to the distribution, where the same intersection works",
       len({a for a, _, _ in _vcar}) == 3
       and len({d for _, _, d in _vcar}) == 3)
+# N VEILS IN ONE ROUND ARE A JOINT TIMING CONSTRAINT unless they are spread.
+# With the ordinary 3-12 minute jitter, N veils land inside the window meant
+# for one — so an analyst holding N known swap outputs keeps only the N-tuples
+# of candidate transactions that all fall in one short window, which is a
+# handle the single-veil design never gave him.
+check("split: a ONE-chunk run keeps the ordinary delay window untouched",
+      ghost._veil_window(None, 1) == ghost.DEFAULT_HOP_DELAY)
+check("split: with N chunks the window is widened, so N veils are not "
+      "compressed into the space of one",
+      ghost._veil_window(None, 4)[1] > ghost.DEFAULT_HOP_DELAY[1])
+check("split: ...in proportion to the chunk count, keeping the expected gap "
+      "between consecutive veils about what a single veil gets",
+      ghost._veil_window(None, 4)[1] == ghost.DEFAULT_HOP_DELAY[1] * 4)
+check("split: ...and it respects a custom --hop-delay rather than overriding it",
+      ghost._veil_window((60, 120), 3) == (60, 360))
+# ...and the plan actually USES it: the delays of a 3-veil plan must be able to
+# exceed what a single veil could ever draw.
+_saw_beyond = False
+for _t in range(60):
+    _sv = _saved_cfa
+    try:
+        _cc = [80]
+
+        def _f4(rpc, label=""):
+            _cc[0] += 1
+            return _cc[0]
+        ghost.create_fresh_account = _f4
+        with contextlib.redirect_stdout(io.StringIO()):
+            _pl, _ = ghost.build_entry_veils(
+                _XferRPC(_one), [("E0", 10, 1), ("E1", 11, 1), ("E2", 12, 1)])
+    finally:
+        ghost.create_fresh_account = _sv
+    if any(t["delay"] > ghost.DEFAULT_HOP_DELAY[1] for t in _pl):
+        _saw_beyond = True
+        break
+check("split: a multi-veil plan really draws delays beyond the single-veil "
+      "ceiling — the wider window reaches the plan, not just the helper",
+      _saw_beyond)
+
 check("split: no veil pays a carrier another veil also pays",
       len({t["dst"] for t in _vplan}) == 3)
 
@@ -521,12 +560,42 @@ check("control: ...over all of the targets",
 check("control: ...with one change location", _c1 == [20])
 
 # -- --split with --peel is refused, and says why --------------------------
+# AT PARSE TIME, which is the whole point: refusing this at the distribution
+# means refusing after the quotes are fetched and the deposit instructions
+# printed — possibly after the operator has already sent Bitcoin, at which
+# point "refused" means their money is mid-swap with no run to receive it.
+_early = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=3, peel=True))
+except SystemExit as _e:
+    _early = str(_e.code)
+check("split: --split with --peel is refused at FLAG-PARSE time, before any "
+      "quote is fetched or any BTC is sent", _early is not None)
+check("split: ...naming the convergence as the reason", _early and "convergence" in _early)
+check("split: ...and the time cost of N sequential chains",
+      _early and "20 minutes" in _early)
+_ok_peel = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=1, peel=True))
+except SystemExit as _e:
+    _ok_peel = str(_e.code)
+check("control: --peel with ONE chunk is not refused", _ok_peel is None)
+_ok_split = None
+try:
+    ghost.resolve_split(types.SimpleNamespace(split=3, peel=False))
+except SystemExit as _e:
+    _ok_split = str(_e.code)
+check("control: --split without --peel is not refused", _ok_split is None)
+
+# ...and the distribution keeps its own backstop for a caller that gets there
+# another way.
 _peel_msg = None
 try:
     _dist(_SRC, _SLICES, _BY, peel=True)
 except SystemExit as _e:
     _peel_msg = str(_e.code)
-check("split: --split with --peel is REFUSED", _peel_msg is not None)
+check("split: the distribution still refuses it as a backstop",
+      _peel_msg is not None)
 check("split: ...because merging the chains would re-create the convergence",
       _peel_msg and "convergence" in _peel_msg)
 check("split: ...and N sequential chains is the time cost, stated",
@@ -537,9 +606,10 @@ check("control: ONE chunk with --peel is NOT refused by that check",
                           peel=True)] and "")() or ""))
 
 # -- the budget follows the money -----------------------------------------
-_slices, _su, _amts = ghost.size_distribution(
+_slices, _su, _amts, _bad = ghost.size_distribution(
     ["m0", "m1", "m2", "m3"], [Decimal("3"), Decimal("1")], Decimal("8"),
     Decimal("0.0024"), False, _secretsmod.SystemRandom())
+check("split: a fundable distribution names no unfundable chunk", _bad is None)
 check("split: destinations are sliced by each chunk's OWN arrived balance, "
       "not equally — chunks are not equal",
       [len(x) for x in _slices] == [3, 1])
@@ -552,6 +622,17 @@ check("split: a chunk with NO destinations comes back empty rather than "
       ghost.size_distribution(["m0"], [Decimal("1"), Decimal("1")],
                               Decimal("8"), Decimal("0.0024"), False,
                               _secretsmod.SystemRandom())[2] == [])
+# A chunk that arrives above dust but too small to fund even ONE mix output is
+# NAMED, so the caller can drop that chunk and re-size instead of losing the
+# whole run to it. It used to abort everything under a message about the
+# wallet balance being too small — which it was not; every other chunk was fine.
+_tiny_res = ghost.size_distribution(
+    ["m0", "m1", "m2", "m3"], [Decimal("10"), Decimal("0.0002")],
+    Decimal("9"), Decimal("0.0024"), False, _secretsmod.SystemRandom())
+check("split: an under-funded chunk is IDENTIFIED, not returned as a bare "
+      "failure", _tiny_res[3] is not None and _tiny_res[2] == [])
+check("split: ...and it is the small one that is named, not chunk 0",
+      _tiny_res[3] == 1)
 
 # -- --split bounds --------------------------------------------------------
 for _ok in (1, 2, 8, None):
@@ -640,6 +721,278 @@ check("split: otherwise --split is",
       ghost.planned_chunk_count(types.SimpleNamespace(split=4), []) == 4)
 check("split: and it is never zero",
       ghost.planned_chunk_count(types.SimpleNamespace(split=None), []) == 1)
+
+
+# ==========================================================================
+# A HOP NEVER CROSSES SWAP CHUNKS.
+#
+# The entry set stops two chunks meeting at the veil or the distribution. The
+# DAG round could still put them on one subaddress, by a route that has
+# nothing to do with the entry addresses:
+#
+#   the round is a permutation, so a target that hops its OWN output away ends
+#   holding exactly one output and whose it is does not matter. But two kinds
+#   of target do NOT hop and are still eligible to RECEIVE one -- a source
+#   whose hop amount lands at or below dust, and a source that could not be
+#   given a destination. Such a target keeps its original output AND takes
+#   delivery of the incoming hop, and the exit's per-subaddress sweep_all then
+#   spends BOTH IN ONE TRANSACTION.
+#
+# With one chunk that is harmless: both outputs are the same money. With N it
+# is the convergence the whole change exists to prevent.
+#
+# Found by tracing the round by hand. It needs a small-enough fan-out output
+# or an exhausted candidate pool, so it is occasional rather than reliable --
+# which is worse than reliable, not better.
+# ==========================================================================
+print("\n=== DAG hops stay inside their own chunk ===")
+
+_HA = types.SimpleNamespace(dag_mixing=True, deep=2)
+_CHUNK_A = [f"A{i}" for i in range(4)]
+_CHUNK_B = [f"B{i}" for i in range(4)]
+_ALL = _CHUNK_A + _CHUNK_B
+_AI = {a: (70 + i, 1) for i, a in enumerate(_ALL)}
+
+
+def _hop_plan(by_addr, slices):
+    _dag = ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod)
+    with contextlib.redirect_stdout(io.StringIO()):
+        return ghost.build_dag_plan(
+            _HA, Decimal("0.0024"), list(_ALL), by_addr, _dag, _ALL, _AI,
+            _secretsmod, dest_slices=slices)
+
+
+# Every output comfortably fundable: a clean permutation.
+_BY_OK = {a: Decimal("1") for a in _ALL}
+_chunk_of = {a: ("A" if a in _CHUNK_A else "B") for a in _ALL}
+for _trial in range(25):
+    _p = _hop_plan(_BY_OK, [_CHUNK_A, _CHUNK_B])
+    _cross = [(t["src"], t["dst"]) for t in _p
+              if _chunk_of[t["src"]] != _chunk_of[t["dst"]]]
+    if _cross:
+        break
+check("hop: over 25 plans, NO hop ever crosses from one chunk's slice to the "
+      "other's", not _cross)
+check("hop: ...and the round still hops (this is not vacuously empty)",
+      len(_p) > 0)
+check("hop: ...one destination each, never used twice",
+      len({t["dst"] for t in _p}) == len(_p))
+
+# THE FAILING SHAPE. One output in chunk A is too small to fund a hop, so it
+# does not hop -- and would previously have been a legal destination for a
+# chunk-B source, leaving A-dust and B-value on one subaddress.
+_BY_DUST = dict(_BY_OK)
+_BY_DUST["A0"] = Decimal("0.0001")          # hop amount lands under dust
+_saw_nonhopper_as_dest = False
+_saw_cross = False
+for _trial in range(40):
+    _p2 = _hop_plan(_BY_DUST, [_CHUNK_A, _CHUNK_B])
+    _srcs = {t["src"] for t in _p2}
+    for t in _p2:
+        if _chunk_of[t["src"]] != _chunk_of[t["dst"]]:
+            _saw_cross = True
+        # a destination that is NOT itself a source keeps its own output too
+        if t["dst"] not in _srcs and _chunk_of[t["dst"]] != _chunk_of[t["src"]]:
+            _saw_nonhopper_as_dest = True
+check("hop: A0 cannot fund a hop, and over 40 plans it is never paid by the "
+      "OTHER chunk — which is the merge",
+      not _saw_cross and not _saw_nonhopper_as_dest)
+check("hop: ...and A0 really is unfundable (the fixture bites)",
+      ghost.compute_hop_amount(Decimal("0.0001"), Decimal("0.0024"))
+      <= ghost.DUST_XMR)
+
+# A SLICE OF ONE CANNOT HOP, and with several chunks and few wallets that is
+# most of them: a hop must leave its source and stay inside its chunk, so a
+# chunk holding one mix subaddress has nowhere legal to send it. The run must
+# say so rather than reporting "could not be given a destination" as if it were
+# bad luck.
+_thin_out = io.StringIO()
+with contextlib.redirect_stdout(_thin_out):
+    ghost.build_dag_plan(_HA, Decimal("0.0024"), list(_ALL), _BY_OK,
+                         ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod),
+                         _ALL, _AI, _secretsmod,
+                         dest_slices=[["A0"], ["A1"], _CHUNK_B + _CHUNK_A[2:]])
+_tm = _thin_out.getvalue()
+check("hop: a chunk with fewer than two mix subaddresses is REPORTED, not "
+      "silently left unhopped", "nowhere to hop" in _tm)
+check("hop: ...explaining that a hop cannot leave its own chunk",
+      "cannot leave its own chunk" in _tm)
+check("hop: ...and saying how many --wallets would fix it",
+      "--wallets" in _tm)
+_fat_out = io.StringIO()
+with contextlib.redirect_stdout(_fat_out):
+    ghost.build_dag_plan(_HA, Decimal("0.0024"), list(_ALL), _BY_OK,
+                         ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod),
+                         _ALL, _AI, _secretsmod,
+                         dest_slices=[_CHUNK_A, _CHUNK_B])
+check("control: slices with room to hop produce NO such warning",
+      "nowhere to hop" not in _fat_out.getvalue())
+
+# CONTROL: with ONE chunk the slice is every target and the round is unchanged
+# -- hops range over the whole mix, exactly as before.
+_p3 = _hop_plan(_BY_OK, [list(_ALL)])
+check("control: with one chunk hops range over every mix subaddress",
+      len(_p3) > 0 and len({t["dst"] for t in _p3}) == len(_p3))
+_spans = False
+for _trial in range(25):
+    _p4 = _hop_plan(_BY_OK, [list(_ALL)])
+    if any(_chunk_of[t["src"]] != _chunk_of[t["dst"]] for t in _p4):
+        _spans = True
+        break
+check("control: ...and it DOES cross what would have been slice boundaries, "
+      "so the restriction above is doing real work rather than being the "
+      "only thing that could happen", _spans)
+
+# ...and passing no slices at all behaves like one slice (back-compatible).
+_p5 = _hop_plan(_BY_OK, None)
+check("control: dest_slices=None falls back to the whole target list",
+      len(_p5) > 0)
+
+
+# ==========================================================================
+# EQUAL BTC CHUNKS UNDO THE SPLIT ON THE BITCOIN SIDE.
+#
+# The Monero side of --split is careful: one entry address per chunk, one veil
+# each, one distribution each, no transaction spending two chunks. None of it
+# helps if the BITCOIN chain hands an observer the grouping for free. This was
+#
+#     per_chunk = (total / n).quantize(SATOSHI)
+#     btc_chunks = [per_chunk] * n
+#
+# so a --split 4 run told the operator to make four deposits of an IDENTICAL
+# amount, within minutes, to the same vault — one cluster, and the OP_RETURNs
+# then read out all four Monero destinations.
+# ==========================================================================
+print("\n=== the BTC chunks are unequal ===")
+
+_R = _secretsmod.SystemRandom()
+
+for _total, _n in [(Decimal("0.08"), 4), (Decimal("0.5"), 2),
+                   (Decimal("1"), 8), (Decimal("0.13"), 3)]:
+    _a = ghost.split_btc_amount(_total, _n, _R)
+    check(f"btc: {_total}/{_n} produces {_n} chunks", len(_a) == _n)
+    check(f"btc: {_total}/{_n} sums EXACTLY to the total (no satoshi lost or "
+          f"invented)", sum(_a, Decimal(0)) == _total)
+    check(f"btc: {_total}/{_n} chunks are DISTINCT — the whole point",
+          len(set(_a)) == _n)
+    check(f"btc: {_total}/{_n} every chunk is positive", all(x > 0 for x in _a))
+    _share = _total / Decimal(_n)
+    # THE DERIVED BOUND, not the naive one. Each chunk is total * w_i/sum(w)
+    # with w_i in [1-j, 1+j], so it lands between (1-j)/(1+j) and (1+j)/(1-j)
+    # of the equal share -- normalising (which is what keeps the sum exact)
+    # widens the band beyond +/-j. Asserting +/-j here failed, correctly, and
+    # the answer was to state the real bound rather than loosen it to whatever
+    # happened to pass.
+    _j = ghost.SPLIT_JITTER
+    _lo = _share * (Decimal(1) - _j) / (Decimal(1) + _j)
+    _hi = _share * (Decimal(1) + _j) / (Decimal(1) - _j)
+    check(f"btc: {_total}/{_n} no chunk is conspicuous — every one inside the "
+          f"derived band, so none is obviously the big or the small one",
+          all(_lo <= x <= _hi for x in _a))
+
+# NOT A FIXED PATTERN. Two runs of the same amount must not produce the same
+# chunk sizes, or the "unequal" split is just a different constant.
+_s1 = ghost.split_btc_amount(Decimal("0.4"), 4, _R)
+_s2 = ghost.split_btc_amount(Decimal("0.4"), 4, _R)
+check("btc: two runs of the same amount give DIFFERENT chunk sizes",
+      _s1 != _s2)
+
+# The quantisation drift must not always land on chunk 0, or "the one that is
+# not a round fraction" identifies it in every run.
+_firsts = set()
+for _ in range(40):
+    _x = ghost.split_btc_amount(Decimal("0.07"), 3, _R)
+    _firsts.add(_x[0])
+check("btc: the remainder is not always put on chunk 0", len(_firsts) > 1)
+
+# CONTROL: one chunk is the whole amount, untouched — a default run is not
+# jittered into a different number than the operator typed.
+check("control: --split 1 hands over exactly what was asked for",
+      ghost.split_btc_amount(Decimal("0.123456"), 1, _R) == [Decimal("0.123456")])
+
+# DEGENERATE AMOUNTS MUST NEVER PRODUCE A NEGATIVE INSTRUCTION.
+#
+# The first fallback here divided equally and put the difference on chunk 0,
+# so 1 satoshi across 3 chunks came out as [-1, 1, 1] satoshis — an
+# instruction to send less than nothing, which summed correctly and passed
+# every other check on its way to the operator. At (or just above) n satoshis
+# every chunk must be exactly one satoshi and there is no room to jitter, so
+# the boundary is repaired rather than approximated.
+for _t, _n in [("0.00000003", 3), ("0.00000008", 8), ("0.0000001", 3),
+               ("0.0000001", 8)]:
+    for _rep in range(60):
+        _tiny = ghost.split_btc_amount(Decimal(_t), _n, _R)
+        if not (all(x > 0 for x in _tiny)
+                and sum(_tiny, Decimal(0)) == Decimal(_t)):
+            break
+    check(f"btc: {_t} across {_n} chunks is positive and exact, every time",
+          all(x > 0 for x in _tiny) and sum(_tiny, Decimal(0)) == Decimal(_t))
+
+# Below n satoshis there is no correct answer, so it is refused up front
+# rather than invented.
+_imposs = None
+try:
+    ghost.resolve_btc_amount(types.SimpleNamespace(
+        btc_amount=Decimal("0.00000001"), split=3))
+except SystemExit as _e:
+    _imposs = str(_e.code)
+check("btc: --btc-amount below one satoshi per chunk is REFUSED", _imposs is not None)
+check("btc: ...naming the real minimum", _imposs and "0.00000003" in _imposs)
+# AS A NUMBER THE OPERATOR CAN TYPE. Decimal renders small values in
+# scientific notation, so this message read "3 chunks need at least 3E-8 BTC"
+# — not a figure anyone can enter into a wallet, describing a payment.
+check("btc: ...in fixed notation, not scientific", "E-" not in _imposs)
+for _v, _want in [("3E-8", "0.00000003"), ("0.5", "0.5"), ("1", "1"),
+                  ("1E-7", "0.0000001"), ("0.123456789", "0.12345679")]:
+    check(f"btc: fmt_btc({_v}) is typeable -> {_want}",
+          ghost.fmt_btc(Decimal(_v)) == _want)
+check("control: exactly one satoshi per chunk is allowed",
+      ghost.resolve_btc_amount(types.SimpleNamespace(
+          btc_amount=Decimal("0.00000003"), split=3)) is None)
+check("control: --split 1 has no such minimum",
+      ghost.resolve_btc_amount(types.SimpleNamespace(
+          btc_amount=Decimal("0.00000001"), split=1)) is None)
+# ...and the splitter itself refuses rather than inventing, if reached directly.
+_raised = False
+try:
+    ghost.split_btc_amount(Decimal("0.00000001"), 3, _R)
+except ValueError:
+    _raised = True
+check("btc: the splitter RAISES on an impossible split rather than returning "
+      "a negative amount", _raised)
+
+# Every chunk is a whole number of satoshis — an unsendable amount would be an
+# instruction the operator cannot follow. This holds because the TOTAL is
+# satoshi-exact: resolve_btc_amount refuses anything finer, which is what makes
+# the property true rather than approximately true. Asserting it against a
+# sub-satoshi total is how that gap was found.
+for _tot in ("0.33333333", "1", "0.07", "0.00012345"):
+    _sat = ghost.split_btc_amount(Decimal(_tot), 3, _R)
+    check(f"btc: every chunk of {_tot} is a whole number of satoshis",
+          all(x == x.quantize(ghost.SATOSHI_BTC) for x in _sat))
+
+_sub = None
+try:
+    ghost.resolve_btc_amount(types.SimpleNamespace(
+        btc_amount=Decimal("0.123456789")))
+except SystemExit as _e:
+    _sub = str(_e.code)
+check("btc: a --btc-amount finer than a satoshi is REFUSED", _sub is not None)
+check("btc: ...and refused rather than rounded, because rounding would swap a "
+      "different amount than was asked for",
+      _sub and "rather than rounding" in _sub)
+check("btc: ...and it names both payable amounts either side",
+      _sub and "0.12345678" in _sub and "0.12345679" in _sub)
+for _ok_amt in ("0.1", "0.00000001", "1", "0.12345678"):
+    _r = None
+    try:
+        ghost.resolve_btc_amount(types.SimpleNamespace(
+            btc_amount=Decimal(_ok_amt)))
+    except SystemExit as _e:
+        _r = str(_e.code)
+    check(f"control: --btc-amount {_ok_amt} is payable and allowed", _r is None)
+check("control: no --btc-amount at all is fine (manual and receive modes)",
+      ghost.resolve_btc_amount(types.SimpleNamespace(btc_amount=None)) is None)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

@@ -754,9 +754,19 @@ check("e2e: ...each naming a DIFFERENT destination — this is G5",
       len(set(_dests)) == 3)
 check("e2e: ...and they are the run's own entry addresses, in chunk order",
       _dests == [_addr(3000 + i) for i in range(3)])
-check("e2e: the BTC amount was split three ways",
-      len({p["sellAmount"] for p in _posted}) <= 2       # remainder on chunk 0
-      and all(D(p["sellAmount"]) > 0 for p in _posted))
+check("e2e: the BTC amount was split three ways, all positive",
+      len(_posted) == 3 and all(D(p["sellAmount"]) > 0 for p in _posted))
+# ALL THREE DIFFERENT. This used to allow at most two distinct values (equal
+# chunks with the remainder on chunk 0), which is what the splitter produced --
+# and three identical deposits made minutes apart to the same vault are ONE
+# CLUSTER on the Bitcoin chain, whose OP_RETURNs then read out all three
+# Monero destinations. The Monero-side split is undone by the Bitcoin side if
+# the amounts match.
+check("e2e: ...and NO two chunks carry the same BTC amount, so the deposits "
+      "are not one cluster on the Bitcoin chain",
+      len({p["sellAmount"] for p in _posted}) == 3)
+check("e2e: ...while still summing to exactly what was asked for",
+      sum((D(p["sellAmount"]) for p in _posted), D(0)) == D("0.6"))
 
 # CONTROL: one chunk still posts one address, exactly as before.
 _p1, _e1 = _drive_split(1)

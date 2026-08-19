@@ -1266,6 +1266,17 @@ Actually gets zero deposits. False sense of security.
 and calls `stage2_get_swap_quotes()` which generates real deposit addresses + memos.
 Also prints a copy-paste-ready SENDER INSTRUCTIONS block.
 
+> **SUPERSEDED — do not read the paragraph above as current behaviour.** "N equal
+> chunks" was itself a leak, and a later round removed it twice over. N identical
+> deposits made minutes apart to the same vault are one cluster on the *Bitcoin*
+> chain, and their OP_RETURNs then read out every Monero destination — so the
+> chunks are now jittered (`split_btc_amount`) and sum exactly. Worse, all N
+> chunks were routed to ONE entry address, which linked the swaps at the
+> aggregator and made the entry veil an N-input transaction whose rings could be
+> intersected to identify the carrier. `--split N` now mints one entry address
+> per chunk. See `create_entry_set` and `build_entry_veils` in GhostSpiral, and
+> the `--split` bullets in OPSEC_SETUP.md.
+
 ### BUG 20 (FIXED): Broadcaster silently broadcast unmanifested blobs
 
 **File:** broadcast_signed_xmr

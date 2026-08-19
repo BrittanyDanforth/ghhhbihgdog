@@ -448,7 +448,33 @@ the whole and only claim. So:
   is capped at 8 (every chunk costs a swap fee, a veil transaction and a
   wallet account, and the offline signing wallet derives subaddresses for a
   bounded number of accounts), and it is **not supported with `--peel`**: each
-  chunk would need its own sequential, confirmation-gated chain.
+  chunk would need its own sequential, confirmation-gated chain. That is
+  refused when the flags are parsed, not when the distribution is built —
+  refusing later would mean refusing after the deposit instructions were
+  printed, possibly after you had already sent Bitcoin.
+- **The chunks are UNEQUAL, and that is not cosmetic.** They used to be an
+  exact division, so a `--split 4` run told you to make four deposits of an
+  identical amount, within minutes, to the same vault. That is one cluster on
+  the *Bitcoin* chain, and the OP_RETURNs then read out all four Monero
+  destinations — the careful Monero-side separation undone by the side of the
+  transaction nobody was looking at. Each chunk is now jittered, and they sum
+  to exactly what you asked for. `--btc-amount` finer than a satoshi is
+  refused rather than rounded: rounding would swap a different amount than you
+  asked for, and the deposit line would name a figure no wallet can send.
+- **A hop never crosses chunks either.** The DAG round is a permutation, so a
+  mix subaddress that hops its own output away ends holding exactly one output
+  and whose it is does not matter. But an output too small to fund a hop, or
+  one that could not be given a destination, does *not* hop and can still
+  receive one — keeping its own output *and* the incoming one. With one chunk
+  that is harmless. With several, the exit's per-subaddress sweep would then
+  spend two chunks in one transaction. Hop destinations are drawn from the
+  source's own chunk, so it cannot happen.
+- **A chunk that does not arrive does not sink the run.** The arrival gate
+  compares the *sum* against the target, so one swap overshooting can cover
+  another that has not landed. Chunks that arrived empty — or too small to
+  fund even one mix output — are dropped, named, and their entry addresses
+  stay held back from the exit, so a late arrival is never swept to your
+  destination in one hop. The rest of the run continues.
 - **Spending one output of an address holding several is not available, and
   that is structural.** `sweep_single` names its target by key image, and the
   online wallet is **view-only** — it cannot compute key images at all.

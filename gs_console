@@ -78,7 +78,15 @@ SCHEMA = {
     "pairs_file":   ("re", PATH_RE),
     "swap_btc":     ("re", DEC_RE),
     "btc_amount":   ("re", DEC_RE),
-    "split":        ("int", (1, 20)),
+    # 8, NOT 20, and it must equal gs_common.MAX_SPLIT.
+    #
+    # The console offered a split of up to 20 while GhostSpiral refuses above
+    # 8, so the web form accepted a value the pipeline then rejected -- after
+    # the operator had filled it in. gs_common owns the number; this is a
+    # literal because the SCHEMA is built at import time and the console loads
+    # gs_common lazily, so tests/test_console.py ENFORCES that the two agree.
+    # A comment asking two numbers to stay in sync is a hope, not a guarantee.
+    "split":        ("int", (1, 8)),
     "wallets":      ("int", (3, 60)),
     "deep":         ("int", (1, 6)),
     "fee_priority": ("int", (1, 4)),
@@ -1363,7 +1371,7 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <div id="send-fields">
       <div class="f"><label for="btc_entry">BTC entry</label><input id="btc_entry" placeholder="bc1q…"></div>
       <div class="f"><label for="btc_amount">BTC amount</label><input id="btc_amount" placeholder="0.05"></div>
-      <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="20" value="1"></div>
+      <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="8" value="1"></div>
       <label class="chk"><input type="checkbox" id="joinmarket">
         <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
     </div>

@@ -493,13 +493,62 @@ check("UNCLEAN: an output whose balance could not be re-read is unclean too",
 # THE SENTENCE ITSELF. _stage5_run is where the claim is printed, so the claim
 # is what has to be tested -- a counter that is right while the message is
 # still wrong fixes nothing.
-_s5src = Path(REPO, "GhostSpiral").read_text()
-_branch = _s5src[_s5src.index("elif _unclean:"):
-                 _s5src.index("EXIT COMPLETE")]
-check("UNCLEAN: the EXIT COMPLETE branch is guarded by the unclean count",
-      "_unclean" in _s5src.split("elif _relayed and not _held:")[0][-800:])
-check("UNCLEAN: ...and the unclean branch says the value has NOT left",
-      "has NOT left the wallet" in _branch)
+# DRIVEN, not grepped. This was two source-substring checks, one of which
+# split the file on the literal `elif _relayed and not _held:` -- so the moment
+# that line was reworded the split returned the WHOLE file and the check
+# stopped testing anything. It was reworded, for a real reason: `_held` became
+# a {"entry": n, "change": n} breakdown, and a two-key dict is ALWAYS truthy,
+# so `not _held` was permanently False and the clean-exit message could never
+# print at all. A grep for the old text would have gone green on that.
+def _drive_stage5_exit(residue, hold=(), entry_pairs=()):
+    """Run the REAL _stage5_run exit block. Returns its stdout."""
+    saved = (ghost._run_round, ghost._wait_for_change_settled,
+             ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+             ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+             ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+    try:
+        ghost._run_round = lambda *a, **k: 1
+        ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+        ghost._change_residue = lambda *a, **k: residue
+        ghost.connect_rpc = lambda *a, **k: _BalRPC(
+            {4: {1: 5_000_000_000_000}, 3: {1: 1_000_000_000_000}})
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost._wait_for_fanout_confirm = lambda *a, **k: True
+        ghost._run_change_sweeps = lambda *a, **k: 0
+        _a = types.SimpleNamespace(**{**vars(_wargs), "entry_veil": True})
+        _st = os.path.join(_tf.mkdtemp(prefix="s5exit_"), "tx_staging")
+        os.makedirs(_st, exist_ok=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ghost._stage5_run(_a, _plan, None, [], _st, None, 1,
+                              distribution_mode="fanout",
+                              change_target=None, change_sweep_jobs=None,
+                              delay_window=(0, 0),
+                              exit_accounts=[4] + [p[0] for p in hold],
+                              exit_hold=list(hold))
+        return buf.getvalue()
+    finally:
+        (ghost._run_round, ghost._wait_for_change_settled,
+         ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+         ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+         ghost._wait_for_fanout_confirm, ghost._run_change_sweeps) = saved
+
+
+_clean_out = _drive_stage5_exit(0)
+check("UNCLEAN: a genuinely clean exit DOES announce EXIT COMPLETE — the "
+      "branch is reachable at all",
+      "EXIT COMPLETE" in _clean_out)
+_dirty_out = _drive_stage5_exit(5_000_000)
+check("UNCLEAN: an exit that left value behind does NOT announce EXIT COMPLETE",
+      "EXIT COMPLETE" not in _dirty_out)
+check("UNCLEAN: ...and says the value has NOT left the wallet",
+      "has NOT left the wallet" in _dirty_out)
+_held_out = _drive_stage5_exit(0, hold=[(3, 1)], entry_pairs=[(3, 1)])
+check("UNCLEAN: an exit that WITHHELD an output does not announce EXIT "
+      "COMPLETE either", "EXIT COMPLETE" not in _held_out)
 
 
 

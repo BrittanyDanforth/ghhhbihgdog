@@ -569,6 +569,41 @@ def decimal_env(label: str, text, positive: bool = False,
     return v
 
 
+#: One satoshi, as a Decimal. BTC amounts quantise to this.
+SATOSHI_BTC = Decimal("0.00000001")
+
+
+def fmt_btc(x: Decimal) -> str:
+    """A BTC amount an operator can actually type into a wallet.
+
+    Decimal renders small values in scientific notation -- str(Decimal("3E-8"))
+    is "3E-8" -- and these strings go into deposit instructions and refusal
+    messages. "send at least 3E-8 BTC" is not a figure anyone can enter, and
+    the number it describes is a payment. Fixed notation, eight places, with
+    trailing zeros trimmed back to at least one decimal.
+    """
+    q = Decimal(x).quantize(SATOSHI_BTC)
+    out = format(q, "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".") or "0"
+    return out
+
+
+#: Most swap chunks a run will accept (--split N, or N JoinMarket UTXOs).
+#:
+#: HERE rather than in GhostSpiral because gs_console builds the argv and had
+#: its own bound of 20 -- so the console offered, and the web form accepted, a
+#: split the pipeline then refused, after the operator had filled the form.
+#: Two numbers for one rule is the drift this module exists to stop.
+#:
+#: Each chunk costs a swap fee, its own entry veil transaction and its own
+#: wallet account, and the offline signing wallet derives subaddresses for a
+#: bounded number of accounts -- 50 by default, fixed when it was created, and
+#: OPSEC_SETUP.md measures the online wallet passing that during the second
+#: run. Past this point an extra run buys more than an extra chunk.
+MAX_SPLIT = 8
+
+
 #: The roots paranoia_mode globs when it hunts artifacts, at depth 0 and 1.
 #: Named ONCE, here, because three places now need to agree about them: the
 #: wipe itself, and the two tools that write operator-chosen paths which the
