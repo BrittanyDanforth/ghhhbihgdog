@@ -3,6 +3,7 @@
 Loads the real extensionless scripts as modules and asserts real behavior."""
 import ast
 import re
+import stat
 import sys, os, shutil, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 
@@ -2682,6 +2683,153 @@ finally:
 check("veil wiring: --no-entry-veil skips round 0 entirely",
       not any(x[0] == "round" and x[1] == "Entry veil" for x in _seq7)
       and ("peels",) in _seq7)
+
+
+# ---------------------------------------------------------------------------
+# THREE GUARANTEES THAT MUTATION TESTING FOUND WERE PROTECTED BY NOTHING.
+#
+# Each has a docstring explaining why a silent fallback would be catastrophic.
+# Each survived having that fallback reinstated: the suites went green with the
+# guarantee removed. A stated invariant with no test is a comment.
+# ---------------------------------------------------------------------------
+
+# 1. _src_index must ABORT on an unknown address, not resolve it to 0.
+#    Subaddress 0 is the account's change/primary address, so a fallback spends
+#    the wrong output and the only symptom is money moving from somewhere else.
+try:
+    ghost._src_index({"KNOWN": (3, 9)}, "UNKNOWN")
+    check("_src_index: an unknown source ABORTS rather than resolving to 0", False)
+except SystemExit:
+    check("_src_index: an unknown source ABORTS rather than resolving to 0", True)
+check("_src_index: a known source still resolves",
+      ghost._src_index({"KNOWN": (3, 9)}, "KNOWN") == 9)
+try:
+    ghost._src_account({"KNOWN": (3, 9)}, "UNKNOWN")
+    check("_src_account: an unknown source ABORTS rather than resolving to 0", False)
+except SystemExit:
+    check("_src_account: an unknown source ABORTS rather than resolving to 0", True)
+check("_src_account: a known source still resolves",
+      ghost._src_account({"KNOWN": (3, 9)}, "KNOWN") == 3)
+
+# 2. _wait_for_change_settled must NOT report settled while anything is still
+#    confirming. sweep_all can only spend UNLOCKED outputs, so a premature True
+#    sweeps part of the change and leaves the rest -- while the caller prints
+#    that nothing is parked.
+class _SettleRpc:
+    """total != unlocked forever: the wallet never finishes confirming."""
+    def __init__(self, pairs): self.pairs = pairs; self.calls = 0
+    def raw_request(self, m, p=None): return {}
+    def get_subaddress_balance(self, a, i):
+        self.calls += 1
+        return self.pairs[min(self.calls - 1, len(self.pairs) - 1)]
+
+_r_conn, _r_sd, _r_to = ghost.connect_rpc, ghost.shutdown_requested, ghost.FANOUT_CONFIRM_TIMEOUT
+_r_poll = ghost.FANOUT_CONFIRM_POLL
+try:
+    # The loop sleeps FANOUT_CONFIRM_POLL between polls with a hardcoded
+    # time.sleep and no injection point, so a test either waits 30s per poll
+    # or shortens both. Worth noting as a testability gap in its own right --
+    # and note the loop advances `waited` BY the poll interval, so a 0 here
+    # spins forever rather than polling fast.
+    ghost.FANOUT_CONFIRM_POLL = 1
+    ghost.FANOUT_CONFIRM_TIMEOUT = 4
+    ghost.shutdown_requested = lambda: False
+    _never = _SettleRpc([(5_000, 2_000)])
+    ghost.connect_rpc = lambda *a, **k: _never
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _ok, _tot = ghost._wait_for_change_settled(
+            _VA(rpc_primary="http://x", tor_proxy=None), 4, 0, None, "t")
+    check("changesettle: never reports settled while total != unlocked",
+          _ok is False)
+    _then = _SettleRpc([(5_000, 2_000), (5_000, 2_000), (5_000, 5_000)])
+    ghost.connect_rpc = lambda *a, **k: _then
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _ok2, _tot2 = ghost._wait_for_change_settled(
+            _VA(rpc_primary="http://x", tor_proxy=None), 4, 0, None, "t")
+    check("changesettle: reports settled once nothing is confirming",
+          _ok2 is True and _tot2 == 5_000)
+finally:
+    ghost.connect_rpc, ghost.shutdown_requested = _r_conn, _r_sd
+    ghost.FANOUT_CONFIRM_TIMEOUT = _r_to
+    ghost.FANOUT_CONFIRM_POLL = _r_poll
+
+# 3. build_peel_plan must REFUSE a hop with no carrier, not fall back to
+#    subaddress 0 -- that rebuilds the repeated-spender hub the rotating
+#    carriers exist to remove, silently and on-chain.
+_amts3 = [Decimal("1"), Decimal("1"), Decimal("1")]
+try:
+    ghost.build_peel_plan(entry_index=7, change_index=0,
+                          dests=["A", "B", "C"], amounts=_amts3,
+                          carriers=[("CAR1", 11)],            # one short
+                          remainders=[Decimal("2"), Decimal("1")])
+    check("build_peel_plan: a hop with no carrier RAISES, never falls back to 0",
+          False)
+except (ValueError, SystemExit):
+    check("build_peel_plan: a hop with no carrier RAISES, never falls back to 0",
+          True)
+_full3 = ghost.build_peel_plan(entry_index=7, change_index=0,
+                               dests=["A", "B", "C"], amounts=_amts3,
+                               carriers=[("CAR1", 11), ("CAR2", 12)],
+                               remainders=[Decimal("2"), Decimal("1")])
+check("build_peel_plan: a complete carrier list still plans",
+      len(_full3) == 3 and [p["src_index"] for p in _full3] == [7, 11, 12])
+check("build_peel_plan: no hop spends subaddress 0",
+      all(p["src_index"] != 0 for p in _full3))
+
+
+# ---------------------------------------------------------------------------
+# secure_write_bytes must NARROW a pre-existing file's permissions.
+#
+# Mutation testing found this protected by nothing. It is easy to miss because
+# a NEW file gets its mode from os.open's `mode` argument, so dropping the
+# fchmod changes nothing there -- every existing test writes new files and all
+# of them stayed green. O_CREAT does NOT change an existing file's mode, so the
+# untested case is the one that matters: writing a secret into a path that is
+# already world-readable leaves it world-readable.
+# ---------------------------------------------------------------------------
+_pw = os.path.join(_scratch, "perm_probe")
+open(_pw, "w").write("old")
+os.chmod(_pw, 0o644)
+gs.secure_write_bytes(Path(_pw), b"secret-bearing content")
+_mode = stat.S_IMODE(os.stat(_pw).st_mode)
+check("secure_write_bytes: narrows a PRE-EXISTING 0644 file to 0600 "
+      f"(got {oct(_mode)})", _mode == 0o600)
+check("secure_write_bytes: ...and the content really was replaced",
+      open(_pw, "rb").read() == b"secret-bearing content")
+_pw2 = os.path.join(_scratch, "perm_probe_new")
+gs.secure_write_bytes(Path(_pw2), b"x")
+check("secure_write_bytes: a NEW file is 0600 too",
+      stat.S_IMODE(os.stat(_pw2).st_mode) == 0o600)
+# The same hole one level up: atomic_write_json writes through a .tmp, so a
+# stale world-readable .tmp from an interrupted run must not survive as one.
+_pj = Path(_scratch) / "aj.json"
+open(str(_pj) + ".tmp", "w").write("{}")
+os.chmod(str(_pj) + ".tmp", 0o644)
+gs.atomic_write_json({"k": "v"}, _pj)
+check("atomic_write_json: a stale world-readable .tmp does not become the file",
+      stat.S_IMODE(os.stat(_pj).st_mode) == 0o600,
+      )
+
+# env_or_argv must WARN when a value arrives on argv, where /proc/<pid>/cmdline
+# (mode 444) exposes it to every local account. Driven, because the warning is
+# the entire feature.
+_buf8 = _io.StringIO()
+with _ctx.redirect_stdout(_buf8):
+    gs.env_or_argv("GS_NOPE_UNSET", "on-the-command-line", "The probe value")
+check("env_or_argv: an argv-supplied value is warned about",
+      "command line" in _buf8.getvalue())
+os.environ["GS_PROBE_BOTH"] = "from-env"
+try:
+    _buf9 = _io.StringIO()
+    with _ctx.redirect_stdout(_buf9):
+        _v9 = gs.env_or_argv("GS_PROBE_BOTH", "from-argv", "The probe value")
+    check("env_or_argv: env wins when both are supplied", str(_v9) == "from-env")
+    check("env_or_argv: ...and BOTH-supplied is warned about",
+          "ALSO passed on the command line" in _buf9.getvalue())
+    check("env_or_argv: ...and a disagreement is surfaced",
+          "DISAGREE" in _buf9.getvalue())
+finally:
+    os.environ.pop("GS_PROBE_BOTH", None)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
