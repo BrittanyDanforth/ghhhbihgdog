@@ -577,7 +577,102 @@ check("CHANGE HOLD: the ENTRY output is described as ENTRY",
 check("CHANGE HOLD: the change output is described as CHANGE, not ENTRY",
       "a distribution CHANGE address (account 3 / subaddr 0)" in _mtxt)
 check("CHANGE HOLD: ...and the change explanation is the change one",
-      "the change sweep is what pushes it into" in _mtxt)
+      "The change sweep would have moved it once" in _mtxt)
+# ...and it must not repeat the G7 claim. This message said the sweep "pushes
+# it into the mix"; the sweep moves it once to a fresh address that is in no
+# plan and no hop graph. Written here by the same pass that fixed the hold,
+# and missed by a plain grep because it spans three source lines.
+check("CHANGE HOLD: ...and does NOT claim the sweep mixes it",
+      "into the mix" not in _mtxt)
+check("CHANGE HOLD: ...but does say it is unmixed either way",
+      "UNMIXED either way" in _mtxt)
+
+
+
+# ==========================================================================
+# G8: A PARTIAL PEEL CHAIN WAITED AN HOUR PER PEEL THAT NEVER RAN
+# ==========================================================================
+print("\n=== change sweeps skip peels that never ran ===")
+#
+# change_sweep_jobs is provisioned for EVERY hop in the plan, in hop order,
+# before the chain runs. A chain that stops early leaves the rest of those
+# accounts never funded — and _wait_for_change_settled cannot tell "nothing
+# arrived yet" from "nothing is ever coming", so it waited out
+# FANOUT_CONFIRM_TIMEOUT (3600s) on each. A 7-peel chain stopping at the first
+# peel spent ~6 hours polling addresses that could not hold anything, then
+# reported them "NOT swept — UNMIXED", sending the operator to look for money
+# that was never there.
+_g8_seen = []
+_g8_saved = (ghost._run_peel_chain, ghost._run_change_sweeps,
+             ghost._run_round, ghost._wait_for_fanout_confirm,
+             ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+             ghost.secure_delay, ghost._wait_for_carrier,
+             ghost._run_exit_withdrawals)
+
+
+def _g8_run(total_peels, relayed):
+    """Drive _stage5_run's peel branch; return the jobs the sweeps were given."""
+    _g8_seen.clear()
+    d = _tf.mkdtemp(prefix="g8_")
+    plan = os.path.join(d, "peel.json")
+    with open(plan, "w") as fh:
+        json.dump({"meta": {}, "txs": [{"i": i} for i in range(total_peels)]}, fh)
+    stg = os.path.join(d, "tx_staging")
+    os.makedirs(stg, exist_ok=True)
+    jobs = [(10 + i, 0, f"DST{i}", 1) for i in range(total_peels)]
+    try:
+        ghost._run_peel_chain = lambda *a, **k: relayed
+        ghost._run_change_sweeps = lambda a, j, *rest, **k: (
+            _g8_seen.extend(j) or 0)
+        ghost._run_round = lambda *a, **k: 1
+        ghost._wait_for_fanout_confirm = lambda *a, **k: True
+        ghost._wait_for_carrier = lambda *a, **k: True
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        # the exit is a separate concern; this drive is about the sweeps
+        ghost._run_exit_withdrawals = lambda *a, **k: (0, 0, 0, 0, 0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ghost._stage5_run(
+                types.SimpleNamespace(**{**vars(_wargs), "peel": True}),
+                plan, None, [], stg, None, 1,
+                distribution_mode="peel", change_target=(4, 0),
+                change_sweep_jobs=jobs, delay_window=(0, 0))
+        return list(_g8_seen), buf.getvalue()
+    finally:
+        (ghost._run_peel_chain, ghost._run_change_sweeps, ghost._run_round,
+         ghost._wait_for_fanout_confirm, ghost.integrity_log, ghost.newnym,
+         ghost.tor_recheck, ghost.secure_delay, ghost._wait_for_carrier,
+         ghost._run_exit_withdrawals) = _g8_saved
+
+
+_g8_jobs, _g8_out = _g8_run(total_peels=7, relayed=1)
+check("G8: a chain that relayed 1 of 7 peels sweeps only 1 change location",
+      len(_g8_jobs) == 1)
+check("G8: ...and it is the FIRST one, matching hop order",
+      _g8_jobs and _g8_jobs[0][0] == 10)
+check("G8: ...and the operator is told why the rest were skipped",
+      "never ran" in _g8_out and "hold nothing" in _g8_out)
+
+# The saving, stated in the units that matter.
+check(f"G8: that is {6 * ghost.FANOUT_CONFIRM_TIMEOUT // 3600} hours of "
+      f"polling empty addresses avoided",
+      ghost.FANOUT_CONFIRM_TIMEOUT >= 3600)
+
+# A COMPLETE chain must be unaffected — the fix must not skip real change.
+_g8_full, _g8_fout = _g8_run(total_peels=7, relayed=7)
+check("G8: a chain that relayed ALL 7 peels still sweeps all 7",
+      len(_g8_full) == 7)
+check("G8: ...and says nothing about skipping", "never ran" not in _g8_fout)
+
+# Partial in the middle, to show it is the count and not a special case.
+_g8_mid, _ = _g8_run(total_peels=12, relayed=5)
+check("G8: 5 of 12 relayed -> exactly 5 change locations swept",
+      len(_g8_mid) == 5)
+check("G8: ...in hop order, not an arbitrary subset",
+      [j[0] for j in _g8_mid] == [10, 11, 12, 13, 14])
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

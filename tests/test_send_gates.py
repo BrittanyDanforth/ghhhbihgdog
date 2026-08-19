@@ -276,6 +276,70 @@ check("slip: lowering it below a small deviation stops it",
 check("slip: an unavailable oracle does not abort the run (the gate simply "
       "cannot judge)", run_stage2(D("100"), None) is None)
 
+
+# ==========================================================================
+# 4. NUMBERS THAT ARRIVE FROM OUTSIDE
+# ==========================================================================
+print("\n=== external numbers: quotes and price oracles ===")
+#
+# decimal_arg guards argv and decimal_env guards the environment. Everything
+# that arrives over a socket or out of a file was still parsed with a bare
+# Decimal() — and the trap is that Decimal parses "NaN" and "Infinity" happily,
+# then poisons the COMPARISON rather than the conversion:
+#
+#     exp = Decimal(str(external))     # succeeds
+#     if exp <= 0:                     # RAISES InvalidOperation here
+#
+# so the guard meant to reject the value is the line that crashes. Measured: a
+# SwapKit quote of expectedOutput="NaN" took stage 2 out with an uncaught
+# traceback, and quote_deviation — whose docstring promises it "returns None
+# when the comparison cannot be made honestly" — raised on the same input.
+
+check("ext: finite_decimal parses a real number", gs.finite_decimal("1.5") == D("1.5"))
+for _bad in ("NaN", "Infinity", "-Infinity", "abc", None, ""):
+    check(f"ext: finite_decimal({_bad!r}) -> the default, never a raise",
+          gs.finite_decimal(_bad) is None)
+check("ext: ...and the default is returned, not invented",
+      gs.finite_decimal("NaN", D(0)) == D(0))
+
+# quote_deviation must be TOTAL. Its docstring already promised this.
+for _lbl, _args in (("expected=NaN", ("NaN", "1", "0.005")),
+                    ("expected=Infinity", ("Infinity", "1", "0.005")),
+                    ("oracle=NaN", ("200", "1", "NaN")),
+                    ("oracle=Infinity", ("200", "1", "Infinity")),
+                    ("amount=NaN", ("200", "NaN", "0.005"))):
+    _raised = False
+    try:
+        _r = ghost.quote_deviation(D(_args[0]) if _args[0][0].isdigit() else _args[0],
+                                   _args[1], _args[2])
+    except Exception:                                        # noqa: BLE001
+        _raised = True
+        _r = "RAISED"
+    check(f"ext: quote_deviation({_lbl}) returns None instead of raising",
+          not _raised and _r is None)
+check("control: a real comparison still produces a deviation",
+      ghost.quote_deviation(D("100"), D("1"), D("0.005")) is not None)
+
+# The price oracle must not hand back a non-finite rate.
+def _oracle(v):
+    return gs.btc_per_xmr_oracle(
+        None, getter=lambda u, proxy=None: {"monero": {"btc": v}})
+
+
+for _bad in ("Infinity", "NaN", "-1", "0"):
+    check(f"ext: an oracle price of {_bad!r} yields None, not a usable rate",
+          _oracle(_bad) is None)
+check("control: a real oracle price is returned", _oracle("0.005") == D("0.005"))
+
+# ...and stage 2 survives every one of them, reporting rather than crashing.
+for _exp in ("NaN", "Infinity", "-5", "abc"):
+    _out = run_stage2(_exp, D("0.005"))
+    check(f"ext: stage 2 survives expectedOutput={_exp!r} without a traceback",
+          _out is None or "Chunk" in str(_out))
+check("control: a good quote still passes stage 2",
+      run_stage2(D("200"), D("0.005")) is None)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

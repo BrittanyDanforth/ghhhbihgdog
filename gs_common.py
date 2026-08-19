@@ -414,6 +414,39 @@ def decimal_arg(text: str) -> Decimal:
     return v
 
 
+def finite_decimal(value, default=None):
+    """Parse an EXTERNAL number, or return `default`. Never raises.
+
+    For values this toolchain did not write: swap quotes, price-oracle
+    responses, plan files on disk. decimal_arg guards argv and decimal_env
+    guards the environment; this guards everything that arrives over a socket
+    or out of a file.
+
+    The trap is that Decimal parses "NaN" and "Infinity" happily and then
+    poisons the COMPARISON rather than the conversion. `Decimal("NaN") <= 0`
+    RAISES InvalidOperation, so a guard written as
+
+        exp = Decimal(str(external))      # succeeds
+        if exp <= 0:                      # raises HERE, before it can guard
+            ...
+
+    crashes at the line meant to reject the value. Measured: a SwapKit quote of
+    expectedOutput="NaN" produced an uncaught InvalidOperation out of stage 2,
+    and quote_deviation -- whose docstring promises it "returns None when the
+    comparison cannot be made honestly" -- raised on the same input rather than
+    returning None.
+
+    Infinity is the quieter half: it compares greater than everything, so it
+    survives every `<= 0` test and reaches the arithmetic, where a deviation of
+    "Infinity%" gets printed at the operator.
+    """
+    try:
+        v = Decimal(str(value))
+    except Exception:                                        # noqa: BLE001
+        return default
+    return v if v.is_finite() else default
+
+
 def decimal_env(label: str, text, positive: bool = False,
                 max_value: Decimal = None) -> Decimal:
     """decimal_arg's rules, for a value that came from the ENVIRONMENT.
@@ -1652,8 +1685,12 @@ def btc_per_xmr_oracle(proxies: Optional[Dict[str, str]] = None, getter=None):
     fetch = getter or safe_get
     try:
         p = fetch(CG_PRICE_URL, proxies)
-        rate = Decimal(str(p["monero"]["btc"]))
-        if rate <= 0:
+        # finite_decimal: a NaN rate made `rate <= 0` RAISE (caught below, so
+        # it degraded to None by accident rather than by design), and an
+        # Infinity rate sailed past `<= 0` and was RETURNED as a usable price.
+        # Both come straight out of a third-party JSON body.
+        rate = finite_decimal(p["monero"]["btc"])
+        if rate is None or rate <= 0:
             raise ValueError("non-positive rate")
         integrity_log("swap", "price_oracle_ok")
         return rate
@@ -1673,11 +1710,14 @@ def quote_deviation(expected_out, amount_in, rate_in_per_out):
     """
     if rate_in_per_out is None:
         return None
-    try:
-        exp = Decimal(str(expected_out))
-        amt = Decimal(str(amount_in))
-        rate = Decimal(str(rate_in_per_out))
-    except Exception:                                        # noqa: BLE001
+    # finite_decimal, not Decimal: this promises to return None when the
+    # comparison "cannot be made honestly", and a NaN made it RAISE instead --
+    # `Decimal("NaN") <= 0` throws InvalidOperation, so the guard below was the
+    # line that crashed. Reachable straight off a swap quote.
+    exp = finite_decimal(expected_out)
+    amt = finite_decimal(amount_in)
+    rate = finite_decimal(rate_in_per_out)
+    if exp is None or amt is None or rate is None:
         return None
     if rate <= 0 or amt <= 0 or exp <= 0:
         return None

@@ -46,6 +46,7 @@ from gs_common import (
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
+    finite_decimal,
     decimal_env, XMR_ABSURD_TOTAL,
     swap_arrival_floor,
     create_fresh_account, run_lock,
@@ -1552,10 +1553,14 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         validate_swap_route(deposit_addr, memo, xmr_dest, i,
                             allow_unbound_memo=args.allow_unbound_memo)
 
-        try:
-            expected_dec = Decimal(str(expected_output))
-        except Exception:                                 # noqa: BLE001
-            expected_dec = Decimal(0)
+        # finite_decimal: `Decimal("NaN")` parses, and then `expected_dec <= 0`
+        # RAISES InvalidOperation -- so the guard meant to reject an unreadable
+        # quote was itself the crash. A SwapKit response of
+        # expectedOutput="NaN" took stage 2 out with an uncaught traceback.
+        # Infinity is quieter: it passes `<= 0` and reaches the slippage
+        # arithmetic, which then tells the operator the quote is "Infinity%"
+        # away from the oracle.
+        expected_dec = finite_decimal(expected_output, Decimal(0))
         if expected_dec <= 0:
             # A silent 0 here defeats the slippage cross-check below AND
             # prints "Expected: ~0 XMR" in the deposit instructions. Say so;
@@ -4135,7 +4140,32 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
 def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                       staging_dir, proxy, meta, label="change sweep", seq=0,
                       delay_window=None, outcomes=None):
-    """Sweep ONE change location into the mix, leaving nothing behind.
+    """Sweep ONE change location onto a fresh address, leaving nothing behind.
+
+    IT DOES NOT GO "INTO THE MIX", and this said it did -- in the summary line,
+    in two operator messages and in the caller. The destination is a subaddress
+    of an account created moments earlier (create_fresh_account at the call
+    site); it is not in `subs`, so it is not in `mix_targets`, so it is not in
+    `fanout_dests`, so it is not in `hop_sources`, and build_dag_adjacency has
+    never heard of it. Verified by driving the real selection: the change
+    destination appears in none of them.
+
+    So the swept change moves exactly ONCE and then rests.
+
+    It cannot currently do more, and the reason is structural rather than an
+    oversight: the DAG plan is BUILT AND SIGNED before this destination exists,
+    and the change amount is not known until the distribution has executed and
+    paid its fee. A hop out of this address cannot be sized in a pre-signed
+    plan. Giving it one would need a second, dynamically-built hop round after
+    the sweeps -- a feature, not a correction, and not something to imply in a
+    message.
+
+    What the sweep IS worth: the change is the one output of the distribution
+    that would otherwise never move at all, sitting on the spending account
+    where anyone who identifies that transaction can watch it. One hop to an
+    address that appears in no plan is materially better than zero. It is just
+    not mixing, and calling it mixing is how an operator comes to believe the
+    remainder is as protected as the rest.
 
     Neither distribution can allocate its input exactly, because the fee is not
     known when the amounts are chosen. A fan-out holds ~FANOUT_SPEND_FRACTION
@@ -4188,7 +4218,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     if not _wait_for_change_settled(args, account, change_index, proxy, label)[0]:
         _note("skipped_not_confirmed")
         print(f"  [!] The change on account {account} did not confirm in time, so "
-              f"it was NOT swept into the mix. It is safe on account {account}, "
+              f"it was NOT swept to a fresh address. It is safe on account {account}, "
               f"subaddress {change_index} — but it is UNMIXED, and it is an "
               f"output that never moved. Sweep it by hand.")
         return False
@@ -4231,7 +4261,9 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                   f"output that never moves. Sweep it by hand once it unlocks.")
         else:
             _note("swept_into_mix")
-            print(f"  [+] The change on account {account} was swept into the mix; "
+            print(f"  [+] The change on account {account} was swept to a fresh "
+                  f"address (it moves once and rests there -- it does NOT go "
+                  f"through the hop rounds; see _run_change_sweep); "
                   f"verified nothing is parked on that change address.")
         return True
     finally:
@@ -4390,11 +4422,12 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                       "preventing.")
             else:
                 print("      This is the remainder the distribution could not "
-                      "allocate, and the change sweep is what pushes it into "
-                      "the mix. It did not get there, so it is UNMIXED — and "
-                      "it is an output of the transaction that spent your "
-                      "swapped funds. Withdrawing it publishes that link in "
-                      "one hop.")
+                      "allocate. The change sweep would have moved it once, to "
+                      "a fresh address — it never goes through the hop rounds, "
+                      "so it is UNMIXED either way — and it did not even get "
+                      "that far. It is an output of the transaction that spent "
+                      "your swapped funds, so withdrawing it publishes that "
+                      "link in one hop.")
             print("      It is safe where it is. To mix it: mint a fresh "
                   "receive wallet (create_receive_wallet), send this balance "
                   "to it as ONE ordinary transfer — that hop is the entry "
@@ -4581,18 +4614,42 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                     _cs_meta = json.load(_mf).get("meta", {})
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
-            _missed = _run_change_sweeps(args, change_sweep_jobs, staging_dir,
+            # ONLY THE PEELS THAT ACTUALLY RAN LEFT CHANGE.
+            #
+            # change_sweep_jobs is provisioned for EVERY hop in the plan, in
+            # hop order, before the chain runs. A chain that stops early leaves
+            # the rest of those accounts never funded -- and _wait_for_change_settled
+            # cannot distinguish "nothing arrived yet" from "nothing is ever
+            # coming", so it waited out FANOUT_CONFIRM_TIMEOUT on each one.
+            # That is one hour per unrun peel: a 7-peel chain that stopped at
+            # the first peel spent ~6 hours polling accounts that could not
+            # hold anything, and then reported them as "NOT swept — UNMIXED",
+            # which is true of an empty address and tells the operator to go
+            # looking for money that was never there.
+            #
+            # _relayed is the count the chain actually relayed, and the jobs are
+            # in the same hop order, so everything past it is provably empty.
+            _runnable = change_sweep_jobs[:_relayed]
+            _skipped_jobs = change_sweep_jobs[_relayed:]
+            if _skipped_jobs:
+                integrity_log("stage5", "change_sweeps_skipped_unrun_peels")
+                print(f"  [*] {len(_skipped_jobs)} change location(s) belong to "
+                      f"peels that never ran, so they hold nothing. Skipping "
+                      f"them rather than waiting "
+                      f"{FANOUT_CONFIRM_TIMEOUT // 60} minutes each to watch an "
+                      f"empty address.")
+            _missed = _run_change_sweeps(args, _runnable, staging_dir,
                                          proxy, _cs_meta, delay_window)
             if _missed:
                 incomplete.append(
-                    f"{_missed} of {len(change_sweep_jobs)} peel change output(s) "
-                    f"were NOT swept into the mix — they are unmixed on their "
+                    f"{_missed} of {len(_runnable)} peel change output(s) "
+                    f"were NOT swept to a fresh address — they are unmixed on their "
                     f"hop's change address")
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
         # The fan-out could not allocate its input exactly, so ~10% came back
-        # as change. Sweep it into the mix rather than leaving a tenth of the
+        # as change. Sweep it to a fresh address rather than leaving a tenth of the
         # balance parked, unmixed, on the one output that never moves.
         if change_sweep_jobs:
             try:
@@ -4602,7 +4659,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 _cs_meta = {}
             if _run_change_sweeps(args, change_sweep_jobs, staging_dir,
                                   proxy, _cs_meta, delay_window):
-                incomplete.append("the fan-out's change was NOT swept into the mix "
+                incomplete.append("the fan-out's change was NOT swept to a fresh address "
                                   "— roughly a tenth of the balance is unmixed on "
                                   "the change address")
 

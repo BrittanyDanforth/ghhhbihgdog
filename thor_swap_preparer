@@ -41,6 +41,7 @@ from gs_common import (
     btc_per_xmr_oracle, quote_deviation, decimal_arg,
     validate_xmr_address,
     decimal_env,
+    finite_decimal,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -348,7 +349,7 @@ def main():
         deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
         memo = tx_info.get("memo") or tx_info.get("data") or ""
         try:
-            expected_xmr = Decimal(str(route.get("expectedOutput") or "0"))
+            expected_xmr = finite_decimal(route.get("expectedOutput"), Decimal(0))
         except Exception:
             expected_xmr = Decimal(0)
         if expected_xmr <= 0:

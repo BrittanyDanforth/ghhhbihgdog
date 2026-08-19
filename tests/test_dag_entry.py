@@ -27,8 +27,10 @@ keys but not the values.
 import importlib.machinery
 import importlib.util
 import os
+import re
 import secrets
 import sys
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -159,6 +161,58 @@ check("ENTRY is still present as a source key (it is simply never funded)",
       _e in _dag)
 check("...and is not among the sources the assignment was asked to place",
       _e not in _mt)
+
+
+# ==========================================================================
+# G7: THE SWEPT CHANGE DOES NOT HOP, AND NOTHING MAY SAY IT DOES
+# ==========================================================================
+print("\n=== swept change is not in the hop graph ===")
+#
+# _run_change_sweep's summary line said "Sweep ONE change location into the
+# mix", and two operator messages plus the caller repeated it. The destination
+# is a subaddress of an account created moments earlier, so it is not in
+# `subs`, not in `mix_targets`, not in `fanout_dests`, not in `hop_sources`,
+# and build_dag_adjacency has never heard of it. The swept change moves once
+# and rests.
+#
+# It cannot currently do more: the DAG plan is built and SIGNED before the
+# destination exists, and the change amount is not known until the
+# distribution has executed and paid its fee, so a hop out of it cannot be
+# sized in a pre-signed plan. The defect was the claim, not the behaviour —
+# and an operator who believes the remainder went through the mix treats it as
+# though it did.
+_g7_subs = [f"mix{_i:02d}" for _i in range(12)]
+_g7_entry = _g7_subs[0]
+_g7_mix = [x for x in _g7_subs if x != _g7_entry]
+_g7_fan, _g7_hops = ghost.select_fanout_targets(_g7_mix, set(), 8, 3)
+_g7_change = "change_sweep_destination_created_later"
+
+check("G7: the change destination is not a fan-out destination",
+      _g7_change not in _g7_fan)
+check("G7: ...not a hop source", _g7_change not in _g7_hops)
+check("G7: ...not in mix_targets at all", _g7_change not in _g7_mix)
+check("G7: ...and the hop graph does not contain it",
+      _g7_change not in ghost.build_dag_adjacency(_g7_subs, _g7_entry, 2, RNG))
+
+# Non-vacuity: a REAL mix output is in all of those, so the checks above are
+# about this address and not about the harness.
+check("control: a real mix output IS a hop source", _g7_mix[1] in _g7_hops)
+check("control: ...and is in the hop graph",
+      _g7_mix[1] in ghost.build_dag_adjacency(_g7_subs, _g7_entry, 2, RNG))
+
+# THE CLAIM. Adjacent string literals joined first, so a message split across
+# source lines is still found — the wrap that made an earlier check report a
+# missing warning that was right there.
+_g7_src = re.sub(r"\s+", " ", Path(REPO, "GhostSpiral").read_text())
+_g7_src = re.sub(r'"\s*f?"', "", _g7_src)
+check("G7: nothing claims the change is swept 'into the mix' any more",
+      "into the mix" not in _g7_src)
+check("G7: ...and the success message says it moves once and rests",
+      "moves once and rests" in _g7_src)
+check("G7: ...and the docstring states WHY it cannot hop (the plan is "
+      "pre-signed and the amount is not known until execution)",
+      "BUILT AND SIGNED before this destination exists" in _g7_src)
+
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
