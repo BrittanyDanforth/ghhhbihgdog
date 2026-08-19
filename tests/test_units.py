@@ -2418,6 +2418,68 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
 # Plus a hang: tumbler.py's miner-fee question is a bare input() guarded by
 # `not options['restart']`, so --yes does NOT bypass it, and with stdin
 # inherited it would sit unread until the 3600s timeout.
+# THE INTEGRITY CHAIN HAD NO VERIFIER. Every tool's header advertises
+# "integrity hash-chain logging", every stage calls integrity_log, and the
+# chain it builds is genuine -- sha256(prev_hash + payload) per line, written
+# under a lock. But nothing in the repo ever recomputed it. A hash chain is not
+# tamper EVIDENCE until something examines the evidence; unverified it is an
+# append-only log, and an adversary who edits a line is indistinguishable from
+# one who does not because nobody looks.
+_vc_dir = Path(tempfile.mkdtemp(prefix="vchain_"))
+_vc = _vc_dir / "integrity_chain.log"
+
+
+def _build_chain(n=6):
+    if _vc.exists():
+        _vc.unlink()
+    for _i in range(n):
+        _gsc.integrity_log("stage", f"event{_i}", log_path=_vc)
+
+
+_build_chain()
+_ok, _bad, _why = _gsc.verify_integrity_chain(_vc)
+check("chain: an untampered chain verifies", _ok and _bad is None)
+check("chain: ...and reports how many links it checked", "6 links verified" in _why)
+
+# An EDIT to a middle line must break every link after it.
+_ls = _vc.read_text().splitlines()
+_h, _rest = _ls[2].split(" | ", 1)
+_ls[2] = _h + " | " + _rest.replace("event2", "eventX")
+_vc.write_text("\n".join(_ls) + "\n")
+_ok, _bad, _why = _gsc.verify_integrity_chain(_vc)
+check("chain: an EDITED line is detected, at the right line number",
+      _ok is False and _bad == 3)
+
+# A mid-file DELETION likewise.
+_build_chain()
+_ls = _vc.read_text().splitlines()
+del _ls[2]
+_vc.write_text("\n".join(_ls) + "\n")
+check("chain: a DELETED middle line is detected",
+      _gsc.verify_integrity_chain(_vc)[0] is False)
+
+# TAIL TRUNCATION is undetectable and must be ADMITTED, not silently passed as
+# a clean bill of health. Nothing signs the chain's length or head, so a
+# shorter chain recomputes perfectly. This asserts the honesty of the report,
+# not a capability.
+_build_chain()
+_vc.write_text("\n".join(_vc.read_text().splitlines()[:3]) + "\n")
+_ok, _bad, _why = _gsc.verify_integrity_chain(_vc)
+check("chain: tail truncation still verifies (the real, documented blind spot)",
+      _ok is True)
+check("chain: ...and the result SAYS truncation is undetectable, so 'OK' is "
+      "never read as 'nothing was removed'",
+      "truncation is undetectable" in _why)
+
+# A missing or empty chain is not success.
+check("chain: a missing chain is not OK",
+      _gsc.verify_integrity_chain(_vc_dir / "absent.log")[0] is False)
+(_vc_dir / "empty.log").write_text("")
+check("chain: an empty chain is not OK",
+      _gsc.verify_integrity_chain(_vc_dir / "empty.log")[0] is False)
+shutil.rmtree(_vc_dir, ignore_errors=True)
+
+
 # THE RESOURCE SENTINEL, EXERCISED FOR REAL. psutil is a DECLARED dependency
 # (requirements.txt), but it was absent from the environment this repo was
 # audited in, so require_resources only ever took its "DISABLED" branch and the

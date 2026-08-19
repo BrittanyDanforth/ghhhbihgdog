@@ -125,6 +125,61 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     return h
 
 
+def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
+    """Recompute the hash chain and report the FIRST link that does not hold.
+
+    Returns (ok, bad_lineno, reason). bad_lineno is 1-based, or None when ok.
+
+    THIS DID NOT EXIST. Every tool in this chain advertises "integrity
+    hash-chain logging" in its header and calls integrity_log on every
+    meaningful step, and the chain it builds is a real one -- each line is
+    sha256(previous_hash + payload), serialised under a lock. But nothing
+    anywhere recomputed it. A hash chain is not tamper-EVIDENCE until something
+    examines the evidence; unverified, it is an expensive append-only log, and
+    an adversary who edits a line and recomputes the hashes below it is
+    indistinguishable from one who does not, because nobody ever looks.
+
+    What this can and cannot show, stated plainly so it is not oversold:
+      * It detects an EDIT or a DELETION in the middle of the file: every link
+        after the change fails recomputation.
+      * It does NOT detect TRUNCATION of the tail, and it cannot. Nothing here
+        signs the chain's length or its head, so lopping off the last N lines
+        leaves a shorter chain that verifies perfectly. Detecting that needs a
+        secret or an off-host anchor, neither of which this toolchain has.
+        Anyone reading a "chain OK" result must understand it as "no line was
+        altered", not "nothing was removed".
+      * A '!nolock' stage marks a link written without serialisation, which can
+        fork the chain legitimately. Those are reported, not treated as tamper.
+    """
+    log_path = Path(log_path)
+    if not log_path.exists():
+        return (False, None, f"{log_path} does not exist")
+    lines = log_path.read_text().splitlines()
+    if not lines:
+        return (False, None, f"{log_path} is empty")
+    prev = "0" * 64
+    nolock = 0
+    for i, raw in enumerate(lines, start=1):
+        if " | " not in raw:
+            return (False, i, f"line {i} is not a chain line (no ' | ' separator)")
+        h, payload = raw.split(" | ", 1)
+        h = h.strip()
+        expect = hashlib.sha256((prev + payload).encode()).hexdigest()
+        if h != expect:
+            return (False, i,
+                    f"line {i} does not chain: recorded {h[:16]}..., recomputed "
+                    f"{expect[:16]}... — this line or one before it was altered")
+        if "!nolock" in payload:
+            nolock += 1
+        prev = h
+    reason = f"{len(lines)} links verified"
+    if nolock:
+        reason += (f"; {nolock} written without the lock (concurrent writers "
+                   f"can fork a chain legitimately)")
+    reason += "; NOTE: tail truncation is undetectable by design"
+    return (True, None, reason)
+
+
 def _append_chain_line(log_path: Path, h: str, line: str) -> None:
     """Append one already-computed chain line. Caller holds the lock."""
     # O_CREAT with an explicit 0600, NOT open("a") + chmod afterwards. The plain

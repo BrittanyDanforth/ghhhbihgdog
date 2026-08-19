@@ -24,6 +24,7 @@ from pathlib import Path
 from gs_common import (
     integrity_log, require_resources, install_signal_handlers,
     shutdown_requested, secure_hex, secure_delete_file, secure_write_bytes,
+    verify_integrity_chain,
 )
 
 # Paths to wipe
@@ -939,7 +940,36 @@ def main():
     ap.add_argument("--search-dir", action="append", default=[],
                     help="additional directories to search for GhostSpiral artifacts "
                          "(can be specified multiple times)")
+    # This tool DESTROYS integrity_chain.log, so it is the operator's last
+    # chance to check it. Nothing in this toolchain verified the chain at all
+    # before now -- every header advertised "integrity hash-chain logging" and
+    # the chain was real, but no code ever recomputed it, which makes it an
+    # append-only log rather than tamper evidence.
+    ap.add_argument("--verify-chain", action="store_true",
+                    help="recompute integrity_chain.log and report the first "
+                         "broken link, then exit without wiping anything. "
+                         "Detects edits and mid-file deletions; tail "
+                         "truncation is undetectable by design.")
     args = ap.parse_args()
+
+    if args.verify_chain:
+        ok, bad, why = verify_integrity_chain()
+        if ok:
+            print(f"  [+] Integrity chain OK — {why}")
+            # Not logged: appending here would extend the very chain just
+            # verified, so the printed result and the file would disagree the
+            # moment anyone re-ran this.
+            #
+            # sys.exit, not `return`: main() is invoked bare at the bottom of
+            # this file, so a returned code is DISCARDED and the process exits
+            # 0. A failed verification that exits 0 is the exact fake-success
+            # this tool has already been corrected for twice.
+            sys.exit(0)
+        where = f" at line {bad}" if bad else ""
+        print(f"  [!] INTEGRITY CHAIN FAILED{where}: {why}")
+        print(f"  [!] A link does not recompute, so this log has been altered "
+              f"since it was written. Treat everything it says as unreliable.")
+        sys.exit(1)
 
     require_resources(min_disk_gb=1.0)
     integrity_log("paranoia", f"start:dry={args.dry_run}")
@@ -1066,4 +1096,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit(main()), not a bare main(): a code returned from main() was
+    # silently dropped and the process exited 0 regardless. main() returns None
+    # on its normal path, and sys.exit(None) is still 0, so this changes
+    # nothing except that a non-zero return can no longer be lost.
+    sys.exit(main())
