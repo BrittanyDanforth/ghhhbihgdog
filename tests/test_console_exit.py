@@ -229,6 +229,77 @@ try:
     check("claim: no built-in fee table to fall back on",
           not any(t in _src for t in ("FEE_TABLE", "DEFAULT_FEE", "FALLBACK_FEE")))
 
+    # ---- THE PREFLIGHT MUST NOT CLAIM WHAT IT DID NOT ESTABLISH ---------
+    #
+    # `ok` decides whether the spend is PERMITTED. It used to decide what the
+    # operator was TOLD as well, and the two are not the same question:
+    #
+    #   * verdict "unknown" permitted the spend AND rendered
+    #     "✓ Relay egress not clearnet" -- while unknown is the DEFAULT for a
+    #     freshly started daemon ("no peer connections yet"), a restricted RPC,
+    #     or any probe error. The page asserted a fact the check had explicitly
+    #     failed to establish.
+    #   * verdict "clearnet" WITH --allow-clearnet-relay rendered the SAME
+    #     green "not clearnet" -- the exact opposite of the measurement.
+    #
+    # Spend permission is deliberately unchanged (GhostSpiral's Stage 0 also
+    # proceeds on unknown with a warning; diverging would push operators toward
+    # the override, which switches the check off for the case it exists to
+    # catch). Only the honesty changes: a third `state` drives the display.
+    import types as _t
+    import importlib.machinery as _im, importlib.util as _iu
+    _cld = _im.SourceFileLoader("gs_console_probe", os.path.join(REPO, "gs_console"))
+    _con = _iu.module_from_spec(_iu.spec_from_loader(_cld.name, _cld))
+    _cld.exec_module(_con)
+
+    def _pf(verdict, allow=False, detail="d"):
+        _con._gs_common = lambda: _t.SimpleNamespace(
+            validate_proxy=lambda p: {"http": p, "https": p},
+            tor_recheck=lambda *a, **k: None,
+            _LOCALHOST_NAMES={"127.0.0.1", "localhost"},
+            check_daemon_relay_egress=lambda d, p: {
+                "verdict": verdict, "onion": 0, "clear": 3, "local": 0,
+                "detail": detail})
+        return _con.mandatory_preflight({
+            "tor_proxy": "socks5h://127.0.0.1:9050",
+            "rpc_daemon": "http://127.0.0.1:18081",
+            "allow_clearnet_relay": allow})
+
+    _u = _pf("unknown")
+    check("preflight: an UNVERIFIED egress is not shown as verified",
+          _u["checks"]["egress"]["state"] == "warn"
+          and "NOT VERIFIED" in _u["checks"]["egress"]["label"])
+    check("preflight: ...and never claims 'not clearnet'",
+          "not clearnet" not in _u["checks"]["egress"]["label"])
+    check("preflight: ...while still permitting the spend, as the pipeline does",
+          _u["ok"] is True and _u["warn"] is True)
+
+    _c = _pf("clearnet", allow=True)
+    check("preflight: an OVERRIDDEN clearnet egress is labelled IS CLEARNET, "
+          "not 'not clearnet'", "IS CLEARNET" in _c["checks"]["egress"]["label"])
+    check("preflight: ...is a warning rather than a pass",
+          _c["checks"]["egress"]["state"] == "warn" and _c["warn"] is True)
+    check("preflight: ...and says the operator overrode it",
+          "overrode" in _c["checks"]["egress"]["detail"])
+
+    _cf = _pf("clearnet", allow=False)
+    check("preflight: clearnet WITHOUT the override still blocks the spend",
+          _cf["ok"] is False and _cf["checks"]["egress"]["state"] == "fail")
+    _off = _pf("offline")
+    check("preflight: an offline daemon blocks the spend",
+          _off["ok"] is False and _off["checks"]["egress"]["state"] == "fail")
+    _t_ok = _pf("tor")
+    check("preflight: a genuinely Tor egress is the ONLY state shown as a pass",
+          _t_ok["checks"]["egress"]["state"] == "ok" and _t_ok["warn"] is False)
+
+    check("page: the renderer has a distinct WARNING style, so a warn cannot "
+          "look like a pass", ".pfrow.warn" in _src and ".pfhead.warn" in _src)
+    check("page: the headline distinguishes a clean pass from a warned one",
+          "WITH WARNINGS" in page)
+    check("page: the egress row label comes from the server verdict, not a "
+          "hardcoded 'not clearnet' assertion",
+          "row('egress','Relay egress not clearnet')" not in page)
+
     # ---- the arm phrase gate -------------------------------------------
     st, r = post("/run/run_pipeline", {"params": dict(base_params, exit_to=[A1])})
     check("arm: the money-moving action refuses without the arm phrase",

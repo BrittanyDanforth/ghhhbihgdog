@@ -895,7 +895,8 @@ def mandatory_preflight(params: dict) -> dict:
     try:
         proxy = gs.validate_proxy(tor)
         gs.tor_recheck(proxy, "console_preflight")   # single-shot; SystemExit on fail
-        checks["tor"] = {"ok": True, "detail": "traffic verified exiting via Tor"}
+        checks["tor"] = {"ok": True, "state": "ok", "label": "Traffic exits via Tor",
+                         "detail": "traffic verified exiting via Tor"}
     except SystemExit as e:
         _d = (str(e).strip().splitlines() or ["Tor check failed"])[0][:150]
         checks["tor"] = {"ok": False, "detail": _d + " — is Tor running? Click "
@@ -917,20 +918,50 @@ def mandatory_preflight(params: dict) -> dict:
     except Exception as e:                            # noqa: BLE001
         eg = {"verdict": "unknown", "detail": f"egress probe error: {str(e)[:100]}"}
     verdict = eg.get("verdict", "unknown")
+    # THREE STATES, NOT TWO. `ok` decides whether the spend is permitted;
+    # `state` decides what the operator is TOLD. Collapsing them made the page
+    # assert things that were not true:
+    #
+    #   * verdict "unknown" rendered as "✓ Relay egress not clearnet" -- and
+    #     unknown is the DEFAULT for a freshly started daemon ("no peer
+    #     connections yet"), a restricted RPC, or any probe error. The page
+    #     claimed a fact it had explicitly failed to establish.
+    #   * verdict "clearnet" WITH --allow-clearnet-relay also rendered as
+    #     "✓ Relay egress not clearnet", i.e. the exact opposite of the
+    #     measurement. Overriding is the operator's call; being told the
+    #     egress is clean while overriding it is not.
+    #
+    # GhostSpiral's Stage 0 proceeds on unknown with a printed warning, so the
+    # spend stays PERMITTED here for the same verdicts it permits -- diverging
+    # would push operators toward --allow-clearnet-relay, which switches the
+    # check off for the case it exists to catch. Only the honesty changes.
     if verdict == "clearnet":
         eok = allow_clear
+        state = "warn" if allow_clear else "fail"
+        label = "Relay egress IS CLEARNET"
         detail = eg.get("detail", "relays to raw-IP peers")
         if allow_clear:
-            detail += " — overridden by 'Allow clearnet relay'"
+            detail += " — you overrode this with 'Allow clearnet relay'"
     elif verdict == "offline":
-        eok = False
+        eok, state = False, "fail"
+        label = "Daemon is offline"
         detail = eg.get("detail", "daemon is --offline; the broadcast would go nowhere")
-    else:  # tor / unknown -> allowed (unknown matches GhostSpiral: proceed, flagged)
-        eok = True
+    elif verdict == "tor":
+        eok, state = True, "ok"
+        label = "Relay egress not clearnet"
         detail = eg.get("detail", verdict)
-    checks["egress"] = {"ok": eok, "verdict": verdict, "detail": detail}
+    else:
+        eok, state = True, "warn"
+        label = "Relay egress NOT VERIFIED"
+        detail = (eg.get("detail", "could not observe where this daemon relays")
+                  + " — treat the broadcast as clearnet unless you set "
+                    "monerod --tx-proxy")
+    checks["egress"] = {"ok": eok, "state": state, "verdict": verdict,
+                        "label": label, "detail": detail}
 
-    return {"ok": all(c["ok"] for c in checks.values()), "checks": checks}
+    return {"ok": all(c["ok"] for c in checks.values()),
+            "warn": any(c.get("state") == "warn" for c in checks.values()),
+            "checks": checks}
 
 
 class H(BaseHTTPRequestHandler):
@@ -1237,9 +1268,14 @@ font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;white-
 .pfhead.ok{background:var(--oks);color:var(--ok)}
 .pfhead.bad{background:var(--errs);color:var(--err)}
 .pfhead.run{background:var(--warns);color:var(--warn)}
+/* A preflight that PERMITTED the spend without VERIFYING the fact must not
+   look like one that verified it. Amber is its own state, not a shade of green. */
+.pfhead.warn{background:var(--warns);color:var(--warn)}
 .pfrow{display:flex;justify-content:space-between;gap:10px;padding:6px 11px;border-top:1px solid var(--line);align-items:baseline}
 .pfrow.ok span:first-child{color:var(--ok)}
 .pfrow.bad span:first-child{color:var(--err);font-weight:600}
+.pfrow.fail span:first-child{color:var(--err);font-weight:600}
+.pfrow.warn span:first-child{color:var(--warn);font-weight:600}
 .pfrow .pfd{color:var(--mut);font-size:11px;font-family:ui-monospace,Menlo,monospace;text-align:right;max-width:62%;word-break:break-word}
 .pfbtns{display:flex;gap:14px;margin-top:8px}
 .pfre{font-size:11.5px;color:var(--acc);background:none;border:0;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
@@ -1575,13 +1611,24 @@ function collect(){
 let preflightOk=false, pfBusy=false, pfSeq=0;
 function renderPreflight(r){
  const c=(r&&r.checks)||{};
- const head=r&&r.ok
-  ? `<div class="pfhead ok">✓ OPSEC preflight passed — spend permitted</div>`
-  : `<div class="pfhead bad">✕ OPSEC preflight FAILED — spend blocked until fixed</div>`;
- const row=(k,label)=>{const v=c[k]; if(!v) return '';
-  return `<div class="pfrow ${v.ok?'ok':'bad'}"><span>${v.ok?'✓':'✕'} ${esc(label)}</span>`
+ // THREE states. A check that passed the SPEND GATE is not necessarily a check
+ // that VERIFIED anything: an unknown relay egress permits the spend (matching
+ // the pipeline) but has established nothing, and an overridden clearnet egress
+ // permits it while the measurement says the opposite. Both used to render as a
+ // green tick reading "Relay egress not clearnet".
+ const head=!r||!r.ok
+  ? `<div class="pfhead bad">✕ OPSEC preflight FAILED — spend blocked until fixed</div>`
+  : (r.warn
+     ? `<div class="pfhead warn">! OPSEC preflight passed WITH WARNINGS — read them before spending</div>`
+     : `<div class="pfhead ok">✓ OPSEC preflight passed — spend permitted</div>`);
+ // The label comes from the SERVER, per verdict, so the page cannot assert a
+ // fact the check did not establish.
+ const row=k=>{const v=c[k]; if(!v) return '';
+  const st=v.state||(v.ok?'ok':'fail');
+  const mark=st==='ok'?'✓':(st==='warn'?'!':'✕');
+  return `<div class="pfrow ${st}"><span>${mark} ${esc(v.label||k)}</span>`
     +`<span class="pfd">${esc(v.detail||'')}</span></div>`;};
- $('#pfstatus').innerHTML=head+row('tor','Traffic exits via Tor')+row('egress','Relay egress not clearnet');
+ $('#pfstatus').innerHTML=head+row('tor')+row('egress')+row('deps');
 }
 async function runPreflight(){
  if(pfBusy) return; pfBusy=true; const seq=++pfSeq;
