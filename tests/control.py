@@ -48,6 +48,8 @@ ACTIONS = {
     "chainredact": {**suite("test_chain_redaction", "the persistent chain must not map the run: no numbers, no counts"), "group": "Offline suites"},
     "dagentry":    {**suite("test_dag_entry", "no hop may pay the publicly-named ENTRY address"), "group": "Offline suites"},
     "envleaks":    {**suite("test_env_leaks", "nothing sensitive on argv, nothing GS_ to a third-party child"), "group": "Offline suites"},
+    "torgates":    {**suite("test_tor_gates", "the Tor leak gates, executed rather than stubbed"), "group": "Offline suites"},
+    "sendgates":   {**suite("test_send_gates", "the last checks before an irreversible send"), "group": "Offline suites"},
     "console":     {**suite("test_console", "password scope, no invented fees, egress, HTTP gates"), "group": "Offline suites"},
     "shmwipe":     {**suite("test_shmwipe", "/dev/shm + $TMPDIR scratch is wiped, other software's is not"), "group": "Offline suites"},
     "concurrency": {**suite("test_concurrency", "hash chain under parallel writers; console hangs, stdin, buffering"), "group": "Offline suites"},

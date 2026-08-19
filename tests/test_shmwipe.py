@@ -116,6 +116,49 @@ for label, root in (("shm-like", shm), ("tmpdir", tmpd)):
     check(f"{label}: no failures", failed == 0)
 
 # ---------------------------------------------------------------------------
+# BOTH ROOTS IN ONE CALL, AND THEY MUST BE DIFFERENT DIRECTORIES.
+#
+# The loop above points SHM_ROOT and gettempdir() at the SAME directory each
+# iteration, for the good reason documented there. The cost is that it cannot
+# tell the two roots apart: with both aliased, removing /dev/shm from the
+# helper's root list entirely still finds every file through the tmpdir entry,
+# and the suite stays green. Verified by mutation — `roots = [SHM_ROOT,
+# tempfile.gettempdir()]` reduced to `[tempfile.gettempdir()]` passed this file
+# and every other.
+#
+# What /dev/shm holds is the signer's RAM scratch: gs_sign_*, gs_impout_* and
+# .gs_pw_* — the wallet password and unsigned transaction data, kept there
+# specifically to stay off a disk. A wipe that silently stopped covering it is
+# the whole phase failing quietly.
+#
+# Safe to point them at DIFFERENT fakes now: SHM_ROOT exists as a patchable
+# constant precisely so the real /dev/shm is never scanned. Nothing below
+# touches it.
+shm2 = sandbox / "shm_only"; shm2.mkdir()
+tmp2 = sandbox / "tmp_only"; tmp2.mkdir()
+populate(shm2)
+populate(tmp2)
+para.SHM_ROOT = str(shm2)
+para.tempfile.gettempdir = lambda: str(tmp2)
+_c2, _f2 = para._wipe_targeted_temp_roots(
+    dry=False, uid=os.getuid(), already_done=["/tmp", "/var/tmp"])
+for name in OURS:
+    check(f"both-roots: {name} cleaned from the SHM root", not (shm2 / name).exists())
+    check(f"both-roots: {name} cleaned from the TMPDIR root", not (tmp2 / name).exists())
+check("both-roots: ONE call covered both distinct roots (3 + 3 removed)",
+      _c2 == 6)
+check("both-roots: no failures", _f2 == 0)
+for name in THEIRS:
+    check(f"both-roots: {name} survives in the SHM root", (shm2 / name).exists())
+    check(f"both-roots: {name} survives in the TMPDIR root", (tmp2 / name).exists())
+
+# Non-vacuity: the two roots really are different directories, or this whole
+# section would be the aliased case again under a new name.
+check("control: the two roots are genuinely different directories",
+      os.path.realpath(shm2) != os.path.realpath(tmp2))
+
+
+# ---------------------------------------------------------------------------
 # dry run must delete NOTHING
 # ---------------------------------------------------------------------------
 dryroot = sandbox / "dry"; dryroot.mkdir()
