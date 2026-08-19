@@ -7,8 +7,13 @@ Never use on main-net coins you do not own.
 
 End-to-end pipeline:
   Stage 0: Validate inputs, Tor, RPC sync
-  Stage 1: JoinMarket receive (optional BTC tumble)
-  Stage 2: ThorChain BTC->XMR swap
+  Stage 1: JoinMarket receive (optional BTC tumble; runs JoinMarket's own
+           tumbler.py, which this repo neither ships nor installs)
+  Stage 2: ThorChain BTC->XMR swap QUOTES ONLY. This fetches deposit
+           addresses and memos and prints them; it does NOT send BTC and
+           cannot. The operator makes the deposit by hand, and the run waits
+           for the XMR to arrive. The header said "swap", which reads as
+           something this executes.
   Stage 3: Build wallets & DAG mixing graph
   Stage 4: Build unsigned TX plan with fee-aware amounts
   Stage 5: Auto-sign + broadcast
@@ -38,7 +43,7 @@ from gs_common import (
     check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv,
     create_fresh_account, run_lock,
-    btc_per_xmr_oracle, quote_deviation,
+    btc_per_xmr_oracle, quote_deviation, wipe_covers,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -944,6 +949,84 @@ def parse_jm_amounts(stdout: str, dest: str) -> List[Decimal]:
     tumble, rather than silently pretending JoinMarket contributed (the old
     behaviour). Deduplicated, since a summary line may repeat a per-tx amount.
     """
+    # PRIMARY: the transaction JSON. Read off upstream rather than guessed --
+    # jmbitcoin.human_readable_transaction returns json.dumps(outdict,
+    # indent=4), and human_readable_output builds each output dict in the order
+    # value_sats, scriptPubKey, address. So a real tumbler log contains:
+    #
+    #     "outputs": [
+    #         {
+    #             "value_sats": 12345678,
+    #             "scriptPubKey": "0014...",
+    #             "address": "bc1qdest..."
+    #         },
+    #
+    # WHICH IS WHY THE OLD PARSER COULD NEVER MATCH. It required the
+    # destination and an amount on the SAME line and JoinMarket never puts them
+    # there: value_sats and address are two lines apart, and the one line that
+    # does carry a formatted amount ("total estimated amount spent = 0.001 BTC
+    # (100000 sat)", via amount_to_str) has no address on it -- and is an
+    # ESTIMATE INCLUDING FEES, not what was delivered. The regex also looked
+    # for digits followed by "sat", while the JSON key is "value_sats" with the
+    # number after it. So a tumble could complete and the caller would still
+    # abort with "no output amount could be parsed", throwing away a real
+    # tumble. Fixing the invocation without fixing this would have moved the
+    # failure one step later, not removed it.
+    #
+    # Grouped BY TXID and overwritten when a txid reappears, because a tumbler
+    # makes several transactions and logs the same one more than once
+    # ("obtained tx", then again when it completes). The old dedup was on the
+    # amount VALUE, which silently discarded a genuine second payment that
+    # happened to be the same size -- likely in a tumble, whose whole design is
+    # similar-sized chunks.
+    # ORDER MATTERS AND IT IS NOT THE OBVIOUS ONE. human_readable_transaction
+    # builds its dict as hex, inputs, OUTPUTS, txid, nLockTime, nVersion -- so
+    # every output line is read BEFORE the txid that owns it. Outputs are
+    # therefore collected into a pending block and committed when the txid
+    # arrives; keying them off "the last txid seen" would attribute each tx's
+    # outputs to the PREVIOUS transaction. "hex" opens a block and resets the
+    # buffer, so a partial block cannot bleed into the next one.
+    #
+    # Committing with = rather than .append() is what makes the duplicate
+    # logging harmless: JM prints the same transaction more than once
+    # ("obtained tx", then again on completion), and the second block simply
+    # replaces the first. A block with no txid is dropped and the caller fails
+    # loudly, which is the safe direction.
+    per_tx: dict = {}
+    block: List[Decimal] = []
+    pending = None
+    for line in stdout.splitlines():
+        if re.search(r'"hex"\s*:', line):
+            block = []
+            pending = None
+            continue
+        m = re.search(r'"txid"\s*:\s*"([0-9a-fA-F]{64})"', line)
+        if m:
+            per_tx[m.group(1)] = block
+            block = []
+            pending = None
+            continue
+        m = re.search(r'"value_sats"\s*:\s*(\d+)', line)
+        if m:
+            pending = int(m.group(1))
+            continue
+        m = re.search(r'"address"\s*:\s*"([^"]+)"', line)
+        if m:
+            if m.group(1) == dest and pending and pending > 0:
+                block.append(Decimal(pending) / Decimal(10 ** 8))
+            pending = None
+    if any(per_tx.values()):
+        out: List[Decimal] = []
+        for _t, vals in per_tx.items():
+            out.extend(vals)
+        return out
+
+    # FALLBACK for a JoinMarket that reports differently: a line carrying the
+    # destination AND an amount together. This was the only path before, and it
+    # matches nothing in current JM output -- kept because it costs nothing and
+    # a future/older version may emit such a line. Dedup by value here is
+    # acceptable: without a txid there is nothing better to key on, and the
+    # caller fails loudly on an empty result either way.
     amounts: List[Decimal] = []
     seen = set()
     for line in stdout.splitlines():
@@ -2516,23 +2599,8 @@ def main():
             "distribution_mode": distribution_mode,
         }
 
-        outdir = Path(args.output)
-        secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing
-        plan_tag = secure_hex(8)
-        fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
-        atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
-        veil_file = None
-        if veil_plan:
-            veil_file = outdir / f"unsigned_veil_{plan_tag}.json"
-            atomic_write_json({"meta": meta, "txs": veil_plan}, veil_file)
-        dag_file = None
-        if dag_plan:
-            dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
-            atomic_write_json({"meta": meta, "txs": dag_plan}, dag_file)
-        integrity_log("stage4", "unsigned_dump_saved")
-        print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
-        if dag_file:
-            print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
+        fanout_file, veil_file, dag_file = _write_plans(
+            args, meta, fanout_plan, veil_plan, dag_plan)
 
         ###########################################################################
         # Stage 5 - Auto sign + broadcast
@@ -2593,6 +2661,64 @@ def main():
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
                           spent_plans=(veil_file, fanout_file, dag_file))
+
+
+def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
+    """Materialise the round plans to --output. Returns (fanout, veil, dag).
+
+    veil and dag are None when that round is not planned, and every caller
+    downstream relies on that: _stage5_run skips Round 0 on a falsy veil_file,
+    and _wipe_spent_plans tolerates the Nones so a completed run erases exactly
+    the plans that exist.
+
+    All three share ONE plan_tag, so the files of a single run are
+    recognisable as a set -- and _stage5_cleanup erases every unsigned_*.json
+    it is not explicitly told to keep, which is how a previous run's plans stop
+    accumulating in the output directory.
+    """
+    outdir = Path(args.output)
+    secure_mkdir(outdir)          # 0700, not 0755: listing leaks TX count/timing
+    _warn_unwiped_outdir(outdir)
+    plan_tag = secure_hex(8)
+    fanout_file = outdir / f"unsigned_fanout_{plan_tag}.json"
+    atomic_write_json({"meta": meta, "txs": fanout_plan}, fanout_file)
+    veil_file = None
+    if veil_plan:
+        veil_file = outdir / f"unsigned_veil_{plan_tag}.json"
+        atomic_write_json({"meta": meta, "txs": veil_plan}, veil_file)
+    dag_file = None
+    if dag_plan:
+        dag_file = outdir / f"unsigned_dag_{plan_tag}.json"
+        atomic_write_json({"meta": meta, "txs": dag_plan}, dag_file)
+    integrity_log("stage4", "unsigned_dump_saved")
+    print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
+    if dag_file:
+        print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
+    return fanout_file, veil_file, dag_file
+
+
+def _warn_unwiped_outdir(outdir: Path) -> bool:
+    """Warn if --output sits where paranoia_mode's sweep will never look.
+
+    That sweep globs four FIXED roots (cwd, $HOME, $HOME/ghostspiral,
+    $HOME/GhostSpiral) at depth 0 and 1, so `--output /mnt/usb/plans` puts
+    every hop's source, destination, amount and account index somewhere nothing
+    will ever erase -- and the run reports success identically either way.
+
+    A COMPLETE run now wipes its own plans (see _wipe_spent_plans), but an
+    INCOMPLETE one keeps them deliberately, and that is precisely the run that
+    strands them. So the warning goes out when the directory is chosen, while
+    the operator can still do something about it. Returns True if it warned.
+    """
+    if wipe_covers(outdir):
+        return False
+    integrity_log("stage4", "outdir_outside_wipe_roots")
+    print(f"  [!] {outdir} is outside every directory paranoia_mode searches. "
+          f"The unsigned plans written there carry every hop's destination and "
+          f"amount. If this run does not complete they will NOT be wiped — "
+          f"erase them yourself, or pass --search-dir {outdir.resolve()} to "
+          f"paranoia_mode.")
+    return True
 
 
 def _wipe_spent_plans(*plan_files):
@@ -3376,6 +3502,18 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # bare "failed" read as a lost exit.
         print(f"  [!] Off-ramp reference failed (non-fatal — no XMR moved, the "
               f"mix is unaffected): {e}")
+
+    # Every round wipes its OWN staging subdir, which leaves the parent behind
+    # as an empty directory. It holds nothing, but its existence and mtime date
+    # a run on a host that is supposed to look untouched -- and the operator
+    # has no reason to think anything is left, because the run just reported
+    # success. rmdir, not a recursive delete: if anything is still in there a
+    # round failed to clean up after itself, and silently destroying it would
+    # hide that. OSError (not empty / already gone) is the correct no-op.
+    try:
+        Path(staging_dir).rmdir()
+    except OSError:
+        pass
 
     integrity_log("stage5", f"stage5_done:incomplete={len(incomplete)}")
     return incomplete

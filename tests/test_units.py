@@ -2406,6 +2406,101 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
       "NOT what was planned" in _buf5.getvalue()
       and "SEPARATE ACCOUNTS" not in _buf5.getvalue())
 
+# parse_jm_amounts AGAINST JOINMARKET'S REAL OUTPUT FORMAT.
+#
+# Fixing stage1's argv without this would have moved the failure one step
+# later, not removed it: a tumble would run, complete, and then be thrown away
+# with "no output amount could be parsed".
+#
+# The format is read off upstream, not guessed.
+# jmbitcoin.human_readable_transaction returns json.dumps(outdict, indent=4),
+# and human_readable_output builds each output as value_sats, scriptPubKey,
+# address -- so value_sats and address are TWO LINES APART. The old parser
+# required the destination and an amount on the SAME line, which JoinMarket
+# never emits, and looked for digits followed by "sat" while the JSON key is
+# "value_sats" with the number after it.
+#
+# The fixture is built the way upstream builds it (same key order, same
+# json.dumps(indent=4)) rather than hand-typed, so it cannot drift into
+# whatever shape makes the parser look good.
+_JM_DEST = "bc1qdestinationaddressexample000000000000000"
+_JM_OTHER = "bc1qsomeothermakeraddress0000000000000000000"
+
+
+def _hr_output(sats, addr):
+    _d = {}
+    _d["value_sats"] = sats
+    _d["scriptPubKey"] = "0014deadbeef"
+    if addr:
+        _d["address"] = addr
+    return _d
+
+
+def _hr_tx(txid, outs):
+    _o = {}
+    _o["hex"] = "0200"
+    _o["inputs"] = [{"outpoint": "abc:0"}]
+    _o["outputs"] = [_hr_output(_s, _a) for _s, _a in outs]
+    _o["txid"] = txid
+    _o["nLockTime"] = 0
+    _o["nVersion"] = 2
+    return json.dumps(_o, indent=4)
+
+
+# Two coinjoins to the destination of the SAME size, one unrelated tx, and the
+# first tx logged twice -- JoinMarket prints "obtained tx" and prints it again
+# when the tx completes.
+_jm_tx1 = _hr_tx("a" * 64, [(5_000_000, _JM_DEST), (3_000_000, _JM_OTHER)])
+_jm_tx2 = _hr_tx("b" * 64, [(5_000_000, _JM_DEST), (1_000_000, _JM_OTHER)])
+_jm_tx3 = _hr_tx("c" * 64, [(9_000_000, _JM_OTHER)])
+_jm_log = ("INFO Chose destination address: " + _JM_DEST + "\n"
+           "obtained tx\n" + _jm_tx1 + "\n"
+           "total estimated amount spent = 0.05100000 BTC (5100000 sat)\n"
+           "obtained tx\n" + _jm_tx1 + "\n"
+           "obtained tx\n" + _jm_tx2 + "\n"
+           "obtained tx\n" + _jm_tx3 + "\n")
+
+_jm_amts = ghost.parse_jm_amounts(_jm_log, _JM_DEST)
+check("jm-parse: reads amounts out of JoinMarket's real tx JSON",
+      len(_jm_amts) == 2)
+check("jm-parse: finds BOTH payments even though they are the same size "
+      "(the old value-based dedup would have collapsed them)",
+      sorted(_jm_amts) == [Decimal("0.05"), Decimal("0.05")])
+check("jm-parse: a transaction logged twice is not counted twice",
+      sum(_jm_amts) == Decimal("0.10"))
+check("jm-parse: outputs paying OTHER addresses are ignored",
+      all(_a == Decimal("0.05") for _a in _jm_amts))
+
+# outputs are emitted BEFORE the txid that owns them, so attribution must not
+# use "the last txid seen" -- that would file each tx's outputs under the
+# previous transaction.
+check("jm-parse: consecutive tx blocks attribute outputs to the right tx",
+      sorted(ghost.parse_jm_amounts(
+          _hr_tx("d" * 64, [(1_000_000, _JM_DEST)]) + "\n"
+          + _hr_tx("e" * 64, [(2_000_000, _JM_DEST)]), _JM_DEST))
+      == [Decimal("0.01"), Decimal("0.02")])
+check("jm-parse: nothing paid to dest yields nothing, so the caller aborts "
+      "rather than inventing a contribution",
+      ghost.parse_jm_amounts(_hr_tx("f" * 64, [(7_000_000, _JM_OTHER)]),
+                             _JM_DEST) == [])
+check("jm-parse: a truncated block with no txid is dropped, not misattributed",
+      ghost.parse_jm_amounts(
+          '"hex": "x"\n"value_sats": 500000\n"address": "%s"\n' % _JM_DEST,
+          _JM_DEST) == [])
+check("jm-parse: the single-line fallback still works for other JM versions",
+      ghost.parse_jm_amounts(f"sent 0.02000000 BTC to {_JM_DEST} ok",
+                             _JM_DEST) == [Decimal("0.02")])
+
+# The regression this replaces, stated as an executable fact.
+_jm_old_hits = []
+for _l in _jm_log.splitlines():
+    if _JM_DEST in _l:
+        _jm_old_hits += re.findall(r"(\d+\.\d{1,8})\s*BTC", _l, re.I)
+        _jm_old_hits += re.findall(r"(\d{4,})\s*sat", _l, re.I)
+check("jm-parse: REGRESSION PROOF — the old same-line rule matches nothing in "
+      "real JoinMarket output", _jm_old_hits == [])
+
+
 # STAGE 1's JOINMARKET INVOCATION. Checked against JoinMarket-Org/
 # joinmarket-clientserver at HEAD, not from memory. The old argv could not have
 # run at all:
@@ -2418,6 +2513,65 @@ check("holdings: an incomplete run reports the shortfall, not a balance table",
 # Plus a hang: tumbler.py's miner-fee question is a bare input() guarded by
 # `not options['restart']`, so --yes does NOT bypass it, and with stdin
 # inherited it would sit unread until the 3600s timeout.
+# THE STAGING ROOT MUST NOT OUTLIVE THE RUN. Every round wipes its own
+# subdirectory, which leaves tx_staging/ behind as an empty directory: it holds
+# nothing, but its existence and mtime date a run on a host that is meant to
+# look untouched, and the operator has no reason to suspect it because the run
+# just reported success. rmdir (not a recursive delete) so a subdir a round
+# failed to clean is left visible rather than silently destroyed.
+_stg = Path(tempfile.mkdtemp(prefix="stgroot_")) / "tx_staging"
+_stg.mkdir()
+_gs_src_stage = code_only(os.path.join(REPO, "GhostSpiral"))
+check("stage5: the staging root is rmdir'd, not recursively deleted",
+      "Path(staging_dir).rmdir()" in _gs_src_stage
+      and "secure_delete_tree(Path(staging_dir))" not in _gs_src_stage)
+# rmdir's real semantics are the whole reason this is safe: it refuses a
+# non-empty directory instead of destroying evidence of a failed cleanup.
+(_stg / "leftover").mkdir()
+_refused = False
+try:
+    _stg.rmdir()
+except OSError:
+    _refused = True
+check("stage5: rmdir REFUSES a staging root that still holds a round's dir "
+      "(so a failed cleanup stays visible)", _refused and _stg.exists())
+(_stg / "leftover").rmdir()
+_stg.rmdir()
+check("stage5: ...and removes it once genuinely empty", not _stg.exists())
+shutil.rmtree(_stg.parent, ignore_errors=True)
+
+
+# WHAT THE WIPE CANNOT REACH, SAID ONCE AND SHARED.
+#
+# paranoia_mode globs four FIXED roots (cwd, $HOME, $HOME/ghostspiral,
+# $HOME/GhostSpiral) at depth 0 and 1. Anything an operator redirects elsewhere
+# -- `--output /mnt/usb/plans`, `--outfile /srv/exit.json` -- is never looked
+# at, and both tools reported success identically wherever they wrote.
+# exit_strategy_simulator had this logic inline; GhostSpiral's --output had no
+# equivalent at all, so the two disagreed about the same question. Now one
+# helper answers it for both.
+_cov_dir = Path(tempfile.mkdtemp(prefix="cov_"))
+check("wipe_covers: the cwd is covered", _gsc.wipe_covers(Path.cwd()))
+check("wipe_covers: a subdirectory of cwd is covered (depth 1)",
+      _gsc.wipe_covers(Path.cwd() / "plans"))
+check("wipe_covers: a file inside a subdirectory of cwd is covered",
+      _gsc.wipe_covers(Path.cwd() / "plans" / "unsigned_fanout_a.json"))
+check("wipe_covers: $HOME is covered", _gsc.wipe_covers(Path.home()))
+check("wipe_covers: an unrelated absolute directory is NOT covered",
+      not _gsc.wipe_covers(Path("/mnt/usb/plans")))
+check("wipe_covers: a file on an unrelated mount is NOT covered",
+      not _gsc.wipe_covers(Path("/srv/exit.json")))
+shutil.rmtree(_cov_dir, ignore_errors=True)
+
+# GhostSpiral must actually WARN, not merely be able to. An incomplete run
+# keeps its plans on purpose, so an --output the wipe cannot reach is exactly
+# the case that strands every hop's destination and amount on disk.
+_src_gs = code_only(os.path.join(REPO, "GhostSpiral"))
+check("stage4: GhostSpiral checks its --output against the wipe roots",
+      "_warn_unwiped_outdir(outdir)" in _src_gs
+      and callable(getattr(ghost, "_warn_unwiped_outdir", None)))
+
+
 # THE INTEGRITY CHAIN HAD NO VERIFIER. Every tool's header advertises
 # "integrity hash-chain logging", every stage calls integrity_log, and the
 # chain it builds is genuine -- sha256(prev_hash + payload) per line, written

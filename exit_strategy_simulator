@@ -65,7 +65,7 @@ from typing import Dict
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, shutdown_requested,
-    env_or_argv,
+    env_or_argv, wipe_covers,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -383,15 +383,10 @@ def main():
     # writes the holding size, its fiat value and the venue to a file no wipe
     # will ever find -- and the operator has no reason to suspect it, because
     # the tool reports "Plan saved" either way.
-    try:
-        _res = _out.resolve().parent
-        _roots = [Path.cwd().resolve(), Path.home().resolve(),
-                  (Path.home() / "ghostspiral").resolve(),
-                  (Path.home() / "GhostSpiral").resolve()]
-        _covered = any(_res == r or r in _res.parents for r in _roots)
-    except OSError:
-        _covered = False
-    if not _covered:
+    # gs_common.wipe_covers, not a fourth inline copy of the root list: this
+    # logic was here and GhostSpiral's --output had no equivalent, so the two
+    # tools disagreed about the same question and a wrong answer is silent.
+    if not wipe_covers(_out):
         print(f"  [!] {_out} is outside every directory paranoia_mode searches.")
         print(f"  [!] This file holds the holding size, its fiat value and the "
               f"venue. The wipe will NOT find it — erase it yourself, or pass "

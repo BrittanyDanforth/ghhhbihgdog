@@ -125,6 +125,39 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
     return h
 
 
+#: The roots paranoia_mode globs when it hunts artifacts, at depth 0 and 1.
+#: Named ONCE, here, because three places now need to agree about them: the
+#: wipe itself, and the two tools that write operator-chosen paths which the
+#: wipe may therefore never reach.
+def paranoia_search_roots() -> list:
+    """The directories paranoia_mode searches for artifacts."""
+    return [Path.cwd().resolve(), Path.home().resolve(),
+            (Path.home() / "ghostspiral").resolve(),
+            (Path.home() / "GhostSpiral").resolve()]
+
+
+def wipe_covers(target) -> bool:
+    """True if paranoia_mode's artifact sweep would ever look at `target`.
+
+    paranoia_mode globs FIXED roots (cwd, $HOME, $HOME/ghostspiral,
+    $HOME/GhostSpiral) at depth 0 and 1. Anything an operator redirects
+    elsewhere -- `--output /mnt/usb/plans`, `--outfile /srv/exit.json` -- is
+    never looked at, and nothing told them so, because both tools report
+    success identically wherever they wrote.
+
+    Shared rather than copied: exit_strategy_simulator had this logic inline
+    and GhostSpiral's --output had no equivalent at all, so the two disagreed
+    about the same question. A wrong answer here is silent by construction.
+    """
+    try:
+        res = Path(target).resolve()
+        if res.is_file() or res.suffix:
+            res = res.parent
+        return any(res == r or r in res.parents for r in paranoia_search_roots())
+    except OSError:
+        return False
+
+
 def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
     """Recompute the hash chain and report the FIRST link that does not hold.
 
