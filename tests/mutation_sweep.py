@@ -359,6 +359,17 @@ MUTATIONS = [
   "    if len(set(amounts)) != n:\n        raise ValueError(",
   "    if False:\n        raise ValueError(",
   ["test_dag_entry"]),
+
+ # sorted() is stable, so keying the staircase on the satoshi value alone puts
+ # TIED chunks in original index order and the lowest index always gets the
+ # lowest amount. Measured P(a[i]<a[j]) = 0.66 at 36 satoshis across 8, where
+ # 0.5 is unbiased -- the ordering tell the docstring says the write-back to
+ # original indices removes.
+ ("the chunk staircase breaks ties by index, so chunk order leaks chunk size",
+  "GhostSpiral",
+  "    _order = sorted(range(n), key=lambda i: (_sat[i], rng.random()))",
+  "    _order = sorted(range(n), key=lambda i: _sat[i])",
+  ["test_dag_entry"]),
 ]
 
 

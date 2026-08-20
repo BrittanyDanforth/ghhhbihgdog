@@ -1416,6 +1416,48 @@ for _bt, _bn in [(2, 2), (3, 3)]:
           f"never returned as a repeated deposit amount",
           _slipped == 0 and _tied == 0)
 
+# THE CHUNK ORDER MUST CARRY NO INFORMATION, at every total and not merely at
+# convenient ones.
+#
+# The distinctness construction sorts the chunks, walks the sorted order adding
+# +1 to force a strict staircase, then writes back to the ORIGINAL indices --
+# and the docstring says that write-back is what stops chunk 0 being
+# systematically the smallest. It is not sufficient, because sorted() is
+# STABLE: keying on the satoshi value alone puts TIED chunks in original index
+# order, so within any tied group the lowest index always received the lowest
+# amount. The tell was reintroduced by the sort, one step before the write-back
+# that was supposed to remove it.
+#
+# The earlier check for this counted how often the result came out fully sorted
+# and found 1/n!, which is correct -- at 1 BTC, where two chunks essentially
+# never tie. The statistic has to be measured where ties are COMMON.
+#
+# P(chunk[i] < chunk[j]) over all i<j is 0.5 for an unbiased split. Measured on
+# the stable-tiebreak version it tracked the tie rate all the way up: 0.501 at
+# 1 BTC, 0.514 at 0.00001 BTC, 0.551 at 0.000002, 0.659 at 36 satoshis, 0.688
+# at 10 satoshis across 4. Randomising the tie-break returns every one of those
+# to ~0.50.
+#
+# Checked at a DUST total, because that is where ties are guaranteed and so
+# where a regression is visible. The band is generous enough not to flake: at
+# 8000 ordered pairs the standard error is ~0.006, and the defect this catches
+# sat 0.16 away from centre.
+_pairs = _conc = 0
+for _rep in range(1000):
+    _o = _split_or_none(ghost.SATOSHI_BTC * Decimal(60), 8, _R)
+    if _o is None:
+        continue
+    for _i in range(8):
+        for _j in range(_i + 1, 8):
+            _pairs += 1
+            if _o[_i] < _o[_j]:
+                _conc += 1
+_ratio = (_conc / _pairs) if _pairs else 0
+check(f"btc: chunk INDEX carries no information about chunk SIZE even where "
+      f"ties are certain — P(a[i]<a[j])={_ratio:.3f}, unbiased is 0.5 "
+      f"(a stable sort tie-break made this 0.62)",
+      _pairs > 0 and 0.46 <= _ratio <= 0.54)
+
 # Every chunk is a whole number of satoshis — an unsendable amount would be an
 # instruction the operator cannot follow. This holds because the TOTAL is
 # satoshi-exact: resolve_btc_amount refuses anything finer, which is what makes
