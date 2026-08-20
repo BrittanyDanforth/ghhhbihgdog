@@ -1355,6 +1355,69 @@ for _lbl, _plan3 in (("veil", _vp3), ("DAG hop", _dp3), ("fan-out", _fp3)):
           all("extra" not in t for t in _plan3))
 
 
+# ==========================================================================
+# --deep COSTS MONEY AND BUYS NO TRANSACTIONS, and the help now says so.
+#
+# `rounds = wallets * 2 * deep` reads as "one transaction per round", with
+# `deep` sitting in it as though depth meant more hop ROUNDS. It does not:
+# --deep multiplies the DAG adjacency's out-degree, assign_hop_destinations
+# still gives every source exactly ONE destination, and _stage5_run runs
+# exactly one DAG round. So the knob scales the fee reserve linearly while the
+# transaction count stays put, and the difference is not distributed -- it
+# becomes change, swept once, reported UNMIXED.
+#
+# Left conservative on purpose: under-reserving fails on the LAST hop after
+# the funds are already split, and a live chain's real fee cannot be measured
+# from here. Made VISIBLE instead, which is what this pins.
+# ==========================================================================
+print("\n=== --deep is honest about its cost ===")
+
+_u1, _f1, _r1 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.0024"), 12, 1)
+_u6, _f6, _r6 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.0024"), 12, 6)
+check("deep: raising --deep really does hold back more of the balance",
+      _f6 > _f1 * 5)
+check("deep: ...so less is distributed into the mix",
+      _u6 < _u1)
+check("deep: ...and the reserve is linear in it, as the formula says",
+      _r6 == _r1 * 6)
+
+# The transaction count does NOT move with --deep. Same sources, same targets,
+# one destination each, whatever the adjacency out-degree.
+_subs_d = [f"m{i}" for i in range(8)]
+_ai_d = {a: (50 + i, 1) for i, a in enumerate(_subs_d)}
+_by_d = {a: Decimal("1") for a in _subs_d}
+_counts = []
+for _deep in (1, 2, 6):
+    _adj = ghost.build_dag_adjacency(_subs_d, [], _deep, _secretsmod)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pl = ghost.build_dag_plan(
+            types.SimpleNamespace(dag_mixing=True, deep=_deep),
+            Decimal("0.0024"), list(_subs_d), _by_d, _adj, _subs_d, _ai_d,
+            _secretsmod, dest_slices=[list(_subs_d)])
+    _counts.append(len(_pl))
+check(f"deep: the DAG round makes the SAME number of hops at --deep 1/2/6 "
+      f"{_counts} — the knob buys no transactions",
+      len(set(_counts)) == 1 and _counts[0] > 0)
+
+# ...and the help says all of that, so an operator is not turning a knob that
+# quietly moves their money out of the mix.
+_gs_help = open(os.path.join(REPO, "GhostSpiral")).read()
+_dh = _gs_help[_gs_help.index('"--deep"'):]
+_dh = _dh[:_dh.index("cli.add_argument", 10)]
+# JOIN THE ADJACENT LITERALS FIRST. Help text is wrapped across concatenated
+# f-strings, so a phrase that reads continuously to an operator ("unmixed
+# change") is split by `" ... "\n f"` in the source and a plain substring
+# search misses it. Searching the raw source for operator-facing wording is a
+# check that fails for the wrong reason -- or passes for one.
+_dh = re.sub(r'"\s*\n\s*f?"', "", _dh)
+check("deep: the help no longer calls it a 'depth multiplier' full stop",
+      "does NOT add hop rounds" in _dh)
+check("deep: ...and states that it scales the fee reserve",
+      "fee reserve" in _dh)
+check("deep: ...and that the difference becomes unmixed change",
+      "unmixed change" in _dh)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

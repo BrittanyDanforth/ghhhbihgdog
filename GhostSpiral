@@ -2455,7 +2455,16 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--wallets", type=int, default=10,
                      help=f"Number of mix wallets (min {MIN_WALLETS})")
     cli.add_argument("--deep", type=int, default=2,
-                     help=f"Depth multiplier for DAG edges (min {MIN_DEEP})")
+                     help=f"Multiplier on the DAG adjacency's out-degree "
+                          f"(min {MIN_DEEP}). It does NOT add hop rounds: "
+                          f"there is one DAG round and every output hops "
+                          f"exactly once whatever this is set to. It DOES "
+                          f"scale the fee reserve linearly, so raising it "
+                          f"distributes less and leaves more as unmixed "
+                          f"change — on a 10 XMR run, --deep 6 holds back "
+                          f"0.43 XMR more than --deep 1 for the same number "
+                          f"of transactions. Raise it for a wider choice of "
+                          f"hop destination, not for more mixing.")
     cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
                      help="Primary monero-wallet-rpc endpoint")
     cli.add_argument("--rpc-alt",
@@ -2807,6 +2816,31 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
     does not fail early or cheaply -- it fails on the LAST hop with "not enough
     money", after the funds have already been split across subaddresses.
     """
+    # `deep` INFLATES THIS RESERVE WITHOUT ADDING A SINGLE TRANSACTION, and
+    # that is stated rather than quietly corrected.
+    #
+    # The formula reads as "one transaction per round", and `deep` sits in it
+    # as though depth meant more hop ROUNDS. It does not: --deep is a
+    # multiplier on the DAG adjacency's out-degree (build_dag_adjacency),
+    # assign_hop_destinations still gives every source exactly ONE
+    # destination, and _stage5_run runs exactly one DAG round. So a wider
+    # `deep` widens the candidate pool for a choice made once, and changes the
+    # transaction count not at all.
+    #
+    # Measured on a 10 XMR run, 12 wallets, 0.0024 XMR fee: --deep 1 holds
+    # back 0.0864 XMR and --deep 6 holds back 0.5184 XMR, for the same ~35
+    # transactions. The 0.432 XMR difference does not vanish -- it is not
+    # distributed, so it stays as change, is swept once to a fresh address,
+    # and is reported UNMIXED. Turning the knob up moves the operator's money
+    # OUT of the mix.
+    #
+    # NOT SILENTLY CHANGED HERE. Under-reserving is the expensive failure --
+    # the docstring above says it "fails on the LAST hop with 'not enough
+    # money', after the funds have already been split across subaddresses" --
+    # and a live chain's real per-transaction fee cannot be measured from
+    # here. Dropping `deep` would be a 2-to-6x cut in the safety margin
+    # justified by arithmetic alone. The cost is made visible to the operator
+    # instead (see --deep's help), and the reserve stays conservative.
     rounds = wallets * 2 * deep
     # hop_fee_reserve, not a second copy of `fee_xmr * FEE_SAFETY_MARGIN`.
     # It was written out here as `per_round_fee`, which made this the third
