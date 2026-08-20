@@ -1510,13 +1510,29 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False,
                 if _t in _seen:
                     continue
                 _seen.add(_t)
+                # CLOSE IT IF AUTH FAILS. The first version of this assigned
+                # the Controller and then authenticated inside the same try, so
+                # a control port that OPENS but refuses authentication -- an
+                # unreadable cookie file is the ordinary way that happens --
+                # left the socket open and simply dropped the reference. With
+                # newnym called from 21 sites, several of them in per-output
+                # loops, that leaks a descriptor per rotation.
+                _cand = None
                 try:
-                    _c = (Controller.from_socket_file(_t) if _t.startswith("/")
-                          else Controller.from_port(*_t.rsplit(":", 1)[0:1],
-                                                    port=int(_t.rsplit(":", 1)[1])))
-                    _c.authenticate()
+                    if _t.startswith("/"):
+                        _cand = Controller.from_socket_file(_t)
+                    else:
+                        _h, _, _p = _t.rpartition(":")
+                        _cand = Controller.from_port(address=_h, port=int(_p))
+                    _cand.authenticate()
+                    _c = _cand
                 except Exception as _e:                      # noqa: BLE001
                     _err = _e
+                    if _cand is not None:
+                        try:
+                            _cand.close()
+                        except Exception:                    # noqa: BLE001
+                            pass
                     _c = None
                     continue
                 if _control_owns_socks(_c, proxy_url):
