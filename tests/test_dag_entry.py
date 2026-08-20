@@ -438,44 +438,102 @@ check("split: THREE SEPARATE CARRIERS — a shared one would just move the "
       "convergence to the distribution, where the same intersection works",
       len({a for a, _, _ in _vcar}) == 3
       and len({d for _, _, d in _vcar}) == 3)
-# N VEILS IN ONE ROUND ARE A JOINT TIMING CONSTRAINT unless they are spread.
-# With the ordinary 3-12 minute jitter, N veils land inside the window meant
-# for one — so an analyst holding N known swap outputs keeps only the N-tuples
-# of candidate transactions that all fall in one short window, which is a
-# handle the single-veil design never gave him.
-check("split: a ONE-chunk run keeps the ordinary delay window untouched",
-      ghost._veil_window(None, 1) == ghost.DEFAULT_HOP_DELAY)
-check("split: with N chunks the window is widened, so N veils are not "
-      "compressed into the space of one",
-      ghost._veil_window(None, 4)[1] > ghost.DEFAULT_HOP_DELAY[1])
-check("split: ...in proportion to the chunk count, keeping the expected gap "
-      "between consecutive veils about what a single veil gets",
-      ghost._veil_window(None, 4)[1] == ghost.DEFAULT_HOP_DELAY[1] * 4)
-check("split: ...and it respects a custom --hop-delay rather than overriding it",
-      ghost._veil_window((60, 120), 3) == (60, 360))
-# ...and the plan actually USES it: the delays of a 3-veil plan must be able to
-# exceed what a single veil could ever draw.
-_saw_beyond = False
-for _t in range(60):
-    _sv = _saved_cfa
-    try:
-        _cc = [80]
+# THE VEILS ARE NOT A TIMING CLUSTER, and they never were.
+#
+# This briefly widened the delay window in proportion to the chunk count, to
+# stop "N veils landing inside the window meant for one". Reading
+# broadcast_signed_xmr killed that premise: it relays a plan file with one
+# `for item in items:` loop that SLEEPS item.delay before each submit, so the
+# delays are CUMULATIVE. N veils already span N full gaps. The widening also
+# scaled the round as N-squared -- measured at N=8, 1.0h became 6.6h -- for a
+# property already held. Reverted; this pins that it stays reverted.
+_sv2 = _saved_cfa
+try:
+    _cc2 = [80]
 
-        def _f4(rpc, label=""):
-            _cc[0] += 1
-            return _cc[0]
-        ghost.create_fresh_account = _f4
+    def _f5(rpc, label=""):
+        _cc2[0] += 1
+        return _cc2[0]
+    ghost.create_fresh_account = _f5
+    _delays = []
+    for _t in range(80):
         with contextlib.redirect_stdout(io.StringIO()):
             _pl, _ = ghost.build_entry_veils(
                 _XferRPC(_one), [("E0", 10, 1), ("E1", 11, 1), ("E2", 12, 1)])
-    finally:
-        ghost.create_fresh_account = _sv
-    if any(t["delay"] > ghost.DEFAULT_HOP_DELAY[1] for t in _pl):
-        _saw_beyond = True
-        break
-check("split: a multi-veil plan really draws delays beyond the single-veil "
-      "ceiling — the wider window reaches the plan, not just the helper",
-      _saw_beyond)
+        _delays += [t["delay"] for t in _pl]
+finally:
+    ghost.create_fresh_account = _sv2
+_lo, _hi = ghost.DEFAULT_HOP_DELAY
+check("split: every veil delay stays inside the ORDINARY --hop-delay window, "
+      "however many chunks there are — the relay loop is sequential, so N "
+      "veils already span N gaps",
+      _delays and all(_lo <= d <= _hi for d in _delays))
+check("split: ...and the window is not silently multiplied by the chunk count "
+      "(which scaled the round as N-squared, 1.0h to 6.6h at N=8)",
+      max(_delays) <= _hi)
+check("split: ...the delays are still jittered, not a constant",
+      len(set(_delays)) > 3)
+
+
+# ==========================================================================
+# HOW LONG THE RUN WILL TAKE, SAID BEFORE IT STARTS.
+#
+# --dag-mixing's help promised "a run takes ~20+ min longer", counting only
+# the on-chain confirmation wait. The DAG round relays ONE transaction per
+# funded output and broadcast_signed_xmr sleeps that transaction's --hop-delay
+# before each submit, sequentially -- so with the defaults it is about two and
+# a half HOURS, not twenty minutes.
+#
+# An operator told "20 minutes" who sees two hours of silence concludes the
+# run has hung and interrupts it, and an interrupt mid-round is the one
+# failure this pipeline cannot recover from automatically.
+# ==========================================================================
+print("\n=== the runtime estimate ===")
+
+_A = types.SimpleNamespace
+_plain = _A(peel=False, dag_mixing=False, exit_to=None)
+_dag = _A(peel=False, dag_mixing=True, exit_to=None)
+_dagexit = _A(peel=False, dag_mixing=True, exit_to=["x"])
+
+
+def _mins(s):
+    """Parse the estimate back into minutes."""
+    return (float(s.strip("~h")) * 60 if s.endswith("h")
+            else float(s.split()[0].lstrip("~")))
+
+
+check("runtime: --dag-mixing is estimated in HOURS, not the ~20 minutes the "
+      "help used to claim",
+      _mins(ghost.estimate_runtime(_dag, 1, 15, None)) > 120)
+check("runtime: ...and it is the DELAYS that dominate, so it scales with the "
+      "number of mix outputs",
+      _mins(ghost.estimate_runtime(_dag, 1, 30, None))
+      > _mins(ghost.estimate_runtime(_dag, 1, 15, None)) * 1.5)
+check("runtime: a plain run (no dag, no exit) is much shorter",
+      _mins(ghost.estimate_runtime(_plain, 1, 15, None))
+      < _mins(ghost.estimate_runtime(_dag, 1, 15, None)) / 3)
+check("runtime: --exit-to adds one delayed withdrawal per output",
+      _mins(ghost.estimate_runtime(_dagexit, 1, 15, None))
+      > _mins(ghost.estimate_runtime(_dag, 1, 15, None)))
+check("runtime: more chunks means more veils and more fan-outs",
+      _mins(ghost.estimate_runtime(_dag, 8, 15, None))
+      > _mins(ghost.estimate_runtime(_dag, 1, 15, None)))
+check("runtime: a longer --hop-delay makes the estimate longer — it is not a "
+      "constant",
+      _mins(ghost.estimate_runtime(_dag, 1, 15, (3600, 7200)))
+      > _mins(ghost.estimate_runtime(_dag, 1, 15, None)) * 4)
+check("runtime: --peel is estimated as sequential confirmation-gated hops",
+      _mins(ghost.estimate_runtime(_A(peel=True, dag_mixing=False,
+                                      exit_to=None), 1, 7, None)) > 120)
+
+# ...and the help no longer makes the claim that was wrong.
+_help = open(os.path.join(REPO, "GhostSpiral")).read()
+_dagh = _help[_help.index('"--dag-mixing"'):]
+_dagh = _dagh[:_dagh.index("cli.add_argument", 10)]
+check("runtime: the --dag-mixing help no longer says '~20+ min longer'",
+      "20+ min longer" not in _dagh)
+check("runtime: ...and says what actually dominates",
+      "hop-delay" in _dagh.lower() and "HOURS" in _dagh)
 
 check("split: no veil pays a carrier another veil also pays",
       len({t["dst"] for t in _vplan}) == 3)
@@ -1088,6 +1146,58 @@ check("gap: ...naming the aggregator link as the reason",
 _r, _m = _quotes(_CH, [_E1, _E2, _E3])
 check("control: three chunks with three distinct destinations is accepted",
       _m is None and _r is not None and len(_r) == 3)
+
+# A MEMO NAMING ANOTHER CHUNK'S ADDRESS MUST BE REFUSED.
+#
+# The memo is what tells ThorChain where to deliver the XMR, and the deposit
+# address is a SHARED inbound vault -- so a memo naming the wrong address
+# delivers that chunk's money somewhere else. With one entry there was no
+# "wrong address" to name but a stranger's; with N there is now a way for the
+# swap to be routed to ANOTHER CHUNK OF THE SAME RUN, which would put two
+# chunks on one entry and rebuild the exact linkage the split removes --
+# without anything on this side being wrong.
+#
+# The end-to-end drive in test_send_gates cannot see this: its fake builds
+# each memo FROM the payload's own destination, so the memo always matches by
+# construction. This drives the guard with a memo that does not.
+def _quotes_memo(dests, memo_for):
+    """Run the real quote loop where chunk i's memo names memo_for(i)."""
+    saved = (ghost.safe_post, ghost.btc_per_xmr_oracle, ghost.newnym,
+             ghost.secure_delay, ghost.integrity_log)
+    try:
+        ghost.btc_per_xmr_oracle = lambda *a, **k: None
+        ghost.newnym = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        _n = [0]
+
+        def _post(url, payload, proxy):
+            i = _n[0]
+            _n[0] += 1
+            return {"routes": [{"expectedOutput": "1.0", "transaction": {
+                "memo": "=:XMR.XMR:" + memo_for(i) + ":0/1/0::0",
+                "depositAddress":
+                    "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}}]}
+        ghost.safe_post = _post
+        _a = types.SimpleNamespace(allow_unbound_memo=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.stage2_get_swap_quotes(_a, None, _CH, dests)
+        return None
+    except SystemExit as e:
+        return str(e.code)
+    finally:
+        (ghost.safe_post, ghost.btc_per_xmr_oracle, ghost.newnym,
+         ghost.secure_delay, ghost.integrity_log) = saved
+
+
+_E3L = [_E1, _E2, _E3]
+check("gap: a memo naming ANOTHER CHUNK's entry address is REFUSED — it would "
+      "route two chunks to one entry and rebuild the linkage the split removes",
+      _quotes_memo(_E3L, lambda i: _E1) is not None)
+check("gap: a memo naming a STRANGER's address is refused",
+      _quotes_memo(_E3L, lambda i: _addr(9990)) is not None)
+check("control: a memo naming THIS chunk's own address is accepted",
+      _quotes_memo(_E3L, lambda i: _E3L[i]) is None)
 check("control: ...and each deposit records its own destination",
       _r and [d["xmr_dest"] for d in _r] == [_E1, _E2, _E3])
 
@@ -1186,6 +1296,63 @@ with contextlib.redirect_stdout(_hb2):
     ghost.report_holdings(_HoldRPC(), [11, 12, 13, 20], entry_account=None)
 check("control: with no entry account there is no such warning",
       "SWAP ENTRY" not in _hb2.getvalue())
+
+
+# ==========================================================================
+# NOTHING WRITES tx_extra, AND NOTHING MAY START.
+#
+# Every plan entry used to carry `"extra": secure_hex(16)` -- sixteen
+# cryptographically random bytes, at six sites, sitting right next to
+# build_entry_veils' measurements of tx_extra SIZE as a fingerprinting vector
+# (44 / 131 / 259 bytes). It read exactly like tx_extra randomisation and was
+# INERT: airgap_tx_signer never forwarded it to any RPC, and its
+# _canonical_plan says so outright, which is also why the signing fingerprint
+# never covered it.
+#
+# It was worse than dead weight. A standard Monero transaction's tx_extra is
+# the transaction public key and little else -- the 44 bytes measured there.
+# Appending sixteen random bytes would give every transaction this tool makes
+# a size no ordinary wallet emits: a unique fingerprint on EVERY hop, not a
+# defence on any. So the field is gone rather than "completed", and this is
+# what stops the next reader finishing the job.
+# ==========================================================================
+print("\n=== no plan carries tx_extra ===")
+
+import ast as _ast
+_tree = _ast.parse(open(os.path.join(REPO, "GhostSpiral")).read())
+_extra_keys = [k.lineno for n in _ast.walk(_tree) if isinstance(n, _ast.Dict)
+               for k in n.keys
+               if isinstance(k, _ast.Constant) and k.value == "extra"]
+check("tx_extra: NO plan-building dict in GhostSpiral carries an 'extra' key",
+      not _extra_keys)
+
+# ...and the signer would ignore it anyway, so a re-added field would be
+# silently inert rather than loudly wrong. Both halves stated.
+_ag_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
+check("tx_extra: the signer still documents that it never forwards 'extra', "
+      "so re-adding the field would be inert, not effective",
+      "never forwards" in _ag_src)
+
+# The real plans this suite builds must not carry it either -- an AST check
+# alone would miss a field added by dict-update or **kwargs.
+_saved_cfa3 = ghost.create_fresh_account
+try:
+    _c3 = [90]
+
+    def _f6(rpc, label=""):
+        _c3[0] += 1
+        return _c3[0]
+    ghost.create_fresh_account = _f6
+    with contextlib.redirect_stdout(io.StringIO()):
+        _vp3, _ = ghost.build_entry_veils(_XferRPC(_one), [("E0", 10, 1)])
+finally:
+    ghost.create_fresh_account = _saved_cfa3
+_dp3 = _hop_plan(_BY_OK, [list(_ALL)])
+_fp3, _, _ = _dist([("C0", 20, 1)], [["m0", "m1"]],
+                   {"m0": Decimal("1"), "m1": Decimal("1")})
+for _lbl, _plan3 in (("veil", _vp3), ("DAG hop", _dp3), ("fan-out", _fp3)):
+    check(f"tx_extra: a real {_lbl} plan entry carries no 'extra' field",
+          all("extra" not in t for t in _plan3))
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

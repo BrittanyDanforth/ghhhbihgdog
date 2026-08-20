@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Executable tests for the pure-Python (non-Monero-stack) logic I changed.
 Loads the real extensionless scripts as modules and asserts real behavior."""
+import types
 import ast
 import re
 import stat
@@ -2771,10 +2772,38 @@ check("stage4: GhostSpiral checks its --output against the wipe roots",
 # but "you did not give me X" for an X that was given is the class of message
 # this audit keeps removing.
 #
-# Asserted at source level: the branch lives inside main(), which nothing
-# executes, and reaching it through the CLI requires passing Tor verification.
-check("stage2: a non-positive --btc-amount is rejected explicitly, not "
-      "misreported as 'not specified'",
+# DRIVEN, not asserted at source level. This used to read
+#
+#   check(..., "--btc-amount must be positive" in _src_gs)
+#
+# with the honest comment "the branch lives inside main(), which nothing
+# executes" -- so deleting the guard left every suite green. A mutation sweep
+# confirmed it: disabling the branch while leaving the string in place changed
+# nothing anywhere.
+#
+# The guard now lives in resolve_btc_amount, beside the other --btc-amount
+# checks, which is both testable and the right place: the old branch ran after
+# Tor verification, after the wallet was opened and after the entry set had
+# been created, so `--btc-amount 0` did all that work before refusing.
+for _bad_amt in ("0", "-1", "-0.00000001"):
+    _bm = None
+    try:
+        ghost.resolve_btc_amount(types.SimpleNamespace(
+            btc_amount=Decimal(_bad_amt), split=1))
+    except SystemExit as _e:
+        _bm = str(_e.code)
+    check(f"stage2: --btc-amount {_bad_amt} is REFUSED", _bm is not None)
+    check(f"stage2: ...explicitly, not misreported as 'not specified'",
+          _bm and "must be positive" in _bm and "not specified" not in _bm)
+check("stage2: control -- a positive amount is allowed",
+      ghost.resolve_btc_amount(types.SimpleNamespace(
+          btc_amount=Decimal("0.05"), split=1)) is None)
+check("stage2: control -- no amount at all is allowed (manual/receive modes)",
+      ghost.resolve_btc_amount(types.SimpleNamespace(
+          btc_amount=None, split=1)) is None)
+# ...and the stage-2 backstop is still there, so a caller that skips the
+# resolver does not silently accept it either.
+check("stage2: the stage-2 backstop branch survives as defence in depth",
       "--btc-amount must be positive" in _src_gs)
 check("stage2: ...and that check precedes the `> 0` branch it used to fall "
       "through",

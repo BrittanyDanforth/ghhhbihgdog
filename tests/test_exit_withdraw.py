@@ -226,8 +226,25 @@ check("exit: every destination is one the operator supplied",
       all(t["dst"] in (A1, A2) for t in _txs))
 check("exit: the withdrawal is SPREAD across both destinations",
       len({t["dst"] for t in _txs}) == 2)
-check("exit: each carries its own random extra (no shared fingerprint)",
-      len({t["extra"] for t in _txs}) == len(_txs))
+# THIS CHECK USED TO READ:
+#
+#   check("exit: each carries its own random extra (no shared fingerprint)",
+#         len({t["extra"] for t in _txs}) == len(_txs))
+#
+# and it was verifying a property the field could not provide. Every plan
+# entry carried `"extra": secure_hex(16)`, but airgap_tx_signer never forwards
+# it to any RPC -- its own _canonical_plan says so -- so the bytes were
+# generated, written to the plan, and dropped. "No shared fingerprint" was
+# neither true nor false on-chain; nothing about tx_extra was being set at all.
+#
+# A green check asserting an OPSEC property that the code cannot deliver is
+# worse than no check: it is what stops anyone looking. So the field is gone
+# (forwarding it would have given every transaction a tx_extra size no
+# ordinary wallet emits -- a fingerprint on every hop) and this asserts the
+# absence instead.
+check("exit: no exit TX carries an 'extra' field — tx_extra is left to the "
+      "wallet's default, deliberately",
+      all("extra" not in t for t in _txs))
 
 
 # ---- the exit must NOT withdraw an unmixed output off ENTRY --------------
@@ -308,6 +325,42 @@ finally:
     (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
      ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
      ghost.secure_delay) = _saved_chg
+# A CHANGE ACCOUNT WHOSE SWEEP DESTINATION COULD NOT BE CREATED MUST STILL BE
+# HELD.
+#
+# The hold was built from change_sweep_jobs, and build_change_sweep_jobs SKIPS
+# an account whose fresh destination could not be created -- so exactly the
+# account whose change could not be swept was also the one not held, and with
+# --exit-to the exit swept it to the operator's destination. The message they
+# were shown said that change "is an output that never moves".
+#
+# One carrier hid it: change_target covered the only account there was. N
+# carriers give N-1 more chances for that create to fail.
+class _NoAcctRPC:
+    """A wallet that refuses to create the change-sweep destination."""
+
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            raise RuntimeError("wallet refused create_account")
+        raise AssertionError(method)
+
+    def new_subaddress_indexed(self, **k):
+        raise AssertionError("should not be reached")
+
+
+_ai_cs = {}
+with contextlib.redirect_stdout(io.StringIO()) as _cs_out:
+    _jobs = ghost.build_change_sweep_jobs(_NoAcctRPC(), _ai_cs, [41, 42, 43])
+check("change hold: a wallet that cannot create the destination yields NO jobs",
+      _jobs == [])
+check("change hold: ...and the operator is told the value stays put",
+      "UNMIXED" in _cs_out.getvalue())
+check("change hold: ...and is NOT told it 'never moves' — the exit used to "
+      "move it, straight to their destination",
+      "never moves" not in _cs_out.getvalue()
+      and "HOLDS it" in _cs_out.getvalue())
+
+
 check("exit: a held output that is NOT an entry is counted as CHANGE",
       _ch2 == {"entry": 0, "change": 1})
 check("exit: ...and described as a distribution change address, not as ENTRY",
@@ -772,6 +825,51 @@ check("G8: 5 of 12 relayed -> exactly 5 change locations swept",
       len(_g8_mid) == 5)
 check("G8: ...in hop order, not an arbitrary subset",
       [j[0] for j in _g8_mid] == [10, 11, 12, 13, 14])
+
+
+# The hold itself: drive _stage5_run with jobs EMPTY but change_accounts set,
+# and confirm the exit refuses to withdraw those accounts.
+_saved_h = (ghost._run_round, ghost._wait_for_change_settled,
+            ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+            ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+            ghost._wait_for_fanout_confirm, ghost._run_change_sweeps)
+_seen_h = _Recorder()
+try:
+    ghost._run_round = _seen_h
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    # 41/0 and 42/0 are change locations no job could be made for;
+    # 5/1 is a mixed output that must still leave.
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {41: {0: 2_000_000_000_000}, 42: {0: 1_000_000_000_000},
+         5: {1: 4_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    _ha2 = types.SimpleNamespace(**{**vars(_wargs), "entry_veil": True})
+    _hs = os.path.join(_tf.mkdtemp(prefix="chgacct_"), "tx_staging")
+    os.makedirs(_hs, exist_ok=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost._stage5_run(_ha2, _plan, None, [], _hs, None, 1,
+                          distribution_mode="fanout",
+                          change_target=None,
+                          change_sweep_jobs=[],        # every job failed
+                          change_accounts=[41, 42],    # ...but the accounts exist
+                          delay_window=(0, 0),
+                          exit_accounts=[41, 42, 5],
+                          exit_hold=[])
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay, ghost._wait_for_fanout_confirm,
+     ghost._run_change_sweeps) = _saved_h
+_hsrc = [(t["account_index"], t["src_index"]) for r in _seen_h.rounds for t in r]
+check("change hold: an unsweepable change account is NOT withdrawn to --exit-to",
+      (41, 0) not in _hsrc and (42, 0) not in _hsrc)
+check("change hold: ...while the MIXED output still leaves", (5, 1) in _hsrc)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

@@ -236,6 +236,9 @@ SWAPKIT_API = "https://api.swapkit.dev"
 #: repeated number, not so much that one chunk is conspicuous. See
 #: split_btc_amount for what equal chunks cost on the Bitcoin side.
 SPLIT_JITTER = Decimal("0.18")
+#: What one confirm-and-unlock gate costs in wall clock, for the runtime
+#: estimate only. ~10 blocks at ~2 min. Not used for any timeout.
+FANOUT_CONFIRM_POLL_ESTIMATE = 20 * 60
 MIN_WALLETS = 3
 MIN_DEEP = 1
 # Extra mix outputs beyond `wallets`, chosen RANDOMLY per run within this range.
@@ -883,25 +886,6 @@ def entry_output_count(rpc, account: int, index: int):
                and int(t.get("amount", 0) or 0) > 0)
 
 
-def _veil_window(window, n_entries: int):
-    """Widen the broadcast-delay window in proportion to the chunk count.
-
-    N veils relaying in one round with the ordinary per-hop jitter puts N
-    spends inside the window meant for one, which is a joint timing constraint
-    an analyst can use across all N known swap outputs at once. Scaling the
-    window keeps the expected spacing between consecutive veils about what it
-    would be for a single veil.
-
-    Returns the window unchanged for a one-chunk run, so the ordinary path is
-    untouched.
-    """
-    lo, hi = window or DEFAULT_HOP_DELAY
-    n = max(1, int(n_entries))
-    if n == 1:
-        return (lo, hi)
-    return (lo, hi * n)
-
-
 def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
     """The first spend out of each entry output, shaped like ordinary traffic.
 
@@ -929,6 +913,26 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
     he lists the transactions that reference it and keeps the ones with the
     unusual shape, and in fan-out mode that is close to a single candidate.
     The distribution advertised itself.
+
+    THE `extra` COLUMN ABOVE IS tx_extra, AND NOTHING HERE MAY WRITE TO IT.
+    That is worth stating loudly, because until recently every plan entry in
+    this file carried
+
+        "extra": secure_hex(16),
+
+    -- sixteen cryptographically random bytes, at six sites, which read
+    exactly like tx_extra randomisation next to the measurements above. It was
+    INERT: airgap_tx_signer never forwarded it to any RPC (its _canonical_plan
+    says so outright, which is also why the signing fingerprint does not cover
+    it), so it was dead weight that looked like a defence.
+
+    It was worse than dead. A standard Monero transaction's tx_extra is the
+    transaction public key and little else -- the 44 bytes measured above.
+    Appending sixteen random bytes would make every transaction this tool
+    produces a size no ordinary wallet emits, which is a unique fingerprint on
+    EVERY hop rather than a defence on any. So the field is gone rather than
+    "completed", and this note exists so the next reader does not finish the
+    job. tx_extra is left to the wallet's default, deliberately.
 
     So each entry output is swept, once, into a fresh carrier -- 1-in/2-out,
     zero change, the shape most of the network is making -- and the
@@ -1087,24 +1091,25 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
             "account_index": acct_in,
             "dst": addr,
             "sweep": True,
-            # SPREAD WIDER THE MORE CHUNKS THERE ARE.
+            # THE ORDINARY PER-HOP DELAY, AND NOTHING EXTRA. This briefly
+            # multiplied the window by the chunk count, on the reasoning that
+            # "the N veils relay in one round, so N of them land inside the
+            # window meant for one" -- which would hand an analyst a joint
+            # timing constraint across all N known swap outputs at once.
             #
-            # The N veils relay in ONE round, and with the default 3-12 minute
-            # jitter N of them land inside one narrow window. That hands the
-            # analyst something the single-veil design never gave him: a joint
-            # constraint. Holding N known swap outputs, he keeps only the
-            # N-tuples of candidate transactions that all fall in one short
-            # window, and a coincidence that is unremarkable once is not
-            # unremarkable N times over.
+            # THAT PREMISE WAS WRONG, and reading the broadcaster is what
+            # showed it. broadcast_signed_xmr relays a plan file with a single
+            # `for item in items:` loop that SLEEPS item.delay before each
+            # submit, so the delays are CUMULATIVE, not offsets from a common
+            # start. N veils therefore already span N full gaps -- about an
+            # hour at N=8 with the default window -- and there is no narrow
+            # window to spread out of.
             #
-            # Multiplying the window by the chunk count keeps the EXPECTED gap
-            # between consecutive veils roughly what it is for a single one,
-            # instead of compressing N spends into the space of one. It costs
-            # wall-clock and nothing else -- the veils are independent, so a
-            # later one does not block an earlier one, and Round 0 waits for
-            # all of them anyway.
-            "delay": hop_delay(_veil_window(delay_window, len(entries))),
-            "extra": secure_hex(16),
+            # The multiplication also cost far more than it looked: with each
+            # of N veils drawing from a window N times wider, the round scales
+            # as N-squared. Measured against the shipped constants, N=8 went
+            # from 1.0h to 6.6h for no property that was not already held.
+            "delay": hop_delay(delay_window),
         })
         carriers.append((acct, idx, addr))
     # THE CARRIERS MUST BE DISTINCT, and this is the invariant's last gap.
@@ -1209,7 +1214,6 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
             "dst": p["dst"],
             "amt": p["amt"],
             "delay": hop_delay(delay_window),
-            "extra": secure_hex(16),
             "peel_num": p["peel_num"],
         }
         if p.get("destinations"):
@@ -2488,8 +2492,14 @@ def build_cli() -> argparse.ArgumentParser:
     cli.add_argument("--dag-mixing", action="store_true",
                      help="Enable the second-round DAG hop-mixing across mix "
                           "subaddresses. This REQUIRES waiting for the fan-out "
-                          "round to confirm on-chain (~10 blocks) before the hop "
-                          "TXs can be created, so a run takes ~20+ min longer. "
+                          "round to confirm on-chain (~10 blocks), and then "
+                          "relays ONE hop per funded output, each preceded by "
+                          "its own --hop-delay. That second part dominates: "
+                          "the confirmation wait is ~20 min, but the hops are "
+                          "roughly (wallets + decoys) x the delay, so with the "
+                          "defaults a run takes about TWO AND A HALF HOURS "
+                          "longer, not 20 minutes. Budget for it before you "
+                          "start; interrupting mid-round is what strands funds. "
                           "Off by default: the default run does the fan-out "
                           "distribution only (fast, and still spreads funds "
                           "across fresh subaddresses).")
@@ -3204,7 +3214,6 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                 "dst": d,
                 "sweep": True,
                 "delay": hop_delay(delay_window),
-                "extra": secure_hex(16),
             })
         if not dag_plan:
             integrity_log("stage4", "dag_mixing_skipped:hop_unfundable")
@@ -3426,6 +3435,21 @@ def resolve_btc_amount(args) -> None:
     amt = getattr(args, "btc_amount", None)
     if amt is None:
         return
+    # POSITIVE, AND CHECKED HERE. This lived in main()'s stage-2 block, which
+    # runs after Tor verification, after the wallet is opened, after the mix
+    # subaddresses and the entry set have been created -- so `--btc-amount 0`
+    # did all of that work before saying no. Its only test asserted the
+    # message existed IN THE SOURCE, with the honest comment "the branch lives
+    # inside main(), which nothing executes"; deleting the guard left every
+    # suite green. main() is drivable by a test now, but the right answer is
+    # that a flag this simple should be refused where the other flag checks
+    # are, before anything happens. The stage-2 branch stays as a backstop.
+    if amt <= 0:
+        integrity_log("stage0", "btc_amount_not_positive")
+        sys.exit(
+            f"[!] --btc-amount must be positive (got {fmt_btc(amt)}).\n"
+            f"    A zero or negative amount is not a swap. Nothing has been "
+            f"created and nothing sent.")
     n = max(1, int(getattr(args, "split", 1) or 1))
     if n > 1 and amt < SATOSHI_BTC * Decimal(n):
         # EVERY CHUNK NEEDS A SATOSHI. Below that split_btc_amount has no
@@ -4202,7 +4226,6 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                                   "amount": str(fanout_by_addr[a])}
                                  for a in _slice],
                 "delay": hop_delay(_delay_window),
-                "extra": secure_hex(16),
             })
         # Log the STRUCTURE (one TX, N destinations) but NOT the per-destination
         # amount. integrity_chain.log persists on disk, and the exact fan-out
@@ -4444,6 +4467,82 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
                            if i != _bad]
     # bal_before_veils, NOT the netted `bal` -- see the note in the loop.
     return (entries, unlocked, bal_before_veils, usable, _sl, _su, _amts)
+
+
+def estimate_runtime(args, n_chunks: int, mix_outputs: int,
+                     delay_window) -> str:
+    """A rough wall-clock estimate for this run, as an operator-readable line.
+
+    THE DELAYS DOMINATE, AND NOTHING SAID SO. --dag-mixing's help promised "a
+    run takes ~20+ min longer", counting only the on-chain confirmation wait --
+    but the DAG round relays ONE transaction per funded output and
+    broadcast_signed_xmr sleeps that transaction's --hop-delay before each
+    submit, sequentially. With the default 3-12 minute jitter and a default
+    12-wallet run that is ~2 hours of sleeping, not 20 minutes of waiting.
+
+    An operator who is told "20 minutes" and sees nothing happen for two hours
+    concludes the run has hung and interrupts it -- and an interrupt mid-round
+    is the one failure this pipeline has no automatic recovery from. The
+    estimate is cheap; the misunderstanding is not.
+
+    Deliberately rough and stated as such. It cannot know the real fee, the
+    real block times, or how long a swap takes to settle, and it does not try:
+    every figure here is the planned delays plus the confirmation gates, which
+    are the parts this tool actually controls.
+    """
+    lo, hi = delay_window or DEFAULT_HOP_DELAY
+    mean = (Decimal(lo) + Decimal(hi)) / 2
+    confirm = Decimal(FANOUT_CONFIRM_POLL_ESTIMATE)
+    # veil round + distribution + (dag confirm + dag round) + (exit)
+    secs = mean * n_chunks                       # one veil per chunk
+    secs += confirm                              # carriers confirm+unlock
+    if getattr(args, "peel", False):
+        secs += (mean + confirm) * mix_outputs   # sequential, gated per peel
+    else:
+        secs += mean * n_chunks                  # one fan-out per chunk
+    if getattr(args, "dag_mixing", False):
+        secs += confirm + mean * mix_outputs
+    if getattr(args, "exit_to", None):
+        secs += mean * mix_outputs               # one withdrawal per output
+    hours = secs / Decimal(3600)
+    return (f"~{hours:.1f}h" if hours >= 1
+            else f"~{int(secs / 60)} min")
+
+
+def build_change_sweep_jobs(rpc_primary, addr_index, change_accounts) -> list:
+    """A fresh destination for each account's change. Returns
+    [(account, 0, dest_addr, dest_index)].
+
+    A distribution cannot allocate its input exactly, so monerod returns the
+    remainder to subaddress 0 of the SPENDING account. That output never went
+    through the hop rounds, so it is unmixed, and leaving it on the account
+    that spent the swapped funds is the leak the sweep exists to close.
+
+    ONE JOB PER CHANGE ACCOUNT, and with N carriers there are N of them.
+
+    A job whose destination could not be created is SKIPPED, and the caller
+    must still HOLD that account: the exit is what would otherwise withdraw
+    the change nobody could sweep. That coupling lived in the caller and got
+    it wrong -- the hold was built from the jobs, so the one account whose
+    sweep failed was also the one not held. See the hold in _stage5_run.
+    """
+    change_sweep_jobs = []
+    for _acct in change_accounts:
+        try:
+            _csacct = create_fresh_account(rpc_primary, label="")
+            _csa, _csi = rpc_primary.new_subaddress_indexed(
+                account_index=_csacct, label="")
+        except Exception as e:                           # noqa: BLE001
+            integrity_log("stage4", f"change_sweep_target_FAILED:{_acct}")
+            print(f"  [!] Could not create a destination for the change on "
+                  f"account {_acct} ({str(e)[:60]}). That change will stay "
+                  f"on account {_acct}, subaddress 0 — UNMIXED. The exit "
+                  f"HOLDS it, so it is not withdrawn to your destination; "
+                  f"it simply sits there. Move it by hand, or leave it.")
+            continue
+        addr_index[_csa] = (_csacct, _csi)
+        change_sweep_jobs.append((_acct, 0, _csa, _csi))
+    return change_sweep_jobs
 
 
 def main():
@@ -4892,21 +4991,18 @@ def main():
         # proves they share an owner. These are swept change: they are what
         # the operator is left holding, so they get the same treatment every
         # other resting output gets (see create_subs).
-        change_sweep_jobs = []
-        for _acct in change_accounts:
-            try:
-                _csacct = create_fresh_account(rpc_primary, label="")
-                _csa, _csi = rpc_primary.new_subaddress_indexed(
-                    account_index=_csacct, label="")
-            except Exception as e:                           # noqa: BLE001
-                integrity_log("stage4", f"change_sweep_target_FAILED:{_acct}")
-                print(f"  [!] Could not create a destination for the change on "
-                      f"account {_acct} ({str(e)[:60]}). That change will stay "
-                      f"on account {_acct}, subaddress 0 — UNMIXED, and it is "
-                      f"an output that never moves.")
-                continue
-            addr_index[_csa] = (_csacct, _csi)
-            change_sweep_jobs.append((_acct, 0, _csa, _csi))
+        change_sweep_jobs = build_change_sweep_jobs(
+            rpc_primary, addr_index, change_accounts)
+
+        # HOW LONG THIS WILL TAKE, BEFORE IT STARTS. The delays are the
+        # dominant cost and nothing said so -- see estimate_runtime. An
+        # operator who thinks a run takes twenty minutes and sees two hours of
+        # silence interrupts it, and an interrupt mid-round is the failure
+        # this pipeline cannot recover from automatically.
+        print(f"  [*] Expected wall-clock for the rounds below: "
+              f"{estimate_runtime(args, len(SPEND_SOURCES), fanout_count, _delay_window)}"
+              f" — mostly the per-transaction --hop-delay, which is an OPSEC "
+              f"parameter, not overhead. Do NOT interrupt it.")
 
         # All four veil/delay kwargs below are required -- see _stage5_run.
         incomplete, withheld = _stage5_run(args, fanout_file, dag_file,
@@ -4915,6 +5011,7 @@ def main():
                                  distribution_mode=distribution_mode,
                                  change_target=(bal_account, 0),
                                  change_sweep_jobs=change_sweep_jobs,
+                                 change_accounts=change_accounts,
                                  delay_window=_delay_window,
                                  veil_file=veil_file,
                                  veil_target=[(_a, _i) for _d, _a, _i
@@ -5704,7 +5801,6 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         "dst": dest_addr,
         "sweep": True,
         "delay": hop_delay(delay_window),
-        "extra": secure_hex(16),
     }
     path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
     atomic_write_json({"meta": meta, "txs": [sweep_tx]}, path)
@@ -5993,7 +6089,6 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             "dst": dst,
             "sweep": True,
             "delay": hop_delay(delay_window),
-            "extra": secure_hex(16),
         }
         path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"
         atomic_write_json({"meta": meta, "txs": [tx]}, path)
@@ -6042,6 +6137,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
 def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 proxy, spendable_amount, distribution_mode="fanout",
                 change_target=(0, 0), change_sweep_jobs=None,
+                change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
                 veil_need=None, exit_accounts=None, exit_hold=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
@@ -6249,6 +6345,25 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         _hold = list(exit_hold or ())
         for _cj in (change_sweep_jobs or ()):
             _hold.append((int(_cj[0]), int(_cj[1])))
+        # EVERY CHANGE ACCOUNT, NOT ONLY THE ONES THAT GOT A SWEEP JOB.
+        #
+        # The comment above says this hold is "unconditional rather than
+        # conditional on the sweep having failed". It was not: it was built
+        # from change_sweep_jobs, and a job is SKIPPED when its fresh
+        # destination could not be created (stage 4 catches that and prints
+        # "That change will stay on account N, subaddress 0 — UNMIXED, and it
+        # is an output that never moves").
+        #
+        # So exactly the account whose change could not be swept was also the
+        # one not held, and with --exit-to the exit then swept it to the
+        # operator's destination -- while the message told them it never
+        # moves. Conditional in the one case where it mattered, and a false
+        # statement to go with it.
+        #
+        # One carrier hid this: change_target covered the only account there
+        # was. N carriers give N-1 more chances for that create to fail.
+        for _ca in (change_accounts or ()):
+            _hold.append((int(_ca), 0))
         if change_target:
             _hold.append((int(change_target[0]), int(change_target[1])))
         _relayed, _failed, _skipped, _held, _unclean = _run_exit_withdrawals(
