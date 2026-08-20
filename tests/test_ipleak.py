@@ -813,6 +813,59 @@ check(f"isolation: newnym is KEPT alongside it, defence in depth "
 check("isolation: ...and every required rotation says which tor it means",
       "proxy_url=getattr(args, \"tor_proxy\", \"\")" in _gs_src)
 
+# EVERY FILE, NOT JUST GhostSpiral -- and this is how the real one was missed.
+#
+# The check above is a substring test against GhostSpiral only. broadcast_
+# signed_xmr called newnym(required=True) with NO proxy_url at all, and
+# newnym then falls back to its default ctrl of /var/run/tor/control and
+# rotates whatever tor owns that path. On an operator running Tor Browser
+# (--tor-proxy socks5h://127.0.0.1:9150 -- a setup gs_console's own detection
+# offers and test_console pins) that is a DIFFERENT daemon from the one
+# carrying the relay. _control_owns_socks, which exists to catch exactly that,
+# is skipped as well: with no proxy_url it returns True immediately.
+#
+# So "NEWNYM before EVERY TX (including the first) for circuit isolation" --
+# the comment sitting directly above the call -- was true of the call and
+# false of the circuits, and a whole batch of transactions relayed on one.
+# In the process that publishes the money.
+#
+# Found by RUNNING the pipeline end to end against a real chain, not by a
+# test: nothing in this suite had ever executed GhostSpiral.main() far enough
+# to spawn a real broadcast. AST, so it cannot be fooled by formatting, and
+# every toolchain file rather than the one that happened to be looked at.
+def _newnyms_missing_proxy(path):
+    out = []
+    for node in _ast.walk(_ast.parse(open(path).read())):
+        if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "newnym":
+            if not any(k.arg == "proxy_url" for k in node.keywords):
+                out.append(getattr(node, "lineno", "?"))
+    return out
+
+
+_callers = ["GhostSpiral", "broadcast_signed_xmr", "airgap_tx_signer",
+            "thor_swap_preparer", "create_receive_wallet", "receive_watch",
+            "gs_console"]
+_bad = {}
+_total = 0
+for _f in _callers:
+    _fp = os.path.join(REPO, _f)
+    if not os.path.exists(_fp):
+        continue
+    _miss = _newnyms_missing_proxy(_fp)
+    _total += sum(1 for n in _ast.walk(_ast.parse(open(_fp).read()))
+                  if isinstance(n, _ast.Call)
+                  and getattr(n.func, "id", None) == "newnym")
+    if _miss:
+        _bad[_f] = _miss
+check(f"isolation: EVERY newnym call in the toolchain names its tor "
+      f"({_total} call(s) across {len(_callers)} files; offenders: "
+      f"{_bad or 'none'})", not _bad)
+
+# NON-VACUITY: the walker must actually be finding calls, or "no offenders"
+# is just an empty search.
+check("isolation: ...and the walker really found the calls it checked",
+      _total >= 15)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed, {len(UNPROVEN)} UNPROVEN")
 if UNPROVEN:
     print("UNPROVEN (these guarantees were NOT measured — do not read this "

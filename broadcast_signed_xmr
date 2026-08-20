@@ -884,7 +884,24 @@ def main():
         tx_data_hex = raw_data.hex()
 
         # NEWNYM before EVERY TX (including the first) for circuit isolation.
-        newnym(required=True)
+        #
+        # WITH THE PROXY NAMED. Without it, newnym() falls back to its default
+        # ctrl of /var/run/tor/control and rotates WHATEVER tor owns that path
+        # -- which is not necessarily the tor carrying this relay. An operator
+        # on Tor Browser (--tor-proxy socks5h://127.0.0.1:9150, a setup
+        # gs_console's own detection offers and test_console pins) had every
+        # transaction in the batch relayed through Tor Browser's tor while this
+        # rotated the SYSTEM tor. _control_owns_socks, which exists to catch
+        # exactly that, is skipped too: with no proxy_url it returns True
+        # immediately. So "NEWNYM before EVERY TX" was true of the call and
+        # false of the circuits, and the whole batch went out on one.
+        #
+        # tor_control_targets was added for this and applied to all 21 call
+        # sites in the toolchain. These two -- in the process that actually
+        # publishes the money -- were the ones it missed. Found by RUNNING the
+        # pipeline end to end, not by a test: nothing had ever executed
+        # GhostSpiral.main() far enough to spawn a real broadcast.
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
         secure_delay(5.0, 15.0)
 
         attempts = args.rebroadcast
@@ -973,7 +990,10 @@ def main():
 
             attempts -= 1
             if attempts > 0:
-                newnym()
+                # Same reasoning as the per-TX rotation above, and this one is
+                # best-effort, so a wrong-daemon rotation here would have been
+                # silent rather than merely useless.
+                newnym(proxy_url=getattr(args, "tor_proxy", ""))
                 secure_delay(5.0, 15.0)
 
         if outcome == "relayed":

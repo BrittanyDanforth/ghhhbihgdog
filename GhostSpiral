@@ -3466,6 +3466,92 @@ def resolve_entry_mode(args) -> tuple:
             receive_subaddress_index)
 
 
+def refuse_hot_wallet(rpc) -> None:
+    """The online wallet must be VIEW-ONLY, and nothing checked.
+
+    The pipeline is create -> sign -> broadcast across an air gap: phase_create
+    asks monero-wallet-rpc for an `unsigned_txset`, an offline full wallet
+    signs it, the broadcaster relays it. monero-wallet-rpc only returns an
+    unsigned_txset for a WATCH-ONLY wallet -- a full (hot) wallet builds and
+    relays directly and returns no such field.
+
+    OPSEC_SETUP.md says view-only in six places and airgap_tx_signer's usage
+    block says "Phase 1 -- create unsigned TXs (online, view-only wallet)".
+    Nothing enforced it. Pointing --rpc-primary at an ordinary hot wallet --
+    the wallet that HAS the money, so the obvious thing to point at -- produced
+    this, deep inside Round 0:
+
+        [!] TX 0: RPC returned no unsigned_txset
+        [+] Phase 1 complete: 0 unsigned TXs created, 1 failed.
+        [!] 1 TXs failed. Check RPC connection and balances.
+
+    The connection is fine and the balance is fine, so that advice sends the
+    operator to debug the two things that are not wrong. And it arrives AFTER
+    the veil and fan-out plans are on disk in plaintext and after several Tor
+    rotations, rather than before anything has happened.
+
+    Observed by running the real pipeline against a real wallet, not deduced.
+
+    THE PROBE IS sign_transfer WITH A JUNK TXSET, and the obvious alternatives
+    were tried against a real monero-wallet-rpc 0.18.3.1 first:
+
+      * `sign` -- on a watch-only wallet the RPC closes the connection and the
+        PROCESS DIES. A preflight that kills the operator's wallet-rpc is worse
+        than no preflight.
+      * `export_key_images` -- same, it kills a watch-only wallet outright.
+      * `query_key {"key_type": "spend_key"}` discriminates cleanly, but on a
+        hot wallet it pulls the SPEND KEY over the wire into this process to
+        answer a yes/no question.
+
+    sign_transfer errors on both kinds, returns no key material either way, and
+    both wallets survive it:
+
+        full wallet  -> "cannot load unsigned_txset"
+        view-only    -> "command not supported by watch-only wallet"
+
+    An unrecognised answer is treated as "cannot tell" and let through. This is
+    a preflight; refusing a run over a diagnostic string a future RPC version
+    words differently would be worse than the failure it prevents.
+    """
+    try:
+        r = rpc.raw_request("sign_transfer", {"unsigned_txset": "00"})
+    except Exception as e:                                   # noqa: BLE001
+        # An RPC that reports by raising is saying the same thing the error
+        # body would. Read the text and fall through if it is not ours.
+        msg = str(e).lower()
+    else:
+        msg = str(r).lower() if r is not None else ""
+    if "watch-only" in msg or "watch only" in msg:
+        integrity_log("stage0", "wallet_view_only_ok")
+        return
+    if "cannot load unsigned_txset" not in msg:
+        integrity_log("stage0", "wallet_kind_unknown")
+        return
+    integrity_log("stage0", "REFUSED:hot_wallet_online")
+    sys.exit(
+        "[!] --rpc-primary is serving a FULL (hot) wallet, and this pipeline "
+        "cannot use one.\n"
+        "    Every round is built as an UNSIGNED transaction, signed offline, "
+        "then relayed\n"
+        "    separately, and monero-wallet-rpc only returns an unsigned txset "
+        "for a\n"
+        "    WATCH-ONLY wallet. A full wallet builds and relays directly, so "
+        "Round 0 would\n"
+        "    fail with 'RPC returned no unsigned_txset' once the plans were "
+        "already on disk.\n"
+        "\n"
+        "    NOTHING HAS BEEN SPENT. Serve a view-only wallet here and keep "
+        "the full one\n"
+        "    offline for --wallet-file:\n"
+        "        monero-wallet-cli --generate-from-view-key <name>    "
+        "(address + private VIEW key)\n"
+        "    then point --rpc-primary at a monero-wallet-rpc holding THAT "
+        "wallet, and\n"
+        "    --wallet-file at the full wallet on the offline machine. "
+        "OPSEC_SETUP.md walks\n"
+        "    through it — the air gap is the point, not an inconvenience.")
+
+
 def stage0_preflight(args, proxy) -> tuple:
     """Every gate that must hold BEFORE this run is allowed to touch money.
 
@@ -3594,6 +3680,11 @@ def stage0_preflight(args, proxy) -> tuple:
 
     rpc_primary = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
     rpc_alt = connect_rpc(args.rpc_alt, proxy_url=getattr(args, "tor_proxy", "")) if args.rpc_alt else None
+
+    # BEFORE ANYTHING IS PLANNED. A hot wallet cannot produce the unsigned
+    # transactions this pipeline is built on, and discovering that in Round 0
+    # costs a confusing failure with the plans already written to disk.
+    refuse_hot_wallet(rpc_primary)
 
     # Sync guard: wait for nodes to agree on height
     for attempt in range(30):
