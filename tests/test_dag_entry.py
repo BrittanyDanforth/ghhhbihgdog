@@ -1385,6 +1385,37 @@ except ValueError:
 check("btc: the splitter RAISES on an impossible split rather than returning "
       "a negative amount", _raised)
 
+# JUST BELOW THE FLOOR IT MUST RAISE, NOT RETURN A TIED PAIR.
+#
+# 2 satoshis across 2 chunks, and 3 across 3, clear "one satoshi each" but sit
+# below 1+2+...+n, so no distinct positive split exists. The construction
+# leaves the smallest chunk at zero there, and the positivity repair moves a
+# satoshi onto it FROM THE LARGEST -- which lands both on the same value. The
+# splitter used to return [1, 1] on roughly half the draws and raise on the
+# rest: distinct in the branch that promises it, tied in the branch that fixes
+# positivity, with nothing between them to notice. resolve_btc_amount refuses
+# these totals, so the CLI never reaches them -- but the raise-branch's own
+# comment says reaching the splitter means that gate was bypassed, and there it
+# must raise EVERY time, never hand back a repeated deposit amount.
+#
+# Hammered, because the old behaviour was a coin flip: a single draw caught it
+# only half the time, which is exactly how the earlier distinctness check let a
+# broken repair through a full mutation sweep.
+for _bt, _bn in [(2, 2), (3, 3)]:
+    _tot = ghost.SATOSHI_BTC * Decimal(_bt)
+    _tied = _slipped = 0
+    for _rep in range(400):
+        try:
+            _bx = ghost.split_btc_amount(_tot, _bn, _R)
+            _slipped += 1
+            if len(set(_bx)) != _bn:
+                _tied += 1
+        except ValueError:
+            pass
+    check(f"btc: {_bt} satoshis across {_bn} chunks is REFUSED every time, "
+          f"never returned as a repeated deposit amount",
+          _slipped == 0 and _tied == 0)
+
 # Every chunk is a whole number of satoshis — an unsendable amount would be an
 # instruction the operator cannot follow. This holds because the TOTAL is
 # satoshi-exact: resolve_btc_amount refuses anything finer, which is what makes

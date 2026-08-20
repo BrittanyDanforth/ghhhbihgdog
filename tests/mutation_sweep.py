@@ -349,6 +349,16 @@ MUTATIONS = [
   "    if key in _CARDINAL_EVENTS_LOGGED:\n        return \"\"",
   "    if False:\n        return \"\"",
   ["test_units"]),
+
+ # The positivity repair can put two chunks on the same satoshi just below the
+ # feasibility floor -- [1, 1] for 2 satoshis across 2. Dropping the final
+ # distinctness re-check lets that repeated deposit amount be RETURNED instead
+ # of raised, which is the Bitcoin-side cluster the whole function removes.
+ ("the split's distinctness re-check after the positivity repair is dropped",
+  "GhostSpiral",
+  "    if len(set(amounts)) != n:\n        raise ValueError(",
+  "    if False:\n        raise ValueError(",
+  ["test_dag_entry"]),
 ]
 
 
