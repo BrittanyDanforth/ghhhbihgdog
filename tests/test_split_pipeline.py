@@ -199,8 +199,31 @@ check("...from three DIFFERENT carrier accounts",
 _sizes = [len(t.get("destinations") or []) for t in _by.get("Fan-out", [])]
 check(f"...with slices sized by each chunk's OWN balance, not equally {_sizes}",
       len(set(_sizes)) > 1 and _sizes == sorted(_sizes, reverse=True))
-check("Round 2 hops every funded output",
-      len(_by.get("DAG", [])) == sum(_sizes))
+# EVERY OUTPUT THAT CAN LEGALLY HOP, WHICH IS NOT EVERY OUTPUT.
+#
+# This asserted len(DAG) == sum(_sizes) -- every fan-out output hops -- and had
+# been FLAKY since it was written: 9 failures in 25 runs, silently passing the
+# audit's verification sweeps by luck. The cause is not a bug in the round. A
+# hop must leave its source AND stay inside its own chunk (that restriction is
+# what stops two chunks meeting in one transaction), so a chunk holding ONE mix
+# subaddress has nowhere legal to send it. With balances 4/3/1 the smallest
+# chunk gets a slice of 1 whenever fanout_count lands on 8 (slices [4,3,1]) and
+# a slice of 2 when it lands on 10 ([5,3,2]) -- and fanout_count varies with the
+# decoy count, so the same test drew both.
+#
+# Loosening it to <= would have hidden a real regression. The honest assertion
+# is the one the design actually makes: every output hops EXCEPT those in a
+# slice too thin to have a legal destination -- and the run must SAY so, because
+# silently skipping a mixing round is the failure this project keeps finding.
+_thin_slices = [n for n in _sizes if n < 2]
+_hoppable = sum(n for n in _sizes if n >= 2)
+check(f"Round 2 hops every output that CAN hop — {len(_by.get('DAG', []))} of "
+      f"{_hoppable} hoppable, from slices {_sizes}",
+      len(_by.get("DAG", [])) == _hoppable)
+check("...and a chunk too thin to hop is REPORTED, not silently skipped",
+      not _thin_slices or "nowhere to hop" in out.getvalue())
+check("...with no hop invented for a chunk that had nowhere to send it",
+      len(_by.get("DAG", [])) <= sum(_sizes))
 
 print("\n=== the invariant, on the plans this run actually produced ===")
 veil = dict(ROUNDS).get("Entry veil", [])

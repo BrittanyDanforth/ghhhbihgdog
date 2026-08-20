@@ -1684,3 +1684,29 @@ calls.** B1 was `split_by_weight` (contiguity assumed by `size_distribution`),
 B6 was `assign_hop_destinations` (uniqueness assumed across repeated calls),
 B8 is `create_fresh_account`. In each case some callers closed the gap and
 others did not, and nothing marked which.
+
+### B9 (FIXED): the end-to-end split test had been a coin flip since it was written
+
+The final verification sweep turned `test_split_pipeline` red — one check,
+`"Round 2 hops every funded output"`. Re-running it passed. Measured: **9
+failures in 25 runs** on the tree from before this round's DAG work, **3 in 25**
+after. Pre-existing, and unrelated to the changes that exposed it.
+
+It was not a bug in the round. A hop must leave its source AND stay inside its
+own chunk — that restriction is what stops two chunks meeting in one
+transaction — so a chunk holding ONE mix subaddress has nowhere legal to send
+it. With balances 4/3/1 the smallest chunk gets a slice of 1 when
+`fanout_count` lands on 8 (slices `[4,3,1]`) and a slice of 2 when it lands on
+10 (`[5,3,2]`), and `fanout_count` varies with the decoy count. The same test
+drew both. The run reports the thin chunk ("nowhere to hop"); the test just
+demanded more than the design provides.
+
+Loosening it to `<=` would have hidden a genuinely dropped hop. It now counts
+the outputs that CAN hop, requires the thin chunk to be reported, and keeps an
+upper bound. **0 failures in 40 runs**, and 6/6 red against a mutation that
+silently drops one hop.
+
+Second instance of one shape this round — the BTC distinctness check was the
+first. **A test that is really a coin flip reports SURVIVED and CAUGHT for the
+same mutation on different runs**, and passes verification sweeps by luck. Both
+are deterministic now.

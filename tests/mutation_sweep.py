@@ -329,6 +329,17 @@ MUTATIONS = [
   "    if len(set(_pc_addrs)) != len(_pc_addrs) or len(set(hop_accounts)) != len(hop_accounts):",
   "    if False:",
   ["test_dag_entry"]),
+
+ # The end-to-end split run must still notice a hop that silently goes missing.
+ # Its old check ("hops every funded output") was FLAKY -- 9 failures in 25 --
+ # because a chunk whose slice holds one subaddress has nowhere legal to hop,
+ # so the assertion was stronger than the design. Loosening it to <= would have
+ # hidden exactly this mutation; it counts the HOPPABLE outputs instead.
+ ("the DAG round silently drops a hop it could have made", "GhostSpiral",
+  "        _unassigned = [s for s in _fundable if s not in _dsts]",
+  "        _dsts.pop(next(iter(_dsts)), None) if _dsts else None\n"
+  "        _unassigned = [s for s in _fundable if s not in _dsts]",
+  ["test_split_pipeline"]),
 ]
 
 
