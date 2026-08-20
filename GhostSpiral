@@ -4446,19 +4446,75 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
     # changes. With a target in hand, "not enough has arrived yet" is the
     # condition that actually matters.
     if receive_mode:
-        # The funds are already on ENTRY by definition, so there is nothing to
-        # wait for -- but say so when the operator has passed flags that only
-        # this wait consults, rather than accepting them, validating them and
-        # then discarding them in silence.
-        if (args.expect_total_xmr is not None
-                or args.accept_partial_swap
-                or args.swap_tolerance != SWAP_TOLERANCE_DEFAULT):
-            print("  [!] --expect-total-xmr / --swap-tolerance / "
-                  "--accept-partial-swap have NO EFFECT in receiver mode: the "
-                  "XMR is already on the entry address, so there is no arrival "
-                  "to wait for. Use receive_watch before this run if you need "
-                  "to wait for a swap to land.")
-            integrity_log("stage4", "arrival_flags_ignored_receive_mode")
+        # "THE FUNDS ARE ALREADY THERE" IS AN ASSUMPTION, NOT A FACT, and this
+        # branch used to treat it as one: it returned immediately and printed
+        # that --expect-total-xmr, --swap-tolerance and --accept-partial-swap
+        # "have NO EFFECT in receiver mode".
+        #
+        # They have an effect. Receiver mode means the XMR arrives from a swap
+        # the operator arranged with thor_swap_preparer, and a --split N swap
+        # lands N chunks minutes to hours apart -- the same staggered arrival
+        # the send-mode wait below exists for. Nothing forces the operator to
+        # run receive_watch first, and nothing checks that they did.
+        #
+        # Driven: receiver mode, --expect-total-xmr 4.0, 1.0 XMR on ENTRY.
+        # It returned (1.0, 1.0) immediately, printed "NO EFFECT", and the run
+        # planned against a QUARTER of the money. The dust guard downstream
+        # cannot catch it -- 1.0 XMR is four orders of magnitude above
+        # DUST_XMR. Chunks 2-4 then land on an ENTRY the run has finished with:
+        # the veil has already swept it, the distribution has already sized
+        # itself, and the exit correctly refuses to sweep ENTRY -- so they sit
+        # on the one address the public ThorChain memo names, unmixed, until
+        # the operator notices.
+        #
+        # So when the operator HAS told us the total, wait for it, with the
+        # same floor, the same tolerance and the same --accept-partial-swap
+        # escape hatch as the send path. The only thing receiver mode genuinely
+        # lacks is quotes to derive the total FROM; given one, there is no
+        # difference worth a separate code path.
+        if args.expect_total_xmr is None:
+            # No target, so nothing can be checked -- and that is worth saying,
+            # because "it returned immediately" reads as "it verified".
+            if unlocked_bal <= DUST_XMR:
+                print("  [!] Receiver mode with no --expect-total-xmr: this "
+                      "run does NOT wait, and ENTRY holds nothing yet.")
+            integrity_log("stage4", "arrival_receive_no_target")
+            return total_bal, unlocked_bal
+
+        _rfloor, _rtight = swap_arrival_floor(
+            args.expect_total_xmr, args.swap_tolerance, [], n_chunks)
+        if unlocked_bal >= _rfloor:
+            integrity_log("stage4", "arrival_receive_already_complete")
+            return total_bal, unlocked_bal
+
+        print(f"  [*] Receiver mode: waiting for ~{_rfloor} XMR of the "
+              f"{args.expect_total_xmr} XMR you expect "
+              f"({n_chunks} chunk(s), "
+              f"{args.swap_tolerance * 100:.0f}% tolerance). "
+              f"{unlocked_bal} XMR unlocked so far.")
+        _rarr = wait_for_swap_arrival(
+            lambda: entry_set_balance(rpc, entry_pair_list), _rfloor, n_chunks)
+        total_bal, unlocked_bal = _rarr["total"], _rarr["unlocked"]
+        if _rarr["state"] == "interrupted":
+            sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
+        if _rarr["state"] == "funded":
+            integrity_log("stage4", "xmr_arrival_done")
+            return total_bal, unlocked_bal
+        integrity_log("stage4", f"arrival_incomplete:{_rarr['state']}")
+        if not args.accept_partial_swap:
+            sys.exit(
+                f"[!] The expected XMR has NOT fully arrived "
+                f"({'nothing new arrived' if _rarr['state'] == 'stalled' else 'the time limit was reached'}).\n"
+                f"    On ENTRY now: {unlocked_bal} XMR unlocked "
+                f"({total_bal} XMR total); expected ~{_rfloor}.\n"
+                f"    Nothing has been spent. Planning against a fraction "
+                f"leaves the rest UNMIXED on ENTRY -- the address your swap "
+                f"memo names in public -- and nothing in this run will ever "
+                f"mix it.\n"
+                f"    Wait and re-run, or pass --accept-partial-swap to plan "
+                f"against what is here.")
+        print(f"  [!] --accept-partial-swap: planning against {unlocked_bal} "
+              f"XMR. Anything arriving later stays on ENTRY unmixed.")
         return total_bal, unlocked_bal
     if not (unlocked_bal <= DUST_XMR
             or (floor_ > 0 and unlocked_bal < floor_)):

@@ -547,15 +547,20 @@ check("STAGE4: ...and warns that later arrivals are never mixed",
 check("STAGE4: ...and that the exit will not withdraw them",
       "will NOT withdraw" in _out)
 
-# Receiver mode: nothing to wait for -- but the flags must not be swallowed.
+# Receiver mode WITH the target already satisfied: 9 XMR on ENTRY against an
+# expected 5.0, so there is genuinely nothing to wait for and it returns at
+# once. This used to assert the opposite intent -- that the flags were IGNORED
+# and said so ("NO EFFECT in receiver mode") -- which was the defect, not the
+# contract: the flags are now honoured, and the receiver section further down
+# drives the case where the money has NOT all arrived.
 _res, _out, _exit = drive_stage4([(9, 9)], deposits=_Q3, receive_mode=True,
                                  unlocked_now=D(9), total_now=D(9),
                                  expect=D("5.0"))
-check("STAGE4: receiver mode returns the balance it was given",
+check("STAGE4: receiver mode returns the balance it was given when the "
+      "expected total is already there",
       _exit is None and _res == (D(9), D(9)))
-check("STAGE4: ...and SAYS the arrival flags are ignored rather than "
-      "discarding them in silence",
-      "NO EFFECT in receiver mode" in _out)
+check("STAGE4: ...and no longer claims the arrival flags have NO EFFECT",
+      "NO EFFECT in receiver mode" not in _out)
 
 # Manual mode: no quotes, so no target. The warning must not be conditional on
 # --split, which does nothing in manual mode.
@@ -1076,6 +1081,112 @@ check("heartbeat: ...and how far from the target, as a percentage",
 check("heartbeat: GhostSpiral and receive_watch use ONE progress_line",
       ghost.progress_line is _gsc.progress_line)
 
+
+
+# ==========================================================================
+# RECEIVER MODE MUST WAIT TOO, WHEN IT HAS BEEN TOLD WHAT TO WAIT FOR.
+#
+# This branch returned immediately and printed that --expect-total-xmr,
+# --swap-tolerance and --accept-partial-swap "have NO EFFECT in receiver mode:
+# the XMR is already on the entry address, so there is no arrival to wait for."
+#
+# The XMR gets to that entry address from a swap the operator arranged, and a
+# --split N swap lands N chunks minutes to hours apart -- the same staggered
+# arrival the send-mode wait exists for. Nothing forces a receive_watch run
+# first and nothing checked that one happened.
+#
+# Driven on the old code: receiver mode, --expect-total-xmr 4.0, 1.0 XMR on
+# ENTRY -> returned (1.0, 1.0) immediately and the run planned against a
+# QUARTER of the money. The dust guard downstream cannot see it: 1.0 XMR is
+# four orders of magnitude above DUST_XMR. Chunks 2-4 then land on an ENTRY the
+# run has finished with -- veil swept, distribution sized -- and the exit
+# correctly refuses to sweep ENTRY, so they sit on the one address the public
+# ThorChain memo names.
+# ==========================================================================
+print("\n=== receiver mode waits for the total it was given ===")
+
+
+class _RClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, n):
+        self.t += n
+
+
+_r_real = ghost.wait_for_swap_arrival
+
+
+def _r_fast(bf, f, c, **kw):
+    cl = _RClock()
+    return _r_real(bf, f, c, stall_s=3600, timeout_s=7200, poll_s=30,
+                   sleep_fn=cl.sleep, clock=cl, echo=lambda *a, **k: None)
+
+
+def _recv(landed, expect, accept_partial=False, target=True, later=None):
+    seq = {"n": 0}
+
+    def _bal(rpc, pairs):
+        seq["n"] += 1
+        v = D(str(later)) if (later and seq["n"] > 3) else D(str(landed))
+        return (v, v)
+
+    _saved = (ghost.wait_for_swap_arrival, ghost.entry_set_balance,
+              ghost.integrity_log)
+    ghost.wait_for_swap_arrival = _r_fast
+    ghost.entry_set_balance = _bal
+    ghost.integrity_log = lambda *a, **k: None
+    a = types.SimpleNamespace(
+        expect_total_xmr=(D(str(expect)) if target else None),
+        accept_partial_swap=accept_partial,
+        swap_tolerance=ghost.SWAP_TOLERANCE_DEFAULT, split=4)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return ("ok", ghost.stage4_await_swap(
+                a, None, [(3, 1)], ["8" + "A" * 94], [], True,
+                D(str(landed)), D(str(landed))))
+    except SystemExit as e:
+        return ("exit", str(e))
+    finally:
+        (ghost.wait_for_swap_arrival, ghost.entry_set_balance,
+         ghost.integrity_log) = _saved
+
+
+_st, _r = _recv(1.0, 4.0)
+check("receiver: 1.0 of an expected 4.0 XMR REFUSES instead of planning "
+      "against a quarter of the money", _st == "exit")
+check("receiver: ...and says the rest would stay on ENTRY unmixed",
+      _st == "exit" and "UNMIXED" in _r)
+check("receiver: ...and names the escape hatch rather than only refusing",
+      _st == "exit" and "--accept-partial-swap" in _r)
+
+_st, _r = _recv(4.0, 4.0)
+check("receiver: the full amount proceeds", _st == "ok" and _r[1] == D("4.0"))
+
+# THE POINT OF WAITING: the rest turns up while it waits and the run continues
+# on its own, which is what "detect it and then just do it" means.
+_st, _r = _recv(1.0, 4.0, later=4.0)
+check("receiver: the rest arriving DURING the wait proceeds automatically "
+      "with the full amount", _st == "ok" and _r[1] == D("4.0"))
+
+_st, _r = _recv(1.0, 4.0, accept_partial=True)
+check("receiver: --accept-partial-swap still plans against what is there",
+      _st == "ok" and _r[1] == D("1.0"))
+
+# Unchanged where there is nothing to check against.
+_st, _r = _recv(1.0, 4.0, target=False)
+check("receiver: with no --expect-total-xmr the behaviour is unchanged",
+      _st == "ok" and _r[1] == D("1.0"))
+# code_only: the fix's own comment QUOTES the removed sentence to record why
+# it went, and a raw read cannot tell a defect from its own post-mortem. That
+# is the fourth time this session a literal source check has caught prose.
+from srcutil import code_only as _code_only_sa                # noqa: E402
+check("receiver: ...and the old 'NO EFFECT' claim is gone from the CODE",
+      "have NO EFFECT in receiver mode" not in
+      _code_only_sa(os.path.join(REPO, "GhostSpiral")))
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
