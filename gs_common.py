@@ -1003,7 +1003,7 @@ def check_daemon_relay_egress(daemon_url: str,
     broadcast on a diagnostic.
     """
     out = {"verdict": "unknown", "onion": 0, "clear": 0, "local": 0,
-           "detail": ""}
+           "detail": "", "nettype": "unknown"}
     parsed = urlparse(daemon_url)
     host = (parsed.hostname or "127.0.0.1").lower()
     use_proxies = None
@@ -1018,6 +1018,20 @@ def check_daemon_relay_egress(daemon_url: str,
         info = requests.post(
             endpoint, json={"jsonrpc": "2.0", "id": "0", "method": "get_info"},
             timeout=20, proxies=use_proxies).json().get("result") or {}
+        # WHICH CHAIN. get_info already told us; nothing was reading it.
+        #
+        # monerod reports nettype as "mainnet" | "testnet" | "stagenet" |
+        # "fakechain" (--regtest). The WALLET cannot answer this: regtest
+        # deliberately uses MAINNET address prefixes, so validate_address on a
+        # regtest wallet returns nettype "mainnet" for both its own addresses
+        # and real mainnet ones -- driven and confirmed. The daemon is the only
+        # component that knows, and this function was already asking it and
+        # throwing the answer away.
+        #
+        # Carried out even on the offline/early-return paths below, because
+        # "which chain" is exactly the question an operator needs answered when
+        # something looks wrong.
+        out["nettype"] = str(info.get("nettype") or "unknown")
         if info.get("offline"):
             out["verdict"] = "offline"
             out["detail"] = "daemon is running --offline; it cannot relay at all"

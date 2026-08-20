@@ -2890,6 +2890,15 @@ def build_cli() -> argparse.ArgumentParser:
                           "the funds stay on this wallet.")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--allow-test-chain", action="store_true",
+                     help="proceed when the daemon is on testnet, stagenet or a "
+                          "regtest fakechain instead of mainnet. WITHOUT this the "
+                          "run STOPS, because the mix-up is silent in both "
+                          "directions: a 'test' pointed at mainnet spends real "
+                          "money irreversibly, and a 'real' run on a private chain "
+                          "moves nothing anyone else can see. The wallet cannot "
+                          "tell you which it is — regtest uses mainnet address "
+                          "prefixes — so only the daemon knows.")
     cli.add_argument("--accept-fallback-fee", action="store_true",
                      help="proceed when the daemon gives no fee estimate, using "
                           "the built-in per-priority figure instead of aborting. "
@@ -3137,6 +3146,65 @@ def stage0_preflight(args, proxy) -> tuple:
     # time wasted. Fail before any of that happens.
     egress = check_daemon_relay_egress(args.rpc_daemon, proxy)
     integrity_log("stage0", f"relay_egress:{egress['verdict']}")
+
+    # WHICH CHAIN IS THIS, and does the operator know?
+    #
+    # Nothing anywhere in this toolchain asked. check_daemon_relay_egress has
+    # always fetched get_info and has always thrown away its `nettype` field.
+    #
+    # THE WALLET CANNOT ANSWER IT. Driven against a real monerod --regtest with
+    # a real monero-wallet-rpc: regtest uses MAINNET address prefixes, so the
+    # wallet's validate_address returns nettype "mainnet" for its own addresses
+    # AND for a genuine mainnet address, and gs_common.validate_xmr_address --
+    # which checks format and checksum entirely offline and never asks the
+    # wallet at all -- accepts both. The daemon reported `nettype: fakechain`
+    # the whole time.
+    #
+    # Both directions of the mix-up are expensive, and the console makes the
+    # first one easy: rpc_daemon is a text field that stays at :18081 while the
+    # wallet is swapped for a test one.
+    #
+    #   * believing it is a TEST run when --rpc-daemon points at real mainnet
+    #     -> the pipeline spends REAL money, and every "test" transaction is a
+    #        real, irreversible one;
+    #   * believing it is a REAL run when the daemon is a fakechain -> the
+    #     operator thinks their funds are mixed and sitting at --exit-to, and
+    #     nothing has happened on any chain anyone else can see.
+    #
+    # So: say it out loud always, and REFUSE a non-mainnet chain unless the
+    # operator asked for one. Refusing is the right default because this is the
+    # tool that SPENDS -- the same argument _reject_implausible_fee makes about
+    # sizing a plan around a bogus number.
+    _net = str(egress.get("nettype") or "unknown")
+    integrity_log("stage0", f"chain:{_net}")
+    if _net == "mainnet":
+        print(f"  [+] Chain: MAINNET (daemon at {args.rpc_daemon}).")
+    elif _net == "unknown":
+        print(f"  [!] Could not determine which chain the daemon at "
+              f"{args.rpc_daemon} is on.")
+        print( "      Proceeding, but you are spending without confirmation of "
+               "which network this is.")
+    else:
+        print(f"  [!] Chain: {_net.upper()} — this is NOT mainnet.")
+        if not args.allow_test_chain:
+            sys.exit(
+                f"[!] The daemon at {args.rpc_daemon} is on {_net}, not mainnet.\n"
+                f"    Refusing before anything is created. Two ways this bites, "
+                f"and both are quiet:\n"
+                f"      * you think this is a test and it is spending REAL "
+                f"money — every\n"
+                f"        transaction is irreversible;\n"
+                f"      * you think this is real and it is a private chain — "
+                f"nothing you can\n"
+                f"        see afterwards exists to anyone else, and the funds "
+                f"never moved.\n"
+                f"    The WALLET cannot tell you which it is: regtest uses "
+                f"mainnet address\n"
+                f"    prefixes, so the addresses look identical. Only the "
+                f"daemon knows.\n"
+                f"    If you meant to run on {_net}, pass --allow-test-chain.")
+        print(f"  [!] --allow-test-chain given; proceeding on {_net}. "
+              f"Nothing here touches mainnet.")
     if egress["verdict"] == "clearnet":
         print(f"  [!] RELAY EGRESS IS CLEARNET: {egress['detail']}")
         if not args.allow_clearnet_relay:

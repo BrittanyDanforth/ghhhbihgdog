@@ -1078,6 +1078,110 @@ def test_console_does_not_call_a_healthy_daemon_broken():
           in (fresh.get("warning") or ""))
 
 
+def test_console_can_express_the_timing_parameter():
+    """The dashboard must be able to set --hop-delay. It could not.
+
+    SCHEMA is the whitelist -- "Anything not here cannot reach an argv" -- and
+    hop_delay was absent from it, so EVERY dashboard-driven run was pinned to
+    GhostSpiral's DEFAULT_HOP_DELAY of 180-720s, silently, with no control and
+    no mention that it mattered.
+
+    GhostSpiral's own --hop-delay help calls it "AN OPSEC PARAMETER" and says
+    the default spends each carrier output "at roughly 11-16 blocks of age --
+    close to the youngest an output can legally be spent", while Monero draws
+    ring decoys from a distribution "whose bulk sits far above that" -- so the
+    real output tends to be the newest member of its own ring. It recommends
+    21600-86400. The CLI accepts up to HOP_DELAY_MAX (7 days). The dashboard
+    offered exactly one value, the weakest, and every run from the page carried
+    the same short timing signature.
+    """
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "ghost_hd", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(g)
+
+    check("hop delay: the console whitelist admits it at all",
+          "hop_delay" in c.SCHEMA)
+
+    def argv_for(v):
+        p = {"mode": "receive", "receive_wallet": "w.json",
+             "tor_proxy": "socks5h://127.0.0.1:9050",
+             "rpc_daemon": "http://127.0.0.1:18081",
+             "rpc_primary": "http://127.0.0.1:18083",
+             "wallets": 10, "deep": 2, "fee_priority": 1}
+        if v is not None:
+            p["hop_delay"] = v
+        cl = c.clean(p)
+        a, _why = c.pipeline_argv(cl["params"])
+        return a, cl["errors"]
+
+    a, _ = argv_for("21600-86400")
+    check("hop delay: a range reaches the argv",
+          "--hop-delay" in a and a[a.index("--hop-delay") + 1] == "21600-86400")
+    a, _ = argv_for("600")
+    check("hop delay: a single value reaches the argv",
+          "--hop-delay" in a and a[a.index("--hop-delay") + 1] == "600")
+
+    # OMITTED means GhostSpiral's default, not a copy of it here. Re-declaring
+    # the default in the console is how the --split ceiling and the job timeout
+    # both drifted.
+    a, _ = argv_for(None)
+    check("hop delay: unset omits the flag, so the default lives in ONE place",
+          "--hop-delay" not in a)
+    a, _ = argv_for("")
+    check("hop delay: ...and an empty choice does the same", "--hop-delay" not in a)
+
+    # Garbage must not reach an argv that ends in a spend.
+    for bad in ("abc", "-5", "12-9999999999", "1 2", "600;rm -rf /"):
+        a, errs = argv_for(bad)
+        check(f"hop delay: {bad!r} is refused and never reaches the argv",
+              "--hop-delay" not in a and any("hop_delay" in e for e in errs))
+
+    # The console regex is deliberately looser than the real cap; GhostSpiral
+    # owns the bound and must still enforce it, with its own message.
+    check("hop delay: the console accepts 7 digits...",
+          bool(c.HOPDELAY_RE.match("9999999")))
+    try:
+        g.parse_hop_delay("9999999")
+        check("hop delay: ...and GhostSpiral enforces HOP_DELAY_MAX", False)
+    except ValueError as e:
+        check("hop delay: ...and GhostSpiral enforces HOP_DELAY_MAX on it",
+              str(g.HOP_DELAY_MAX) in str(e))
+    # Everything the console offers must actually parse.
+    import re as _re
+    for opt in _re.findall(r'<option value="([^"]*)"', c.PAGE if hasattr(c, "PAGE") else ""):
+        if not opt:
+            continue
+        if c.HOPDELAY_RE.match(opt):
+            try:
+                g.parse_hop_delay(opt)
+                ok = True
+            except ValueError:
+                ok = False
+            check(f"hop delay: the offered option {opt!r} is accepted by "
+                  f"GhostSpiral", ok)
+
+
+def test_daemon_chain_is_reported_not_assumed():
+    """check_daemon_relay_egress must report WHICH chain the daemon is on.
+
+    It has always called get_info and always discarded the nettype field. The
+    wallet cannot answer this: regtest uses MAINNET address prefixes, so
+    validate_address on a regtest wallet returns nettype "mainnet" for its own
+    addresses and for real mainnet ones alike, and gs_common.validate_xmr_address
+    checks format and checksum entirely offline without ever asking the wallet.
+    Driven against a real monerod --regtest, the daemon said `fakechain` while
+    every address check said mainnet.
+    """
+    import gs_common as _gc
+    check("chain: the egress probe always carries a nettype key",
+          "nettype" in _gc.check_daemon_relay_egress("http://127.0.0.1:1", None))
+    check("chain: an unreachable daemon reports it as unknown, not a guess",
+          _gc.check_daemon_relay_egress("http://127.0.0.1:1", None)["nettype"]
+          == "unknown")
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

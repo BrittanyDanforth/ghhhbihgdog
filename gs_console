@@ -105,6 +105,11 @@ URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:\d{1,5})?$")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")
 DEC_RE = re.compile(r"^\d{1,10}(\.\d{1,12})?$")
+#: --hop-delay, as GhostSpiral.parse_hop_delay accepts it: "SECONDS" or
+#: "MIN-MAX" seconds. Bounds are re-checked by parse_hop_delay itself (negative,
+#: backwards, and > HOP_DELAY_MAX all raise there); this only has to keep
+#: anything that is not that shape off the argv.
+HOPDELAY_RE = re.compile(r"^\d{1,7}(-\d{1,7})?$")
 #: Monero address: 95 chars, base58 (no 0OIl), 4/8 prefix. Standard AND
 #: subaddress forms both start 4/8 and both are legitimate exit destinations --
 #: an exchange deposit address is normally a subaddress. This is a FORMAT check
@@ -132,6 +137,24 @@ SCHEMA = {
     "wallets":      ("int", (3, 60)),
     "deep":         ("int", (1, 6)),
     "fee_priority": ("int", (1, 4)),
+    # THE TIMING PARAMETER, and the console could not express it.
+    #
+    # SCHEMA is the whitelist -- "Anything not here cannot reach an argv" --
+    # and hop_delay was not in it, so EVERY dashboard-driven run was pinned to
+    # GhostSpiral's DEFAULT_HOP_DELAY of 180-720s (3-12 minutes) with no way to
+    # change it and no mention that it mattered.
+    #
+    # GhostSpiral's own --hop-delay help calls it "AN OPSEC PARAMETER" and says
+    # the default "spends each carrier output at roughly 11-16 blocks of age --
+    # close to the youngest an output can legally be spent, and Monero's decoy
+    # selection draws ring members from a distribution whose bulk sits far
+    # above that", i.e. the real output tends to be the newest member of its
+    # own ring, which is a standard heuristic. It recommends 21600-86400.
+    #
+    # The CLI accepts up to HOP_DELAY_MAX (7 days). The dashboard offered one
+    # value, the weakest one, silently -- so every run driven from this page
+    # carried the same short timing signature.
+    "hop_delay":    ("re", HOPDELAY_RE),
     "dag_mixing":   ("bool", None),
     "peel":         ("bool", None),
     "joinmarket":   ("bool", None),
@@ -239,6 +262,12 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
     a += ["--wallets", str(p.get("wallets", 10)),
           "--deep", str(p.get("deep", 2)),
           "--fee-priority", str(p.get("fee_priority", 1))]
+    # Only when the operator set one: omitting the flag lets GhostSpiral apply
+    # its own DEFAULT_HOP_DELAY, so the default lives in ONE place instead of
+    # being re-declared here and drifting -- the mistake the --split ceiling
+    # and the job timeout both made.
+    if p.get("hop_delay"):
+        a += ["--hop-delay", str(p["hop_delay"])]
     if p.get("dag_mixing"):
         a.append("--dag-mixing")
     if p.get("peel"):
@@ -1636,6 +1665,25 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <div class="row2" style="margin-top:10px">
         <div class="f" style="grid-template-columns:76px 1fr"><label for="wallets">Wallets</label><input id="wallets" type="number" min="3" max="60" value="10"></div>
         <div class="f" style="grid-template-columns:56px 1fr"><label for="deep">Depth</label><input id="deep" type="number" min="1" max="6" value="2"></div>
+      </div>
+      <div class="f" style="grid-template-columns:110px 1fr;margin-top:8px">
+        <label for="hop_delay">Hop delay</label>
+        <select id="hop_delay">
+          <option value="">default · 180-720s (3-12 min) — fastest, WEAKEST</option>
+          <option value="1800-7200">30 min - 2 h · a few hours per chain</option>
+          <option value="7200-21600">2 - 6 h · most of a day</option>
+          <option value="21600-86400">6 - 24 h · days (recommended for ring-age)</option>
+          <option value="86400-259200">1 - 3 days · slowest</option>
+        </select>
+      </div>
+      <div class="d" style="margin:-2px 0 8px 0">
+        Seconds to wait before broadcasting each transaction. A hop cannot be
+        built until the previous output confirms and unlocks (~10 blocks); this
+        is added on top. At the default each output is spent at roughly 11-16
+        blocks of age — close to the youngest an output can legally be spent,
+        while Monero picks ring decoys from a distribution whose bulk sits far
+        above that, so the real output tends to be the newest member of its own
+        ring. Longer costs time and buys ring-age plausibility.
       </div>
       <label class="chk"><input type="checkbox" id="dag_mixing" checked>
         <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
