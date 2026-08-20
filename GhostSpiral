@@ -719,24 +719,72 @@ def split_btc_amount(total: Decimal, n: int, rng) -> list:
     # one -- and it costs a satoshi to remove. Take from the largest so the sum
     # is preserved and the band is not disturbed.
     #
-    # Best-effort by construction: at n satoshis total every chunk must be
-    # exactly one and distinctness is impossible. The loop stops rather than
-    # spinning, and the boundary repair below still guarantees positivity.
-    for _ in range(n * 4):
-        _seen = {}
-        _dup = None
-        for _i, _v in enumerate(amounts):
-            if _v in _seen:
-                _dup = _i
-                break
-            _seen[_v] = _i
-        if _dup is None:
+    # THE SEARCH-AND-NUDGE LOOP THIS REPLACES CYCLED, and gave up holding
+    # duplicates while the docstring promised there were none. It found the
+    # first duplicate, then moved a satoshi to it FROM THE LARGEST -- and the
+    # largest is usually the chunk it incremented on the previous pass, so it
+    # handed the satoshi straight back. Measured: with every weight equal it
+    # returns 3 distinct values out of 8, oscillating until n*4 passes run out;
+    # with a real SystemRandom at 0.00001 BTC across 8 chunks, 1100 of 20000
+    # draws came back with duplicates. It only ever worked because realistic
+    # totals produce at most ONE tied pair, which is the one case it can fix.
+    #
+    # This is not a search. n distinct positive satoshi values summing to S
+    # exist exactly when S >= 1+2+...+n, so the construction below always
+    # succeeds above that bound and resolve_btc_amount refuses below it.
+    #
+    #   1. Sort a view of the chunks and force the sequence strictly upward,
+    #      which makes them distinct and can only ADD satoshis.
+    #   2. Give the added satoshis back from the top down, taking from each
+    #      chunk only the slack above the one beneath it, so no step can
+    #      recreate a tie.
+    #
+    # Written back to the ORIGINAL indices, so chunk 0 is not systematically
+    # the smallest -- an ordered result would be its own tell.
+    _sat = [int((a_ / SATOSHI_BTC).to_integral_value()) for a_ in amounts]
+    _total_sat = int((total / SATOSHI_BTC).to_integral_value())
+    _order = sorted(range(n), key=lambda i: _sat[i])
+    for _pos in range(1, n):
+        _i, _prev = _order[_pos], _order[_pos - 1]
+        if _sat[_i] <= _sat[_prev]:
+            _sat[_i] = _sat[_prev] + 1
+    _excess = sum(_sat) - _total_sat
+    # SWEPT TO CONVERGENCE, not once. A single top-down pass stalls whenever
+    # the staircase is already tight: every chunk sits exactly one satoshi
+    # above the one beneath it, so only the SMALLEST has slack -- and giving
+    # that back opens slack for the next one up, which the pass has already
+    # gone past. Measured on the one-pass version, 50 satoshis across 8 chunks
+    # left duplicates in 20000 draws out of 20000, even though 50 is above the
+    # 36 that 8 distinct positive values need. Each sweep strictly lowers the
+    # sum while any slack remains, so this terminates.
+    while _excess > 0:
+        _moved = False
+        for _pos in range(n - 1, -1, -1):
+            _i = _order[_pos]
+            # Floor: strictly above the chunk beneath it, or 1 satoshi for the
+            # smallest. Both keep every chunk positive and distinct.
+            _floor = (_sat[_order[_pos - 1]] + 1) if _pos > 0 else 1
+            _take = min(_sat[_i] - _floor, _excess)
+            if _take > 0:
+                _sat[_i] -= _take
+                _excess -= _take
+                _moved = True
+                if _excess == 0:
+                    break
+        if not _moved:
             break
-        _big = amounts.index(max(amounts))
-        if _big == _dup or amounts[_big] - SATOSHI_BTC <= 0:
-            break
-        amounts[_big] -= SATOSHI_BTC
-        amounts[_dup] += SATOSHI_BTC
+    if _excess == 0:
+        amounts = [SATOSHI_BTC * _v for _v in _sat]
+    else:
+        # Below 1+2+...+n satoshis there is no set of n distinct positive
+        # amounts, so this cannot be repaired -- and it must not be returned
+        # quietly, because equal deposits are the Bitcoin-side tell the whole
+        # function exists to remove. resolve_btc_amount refuses this at parse
+        # time; reaching it means that gate was bypassed or changed.
+        raise ValueError(
+            f"{_total_sat} satoshis cannot be split into {n} DISTINCT positive "
+            f"chunks (the smallest such split needs {n * (n + 1) // 2}). "
+            f"Refusing to return repeated deposit amounts.")
 
     # REPAIR the boundary rather than raise on it. At (or just above) n
     # satoshis every chunk must be exactly one satoshi, so there is no room to
@@ -3517,18 +3565,29 @@ def resolve_btc_amount(args) -> None:
             f"    A zero or negative amount is not a swap. Nothing has been "
             f"created and nothing sent.")
     n = max(1, int(getattr(args, "split", 1) or 1))
-    if n > 1 and amt < SATOSHI_BTC * Decimal(n):
-        # EVERY CHUNK NEEDS A SATOSHI. Below that split_btc_amount has no
-        # correct answer, and the version before this invented one: 1 satoshi
-        # across 3 chunks came out as [-1, 1, 1] satoshis -- a negative amount,
-        # summing correctly, passing every other check, and reaching the
-        # operator as "send exactly -0.00000001 BTC".
+    # DISTINCT satoshis, not merely one each. n chunks that are positive AND
+    # all different need at least 1+2+...+n of them; the old bound was n, which
+    # let through totals where split_btc_amount could only return repeated
+    # deposit amounts -- the exact Bitcoin-side cluster the split exists to
+    # remove, and it returned them silently.
+    #
+    # EVERY CHUNK STILL NEEDS A SATOSHI, which is the weaker half of this and
+    # the reason the bound existed at all: the version before it invented an
+    # answer, and 1 satoshi across 3 chunks came out as [-1, 1, 1] -- a
+    # NEGATIVE amount, summing correctly, passing every other check, and
+    # reaching the operator as "send exactly -0.00000001 BTC".
+    _min_sat = n * (n + 1) // 2
+    if n > 1 and amt < SATOSHI_BTC * Decimal(_min_sat):
         integrity_log("stage0", "btc_amount_too_small_to_split")
         sys.exit(
             f"[!] --btc-amount {fmt_btc(amt)} cannot be split {n} ways: every chunk "
             f"needs at least one\n"
-            f"    satoshi, so {n} chunks need at least "
-            f"{fmt_btc(SATOSHI_BTC * Decimal(n))} BTC. Use fewer --split chunks.")
+            f"    satoshi and no two may be equal, so {n} chunks need at least "
+            f"{fmt_btc(SATOSHI_BTC * Decimal(_min_sat))} BTC\n"
+            f"    ({_min_sat} satoshis). Equal chunks would put {n} identical "
+            f"deposits on the Bitcoin\n"
+            f"    chain, which is the cluster splitting the amount exists to "
+            f"avoid. Use fewer --split chunks.")
     if amt != amt.quantize(SATOSHI_BTC):
         integrity_log("stage0", "btc_amount_subsatoshi")
         sys.exit(
@@ -5316,14 +5375,49 @@ def _run_round(args, plan_file, staging_dir, label, wipe: bool = True):
     left in this same staging path is exactly what the resume guard treats as
     a half-finished broadcast, so keeping it would make the NEXT run abort.
     """
+    _ok = False
     try:
-        return _run_round_body(args, plan_file, staging_dir, label)
+        _result = _run_round_body(args, plan_file, staging_dir, label)
+        _ok = True
+        return _result
     finally:
         _sd = Path(staging_dir)
-        if wipe and _sd.is_dir() and not secure_delete_tree(_sd):
-            print(f"  [!] Could not securely wipe {staging_dir}; it holds this "
-                  f"round's signed, relayable transaction blob. Remove it "
-                  f"manually.")
+        if wipe and _sd.is_dir():
+            # THE BROADCASTER'S LAST WORDS ARE "retry with --resume", AND THIS
+            # IS THE LINE THAT MAKES THAT IMPOSSIBLE.
+            #
+            # broadcast_signed_xmr exits non-zero on a partial relay with
+            # "rest transient -- retry with --resume {progF}", where progF is
+            # {staging_dir}/bcast_progress.json -- inside the tree wiped two
+            # lines below, along with signed/*.signed. So the last thing an
+            # operator reads is an instruction naming a file this function then
+            # securely erases, and they are left hunting for it.
+            #
+            # The wipe is still right: a partially relayed round leaves SIGNED,
+            # RELAYABLE transactions on disk, and that is the exposure secure
+            # staging exists for. What was wrong is only that nothing said the
+            # resume was gone. Saying it costs three lines.
+            #
+            # Gated on the round having actually reached the broadcast, so an
+            # early create/sign failure -- which prints no resume advice and
+            # leaves no signed blob -- does not get a correction to a message
+            # the operator never saw.
+            if not _ok and ((_sd / "bcast_progress.json").exists()
+                            or (_sd / "signed").is_dir()):
+                print(f"  [!] {label}: --resume is NOT available for this round. "
+                      f"Its signed transactions and its progress file are being "
+                      f"securely erased right now, deliberately: leaving "
+                      f"relayable blobs on disk is a worse exposure than losing "
+                      f"the ability to retry. Ignore the broadcaster's "
+                      f"'--resume' line above — that file will not exist.")
+                print(f"      Anything that DID relay is on-chain and cannot be "
+                      f"recalled; anything that did not is still unspent where "
+                      f"it was. Nothing is lost, and nothing left this wallet "
+                      f"that had not already left it.")
+            if not secure_delete_tree(_sd):
+                print(f"  [!] Could not securely wipe {staging_dir}; it holds this "
+                      f"round's signed, relayable transaction blob. Remove it "
+                      f"manually.")
 
 
 #: Round events already recorded, as (event, role). One entry per KIND, not

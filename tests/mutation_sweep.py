@@ -128,9 +128,27 @@ MUTATIONS = [
   "    funded = [(e, u) for e, u in zip(entry_set, entry_unlocked)]",
   ["test_dag_entry"]),
 
+ # Was a COIN FLIP before the construction replaced the nudge loop: the check
+ # drew 120 random splits and hoped one collided, so it reported SURVIVED on
+ # one sweep and CAUGHT on the next. It is deterministic now -- _FlatRNG makes
+ # every weight identical, so the repair has to do its whole job.
  ("two BTC chunks may be equal", "GhostSpiral",
-  "    for _ in range(n * 4):\n        _seen = {}",
-  "    for _ in range(0):\n        _seen = {}",
+  "    if _excess == 0:\n        amounts = [SATOSHI_BTC * _v for _v in _sat]",
+  "    if False:\n        amounts = [SATOSHI_BTC * _v for _v in _sat]",
+  ["test_dag_entry"]),
+
+ # One give-back pass instead of sweeping to convergence: stalls whenever the
+ # staircase is already tight, which is exactly the small-total case.
+ ("the distinctness give-back runs once instead of to convergence",
+  "GhostSpiral",
+  "    while _excess > 0:\n        _moved = False",
+  "    while _excess > 0 and False:\n        _moved = False",
+  ["test_dag_entry"]),
+
+ # n satoshis, not 1+2+...+n: accepts totals whose only split is repeats.
+ ("--btc-amount is bounded at n satoshis, not n distinct ones", "GhostSpiral",
+  "    _min_sat = n * (n + 1) // 2",
+  "    _min_sat = n",
   ["test_dag_entry"]),
 
  ("the console split bound drifts from gs_common", "gs_console",

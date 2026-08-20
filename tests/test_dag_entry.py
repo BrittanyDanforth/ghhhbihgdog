@@ -992,28 +992,73 @@ print("\n=== the BTC chunks are unequal ===")
 
 _R = _secretsmod.SystemRandom()
 
+
+class _FlatRNG:
+    """Every weight identical, so every chunk starts out equal.
+
+    split_btc_amount draws its jitter from randrange(0, 2001); returning the
+    midpoint gives weight exactly 1 for every chunk. That is the worst case for
+    the distinctness construction and the one a random RNG almost never
+    produces, which is why the old probabilistic check missed a repair that
+    could not handle it.
+    """
+
+    def randrange(self, a, b=None):
+        return 1000 if b == 2001 else 0
+
+    def random(self):
+        return 0.5
+
+
+def _split_or_none(total, n, rng):
+    """split_btc_amount, but a refusal is a RED CHECK rather than a traceback.
+
+    It raises ValueError when it cannot produce n distinct positive chunks. A
+    test that let that escape would kill this file, print no RESULT line, and
+    score NO-RESULT in the mutation sweep -- which the sweep's own header warns
+    is not a catch. Returning None instead makes the checks below fail with
+    their own words.
+    """
+    try:
+        return ghost.split_btc_amount(total, n, rng)
+    except ValueError:
+        return None
+
+
 for _total, _n in [(Decimal("0.08"), 4), (Decimal("0.5"), 2),
                    (Decimal("1"), 8), (Decimal("0.13"), 3)]:
-    _a = ghost.split_btc_amount(_total, _n, _R)
+    _a = _split_or_none(_total, _n, _R) or []
     check(f"btc: {_total}/{_n} produces {_n} chunks", len(_a) == _n)
     check(f"btc: {_total}/{_n} sums EXACTLY to the total (no satoshi lost or "
           f"invented)", sum(_a, Decimal(0)) == _total)
-    # DISTINCT EVERY TIME, not usually. Jitter alone did not give this:
-    # measured at 0.085% collisions for 4 chunks and 0.585% for 8, because
-    # quantising to satoshis and nudging random chunks by one puts two values
-    # together far more often than the continuous odds suggest. This check
-    # was therefore asserting something FALSE and would have gone red about
-    # once in every 150 runs -- which teaches an operator to re-run rather
-    # than to look. split_btc_amount repairs collisions now.
-    for _rep in range(120):
-        _ax = ghost.split_btc_amount(_total, _n, _R)
-        if len(set(_ax)) != _n:
-            break
-    check(f"btc: {_total}/{_n} chunks are DISTINCT, over 120 draws — a "
-          f"repeated deposit amount is the tell this exists to remove",
-          len(set(_ax)) == _n)
+    # DETERMINISTIC, not 120 hopeful draws. This used to draw repeatedly and
+    # assert the last one was distinct -- and natural collisions run at 0.085%
+    # for 4 chunks and 0.585% for 8, so 120 draws caught a broken repair only
+    # about 60% of the time. It let a real defect through a full mutation
+    # sweep: the sweep reported "two BTC chunks may be equal" as SURVIVED on
+    # one run and CAUGHT on another, which is the signature of a check that is
+    # really a coin flip.
+    #
+    # _FlatRNG makes every weight identical, so EVERY chunk collides and the
+    # repair has to do its whole job. The old repair returned 3 distinct
+    # values out of 8 here: it always took its satoshi from the LARGEST chunk,
+    # which is the one it had just incremented, so it handed the satoshi
+    # straight back and oscillated until its pass budget ran out.
+    _ax = _split_or_none(_total, _n, _FlatRNG())
+    check(f"btc: {_total}/{_n} chunks are DISTINCT even when every weight is "
+          f"identical — a repeated deposit amount is the tell this exists to "
+          f"remove", _ax is not None and len(set(_ax)) == _n)
     check(f"btc: {_total}/{_n} ...and the repair did not break the total",
-          sum(_ax, Decimal(0)) == _total and all(x > 0 for x in _ax))
+          _ax is not None and sum(_ax, Decimal(0)) == _total
+          and all(x > 0 for x in _ax))
+    # ...and still distinct on ordinary random draws.
+    _rand_dups = 0
+    for _rep in range(200):
+        _rx = _split_or_none(_total, _n, _R)
+        if _rx is None or len(set(_rx)) != _n:
+            _rand_dups += 1
+    check(f"btc: {_total}/{_n} ...and distinct on 200 random draws too",
+          _rand_dups == 0)
     check(f"btc: {_total}/{_n} every chunk is positive", all(x > 0 for x in _a))
     _share = _total / Decimal(_n)
     # THE DERIVED BOUND, not the naive one. Each chunk is total * w_i/sum(w)
@@ -1031,8 +1076,8 @@ for _total, _n in [(Decimal("0.08"), 4), (Decimal("0.5"), 2),
 
 # NOT A FIXED PATTERN. Two runs of the same amount must not produce the same
 # chunk sizes, or the "unequal" split is just a different constant.
-_s1 = ghost.split_btc_amount(Decimal("0.4"), 4, _R)
-_s2 = ghost.split_btc_amount(Decimal("0.4"), 4, _R)
+_s1 = _split_or_none(Decimal("0.4"), 4, _R) or []
+_s2 = _split_or_none(Decimal("0.4"), 4, _R) or []
 check("btc: two runs of the same amount give DIFFERENT chunk sizes",
       _s1 != _s2)
 
@@ -1040,32 +1085,40 @@ check("btc: two runs of the same amount give DIFFERENT chunk sizes",
 # not a round fraction" identifies it in every run.
 _firsts = set()
 for _ in range(40):
-    _x = ghost.split_btc_amount(Decimal("0.07"), 3, _R)
-    _firsts.add(_x[0])
+    _x = _split_or_none(Decimal("0.07"), 3, _R) or []
+    if _x:
+        _firsts.add(_x[0])
 check("btc: the remainder is not always put on chunk 0", len(_firsts) > 1)
 
 # CONTROL: one chunk is the whole amount, untouched — a default run is not
 # jittered into a different number than the operator typed.
 check("control: --split 1 hands over exactly what was asked for",
-      ghost.split_btc_amount(Decimal("0.123456"), 1, _R) == [Decimal("0.123456")])
+      _split_or_none(Decimal("0.123456"), 1, _R) == [Decimal("0.123456")])
 
 # DEGENERATE AMOUNTS MUST NEVER PRODUCE A NEGATIVE INSTRUCTION.
 #
 # The first fallback here divided equally and put the difference on chunk 0,
 # so 1 satoshi across 3 chunks came out as [-1, 1, 1] satoshis — an
 # instruction to send less than nothing, which summed correctly and passed
-# every other check on its way to the operator. At (or just above) n satoshis
-# every chunk must be exactly one satoshi and there is no room to jitter, so
-# the boundary is repaired rather than approximated.
-for _t, _n in [("0.00000003", 3), ("0.00000008", 8), ("0.0000001", 3),
-               ("0.0000001", 8)]:
+# every other check on its way to the operator.
+#
+# THE BOUND IS 1+2+...+n SATOSHIS, NOT n. n distinct positive amounts need that
+# many, and the old bound of n let through totals whose only possible answer
+# was repeated deposit amounts -- the Bitcoin-side cluster the split exists to
+# remove, returned silently. These totals are all at or above the real
+# minimum, so they must come back positive, exact AND distinct.
+for _t, _n in [("0.00000006", 3), ("0.00000036", 8), ("0.0000001", 3),
+               ("0.00000040", 8)]:
     for _rep in range(60):
-        _tiny = ghost.split_btc_amount(Decimal(_t), _n, _R)
-        if not (all(x > 0 for x in _tiny)
-                and sum(_tiny, Decimal(0)) == Decimal(_t)):
+        _tiny = _split_or_none(Decimal(_t), _n, _R)
+        if _tiny is None or not (all(x > 0 for x in _tiny)
+                                 and sum(_tiny, Decimal(0)) == Decimal(_t)):
             break
     check(f"btc: {_t} across {_n} chunks is positive and exact, every time",
-          all(x > 0 for x in _tiny) and sum(_tiny, Decimal(0)) == Decimal(_t))
+          _tiny is not None and all(x > 0 for x in _tiny)
+          and sum(_tiny, Decimal(0)) == Decimal(_t))
+    check(f"btc: {_t} across {_n} chunks is DISTINCT at the boundary too",
+          _tiny is not None and len(set(_tiny)) == _n)
 
 # Below n satoshis there is no correct answer, so it is refused up front
 # rather than invented.
@@ -1076,7 +1129,22 @@ try:
 except SystemExit as _e:
     _imposs = str(_e.code)
 check("btc: --btc-amount below one satoshi per chunk is REFUSED", _imposs is not None)
-check("btc: ...naming the real minimum", _imposs and "0.00000003" in _imposs)
+check("btc: ...naming the real minimum, which is 1+2+...+n satoshis and not n",
+      _imposs and "0.00000006" in _imposs)
+check("btc: ...and saying WHY — equal chunks are the Bitcoin-side cluster",
+      _imposs and "identical" in _imposs and "deposits" in _imposs)
+# THE RANGE THE OLD BOUND LET THROUGH. 4 satoshis across 3 chunks clears "one
+# satoshi each" and still cannot be split into three DISTINCT positive amounts
+# (that needs 6), so it used to reach split_btc_amount, which returned repeats.
+_between = None
+try:
+    ghost.resolve_btc_amount(types.SimpleNamespace(
+        btc_amount=Decimal("0.00000004"), split=3))
+except SystemExit as _e:
+    _between = str(_e.code)
+check("btc: a total with a satoshi per chunk but no DISTINCT split is refused "
+      "too — the old bound accepted it and the chunks came back equal",
+      _between is not None)
 # AS A NUMBER THE OPERATOR CAN TYPE. Decimal renders small values in
 # scientific notation, so this message read "3 chunks need at least 3E-8 BTC"
 # — not a figure anyone can enter into a wallet, describing a payment.
@@ -1085,9 +1153,10 @@ for _v, _want in [("3E-8", "0.00000003"), ("0.5", "0.5"), ("1", "1"),
                   ("1E-7", "0.0000001"), ("0.123456789", "0.12345679")]:
     check(f"btc: fmt_btc({_v}) is typeable -> {_want}",
           ghost.fmt_btc(Decimal(_v)) == _want)
-check("control: exactly one satoshi per chunk is allowed",
+check("control: exactly 1+2+...+n satoshis IS allowed — the bound refuses "
+      "below the minimum, it does not refuse the minimum",
       ghost.resolve_btc_amount(types.SimpleNamespace(
-          btc_amount=Decimal("0.00000003"), split=3)) is None)
+          btc_amount=Decimal("0.00000006"), split=3)) is None)
 check("control: --split 1 has no such minimum",
       ghost.resolve_btc_amount(types.SimpleNamespace(
           btc_amount=Decimal("0.00000001"), split=1)) is None)
@@ -1106,7 +1175,7 @@ check("btc: the splitter RAISES on an impossible split rather than returning "
 # the property true rather than approximately true. Asserting it against a
 # sub-satoshi total is how that gap was found.
 for _tot in ("0.33333333", "1", "0.07", "0.00012345"):
-    _sat = ghost.split_btc_amount(Decimal(_tot), 3, _R)
+    _sat = _split_or_none(Decimal(_tot), 3, _R) or []
     check(f"btc: every chunk of {_tot} is a whole number of satoshis",
           all(x == x.quantize(ghost.SATOSHI_BTC) for x in _sat))
 
