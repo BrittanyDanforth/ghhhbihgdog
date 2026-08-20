@@ -1119,6 +1119,43 @@ check("control: e2e actually wrote every line",
       len([ln for ln in _disk.splitlines() if " | " in ln]) == len(_WROTE))
 
 
+# ==========================================================================
+# 5. THE COUNT AGAIN, WHERE THE LOOP IS A COMPREHENSION.
+#
+# The sweep that closed this class looked for `for` and `while` statements and
+# for functions called inside one. A list comprehension is neither, so
+# thor_swap_preparer.resolve_destinations kept the leak:
+#
+#     out = [_dest_from_bundle(b) for b in bundles]
+#
+# and _dest_from_bundle chained `dest_from_bundle:{scrub_address(addr)}` on
+# every call. chain_safe reduces that to `dest_from_bundle:<addr>` -- the same
+# line for every bundle -- so a five-swap run left five byte-identical lines
+# and the swap batch size came off the file by counting them. Driven with five
+# real-shaped subaddresses: one distinct payload, five occurrences.
+#
+# The same file already applied the fix 393 lines below, for "pair_ready".
+# ==========================================================================
+print("\n=== a comprehension is a loop too ===")
+
+_thor_src = (Path(__file__).resolve().parent.parent / "thor_swap_preparer").read_text()
+check("thor: the per-bundle destination line is chained ONCE, not once per "
+      "bundle — counting them would give the swap batch size",
+      'integrity_log_once("thor", "dest_from_bundle")' in _thor_src
+      and 'f"dest_from_bundle:{scrub_address(addr)}"' not in _thor_src)
+
+# DRIVEN: five calls, one line. The count is the property, so count it.
+_tl = Path(tempfile.mkdtemp(prefix="thor_card_")) / "chain.log"
+for _i in range(5):
+    gsc.integrity_log_once("thor", "dest_from_bundle", log_path=_tl)
+check("thor: ...proven by driving it — five bundles leave one line",
+      len(_tl.read_text().splitlines()) == 1)
+check("thor: ...and that the destinations came from bundles is still recorded",
+      "dest_from_bundle" in _tl.read_text())
+check("thor: ...and the chain still verifies",
+      gsc.verify_integrity_chain(_tl)[0] is True)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

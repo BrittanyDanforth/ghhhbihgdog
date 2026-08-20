@@ -387,6 +387,15 @@ MUTATIONS = [
   '    integrity_log_once("wallet", "receive_account")',
   '    integrity_log("wallet", f"receive_account:{acct_idx}")',
   ["test_units"]),
+
+ # resolve_destinations calls _dest_from_bundle in a LIST COMPREHENSION, which
+ # the for/while sweep did not treat as a loop. One line per bundle, identical
+ # after redaction, so counting them gives the swap batch size.
+ ("the per-bundle destination line is chained once per bundle again",
+  "thor_swap_preparer",
+  '    integrity_log_once("thor", "dest_from_bundle")',
+  '    integrity_log("thor", f"dest_from_bundle:{scrub_address(addr)}")',
+  ["test_chain_redaction"]),
 ]
 
 

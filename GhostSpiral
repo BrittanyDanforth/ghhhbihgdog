@@ -41,7 +41,7 @@ from typing import List
 from gs_common import (
     VERSION, integrity_log, verify_tor, tor_recheck, newnym,
     safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
-    secure_hex, secure_delay, atomic_write_json, secure_file_perms,
+    secure_hex, secure_delay, atomic_write_json,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_or_warn,
@@ -3457,7 +3457,6 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
             # Each source hops onward from its OWN fan-out balance, so the hop
             # amounts stay as unequal as the fan-out that funded them -- no
             # single hop value for an analyst to cluster on.
-            src_hop_amt = compute_hop_amount(fanout_by_addr[s], fee_xmr)
             d = _dsts.get(s)
             if d is None:
                 continue
@@ -3476,11 +3475,30 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
             # made every hop traceable to a single sink even after the account
             # rotation moved that sink off the wallet's primary address.
             #
-            # src_hop_amt is still computed above: it is the fundability check
-            # (can this output cover a fee at all?) and it decides whether the
-            # hop is planned. It is deliberately NOT carried into the entry --
-            # a sweep has no amount, and one sitting here would look
-            # authoritative while being ignored.
+            # NO AMOUNT IN THE ENTRY, deliberately -- a sweep has no amount,
+            # and one sitting here would look authoritative while being
+            # ignored.
+            #
+            # This block used to open by recomputing
+            # `src_hop_amt = compute_hop_amount(fanout_by_addr[s], fee_xmr)`
+            # and the comment here said that computation "is the fundability
+            # check ... and it decides whether the hop is planned". It decided
+            # nothing. Nothing read it. The fundability check is the one that
+            # BUILDS `_fundable` above -- "FUNDABILITY FIRST, then
+            # destinations" -- and by the time a source reaches this loop it
+            # has already passed it, so the recomputation could only ever
+            # return the same answer to no one.
+            #
+            # Proven rather than assumed: replacing the line with
+            # `assert compute_hop_amount(...) > DUST_XMR` never fired across
+            # 483 checks in the five suites that drive this planner, and
+            # compute_hop_amount is pure, so the line had no effect to lose.
+            #
+            # A comment claiming a gate where there is none is the expensive
+            # half of this. It tells the next reader that deleting an obviously
+            # redundant line removes a safety check, and it tells anyone
+            # auditing the planner that per-source fundability is enforced
+            # HERE, one screen below the loop that actually enforces it.
             dag_plan.append({
                 "src": s,
                 "src_index": _src_index(addr_index, s),

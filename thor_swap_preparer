@@ -97,7 +97,20 @@ def _dest_from_bundle(path: str) -> str:
     except ValueError as e:
         sys.exit(f"[!] {path}: {e}")
     addr = d["address"]
-    integrity_log("thor", f"dest_from_bundle:{scrub_address(addr)}")
+    # ONCE, NOT ONCE PER BUNDLE. resolve_destinations calls this in a list
+    # comprehension over every bundle, so a five-swap run wrote five
+    # `dest_from_bundle:<addr>` lines -- byte-identical after chain_safe --
+    # and the batch size came off the file by counting them. That is the
+    # number of swap chunks, which is exactly what chain_safe's docstring
+    # says redaction removes ("and how many there were, does not").
+    #
+    # This file already had the fix 393 lines below (integrity_log_once for
+    # "pair_ready"); the sweep that added it looked for `for` and `while`
+    # loops and a comprehension is neither.
+    #
+    # The address is redacted to <addr> here anyway, so the per-call form
+    # carried nothing on disk that this does not.
+    integrity_log_once("thor", "dest_from_bundle")
     return addr
 
 
