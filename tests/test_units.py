@@ -2038,6 +2038,63 @@ check("redact: ordinary prose is unchanged",
 check("redact: empty and None are safe",
       gs.redact_addresses("") == "" and gs.redact_addresses(None) is None)
 
+# ORDER MATTERS, AND IT IS THE WHOLE GUARANTEE: redact the stream, THEN slice.
+#
+# redact_addresses matches _ADDRESS_RE, a run of 90+ base58 characters, which
+# is what lets its docstring call the masking "structural, not a byte count".
+# Slicing FIRST can cut a 95-character address below that floor, and a 60- or
+# 80-character fragment is not an address to the regex -- it passes through
+# verbatim.
+#
+# airgap_tx_signer's import_outputs path did exactly that:
+# `redact_addresses(_txt.strip()[-160:])`. Measured against the real 95-char
+# address this suite uses, sweeping the trailing-text length, it leaked up to
+# 89 VERBATIM CHARACTERS of the wallet's PRIMARY ADDRESS to the terminal --
+# worst at 70 trailing characters. The file's two other sites always had it the
+# right way round (`redact_addresses(result.stderr)[:200]`).
+#
+# Checked as a PROPERTY of the two orders, not as a string in the source, so it
+# still holds if the slice length or the surrounding text changes.
+_PA = ("A2feEzqiMBDbMn1vnGj8pCeAMZzEoBBFTW4AR8AbSQGK1puUDwKKv2y1fzcuyZgNqe4"
+       "kxigJLCzZnbZXrMpEe3oz3ri7mh6")
+
+
+def _longest_verbatim(needle, hay):
+    best = 0
+    for _i in range(len(needle)):
+        for _j in range(len(needle), _i, -1):
+            if _j - _i > best and needle[_i:_j] in hay:
+                best = _j - _i
+                break
+    return best
+
+
+_slice_first_worst = 0
+_redact_first_worst = 0
+for _d in range(0, 140):
+    _stream = f"Monero 'Fluorine Fermi' (v0.18.3.1)\nOpened wallet: {_PA}\n" + "x" * _d
+    _slice_first_worst = max(
+        _slice_first_worst,
+        _longest_verbatim(_PA, gs.redact_addresses(_stream.strip()[-160:])))
+    _redact_first_worst = max(
+        _redact_first_worst,
+        _longest_verbatim(_PA, gs.redact_addresses(_stream.strip())[-160:]))
+check(f"redact: slicing BEFORE redacting leaks the address verbatim "
+      f"({_slice_first_worst} chars) — the control that makes the next check "
+      f"non-vacuous", _slice_first_worst > 8)
+check(f"redact: redacting BEFORE slicing leaks only the intended scrub "
+      f"({_redact_first_worst} chars, at every trailing length)",
+      _redact_first_worst <= 8)
+# code_only, not a raw read: the fix's own comment QUOTES the broken
+# expression as the post-mortem, and a substring search over the whole file
+# matched it and went red. That is the exact failure srcutil exists for --
+# "a substring search cannot tell a defect from its own post-mortem".
+_signer_code = code_only(os.path.join(REPO, "airgap_tx_signer"))
+check("signer: the import_outputs path redacts the WHOLE stream before "
+      "slicing it",
+      "redact_addresses(_txt.strip())[-160:]" in _signer_code
+      and "redact_addresses(_txt.strip()[-160:])" not in _signer_code)
+
 # The signer must actually USE it on wallet-cli output, not merely import it.
 _signer_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
 check("signer: redacts wallet-cli stdout before printing it",

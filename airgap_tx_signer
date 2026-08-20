@@ -939,12 +939,31 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
                           f"(needed to sign spends of earlier rounds' outputs).")
                 else:
                     integrity_log("signer", "outputs_import_unconfirmed")
-                    # redact_addresses: this is monero-wallet-cli's own output,
-                    # which always contains "Opened wallet: <primary address>".
+                    # REDACT THE WHOLE STREAM, THEN SLICE. This was
+                    # `redact_addresses(_txt.strip()[-160:])` -- sliced first,
+                    # redacted second -- and the order is the entire guarantee.
+                    #
+                    # redact_addresses matches on _ADDRESS_RE, a run of 90 or
+                    # more base58 characters, which is what lets it say its
+                    # masking is "structural, not a byte count". Taking the
+                    # last 160 characters can CUT the 95-character primary
+                    # address below that floor, and a 60- or 80-character
+                    # fragment is not an address to the regex, so it passes
+                    # through verbatim.
+                    #
+                    # Measured against the real 95-char address the suite uses,
+                    # sweeping the trailing-text length: the shipped expression
+                    # leaked up to 89 verbatim characters of the wallet's
+                    # PRIMARY ADDRESS to the terminal, worst at 70 trailing
+                    # characters. Redacting first and slicing after leaks 8 --
+                    # the intended scrub form -- at every length.
+                    #
+                    # The other two sites in this file already do it in this
+                    # order (redact_addresses(result.stderr)[:200]).
                     print(f"  [!] import_outputs did not confirm success. If this round "
                           f"spends an output an earlier round created, signing will "
                           f"fail. Last output: "
-                          f"{redact_addresses(_txt.strip()[-160:])}")
+                          f"{redact_addresses(_txt.strip())[-160:]}")
         except subprocess.TimeoutExpired:
             integrity_log("signer", "outputs_import_timeout")
             print("  [!] import_outputs timed out.")

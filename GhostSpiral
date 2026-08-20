@@ -6090,11 +6090,45 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
     _outcomes = set()
     for n, (account, change_index, dest_addr, dest_index) in enumerate(jobs, 1):
         label = f"change sweep {n}/{len(jobs)}"
-        if not _run_change_sweep(args, account, change_index, dest_addr,
-                                 dest_index, staging_dir, proxy, meta,
-                                 label=label, seq=n,
-                                 delay_window=delay_window,
-                                 outcomes=_outcomes):
+        # THE PROMISE ABOVE IS "the remaining sweeps still run", and it only
+        # covered ONE of the two ways a sweep fails.
+        #
+        # _run_change_sweep returns False when _wait_for_change_settled times
+        # out, and that was handled. Its other failure mode is _run_round,
+        # which aborts the PROCESS with sys.exit on any create, sign or
+        # broadcast failure -- and it is called there with a `finally` but no
+        # `except`, so SystemExit propagated straight out of this loop.
+        #
+        # Driven with four jobs and a round that fails on the second: two
+        # _run_round calls made, sweeps 3 and 4 never attempted, SystemExit out
+        # of the function. Not "reported and the rest still run".
+        #
+        # And this loop runs BEFORE the exit (_run_change_sweeps at the top of
+        # stage 5, _run_exit_withdrawals ~100 lines later), so one failed sweep
+        # took the whole pipeline down with the mixed funds still sitting on
+        # the wallet -- the exit never got to withdraw any of them. A stranded
+        # change output is the small loss here; the un-run exit is the large
+        # one.
+        #
+        # _run_exit_withdrawals already has exactly this guard, with a comment
+        # making the same argument ("one failure must not strand them"). This
+        # is that guard, on the loop whose docstring already claimed it.
+        try:
+            _swept = _run_change_sweep(args, account, change_index, dest_addr,
+                                       dest_index, staging_dir, proxy, meta,
+                                       label=label, seq=n,
+                                       delay_window=delay_window,
+                                       outcomes=_outcomes)
+        except SystemExit:
+            _outcomes.add("round_failed")
+            print(f"  [!] {label}: FAILED to create, sign or broadcast. The "
+                  f"change on account {account} / subaddr {change_index} is "
+                  f"UNMIXED and still there.\n"
+                  f"      Continuing with the remaining sweeps and the exit — "
+                  f"stopping here would strand every other output too.")
+            failed += 1
+            continue
+        if not _swept:
             failed += 1
     if _outcomes:
         integrity_log("stage5", "change_sweeps:" + ",".join(sorted(_outcomes)))
@@ -6517,9 +6551,32 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"
         atomic_write_json({"meta": meta, "txs": [tx]}, path)
         stage = f"{staging_dir}/exit{n}"
+        # A TOR FAILURE IS NOT A WITHDRAWAL FAILURE, and the except below
+        # cannot tell them apart on its own.
+        #
+        # newnym(required=True) and tor_recheck() both report by sys.exit --
+        # tor_recheck's is "[!] Tor leak detected during {stage} - aborting."
+        # -- and Python only prints that when it reaches the top level. Sitting
+        # inside this try, they were caught by the `except SystemExit` written
+        # for a failed ROUND: the message was discarded, replaced by the loop's
+        # generic per-output line, and the loop moved on to the next output and
+        # re-ran the same failing gate.
+        #
+        # Driven with tor_recheck's real leak behaviour and three funded
+        # outputs: the operator got three "FAILED. Account N / subaddr M was
+        # NOT withdrawn and its funds are still on this wallet" lines, and the
+        # words "Tor" and "leak" appeared nowhere in the output. That reads as
+        # a wallet or daemon problem and invites a retry, which is the one
+        # response a live deanonymising leak must not get.
+        #
+        # So the gates are tracked separately and their abort is RE-RAISED,
+        # carrying its own message. Re-raising still runs the `finally` below,
+        # so the exit plan -- which holds --exit-to -- is still wiped.
+        _gates_passed = False
         try:
             newnym(required=True)
             tor_recheck(proxy, f"exit_{n}")
+            _gates_passed = True
             _run_round(args, path, stage, label.capitalize())
             _left = _change_residue(args, acct, sub)
             if _left is None:
@@ -6540,6 +6597,13 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                 print(f"  [+] {label}: account {acct} / subaddr {sub} emptied.")
             relayed += 1
         except SystemExit:
+            # THE TOR GATES ABOVE ARE NOT ROUNDS. If the abort came from
+            # newnym/tor_recheck rather than from the round, let it out: it is
+            # a fail-closed safety stop about the network, it carries its own
+            # message, and continuing the loop would re-run the same gate on
+            # every remaining output. `finally` still wipes the plan.
+            if not _gates_passed:
+                raise
             # _run_round aborts the PROCESS on a failed round. An exit is a
             # loop over independent transactions and the rest are still
             # withdrawable, so one failure must not strand them -- and it must

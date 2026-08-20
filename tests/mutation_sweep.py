@@ -422,6 +422,36 @@ MUTATIONS = [
   '    if acct in seen_accts:',
   '    if False:',
   ["test_swap_receive"]),
+
+ # The exit loop's Tor gates sit inside the try whose `except SystemExit` is
+ # there for a failed ROUND. Without the re-raise, tor_recheck's
+ # "[!] Tor leak detected" is swallowed, reported as an ordinary withdrawal
+ # failure, and the loop re-runs the leaking gate on every remaining output.
+ ("a mid-run Tor leak during the exit is swallowed as a withdrawal failure",
+  "GhostSpiral",
+  "            if not _gates_passed:\n                raise",
+  "            if False:\n                raise",
+  ["test_exit_withdraw"]),
+
+ # _run_change_sweep calls _run_round, which sys.exits on a create/sign/
+ # broadcast failure. Without the guard that abort leaves the sweep loop and
+ # kills the pipeline BEFORE _run_exit_withdrawals runs, stranding every mixed
+ # output -- while the loop's docstring promises "the remaining sweeps still
+ # run".
+ ("a failed change-sweep round kills the pipeline before the exit",
+  "GhostSpiral",
+  "        except SystemExit:\n            _outcomes.add(\"round_failed\")",
+  "        except ZeroDivisionError:\n            _outcomes.add(\"round_failed\")",
+  ["test_exit_withdraw"]),
+
+ # redact_addresses matches 90+ base58 chars. Slicing to 160 characters BEFORE
+ # redacting can cut a 95-char address below that floor, so it is not an
+ # address to the regex and passes through verbatim -- measured at up to 89
+ # characters of the wallet's primary address.
+ ("the signer slices wallet-cli output BEFORE redacting it", "airgap_tx_signer",
+  "{redact_addresses(_txt.strip())[-160:]}",
+  "{redact_addresses(_txt.strip()[-160:])}",
+  ["test_units"]),
 ]
 
 

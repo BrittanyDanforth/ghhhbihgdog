@@ -22,7 +22,7 @@ What matters here, and why each is a test rather than a comment:
 Pure-function checks: no daemon, no wallet, no binaries. The end-to-end proof
 that value really leaves the wallet is a separate regtest run.
 """
-import importlib.machinery, importlib.util, io, os, sys, contextlib, types, json
+import importlib.machinery, importlib.util, io, os, sys, contextlib, types, json, tempfile
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -924,6 +924,183 @@ _hsrc = [(t["account_index"], t["src_index"]) for r in _seen_h.rounds for t in r
 check("change hold: an unsweepable change account is NOT withdrawn to --exit-to",
       (41, 0) not in _hsrc and (42, 0) not in _hsrc)
 check("change hold: ...while the MIXED output still leaves", (5, 1) in _hsrc)
+
+
+
+# ==========================================================================
+# A TOR LEAK IS NOT A WITHDRAWAL FAILURE.
+#
+# The exit loop opens each iteration with newnym(required=True) and
+# tor_recheck(), both of which report by sys.exit -- tor_recheck's message is
+# "[!] Tor leak detected during {stage} - aborting." They sat INSIDE the try
+# whose `except SystemExit` exists so one failed ROUND does not strand the
+# other outputs, so the leak was caught, its message discarded, and replaced
+# by the loop's generic per-output line. The loop then continued to the next
+# output and re-ran the same failing gate.
+#
+# Driven below with tor_recheck's real leak behaviour: before the fix, three
+# funded outputs produced three "FAILED ... NOT withdrawn" lines and the words
+# "Tor" and "leak" appeared nowhere. That reads as a wallet or daemon problem
+# and invites a retry, which is the one response a live deanonymising leak
+# must not get.
+# ==========================================================================
+print("\n=== a Tor leak during the exit fails CLOSED ===")
+
+_tor_saved = (ghost.connect_rpc, ghost._funded_subaddresses,
+              ghost._wait_for_change_settled, ghost._change_residue,
+              ghost.newnym, ghost.tor_recheck, ghost._run_round,
+              ghost.integrity_log, ghost.secure_delete_or_warn,
+              ghost.secure_delete_tree)
+_rounds_reached = []
+try:
+    ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
+        raw_request=lambda m, p=None: {})
+    ghost._funded_subaddresses = lambda *a, **k: [(3, 1, 1000), (4, 1, 1000),
+                                                  (5, 1, 1000)]
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.newnym = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delete_or_warn = lambda *a, **k: True
+    ghost.secure_delete_tree = lambda *a, **k: True
+    # gs_common.tor_recheck's REAL behaviour on a mid-run leak, verbatim.
+    ghost.tor_recheck = lambda proxy, stage="recheck": sys.exit(
+        f"[!] Tor leak detected during {stage} - aborting.")
+    ghost._run_round = lambda *a, **k: _rounds_reached.append(1)
+
+    _targs = types.SimpleNamespace(
+        exit_to="8" + "A" * 94, wallet_password="x",
+        rpc="http://127.0.0.1:18083", rpc_primary="http://127.0.0.1:18083",
+        tor_proxy="socks5h://127.0.0.1:9050", hop_delay=None, dry_run=False,
+        wallet_cli="/bin/true", split=1)
+    _buf = io.StringIO()
+    _leak_msg = None
+    _returned = None
+    _real_out, sys.stdout = sys.stdout, _buf
+    try:
+        _returned = ghost._run_exit_withdrawals(
+            _targs, [(3, 1), (4, 1), (5, 1)], _targs.exit_to,
+            tempfile.mkdtemp(prefix="gs_torleak_"), {"http": "x", "https": "x"},
+            {}, (60, 120), hold=[], entry_pairs=[])
+    except SystemExit as _e:
+        _leak_msg = str(_e)
+    finally:
+        sys.stdout = _real_out
+    _tor_out = _buf.getvalue()
+
+    check("exit/tor: a mid-run Tor leak ABORTS the exit instead of being "
+          "reported as a withdrawal failure",
+          _leak_msg is not None and _returned is None)
+    check("exit/tor: ...and the operator is told it was TOR, in its own words",
+          _leak_msg and "Tor leak detected" in _leak_msg)
+    check("exit/tor: ...it does NOT continue to the remaining outputs and "
+          "re-run the failing gate",
+          _tor_out.count("NOT withdrawn") == 0)
+    check("exit/tor: ...and no round is broadcast after a leak is detected",
+          _rounds_reached == [])
+
+    # CONTROL: a failed ROUND must still be swallowed, or the fix has simply
+    # made every failure fatal -- which is the behaviour the except was
+    # written to prevent.
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost._run_round = lambda *a, **k: sys.exit("[!] round failed")
+    _buf2 = io.StringIO()
+    _real_out, sys.stdout = sys.stdout, _buf2
+    _res2 = None
+    _esc = None
+    try:
+        _res2 = ghost._run_exit_withdrawals(
+            _targs, [(3, 1), (4, 1), (5, 1)], _targs.exit_to,
+            tempfile.mkdtemp(prefix="gs_roundfail_"),
+            {"http": "x", "https": "x"}, {}, (60, 120), hold=[], entry_pairs=[])
+    except SystemExit as _e:
+        _esc = str(_e)
+    finally:
+        sys.stdout = _real_out
+    check("control: a failed ROUND is still caught, so the other outputs are "
+          "still attempted", _esc is None and _res2 is not None
+          and _res2[1] == 3)
+    check("control: ...and each one is reported",
+          _buf2.getvalue().count("NOT withdrawn") == 3)
+finally:
+    (ghost.connect_rpc, ghost._funded_subaddresses,
+     ghost._wait_for_change_settled, ghost._change_residue, ghost.newnym,
+     ghost.tor_recheck, ghost._run_round, ghost.integrity_log,
+     ghost.secure_delete_or_warn, ghost.secure_delete_tree) = _tor_saved
+
+
+# ==========================================================================
+# A FAILED CHANGE SWEEP MUST NOT TAKE THE EXIT DOWN WITH IT.
+#
+# _run_change_sweeps' docstring promises "A failure is reported and the
+# remaining sweeps still run", and it only handled ONE of the two failure
+# modes: _run_change_sweep returning False when the settle wait times out. Its
+# other mode is _run_round, which sys.exits on any create/sign/broadcast
+# failure and is called there with a `finally` but no `except` -- so SystemExit
+# propagated straight out of the loop.
+#
+# These sweeps run BEFORE _run_exit_withdrawals, so one failed sweep took the
+# whole pipeline down with every mixed output still on the wallet. The stranded
+# change is the small loss; the exit never running is the large one.
+# ==========================================================================
+print("\n=== a failed change sweep does not strand the rest ===")
+
+_cs_saved = (ghost._wait_for_change_settled, ghost._change_residue,
+             ghost.integrity_log, ghost.secure_delete_or_warn,
+             ghost.secure_delete_tree, ghost.atomic_write_json,
+             ghost.connect_rpc, ghost._run_round)
+try:
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 1000)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delete_or_warn = lambda *a, **k: True
+    ghost.secure_delete_tree = lambda *a, **k: True
+    ghost.atomic_write_json = lambda *a, **k: None
+    ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
+        raw_request=lambda m, p=None: {})
+    _cs_calls = []
+
+    def _cs_round(args, path, stage, label):
+        _cs_calls.append(label)
+        if len(_cs_calls) == 2:
+            sys.exit("[!] Change sweep 2/4: broadcast failed (exit 1)")
+        return 1
+    ghost._run_round = _cs_round
+
+    _csargs = types.SimpleNamespace(
+        rpc="x", wallet_password="x", tor_proxy="x", hop_delay=None,
+        dry_run=False, rpc_primary="x", wallet_cli="/bin/true", split=1)
+    _jobs = [(3, 0, "8" + "A" * 94, 1), (4, 0, "8" + "B" * 94, 1),
+             (5, 0, "8" + "C" * 94, 1), (6, 0, "8" + "D" * 94, 1)]
+    _buf3 = io.StringIO()
+    _real_out, sys.stdout = sys.stdout, _buf3
+    _csfailed = None
+    _csesc = None
+    try:
+        _csfailed = ghost._run_change_sweeps(
+            _csargs, _jobs, tempfile.mkdtemp(prefix="gs_cs_"),
+            {"http": "x"}, {}, (60, 120))
+    except SystemExit as _e:
+        _csesc = str(_e)
+    finally:
+        sys.stdout = _real_out
+
+    check("change sweeps: a round that ABORTS does not propagate out of the "
+          "loop", _csesc is None)
+    check("change sweeps: ...the remaining sweeps still run (4 of 4 attempted, "
+          f"got {len(_cs_calls)})", len(_cs_calls) == 4)
+    check("change sweeps: ...and the failure is counted, not swallowed",
+          _csfailed == 1)
+    check("change sweeps: ...and the operator is told that change is UNMIXED "
+          "and still there",
+          "UNMIXED" in _buf3.getvalue() and "still there" in _buf3.getvalue())
+    check("change sweeps: ...and told the run continues rather than stopping",
+          "Continuing with the remaining sweeps" in _buf3.getvalue())
+finally:
+    (ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.integrity_log, ghost.secure_delete_or_warn,
+     ghost.secure_delete_tree, ghost.atomic_write_json, ghost.connect_rpc,
+     ghost._run_round) = _cs_saved
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
