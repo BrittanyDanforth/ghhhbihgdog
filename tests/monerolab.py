@@ -37,6 +37,7 @@ used start_mining and polled for a target height, which overshoots by however
 many blocks land before the stop request is seen -- enough to make a
 locked-output test inconclusive.
 """
+import json
 import os
 import subprocess
 import time
@@ -331,6 +332,56 @@ class MoneroLab:
         can only ask the daemon nicely cannot test what happens when it dies.
         """
         return self.procs[0] if self.procs else None
+
+    def restore_cold_wallet(self, dest_file, address, spendkey, viewkey,
+                            password=""):
+        """Restore a spend-key wallet that has never opened against a daemon.
+
+        wallet-cli refuses import_outputs (and sign_transfer when the unsigned
+        set carries outputs to import) on any wallet file that has previously
+        refreshed from a node -- 'Hot wallets cannot import outputs'. The
+        lab's RPC wallet is always that kind of hot wallet. A genuine air-gap
+        restore from keys, started with --offline and never connected, is
+        what phase_sign's import is for.
+
+        dest_file is the wallet path without a .keys suffix. Returns dest_file.
+        """
+        dest_file = os.path.abspath(dest_file)
+        os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
+        shm = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        spec_dir = shm or os.path.dirname(dest_file)
+        spec_path = os.path.join(spec_dir, os.path.basename(dest_file) + ".restore.json")
+        spec = {
+            "version": 1,
+            "filename": dest_file,
+            "password": password,
+            "scan_from_height": 0,
+            "address": address,
+            "viewkey": viewkey,
+            "spendkey": spendkey,
+        }
+        fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps(spec).encode())
+        finally:
+            os.close(fd)
+        try:
+            r = subprocess.run(
+                ["monero-wallet-cli", "--offline",
+                 "--generate-from-json", spec_path,
+                 "--subaddress-lookahead", "400:50"],
+                capture_output=True, text=True, timeout=90,
+                input="exit\n",
+            )
+        finally:
+            try:
+                os.remove(spec_path)
+            except OSError:
+                pass
+        if not os.path.exists(dest_file):
+            tail = (r.stderr or r.stdout or "")[-500:]
+            raise RuntimeError(f"cold wallet restore did not write {dest_file}: {tail}")
+        return dest_file
 
     def stop(self):
         for p in self.procs:
