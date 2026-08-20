@@ -317,6 +317,12 @@ PRIORITY_FEE_MULTIPLIER = {1: 1, 2: 4, 3: 20, 4: 166}
 # roughly 20 min on mainnet). The DAG-mixing round sources FROM those fan-out
 # subaddresses, so it cannot be created until the fan-out has confirmed. These
 # bound how long Stage 5 waits for that before giving up and skipping DAG.
+#: How long the BROADCAST child gets for the relay work itself -- egress
+#: re-checks, submits, retries -- on top of whatever inter-transaction delay
+#: the round planned. This used to be the WHOLE budget (a bare timeout=7200),
+#: which silently capped the sum of every --hop-delay in a round at two hours.
+BROADCAST_WORK_TIMEOUT = 7200
+
 FANOUT_CONFIRM_TIMEOUT = 3600   # seconds to wait for fan-out to unlock
 FANOUT_CONFIRM_POLL = 30        # seconds between balance polls
 
@@ -6097,6 +6103,57 @@ def _run_round_body(args, plan_file, staging_dir, label):
         # the moment of relay. --allow-clearnet-relay is forwarded too, or the
         # operator's explicit override at the top level would be silently
         # dropped and the child would refuse anyway.
+        # THE TIMEOUT MUST INCLUDE THE DELAYS THIS ROUND PLANNED TO SERVE.
+        #
+        # This was `timeout=7200`, a constant, while the delays are served
+        # INSIDE this child and are CUMULATIVE -- the comment at the veil
+        # builder says so in as many words: broadcast_signed_xmr "relays a plan
+        # file with a single `for item in items:` loop that SLEEPS item.delay
+        # before each submit, so the delays are CUMULATIVE, not offsets from a
+        # common start."
+        #
+        # So the round's entire planned delay budget had to fit in two hours,
+        # and nothing checked that it did. Measured with the shipped hop_delay
+        # over 600 trials per cell, P(one round exceeds 7200s):
+        #
+        #                            N=1     N=2     N=8    N=10    N=20
+        #   default 180-720          0.0%    0.0%    0.0%    0.0%   99.3%
+        #   1800-7200                0.0%   78.2%  100.0%  100.0%  100.0%
+        #   7200-21600             100.0%  100.0%  100.0%  100.0%  100.0%
+        #   21600-86400            100.0%  100.0%  100.0%  100.0%  100.0%
+        #
+        # 21600-86400 is the window hop_delay()'s OWN docstring recommends for
+        # ring-age plausibility, and every draw from it exceeded the cap at
+        # N=1. So the tool's own advice guaranteed the round was killed with
+        # nothing relayed -- and the default did too once --wallets reached 20,
+        # which gs_console offers up to 60.
+        #
+        # What made it expensive rather than merely annoying: _run_round's
+        # finally securely erases this round's signed blobs AND
+        # bcast_progress.json, so --resume is gone with them, and on the entry
+        # veil -- the first stage-5 round, whose _run_round is not wrapped --
+        # the sys.exit takes the whole run down with the funds still on ENTRY,
+        # the address the public ThorChain memo names.
+        #
+        # The plan file is right here and carries every delay, so the bound is
+        # derived instead of guessed: the sum of what this round will actually
+        # sleep, plus the original two hours for the work itself (egress
+        # re-checks, submits, retries).
+        _planned_delay = 0
+        try:
+            _ptxs = json.loads(Path(plan_file).read_text()).get("txs") or []
+            _planned_delay = sum(max(0, int(t.get("delay") or 0)) for t in _ptxs)
+        except Exception:                                    # noqa: BLE001
+            # A plan we cannot re-read is not a reason to pick a bound that is
+            # too SHORT: fall back to the old constant plus the widest window
+            # the operator could have asked for, so the failure mode is a wait
+            # rather than a kill with the blobs erased.
+            _planned_delay = HOP_DELAY_MAX
+        _bcast_timeout = BROADCAST_WORK_TIMEOUT + _planned_delay
+        if _planned_delay > BROADCAST_WORK_TIMEOUT:
+            print(f"  [*] {label}: this round will sleep ~{_planned_delay // 60} min "
+                  f"of planned inter-transaction delay before it finishes "
+                  f"(--hop-delay). Allowing {_bcast_timeout // 60} min.")
         _bcast_cmd = [sys.executable, _tool("broadcast_signed_xmr"), f"{staging_dir}/signed",
                       "--tor-proxy", args.tor_proxy,
                       "--rpc", args.rpc_primary,
@@ -6104,11 +6161,15 @@ def _run_round_body(args, plan_file, staging_dir, label):
                       "--resume", f"{staging_dir}/bcast_progress.json"]
         if args.allow_clearnet_relay:
             _bcast_cmd.append("--allow-clearnet-relay")
-        subprocess.run(_bcast_cmd, check=True, timeout=7200, env=_child_env())
+        subprocess.run(_bcast_cmd, check=True, timeout=_bcast_timeout,
+                       env=_child_env())
         _round_log("broadcast_ok", label)
     except subprocess.TimeoutExpired:
         _round_log("broadcast_timeout", label)
-        sys.exit(f"[!] {label}: broadcast timed out after 2 hours")
+        sys.exit(f"[!] {label}: broadcast timed out after "
+                 f"{_bcast_timeout // 60} min (planned delays "
+                 f"{_planned_delay // 60} min + {BROADCAST_WORK_TIMEOUT // 60} "
+                 f"min for the relay work itself).")
     except subprocess.CalledProcessError as e:
         _round_log("broadcast_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: broadcast failed (exit {e.returncode})")

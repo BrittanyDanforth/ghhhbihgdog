@@ -879,6 +879,67 @@ check("chain: the sync height is coarsened, not exact",
       'rpc_sync_ok:height={h1}' not in _gs_a
       and "height~" in _gs_a)
 
+# THE BROADCAST TIMEOUT MUST COVER THE DELAYS THE ROUND PLANNED TO SERVE.
+#
+# _run_round_body ran the broadcaster with a bare `timeout=7200` while the
+# delays are served INSIDE that child and are CUMULATIVE -- the veil builder's
+# own comment says broadcast_signed_xmr "relays a plan file with a single
+# `for item in items:` loop that SLEEPS item.delay before each submit, so the
+# delays are CUMULATIVE, not offsets from a common start."
+#
+# So a round's whole delay budget had to fit in two hours. Measured with the
+# shipped hop_delay, 600 trials per cell, P(round exceeds 7200s):
+#
+#                        N=1     N=2     N=8    N=10    N=20
+#   default 180-720      0.0%    0.0%    0.0%    0.0%   99.3%
+#   1800-7200            0.0%   78.2%  100.0%  100.0%  100.0%
+#   7200-21600         100.0%  100.0%  100.0%  100.0%  100.0%
+#   21600-86400        100.0%  100.0%  100.0%  100.0%  100.0%
+#
+# 21600-86400 is what hop_delay()'s OWN docstring recommends for ring-age
+# plausibility, and every draw from it blew the cap at N=1 -- so following the
+# tool's advice guaranteed the round was killed having relayed nothing. The
+# default did it too at --wallets 20, which gs_console offers up to 60.
+#
+# And the kill is not recoverable: _run_round's finally securely erases the
+# round's signed blobs and bcast_progress.json, so --resume goes with them; on
+# the entry veil, the first stage-5 round, the sys.exit takes the whole run
+# down with the funds still on ENTRY -- the address the public ThorChain memo
+# names.
+check("broadcast timeout: the relay-work budget is its own constant, not the "
+      "whole budget", hasattr(ghost, "BROADCAST_WORK_TIMEOUT"))
+# srcutil.code_only, not the local token-joining _code_only: that one joins
+# tokens with spaces, so `timeout=_bcast_timeout` becomes `timeout = _bcast
+# _timeout` and an exact-text check misses it. This one keeps the layout.
+_bsrc = code_only(os.path.join(REPO, "GhostSpiral"))
+check("broadcast timeout: the bare timeout=7200 is gone",
+      "timeout=7200" not in _bsrc)
+check("broadcast timeout: it is derived from the plan's own delays",
+      "_bcast_timeout = BROADCAST_WORK_TIMEOUT + _planned_delay" in _bsrc)
+check("broadcast timeout: ...and the subprocess actually uses it",
+      "timeout=_bcast_timeout" in _bsrc)
+
+# The property, computed the way the shipped line computes it.
+import json as _json
+for _w, _n in ((None, 10), (None, 20), ((1800, 7200), 8), ((7200, 21600), 1),
+               ((21600, 86400), 1), ((21600, 86400), 10)):
+    _delays = [ghost.hop_delay(_w) for _ in range(_n)]
+    _planned = sum(_delays)
+    _t = ghost.BROADCAST_WORK_TIMEOUT + _planned
+    check(f"broadcast timeout: window={_w} N={_n} — the round fits its own "
+          f"timeout ({_planned}s planned, {_t}s allowed)", _planned < _t)
+# Non-vacuity: the old constant really would have killed most of these.
+_killed_by_old = sum(
+    1 for _w, _n in (((21600, 86400), 1), ((7200, 21600), 1), ((1800, 7200), 8))
+    if sum(ghost.hop_delay(_w) for _ in range(_n)) >= 7200)
+check("control: the old 7200 constant would still have killed those rounds "
+      f"({_killed_by_old}/3)", _killed_by_old == 3)
+# A plan that cannot be re-read must fail LONG, never short.
+check("broadcast timeout: an unreadable plan falls back to the widest window, "
+      "so the failure is a wait and not a kill with the blobs erased",
+      "_planned_delay = HOP_DELAY_MAX" in _bsrc)
+
+
 # 4. THE RELAY SCHEDULE. The per-TX delays are the mechanism that stops a batch
 #    relaying as one timing cluster. Writing their LENGTHS into a persistent,
 #    index-keyed file hands a reader the exact schedule -- the correlation the
