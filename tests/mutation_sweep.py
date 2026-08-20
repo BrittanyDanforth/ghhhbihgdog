@@ -316,6 +316,19 @@ MUTATIONS = [
   "    if total != total.quantize(SATOSHI_BTC):",
   "    if False:",
   ["test_dag_entry"]),
+
+ # create_fresh_account validates ONE answer and has no memory across calls,
+ # so every loop that mints in bulk has to check for itself. create_subs,
+ # create_entry_set and build_entry_veils do; these two did not.
+ ("two change sweeps may pay the same fresh address", "GhostSpiral",
+  "    if len(set(_cs_addrs)) != len(_cs_addrs) or len(set(_cs_accts)) != len(_cs_accts):",
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("two peel hops may share a carrier or a change account", "GhostSpiral",
+  "    if len(set(_pc_addrs)) != len(_pc_addrs) or len(set(hop_accounts)) != len(hop_accounts):",
+  "    if False:",
+  ["test_dag_entry"]),
 ]
 
 

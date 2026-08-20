@@ -568,6 +568,96 @@ check("split: two veils paying ONE carrier is REFUSED, not silently merged",
 check("split: ...and the refusal names it as the convergence it is",
       _merged and "convergence" in _merged)
 
+# THE SAME CHECK, ON THE TWO LOOPS THAT DID NOT MAKE IT.
+#
+# create_fresh_account validates the SHAPE of one answer and has no memory
+# across calls, so nothing in it can notice a wallet handing back an index it
+# already gave. Three loops close that themselves -- create_subs,
+# create_entry_set and build_entry_veils, each aborting with a message naming
+# the merge. Two minted the same way from the same RPC and never looked.
+
+
+class _DupTargetRPC:
+    """A wallet that hands back the SAME subaddress every time."""
+
+    def __init__(self, dup_addr=True, dup_acct=False):
+        self.n = 200
+        self.dup_addr = dup_addr
+        self.dup_acct = dup_acct
+
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            if self.dup_acct:
+                return {"account_index": 777}
+            self.n += 1
+            return {"account_index": self.n}
+        raise AssertionError(method)
+
+    def new_subaddress_indexed(self, account_index=0, label=""):
+        if self.dup_addr:
+            return ("SHARED_TARGET", 1)
+        return (f"T{account_index}", 1)
+
+
+# --- change-sweep destinations -------------------------------------------
+# Each change location holds ONE chunk's distribution remainder, so two jobs
+# sharing a destination put two swap chunks on one address -- and the exit
+# sweeps a subaddress in ONE transaction, spending both together. Before this
+# check, three jobs came back all pointing at the same address, silently.
+for _lbl, _rpc in [("address", _DupTargetRPC(dup_addr=True)),
+                   ("account", _DupTargetRPC(dup_addr=False, dup_acct=True))]:
+    _csdup = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.build_change_sweep_jobs(_rpc, {}, [11, 22, 33])
+    except SystemExit as _e:
+        _csdup = str(_e.code)
+    check(f"changesweep: a wallet reusing one {_lbl} for two change sweep "
+          f"destinations is REFUSED", _csdup is not None)
+    check(f"changesweep: ...and the refusal ({_lbl}) says it would merge two "
+          f"chunks the exit then spends together",
+          _csdup and "two chunks" in _csdup and "ONE" in _csdup)
+
+_csok = None
+with contextlib.redirect_stdout(io.StringIO()):
+    _csok = ghost.build_change_sweep_jobs(
+        _DupTargetRPC(dup_addr=False), {}, [11, 22, 33])
+check("control: distinct change-sweep destinations are accepted",
+      len(_csok) == 3 and len({j[2] for j in _csok}) == 3)
+
+# --- peel carriers and hop accounts --------------------------------------
+# build_peel_stage_plan's own docstring dies twice on a duplicate: ROTATING
+# CARRIERS ("no address is ever spent twice") and ONE ACCOUNT PER HOP (two
+# peels' change on one subaddress 0 makes the collecting sweep a 2-input
+# transaction). Measured before the check: a duplicate address gave 4 peels
+# spending only 2 distinct sources; a duplicate account gave 4 peels with 2
+# change accounts.
+_PD = [f"P{i}" for i in range(4)]
+_PBY = {a: Decimal("1") for a in _PD}
+for _lbl, _rpc in [("carrier address", _DupTargetRPC(dup_addr=True)),
+                   ("hop account", _DupTargetRPC(dup_addr=False, dup_acct=True))]:
+    _pdup = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.build_peel_stage_plan(_rpc, 9, "PENTRY", 1, _PD, _PBY,
+                                        Decimal("0.0024"), delay_window=(0, 0))
+    except SystemExit as _e:
+        _pdup = str(_e.code)
+    check(f"peel: a wallet reusing one {_lbl} across hops is REFUSED",
+          _pdup is not None)
+    check(f"peel: ...and the refusal ({_lbl}) names BOTH costs — the "
+          f"twice-spent address and the 2-input change sweep",
+          _pdup and "twice" in _pdup and "2-input" in _pdup)
+
+with contextlib.redirect_stdout(io.StringIO()):
+    _pok, _paccts = ghost.build_peel_stage_plan(
+        _DupTargetRPC(dup_addr=False), 9, "PENTRY", 1, _PD, _PBY,
+        Decimal("0.0024"), delay_window=(0, 0))
+check("control: distinct peel carriers are accepted",
+      len(_pok) == 4 and len({t["src"] for t in _pok}) == 4)
+check("control: ...each hop leaving its change on its OWN account",
+      len(set(_paccts)) == len(_paccts))
+
 # -- the distribution is N transactions, one per carrier -------------------
 _VA2 = types.SimpleNamespace
 

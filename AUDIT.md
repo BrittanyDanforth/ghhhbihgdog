@@ -1644,3 +1644,43 @@ rather than for every input the caller happened to filter.
 
 Found by re-probing the change against inputs the parse gate normally hides,
 not by a test — the same way B1 itself was found.
+
+### B8 (FIXED): three loops checked for a duplicate wallet answer, two did not
+
+`create_fresh_account` fails closed on a malformed answer, and its docstring is
+careful about it. But it validates **one call** and has no memory across calls,
+so nothing in it can notice a wallet handing back an index it already gave.
+Every loop that mints in bulk has to check that for itself.
+
+| loop | checks? |
+|------|---------|
+| `create_subs` | ✅ `DUPLICATE_SUBADDRESS`, aborts |
+| `create_entry_set` | ✅ `DUPLICATE_ENTRY_SUBADDRESS`, aborts |
+| `build_entry_veils` | ✅ `DUPLICATE_VEIL_CARRIER`, aborts, naming the merge |
+| `build_peel_stage_plan` | ❌ nothing |
+| `build_change_sweep_jobs` | ❌ nothing |
+
+Both unguarded loops have the invariant a duplicate breaks written out in their
+own prose, at length. Driven against a wallet that repeats one answer:
+
+* **`build_change_sweep_jobs`** returned three jobs all paying **one** address.
+  Each change location holds a different chunk's distribution remainder, so
+  that address holds value from three swap chunks — and the exit issues one
+  `sweep_all` per funded subaddress, spending them together.
+* **`build_peel_stage_plan`** produced 4 peels spending only **2 distinct
+  sources** (a duplicate carrier — the repeated-spender hub "ROTATING CARRIERS"
+  exists to remove), or 4 peels with only **2 distinct change accounts** (a
+  duplicate account — so two peels' change lands on one subaddress 0 and the
+  collecting sweep becomes the 2-input transaction "ONE ACCOUNT PER HOP" spends
+  three paragraphs explaining it must never be).
+
+Both now refuse before any money moves, matching the three loops that already
+did. Normal paths unchanged: 3 distinct destinations, 4 peels from 4 distinct
+sources with 4 distinct change accounts.
+
+This is the third instance of one shape, and worth naming as a class:
+**a helper that guarantees a property per call, and callers that need it across
+calls.** B1 was `split_by_weight` (contiguity assumed by `size_distribution`),
+B6 was `assign_hop_destinations` (uniqueness assumed across repeated calls),
+B8 is `create_fresh_account`. In each case some callers closed the gap and
+others did not, and nothing marked which.

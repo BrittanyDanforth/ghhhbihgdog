@@ -1295,6 +1295,33 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
         addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
         hop_accounts.append(acct)
         carriers.append((addr, idx))
+    # VERIFIED, not assumed -- the same check build_entry_veils, create_subs
+    # and create_entry_set all make, and this loop mints the same way from the
+    # same RPC without it. create_fresh_account validates the SHAPE of one
+    # answer; it has no memory across calls, so nothing there can notice the
+    # wallet handing back an index it already gave.
+    #
+    # Both halves of this function's own docstring die on a duplicate:
+    #   * ROTATING CARRIERS -- "one fresh subaddress per hop, so no address is
+    #     ever spent twice". Two equal carriers make one address the input of
+    #     two peels, which is the repeated-spender hub the rotation removes.
+    #   * ONE ACCOUNT PER HOP -- two equal accounts put two peels' change on
+    #     ONE subaddress 0, and the sweep that collects it is then a 2-INPUT
+    #     transaction: public, permanent proof those peels share an owner,
+    #     which is the exact fact the chain spends hours hiding.
+    #
+    # Before any money moves: the carriers are provisioned here, and the peel
+    # plan is built below.
+    _pc_addrs = [a for a, _i in carriers]
+    if len(set(_pc_addrs)) != len(_pc_addrs) or len(set(hop_accounts)) != len(hop_accounts):
+        integrity_log("stage4", "DUPLICATE_PEEL_CARRIER")
+        sys.exit(
+            f"[!] Two of the {len(carriers)} peel carriers came back the SAME.\n"
+            f"    Refusing: the chain would spend one address twice (the hub the\n"
+            f"    rotation exists to remove), and two hops' change would land on one\n"
+            f"    subaddress 0 -- so the sweep collecting it becomes a 2-input\n"
+            f"    transaction proving those peels share an owner. Nothing has been\n"
+            f"    spent. Check the wallet RPC.")
     core = build_peel_plan(
         entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
         carriers=carriers,
@@ -4733,6 +4760,35 @@ def build_change_sweep_jobs(rpc_primary, addr_index, change_accounts) -> list:
             continue
         addr_index[_csa] = (_csacct, _csi)
         change_sweep_jobs.append((_acct, 0, _csa, _csi))
+    # SAME CHECK AS THE VEIL CARRIERS, and for the same reason. Each change
+    # location holds the remainder of ONE chunk's distribution, so two jobs
+    # sharing a destination sweep two different swap chunks onto one address --
+    # and the exit issues a single sweep_all per funded subaddress, so both
+    # then leave in ONE multi-input transaction. That is the convergence the
+    # split exists to prevent, reached through the tidying step.
+    #
+    # build_entry_veils refuses exactly this and says so ("that merges two swap
+    # chunks into one output"); create_subs and create_entry_set refuse it too.
+    # This loop mints from the same RPC in the same shape and was the one that
+    # did not look. create_fresh_account cannot cover it: it validates a single
+    # answer and has no memory across calls.
+    #
+    # Before any money moves -- these are provisioned in stage 4, and the
+    # sweeps run at the end of stage 5.
+    _cs_addrs = [j[2] for j in change_sweep_jobs]
+    _cs_accts = [addr_index[j[2]][0] for j in change_sweep_jobs]
+    if len(set(_cs_addrs)) != len(_cs_addrs) or len(set(_cs_accts)) != len(_cs_accts):
+        integrity_log("stage4", "DUPLICATE_CHANGE_SWEEP_TARGET")
+        sys.exit(
+            f"[!] Two of the {len(change_sweep_jobs)} change sweeps would pay the "
+            f"SAME fresh address.\n"
+            f"    Refusing: each change location holds a DIFFERENT swap chunk's "
+            f"remainder, so that\n"
+            f"    address would hold value from two chunks -- and the exit sweeps a "
+            f"subaddress in ONE\n"
+            f"    transaction, which would spend both together and prove they share "
+            f"an owner.\n"
+            f"    Nothing has been spent. Check the wallet RPC.")
     return change_sweep_jobs
 
 
