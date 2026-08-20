@@ -288,6 +288,60 @@ check("exit: the held ENTRY output is NOT withdrawn",
       (9, 0) not in [(t["account_index"], t["src_index"]) for t in _txs2])
 check("exit: ...and is reported as held, not as a silent success",
       sum(_h2.values()) == 1 and _r2 == 2 and _f2 == 0 and _s2 == 0)
+
+# TWO HELD ENTRY OUTPUTS, which is what --split makes possible. The recovery
+# advice ("mint a fresh receive wallet, send this balance to it") is printed
+# INSIDE the per-output loop, so an operator holding two late swap chunks reads
+# it twice and the natural move is to mint ONE wallet and send both. That
+# single transaction spends two ENTRY outputs whose swaps both settled in
+# public -- the intersection attack, arrived at by following the instructions.
+#
+# report_holdings does say "SPEND THEM ONE ACCOUNT AT A TIME", but it runs only
+# on a COMPLETE run, and a run can reach the exit, hold two entry outputs and
+# still finish incomplete. Then this message is the only place the warning can
+# come from.
+_saved3 = (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+           ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+           ghost.secure_delay)
+rec3 = _Recorder()
+try:
+    ghost._run_round = rec3
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.connect_rpc = lambda *a, **k: _BalRPC(
+        {7: {1: 3_000_000_000_000},
+         9: {0: 1_000_000_000_000},
+         11: {0: 2_000_000_000_000}})
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    _stg3 = os.path.join(_tf.mkdtemp(prefix="exithold2_"), "tx_staging")
+    os.makedirs(_stg3, exist_ok=True)
+    _held2_out = io.StringIO()
+    with contextlib.redirect_stdout(_held2_out):
+        _r3, _f3, _s3, _h3, _u3 = ghost._run_exit_withdrawals(
+            _args, [7, 9, 11], [A1, A2], _stg3, None, {}, (0, 0),
+            hold=[(9, 0), (11, 0)], entry_pairs=[(9, 0), (11, 0)])
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay) = _saved3
+_h2txt = _held2_out.getvalue()
+check("exit: BOTH held ENTRY outputs are reported as entry, not change",
+      _h3.get("entry") == 2)
+check("exit: neither held ENTRY output is withdrawn",
+      not ({(9, 0), (11, 0)} & {(t["account_index"], t["src_index"])
+                                for r in rec3.rounds for t in r}))
+check("exit: with TWO held entry outputs it refuses one shared recovery "
+      "bundle — sending both to one address merges two swap chunks",
+      "ONE FRESH BUNDLE PER ADDRESS" in _h2txt)
+check("exit: ...and says why, in terms of the two public swap settlements",
+      "intersect two known candidate sets" in _h2txt)
+check("exit: ...and it counts them", "2 ENTRY" in _h2txt)
+# CONTROL: one held entry output must NOT get the plural warning.
+check("control: a single held ENTRY output does not get the "
+      "do-not-merge warning", "ONE FRESH BUNDLE PER ADDRESS" not in _held_out.getvalue())
 # WHICH KIND, not just how many. The caller words its report from this: an
 # ENTRY hold and a distribution-CHANGE hold are different addresses with
 # different reasons and different remedies, and the report used to assert

@@ -6091,6 +6091,31 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   "memo — then run this again with --receive-wallet on that "
                   "bundle. Note the account and subaddress above; nothing "
                   "writes them down for you.")
+        # ONE BUNDLE EACH, said ONCE, after the per-output advice above.
+        #
+        # That advice is printed inside the loop, so an operator holding two
+        # late swap chunks is told twice to "mint a fresh receive wallet" and
+        # the natural reading is to mint ONE and send both balances to it.
+        # That single transaction spends two ENTRY outputs, and every swap's
+        # settlement is public -- so it hands an analyst the intersection of
+        # two known candidate sets and identifies the transaction outright.
+        # It is the exact convergence --split exists to prevent, arrived at by
+        # following the tool's own instructions.
+        #
+        # report_holdings says "SPEND THEM ONE ACCOUNT AT A TIME", but it runs
+        # only on a COMPLETE run -- report_completion skips it whenever
+        # `incomplete` is non-empty -- and a run can reach the exit, hold two
+        # entry outputs, and still finish incomplete. Then this is the only
+        # place the warning could come from, and it was not here.
+        if _held_kinds["entry"] > 1:
+            print(f"      ONE FRESH BUNDLE PER ADDRESS, and do NOT send two of "
+                  f"them to the same one. The {_held_kinds['entry']} ENTRY "
+                  f"outputs above are different swap chunks, and each of those "
+                  f"swaps settled in public: a single transaction spending two "
+                  f"of them proves they share an owner and lets an analyst "
+                  f"intersect two known candidate sets — the convergence this "
+                  f"run kept them in separate accounts to prevent. Recover "
+                  f"them one at a time, as separate runs.")
     if not targets:
         if held:
             print("  [!] EXIT: nothing was withdrawn — the only funded output "

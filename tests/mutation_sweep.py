@@ -266,6 +266,14 @@ MUTATIONS = [
   '                                      for _a, _x in _targets) + ".")',
   '                          + f"account {_vacct}/subaddr {_vidx}" + ".")',
   ["test_units"]),
+
+ # The exit prints its recovery advice INSIDE the per-output loop, so two held
+ # entry outputs read as two invitations to mint one wallet and send both --
+ # a single transaction spending two publicly-settled swap chunks.
+ ("two held ENTRY outputs may share one recovery bundle", "GhostSpiral",
+  '        if _held_kinds["entry"] > 1:',
+  "        if False:",
+  ["test_exit_withdraw"]),
 ]
 
 
