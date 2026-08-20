@@ -71,7 +71,7 @@ def _free_port():
 
 
 PORT = _free_port()
-env = dict(os.environ, GS_WALLET_PASSWORD=PW)
+env = dict(os.environ, GS_WALLET_PASSWORD=PW, PYTHONUNBUFFERED="1")
 proc = subprocess.Popen([sys.executable, os.path.join(REPO, "gs_console"),
                          "--port", str(PORT)],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

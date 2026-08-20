@@ -1855,10 +1855,10 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)      # loopback ONLY
-    print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}")
-    print( "  ^ open THIS url — the token is required, and it changes every run")
-    print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'")
-    print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}")
+    print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}", flush=True)
+    print("  ^ open THIS url — the token is required, and it changes every run", flush=True)
+    print(f"  {len(ACTIONS)} actions · funds require the arm phrase '{ARM_PHRASE}'", flush=True)
+    print(f"  wallet password: {'from GS_WALLET_PASSWORD' if os.environ.get('GS_WALLET_PASSWORD') else 'not set'}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
