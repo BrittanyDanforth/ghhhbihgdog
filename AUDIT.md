@@ -1442,3 +1442,138 @@ the signer on this plan and attempting to broadcast, causing confusing failures.
 | /proc/PID/cmdline exposure | KNOWN | Can't fix from userspace; consider env vars |
 | renamethis1 | ON DISK | Not part of pipeline; paranoia now wipes it |
 | CoinGecko rate limiting via Tor | KNOWN | Bisq fallback added; may still fail |
+
+---
+
+## Section 16: Boundary Audit — defects BETWEEN components
+
+The previous rounds each hunted inside one file. This one only looked at the
+seams: a value produced in one function and consumed in another, a claim made
+in one place about behaviour implemented somewhere else, a fix applied to one
+copy of a duplicated thing. Every finding below was reached by reading a path
+end to end, not by a failing test — and each is now pinned by a behavioural
+test that a recorded mutation turns red.
+
+### B1 (FIXED): the fan-out amount map rode on list order
+
+`size_distribution` built its per-destination amounts with `amounts.extend(got)`
+— a flat concatenation of the per-slice results — and `main()` consumes them as
+`dict(zip(fanout_dests, fanout_amounts))`. That is correct only while
+`concat(slices) == fanout_dests` exactly, i.e. while `split_by_weight` returns
+CONTIGUOUS slices IN ORDER.
+
+Nothing stated that contract. `split_by_weight`'s own docstring justifies
+contiguity on **readability** grounds — "contiguity keeps the mapping obvious
+when a plan is read back by hand" — and names round-robin as the equivalent
+alternative. The one edit its comment invites is the edit that breaks this.
+
+Measured, 9 mix targets across chunks weighted 4/3/1:
+
+| partition   | chunk budgets      | amounts each carrier is asked to pay |
+|-------------|--------------------|--------------------------------------|
+| contiguous  | 3.00 / 2.25 / 0.75 | 2.70 / 2.02 / 0.67  (fits)           |
+| round-robin | 3.00 / 2.25 / 0.75 | 1.55 / 0.72 / **3.12** (does not)    |
+
+The third carrier holds 0.75 XMR and is told to pay 3.12. The fan-out then dies
+"not enough money" AFTER the veils have relayed and paid their fees — the exact
+failure the per-carrier sizing exists to prevent.
+
+**Fix:** amounts follow the ADDRESS, so any partition works, and a partition
+that leaves a destination in no slice stops the run at plan time.
+
+**The test was complicit:** the existing check read `sum(_amts[:3]) <= _su[0]`,
+slicing the amounts positionally too — so it would have stayed green through
+exactly the change that breaks the code.
+
+### B2 (FIXED): "Re-run once it confirms" stranded the money
+
+When a veil carrier does not confirm, `_stage5_run` returns early. It is the
+ONLY early return in that function, so it is the one failure where no exit runs
+and the balance simply stays put. The operator was told to "Re-run once it
+confirms."
+
+Nothing re-runs onto a carrier. Send mode calls `create_entry_set` and mints a
+brand-new entry set; receiver mode needs a bundle, and `create_receive_wallet`
+only ever calls `new_subaddress_indexed` — it mints a FRESH subaddress and
+cannot describe an existing address.
+
+The swap-shortfall gate already said this correctly ("a send-mode run mints a
+NEW ENTRY every time, so re-running now leaves what did arrive stranded"). Two
+messages about parked money; one corrected, one still pointing the wrong way.
+
+**Also fixed on that path:** only the FAILING carrier's account was printed,
+while `report_completion` deliberately skips `report_holdings` on an incomplete
+run — so the operator finished holding money on accounts nothing had named.
+
+### B3 (FIXED): the exit's recovery advice, read twice, merges two chunks
+
+`_run_exit_withdrawals` prints "mint a fresh receive wallet ... send this
+balance to it" INSIDE the per-held-output loop. With `--split`, a run can end
+holding two late swap chunks — and the operator reads that paragraph twice. One
+wallet, both balances: a single transaction spending two ENTRY outputs whose
+swap settlements are both public, which is the intersection attack.
+
+`report_holdings` does warn ("SPEND THEM ONE ACCOUNT AT A TIME"), but it runs
+only on a COMPLETE run, and a run can reach the exit, hold two entry outputs and
+still finish incomplete.
+
+Same root cause as B2, in the sibling location. Both now refuse the merge
+explicitly, and only when more than one output is held.
+
+### B4 (FIXED): a wipe that cried wolf
+
+`secure_delete_or_warn` printed "It is STILL ON DISK" for files that were never
+created. `secure_delete_file` lstats first and returns False when that raises,
+so a path that never existed reported exactly like a wipe that could not run.
+
+`atomic_write_json`/`atomic_write_text` call it from `except BaseException`
+precisely when `secure_write_bytes` may have failed to CREATE the temp file
+(read-only or full filesystem, bad directory perms). Every one of those would
+have printed a wipe failure for a nonexistent file and written
+`secure_delete_failed` into the integrity chain. An operator who sees that
+warning cry wolf is one who ignores the real one about a spend-key password
+still sitting in `/dev/shm`.
+
+### B5 (REMOVED): four module-level names nothing read
+
+| name | file | what it was |
+|------|------|-------------|
+| `FANOUT_FEE_BUFFER_MULT` | GhostSpiral | leftover of the fee-sized buffer the block above it says was written and NOT shipped. Its comment described, in the present tense, a fan-out holding back three fee-widths; the code holds back 10% of the balance. It also called the change destination "the wallet's identity address", which the account rotation stopped being true. |
+| `PICONERO` | GhostSpiral | second copy of gs_common's, used only there |
+| `CG_PRICE` | thor_swap_preparer | copy of `gs_common.CG_PRICE_URL`; a URL edit here would have changed nothing |
+| `_XMR_RE` | thor_swap_preparer | a **checksum-less** address regex sitting beside a validator that checks format AND checksum — an invitation to "validate" with the wrong one |
+| `SHELL_HISTORIES` | paranoia_mode | computed at import, read by nothing, under a comment claiming the tests use it. They do not. `wipe_shell_histories` calls `_shell_histories()` live, which is correct: HISTFILE can change between import and the wipe. |
+
+### Checked and found SOUND (recorded so the next audit does not redo them)
+
+* **create → sign boundary.** `_validate_plan` is phase-aware and always runs
+  with the real phase (`--phase` is `choices=["create","sign"]`); `src_index` is
+  mandatory for create, and `phase_create` indexes it only after that check.
+  `account_index` is validated and then actually reaches `sweep_all`/
+  `transfer_split` — not validated-then-ignored.
+* **The signing fingerprint** covers every field `phase_create` uses
+  (`src_index`, `account_index`, `delay`, `sweep`, `dst`/`amt`, `destinations`).
+  `peel_num` and `carrier` are planning-only and read by neither the signer nor
+  the broadcaster.
+* **`SPEND_SOURCES` ↔ `_dest_slices` alignment.** `build_entry_veils` appends
+  one carrier per entry unconditionally, in order, and its docstring states the
+  contract ("parallel to `entries`"). Unlike B1, the contract is explicit.
+* **The dropped-chunk path.** `ENTRY_ADDRS` is assigned once before pruning and
+  never narrowed, so `_exit_hold_list` genuinely gets the FULL entry set and a
+  chunk that lands late is held back from the exit. Now driven end to end by
+  `tests/test_split_partial.py` (4 / 0 / 1 XMR).
+* **Failure propagation.** Both `_run_change_sweeps` call sites act on the
+  return value and feed `incomplete`, which reaches `report_completion` and
+  `sys.exit(1)` with no holdings report and no plan wipe.
+* **`gs_console`.** `_guard` runs before every route on both `do_GET` and
+  `do_POST` (only `/favicon.ico` bypasses, returning 204 with no data);
+  `hmac.compare_digest` for the token; binds `127.0.0.1` only; Host check for
+  DNS rebinding, Origin check for CSRF, `application/json` to defeat CORS-simple
+  posts.
+* **`resolve_destinations`** does enforce one destination per amount — the
+  `zip(args.amounts, args.dests)` below it cannot truncate silently. (Checked
+  after an initial four-suite mutation run wrongly suggested otherwise;
+  `test_swap_receive` catches it. Recorded because the near-miss is the point:
+  a mutation is only as good as the suite list it runs.)
+* **No dead functions** anywhere in the toolchain (AST call-graph); the three
+  apparent ones in `gs_console` are `BaseHTTPRequestHandler` overrides.
