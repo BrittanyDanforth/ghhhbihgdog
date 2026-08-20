@@ -1503,6 +1503,46 @@ check("pairs: a pairs entry written from a real receive bundle is matched by "
 check("pairs: ...and its quote becomes the target",
       ghost.swap_expected_total(_rb_rows)[0] == D("2.5"))
 
+# A FLAG THAT DOES NOTHING MUST SAY SO. Send mode fetches its own quotes and
+# takes the target from those, so a bundle handed in there is genuinely unused
+# -- and an operator who passed one believes the run is gated by it. This file
+# has already shipped two "NO EFFECT" messages that were wrong about their own
+# code; a third flag dropped in silence is the same defect with no message at
+# all.
+_ig_out = io.StringIO()
+_ig_saved = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    _ig_args = types.SimpleNamespace(
+        receive_wallet=None, swap_pairs="thor_pairs.json", joinmarket=False,
+        btc_entry="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+    try:
+        with contextlib.redirect_stdout(_ig_out):
+            ghost.resolve_entry_mode(_ig_args)
+    except SystemExit:
+        pass
+finally:
+    ghost.integrity_log = _ig_saved
+check("pairs: --swap-pairs in SEND mode is reported as ignored, not dropped "
+      "in silence", "ignored in SEND mode" in _ig_out.getvalue())
+
+# ...and stays quiet when it was not passed.
+_ig_out2 = io.StringIO()
+_ig_saved = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    try:
+        with contextlib.redirect_stdout(_ig_out2):
+            ghost.resolve_entry_mode(types.SimpleNamespace(
+                receive_wallet=None, swap_pairs=None, joinmarket=False,
+                btc_entry="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
+    except SystemExit:
+        pass
+finally:
+    ghost.integrity_log = _ig_saved
+check("pairs: ...and says nothing when it was not passed",
+      "swap-pairs" not in _ig_out2.getvalue())
+
 # The flag has to exist and reach stage 4's decision.
 check("pairs: --swap-pairs is a real flag",
       "--swap-pairs" in (ghost.build_cli().format_help()))

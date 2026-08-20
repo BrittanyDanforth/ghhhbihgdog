@@ -3448,6 +3448,20 @@ def resolve_entry_mode(args) -> tuple:
             sys.exit("[!] Invalid BTC entry address: failed bech32 checksum "
                      "(expected bc1.../tb1... with a valid checksum)")
         integrity_log("stage0", "btc_entry_validated")
+        if getattr(args, "swap_pairs", None):
+            # SAID, not silently discarded. Send mode fetches its own quotes
+            # in stage 2 and derives the arrival target from those, so a bundle
+            # handed in here is genuinely unused -- but an operator who passed
+            # one believes the run is gated by it, and this file has already
+            # shipped two "NO EFFECT" messages that were wrong about their own
+            # code. A flag that is accepted, validated and then dropped in
+            # silence is how that belief survives to the point where it costs
+            # money.
+            integrity_log("stage0", "swap_pairs_ignored_send_mode")
+            print(f"  [!] --swap-pairs is ignored in SEND mode: this run "
+                  f"fetches its own quotes and takes the arrival target from "
+                  f"them. The flag exists for RECEIVER mode, where there are "
+                  f"no quotes to fetch.")
     return (receive_mode, receive_entry_addr, receive_account_index,
             receive_subaddress_index)
 
