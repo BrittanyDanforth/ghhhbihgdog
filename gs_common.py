@@ -632,7 +632,37 @@ def wipe_covers(target) -> bool:
         res = Path(target).resolve()
         if res.is_file() or res.suffix:
             res = res.parent
-        return any(res == r or r in res.parents for r in paranoia_search_roots())
+        # DEPTH 0 AND 1, which is what the paragraph above says and what the
+        # sweep actually does. This was `r in res.parents`, which is true at
+        # ANY depth -- so every path two or more levels under a root answered
+        # "covered" while _wipe_gs_artifacts_inner never enumerated it. It
+        # globs each root exactly twice, `root.glob(pattern)` and
+        # `root.glob(f"*/{pattern}")`; there is no third level.
+        #
+        # Driven against the real sweep in dry mode, with cwd and $HOME pointed
+        # at a scratch root holding one unsigned_fanout_*.json at each depth:
+        #
+        #     depth 0  covers=True   actually swept=True
+        #     depth 1  covers=True   actually swept=True
+        #     depth 2  covers=True   actually swept=FALSE
+        #     depth 3  covers=True   actually swept=FALSE
+        #
+        # A WRONG ANSWER HERE IS SILENT BY CONSTRUCTION, as the docstring says,
+        # and it is silent in the unsafe direction: all four callers only speak
+        # when this returns False. `GhostSpiral --output plans/run7`,
+        # `create_receive_wallet --output-dir ~/keys/gs`,
+        # `thor_swap_preparer --outfile ~/keys/gs/thor_pairs.json` and
+        # exit_strategy_simulator's --outfile each printed nothing and left
+        # their plans -- hop destinations, amounts, the receive bundle, the
+        # --exit-to destination -- on disk after a wipe the operator was told
+        # covered them.
+        #
+        # res is already the containing DIRECTORY by this point, so depth 0 is
+        # `res == r` (a file sitting in the root) and depth 1 is
+        # `res.parent == r` (a file one directory down, which `*/pattern`
+        # reaches).
+        return any(res == r or res.parent == r
+                   for r in paranoia_search_roots())
     except OSError:
         return False
 

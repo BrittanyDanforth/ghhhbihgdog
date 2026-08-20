@@ -513,6 +513,88 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
         share = (remainder * (Decimal(str(w)) / Decimal(str(wsum)))).quantize(
             DUST_XMR, rounding=ROUND_DOWN)
         amounts.append(min_each + share)
+    # "DELIBERATELY UNEQUAL" IS THE FIRST LINE OF THIS DOCSTRING, and jitter
+    # alone does not deliver it. Every share is quantised onto a DUST_XMR grid
+    # (0.0001 XMR), so independent draws collide far more often than continuous
+    # odds suggest -- and nothing checked afterwards.
+    #
+    # Measured with a real SystemRandom, `usable` from the shipped
+    # compute_fee_budget, fee 0.0024, --deep 2:
+    #
+    #     50 XMR  / --wallets 10   0.1% of plans hold a repeat
+    #      2 XMR  / --wallets 10   1.5%
+    #    0.5 XMR  / --wallets 10   6.4%
+    #      1 XMR  / --wallets 20  28.1%
+    #    0.5 XMR  / --wallets 20  81.3%, with up to FOUR identical amounts
+    #
+    # Which is precisely the cluster the paragraph above describes: N outputs
+    # sharing one value and one transaction shape, followable through every hop
+    # that spends them. The sibling splitter (split_btc_amount) makes exactly
+    # this guarantee and enforces it; this one only claimed it.
+    #
+    # NOT A LACK OF ROOM. Distinct shares on the grid need 0+1+...+(N-1) ticks
+    # and the remainder holds far more wherever this returns anything at all --
+    # 1119 ticks against the 190 needed at 0.5 XMR / 20, the worst case above.
+    # The collisions are collisions, so a construction removes them outright.
+    #
+    # Same construction split_btc_amount uses, in grid ticks rather than
+    # satoshis: sort, force the sequence strictly upward (distinct, and only
+    # ADDS), then give the excess back from the top down taking only the slack
+    # above the one beneath, so no step can recreate a tie. The sum is
+    # preserved exactly, so "never over-budget" still holds, and the floor is
+    # min_each for every output, so "every amount >= min_each" does too.
+    #
+    # Ties broken at random rather than by index, for the same reason
+    # split_btc_amount does it: sorted() is stable, so keying on the value
+    # alone puts tied entries in original index order and the staircase then
+    # hands the lowest index the lowest amount inside every tied group.
+    #
+    # HONESTLY: unlike the BTC splitter, that bias is NOT MEASURABLE here.
+    # Reimplementing this construction with a switchable tie-break and running
+    # both gives P(a[i]<a[j]) deltas inside noise at every setting -- +0.0000
+    # at 0.5 XMR / 20, -0.0148 at 1 XMR / 20 (the wrong sign), +0.0068 at
+    # 0.5 / 10 -- because the remainder here runs to ~1119 grid ticks across 20
+    # draws, so ties are rare and their groups are small, and nothing
+    # accumulates. In split_btc_amount the tie rate reaches 1.0 at dust totals
+    # and the bias reaches 0.66, which is what made it visible there.
+    #
+    # Kept anyway: it costs one sort key, it matches the sibling construction,
+    # and it is the property that stops being true first if the tick budget
+    # ever tightens. No mutation asserts a difference it cannot demonstrate.
+    _tick = [int(((_a - min_each) / DUST_XMR).to_integral_value())
+             for _a in amounts]
+    _target = sum(_tick)
+    _n = fanout_count
+    _order = sorted(range(_n), key=lambda i: (_tick[i], rng.random()))
+    for _pos in range(1, _n):
+        _i, _prev = _order[_pos], _order[_pos - 1]
+        if _tick[_i] <= _tick[_prev]:
+            _tick[_i] = _tick[_prev] + 1
+    _excess = sum(_tick) - _target
+    while _excess > 0:
+        _moved = False
+        for _pos in range(_n - 1, -1, -1):
+            _i = _order[_pos]
+            # Floor: strictly above the one beneath it, or 0 ticks for the
+            # smallest -- 0 is legal here because every share sits ON TOP of
+            # min_each, so a zero share is still a fundable output.
+            _floor = (_tick[_order[_pos - 1]] + 1) if _pos > 0 else 0
+            _take = min(_tick[_i] - _floor, _excess)
+            if _take > 0:
+                _tick[_i] -= _take
+                _excess -= _take
+                _moved = True
+                if _excess == 0:
+                    break
+        if not _moved:
+            break
+    # Only when the give-back balanced exactly. Below 0+1+...+(N-1) ticks there
+    # is no distinct assignment and the staircase cannot be paid for; leaving
+    # the original amounts is right there, because the budget guarantees are
+    # what the caller funds against and a repeat is a weaker failure than an
+    # over-budget plan. Not reached at any setting measured above.
+    if _excess == 0:
+        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]
     return amounts
 
 

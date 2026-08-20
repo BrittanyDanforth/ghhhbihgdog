@@ -452,6 +452,23 @@ MUTATIONS = [
   "{redact_addresses(_txt.strip())[-160:]}",
   "{redact_addresses(_txt.strip()[-160:])}",
   ["test_units"]),
+
+ # paranoia_mode globs each root at depth 0 and 1 only. `r in res.parents` is
+ # true at ANY depth, so a path two levels down answered "covered" and the
+ # three "this will NOT be wiped" warnings stayed silent for it.
+ ("wipe_covers claims coverage at any depth, not the depth 0/1 the sweep reaches",
+  "gs_common.py",
+  "        return any(res == r or res.parent == r\n                   for r in paranoia_search_roots())",
+  "        return any(res == r or r in res.parents\n                   for r in paranoia_search_roots())",
+  ["test_units"]),
+
+ # Every fan-out share is quantised onto a 0.0001 XMR grid, so independent
+ # draws collide: 81% of plans held a repeat at 0.5 XMR / --wallets 20. The
+ # docstring's first line promises "DELIBERATELY UNEQUAL".
+ ("the fan-out amounts may repeat (the equal-value cluster)", "GhostSpiral",
+  "    if _excess == 0:\n        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]",
+  "    if False:\n        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]",
+  ["test_units"]),
 ]
 
 

@@ -198,6 +198,86 @@ check("fanout: zero/negative count returns []",
 _amts_off = ghost.compute_fanout_amounts(Decimal("0.01"), 5, _fee, False, _rnd.Random(3))
 check("fanout: DAG-off floor is only a dust margin (funds smaller balances)",
       len(_amts_off) == 5 and all(a >= Decimal("0.0002") for a in _amts_off))
+
+# "UNEQUAL" WHERE IT WAS ACTUALLY AT RISK.
+#
+# The check above draws ONE plan at 10 XMR across 8 destinations with a seeded
+# rng, and collisions there run at about 0.1% -- so it passes on the broken
+# code and has always passed. Every share is quantised onto a DUST_XMR grid
+# (0.0001 XMR), and it is the SMALL-remainder settings where independent draws
+# land on the same tick.
+#
+# Measured with a real SystemRandom and `usable` from the shipped
+# compute_fee_budget: 6.4% of plans held a repeat at 0.5 XMR / --wallets 10,
+# 28.1% at 1 XMR / 20, and 81.3% at 0.5 XMR / 20 -- with up to FOUR identical
+# amounts. Which is the cluster the docstring's own second paragraph describes:
+# N outputs sharing one value and one transaction shape, followable through
+# every hop that spends them.
+#
+# Not a lack of room -- distinct shares need 0+1+...+(N-1) grid ticks and the
+# remainder held 1119 against the 190 needed at the worst of those. Hammered,
+# because the failure is statistical and one draw would miss it.
+import secrets as _secmod
+_fo_rng = _secmod.SystemRandom()
+for _fb, _fw in ((Decimal("0.5"), 20), (Decimal("1"), 20), (Decimal("0.5"), 10)):
+    _fu = ghost.compute_fee_budget(_fb, Decimal("0.0024"), _fw, deep=2)
+    if isinstance(_fu, tuple):
+        _fu = _fu[0]
+    _fdup = _ffloor = _fover = 0
+    _fbudget = _fu * ghost.FANOUT_SPEND_FRACTION
+    _fmin = (ghost.hop_fee_reserve(Decimal("0.0024")) + ghost.DUST_XMR).quantize(
+        ghost.DUST_XMR, rounding=ghost.ROUND_UP)
+    for _ in range(300):
+        _fa = ghost.compute_fanout_amounts(_fu, _fw, Decimal("0.0024"), True,
+                                           _fo_rng)
+        if not _fa:
+            continue
+        if len(set(_fa)) != len(_fa):
+            _fdup += 1
+        if any(_x < _fmin for _x in _fa):
+            _ffloor += 1
+        if sum(_fa) > _fbudget:
+            _fover += 1
+    check(f"fanout: {_fb} XMR across {_fw} destinations is DISTINCT on every "
+          f"draw — this setting produced a repeat in up to 81% of plans",
+          _fdup == 0)
+    check(f"fanout: ...and the distinctness construction did not break the "
+          f"budget or the per-output floor at {_fb}/{_fw}",
+          _fover == 0 and _ffloor == 0)
+
+# ...and the chunk INDEX must not correlate with the chunk SIZE. The staircase
+# sorts, and sorted() is stable, so keying on the value alone would hand the
+# lowest index the lowest amount inside every tied group -- an ordering tell,
+# biting hardest at exactly the small-remainder settings where the ties are.
+_fu2 = ghost.compute_fee_budget(Decimal("0.5"), Decimal("0.0024"), 20, deep=2)
+if isinstance(_fu2, tuple):
+    _fu2 = _fu2[0]
+_fpairs = _fconc = 0
+for _ in range(400):
+    _fa = ghost.compute_fanout_amounts(_fu2, 20, Decimal("0.0024"), True,
+                                       _fo_rng)
+    if not _fa:
+        continue
+    for _i in range(len(_fa)):
+        for _j in range(_i + 1, len(_fa)):
+            _fpairs += 1
+            if _fa[_i] < _fa[_j]:
+                _fconc += 1
+_fratio = (_fconc / _fpairs) if _fpairs else 0
+# A REGRESSION GUARD, NOT A DEMONSTRATED FIX, and the difference is worth
+# stating. The staircase breaks ties at random rather than by index, the way
+# split_btc_amount does -- but measured here, that changes nothing: switching
+# the tie-break moves P(a[i]<a[j]) by less than noise at every setting, and at
+# 1 XMR / 20 the "biased" version measured LOWER than the random one. The
+# remainder runs to ~1119 grid ticks across 20 draws, so ties are rare and
+# their groups are small and no index bias accumulates. (In split_btc_amount
+# the tie rate hits 1.0 at dust totals and the bias reaches 0.66, which is what
+# made it real there.) No mutation asserts a difference this cannot show; this
+# check pins the PROPERTY, so it still catches a future change that does
+# introduce one.
+check(f"fanout: destination INDEX carries no information about amount — "
+      f"P(a[i]<a[j])={_fratio:.3f}, unbiased is 0.5",
+      _fpairs > 0 and 0.46 <= _fratio <= 0.54)
 check("fanout: DAG-off sum still within budget",
       sum(_amts_off) <= Decimal("0.01") * ghost.FANOUT_SPEND_FRACTION)
 
@@ -3023,6 +3103,31 @@ check("wipe_covers: an unrelated absolute directory is NOT covered",
       not _gsc.wipe_covers(Path("/mnt/usb/plans")))
 check("wipe_covers: a file on an unrelated mount is NOT covered",
       not _gsc.wipe_covers(Path("/srv/exit.json")))
+# DEPTH 0 AND 1 ONLY, because that is all paranoia_mode's sweep reaches.
+#
+# The predicate was `r in res.parents`, which is true at ANY depth, so every
+# path two or more levels under a root answered "covered" while
+# _wipe_gs_artifacts_inner never enumerated it -- it globs each root exactly
+# twice, root.glob(pattern) and root.glob(f"*/{pattern}"), and there is no
+# third level. The docstring stated the correct rule the whole time.
+#
+# Silent in the UNSAFE direction: all four callers only speak when this returns
+# False, so `--output plans/run7` printed nothing and left the hop
+# destinations and amounts on disk after a wipe the operator was told covered
+# them. The checks above only ever tested depth 0 and depth 1, which is why
+# this survived.
+check("wipe_covers: a file TWO levels down is NOT covered — the sweep globs "
+      "root and root/* and stops",
+      not _gsc.wipe_covers(Path.cwd() / "plans" / "run7" / "unsigned_a.json"))
+check("wipe_covers: ...nor three levels down",
+      not _gsc.wipe_covers(Path.cwd() / "a" / "b" / "c" / "unsigned_a.json"))
+check("wipe_covers: a DIRECTORY two levels down is NOT covered either "
+      "(--output plans/run7)",
+      not _gsc.wipe_covers(Path.cwd() / "plans" / "run7"))
+# ...and the boundary still holds from the other side, so this is not simply
+# "refuse everything".
+check("control: a directory ONE level down is still covered (--output plans)",
+      _gsc.wipe_covers(Path.cwd() / "plans"))
 shutil.rmtree(_cov_dir, ignore_errors=True)
 
 # GhostSpiral must actually WARN, not merely be able to. An incomplete run
