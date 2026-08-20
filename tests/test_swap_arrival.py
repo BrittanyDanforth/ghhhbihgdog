@@ -1467,6 +1467,42 @@ try:
 finally:
     ghost.integrity_log = _sp_saved_il
 
+# THE TWO SIDES MUST AGREE ON THE STRING, or the filter matches nothing and
+# every bundle looks like "routed elsewhere" -- which fails SAFE (no target)
+# but silently throws the whole feature away.
+#
+# thor_swap_preparer writes dest_xmr from load_receive_bundle(path)["address"];
+# GhostSpiral's ENTRY in receiver mode is load_receive_bundle(path)["address"]
+# too. Same loader, same key -- driven here through the real shared loader
+# rather than asserted from reading, because "they both use the same key" is
+# the kind of claim that stays true right up until one side normalises.
+_rb_dir = _sp_tmp.mkdtemp(prefix="gs_bundle_")
+_rb_path = _sp_os.path.join(_rb_dir, "wallet_test.json")
+with open(_rb_path, "w") as _f:
+    _sp_json.dump({"schema": "gs_receive_wallet_v1", "address": _SPD,
+                   "account_index": 7, "subaddress_index": 3,
+                   "rpc_endpoint": "http://127.0.0.1:18083"}, _f)
+from gs_common import load_receive_bundle as _rb_load             # noqa: E402
+_rb = _rb_load(_rb_path)
+# What thor_swap_preparer puts in dest_xmr...
+_thor_dest = _rb["address"]
+# ...and what GhostSpiral resolves ENTRY to in receiver mode.
+_gs_entry = _rb["address"]
+_rb_bundle = _sp_bundle("roundtrip.json", [(_thor_dest, "2.5")])
+_rb_saved = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    _o = io.StringIO()
+    with contextlib.redirect_stdout(_o):
+        _rb_rows = ghost._receive_pairs_for(
+            types.SimpleNamespace(swap_pairs=_rb_bundle), _gs_entry)
+finally:
+    ghost.integrity_log = _rb_saved
+check("pairs: a pairs entry written from a real receive bundle is matched by "
+      "the ENTRY that same bundle produces", len(_rb_rows) == 1)
+check("pairs: ...and its quote becomes the target",
+      ghost.swap_expected_total(_rb_rows)[0] == D("2.5"))
+
 # The flag has to exist and reach stage 4's decision.
 check("pairs: --swap-pairs is a real flag",
       "--swap-pairs" in (ghost.build_cli().format_help()))

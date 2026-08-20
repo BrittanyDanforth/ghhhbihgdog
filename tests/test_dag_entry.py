@@ -1394,11 +1394,24 @@ import statistics as _spstat                                      # noqa: E402
 
 
 def _chunk_spread(total, n, seed=1234, draws=200):
-    """Median of (max-min)/mean over `draws` splits. 0 means "all equal"."""
+    """Median of (max-min)/mean over `draws` splits. 0 means "all equal".
+
+    _split_or_none, NOT split_btc_amount directly. It raises ValueError when it
+    cannot produce n distinct positive chunks, and the first version of this
+    helper let that escape -- so mutation [17], which routes every split into
+    that raise, KILLED this file instead of failing a check. No RESULT line,
+    scored NO-RESULT, and the sweep's own header says that is not a catch. The
+    helper twenty lines up exists for exactly this and was written after the
+    same mistake. Returning None makes the checks below go red in their own
+    words.
+    """
     _r = _sprand.Random(seed)
     out = []
     for _ in range(draws):
-        _c = [float(x) for x in ghost.split_btc_amount(Decimal(total), n, _r)]
+        _raw = _split_or_none(Decimal(total), n, _r)
+        if _raw is None:
+            return None
+        _c = [float(x) for x in _raw]
         out.append((max(_c) - min(_c)) / (sum(_c) / len(_c)))
     return _spstat.median(out)
 
@@ -1406,20 +1419,27 @@ def _chunk_spread(total, n, seed=1234, draws=200):
 for _tot, _n in (("0.05", 4), ("1.0", 3), ("0.5", 8), ("0.01", 2)):
     _sp = _chunk_spread(_tot, _n)
     check(f"btc: {_n} chunks of {_tot} BTC are MEANINGFULLY different, not "
-          f"merely non-identical (median spread {_sp:.3f}, jitterless is "
-          f"~0.00001)", _sp > 0.02)
+          f"merely non-identical (median spread "
+          f"{'REFUSED' if _sp is None else format(_sp, '.3f')}, jitterless is "
+          f"~0.00001)", _sp is not None and _sp > 0.02)
 
 # The bound the docstring states, so the spread above cannot come from a jitter
 # that has quietly grown into "one chunk carries almost everything".
 _r_ext = _sprand.Random(99)
 _lo, _hi = 9.9, 0.0
+_band_ok = True
 for _ in range(300):
-    _c = [float(x) for x in ghost.split_btc_amount(Decimal("1.0"), 4, _r_ext)]
+    _raw = _split_or_none(Decimal("1.0"), 4, _r_ext)
+    if _raw is None:
+        _band_ok = False
+        break
+    _c = [float(x) for x in _raw]
     _mean = sum(_c) / len(_c)
     _lo = min(_lo, min(_c) / _mean)
     _hi = max(_hi, max(_c) / _mean)
 check(f"btc: ...and still inside the stated 0.70x-1.44x band "
-      f"(saw {_lo:.3f}x-{_hi:.3f}x)", 0.68 <= _lo and _hi <= 1.46)
+      f"(saw {_lo:.3f}x-{_hi:.3f}x)",
+      _band_ok and 0.68 <= _lo and _hi <= 1.46)
 
 # NON-VACUITY: the measure must actually report ~0 for a genuinely equal split,
 # or `> 0.02` is passing for some other reason.
