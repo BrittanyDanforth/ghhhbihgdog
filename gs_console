@@ -139,6 +139,27 @@ SCHEMA = {
     "pairs_file":   ("re", PATH_RE),
     "swap_btc":     ("re", DEC_RE),
     "btc_amount":   ("re", DEC_RE),
+    #: HOW MUCH XMR THIS RUN IS WAITING FOR, and the console could not say it.
+    #:
+    #: Exactly the hop_delay omission below, in the place where it costs money
+    #: rather than ring-age plausibility. SCHEMA is the whitelist -- "Anything
+    #: not here cannot reach an argv" -- and expect_total_xmr was not in it, so
+    #: no dashboard-driven run could set one, ever.
+    #:
+    #: In RECEIVE mode that is the whole gate. GhostSpiral's stage 4 branches on
+    #: `args.expect_total_xmr is None` and, with no target, prints "this run
+    #: does NOT wait" and plans against whatever happens to be on ENTRY at that
+    #: instant. So a dashboard receive run paid by four swaps starts mixing on
+    #: the first one to land: the veil sweeps it, the distribution sizes itself
+    #: from it, and chunks two to four arrive on an ENTRY the run has already
+    #: finished with -- unmixed, on the address the swap memo names in public.
+    #: The gate that refuses exactly this exists and is reachable only from the
+    #: CLI.
+    #:
+    #: Send mode usually derives the target from the quotes (--btc-amount sums
+    #: them), so this is the fallback there rather than the only route -- but it
+    #: is the only route when a quote comes back unreadable.
+    "expect_total_xmr": ("re", DEC_RE),
     # 8, NOT 20, and it must equal gs_common.MAX_SPLIT.
     #
     # The console offered a split of up to 20 while GhostSpiral refuses above
@@ -256,6 +277,15 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
             why.append("Receive mode needs the wallet JSON from create_receive_wallet.")
         else:
             a += ["--receive-wallet", p["receive_wallet"]]
+        # --split is NOT dead in receive mode, whatever the old wording said:
+        # stage4 computes n_chunks as `len(swap_deposits) or max(args.split, 1)`
+        # and receive mode has no deposits, so this IS the chunk count the
+        # arrival gate uses. Several swaps can be routed to one receive address
+        # -- receive_watch's pairs_for_dest exists to collect them -- so the
+        # number is real, and it tightens the gate when the implied per-chunk
+        # size is smaller than the tolerance.
+        if p.get("split", 1) > 1:
+            a += ["--split", str(p["split"])]
     else:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")
@@ -269,6 +299,12 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
             a += ["--split", str(p["split"])]
         if p.get("joinmarket"):
             a.append("--joinmarket")
+    # Both modes: in receive mode it is the only way to get a target at all,
+    # and in send mode it is the fallback for when a quote is unreadable and
+    # the summed-from-quotes target would silently be built from fewer chunks
+    # than the operator actually paid for.
+    if p.get("expect_total_xmr"):
+        a += ["--expect-total-xmr", str(p["expect_total_xmr"])]
     if not p.get("tor_proxy"):
         why.append("A socks5h:// Tor proxy is required — the pipeline refuses to run without one.")
     else:
@@ -1729,6 +1765,17 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         Reads only, spends nothing; when the money lands it asks what you want to do with it.
         With a quote file it waits for the quoted amount, otherwise for any balance at all.
         <div class="stepacts" data-acts="watch_receive"></div>
+        <div class="f" style="margin-top:10px"><label for="expect_total_xmr">Total XMR expected
+          <span class="d">all swaps to this address</span></label>
+          <input id="expect_total_xmr" placeholder="4.0"></div>
+        <div class="f"><label for="split_recv">Number of swaps
+          <span class="d">paying that total</span></label>
+          <input id="split_recv" type="number" min="1" max="8" value="1"></div>
+        <p class="lead" style="margin-top:6px"><b>Fill these in.</b> Without a total the mix does
+        <i>not</i> wait: it plans against whatever has landed the moment it starts. If the
+        sender pays in several swaps, the ones that arrive later are never mixed — they sit on
+        the receive address, which the swap memo names in public. The count tightens the gate
+        so one missing swap cannot hide inside the tolerance.</p>
       </div></div>
     </div>
     <div class="stepnav"><button class="bk" data-go="1">← Back</button><button class="nx" data-go="3">Next →</button></div>
@@ -1969,7 +2016,12 @@ function collect(){
  const c=id=>!!$('#'+id)?.checked;
  return {mode, btc_entry:v('btc_entry'), btc_amount:v('btc_amount'),
   receive_wallet:v('receive_wallet'), pairs_file:v('pairs_file'),
-  swap_btc:v('swap_btc'), split:+v('split')||1,
+  swap_btc:v('swap_btc'),
+  // The send form's "Split into" input stays in the DOM in receive mode
+  // (its container is hidden, not removed) and still reads 1, so keying
+  // off it unconditionally would shadow the receive field for good.
+  split: mode==='receive' ? (+v('split_recv')||1) : (+v('split')||1),
+  expect_total_xmr:v('expect_total_xmr'),
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),

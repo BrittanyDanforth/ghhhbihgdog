@@ -252,11 +252,47 @@ CHOICES = [
 
 
 def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
-                      rpc_url: str = "") -> list:
+                      rpc_url: str = "", target=None, chunks: int = 0,
+                      tolerance=None) -> list:
     """The exact argv for a chosen mix. Returns [] for the do-nothing choice.
 
     Built as a list, never a string: it is printed for the operator to run, and
     a quoted-string command is how a path with a space becomes two arguments.
+
+    IT CARRIES THE TARGET THIS WATCH USED. It did not, and the omission
+    disarmed the one gate on the other side.
+
+    This watch knows exactly what it was waiting for: `target` summed from the
+    quotes of every pair routed to this address, and how many pairs those were.
+    The command it printed passed --wallets/--deep/--fee-priority and stopped,
+    so GhostSpiral started with args.expect_total_xmr None -- and its receiver
+    branch reads that as "no target, nothing to check", prints "this run does
+    NOT wait", and plans against whatever happens to be on ENTRY at that
+    moment. The operator follows the tool's own printed instruction and gets
+    the unguarded run.
+
+    That matters most in the case this tool itself warns about. The PAID gate
+    is `target` minus --tolerance, so the watch can legitimately report PAID
+    with a chunk still confirming; it says so ("X XMR MORE ... has not unlocked
+    yet ... wait ~20 min and re-run"). An operator who runs the printed command
+    instead spends the unlocked part and strands the rest on the receive
+    address -- the one address the swap provider has already tied to a BTC
+    payment. Passing the numbers through means the mix re-checks them itself
+    rather than trusting that the operator read the paragraph.
+
+    It cannot over-tighten. GhostSpiral's receiver gate calls
+    swap_arrival_floor with an EMPTY chunk-amount list, so its floor is always
+    equal to or looser than the one this watch already cleared -- measured on
+    0.50/0.30/0.15/0.05 at 10%: this watch tightens to 0.95, GhostSpiral stays
+    at 0.90. So it can never refuse a run this tool has just approved.
+
+    --swap-tolerance goes too, because the two sides default independently: a
+    watch run with --tolerance 0.2 that then hands over a command using
+    GhostSpiral's 0.1 default would be handing over a stricter gate than the
+    one it cleared.
+
+    target None or <= 0 means --any, or no readable quote: there is genuinely
+    no number, so none is passed and the behaviour is exactly what it was.
     """
     f = choice.get("flags")
     if not f:
@@ -280,6 +316,22 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
             "--wallets", str(f["wallets"]),
             "--deep", str(f["deep"]),
             "--fee-priority", str(f["fee_priority"])]
+    if target is not None and target > 0:
+        argv += ["--expect-total-xmr", str(target)]
+        # How many payments make up that total. In receiver mode this is what
+        # stage4's n_chunks becomes, and it tightens the gate when the implied
+        # per-chunk size is smaller than the tolerance -- so a single missing
+        # swap cannot hide inside it.
+        #
+        # Usually 1: thor_swap_preparer refuses a batch that routes two swaps
+        # to one address. It only exceeds 1 for an operator who got several
+        # payments onto this address anyway (separate preparer runs against the
+        # same bundle, which the per-batch refusal cannot see), and that is
+        # precisely when the gate must not be told there was only one.
+        if chunks > 1:
+            argv += ["--split", str(chunks)]
+        if tolerance is not None:
+            argv += ["--swap-tolerance", str(tolerance)]
     if f.get("dag_mixing"):
         argv.append("--dag-mixing")
     if f.get("peel"):
@@ -1081,7 +1133,9 @@ def main():
               f"subaddress.")
         return 0
 
-    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy, rpc_url)
+    argv = build_mix_command(c, args.receive_wallet, args.tor_proxy, rpc_url,
+                             target=target, chunks=len(matched),
+                             tolerance=args.tolerance)
     print(f"\n  [+] {c['name']} — run this to start the mix:\n")
     print("      " + format_mix_command(argv))
     print("\n  This tool does not spend. Nothing moves until you run that command,")

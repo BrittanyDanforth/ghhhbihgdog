@@ -5258,17 +5258,52 @@ def establish_entry_set(args, rpc_primary, addr_index, jm_utxos,
         addr_index[receive_entry_addr] = (receive_account_index,
                                           receive_subaddress_index)
         if int(getattr(args, "split", 1) or 1) > 1:
-            # SAID, not silently ignored. --split divides --btc-amount, which
-            # receive mode does not have, and a bundle describes exactly one
-            # address -- so the flag cannot do anything here. Accepting a flag,
-            # validating it and then discarding it in silence is how an
-            # operator comes to believe a run split when it did not.
-            integrity_log("stage3", "split_ignored_receive_mode")
-            print(f"  [!] --split {args.split} has NO EFFECT in receiver mode: "
-                  f"a receive bundle describes exactly one address, and there "
-                  f"is no --btc-amount to divide. For N genuinely separate "
-                  f"entries, mint N bundles (create_receive_wallet --count N) "
-                  f"and run once per bundle.")
+            # SAID, not silently ignored -- but say the TRUE thing.
+            #
+            # This claimed "--split N has NO EFFECT in receiver mode", and that
+            # is false. stage4 computes
+            #
+            #     n_chunks = len(swap_deposits) or max(args.split, 1)
+            #
+            # and receiver mode has no swap_deposits, so --split IS n_chunks
+            # here, and n_chunks feeds swap_arrival_floor. Measured: with
+            # --expect-total-xmr 4 and the default 10% tolerance, --split 1
+            # gives a floor of 3.6 and --split 12 gives 3.666..., because once
+            # the implied per-chunk size falls below the tolerance the gate
+            # tightens so a whole missing chunk cannot hide inside it. So the
+            # flag changes the one thing in receiver mode that decides whether
+            # the run waits or spends.
+            #
+            # Normally that count is 1, and deliberately so: thor_swap_preparer
+            # REFUSES a batch that routes two swaps to one address, because
+            # reusing a destination tells the aggregator those BTC payments
+            # belong together. So --split > 1 here is the operator who got more
+            # than one payment onto this address anyway -- separate
+            # thor_swap_preparer runs against the same bundle, which the
+            # per-batch refusal does not see, or a sender who paid in
+            # instalments. That is against this toolchain's advice, and it is
+            # exactly when the arrival gate most needs to know: the run should
+            # still refuse to spend a fraction, whatever the operator did to
+            # get there.
+            #
+            # What --split genuinely cannot do here is create N entries: a
+            # bundle describes exactly one address, and there is no
+            # --btc-amount to divide. That is what the message should have
+            # said. This is the second "NO EFFECT" claim in this file that was
+            # wrong about its own code -- the first one, in stage4, was telling
+            # operators that --expect-total-xmr did nothing in receiver mode
+            # while the run planned against a quarter of the money.
+            integrity_log("stage3", "split_receive_mode_gate_only")
+            print(f"  [!] --split {args.split} does NOT create {args.split} "
+                  f"entries in receiver mode: a bundle describes exactly one "
+                  f"address, and there is no --btc-amount to divide. For N "
+                  f"genuinely separate entries, mint N bundles "
+                  f"(create_receive_wallet --count N) and run once per bundle.")
+            print(f"      It DOES tell the arrival gate to expect "
+                  f"{args.split} separate payments to this one address, which "
+                  f"tightens the gate so one missing payment cannot hide "
+                  f"inside the tolerance. That is the right value if "
+                  f"{args.split} swaps are routed here.")
         integrity_log("stage3", "entry_reused_from_receive_wallet")
         print(f"  [+] ENTRY (from receive wallet): "
               f"{scrub_address(receive_entry_addr)}")

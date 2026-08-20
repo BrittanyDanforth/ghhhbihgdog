@@ -1163,6 +1163,110 @@ def test_console_can_express_the_timing_parameter():
                   f"GhostSpiral", ok)
 
 
+def test_console_can_express_the_expected_total():
+    """The dashboard must be able to say how much XMR the run is waiting for.
+
+    Same shape as the hop_delay omission above, in the place where it costs
+    money rather than ring-age plausibility. SCHEMA is the whitelist --
+    "Anything not here cannot reach an argv" -- and expect_total_xmr was not in
+    it, so no dashboard-driven run could ever set a target.
+
+    In RECEIVE mode that is the entire gate. GhostSpiral's stage 4 branches on
+    `args.expect_total_xmr is None` and, with no target, prints "this run does
+    NOT wait" and plans against whatever is on ENTRY at that instant. A
+    dashboard receive run paid by four swaps therefore starts mixing on the
+    first one to land: the veil sweeps it, the distribution sizes itself from
+    it, and chunks two to four arrive on an ENTRY the run has already finished
+    with -- unmixed, on the address the swap memo names in public. The gate
+    that refuses exactly this exists, and was reachable only from the CLI.
+    """
+    from decimal import Decimal
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "ghost_et", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(g)
+
+    check("expected total: the console whitelist admits it at all",
+          "expect_total_xmr" in c.SCHEMA)
+
+    def argv_for(extra=None, mode="receive"):
+        p = {"mode": mode, "tor_proxy": "socks5h://127.0.0.1:9050",
+             "wallets": 10, "deep": 2, "fee_priority": 1}
+        if mode == "receive":
+            p["receive_wallet"] = "w.json"
+        else:
+            p["btc_entry"] = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+            p["btc_amount"] = "0.05"
+        p.update(extra or {})
+        cl = c.clean(p)
+        a, _why = c.pipeline_argv(cl["params"])
+        return a, cl["errors"]
+
+    a, _ = argv_for({"expect_total_xmr": "4.0", "split": 4})
+    check("expected total: it reaches the argv",
+          "--expect-total-xmr" in a
+          and a[a.index("--expect-total-xmr") + 1] == "4.0")
+
+    # --split is NOT dead in receive mode: stage4 computes n_chunks as
+    # `len(swap_deposits) or max(args.split, 1)`, and receive mode has no
+    # deposits -- so this IS the chunk count the arrival gate keys on. It was
+    # only ever emitted in the send branch.
+    check("expected total: the chunk count reaches the argv in RECEIVE mode too",
+          "--split" in a and a[a.index("--split") + 1] == "4")
+
+    # Unset must behave exactly as before.
+    a, _ = argv_for()
+    check("expected total: unset omits the flag, so behaviour is unchanged",
+          "--expect-total-xmr" not in a)
+    a, _ = argv_for({"expect_total_xmr": ""})
+    check("expected total: ...and an empty field does the same",
+          "--expect-total-xmr" not in a)
+
+    # Send mode gets it too -- the fallback for an unreadable quote.
+    a, _ = argv_for({"expect_total_xmr": "1.25"}, mode="send")
+    check("expected total: send mode can set it as well",
+          "--expect-total-xmr" in a)
+
+    # Garbage must not reach an argv that ends in a spend.
+    for bad in ("abc", "4.0;rm -rf /", "1 2", "$(id)", "--wallets"):
+        a, errs = argv_for({"expect_total_xmr": bad})
+        check(f"expected total: {bad!r} is refused and never reaches the argv",
+              "--expect-total-xmr" not in a
+              and any("expect_total_xmr" in e for e in errs))
+
+    # AND GhostSpiral MUST ACCEPT WHAT THE CONSOLE BUILDS. A flag that passes
+    # the console's own validation and then dies in argparse is worse than no
+    # flag at all: it fails after the operator has filled the form in.
+    a, _ = argv_for({"expect_total_xmr": "4.0", "split": 4})
+    ns = g.build_cli().parse_args(a[2:])
+    check("expected total: GhostSpiral's parser accepts the console's argv, "
+          "with the value intact",
+          ns.expect_total_xmr == Decimal("4.0") and ns.split == 4)
+    check("expected total: ...and it is the type stage 4 compares against",
+          isinstance(ns.expect_total_xmr, Decimal))
+
+    # The field has to exist on the page, or the schema entry is unreachable.
+    _page = getattr(c, "PAGE", "")
+    check("expected total: the receive step actually offers the input",
+          'id="expect_total_xmr"' in _page)
+    check("expected total: ...and the page collects it into the request",
+          "expect_total_xmr:v('expect_total_xmr')" in _page)
+    # The send form's "Split into" input lives inside #send-fields, which is
+    # HIDDEN in receive mode rather than removed -- so it is still in the DOM
+    # and still reads 1. A receive-side count therefore needs its own field,
+    # and collect() has to prefer it, or the send input shadows it forever and
+    # every receive run reports one chunk no matter what the operator typed.
+    check("expected total: receive mode has its own swap-count field",
+          'id="split_recv"' in _page)
+    check("expected total: ...and collect() prefers it in receive mode",
+          "mode==='receive' ? (+v('split_recv')||1) : (+v('split')||1)"
+          in _page)
+    check("expected total: ...and the receive step does not point at a field "
+          "that is hidden there",
+          "set Split below" not in _page)
+
+
 def test_daemon_chain_is_reported_not_assumed():
     """check_daemon_relay_egress must report WHICH chain the daemon is on.
 

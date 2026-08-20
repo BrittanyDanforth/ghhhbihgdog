@@ -885,6 +885,92 @@ check("console: with no swap quote the watch falls back to --any",
 check("console: receive_watch is in the compile-everything check",
       '"receive_watch"' in _con)
 
+# ==========================================================================
+# THE HANDOFF MUST CARRY THE TARGET THIS WATCH USED.
+#
+# The printed mix command passed --wallets/--deep/--fee-priority and stopped,
+# so GhostSpiral started with expect_total_xmr None -- and its receiver branch
+# reads that as "no target, nothing to check", prints "this run does NOT wait",
+# and plans against whatever is on ENTRY at that moment. The operator follows
+# the tool's own printed instruction and gets the unguarded run: the gate that
+# exists to stop a run spending a fraction of the money was disarmed by the
+# command this tool told them to type.
+# ==========================================================================
+print()
+print("=== the mix command carries the numbers the watch was waiting for ===")
+
+from decimal import Decimal as D                                   # noqa: E402
+from srcutil import code_only as _code_only                        # noqa: E402
+
+_C2 = rw.choice_by_key("2")
+
+
+def _mix(**kw):
+    return rw.build_mix_command(_C2, "w.json", "socks5h://127.0.0.1:9050",
+                                "http://127.0.0.1:18083", **kw)
+
+
+def _flag(argv, name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+_h = _mix(target=D("4.0"), chunks=4, tolerance=D("0.1"))
+check("handoff: the quoted total is passed as --expect-total-xmr",
+      _flag(_h, "--expect-total-xmr") == "4.0")
+check("handoff: how many swaps make it up is passed as --split",
+      _flag(_h, "--split") == "4")
+check("handoff: the tolerance goes too, so both sides use ONE number",
+      _flag(_h, "--swap-tolerance") == "0.1")
+
+# --any / no readable quote: there is genuinely no number, so none is invented.
+_hn = _mix(target=None, chunks=0, tolerance=D("0.1"))
+check("handoff: with no target (--any) nothing is passed and the behaviour "
+      "is unchanged",
+      "--expect-total-xmr" not in _hn and "--swap-tolerance" not in _hn)
+_hz = _mix(target=D("0"), chunks=0, tolerance=D("0.1"))
+check("handoff: a zero target is not passed either",
+      "--expect-total-xmr" not in _hz)
+
+# One swap: --split 1 is GhostSpiral's default, so do not add noise.
+_h1 = _mix(target=D("1.5"), chunks=1, tolerance=D("0.2"))
+check("handoff: a single swap does not add a redundant --split 1",
+      "--split" not in _h1)
+check("handoff: ...but a non-default tolerance still goes",
+      _flag(_h1, "--swap-tolerance") == "0.2")
+
+# It has to actually PARSE as GhostSpiral flags -- a handoff that produces an
+# argparse error is worse than one that produces a weak run.
+import importlib.machinery as _hm, importlib.util as _hu           # noqa: E402
+_gld = _hm.SourceFileLoader("GhostSpiral", os.path.join(REPO, "GhostSpiral"))
+_ghost = _hu.module_from_spec(_hu.spec_from_loader(_gld.name, _gld))
+_gld.exec_module(_ghost)
+_ns = _ghost.build_cli().parse_args(_h[2:])
+check("handoff: GhostSpiral's own parser accepts the command, with the "
+      "values intact",
+      _ns.expect_total_xmr == D("4.0") and _ns.split == 4
+      and _ns.swap_tolerance == D("0.1"))
+
+# AND IT MUST NEVER REFUSE A RUN THIS WATCH JUST APPROVED. GhostSpiral's
+# receiver gate calls swap_arrival_floor with an EMPTY chunk-amount list, so
+# its floor is equal to or looser than the one cleared here. If that ever
+# inverts, the handoff starts telling operators to run a command that stops.
+from gs_common import swap_arrival_floor as _saf                   # noqa: E402
+for _amts in ([D("0.5"), D("0.3"), D("0.15"), D("0.05")],
+              [D("1")] * 4, [D("1")], [D("2"), D("2")]):
+    _t = sum(_amts)
+    _watch = _saf(_t, D("0.1"), _amts, len(_amts))[0]
+    _mixf = _saf(_t, D("0.1"), [], len(_amts))[0]
+    check(f"handoff: the mix's gate is never stricter than the watch's "
+          f"({len(_amts)} chunk(s), {_t} XMR)", _mixf <= _watch)
+
+# main() must pass them -- building them correctly and then calling with the
+# old signature would leave every check above green and the defect in place.
+_rw_src = _code_only(os.path.join(REPO, "receive_watch"))
+_norm_rw = " ".join(_rw_src.split())
+check("handoff: main() passes the target, the chunk count and the tolerance",
+      "target=target, chunks=len(matched), tolerance=args.tolerance"
+      in _norm_rw)
+
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

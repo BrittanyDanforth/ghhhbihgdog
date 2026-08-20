@@ -70,7 +70,7 @@ bcast = load("broadcast_signed_xmr")
 ghost = load("GhostSpiral")
 
 BASE = tempfile.mkdtemp(prefix="rd_")
-DPORT, WPORT = 30121, 30123
+DPORT, WPORT = 30281, 30283
 lab = MoneroLab(BASE, DPORT, WPORT)
 DR = f"http://127.0.0.1:{DPORT}"
 WBASE = f"http://127.0.0.1:{WPORT}"
