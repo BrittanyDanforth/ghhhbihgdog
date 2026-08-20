@@ -6270,16 +6270,59 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             if not _wait_for_carrier(args, _vacct, _vidx, _needs[_vi], proxy,
                                      _vlabel):
                 integrity_log("stage5", "veil_carrier_timeout")
+                # "RE-RUN ONCE IT CONFIRMS" WAS WRONG, AND WRONG IN THE ONE
+                # DIRECTION THAT COSTS MONEY. Nothing re-runs onto a carrier: a
+                # send-mode run calls create_entry_set and mints a brand-new
+                # entry set, and receiver mode needs a bundle, which
+                # create_receive_wallet only ever mints for a NEW subaddress --
+                # it cannot describe an address that already exists. So a
+                # re-run waits for money on addresses that hold nothing while
+                # the balance sits here forever.
+                #
+                # The swap-shortfall gate already says this correctly ("a
+                # send-mode run mints a NEW ENTRY every time, so re-running now
+                # leaves what did arrive stranded"). Two messages about parked
+                # money, one fixed and one still sending the operator the way
+                # that strands it.
                 print(f"  [!] The entry sweep did not confirm and unlock in "
                       f"time, so the distribution was NOT created. The funds "
                       f"are safe on account {_vacct}, subaddress {_vidx} — but "
-                      f"they are UNDISTRIBUTED. Re-run once it confirms, or "
-                      f"distribute by hand.")
+                      f"they are UNDISTRIBUTED.")
+                print(f"      DO NOT simply re-run: this run's carriers are "
+                      f"not an entry any later run can adopt. A send-mode "
+                      f"re-run mints a NEW entry set and waits for a NEW swap; "
+                      f"receiver mode needs a bundle, and "
+                      f"create_receive_wallet only mints one for a FRESH "
+                      f"subaddress. Either way nothing points at the accounts "
+                      f"below and the balance stays there.")
+                print(f"      To mix it: mint a fresh receive wallet "
+                      f"(create_receive_wallet), send ONE carrier's balance to "
+                      f"it as a single ordinary transfer, then run this with "
+                      f"--receive-wallet on that bundle. The carrier is "
+                      f"already one hop past the address the swap memo names, "
+                      f"so that transfer discloses nothing new.")
                 if len(_targets) > 1:
+                    # NAME EVERY CARRIER, because this is the last chance to.
+                    # report_completion deliberately skips report_holdings on an
+                    # incomplete run, so if these accounts are not printed here
+                    # the operator finishes the run knowing only the account
+                    # that FAILED -- and the ones that succeeded are holding
+                    # money on accounts nothing has told them about.
                     print(f"      This is carrier {_vi + 1} of "
                           f"{len(_targets)}. The others may have confirmed; "
                           f"each holds its own swap chunk, on its own account "
-                          f"— none of them has been distributed.")
+                          f"— none of them has been distributed. Every carrier "
+                          f"this run created, so you can find all of them: "
+                          + ", ".join(f"account {_a}/subaddr {_x}"
+                                      for _a, _x in _targets) + ".")
+                    print(f"      ONE BUNDLE PER CARRIER, and do NOT sweep "
+                          f"them together into one. Each carrier holds a "
+                          f"DIFFERENT swap chunk, and every one of those swaps "
+                          f"settled in public: a single transaction spending "
+                          f"two of them is the convergence --split exists to "
+                          f"prevent, and it hands an analyst the intersection "
+                          f"of two known candidate sets. Recover them one at a "
+                          f"time, as separate runs.")
                 return (["the entry sweep did not confirm, so nothing was distributed"],
                         withheld)
 

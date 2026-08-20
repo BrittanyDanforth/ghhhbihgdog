@@ -251,6 +251,21 @@ MUTATIONS = [
   "    if not os.path.lexists(path):\n        return True",
   "    if False:\n        return True",
   ["test_shmwipe"]),
+
+ # The carrier timeout is the ONLY early return in _stage5_run, so it is the
+ # one failure where no exit runs and the money simply stays where it is. What
+ # the operator is told here is the whole recovery.
+ ("the carrier timeout tells the operator to re-run (which strands it)",
+  "GhostSpiral",
+  '                print(f"      DO NOT simply re-run: this run\'s carriers are "',
+  '                print("      Re-run once it confirms."); print(f"      IGNORED: "',
+  ["test_units"]),
+
+ ("the carrier timeout names only the carrier that FAILED", "GhostSpiral",
+  '                          + ", ".join(f"account {_a}/subaddr {_x}"\n'
+  '                                      for _a, _x in _targets) + ".")',
+  '                          + f"account {_vacct}/subaddr {_vidx}" + ".")',
+  ["test_units"]),
 ]
 
 

@@ -2750,6 +2750,70 @@ finally:
 check("stage5: a completed run REMOVES its now-empty staging root",
       not _stg_live.exists())
 
+# THE CARRIER TIMEOUT, DRIVEN. Every other test in this repo stubs
+# _wait_for_carrier to True, so the branch that runs when a veil carrier never
+# confirms had never executed -- and it was telling the operator to do the one
+# thing that strands the money.
+#
+# "Re-run once it confirms" is false. Nothing re-runs onto a carrier: send mode
+# calls create_entry_set and mints a brand-new entry set, and receiver mode
+# needs a bundle that create_receive_wallet only ever mints for a FRESH
+# subaddress. The swap-shortfall gate says this correctly; this message did not.
+_stg_to = Path(tempfile.mkdtemp(prefix="stgtimeout_")) / "tx_staging"
+_stg_to.mkdir()
+_veil_to = str(_stg_to.parent / "veil.json")
+with open(_veil_to, "w") as _fh:
+    json.dump({"meta": {}, "txs": [{"src": "a", "src_index": 1,
+                                    "account_index": 9, "dst": "b",
+                                    "sweep": True, "delay": 0}]}, _fh)
+_pf_to = str(_stg_to.parent / "fanout2.json")
+with open(_pf_to, "w") as _fh:
+    json.dump({"meta": {}, "txs": []}, _fh)
+_to_out = _io.StringIO()
+try:
+    ghost._run_round = lambda *a, **k: 1
+    # Carrier 1 confirms, carrier 2 does NOT -- so the multi-carrier branch runs.
+    _seen_c = {"n": 0}
+    def _wc(*a, **k):
+        _seen_c["n"] += 1
+        return _seen_c["n"] < 2
+    ghost._wait_for_carrier = _wc
+    ghost._run_peel_chain = lambda *a, **k: 0
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    with _ctx.redirect_stdout(_to_out):
+        _to_res = ghost._stage5_run(
+            _StgArgs(dag_mixing=False), _pf_to, None, [], str(_stg_to), None,
+            Decimal("9"), distribution_mode="fanout", change_target=(4, 0),
+            change_sweep_jobs=[], veil_file=_veil_to,
+            veil_target=[(11, 1), (22, 1), (33, 1)],
+            veil_need=[Decimal("1"), Decimal("1"), Decimal("1")],
+            delay_window=(0, 0))
+finally:
+    (ghost._run_round, ghost._wait_for_carrier, ghost._run_peel_chain,
+     ghost._run_change_sweeps, ghost._wait_for_fanout_confirm,
+     ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+     ghost.secure_delay) = _saved_s5
+_to_txt = _to_out.getvalue()
+check("carrier timeout: the run reports itself INCOMPLETE",
+      bool(_to_res) and bool(_to_res[0]))
+check("carrier timeout: it does NOT tell the operator to just re-run — "
+      "a re-run mints a new entry set and never looks at this carrier",
+      "Re-run once it confirms" not in _to_txt)
+check("carrier timeout: ...it says so explicitly", "DO NOT simply re-run" in _to_txt)
+check("carrier timeout: ...and gives the recovery that actually works",
+      "create_receive_wallet" in _to_txt and "--receive-wallet" in _to_txt)
+check("carrier timeout: EVERY carrier account is named, not only the one that "
+      "failed — report_completion prints no holdings on an incomplete run",
+      all(f"account {_a}" in _to_txt for _a in (11, 22, 33)))
+check("carrier timeout: ...and it refuses to let them be swept together, "
+      "which would spend two swap chunks in one transaction",
+      "do NOT sweep" in _to_txt and "convergence" in _to_txt)
+
 # ...and a staging root that still holds a failed round's directory is LEFT,
 # so the failure stays visible rather than being silently destroyed.
 _stg_dirty = Path(tempfile.mkdtemp(prefix="stgdirty_")) / "tx_staging"
