@@ -621,21 +621,74 @@ def main():
 
     # Delay fallback: the unsigned plan, when the manifest carried none. Plan
     # entries are written in idx order by phase_create, so position == idx.
+    #
+    # IT MUST BE THE RIGHT PLAN, and the first version of this could not tell.
+    # It took
+    #
+    #     sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)[0]
+    #
+    # -- the lexicographically greatest filename in one hardcoded directory --
+    # and applied whatever delays it found, keyed by index, to whatever blobs
+    # were being relayed. A run leaves several plans side by side (veil,
+    # fanout, dag), the tag in each name is random hex, and the exit writes
+    # unsigned_exit_*.json somewhere else entirely, so "greatest filename" is
+    # not a match, it is a coin flip. Worse, it then printed
+    #
+    #     [+] TX delays loaded from unsigned_plan (1 entries)
+    #
+    # which reads as confirmation. A wrong delay is not a neutral outcome here:
+    # the delays are the mechanism that keeps a batch from relaying as one
+    # timing cluster, and silently serving another plan's schedule is exactly
+    # the correlation they exist to destroy -- announced as success.
+    #
+    # So the fallback now has to EARN it: a candidate is only usable if its tx
+    # count matches the number of blobs in hand, and if exactly one candidate
+    # does. Anything else falls through to the honest "no delays found"
+    # warning below, which is a true statement about a run that is about to
+    # relay without them. This is a legacy path either way -- phase_create
+    # writes the delay into unsigned_manifest.json and phase_sign carries it to
+    # signed_manifest_v1.json, both covered end to end by
+    # tests/real_delay_pipeline_testnet.py -- so refusing to guess costs
+    # nothing a correctly signed batch needs.
     if not any(i.delay for i in items):
-        plan_files = sorted(Path(".").glob("unsigned/unsigned_*.json"), reverse=True)
-        if plan_files:
+        candidates = []
+        for pf_path in sorted(Path(".").glob("unsigned/unsigned_*.json")):
             try:
-                with open(plan_files[0]) as pf:
+                with open(pf_path) as pf:
                     plan_data = json.load(pf)
-                if isinstance(plan_data, dict) and "txs" in plan_data:
-                    by_idx = {i: int(tx["delay"])
-                              for i, tx in enumerate(plan_data["txs"]) if "delay" in tx}
-                    if by_idx:
-                        for it in items:
-                            it.delay = by_idx.get(it.idx, 0)
-                        delay_source = "unsigned_plan"
-            except Exception:
-                pass
+            except Exception:                                # noqa: BLE001
+                continue
+            if not (isinstance(plan_data, dict)
+                    and isinstance(plan_data.get("txs"), list)):
+                continue
+            txs = plan_data["txs"]
+            if len(txs) != len(items):
+                continue
+            by_idx = {}
+            for pos, tx in enumerate(txs):
+                if isinstance(tx, dict) and "delay" in tx:
+                    try:
+                        by_idx[pos] = int(tx["delay"])
+                    except (TypeError, ValueError):
+                        by_idx = {}
+                        break
+            if by_idx:
+                candidates.append((pf_path, by_idx))
+        if len(candidates) == 1:
+            for it in items:
+                it.delay = candidates[0][1].get(it.idx, 0)
+            delay_source = f"unsigned_plan {candidates[0][0].name}"
+        elif len(candidates) > 1:
+            # Naming them, because the operator is the only one who can say
+            # which plan these blobs came from.
+            print(f"  [!] {len(candidates)} unsigned plans in ./unsigned match "
+                  f"this batch's {len(items)} blob(s), so which one holds "
+                  f"their delays cannot be determined: "
+                  + ", ".join(c[0].name for c in candidates) + ".")
+            print("  [!] Refusing to guess — serving another plan's schedule "
+                  "is the timing correlation the delays exist to prevent. "
+                  "Re-sign so the manifest carries them, or move the other "
+                  "plans aside.")
 
     if any(i.delay for i in items):
         n_delays = sum(1 for i in items if i.delay)

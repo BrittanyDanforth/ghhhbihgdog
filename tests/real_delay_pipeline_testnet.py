@@ -112,9 +112,18 @@ for _stub in ("verify_tor", "tor_recheck", "newnym", "install_signal_handlers"):
 bcast.check_daemon_relay_egress = lambda *a, **k: {"verdict": "tor",
                                                    "detail": "isolated testnet"}
 bcast.shutdown_requested = lambda: False
-# secure_delay is what actually serves a planned delay. Record what it is asked
-# to wait rather than waiting it -- the point is the NUMBER, not the wall clock.
-bcast.secure_delay = lambda s, *a, **k: slept.append(int(s))
+# _sleep_interruptible is what actually serves a PLANNED delay -- record what
+# it is asked to wait rather than waiting it, because the point is the NUMBER,
+# not the wall clock.
+#
+# The first version of this recorded secure_delay instead, which is the 5-15s
+# inter-TX jitter and nothing to do with the plan: it captured [5, 5] while the
+# run really did sleep the planned 11s and 29s, so the check failed on a build
+# that was working correctly, and would equally have PASSED a build where the
+# planned delay was dropped and only the jitter remained.
+bcast._sleep_interruptible = lambda s: (slept.append(int(s)), True)[1]
+# ...and the jitter itself is not under test, so do not spend it.
+bcast.secure_delay = lambda *a, **k: None
 
 
 def run_broadcast(path, progfile, extra=()):
@@ -280,6 +289,63 @@ try:
     _exit_fn = _exit_fn[:_exit_fn.index("\ndef ")]
     check("the exit's per-output tx carries a delay key",
           '"delay": hop_delay(delay_window)' in _exit_fn)
+
+    step("9. the unsigned-plan FALLBACK must not serve another plan's schedule")
+    # Reachable whenever the manifest carries no delays -- an older signer, or
+    # a raw blob directory with no manifest at all. It used to take the
+    # lexicographically greatest unsigned_*.json in ./unsigned and apply its
+    # delays by index, then print "TX delays loaded from unsigned_plan", which
+    # reads as confirmation. A run leaves veil/fanout/dag plans side by side
+    # with random hex tags, so that was a coin flip announced as success.
+    fb = os.path.join(BASE, "fallback")
+    shutil.copytree(signed_dir, fb)
+    _fbm = json.load(open(os.path.join(fb, "signed_manifest_v1.json")))
+    for e in _fbm:
+        e["delay"] = 0
+    with open(os.path.join(fb, "signed_manifest_v1.json"), "w") as f:
+        json.dump(_fbm, f)
+    os.makedirs(os.path.join(BASE, "unsigned"), exist_ok=True)
+    os.chdir(BASE)
+
+    def _plan(name, delays):
+        with open(os.path.join(BASE, "unsigned", name), "w") as f:
+            json.dump({"meta": {}, "txs": [{"dst": "x", "delay": d}
+                                           for d in delays]}, f)
+
+    # TWO plans that both match this batch's blob count. Ambiguous -- and the
+    # old code would have taken the alphabetically-last one, silently.
+    _plan("unsigned_fanout_aaaa.json", [7, 8])
+    _plan("unsigned_veil_zzzz.json", [900, 901])
+    slept.clear()
+    _buf3 = io.StringIO()
+    with contextlib.redirect_stdout(_buf3):
+        run_broadcast(fb, os.path.join(BASE, "prog3.json"))
+    t3 = _buf3.getvalue()
+    check("fallback: two matching plans -> it REFUSES to guess", "Refusing to guess" in t3)
+    check("fallback: ...names them, since only the operator can say which",
+          "unsigned_fanout_aaaa.json" in t3 and "unsigned_veil_zzzz.json" in t3)
+    check("fallback: ...and does NOT claim delays were loaded",
+          "delays loaded from unsigned_plan" not in t3.lower())
+    check("fallback: ...so the honest 'minimal gap' warning is what shows",
+          "minimal gap" in t3)
+    check("fallback: ...and no other plan's schedule was served",
+          900 not in slept and 7 not in slept)
+
+    # UNAMBIGUOUS: one candidate, right tx count -> it is used, and named.
+    os.remove(os.path.join(BASE, "unsigned", "unsigned_veil_zzzz.json"))
+    # A plan with the WRONG tx count must not qualify, so add one.
+    _plan("unsigned_dag_mmmm.json", [500])
+    fb2 = os.path.join(BASE, "fallback2")
+    shutil.copytree(fb, fb2)
+    slept.clear()
+    _buf4 = io.StringIO()
+    with contextlib.redirect_stdout(_buf4):
+        run_broadcast(fb2, os.path.join(BASE, "prog4.json"))
+    t4 = _buf4.getvalue()
+    check("fallback: one matching plan IS used", "delays loaded from unsigned_plan" in t4.lower())
+    check("fallback: ...naming the file it trusted", "unsigned_fanout_aaaa.json" in t4)
+    check("fallback: ...serving THAT plan's delays, in idx order", slept[:2] == [7, 8])
+    check("fallback: ...and the wrong-length plan was ignored", 500 not in slept)
 
     result = "SUCCESS" if FAIL == 0 else "FAILED"
 finally:
