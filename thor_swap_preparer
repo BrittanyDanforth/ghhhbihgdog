@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from gs_common import (
-    integrity_log, verify_tor, validate_proxy, newnym,
+    integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
@@ -388,6 +388,21 @@ def main():
             newnym(required=True)
             secure_delay(3.0, 8.0)
 
+        # AND A CIRCUIT THIS PAIR OWNS. The comment above names the failure
+        # exactly -- "a silently-failed rotation puts every quote in the batch
+        # on ONE circuit, so the aggregator sees one client asking for N swaps"
+        # -- and a NEWNYM that Tor COALESCES fails silently in precisely that
+        # way, while still answering 250 OK. Verified against a running Tor:
+        # three NEWNYM signals in a row each accepted in 0.000s, against an
+        # internal MAX_SIGNEWNYM_RATE of 10 seconds.
+        #
+        # A distinct SOCKS username puts this quote on its own circuit
+        # deterministically (Tor's IsolateSOCKSAuth, on by default), which is
+        # the guarantee the rotation was reaching for. Additive: newnym still
+        # runs above.
+        _qproxy = isolated_proxy(args.tor_proxy, f"pair:{i}") if (
+            proxy and args.tor_proxy) else proxy
+
         # SwapKit v3 API (replaces defunct thorswap aggregator)
         payload = {
             "sellAsset": "BTC.BTC",
@@ -397,7 +412,7 @@ def main():
         }
 
         try:
-            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, _qproxy)
         except Exception as e:
             if proxy:
                 newnym()

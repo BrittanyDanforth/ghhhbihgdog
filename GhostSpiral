@@ -52,6 +52,7 @@ from gs_common import (
     decimal_env, XMR_ABSURD_TOTAL,
     swap_arrival_floor,
     progress_line,
+    isolated_proxy,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
@@ -2643,6 +2644,28 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
             newnym(required=True)   # per-chunk quote isolation
             secure_delay(3.0, 10.0)
 
+        # AND A CIRCUIT THIS CHUNK OWNS, not merely a hope of a fresh one.
+        #
+        # newnym above asks Tor to retire its circuits; it does not say which
+        # circuit the next stream lands on, and newnym()'s own docstring is
+        # explicit that a True "means 'Tor accepted the request', not 'this
+        # stream is provably on a new circuit'" because Tor coalesces signals
+        # sent close together. Verified against a running Tor: three NEWNYM
+        # signals in a row were each accepted in 0.000s while Tor's internal
+        # MAX_SIGNEWNYM_RATE is 10 seconds.
+        #
+        # Tor's SocksPort carries IsolateSOCKSAuth by default, so a distinct
+        # SOCKS username puts this quote on its own circuit deterministically.
+        # That is the guarantee this loop needs: resolve_destinations' docstring
+        # says the rotation "exists so the aggregator sees N unrelated clients
+        # rather than one client arranging N swaps", and one client arranging N
+        # swaps is exactly what a coalesced NEWNYM leaves behind.
+        #
+        # Additive: newnym still runs. Verified against the live Tor that the
+        # derived credentials are accepted (SOCKS method 0x02, auth 0x00).
+        _qproxy = isolated_proxy(args.tor_proxy, f"quote:{i}") if getattr(
+            args, "tor_proxy", None) else proxy
+
         # THIS chunk's own destination -- see the docstring. Indexed by the
         # loop variable, not a shared value captured above.
         chunk_dest = xmr_dests[i]
@@ -2659,7 +2682,7 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         }
 
         try:
-            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, proxy)
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, _qproxy)
         except Exception as e:
             newnym()
             integrity_log("stage2", f"quote_api_error:{i}")

@@ -38,7 +38,64 @@ INTEGRITY_LOG = Path("integrity_chain.log")
 #: One piconero, the smallest amount Monero represents. Used to put a gate
 #: strictly ABOVE a computed quantity rather than merely at it.
 PICONERO = Decimal("0.000000000001")
-SOCKS_RE = re.compile(r"^socks5h://[^\s:]+:\d{1,5}$")
+#: socks5h://[user:pass@]host:port
+#:
+#: THE CREDENTIALS ARE THE POINT, and this regex used to forbid them.
+#:
+#: Tor's SocksPort has IsolateSOCKSAuth ON BY DEFAULT: two streams presenting
+#: DIFFERENT SOCKS username/password are placed on DIFFERENT circuits,
+#: deterministically, immediately, with no rate limit. That is the standard
+#: mechanism for per-stream circuit isolation and it is what this toolchain
+#: wants everywhere it calls newnym().
+#:
+#: It was unreachable. `^socks5h://[^\s:]+:\d{1,5}$` rejects a userinfo part,
+#: so the only isolation available was SIGNAL NEWNYM -- which newnym()'s own
+#: docstring admits "means 'Tor accepted the request', not 'this stream is
+#: provably on a new circuit'", because Tor coalesces signals sent close
+#: together and answers 250 OK either way. Verified against the running Tor:
+#: three NEWNYM signals in a row were each accepted in 0.000s, while Tor's
+#: internal MAX_SIGNEWNYM_RATE is 10 seconds and the code sleeps 5.
+#:
+#: Verified that this Tor really does offer it: a raw SOCKS5 handshake
+#: presenting credentials gets method 0x02 (USERNAME/PASSWORD) and auth status
+#: 0x00 (OK); presenting none gets method 0x00.
+SOCKS_RE = re.compile(r"^socks5h://([^\s:@/]+:[^\s:@/]*@)?[^\s:@/]+:\d{1,5}$")
+
+#: Per-process salt, so two runs on the same box do not present the same SOCKS
+#: identity for the same tag. Never logged, never written to disk -- it exists
+#: only to keep tags unlinkable between runs.
+_SOCKS_ISOLATION_SALT = secrets.token_hex(8)
+
+
+def isolated_proxy(proxy_url: str, tag: str) -> Dict[str, str]:
+    """A proxy dict whose SOCKS credentials are unique to `tag`.
+
+    Two calls with different tags give two streams that Tor places on separate
+    circuits (IsolateSOCKSAuth, on by default). Two calls with the SAME tag
+    reuse one circuit deliberately -- retries of one logical operation should
+    not each burn a new circuit.
+
+    STRONGER THAN newnym(), AND IT COMPOSES WITH IT. newnym asks Tor to retire
+    every circuit and hope the next stream gets a fresh one; this states which
+    circuit a stream belongs to. newnym is kept at the call sites that have it,
+    so this is added isolation rather than replaced isolation.
+
+    The credential is derived from a per-process salt and the tag, so it is
+    stable within a run (a retry lands on the same circuit) and unlinkable
+    across runs. The tag itself never reaches Tor in the clear -- only its
+    hash -- because a tag like "chunk3" would otherwise tell a local observer
+    of the SOCKS port how many chunks this run has.
+
+    Falls back to the bare proxy when `proxy_url` already carries credentials,
+    rather than silently replacing what the operator configured.
+    """
+    if not proxy_url or "@" in proxy_url:
+        return {"http": proxy_url, "https": proxy_url}
+    user = hashlib.sha256(
+        f"{_SOCKS_ISOLATION_SALT}:{tag}".encode()).hexdigest()[:16]
+    scheme, _, rest = proxy_url.partition("://")
+    built = f"{scheme}://{user}:x@{rest}"
+    return {"http": built, "https": built}
 # CRITICAL: only socks5h:// is accepted. Plain socks5:// leaks DNS locally
 # because the requests library resolves hostnames BEFORE sending through
 # the SOCKS proxy. With socks5h://, DNS resolution happens at the proxy.

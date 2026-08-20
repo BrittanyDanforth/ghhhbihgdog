@@ -100,7 +100,10 @@ JOB_TIMEOUT_S = JOB_TIMEOUT_FLOOR_S        # overridable with --job-timeout
 JOB_TERM_GRACE_S = 30
 
 # ── parameter schema. Anything not here cannot reach an argv. ───────────────
-SOCKS_RE = re.compile(r"^socks5h://[A-Za-z0-9._-]+:\d{1,5}$")
+#: socks5h://[user:pass@]host:port -- the userinfo is Tor stream isolation
+#: (IsolateSOCKSAuth), not decoration. gs_common.SOCKS_RE accepts it and the
+#: console must not be the component that forbids it.
+SOCKS_RE = re.compile(r"^socks5h://([A-Za-z0-9._-]+:[A-Za-z0-9._-]*@)?[A-Za-z0-9._-]+:\d{1,5}$")
 URL_RE = re.compile(r"^https?://[A-Za-z0-9._\-]+(:\d{1,5})?$")
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,200}$")

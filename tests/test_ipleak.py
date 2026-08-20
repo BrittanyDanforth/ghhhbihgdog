@@ -699,6 +699,95 @@ check("proxy: whitespace around a good proxy does not smuggle a bad one",
       _refused("socks5h://127.0.0.1:9050 socks5://127.0.0.1:9050"))
 
 
+
+# ==========================================================================
+# PER-STREAM CIRCUIT ISOLATION, which the toolchain could not express.
+#
+# Tor's SocksPort carries IsolateSOCKSAuth BY DEFAULT: streams presenting
+# different SOCKS username/password go on different circuits, deterministically
+# and immediately. It is the standard mechanism for exactly what newnym() is
+# reaching for -- and SOCKS_RE forbade a userinfo part, so it was unreachable.
+#
+# newnym() alone cannot promise it, and says so: "a True here means 'Tor
+# accepted the request', not 'this stream is provably on a new circuit'",
+# because Tor coalesces signals sent close together. Verified against a running
+# Tor 0.4.8.10: three NEWNYM signals in a row were each accepted in 0.000s,
+# while Tor's internal MAX_SIGNEWNYM_RATE is 10 seconds and newnym sleeps 5.
+#
+# Also verified against that Tor, by raw SOCKS5 handshake: presenting
+# credentials gets method 0x02 (USERNAME/PASSWORD) and auth status 0x00 (OK);
+# presenting none gets method 0x00. The mechanism is really there.
+#
+# NOT VERIFIED HERE, and it should not be claimed: that two credentials land on
+# two DIFFERENT circuits. Proving that needs a bootstrapped Tor with real
+# circuits, and this sandbox intercepts TLS so Tor cannot complete its v3 link
+# handshake. What is pinned below is the part that is checkable.
+# ==========================================================================
+print("\n=== per-stream SOCKS circuit isolation ===")
+
+_B = "socks5h://127.0.0.1:9050"
+_tags = ["quote:0", "quote:1", "quote:2", "pair:0", "veil", "exit:1"]
+_ids = [gs.isolated_proxy(_B, t)["http"] for t in _tags]
+check("isolation: distinct tags give distinct SOCKS identities",
+      len(set(_ids)) == len(_tags))
+check("isolation: the same tag is STABLE, so a retry reuses its circuit "
+      "instead of burning a new one",
+      gs.isolated_proxy(_B, "quote:0")["http"]
+      == gs.isolated_proxy(_B, "quote:0")["http"])
+# The tag must not travel in the clear: "quote:3" would tell a local observer
+# of the SOCKS port how many chunks this run has -- the cardinality every other
+# rule in this repo works to withhold.
+check("isolation: the tag itself never reaches the proxy in the clear",
+      not any(t.split(":")[0] in u for t, u in zip(_tags, _ids)))
+check("isolation: ...and neither does the chunk index",
+      "quote:2" not in gs.isolated_proxy(_B, "quote:2")["http"])
+# An operator who configured their own credentials must keep them.
+_own = "socks5h://mine:secret@127.0.0.1:9050"
+check("isolation: operator-supplied credentials are not overwritten",
+      gs.isolated_proxy(_own, "quote:0")["http"] == _own)
+check("isolation: an empty proxy stays empty (no invented credentials)",
+      gs.isolated_proxy("", "quote:0")["http"] == "")
+
+# THE DNS-LEAK GUARD MUST SURVIVE THE WIDENED REGEX. This is the check that
+# matters most here: relaxing SOCKS_RE to admit userinfo must not accidentally
+# admit socks5:// (local DNS resolution, every destination hostname to the
+# ISP's resolver).
+for _bad in ("socks5://127.0.0.1:9050", "socks5://u:p@127.0.0.1:9050"):
+    _refused = False
+    try:
+        gs.validate_proxy(_bad)
+    except SystemExit:
+        _refused = True
+    check(f"isolation: {_bad} is STILL refused (DNS leak guard intact)",
+          _refused)
+for _good in (_B, _own):
+    _ok = True
+    try:
+        gs.validate_proxy(_good)
+    except SystemExit:
+        _ok = False
+    check(f"isolation: {_good.split('@')[-1]} with"
+          f"{'out' if '@' not in _good else ''} credentials is accepted", _ok)
+# ...and nothing else sneaks through the looser pattern.
+for _bad in ("socks5h://127.0.0.1", "socks5h://:9050", "socks5h://a@b@c:9050",
+             "http://127.0.0.1:9050", "socks5h://127.0.0.1:99999999"):
+    check(f"isolation: {_bad!r} is still rejected by the pattern",
+          not gs.SOCKS_RE.match(_bad))
+
+# The quote loops must actually USE it -- an unused helper is not isolation.
+from srcutil import code_only  # noqa: E402
+_gs_src = code_only(os.path.join(REPO, "GhostSpiral"))
+_th_src = code_only(os.path.join(REPO, "thor_swap_preparer"))
+check("isolation: GhostSpiral's per-chunk quote loop uses a per-chunk circuit",
+      'isolated_proxy(args.tor_proxy, f"quote:{i}")' in _gs_src)
+check("isolation: ...and posts the quote through it, not the shared proxy",
+      "safe_post(f\"{SWAPKIT_API}/v3/quote\", payload, _qproxy)" in _gs_src)
+check("isolation: thor_swap_preparer's per-pair loop does the same",
+      'isolated_proxy(args.tor_proxy, f"pair:{i}")' in _th_src)
+# Additive, not a replacement: newnym must still run.
+check("isolation: newnym is KEPT alongside it (defence in depth)",
+      "newnym(required=True)" in _gs_src and "newnym(required=True)" in _th_src)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed, {len(UNPROVEN)} UNPROVEN")
 if UNPROVEN:
     print("UNPROVEN (these guarantees were NOT measured — do not read this "
