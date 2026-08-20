@@ -253,7 +253,77 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # failure leaves the subaddress creation on the same circuit as whatever
     # follows it -- which is the correlation the rotation exists to break.
     newnym(required=True)
-    return addr_str, fname
+    # (account, subaddress) alongside the address, so main() can compare
+    # SUCCESSIVE mints -- see the duplicate check there. A third element rather
+    # than a new shape, so `addr, path = mint_one_receive(...)` still unpacks
+    # for every existing caller.
+    return addr_str, fname, (acct_idx, sub_idx)
+
+
+def refuse_duplicate_receive(addr, acct, seen_addrs, seen_accts,
+                             n, count) -> None:
+    """Refuse a mint the wallet has already handed back this run.
+
+    A FUNCTION so a test drives the SHIPPED guard rather than a copy of it.
+    This started inline in main()'s loop, and the test meant to pin it
+    reimplemented the loop body instead of calling it -- so the mutation
+    sweep turned both checks into `if False:` and the suite stayed GREEN,
+    twice. Same lesson compute_hop_amount records: "a modelled formula in a
+    test cannot catch a regression in the shipped one."
+    """
+    # THE SIXTH MINTING LOOP, and the only one that did not check.
+    #
+    # create_fresh_account validates a SINGLE answer and has no memory
+    # across calls -- build_change_sweep_jobs says so in as many words:
+    # "it validates a single answer and has no memory across calls". Every
+    # other bulk-minting loop in this toolchain closes that gap itself, and
+    # there are seven of them: DUPLICATE_SUBADDRESS, DUPLICATE_MIX_ACCOUNT,
+    # DUPLICATE_ENTRY_SUBADDRESS, DUPLICATE_ENTRY_ACCOUNT,
+    # DUPLICATE_VEIL_CARRIER, DUPLICATE_PEEL_CARRIER,
+    # DUPLICATE_CHANGE_SWEEP_TARGET. This loop merged N results into a list
+    # and compared them with nothing.
+    #
+    # Driven with a wallet-rpc that repeats its answer -- proxied, older,
+    # or re-opened, which is the threat model the other seven accept:
+    # --count 3 returned three "independent receives" that were ONE address
+    # in ONE account, and wrote three separate bundle files pointing at it.
+    #
+    # thor_swap_preparer does refuse duplicate destinations, so the money
+    # does not actually converge on the documented path. But it refuses
+    # THERE -- after three accounts exist, three bundles are on disk and
+    # three Tor circuits have been rotated -- and it blames the swap
+    # destinations, which is the symptom. The fault is a wallet-rpc handing
+    # back the same account twice, and nothing said so.
+    #
+    # An account collision is its own harm even when the addresses differ:
+    # change lands on the SPENDING account's subaddress 0, so two receives
+    # in one account pool their leftovers onto a single address, which is
+    # the exact reason each receive gets an account of its own.
+    if addr in seen_addrs:
+        integrity_log("wallet", "DUPLICATE_RECEIVE_ADDRESS")
+        sys.exit(
+            f"[!] The wallet returned an address it has ALREADY given this "
+            f"run (receive {n + 1} of {count}).\n"
+            f"    Each receive must be a fresh, unused address: several "
+            f"swaps delivering to one\n"
+            f"    address links them to the aggregator and puts the same "
+            f"destination in every\n"
+            f"    public swap memo. Refusing rather than writing bundles "
+            f"that all name it.\n"
+            f"    Check that monero-wallet-rpc is the wallet you think it "
+            f"is and is not being\n"
+            f"    served from a cache or a stale session.")
+    if acct in seen_accts:
+        integrity_log("wallet", "DUPLICATE_RECEIVE_ACCOUNT")
+        sys.exit(
+            f"[!] The wallet put receive {n + 1} of {count} in "
+            f"account {acct}, which this run has\n"
+            f"    already used. Change is returned to the SPENDING "
+            f"account's subaddress 0, so two\n"
+            f"    receives sharing an account pool every leftover from "
+            f"mixing onto ONE address --\n"
+            f"    which is the whole reason each receive gets an account "
+            f"of its own. Refusing.")
 
 
 def print_next_steps(bundles: list) -> None:
@@ -402,10 +472,16 @@ def main():
         sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
                  f"Open/create a wallet in wallet-rpc first, then re-run.")
     bundles = []
+    _seen_addrs, _seen_accts = set(), set()
     for n in range(args.count):
         if args.count > 1:
             print(f"\n  === receive {n + 1} of {args.count} ===")
-        bundles.append(mint_one_receive(wallet_rpc, args))
+        _addr, _path, (_acct, _sub) = mint_one_receive(wallet_rpc, args)
+        refuse_duplicate_receive(_addr, _acct, _seen_addrs,
+                                 _seen_accts, n, args.count)
+        _seen_addrs.add(_addr)
+        _seen_accts.add(_acct)
+        bundles.append((_addr, _path))
 
     print_next_steps(bundles)
 

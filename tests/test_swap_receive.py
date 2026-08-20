@@ -365,10 +365,22 @@ def test_dest_from_receive_bundle():
     check("a non-object bundle is refused", refuses(w("lst.json", [DEST])))
     check("a missing file is refused", refuses(os.path.join(d, "nope.json")))
 
-    # The address must be scrubbed in the persistent chain, not written whole.
+    # The address must not reach the persistent chain AT ALL.
+    #
+    # This asserted the address was SCRUBBED there --
+    # "dest_from_bundle:{scrub_address(addr)}" in the source -- which was the
+    # right property while the line was written per bundle. It is now not
+    # written per bundle, because resolve_destinations calls
+    # _dest_from_bundle in a list comprehension and one line per bundle made
+    # the swap batch size recoverable by COUNTING the identical redacted
+    # lines. The address is gone from the payload entirely, which is strictly
+    # stronger than scrubbed, and the old check went red for it.
     src = open(os.path.join(REPO, "thor_swap_preparer")).read()
-    check("the bundle destination is scrubbed in the integrity log",
-          "dest_from_bundle:{scrub_address(addr)}" in src)
+    check("the bundle destination does not reach the integrity chain at all — "
+          "stronger than scrubbed, and it stops the LINE COUNT giving the "
+          "batch size away",
+          "dest_from_bundle:{scrub_address(addr)}" not in src
+          and 'integrity_log_once("thor", "dest_from_bundle")' in src)
     # Ambiguity about where money goes must be refused, never silently resolved.
     check("--dests and --dest-from-receive-wallet together are refused",
           "not both" in src)
@@ -586,6 +598,133 @@ def test_count_mints_independent_receives():
     got = thor.resolve_destinations([D("1"), D("2"), D("3")], [],
                                     [str(f) for f in files])
     check("thor accepts the three bundles --count wrote", got == addrs)
+
+
+def test_count_refuses_a_repeating_wallet():
+    """--count N must REFUSE a wallet-rpc that hands back the same answer.
+
+    THE CHECK ABOVE CANNOT SEE THIS. Its FakeRPC increments next_acct on every
+    create_account and builds each address from that index, so it only ever
+    models a COMPLIANT wallet -- the distinctness it asserts is produced by the
+    fake, not by the code. Deleting the guard leaves it green.
+
+    create_fresh_account validates a single answer and has no memory across
+    calls (build_change_sweep_jobs states exactly that). Seven other bulk
+    loops in this toolchain close that gap themselves --
+    DUPLICATE_SUBADDRESS, DUPLICATE_MIX_ACCOUNT, DUPLICATE_ENTRY_SUBADDRESS,
+    DUPLICATE_ENTRY_ACCOUNT, DUPLICATE_VEIL_CARRIER, DUPLICATE_PEEL_CARRIER,
+    DUPLICATE_CHANGE_SWEEP_TARGET. This one merged N results and compared them
+    with nothing: driven against a repeating wallet-rpc, --count 3 returned
+    three "independent receives" that were ONE address in ONE account and
+    wrote three bundle files naming it.
+
+    thor_swap_preparer does refuse duplicate destinations, so the money never
+    converged on the documented path -- but it refuses after three accounts
+    exist, three bundles are on disk and three circuits have been rotated, and
+    it blames the swap destinations rather than the wallet that repeated
+    itself.
+    """
+    made = []
+
+    class StuckRPC:
+        """Repeats its answer: proxied, older, or a re-opened session."""
+        accounts = [0]
+
+        def raw_request(self, m, p=None):
+            if m == "create_account":
+                return {"account_index": 7}                 # ALWAYS 7
+            if m == "get_address":
+                return {"addresses": [{"address_index": p["address_index"][0],
+                                       "address": made[-1][0]}]}
+            if m == "validate_address":
+                return {"valid": True, "integrated": False,
+                        "subaddress": True, "nettype": "mainnet"}
+            return {}
+
+        def new_subaddress_indexed(self, account_index, label=""):
+            addr = "8" + "B" * 94                           # ALWAYS the same
+            made.append((addr, account_index))
+            return addr, 1
+
+    outdir = tempfile.mkdtemp(prefix="gs_stuck_")
+    crw.newnym = lambda *a, **k: None
+    crw.integrity_log = lambda *a, **k: None
+    crw.connect_rpc = lambda *a, **k: StuckRPC()
+    crw.verify_tor = lambda *a, **k: None
+    crw.validate_proxy = lambda *a, **k: None
+    crw.require_resources = lambda *a, **k: None
+    crw.install_signal_handlers = lambda *a, **k: None
+    args = types.SimpleNamespace(account=None, label="",
+                                 rpc="http://127.0.0.1:18083",
+                                 output_dir=outdir, count=3)
+
+    # DRIVE THE SHIPPED GUARD, not a copy of it.
+    #
+    # The first version of this check reimplemented main()'s loop body here and
+    # then grepped the source for the refusal strings. The mutation sweep
+    # turned BOTH checks into `if False:` and this file stayed green -- the
+    # test was exercising its own copy, and the greps still matched because the
+    # strings were untouched. Hence refuse_duplicate_receive being a function.
+    rpc = StuckRPC()
+    import io
+    real, sys.stdout = sys.stdout, io.StringIO()
+    got = []
+    refusals = []
+    try:
+        seen_a, seen_c = set(), set()
+        for _n in range(3):
+            _addr, _path, (_acct, _sub) = crw.mint_one_receive(rpc, args)
+            try:
+                crw.refuse_duplicate_receive(_addr, _acct, seen_a, seen_c,
+                                             _n, 3)
+            except SystemExit as e:
+                refusals.append(str(e))
+                break
+            seen_a.add(_addr)
+            seen_c.add(_acct)
+            got.append(_addr)
+    finally:
+        sys.stdout = real
+
+    check("--count: a repeating wallet-rpc IS caught (control: the defect is "
+          "reachable at all)", len(made) >= 2 and made[0][0] == made[1][0])
+    check("--count: the shipped guard REFUSES the second mint rather than "
+          "writing a bundle for it", len(refusals) == 1 and len(got) == 1)
+    check("--count: ...and the refusal says why one address across several "
+          "swaps is the harm",
+          refusals and ("links them to the aggregator" in refusals[0]
+                        or "public swap memo" in refusals[0]))
+
+    # ...and the ACCOUNT collision is refused on its own, with different
+    # addresses, because a shared change sink is a separate harm.
+    _acct_only = []
+    try:
+        crw.refuse_duplicate_receive("8" + "C" * 94, 7, {"8" + "D" * 94}, {7},
+                                     1, 3)
+    except SystemExit as e:
+        _acct_only.append(str(e))
+    check("--count: two receives in the SAME account are refused even when "
+          "the addresses differ", len(_acct_only) == 1)
+    check("--count: ...and that refusal names the shared change sink",
+          _acct_only and "subaddress 0" in _acct_only[0]
+          and "pool every leftover" in _acct_only[0])
+
+    # CONTROL: a compliant wallet passes straight through, so the guard is not
+    # simply refusing everything.
+    _ok = True
+    try:
+        crw.refuse_duplicate_receive("8" + "E" * 94, 9, {"8" + "D" * 94}, {7},
+                                     1, 3)
+    except SystemExit:
+        _ok = False
+    check("control: a fresh address in a fresh account is NOT refused", _ok)
+
+    src = open(os.path.join(REPO, "create_receive_wallet")).read()
+    check("--count: main() routes every mint through the shipped guard",
+          "refuse_duplicate_receive(_addr, _acct, _seen_addrs," in src)
+    check("--count: mint_one_receive reports the (account, subaddress) it used, "
+          "so the caller can compare across calls",
+          "return addr_str, fname, (acct_idx, sub_idx)" in src)
 
 
 def test_swap_dest_must_not_be_the_exit_address():

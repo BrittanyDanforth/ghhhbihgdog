@@ -407,6 +407,21 @@ MUTATIONS = [
   "            _scale = args.expect_total_xmr / _quoted_sum",
   "            _scale = args.expect_total_xmr / quoted",
   ["test_swap_arrival"]),
+
+ # create_fresh_account has no memory across calls, and --count N calls it N
+ # times. Seven other bulk loops in this toolchain check for a repeated answer;
+ # this was the eighth and it merged the results without comparing them.
+ ("--count accepts a wallet that hands back the same receive twice",
+  "create_receive_wallet",
+  '    if addr in seen_addrs:',
+  '    if False:',
+  ["test_swap_receive"]),
+
+ ("--count accepts two receives landing in the SAME account (shared change sink)",
+  "create_receive_wallet",
+  '    if acct in seen_accts:',
+  '    if False:',
+  ["test_swap_receive"]),
 ]
 
 
