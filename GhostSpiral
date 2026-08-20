@@ -57,6 +57,7 @@ from gs_common import (
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
     validate_xmr_address, accept_floor,
+    format_quote_failure,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -2692,7 +2693,8 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         except Exception as e:
             newnym(proxy_url=getattr(args, "tor_proxy", ""))
             integrity_log("stage2", f"quote_api_error:{i}")
-            sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
+            sys.exit(format_quote_failure(
+                e, f"SwapKit quote API failed for chunk {i}"))
 
         # Parse the routes from the response
         routes = quote_resp.get("routes", [])

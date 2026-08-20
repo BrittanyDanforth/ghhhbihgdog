@@ -5,6 +5,7 @@ import types
 import ast
 import re
 import stat
+import time
 import sys, os, shutil, tempfile, importlib.util, importlib.machinery
 from decimal import Decimal
 
@@ -1881,6 +1882,48 @@ check("nullsafe (real): memo picked up from tx_info",
 check("nullsafe (real): calldata.data used as memo fallback",
       _try_parse({"calldata": {"to": "A", "data": "0xdeadbeef"},
                   "expectedOutput": "1"})[1] == "0xdeadbeef")
+
+# Cloudflare 403 on SwapKit is a FINAL refusal. Retrying it four times made
+# the console sit for ~48s and then print a truncated "403 Client Error:
+# Forbidden for url: https://api.swapkit.dev" that hides the block page.
+_n403 = {"n": 0}
+
+def _post_403(*_a, **_k):
+    _n403["n"] += 1
+    r = __import__("requests").models.Response()
+    r.status_code = 403
+    r._content = b"<html>Sorry, you have been blocked Cloudflare</html>"
+    r.url = "https://api.swapkit.dev/v3/quote"
+    r.reason = "Forbidden"
+    return r
+
+_saved_post = gs.requests.post
+gs.requests.post = _post_403
+_t0 = time.time()
+try:
+    gs.safe_post("https://api.swapkit.dev/v3/quote", {"sellAsset": "BTC.BTC"},
+                 {"http": "socks5h://127.0.0.1:9050",
+                  "https": "socks5h://127.0.0.1:9050"})
+    _raised_403 = False
+except gs.requests.HTTPError:
+    _raised_403 = True
+finally:
+    gs.requests.post = _saved_post
+check("safe_post: Cloudflare 403 is raised, not swallowed", _raised_403)
+check("safe_post: ...and is attempted ONCE, not four times", _n403["n"] == 1)
+check("safe_post: ...so the operator is not parked for the retry backoff",
+      time.time() - _t0 < 2)
+
+_cf = gs.requests.HTTPError("403 Client Error: Forbidden for url: "
+                            "https://api.swapkit.dev")
+_cf.response = _post_403()
+_msg = gs.format_quote_failure(_cf, "SwapKit quote failed for pair 0")
+check("quote fail: Cloudflare 403 names the block, not just 'Forbidden'",
+      "Cloudflare blocked" in _msg and "api.swapkit.dev" in _msg)
+check("quote fail: ...and says this is not a Tor leak or a missing pair",
+      "not a Tor leak" in _msg and "missing BTC/XMR pair" in _msg)
+check("quote fail: a non-HTTP error still prints the exception",
+      "boom" in gs.format_quote_failure(RuntimeError("boom"), "x"))
 
 # ---------------------------------------------------------------------------
 # exit_strategy_simulator Bisq fallback: EUR must NOT be fabricated from the

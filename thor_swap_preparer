@@ -44,6 +44,7 @@ from gs_common import (
     decimal_env,
     finite_decimal,
     wipe_covers, fmt_btc,
+    format_quote_failure,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
@@ -419,7 +420,8 @@ def main():
             integrity_log("thor", f"quote_fail_{i}:{type(e).__name__}")
             # Abort cleanly with an OPSEC-safe message instead of re-raising a
             # raw requests traceback (which every other abort here avoids).
-            sys.exit(f"[!] SwapKit quote failed for pair {i}: {str(e)[:60]}")
+            sys.exit(format_quote_failure(
+                e, f"SwapKit quote failed for pair {i}"))
 
         routes = quote_resp.get("routes", [])
         if not routes:
