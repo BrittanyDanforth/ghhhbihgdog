@@ -37,7 +37,7 @@ used start_mining and polled for a target height, which overshoots by however
 many blocks land before the stop request is seen -- enough to make a
 locked-output test inconclusive.
 """
-import os
+import atexit, os, socket
 import subprocess
 import time
 
@@ -229,6 +229,45 @@ class MoneroLab:
         broadcast would silently go nowhere" -- a correct guard that a lab
         must satisfy rather than bypass.
         """
+        # NOTHING MAY ALREADY BE ON OUR PORTS. Checked BEFORE launching, because
+        # every after-the-fact check is racy.
+        #
+        # The daemon has an identity check below (height > 1 means someone
+        # else's chain). The WALLET had none: its readiness loop only asked
+        # whether get_version answered, which the daemon comment already
+        # explains is the wrong question. A wallet-rpc left over from an
+        # earlier suite keeps the port, the one we launch fails to bind and
+        # dies --
+        #
+        #     FATAL net  Error starting server: Failed to bind IPv4
+        #     ERROR wallet.rpc  Failed to initialize wallet RPC server
+        #
+        # -- and get_version keeps answering, from the STALE process, whose
+        # --wallet-dir points at a base this run does not own. Every wallet
+        # call then lands on the wrong wallet and surfaces far away as "Cannot
+        # create wallet. Already exists." or "failed to save file <our
+        # path>/w/full.keys", neither of which mentions a port.
+        #
+        # That is exactly why real_flags_testnet, real_watch_desync_testnet and
+        # real_dag_subaddr_testnet failed in a back-to-back sweep and passed
+        # when run alone: the suite before them left its wallet-rpc running.
+        # Waiting for the process to die and polling for it is racy -- measured,
+        # the stale answer arrives first -- so the port is refused up front.
+        for _p, _what in ((self.dp, "monerod"), (self.wp, "monero-wallet-rpc")):
+            _s = socket.socket()
+            _s.settimeout(1.0)
+            try:
+                _busy = _s.connect_ex(("127.0.0.1", _p)) == 0
+            finally:
+                _s.close()
+            if _busy:
+                raise RuntimeError(
+                    f"port {_p} is already in use, so this lab's {_what} could "
+                    f"not own it. A process from an earlier run is still "
+                    f"alive, and this suite would have driven ITS chain or ITS "
+                    f"wallet instead of one it created. Kill it and re-run; do "
+                    f"not run two real-binary suites on the same ports at "
+                    f"once.")
         os.makedirs(os.path.join(self.base, "n"), exist_ok=True)
         if not offline:
             peer_dir = os.path.join(self.base, "peer")
@@ -300,8 +339,10 @@ class MoneroLab:
                     "nothing. See " + os.path.join(self.base, "d.out"))
 
         if not wallet:
+            self._reap_at_exit()
             return self
 
+        _w_out = os.path.join(self.base, "w.out")
         self.procs.append(subprocess.Popen(
             # NO network flag: fakechain uses mainnet address prefixes.
             # --allow-mismatched-daemon-version: a mainnet-mode wallet knows
@@ -316,8 +357,44 @@ class MoneroLab:
             stderr=subprocess.STDOUT))
         for _ in range(60):
             time.sleep(1)
+            # IS THIS OUR WALLET-RPC? Same question the daemon check above asks,
+            # and for the same reason -- "something answers on the port" is not
+            # "the process we started is serving it".
+            #
+            # A wallet-rpc from an earlier suite that was never reaped keeps
+            # port self.wp. The one we just launched then fails to bind and
+            # DIES: its log ends
+            #
+            #     FATAL net  Error starting server: Failed to bind IPv4
+            #     ERROR wallet.rpc  Failed to initialize wallet RPC server
+            #
+            # while get_version keeps answering -- from the STALE process,
+            # whose --wallet-dir points at a base this run does not own and may
+            # have deleted. Every wallet call then lands on the wrong wallet,
+            # and it surfaces far away as "Cannot create wallet. Already
+            # exists." or "failed to save file <this run's path>/w/full.keys",
+            # neither of which mentions a port.
+            #
+            # That is what made real_flags_testnet, real_watch_desync_testnet
+            # and real_dag_subaddr_testnet fail in a back-to-back sweep while
+            # passing alone: the suite before them left its wallet-rpc running.
+            if self.procs[-1].poll() is not None:
+                _tail = ""
+                try:
+                    _tail = open(_w_out).read()[-400:]
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"monero-wallet-rpc exited immediately (code "
+                    f"{self.procs[-1].returncode}). Port {self.wp} is almost "
+                    f"certainly still held by a wallet-rpc from an earlier "
+                    f"run, so this lab would have driven ITS wallet, not one "
+                    f"it created. Kill it and re-run; do not run two "
+                    f"real-binary suites on the same ports at once.\n"
+                    f"--- {_w_out} ---\n{_tail}")
             try:
                 if "result" in self.wj("get_version"):
+                    self._reap_at_exit()
                     return self
             except Exception:                                # noqa: BLE001
                 pass
@@ -331,6 +408,27 @@ class MoneroLab:
         can only ask the daemon nicely cannot test what happens when it dies.
         """
         return self.procs[0] if self.procs else None
+
+    def _reap_at_exit(self):
+        """Kill this lab's processes when the interpreter exits, always.
+
+        stop() has always worked; the problem was that CALLING it was optional.
+        real_flags_testnet, real_dag_subaddr_testnet and
+        real_watch_desync_testnet never did -- and those were exactly the three
+        suites that failed in a back-to-back sweep, because each left its
+        monerod AND its monero-wallet-rpc holding their ports for the next
+        suite to collide with.
+
+        A suite that dies on a traceback could not have called stop() anyway,
+        so the guarantee has to live here rather than in every caller.
+
+        And the obvious shell cleanup does NOT save you: `pkill -x
+        monero-wallet-rpc` never matches, because Linux truncates comm to 15
+        characters and the name is 17 -- ps shows `monero-wallet-r`. Every
+        cleanup written that way is a silent no-op, which is how these
+        processes survived repeated "kill everything" passes.
+        """
+        atexit.register(self.stop)
 
     def stop(self):
         for p in self.procs:
