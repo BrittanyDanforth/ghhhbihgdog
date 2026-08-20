@@ -249,9 +249,40 @@ MIN_DEEP = 1
 DECOY_MIN = 2
 DECOY_MAX = 7
 
-# Fallback fee: conservative estimate for typical 2-input/2-output Monero TX.
-# Updated periodically; safe to overshoot slightly (operator keeps the change).
-FALLBACK_FEE_XMR = Decimal("0.00005")
+# FALLBACK FEE, and the old value here was not conservative -- it was 48x LOW.
+#
+# It was Decimal("0.00005") with the comment "conservative estimate for typical
+# 2-input/2-output Monero TX ... safe to overshoot slightly (operator keeps the
+# change)". It undershoots, badly, and undershooting a fee is the one direction
+# that strands money. Against the real monerod 0.18.3.1 numbers recorded a few
+# lines below (fees = [1200000, 4700000, 19000000, 240000000] piconero/byte,
+# x2000 bytes):
+#
+#     priority 1   real 0.0024    old fallback 0.00005    48.0x too low
+#     priority 2   real 0.0094    old fallback 0.00020    47.0x too low
+#     priority 3   real 0.038     old fallback 0.00100    38.0x too low
+#     priority 4   real 0.48      old fallback 0.00830    57.8x too low
+#
+# compute_hop_amount reserves this fee, and its own docstring says what a short
+# reserve costs: "the plan cleared the dust guard, then transfer_split failed
+# 'not enough money' AFTER the fan-out had already executed on-chain, leaving
+# funds scattered mid-pipeline". That is the same failure the percentage-based
+# reserve caused and that was fixed once already -- reachable again through the
+# fee, and silently.
+#
+# So the table is the daemon's own measured per-priority figures rather than
+# one invented number. Overshooting slightly is safe (the operator keeps the
+# change); undershooting strands funds mid-pipeline, so where the two conflict
+# this rounds up.
+FALLBACK_FEE_BY_PRIORITY = {
+    1: Decimal("0.0024"),
+    2: Decimal("0.0094"),
+    3: Decimal("0.038"),
+    4: Decimal("0.48"),
+}
+# Kept as the priority-1 figure so the name still means "the fallback per-TX
+# fee"; every priority now comes from the table above.
+FALLBACK_FEE_XMR = FALLBACK_FEE_BY_PRIORITY[1]
 
 # Per-TX fee above which the daemon's estimate is not believable and is refused
 # rather than used to size a spending plan. A monerod that is FRESH, --offline,
@@ -327,7 +358,8 @@ SWAP_TOLERANCE_DEFAULT = Decimal("0.10")
 SWAP_ARRIVAL_STEP_FRACTION = Decimal("0.001")
 
 
-def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal:
+def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1,
+                          allow_fallback: bool = False) -> Decimal:
     """Estimate per-TX fee in XMR from monerod's get_fee_estimate.
 
     get_fee_estimate is a DAEMON json_rpc method -- the wallet-rpc (:18083) does
@@ -355,8 +387,68 @@ def fetch_fee_from_daemon(daemon_url, proxies, fee_priority: int = 1) -> Decimal
             _reject_implausible_fee(fee_xmr, daemon_url, "base_times_multiplier")
             integrity_log("fee", "daemon_fee:base_times_multiplier")
             return fee_xmr
+    # NEVER SILENTLY. Reaching here means the daemon gave us nothing usable --
+    # unreachable, wrong --rpc-daemon, a non-localhost daemon with no proxies,
+    # a timeout, or a reply with neither `fees` nor `fee`. Every one of those
+    # returned {} from daemon_fee_estimate, which swallows the reason.
+    #
+    # This used to return a guess and log "using_fallback_fee" to the chain,
+    # while stage0_preflight logged "fee_fetched" -- a line that reads as
+    # success either way -- and printed NOTHING to the terminal. The guess was
+    # 38-58x below the real fee, so every hop under-reserved and the run failed
+    # on a later hop with "not enough money", after the fan-out had already
+    # executed on-chain.
+    #
+    # _reject_implausible_fee, thirty lines down, already refuses a fee that is
+    # too HIGH, with the argument that "sizing a spending plan around a bogus
+    # fee is worse than refusing ... which the operator must fix, not have
+    # papered over". A fee we never obtained is the same case, and it was the
+    # only one of the two that proceeded quietly. The asymmetry was the defect.
+    fee_xmr = FALLBACK_FEE_BY_PRIORITY.get(fee_priority,
+                                           FALLBACK_FEE_XMR * multiplier)
     integrity_log("fee", "using_fallback_fee")
-    return FALLBACK_FEE_XMR * multiplier
+    if not allow_fallback:
+        sys.exit(
+            f"[!] Could not get a fee estimate from the daemon at {daemon_url}.\n"
+            f"    Every amount this run plans is sized against the fee: the "
+            f"fan-out floor, whether\n"
+            f"    each hop is fundable, and how much of your balance is "
+            f"spendable at all. Guessing\n"
+            f"    it wrong LOW is not a smaller error than guessing it high — "
+            f"the plan passes every\n"
+            f"    check and then a later hop fails with 'not enough money', "
+            f"after the fan-out has\n"
+            f"    already executed on-chain and split your funds across "
+            f"subaddresses.\n"
+            f"\n"
+            f"    Check, in this order:\n"
+            f"      * monerod is running and SYNCED, and --rpc-daemon points at "
+            f"its RPC port\n"
+            f"        (mainnet :18081 — NOT the wallet-rpc on :18083, which "
+            f"does not serve\n"
+            f"        get_fee_estimate at all)\n"
+            f"      * a REMOTE daemon is reachable through --tor-proxy (a "
+            f"non-localhost daemon\n"
+            f"        with no proxy is refused rather than queried over "
+            f"clearnet)\n"
+            f"      * the daemon answers: "
+            f"curl {daemon_url}/json_rpc -d "
+            f"'{{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_fee_estimate\"}}'\n"
+            f"\n"
+            f"    To proceed anyway with the built-in estimate for priority "
+            f"{fee_priority}\n"
+            f"    ({fee_xmr} XMR per transaction, from a measured mainnet "
+            f"daemon), pass\n"
+            f"    --accept-fallback-fee. It is a real figure, but it is not "
+            f"YOUR daemon's, and\n"
+            f"    the mempool moves.")
+    print(f"  [!] No fee estimate from the daemon at {daemon_url} — using the "
+          f"built-in figure for priority {fee_priority}: {fee_xmr} XMR per "
+          f"transaction.")
+    print(f"      --accept-fallback-fee was given, so this is not an abort. It "
+          f"is a measured mainnet")
+    print(f"      value, not your daemon's, and every hop is sized against it.")
+    return fee_xmr
 
 
 def _reject_implausible_fee(fee_xmr: Decimal, daemon_url, source: str) -> None:
@@ -2757,6 +2849,15 @@ def build_cli() -> argparse.ArgumentParser:
                           "the funds stay on this wallet.")
     cli.add_argument("--fee-priority", type=int, choices=[1, 2, 3, 4], default=1,
                      help="Monero fee priority: 1=default, 2=x4, 3=x20, 4=x166")
+    cli.add_argument("--accept-fallback-fee", action="store_true",
+                     help="proceed when the daemon gives no fee estimate, using "
+                          "the built-in per-priority figure instead of aborting. "
+                          "WITHOUT this the run STOPS, because every amount is "
+                          "sized against the fee and a low guess fails on a "
+                          "later hop with 'not enough money' — after the fan-out "
+                          "has already executed on-chain. The built-in figures "
+                          "are measured mainnet values, but they are not YOUR "
+                          "daemon's and the mempool moves.")
     cli.add_argument("--dag-mixing", action="store_true",
                      help="Enable the second-round DAG hop-mixing across mix "
                           "subaddresses. This REQUIRES waiting for the fan-out "
@@ -3054,8 +3155,13 @@ def stage0_preflight(args, proxy) -> tuple:
     # the precision does not.
     integrity_log("stage0", f"rpc_sync_ok:height~{int(h1) // 5 * 5}")
 
-    fee_xmr = fetch_fee_from_daemon(args.rpc_daemon, proxy, args.fee_priority)
-    integrity_log("stage0", "fee_fetched")
+    # allow_fallback forwarded, and "fee_fetched" no longer claims more than
+    # happened: it read as success whether the daemon answered or the run
+    # fell back to a guess, which is how a 48x-low fee went unnoticed.
+    fee_xmr = fetch_fee_from_daemon(args.rpc_daemon, proxy, args.fee_priority,
+                                    allow_fallback=getattr(
+                                        args, "accept_fallback_fee", False))
+    integrity_log("stage0", "fee_resolved")
     return rpc_primary, rpc_alt, fee_xmr
 
 

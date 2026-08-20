@@ -55,7 +55,49 @@ ARM_PHRASE = "SPEND"
 TOKEN = secrets.token_urlsafe(24)          # per-run, printed once at startup
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 MAX_JOBS = 200                             # bound the in-memory job table
-JOB_TIMEOUT_S = 4 * 3600                   # nothing legitimate runs longer
+
+# HOW LONG A JOB MAY RUN, and this number used to be 4 * 3600 with the comment
+# "nothing legitimate runs longer". The pipeline this console exists to drive
+# says otherwise, in its own constants:
+#
+#   GhostSpiral.XMR_ARRIVAL_TIMEOUT   = 86400   (24h) the swap-arrival wait ALONE
+#   GhostSpiral.FANOUT_CONFIRM_TIMEOUT = 3600   (1h)  waiting for the fan-out to unlock
+#   GhostSpiral.HOP_DELAY_MAX = 7 * 24 * 3600  (7 days) per --hop-delay, PER HOP
+#
+# A cross-chain BTC->XMR swap settling in under four hours is the lucky case,
+# not the ceiling, and --hop-delay exists precisely so an operator can spread
+# the hops over days. So the console was killing correct, in-progress runs --
+# and killing them at the single worst moment, because a run that is still
+# going at four hours is one that is waiting on money.
+#
+# WORSE THAN LOSING THE RUN: the kill was SIGKILL, which cannot be caught, so
+# NO `finally` BLOCK RUNS. Those finally blocks are what erase
+#   * the WALLET SPEND-KEY PASSWORD  (airgap_tx_signer, four sites)
+#   * the EXIT PLAN carrying --exit-to (GhostSpiral._run_exit_withdrawals)
+#   * the peel and change-sweep plans (destinations and amounts)
+#   * every staging directory of signed transaction blobs
+# so a timed-out run left the wallet password and the operator's final
+# destination sitting on disk in plaintext. The tools all install SIGTERM
+# handlers (gs_common.install_signal_handlers) and shut down cleanly on it --
+# the manual stop button has always sent SIGTERM. Only the watchdog reached for
+# SIGKILL, and only the watchdog fired unattended.
+#
+# The floor below is the sum of the three constants above: the arrival wait,
+# the fan-out confirm, and one maximum hop delay. It is deliberately generous,
+# because the cost of killing a live run is stranded funds plus secrets on
+# disk, while the cost of a hung job living too long is a stale row in a table
+# the operator can clear with the stop button. tests/test_console.py ENFORCES
+# that it stays at or above what GhostSpiral's own constants imply -- a comment
+# asking two numbers to stay in sync is a hope, not a guarantee.
+JOB_TIMEOUT_FLOOR_S = 86400 + 3600 + 7 * 24 * 3600
+JOB_TIMEOUT_S = JOB_TIMEOUT_FLOOR_S        # overridable with --job-timeout
+
+# Grace period between SIGTERM and SIGKILL. The tools catch SIGTERM, stop at
+# their next checkpoint and run their cleanup; secure_delete overwrites before
+# unlinking, and a peel/exit round may have several plans and a staging tree to
+# erase. Long enough for that to finish, short enough that a truly wedged
+# process still goes away.
+JOB_TERM_GRACE_S = 30
 
 # ── parameter schema. Anything not here cannot reach an argv. ───────────────
 SOCKS_RE = re.compile(r"^socks5h://[A-Za-z0-9._-]+:\d{1,5}$")
@@ -528,11 +570,47 @@ def start(argv, label, action_id=None, extra_env=None):
             # start_new_session=True above gives each job its own group, so
             # this cannot reach anything else.
             def _watchdog():
+                # SIGTERM FIRST. This sent SIGKILL, which cannot be caught, so
+                # none of the child's `finally` blocks ran -- and those are what
+                # erase the wallet password, the exit plan carrying --exit-to,
+                # the peel and change-sweep plans, and the staging trees of
+                # signed blobs. A timed-out run left all of it on disk.
+                #
+                # Every tool installs a SIGTERM handler
+                # (gs_common.install_signal_handlers) and stops at its next
+                # checkpoint, which is exactly what the manual stop button has
+                # always relied on. The watchdog is the one path that never
+                # used it, and the only one that fires with nobody watching.
                 with LOCK:
                     job["lines"].append(
-                        f"[console] job exceeded {JOB_TIMEOUT_S}s — killing it.")
+                        f"[console] job exceeded {JOB_TIMEOUT_S}s — asking it "
+                        f"to stop (SIGTERM) so it can erase its plans and the "
+                        f"wallet password.")
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    _pg = os.getpgid(p.pid)
+                except OSError:
+                    return
+                try:
+                    os.killpg(_pg, signal.SIGTERM)
+                except OSError:
+                    return
+                # Then SIGKILL only if it is genuinely wedged. p.wait() is the
+                # drain thread's job, so poll rather than wait here.
+                _deadline = time.time() + JOB_TERM_GRACE_S
+                while time.time() < _deadline:
+                    if p.poll() is not None:
+                        with LOCK:
+                            job["lines"].append(
+                                "[console] job stopped cleanly after SIGTERM.")
+                        return
+                    time.sleep(0.5)
+                with LOCK:
+                    job["lines"].append(
+                        f"[console] still running {JOB_TERM_GRACE_S}s after "
+                        f"SIGTERM — SIGKILL. Its plans and any wallet-password "
+                        f"scratch file may still be on disk; run paranoia_mode.")
+                try:
+                    os.killpg(_pg, signal.SIGKILL)
                 except OSError:
                     pass
             _wd = threading.Timer(JOB_TIMEOUT_S, _watchdog)
@@ -547,11 +625,33 @@ def start(argv, label, action_id=None, extra_env=None):
             finally:
                 _wd.cancel()
             try:
-                p.wait(timeout=JOB_TIMEOUT_S)
+                # Short, because stdout is already closed: the drain loop above
+                # only ends when the child exits or the watchdog killed it, so
+                # this is a reap, not a wait. It used to be JOB_TIMEOUT_S, which
+                # meant a child that closed stdout but did not exit held this
+                # thread for the whole timeout a second time.
+                p.wait(timeout=JOB_TERM_GRACE_S)
             except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                job["lines"].append(f"[console] killed after {JOB_TIMEOUT_S}s timeout")
-                p.wait()
+                # Same escalation as the watchdog, and for the same reason:
+                # SIGKILL skips every `finally`, including the ones that erase
+                # the wallet password and the exit plan.
+                try:
+                    _pg2 = os.getpgid(p.pid)
+                    os.killpg(_pg2, signal.SIGTERM)
+                    job["lines"].append(
+                        "[console] output ended but the process is still alive "
+                        "— SIGTERM sent so it can clean up.")
+                    try:
+                        p.wait(timeout=JOB_TERM_GRACE_S)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(_pg2, signal.SIGKILL)
+                        job["lines"].append(
+                            "[console] SIGKILL after grace period; plans and "
+                            "any wallet-password scratch file may remain on "
+                            "disk — run paranoia_mode.")
+                        p.wait()
+                except OSError:
+                    pass
             job["rc"] = p.returncode
         except FileNotFoundError as e:
             job["lines"].append(f"[console] not found: {e}"); job["rc"] = 127
@@ -1853,7 +1953,25 @@ $('#rpc_daemon').addEventListener('change',loadFees);
 def main():
     ap = argparse.ArgumentParser(description="GhostSpiral operator console")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--job-timeout", type=int, default=JOB_TIMEOUT_FLOOR_S,
+                    metavar="SECONDS",
+                    help=f"kill a job after this long (default {JOB_TIMEOUT_FLOOR_S}s "
+                         f"= the swap-arrival wait + fan-out confirm + one maximum "
+                         f"--hop-delay). Raise it if you schedule several hops at "
+                         f"multi-day delays; a job that is still running is usually "
+                         f"one that is waiting on money, and stopping it strands funds.")
     a = ap.parse_args()
+    global JOB_TIMEOUT_S
+    JOB_TIMEOUT_S = max(1, int(a.job_timeout))
+    if JOB_TIMEOUT_S < JOB_TIMEOUT_FLOOR_S:
+        # Not refused -- an operator running short jobs may genuinely want a
+        # tighter bound -- but never silent, because the number that used to be
+        # here killed live runs at four hours.
+        print(f"  [!] --job-timeout {JOB_TIMEOUT_S}s is BELOW the "
+              f"{JOB_TIMEOUT_FLOOR_S}s a full pipeline can legitimately take "
+              f"(swap arrival + fan-out confirm + one max hop delay).")
+        print( "      A run stopped part-way leaves funds mid-pipeline. The stop "
+               "button is always available.")
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)      # loopback ONLY
     print(f"  GhostSpiral console → http://127.0.0.1:{a.port}/?t={TOKEN}")
     print( "  ^ open THIS url — the token is required, and it changes every run")

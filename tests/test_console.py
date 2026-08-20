@@ -897,6 +897,91 @@ def test_split_bound_is_one_number():
           "--split" not in c.pipeline_argv(_bad["params"])[0])
 
 
+def test_job_timeout_cannot_kill_a_live_pipeline():
+    """The console's job timeout must exceed what GhostSpiral can legitimately take.
+
+    It was 4 * 3600 with the comment "nothing legitimate runs longer". The
+    pipeline it drives says otherwise in its own constants: the swap-arrival
+    wait alone is capped at XMR_ARRIVAL_TIMEOUT (24h), the fan-out confirm adds
+    FANOUT_CONFIRM_TIMEOUT, and --hop-delay accepts up to HOP_DELAY_MAX (7 days)
+    PER HOP. A cross-chain BTC->XMR swap settling inside four hours is the lucky
+    case, so the console was killing correct runs at the exact moment they were
+    waiting on money.
+
+    Same enforcement as the split bound above, and for the same reason: the
+    console is stdlib-only and does not import GhostSpiral, so the number is a
+    literal and a comment asking two numbers to agree is a hope.
+    """
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "ghost_timeout", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(g)
+    floor = g.XMR_ARRIVAL_TIMEOUT + g.FANOUT_CONFIRM_TIMEOUT + g.HOP_DELAY_MAX
+    check(f"job timeout: the console allows at least the arrival wait + fan-out "
+          f"confirm + one max hop delay ({floor}s)",
+          c.JOB_TIMEOUT_FLOOR_S >= floor)
+    check("job timeout: ...and the default is that floor, not something shorter",
+          c.JOB_TIMEOUT_S >= floor)
+    check("job timeout: the old 4h value would NOT have satisfied this "
+          "(control: the check is not vacuous)", 4 * 3600 < floor)
+
+
+def test_watchdog_lets_the_job_clean_up_before_killing_it():
+    """A timed-out job must get SIGTERM first, or its secrets stay on disk.
+
+    The watchdog sent SIGKILL, which cannot be caught, so none of the child's
+    `finally` blocks ran -- and those are what erase the wallet spend-key
+    password (four sites in airgap_tx_signer), the exit plan carrying
+    --exit-to, the peel and change-sweep plans, and the staging trees of signed
+    blobs. A run that timed out left all of it in plaintext on disk.
+
+    Every tool installs a SIGTERM handler via gs_common.install_signal_handlers,
+    and the manual stop button has always relied on that. The watchdog was the
+    one path that did not -- and the only one that fires unattended.
+
+    Driven against the REAL start() with a child that behaves like the tools do:
+    it writes a secret, handles SIGTERM, and erases the secret in a finally.
+    """
+    c = load_console()
+    d = tempfile.mkdtemp(prefix="gs_wd_")
+    secret = os.path.join(d, "secret")
+    child = os.path.join(d, "child.py")
+    with open(child, "w") as fh:
+        fh.write(
+            "import signal, sys, time, pathlib\n"
+            "s = pathlib.Path(sys.argv[1]); s.write_text('WALLET-PASSWORD')\n"
+            "st = {'v': False}\n"
+            "signal.signal(signal.SIGTERM, lambda *a: st.__setitem__('v', True))\n"
+            "print('up', flush=True)\n"
+            "try:\n"
+            "    while not st['v']: time.sleep(0.1)\n"
+            "finally:\n"
+            "    s.unlink(missing_ok=True); print('cleaned', flush=True)\n")
+    _saved = (c.JOB_TIMEOUT_S, c.JOB_TERM_GRACE_S)
+    try:
+        c.JOB_TIMEOUT_S, c.JOB_TERM_GRACE_S = 2, 15
+        jid = c.start([sys.executable, child, secret], "wd-test")
+        for _ in range(400):
+            if c.JOBS[jid]["done"]:
+                break
+            time.sleep(0.25)
+    finally:
+        c.JOB_TIMEOUT_S, c.JOB_TERM_GRACE_S = _saved
+    j = c.JOBS[jid]
+    out = "\n".join(j["lines"])
+    check("watchdog: the timed-out job actually ended", j["done"])
+    check("watchdog: it was asked to stop (SIGTERM), not SIGKILLed outright",
+          "SIGTERM" in out)
+    check("watchdog: the child's cleanup RAN — this is the whole point",
+          "cleaned" in out)
+    check("watchdog: ...so the secret it was holding is GONE from disk "
+          "(SIGKILL left the wallet password and the exit plan behind)",
+          not os.path.exists(secret))
+    check("watchdog: ...and it did not need the SIGKILL escalation",
+          j["rc"] == 0)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

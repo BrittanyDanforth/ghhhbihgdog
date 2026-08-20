@@ -138,10 +138,57 @@ check("fee: uses per-priority fees[2]", fee == Decimal(8000 * 2000) / Decimal(10
 fee = with_estimate({"fee": 1000})
 check("fee: base x multiplier when no fees[]",
       fee == (Decimal(1000 * 2000) / Decimal(10**12)) * Decimal(20))
-# empty -> fallback * multiplier
-fee = with_estimate({})
-check("fee: fallback when empty",
-      fee == ghost.FALLBACK_FEE_XMR * Decimal(20))
+# NO ESTIMATE -> REFUSE, not a silent guess.
+#
+# This asserted `fee == FALLBACK_FEE_XMR * 20`, i.e. it pinned the defect as
+# correct behaviour. When the daemon gave nothing back -- unreachable, wrong
+# --rpc-daemon, a remote daemon with no proxy, a timeout -- fetch_fee_from_daemon
+# returned a guess and the run sized every amount against it. Measured against
+# the real monerod 0.18.3.1 figures the repo records, that guess was 38-58x TOO
+# LOW at every priority, and a low fee is the direction that strands money:
+# compute_hop_amount's own docstring says a short reserve means the plan clears
+# the dust guard and then "transfer_split failed 'not enough money' AFTER the
+# fan-out had already executed on-chain, leaving funds scattered mid-pipeline".
+#
+# _reject_implausible_fee already refuses a fee that is too HIGH for exactly
+# this reason. A fee never obtained is the same case; only it proceeded quietly.
+def _fee_refused_without_flag(est, prio=3):
+    ghost.daemon_fee_estimate = lambda *a, **k: est
+    try:
+        ghost.fetch_fee_from_daemon("http://127.0.0.1:18081", None, prio)
+        return None
+    except SystemExit as e:
+        return str(e)
+_nofee = _fee_refused_without_flag({})
+check("fee: no daemon estimate ABORTS rather than guessing", _nofee is not None)
+check("fee: ...and says the fee sizes every amount in the plan",
+      _nofee and "sized against the fee" in _nofee)
+check("fee: ...and names the wallet-rpc/daemon port confusion, the usual cause",
+      _nofee and ":18081" in _nofee and ":18083" in _nofee)
+check("fee: ...and offers the explicit opt-out rather than just refusing",
+      _nofee and "--accept-fallback-fee" in _nofee)
+
+# ...and WITH the opt-out it proceeds, on a real measured figure.
+import io as _io, contextlib as _ctx
+ghost.daemon_fee_estimate = lambda *a, **k: {}
+with _ctx.redirect_stdout(_io.StringIO()) as _fb:
+    _fallback = ghost.fetch_fee_from_daemon("http://127.0.0.1:18081", None, 3,
+                                            allow_fallback=True)
+check("fee: --accept-fallback-fee proceeds with the per-priority figure",
+      _fallback == ghost.FALLBACK_FEE_BY_PRIORITY[3])
+check("fee: ...and says out loud that it is not the operator's own daemon",
+      "not your daemon" in _fb.getvalue().lower())
+# THE FALLBACK MUST OVERSHOOT, NEVER UNDERSHOOT. The old constant claimed to be
+# "safe to overshoot slightly" and was 48x low. Checked against the daemon
+# figures this repo verified: fees = [1200000, 4700000, 19000000, 240000000]
+# piconero/byte over a ~2 kB transaction.
+for _p, _perbyte in ((1, 1200000), (2, 4700000), (3, 19000000), (4, 240000000)):
+    _real = Decimal(_perbyte * 2000) / Decimal(10 ** 12)
+    check(f"fee: the priority-{_p} fallback is not BELOW a real mainnet fee "
+          f"(under-reserving strands funds mid-pipeline)",
+          ghost.FALLBACK_FEE_BY_PRIORITY[_p] >= _real)
+    check(f"fee: ...and is still inside the implausible ceiling at priority {_p}",
+          ghost.FALLBACK_FEE_BY_PRIORITY[_p] <= ghost.FEE_IMPLAUSIBLE_XMR)
 # fees[] too short for priority -> falls back to base path
 fee = with_estimate({"fee": 1000, "fees": [1000, 4000]})
 check("fee: short fees[] falls through to base",
