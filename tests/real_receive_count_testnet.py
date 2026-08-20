@@ -100,7 +100,8 @@ try:
     print(f"\n=== mint {N} receives through the SHIPPED mint_one_receive ===")
     bundles = [crw.mint_one_receive(rpc, args) for _ in range(N)]
 
-    loaded = [gs_common.load_receive_bundle(str(f)) for _, f in bundles]
+    # mint_one_receive returns (address, path, (account, subaddress)).
+    loaded = [gs_common.load_receive_bundle(str(f)) for _, f, _ in bundles]
     accts = [b["account_index"] for b in loaded]
     addrs = [b["address"] for b in loaded]
 
@@ -145,7 +146,7 @@ try:
     check("...and nothing names the tool in the wallet file", not tagged)
 
     print("\n=== the swap preparer accepts these and refuses reuse ===")
-    paths = [str(f) for _, f in bundles]
+    paths = [str(f) for _, f, _ in bundles]
     amounts = [Decimal("0.01"), Decimal("0.02"), Decimal("0.03")]
     got = thor.resolve_destinations(amounts, [], paths)
     check("thor accepts the N bundles --count produced", got == addrs)

@@ -254,9 +254,20 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # follows it -- which is the correlation the rotation exists to break.
     newnym(required=True)
     # (account, subaddress) alongside the address, so main() can compare
-    # SUCCESSIVE mints -- see the duplicate check there. A third element rather
-    # than a new shape, so `addr, path = mint_one_receive(...)` still unpacks
-    # for every existing caller.
+    # SUCCESSIVE mints -- see refuse_duplicate_receive.
+    #
+    # THIS IS AN ARITY CHANGE, and the comment that used to sit here claimed it
+    # was not: "a third element rather than a new shape, so
+    # `addr, path = mint_one_receive(...)` still unpacks for every existing
+    # caller". That is simply false -- a 3-tuple does not unpack into two
+    # names, it raises ValueError -- and writing it down did not make it true.
+    #
+    # It survived a full offline suite and a 63-mutation sweep because the one
+    # offline test that calls this INDEXES the result (b[0], b[1]) instead of
+    # unpacking it. tests/real_receive_count_testnet.py unpacks, and that is a
+    # real-binary suite that cannot run without monerod installed -- so nothing
+    # in reach at the time executed the line that breaks. Every caller is
+    # updated now; the list is short and it is in this file plus tests/.
     return addr_str, fname, (acct_idx, sub_idx)
 
 
@@ -355,7 +366,13 @@ def print_next_steps(bundles: list) -> None:
     print("     local user can read those from ps / /proc/<pid>/cmdline):")
     print(f"       GS_SWAP_AMOUNTS='{' '.join(['<BTC_AMOUNT>'] * n)}' \\")
     print("       python3 thor_swap_preparer \\")
-    print(f"         --dest-from-receive-wallet {' '.join(str(f) for _, f in bundles)} \\")
+    # INDEXED, not unpacked. main() passes (address, path) pairs while
+    # mint_one_receive returns a 3-tuple, so an unpack here is correct only for
+    # as long as those two shapes stay different -- and a caller that hands its
+    # mint results straight in (which the real-binary suite does) would hit the
+    # ValueError that shape mismatch already caused once.
+    print(f"         --dest-from-receive-wallet "
+          f"{' '.join(str(b[1]) for b in bundles)} \\")
     print("         --tor-proxy <SOCKS5H_PROXY>")
     if n == 1:
         print("     (Splitting into several swaps? Each one needs its OWN address —")
