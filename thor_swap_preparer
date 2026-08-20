@@ -44,10 +44,13 @@ from gs_common import (
     decimal_env,
     finite_decimal,
     wipe_covers, fmt_btc,
+    PAIR_SCHEMA,
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
-PAIR_SCHEMA = "thor_pairs_v1"
+# PAIR_SCHEMA is gs_common's now. It was declared here AND in receive_watch --
+# one constant, two copies, held by the writer and the reader, which are exactly
+# the two sides that must agree about it.
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 # (CG_PRICE and _XMR_RE used to live here and nothing read either. CG_PRICE was
 # a second copy of gs_common.CG_PRICE_URL -- the oracle this tool actually calls

@@ -120,7 +120,8 @@ python3 tests/real_receive_watch_testnet.py # SHIPPED watch loop vs a real walle
                                           #   and that locked funds are not "paid" yet
 ```
 
-`real_phase_create_testnet.py` needs the `monero` package (the others do not).
+`real_delay_pipeline_testnet.py` and `real_phase_create_testnet.py` need the
+`monero` package (the others do not).
 Installing it can fail on modern setuptools, because its `varint` dependency
 still uses `use_2to3`, removed in setuptools 58:
 

@@ -1266,6 +1266,21 @@ def test_console_can_express_the_expected_total():
           "that is hidden there",
           "set Split below" not in _page)
 
+    # THE BUNDLE, so the operator does not retype the total at all. The page
+    # already collects pairs_file for the watch step and it is the same file;
+    # passing it lets GhostSpiral sum the swaps itself AND keep the per-swap
+    # breakdown, which a typed total cannot carry.
+    a, _ = argv_for({"pairs_file": "thor_pairs.json"})
+    check("expected total: the pairs bundle reaches the argv in receive mode",
+          "--swap-pairs" in a
+          and a[a.index("--swap-pairs") + 1] == "thor_pairs.json")
+    ns = g.build_cli().parse_args(a[2:])
+    check("expected total: ...and GhostSpiral's parser takes it",
+          ns.swap_pairs == "thor_pairs.json")
+    a, _ = argv_for()
+    check("expected total: ...and no bundle means no flag, unchanged",
+          "--swap-pairs" not in a)
+
 
 def test_daemon_chain_is_reported_not_assumed():
     """check_daemon_relay_egress must report WHICH chain the daemon is on.

@@ -286,6 +286,17 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         # size is smaller than the tolerance.
         if p.get("split", 1) > 1:
             a += ["--split", str(p["split"])]
+        # THE QUOTES, so the operator does not retype the total.
+        #
+        # The page already collects pairs_file for the watch step, and it is
+        # the same bundle. Passed here, GhostSpiral sums the swaps routed to
+        # this receive address itself -- and gets the PER-SWAP breakdown,
+        # which a hand-typed total cannot carry: on 0.50/0.30/0.15/0.05 the
+        # gate tightens to 0.95 XMR with the breakdown and only reaches 0.90
+        # without it, and at 0.90 the 0.05 swap can be missing entirely while
+        # the run starts mixing.
+        if p.get("pairs_file"):
+            a += ["--swap-pairs", p["pairs_file"]]
     else:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")

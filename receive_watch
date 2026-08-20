@@ -48,7 +48,7 @@ OPSEC hardening:
     arming and running a spend stays where the rest of the toolchain puts it.
 """
 from __future__ import annotations
-import argparse, json, secrets, shlex, sys, time
+import argparse, secrets, shlex, sys, time
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
@@ -61,10 +61,14 @@ from gs_common import (
     swap_arrival_floor,
     decimal_env, XMR_ABSURD_TOTAL,
     progress_line,
+    load_pairs, pairs_for_dest,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
-PAIR_SCHEMA = "thor_pairs_v1"
+# PAIR_SCHEMA, load_pairs and pairs_for_dest now live in gs_common: GhostSpiral
+# reads pairs bundles too, and the schema tag was already duplicated between
+# this file and thor_swap_preparer -- the writer and the reader are exactly the
+# two sides that must not drift.
 
 # Poll cadence. A fixed interval is a heartbeat an observer of a remote RPC can
 # lock onto, so the wait is jittered inside this band rather than ticking.
@@ -141,33 +145,6 @@ def to_xmr(atomic: int) -> Decimal:
     that are not there)."""
     return (Decimal(int(atomic)) / ATOMIC).quantize(Decimal("0.000000000001"),
                                                     rounding=ROUND_DOWN)
-
-
-def load_pairs(path: str) -> list:
-    """Load a thor_pairs_v1 bundle (the list thor_swap_preparer writes)."""
-    p = Path(path)
-    if not p.is_file():
-        raise FileNotFoundError(f"pairs bundle not found: {path}")
-    try:
-        d = json.loads(p.read_text())
-    except Exception as e:                                   # noqa: BLE001
-        raise ValueError(f"pairs bundle is not readable JSON: {str(e)[:60]}")
-    if not isinstance(d, list) or not d:
-        raise ValueError("pairs bundle must be a non-empty JSON list")
-    for entry in d:
-        if not isinstance(entry, dict) or entry.get("schema") != PAIR_SCHEMA:
-            raise ValueError(f"every pair must carry schema {PAIR_SCHEMA}")
-    return d
-
-
-def pairs_for_dest(pairs: list, dest_addr: str) -> list:
-    """Only the pairs actually routed to THIS receive address.
-
-    A pairs file can hold several swaps to several destinations. Summing all of
-    them would set a target this subaddress is never going to reach, and the
-    watch would run until timeout on a payment that already completed.
-    """
-    return [p for p in pairs if p.get("dest_xmr") == dest_addr]
 
 
 def expected_total(pairs: list) -> tuple:
@@ -253,7 +230,7 @@ CHOICES = [
 
 def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
                       rpc_url: str = "", target=None, chunks: int = 0,
-                      tolerance=None) -> list:
+                      tolerance=None, pairs: str = "") -> list:
     """The exact argv for a chosen mix. Returns [] for the do-nothing choice.
 
     Built as a list, never a string: it is printed for the operator to run, and
@@ -316,6 +293,15 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
             "--wallets", str(f["wallets"]),
             "--deep", str(f["deep"]),
             "--fee-priority", str(f["fee_priority"])]
+    # The bundle itself, when this watch was driven from one. GhostSpiral
+    # re-reads it and gets the PER-SWAP amounts, which --expect-total-xmr
+    # cannot carry: on 0.50/0.30/0.15/0.05 the gate tightens to 0.95 XMR with
+    # the breakdown and only reaches 0.90 with the total alone. Both are
+    # passed -- the explicit total is what THIS watch actually waited for, and
+    # GhostSpiral prefers it while warning if it sits below what the quotes
+    # promise.
+    if pairs:
+        argv += ["--swap-pairs", pairs]
     if target is not None and target > 0:
         argv += ["--expect-total-xmr", str(target)]
         # How many payments make up that total. In receiver mode this is what
@@ -1135,7 +1121,8 @@ def main():
 
     argv = build_mix_command(c, args.receive_wallet, args.tor_proxy, rpc_url,
                              target=target, chunks=len(matched),
-                             tolerance=args.tolerance)
+                             tolerance=args.tolerance,
+                             pairs=(args.pairs or ""))
     print(f"\n  [+] {c['name']} — run this to start the mix:\n")
     print("      " + format_mix_command(argv))
     print("\n  This tool does not spend. Nothing moves until you run that command,")

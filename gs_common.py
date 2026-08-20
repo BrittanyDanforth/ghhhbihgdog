@@ -2288,6 +2288,48 @@ def quote_deviation(expected_out, amount_in, rate_in_per_out):
 XMR_ABSURD_TOTAL = Decimal("100000000")
 
 
+#: The schema tag thor_swap_preparer stamps on every entry of a pairs bundle.
+#: Lived in BOTH receive_watch and thor_swap_preparer -- one constant, two
+#: copies, and the writer and the reader are the two sides that must agree
+#: about it. Same reasoning as sum_quoted_xmr below, which is here because it
+#: was written twice and the copies drifted.
+PAIR_SCHEMA = "thor_pairs_v1"
+
+
+def load_pairs(path) -> list:
+    """Load a thor_pairs_v1 bundle (the list thor_swap_preparer writes).
+
+    SHARED, because GhostSpiral reads these too now. It used to be reachable
+    only from receive_watch, so a receiver-mode run had no way to learn what
+    its own swaps were quoted to deliver and the operator had to retype the
+    total by hand -- a decimal that is silent when it is wrong in the direction
+    that matters (too low lowers the arrival gate, and the run spends early).
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"pairs bundle not found: {path}")
+    try:
+        d = json.loads(p.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise ValueError(f"pairs bundle is not readable JSON: {str(e)[:60]}")
+    if not isinstance(d, list) or not d:
+        raise ValueError("pairs bundle must be a non-empty JSON list")
+    for entry in d:
+        if not isinstance(entry, dict) or entry.get("schema") != PAIR_SCHEMA:
+            raise ValueError(f"every pair must carry schema {PAIR_SCHEMA}")
+    return d
+
+
+def pairs_for_dest(pairs: list, dest_addr: str) -> list:
+    """Only the pairs actually routed to THIS receive address.
+
+    A pairs file can hold several swaps to several destinations. Summing all of
+    them would set a target this subaddress is never going to reach, and the
+    watch would run until timeout on a payment that already completed.
+    """
+    return [p for p in pairs if p.get("dest_xmr") == dest_addr]
+
+
 def sum_quoted_xmr(items, key: str = "expected_xmr") -> tuple:
     """Sum the quoted XMR across swap quotes. Returns (total, unreadable, amounts).
 

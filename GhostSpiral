@@ -57,6 +57,7 @@ from gs_common import (
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
     validate_xmr_address, accept_floor,
+    load_pairs, pairs_for_dest,
 )
 
 DUST_XMR = Decimal("0.0001")
@@ -2819,6 +2820,68 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
                  f"CLI has moved on from what this call expects.")
 
 
+def _receive_pairs_for(args, entry_addr: str) -> list:
+    """The swap quotes routed to this receive address, or [].
+
+    Receiver mode has always known WHERE the money is going and not HOW MUCH
+    was coming: the target had to be retyped into --expect-total-xmr by hand.
+
+    Filtered to THIS receive address, because a bundle can describe swaps to
+    several destinations and summing all of them sets a target this subaddress
+    is never going to reach -- the run would sit out its whole wait and then
+    report a shortfall that is really someone else's swap.
+    A hand-typed decimal fails silently in the direction that costs money -- a
+    dropped digit makes the target smaller, the arrival gate opens early, and
+    the run plans against part of the swap while the rest lands on an ENTRY it
+    has already finished with.
+
+    Reading the bundle also gives the gate the PER-CHUNK amounts. Passed [],
+    swap_arrival_floor can only apply the flat tolerance; given the real
+    amounts it tightens when the smallest chunk is worth less than that
+    tolerance, which is the case where a whole missing chunk would otherwise
+    hide inside it.
+
+    NEVER FATAL. This is a convenience over --expect-total-xmr, not a new
+    requirement: a missing, malformed or unrelated bundle warns and returns [],
+    leaving the run exactly as it was before the flag existed. The bundle is a
+    file on disk that anything able to write it can shape, and sum_quoted_xmr
+    already treats NaN/Infinity/absurd quotes as unreadable rather than
+    believing them.
+    """
+    path = getattr(args, "swap_pairs", None)
+    if not path:
+        return []
+    try:
+        allp = load_pairs(path)
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("stage2", "receive_pairs_unreadable")
+        print(f"  [!] --swap-pairs {path} could not be read ({str(e)[:80]}).")
+        print(f"      Continuing without it: the run has NO target unless you "
+              f"pass --expect-total-xmr, and with no target it does not wait.")
+        return []
+    matched = pairs_for_dest(allp, entry_addr)
+    if not matched:
+        # Loud, because the operator supplied a bundle and reasonably believes
+        # it is being used. Silently ignoring it leaves them thinking the run
+        # is gated when it is not.
+        integrity_log("stage2", "receive_pairs_wrong_dest")
+        print(f"  [!] None of the {len(allp)} swap pair(s) in {path} are "
+              f"routed to this receive address, so NONE of them describe this "
+              f"run's money.")
+        print(f"      Continuing without a target unless --expect-total-xmr "
+              f"is set. Check you passed the bundle for THIS receive wallet.")
+        return []
+    _tot, _unreadable, _ = sum_quoted_xmr(matched)
+    integrity_log("stage2", f"receive_pairs_loaded:{len(matched)}")
+    print(f"  [+] --swap-pairs: {len(matched)} swap(s) routed here, quoted "
+          f"{_tot} XMR in total. The run waits for that sum.")
+    if _unreadable:
+        print(f"  [!] {_unreadable} of them carry no readable expected_xmr and "
+              f"contribute NOTHING to the target, so the run will proceed once "
+              f"the readable ones have landed even if those never do.")
+    return matched
+
+
 def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
                            xmr_dests) -> List[dict]:
     """Get ThorChain swap quotes via SwapKit API for each BTC chunk.
@@ -3072,6 +3135,12 @@ def build_cli() -> argparse.ArgumentParser:
                             help="gs_receive_wallet_v1 JSON from create_receive_wallet — "
                                  "RECEIVER mode: XMR already arrived on this address")
 
+    cli.add_argument("--swap-pairs", metavar="PATH",
+                     help="thor_pairs.json from thor_swap_preparer. RECEIVER "
+                          "mode only: the run reads the quotes routed to this "
+                          "receive address and waits for their SUM, instead of "
+                          "the operator retyping the total into "
+                          "--expect-total-xmr.")
     cli.add_argument("--tor-proxy", required=True,
                      help="SOCKS5 proxy (e.g. socks5h://127.0.0.1:9050)")
     cli.add_argument("--joinmarket", action="store_true",
@@ -4718,23 +4787,50 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
         # escape hatch as the send path. The only thing receiver mode genuinely
         # lacks is quotes to derive the total FROM; given one, there is no
         # difference worth a separate code path.
-        if args.expect_total_xmr is None:
+        # THE TARGET, from whichever source has one.
+        #
+        # --expect-total-xmr wins where both exist: the operator holding the
+        # bundle can know something the file does not (a swap they cancelled, a
+        # sender who paid a different amount), and stage4 already warns above
+        # when an explicit target sits BELOW what the quotes promise.
+        #
+        # Otherwise the quotes, when --swap-pairs supplied them. This is the
+        # "only thing receiver mode genuinely lacks" named a few lines up, and
+        # it removes a hand-typed decimal from the one place where typing it
+        # too small opens the gate early and spends part of a swap.
+        _rtarget = (args.expect_total_xmr if args.expect_total_xmr is not None
+                    else (quoted if quoted > 0 else None))
+        if _rtarget is None:
             # No target, so nothing can be checked -- and that is worth saying,
             # because "it returned immediately" reads as "it verified".
             if unlocked_bal <= DUST_XMR:
                 print("  [!] Receiver mode with no --expect-total-xmr: this "
                       "run does NOT wait, and ENTRY holds nothing yet.")
+            print("      Pass --expect-total-xmr <total XMR>, or --swap-pairs "
+                  "<thor_pairs.json> to take the total from the quotes.")
             integrity_log("stage4", "arrival_receive_no_target")
             return total_bal, unlocked_bal
 
+        # chunk_amounts, NOT []. With the bundle read this is the real
+        # per-swap breakdown, and swap_arrival_floor uses it to tighten the
+        # gate when the SMALLEST chunk is worth less than the flat tolerance --
+        # the case where one whole missing swap would otherwise hide inside it.
+        # Empty when no bundle was given, which is the old behaviour exactly.
         _rfloor, _rtight = swap_arrival_floor(
-            args.expect_total_xmr, args.swap_tolerance, [], n_chunks)
+            _rtarget, args.swap_tolerance, chunk_amounts, n_chunks)
+        if _rtight:
+            print(f"  [*] Arrival gate tightened to {_rfloor} XMR, above what "
+                  f"the {args.swap_tolerance * 100:.0f}% tolerance alone would "
+                  f"allow: the smallest quoted swap is worth less than that "
+                  f"tolerance, so at the wider figure it could be missing "
+                  f"entirely and this run would still start mixing.")
+            integrity_log("stage4", "receive_gate_tightened_for_smallest_chunk")
         if unlocked_bal >= _rfloor:
             integrity_log("stage4", "arrival_receive_already_complete")
             return total_bal, unlocked_bal
 
         print(f"  [*] Receiver mode: waiting for ~{_rfloor} XMR of the "
-              f"{args.expect_total_xmr} XMR you expect "
+              f"{_rtarget} XMR you expect "
               f"({n_chunks} chunk(s), "
               f"{args.swap_tolerance * 100:.0f}% tolerance). "
               f"{unlocked_bal} XMR unlocked so far.")
@@ -5705,6 +5801,7 @@ def main():
             integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
             print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
             print(f"  [+] Entry address: {scrub_address(ENTRY)}")
+            swap_deposits = _receive_pairs_for(args, ENTRY)   # --swap-pairs
         else:
             btc_chunks = []
 

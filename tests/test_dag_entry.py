@@ -1358,6 +1358,74 @@ check("btc: a sub-satoshi total is REFUSED rather than silently rounded",
       _subsat is not None)
 check("btc: ...and says the total cannot be split into whole satoshis",
       _subsat and "finer than one satoshi" in _subsat)
+
+# ==========================================================================
+# DISTINCT IS NOT THE SAME AS DIFFERENT, and the suite could not tell.
+#
+# mutation_sweep [12] -- "the BTC chunks are all equal again", which zeroes
+# SPLIT_JITTER -- SURVIVED the whole suite. Every distinctness check above went
+# green, because with the jitter gone the chunks are still technically
+# distinct: the exact-total repair spreads the quantisation remainder a satoshi
+# at a time, so a four-way split of 0.05 comes back as
+#
+#     0.01250002  0.01250003  0.01249994  0.01250001
+#
+# Four different numbers, `len(set(c)) == len(c)`, test passes. And to anyone
+# reading the Bitcoin chain that is four payments of the same size -- exactly
+# the cluster the jitter exists to break, since the whole point of --split is
+# that the deposits should not look like one operator's split of one amount.
+#
+# So the property has to be about the SPREAD, not about inequality. The
+# docstring already states the real bound: each chunk lands between about 0.70x
+# and 1.44x of the equal share at j = 0.18.
+#
+# Measured, as (max - min) / mean, median over 200 draws:
+#     real     0.219 - 0.224 across seeds
+#     mutated  0.0000072, and identical for every seed
+# Four orders of magnitude apart, so 0.02 is nowhere near either.
+#
+# MEDIAN over many draws, not a per-split floor: the jitter is random, so a
+# single split legitimately comes out near-equal sometimes (the minimum
+# observed over 400 real draws was 0.00084). A per-split assertion would be a
+# flake. A SEEDED rng rather than SystemRandom makes it exactly reproducible
+# while still driving the shipped function.
+import random as _sprand                                          # noqa: E402
+import statistics as _spstat                                      # noqa: E402
+
+
+def _chunk_spread(total, n, seed=1234, draws=200):
+    """Median of (max-min)/mean over `draws` splits. 0 means "all equal"."""
+    _r = _sprand.Random(seed)
+    out = []
+    for _ in range(draws):
+        _c = [float(x) for x in ghost.split_btc_amount(Decimal(total), n, _r)]
+        out.append((max(_c) - min(_c)) / (sum(_c) / len(_c)))
+    return _spstat.median(out)
+
+
+for _tot, _n in (("0.05", 4), ("1.0", 3), ("0.5", 8), ("0.01", 2)):
+    _sp = _chunk_spread(_tot, _n)
+    check(f"btc: {_n} chunks of {_tot} BTC are MEANINGFULLY different, not "
+          f"merely non-identical (median spread {_sp:.3f}, jitterless is "
+          f"~0.00001)", _sp > 0.02)
+
+# The bound the docstring states, so the spread above cannot come from a jitter
+# that has quietly grown into "one chunk carries almost everything".
+_r_ext = _sprand.Random(99)
+_lo, _hi = 9.9, 0.0
+for _ in range(300):
+    _c = [float(x) for x in ghost.split_btc_amount(Decimal("1.0"), 4, _r_ext)]
+    _mean = sum(_c) / len(_c)
+    _lo = min(_lo, min(_c) / _mean)
+    _hi = max(_hi, max(_c) / _mean)
+check(f"btc: ...and still inside the stated 0.70x-1.44x band "
+      f"(saw {_lo:.3f}x-{_hi:.3f}x)", 0.68 <= _lo and _hi <= 1.46)
+
+# NON-VACUITY: the measure must actually report ~0 for a genuinely equal split,
+# or `> 0.02` is passing for some other reason.
+_equal = [1.0, 1.0, 1.0, 1.0]
+check("btc: ...and the spread measure reports 0 for a truly equal split",
+      (max(_equal) - min(_equal)) / (sum(_equal) / len(_equal)) == 0.0)
 check("control: a satoshi-exact total of the same size is accepted and EXACT",
       sum(_split_or_none(Decimal("0.12345679"), 3, _R) or [], Decimal(0))
       == Decimal("0.12345679"))

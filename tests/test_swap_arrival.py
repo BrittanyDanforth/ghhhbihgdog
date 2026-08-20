@@ -1374,6 +1374,111 @@ check("blind: ...and the distribution's sizing read is the STRICT one",
 check("blind: ...with the best-effort read gone from that decision",
       "entry_set_balances( rpc_primary, ENTRY_PAIRS)" not in _norm_gs)
 
+
+# ==========================================================================
+# RECEIVER MODE CAN READ ITS OWN QUOTES NOW.
+#
+# stage4's receiver branch said in its own comment that "the only thing
+# receiver mode genuinely lacks is quotes to derive the total FROM". Until
+# --swap-pairs there was no way to supply them, so the target had to be retyped
+# into --expect-total-xmr by hand -- a decimal whose failure is silent in the
+# direction that costs money: a dropped digit makes the target smaller, the
+# gate opens early, and the run plans against part of the swap.
+#
+# And a typed total cannot carry the PER-SWAP breakdown. On 0.50/0.30/0.15/0.05
+# the gate tightens to 0.95 XMR with the breakdown and only reaches 0.90
+# without it -- and at 0.90 the 0.05 swap can be missing entirely while the run
+# starts mixing.
+# ==========================================================================
+print("\n=== receiver mode reads the swap quotes itself ===")
+
+import json as _sp_json, tempfile as _sp_tmp, os as _sp_os      # noqa: E402
+
+_SPD = "4" + "A" * 94
+_SPO = "8" + "B" * 94
+_sp_dir = _sp_tmp.mkdtemp(prefix="gs_pairs_")
+
+
+def _sp_bundle(name, rows, schema="thor_pairs_v1"):
+    _p = _sp_os.path.join(_sp_dir, name)
+    with open(_p, "w") as _f:
+        _sp_json.dump([{"schema": schema, "btc_in": "0.01", "deposit": "bc1x",
+                        "memo": "=:XMR.XMR:" + _d, "dest_xmr": _d,
+                        "expected_xmr": _a, "ts": 0} for _d, _a in rows], _f)
+    return _p
+
+
+def _sp_read(path):
+    _o = io.StringIO()
+    with contextlib.redirect_stdout(_o):
+        _r = ghost._receive_pairs_for(types.SimpleNamespace(swap_pairs=path),
+                                      _SPD)
+    return _r, _o.getvalue()
+
+
+_sp_saved_il = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    _good = _sp_bundle("good.json", [(_SPD, "0.5"), (_SPD, "0.3"),
+                                     (_SPD, "0.15"), (_SPD, "0.05")])
+    _rows, _out = _sp_read(_good)
+    check("pairs: every swap routed to this address is read", len(_rows) == 4)
+    _tot, _unread, _amts = ghost.swap_expected_total(_rows)
+    check("pairs: ...and their quotes sum to the target",
+          _tot == D("1.00") and _unread == 0)
+    check("pairs: ...keeping the PER-SWAP breakdown, which a typed total cannot",
+          [str(a) for a in _amts] == ["0.5", "0.3", "0.15", "0.05"])
+
+    # THE POINT OF THE BREAKDOWN.
+    _with = ghost.swap_arrival_floor(_tot, D("0.1"), _amts, len(_rows))
+    _without = ghost.swap_arrival_floor(_tot, D("0.1"), [], len(_rows))
+    check("pairs: the breakdown TIGHTENS the gate past the flat tolerance",
+          _with[0] > _without[0] and _with[1] is True)
+    check("pairs: ...and the smallest swap could hide under the loose figure",
+          D("0.05") < _tot - _without[0])
+    check("pairs: ...but not under the tight one", D("0.05") > _tot - _with[0])
+
+    # A bundle for someone else must NOT become this run's target.
+    _wrong = _sp_bundle("wrong.json", [(_SPO, "4.0")])
+    _rows, _out = _sp_read(_wrong)
+    check("pairs: a bundle routed elsewhere contributes NOTHING", _rows == [])
+    check("pairs: ...and says so, because the operator supplied it and "
+          "reasonably believes the run is gated",
+          "NONE of them describe this run\'s money" in _out
+          and "are routed to this receive address" in _out)
+
+    # NEVER FATAL: this is a convenience over --expect-total-xmr.
+    for _bad, _why in ((_sp_os.path.join(_sp_dir, "nope.json"), "missing"),
+                       (_sp_bundle("badschema.json", [(_SPD, "1.0")],
+                                   schema="nope_v9"), "wrong schema")):
+        _rows, _out = _sp_read(_bad)
+        check(f"pairs: a {_why} bundle warns and returns [] rather than "
+              f"killing the run", _rows == [] and "[!]" in _out)
+    check("pairs: no --swap-pairs at all is silent and unchanged",
+          _sp_read(None) == ([], ""))
+
+    # An unreadable quote is COUNTED, not dropped -- a silently deflated target
+    # is how a gate reports arrival on a fraction.
+    _nan = _sp_bundle("nan.json", [(_SPD, "1.0"), (_SPD, "NaN")])
+    _rows, _out = _sp_read(_nan)
+    check("pairs: a NaN quote does not kill the read", len(_rows) == 2)
+    check("pairs: ...and the operator is told it contributes nothing",
+          "contribute NOTHING" in _out)
+finally:
+    ghost.integrity_log = _sp_saved_il
+
+# The flag has to exist and reach stage 4's decision.
+check("pairs: --swap-pairs is a real flag",
+      "--swap-pairs" in (ghost.build_cli().format_help()))
+_sp_src = " ".join(_code_only_sa(os.path.join(REPO, "GhostSpiral")).split())
+check("pairs: main() fills swap_deposits from the bundle in receive mode",
+      "swap_deposits = _receive_pairs_for(args, ENTRY)" in _sp_src)
+check("pairs: stage 4 falls back to the quoted sum when no explicit total",
+      "else (quoted if quoted > 0 else None)" in _sp_src)
+check("pairs: stage 4 feeds the REAL chunk amounts to the receiver gate, "
+      "not []",
+      "_rtarget, args.swap_tolerance, chunk_amounts, n_chunks" in _sp_src)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

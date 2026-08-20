@@ -922,6 +922,20 @@ check("handoff: how many swaps make it up is passed as --split",
 check("handoff: the tolerance goes too, so both sides use ONE number",
       _flag(_h, "--swap-tolerance") == "0.1")
 
+# The bundle itself, so GhostSpiral gets the PER-SWAP amounts. The typed total
+# alone cannot carry them, and on 0.50/0.30/0.15/0.05 that is the difference
+# between a 0.95 gate and a 0.90 one -- at 0.90 the smallest swap can be
+# missing entirely while the mix starts.
+_hp = _mix(target=D("1.0"), chunks=4, tolerance=D("0.1"),
+           pairs="thor_pairs.json")
+check("handoff: the pairs bundle is passed through as --swap-pairs",
+      _flag(_hp, "--swap-pairs") == "thor_pairs.json")
+check("handoff: ...alongside the total this watch actually waited for",
+      _flag(_hp, "--expect-total-xmr") == "1.0")
+check("handoff: ...and no bundle means no flag",
+      "--swap-pairs" not in _mix(target=D("1.0"), chunks=1,
+                                 tolerance=D("0.1")))
+
 # --any / no readable quote: there is genuinely no number, so none is invented.
 _hn = _mix(target=None, chunks=0, tolerance=D("0.1"))
 check("handoff: with no target (--any) nothing is passed and the behaviour "
@@ -967,9 +981,10 @@ for _amts in ([D("0.5"), D("0.3"), D("0.15"), D("0.05")],
 # old signature would leave every check above green and the defect in place.
 _rw_src = _code_only(os.path.join(REPO, "receive_watch"))
 _norm_rw = " ".join(_rw_src.split())
-check("handoff: main() passes the target, the chunk count and the tolerance",
-      "target=target, chunks=len(matched), tolerance=args.tolerance"
-      in _norm_rw)
+check("handoff: main() passes the target, the chunk count, the tolerance "
+      "and the bundle",
+      "target=target, chunks=len(matched), tolerance=args.tolerance, "
+      "pairs=(args.pairs or \"\")" in _norm_rw)
 
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")
