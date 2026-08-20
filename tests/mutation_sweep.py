@@ -217,6 +217,40 @@ MUTATIONS = [
   '                      + " ".join(scrub_address(_a) for _a in ENTRY_ADDRS)',
   '                      + scrub_address(ENTRY_ADDRS[0])',
   ["test_send_gates"]),
+
+ # The exit hold is the LAST thing standing between a swap chunk that landed
+ # late and a one-hop sweep to --exit-to from the address the OP_RETURN memo
+ # names in public. Narrowing it to the funded subset is the obvious edit --
+ # every other consumer wants the funded one -- and it fails silently: the run
+ # reports success.
+ ("the exit holds only the chunks that ARRIVED, not the full entry set",
+  "GhostSpiral",
+  "                                 exit_hold=_exit_hold_list(args, addr_index,\n"
+  "                                                           ENTRY_ADDRS))",
+  "                                 exit_hold=_exit_hold_list(args, addr_index,\n"
+  "                                                           [_e[0] for _e in ENTRY_SET_FUNDED]))",
+  ["test_split_partial"]),
+
+ # The amounts must follow the ADDRESS. Reverting to the flat concatenation
+ # re-couples them to split_by_weight returning contiguous slices in order --
+ # measured, a carrier holding 0.75 XMR is then told to pay 3.12.
+ ("the fan-out amounts are matched to destinations BY LIST POSITION",
+  "GhostSpiral",
+  "    amounts = [by_addr[a] for a in fanout_dests]",
+  "    amounts = [by_addr[a] for sl in slices for a in sl]",
+  ["test_dag_entry"]),
+
+ # A wipe that could not run must say so; a file that was never created must
+ # not be reported as one still on disk.
+ ("a failed wipe of the change-sweep plan is silent again", "GhostSpiral",
+  '        secure_delete_or_warn(path, "the change-sweep plan (its destination)")',
+  "        pass",
+  ["test_units"]),
+
+ ("a path that never existed is reported as a FAILED wipe", "gs_common.py",
+  "    if not os.path.lexists(path):\n        return True",
+  "    if False:\n        return True",
+  ["test_shmwipe"]),
 ]
 
 
