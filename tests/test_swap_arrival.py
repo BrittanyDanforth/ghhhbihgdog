@@ -31,7 +31,7 @@ AttributeError on import -- red, but a demonstration of nothing. The OLD GATE
 section reproduces the old loop condition verbatim and drives it down the same
 timeline the fix is tested on, so the defect is shown rather than asserted.
 """
-import importlib.machinery, importlib.util, io, os, sys, contextlib, types
+import importlib.machinery, importlib.util, io, itertools, os, sys, contextlib, types
 from decimal import Decimal
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -482,16 +482,24 @@ def drive_stage4(steps, deposits=None, receive_mode=False, expect=None,
                  unlocked_now=D(0), total_now=D(0)):
     """Run the REAL stage4_await_swap. Returns (result, stdout, exited)."""
     tl = Timeline(steps, 30)
-    saved = (ghost.entry_set_balance, ghost.integrity_log, ghost.time,
+    saved = (ghost.entry_balance_reader, ghost.integrity_log, ghost.time,
              ghost.XMR_ARRIVAL_STALL)
     out = io.StringIO()
     exited = None
     res = None
     try:
-        # entry_set_balance, not xmr_balance: the gate now sums across the
-        # whole entry set, because --split N lands the chunks on N different
-        # subaddresses. Faking the SUM is what the wait actually consumes.
-        ghost.entry_set_balance = lambda rpc, pairs: tl.balance()
+        # entry_balance_reader, not entry_set_balance and not xmr_balance.
+        #
+        # The gate sums across the whole entry set, because --split N lands the
+        # chunks on N different subaddresses -- so faking the SUM is what the
+        # wait actually consumes. That used to be entry_set_balance, and this
+        # stub named it. Stage 4 now builds its balance_fn with
+        # entry_balance_reader (which needs the PER-PAIR read outcomes, not
+        # just the sum, so it can tell "the wallet says zero" from "the wallet
+        # said nothing"), and a stub on the old name is simply not called any
+        # more -- the nine drive_stage4 checks below all failed the moment the
+        # production seam moved, which is what a seam-shaped stub is for.
+        ghost.entry_balance_reader = lambda rpc, pairs, echo=print: tl.balance
         ghost.integrity_log = lambda *a, **k: None
         # A clock the wait can actually advance, and a stall short enough that
         # a missing chunk resolves inside the test rather than in two hours.
@@ -514,7 +522,7 @@ def drive_stage4(steps, deposits=None, receive_mode=False, expect=None,
             except SystemExit as e:
                 exited = e
     finally:
-        (ghost.entry_set_balance, ghost.integrity_log, ghost.time,
+        (ghost.entry_balance_reader, ghost.integrity_log, ghost.time,
          ghost.XMR_ARRIVAL_STALL) = saved
     return res, out.getvalue(), exited
 
@@ -1129,15 +1137,15 @@ def _r_fast(bf, f, c, **kw):
 def _recv(landed, expect, accept_partial=False, target=True, later=None):
     seq = {"n": 0}
 
-    def _bal(rpc, pairs):
+    def _bal():
         seq["n"] += 1
         v = D(str(later)) if (later and seq["n"] > 3) else D(str(landed))
         return (v, v)
 
-    _saved = (ghost.wait_for_swap_arrival, ghost.entry_set_balance,
+    _saved = (ghost.wait_for_swap_arrival, ghost.entry_balance_reader,
               ghost.integrity_log)
     ghost.wait_for_swap_arrival = _r_fast
-    ghost.entry_set_balance = _bal
+    ghost.entry_balance_reader = lambda rpc, pairs, echo=print: _bal
     ghost.integrity_log = lambda *a, **k: None
     a = types.SimpleNamespace(
         expect_total_xmr=(D(str(expect)) if target else None),
@@ -1151,7 +1159,7 @@ def _recv(landed, expect, accept_partial=False, target=True, later=None):
     except SystemExit as e:
         return ("exit", str(e))
     finally:
-        (ghost.wait_for_swap_arrival, ghost.entry_set_balance,
+        (ghost.wait_for_swap_arrival, ghost.entry_balance_reader,
          ghost.integrity_log) = _saved
 
 
@@ -1187,6 +1195,184 @@ from srcutil import code_only as _code_only_sa                # noqa: E402
 check("receiver: ...and the old 'NO EFFECT' claim is gone from the CODE",
       "have NO EFFECT in receiver mode" not in
       _code_only_sa(os.path.join(REPO, "GhostSpiral")))
+
+
+# ==========================================================================
+# "READ AS ZERO" IS NOT "IS ZERO".
+#
+# entry_set_balances deliberately reports an unreadable subaddress as zero, so
+# the arrival gate can never open on a guess. Nothing carried the FACT of the
+# failure out, and two things read that zero as truth:
+#
+#   * the arrival wait, where a wallet-rpc answering nothing at all was
+#     indistinguishable from a swap that never settled -- five-minute
+#     heartbeats reading "unlocked 0 XMR . 0.0%" for up to a day, then a
+#     verdict blaming ThorChain for money that was sitting on ENTRY;
+#   * the one-shot read feeding select_funded_entries, where one dropped poll
+#     drops a FULLY FUNDED chunk out of the distribution, announces "1 of 4
+#     swap chunk(s) have NOT arrived", and leaves that quarter unmixed on the
+#     address the swap memo names in public.
+#
+# Driven with an RPC that raises, which is what a dropped socket, a wallet
+# mid-rescan or a wrong --rpc-primary port actually looks like.
+# ==========================================================================
+print("\n=== an unreadable wallet is not an empty one ===")
+
+_BP = [(10, 1), (11, 1), (12, 1)]
+_BFULL = {(10, 1): (2 * 10**12, 2 * 10**12),
+          (11, 1): (3 * 10**12, 3 * 10**12),
+          (12, 1): (5 * 10**12, 5 * 10**12)}
+
+
+class _BlindRPC:
+    """A wallet-rpc that is reachable in some ways and not others."""
+
+    def __init__(self, per, dead=(), refresh_ok=True):
+        self.per, self.dead, self.refresh_ok = per, set(dead), refresh_ok
+
+    def raw_request(self, method, params=None):
+        if method == "refresh" and not self.refresh_ok:
+            raise RuntimeError("no daemon")
+        return {}
+
+    def get_subaddress_balance(self, account_index=0, address_index=0):
+        if (account_index, address_index) in self.dead:
+            raise RuntimeError("Connection refused")
+        return self.per.get((account_index, address_index), (0, 0))
+
+
+_b_saved_il = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    # Non-vacuity first: a healthy wallet reads exactly as before and says
+    # nothing extra.
+    _bl = []
+    check("blind: a healthy wallet reads the full sum through the reader",
+          ghost.entry_balance_reader(_BlindRPC(_BFULL), _BP,
+                                     echo=_bl.append)() == (D("10"), D("10")))
+    check("blind: ...and prints nothing", _bl == [])
+
+    # TOTAL blindness must RAISE, so wait_for_swap_arrival's own
+    # "wallet-rpc did not answer this tick" branch fires. That branch existed
+    # all along and was unreachable, because the swallow happened below it.
+    _rd = ghost.entry_balance_reader(_BlindRPC(_BFULL, dead=_BP), _BP,
+                                     echo=lambda _s: None)
+    try:
+        _rd()
+        _raised = False
+    except Exception:                                        # noqa: BLE001
+        _raised = True
+    check("blind: every entry address unreadable RAISES rather than "
+          "reporting an authoritative zero", _raised)
+
+    # And end to end through the real wait.
+    _bclock = itertools.count(0, 30)
+    _blines = []
+    _bres = ghost.wait_for_swap_arrival(
+        ghost.entry_balance_reader(_BlindRPC(_BFULL, dead=_BP), _BP,
+                                   echo=_blines.append),
+        D("4.0"), 3, stall_s=600, timeout_s=3600, poll_s=30,
+        sleep_fn=lambda _s: None, clock=lambda: next(_bclock),
+        echo=_blines.append)
+    check("blind: the wait against a dead wallet TELLS the operator the "
+          "wallet is the problem",
+          any("did not answer" in _l for _l in _blines))
+    check("blind: ...naming the real reason, not a truncated empty paren",
+          any("Connection refused" in _l for _l in _blines))
+    check("blind: ...and the verdict carries how many polls failed",
+          _bres.get("poll_errors", 0) > 0
+          and _bres["poll_errors"] == _bres["polls"])
+    # The flood this replaced: one line per poll across the stall window.
+    check("blind: ...rate-limited, not one line per poll",
+          sum(1 for _l in _blines if "did not answer" in _l) < _bres["polls"])
+    check("blind: ...so the operator is not told the swap is short",
+          "THE WALLET WAS NOT READABLE"
+          in ghost.arrival_blindness_note(_bres))
+
+    # PARTIAL blindness: the sum stays low (the gate must stay strict) and the
+    # operator is told the shortfall may be the socket.
+    _plines = []
+    _psum = ghost.entry_balance_reader(_BlindRPC(_BFULL, dead=[(11, 1)]), _BP,
+                                       echo=_plines.append)()
+    check("blind: a partly readable wallet still UNDER-reports, keeping the "
+          "gate strict", _psum == (D("7"), D("7")))
+    check("blind: ...and says the total may be lower than the truth",
+          any("could NOT be read" in _l for _l in _plines))
+
+    # A wallet that will not refresh is reachable but STALE -- no arrival can
+    # ever be seen, and the balances it does return are from before the swap.
+    _slines = []
+    _ssum = ghost.entry_balance_reader(_BlindRPC(_BFULL, refresh_ok=False),
+                                       _BP, echo=_slines.append)()
+    check("blind: a wallet that will not refresh still reports its balances",
+          _ssum == (D("10"), D("10")))
+    check("blind: ...and warns they may be stale",
+          any("stale" in _l for _l in _slines))
+
+    # The one-shot read is a DECISION, and must fail closed.
+    check("blind: the strict read returns normally on a healthy wallet",
+          [u for _t, u in ghost.read_entry_balances_strict(
+              _BlindRPC(_BFULL), _BP, "test")] == [D("2"), D("3"), D("5")])
+    _sx = None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.read_entry_balances_strict(
+                _BlindRPC(_BFULL, dead=[(11, 1)]), _BP, "sizing",
+                sleep_fn=lambda _s: None)
+    except SystemExit as _e:
+        _sx = str(_e)
+    check("blind: one unreadable address ABORTS the run rather than letting "
+          "select_funded_entries drop a funded chunk", _sx is not None)
+    check("blind: ...saying nothing has been spent", "NOTHING HAS BEEN SPENT"
+          in (_sx or ""))
+    # The whole point: it must NOT quietly become a 'chunk never arrived'.
+    check("blind: ...and never claims the chunk did not arrive",
+          "have NOT arrived" not in (_sx or ""))
+
+    # Non-vacuity for the abort: a chunk that is GENUINELY empty is still
+    # allowed through, because that is a real swap shortfall and
+    # select_funded_entries is meant to handle it.
+    _genuine = dict(_BFULL)
+    _genuine[(11, 1)] = (0, 0)
+    check("blind: a genuinely EMPTY entry is not an error — it reads zero and "
+          "the run goes on to drop that chunk",
+          [u for _t, u in ghost.read_entry_balances_strict(
+              _BlindRPC(_genuine), _BP, "test")] == [D("2"), D("0"), D("5")])
+    check("blind: ...and select_funded_entries does drop exactly it",
+          ghost.select_funded_entries(["a", "b", "c"],
+                                      [D("2"), D("0"), D("5")])[0]
+          == ["a", "c"])
+finally:
+    ghost.integrity_log = _b_saved_il
+
+# The production seam. drive_stage4 stubs entry_balance_reader because that is
+# what stage 4 builds its balance_fn from; if a later edit puts a bare
+# `lambda: entry_set_balance(...)` back, the nine drive_stage4 checks go green
+# again while the blindness handling is gone. This is the check that does not.
+check("blind: stage 4 builds its waits from entry_balance_reader, NOT from a "
+      "bare entry_set_balance lambda",
+      _code_only_sa(os.path.join(REPO, "GhostSpiral")).count(
+          "entry_balance_reader(rpc, entry_pair_list)") == 2
+      and "lambda: entry_set_balance(rpc, entry_pair_list)"
+      not in _code_only_sa(os.path.join(REPO, "GhostSpiral")))
+# THIS CHECK WAS FALSE HOPE ON ITS FIRST WRITING, and the mutation that
+# proved it is the whole reason for the shape below. It read
+#
+#     "read_entry_balances_strict(" in code_only(GhostSpiral)
+#
+# which the function's own `def` line satisfies. Reverting the CALL SITE back
+# to the best-effort entry_set_balances -- the actual defect, one funded chunk
+# silently dropped from the distribution -- left the suite ALL GREEN.
+#
+# So: whitespace-normalised, so it survives reformatting, and it names the
+# ARGUMENTS. And the negative half matters as much as the positive one: the
+# call has to be strict AND the old best-effort call must be gone, or a stray
+# duplicate read puts the defect back beside the fix.
+_norm_gs = " ".join(_code_only_sa(os.path.join(REPO, "GhostSpiral")).split())
+check("blind: ...and the distribution's sizing read is the STRICT one",
+      "read_entry_balances_strict( rpc_primary, ENTRY_PAIRS" in _norm_gs)
+check("blind: ...with the best-effort read gone from that decision",
+      "entry_set_balances( rpc_primary, ENTRY_PAIRS)" not in _norm_gs)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

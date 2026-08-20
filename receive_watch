@@ -421,7 +421,11 @@ def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
             # Transient by assumption: log the FACT, not the error text, and
             # keep the place in the queue.
             integrity_log("recv", "poll_error")
-            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:50]}); retrying.")
+            # 200, not 50: this line is the operator's only clue that a long
+            # watch is stuck on the wallet rather than on the payer, and 50
+            # characters truncates most real RPC errors down to nothing
+            # useful. The integrity_log above still records only the FACT.
+            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:200]}); retrying.")
             bal_atomic, unl_atomic = None, None
 
         # Sample the height every tick, alongside the balance. One extra

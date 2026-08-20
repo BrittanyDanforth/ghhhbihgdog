@@ -489,6 +489,94 @@ check("dag: the minimal 2-output case is a clean swap",
       _two == {"a": "b", "b": "a"})
 
 
+
+# ==========================================================================
+# WHAT IS LEFT ON DISK WHEN A RUN DOES NOT FINISH.
+#
+# Every unsigned_*.json holds each hop's source, destination and amount in
+# plaintext, --exit-to included. A COMPLETE run wipes its own; nothing else
+# does, until the START of some later run or a paranoia_mode the operator has
+# to remember. The two endings that leave them behind said nothing about them:
+# the incomplete branch prints "Funds are safe in the wallet" and exits 1, and
+# an uncaught exception never reaches report_completion at all.
+# ==========================================================================
+print("\n=== plan files surviving an abnormal ending ===")
+
+import tempfile as _pf_tmp, json as _pf_json, pathlib as _pf_path
+import io as _pf_io, contextlib as _pf_ctx
+
+_pf_dir = _pf_path.Path(_pf_tmp.mkdtemp(prefix="gs_plansurv_"))
+_pf_a = _pf_dir / "unsigned_fanout_dead.json"
+_pf_b = _pf_dir / "unsigned_veil_dead.json"
+for _f in (_pf_a, _pf_b):
+    _f.write_text(_pf_json.dumps({"txs": [{"dst": "4" + "Z" * 94}]}))
+
+_pf_saved = list(ghost_g._SENSITIVE_PLANS)
+try:
+    ghost_g._SENSITIVE_PLANS.clear()
+
+    # Silent when there is nothing registered -- a suite that never plans must
+    # not grow a spurious warning.
+    _o = _pf_io.StringIO()
+    with _pf_ctx.redirect_stdout(_o):
+        ghost_g._report_surviving_plans()
+    check("plans: nothing registered -> the report says nothing",
+          _o.getvalue() == "")
+
+    ghost_g.register_sensitive_plan(str(_pf_a), str(_pf_b), None)
+    check("plans: a None plan (a round that was not planned) is not tracked",
+          len(ghost_g._SENSITIVE_PLANS) == 2)
+
+    _o = _pf_io.StringIO()
+    with _pf_ctx.redirect_stdout(_o):
+        ghost_g._report_surviving_plans()
+    _txt = _o.getvalue()
+    check("plans: files still on disk are REPORTED", "STILL ON DISK" in _txt)
+    check("plans: ...by full path, so the operator can act on it",
+          str(_pf_a.resolve()) in _txt and str(_pf_b.resolve()) in _txt)
+    check("plans: ...saying what is in them", "--exit-to" in _txt)
+    check("plans: ...and how to erase them",
+          "paranoia_mode" in _txt and "shred" in _txt)
+
+    # THE COMPLETE RUN MUST BE UNCHANGED. _wipe_spent_plans erases them, and
+    # the report then has nothing to say -- if this ever fires on a clean run
+    # the operator is being told to go and delete files that are already gone.
+    ghost_g._wipe_spent_plans(str(_pf_a), str(_pf_b))
+    _o = _pf_io.StringIO()
+    with _pf_ctx.redirect_stdout(_o):
+        ghost_g._report_surviving_plans()
+    check("plans: a COMPLETE run wiped them, so the report stays silent",
+          _o.getvalue() == "")
+finally:
+    ghost_g._SENSITIVE_PLANS[:] = _pf_saved
+    for _f in (_pf_a, _pf_b):
+        if _f.exists():
+            _f.unlink()
+    _pf_dir.rmdir()
+
+# The registration has to happen where the plans are BORN, or a later path can
+# forget. _write_plans is the one place all three are created.
+from srcutil import code_only as _pf_code_only                # noqa: E402
+_pf_src = " ".join(_pf_code_only(os.path.join(REPO, "GhostSpiral")).split())
+check("plans: _write_plans registers all three before returning them",
+      "register_sensitive_plan(fanout_file, veil_file, dag_file) "
+      "return fanout_file, veil_file, dag_file" in _pf_src)
+# atexit, not a finally in main(): a finally does not run when the process
+# dies of an exception raised outside main's body, and main() has no top-level
+# handler at all.
+check("plans: the report is armed with atexit, so an uncaught exception "
+      "still triggers it",
+      "atexit.register(_report_surviving_plans)" in _pf_src)
+check("plans: ...and only under __main__, so importing the module for its "
+      "helpers installs no process-wide hook",
+      # .find, NOT .index. index() RAISES when the needle is gone, and the
+      # needle going is exactly the mutation this pair of checks exists to
+      # catch -- deleting the atexit line killed the whole suite on a
+      # ValueError instead of reporting the check above as red.
+      0 <= _pf_src.find('if __name__ == "__main__":')
+      < _pf_src.find("atexit.register(_report_surviving_plans)"))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

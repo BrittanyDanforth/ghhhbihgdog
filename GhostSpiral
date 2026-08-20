@@ -33,7 +33,7 @@ OPSEC hardening (v10.5):
   - Resource sentinel prevents operation under system stress
 """
 from __future__ import annotations
-import argparse, json, os, re, sys, time, subprocess, secrets
+import argparse, atexit, json, os, re, sys, time, subprocess, secrets
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import List
@@ -360,6 +360,13 @@ XMR_ARRIVAL_POLL = 30           # seconds between arrival polls
 # would be ~2900 entries across a 24-hour wait, which pushes the run's actual
 # events out of the console's 5000-line job buffer.
 ARRIVAL_HEARTBEAT_S = 300
+
+# How often the arrival wait may say a balance read FAILED. Same reasoning as
+# the heartbeat above and deliberately rarer: a wallet-rpc that is half-dead
+# for hours would otherwise emit a line every poll and bury the run's real
+# events in the console's line buffer, which is how the operator loses the one
+# message that matters.
+UNREADABLE_REPORT_S = 600
 
 #: How far below the summed quotes still counts as "all of it arrived".
 #: A swap never pays its quote to the digit (the rate moves between quote and
@@ -2207,7 +2214,7 @@ def xmr_balance(rpc_primary, bal_account: int,
     return total, unlocked
 
 
-def entry_set_balances(rpc_primary, pairs: list) -> list:
+def entry_set_balances(rpc_primary, pairs: list, on_unreadable=None) -> list:
     """[(total, unlocked)] in XMR, one per entry subaddress, in chunk order.
 
     The distribution needs the BREAKDOWN, not just the sum: with --split N each
@@ -2221,18 +2228,51 @@ def entry_set_balances(rpc_primary, pairs: list) -> list:
     inside a poll loop, and under-reporting only makes the arrival gate
     stricter. get_subaddress_balance already refuses to report another
     address's balance as this one's.
+
+    BUT "READ AS ZERO" IS NOT "IS ZERO", and for a long time nothing here
+    could tell the two apart. That is safe for the arithmetic and unsafe for
+    everything that reads the arithmetic:
+
+      * In the arrival wait, a wallet-rpc that answers nothing at all -- a
+        dropped socket, a wallet mid-rescan, the wrong --rpc-primary port --
+        produced a wait that is INDISTINGUISHABLE from a swap that never
+        settled. The operator saw "unlocked 0 XMR · 0.0%" every five minutes
+        and was finally told the swap stalled, which sends them to look at
+        ThorChain. The money may have been sitting on ENTRY the whole time.
+        wait_for_swap_arrival has always had the right branch for this ("wallet-
+        rpc did not answer this tick") -- but this function caught the
+        exception one level BELOW it, so that branch was unreachable from the
+        only caller that matters. A dead safety net.
+      * At the one-shot read that feeds select_funded_entries, a single failed
+        poll makes a FULLY FUNDED chunk look unarrived; it is dropped from the
+        distribution, the run announces "1 of 4 swap chunk(s) have NOT
+        arrived" -- untrue -- and that chunk's money stays on ENTRY, unmixed,
+        for a run that reports success on the rest.
+
+    So the zero stays (the gate must not open on a guess) and the FACT of the
+    failure now escapes, via on_unreadable(acct, idx, exc). Default None is
+    exactly the old behaviour, which is what the existing callers and the
+    "an unreadable entry reads as ZERO" test still assert.
     """
     out = []
     try:
         rpc_primary.raw_request("refresh", {})
-    except Exception:                                        # noqa: BLE001
-        pass  # refresh is best-effort; background sync still applies
+    except Exception as _re:                                 # noqa: BLE001
+        # Best-effort in the sense that background sync may still apply -- but
+        # if the wallet is not reaching its daemon then nothing is syncing and
+        # every balance below is stale. Reported through the same channel
+        # rather than silently passed; the caller decides whether one stale
+        # tick matters.
+        if on_unreadable is not None:
+            on_unreadable(None, None, _re)
     for acct, idx in pairs:
         try:
             tot_atomic, unlk_atomic = rpc_primary.get_subaddress_balance(
                 int(acct), int(idx))
-        except Exception:                                    # noqa: BLE001
+        except Exception as _be:                             # noqa: BLE001
             out.append((Decimal(0), Decimal(0)))
+            if on_unreadable is not None:
+                on_unreadable(int(acct), int(idx), _be)
             continue
         out.append((Decimal(str(tot_atomic or 0)) / Decimal(10 ** 12),
                     Decimal(str(unlk_atomic or 0)) / Decimal(10 ** 12)))
@@ -2275,7 +2315,7 @@ def split_by_weight(items: list, weights: list) -> list:
     return out
 
 
-def entry_set_balance(rpc_primary, pairs: list) -> tuple:
+def entry_set_balance(rpc_primary, pairs: list, on_unreadable=None) -> tuple:
     """(total, unlocked) summed across every entry subaddress, in XMR.
 
     With --split N the swap arrives as N payments to N DIFFERENT addresses
@@ -2289,9 +2329,174 @@ def entry_set_balance(rpc_primary, pairs: list) -> tuple:
     than has arrived only makes the gate stricter. get_subaddress_balance
     already refuses to report another address's balance as this one's.
     """
-    rows = entry_set_balances(rpc_primary, pairs)
+    rows = entry_set_balances(rpc_primary, pairs, on_unreadable)
     return (sum((t for t, _ in rows), Decimal(0)),
             sum((u for _, u in rows), Decimal(0)))
+
+
+def arrival_blindness_note(arrival: dict) -> str:
+    """A line to append when a shortfall may be the WALLET, not the swap.
+
+    Every non-'funded' arrival verdict is reported to the operator as a fact
+    about the swap. That wording is only earned when the wallet was actually
+    answering. A wallet-rpc that failed some or all of the polls produces the
+    same verdict from the same code path, and the operator is then told to go
+    and look at ThorChain for money that never left their own wallet's view.
+
+    Returns "" when every poll was answered, so the common case is unchanged.
+    """
+    polls = int(arrival.get("polls") or 0)
+    errs = int(arrival.get("poll_errors") or 0)
+    if not errs or not polls:
+        return ""
+    if errs >= polls:
+        return (f"\n    THE WALLET WAS NOT READABLE. All {polls} balance "
+                f"poll(s) failed\n"
+                f"    ({str(arrival.get('last_error') or '')[:120]}), so this "
+                f"run never saw ENTRY at all\n"
+                f"    and the shortfall above is NOT evidence about the swap. "
+                f"Check wallet-rpc\n"
+                f"    first — the money may already be there.")
+    return (f"\n    NOTE: {errs} of {polls} balance poll(s) FAILED "
+            f"({str(arrival.get('last_error') or '')[:120]}),\n"
+            f"    so the figure above may be lower than what is really on "
+            f"ENTRY. Check\n"
+            f"    wallet-rpc before concluding the swap is short.\n")
+
+
+def entry_balance_reader(rpc_primary, pairs: list, echo=print):
+    """A balance_fn for wait_for_swap_arrival that cannot go silently blind.
+
+    Returns a zero-argument callable with the same (total, unlocked) contract
+    the wait already expects, so the wait's own logic is untouched.
+
+    WHY THIS EXISTS AT ALL. The wait polls for hours; the thing it polls is a
+    wallet-rpc on the other end of a socket. entry_set_balances treats an
+    unreadable subaddress as zero, deliberately -- see its docstring -- and
+    with a bare `lambda: entry_set_balance(...)` as the balance_fn that made a
+    completely dead wallet look exactly like a swap that had not settled:
+
+        [*] still waiting for the swap - unlocked 0 XMR . 4 to go (0.0%) . 5 min
+        [*] still waiting for the swap - unlocked 0 XMR . 4 to go (0.0%) . 10 min
+        ...
+        [!] The expected XMR has NOT fully arrived (nothing new arrived).
+
+    Every word of that is about ThorChain. None of it is about the wallet, and
+    the wallet was the problem. Driven against an RPC that raises on every
+    call, which is what a dropped socket or a wrong --rpc-primary port is.
+
+    Two failure shapes, two different answers:
+
+      TOTAL blindness (every pair unreadable, and there is at least one pair)
+        -- RAISE. wait_for_swap_arrival already handles a raising balance_fn
+        correctly: it logs arrival_poll_error, prints "wallet-rpc did not
+        answer this tick", KEEPS the previous total rather than re-anchoring
+        the stall clock on a phantom drop to zero, and polls again. That
+        branch was written for exactly this and was unreachable. This makes it
+        reachable instead of adding a second, parallel one.
+
+      PARTIAL blindness (some pairs read, some did not) -- return the partial
+        sum, because under-reporting keeps the gate strict, and SAY SO. The
+        sum is now lower than the truth, so the gate will not open when it
+        should; the operator needs to know the shortfall may be the socket
+        rather than the swap.
+
+    Rate-limited to one line per UNREADABLE_REPORT_S, for the reason the
+    heartbeat is time-based: at a 30s poll a permanently half-dead wallet
+    would otherwise push every real event out of the console's line buffer.
+    """
+    state = {"last": None, "beat": 0.0, "clock": time.monotonic}
+
+    def _read():
+        blind = []
+        stale = []
+
+        def _note(acct, idx, exc):
+            (stale if acct is None else blind).append((acct, idx, exc))
+
+        rows = entry_set_balances(rpc_primary, pairs, _note)
+        if pairs and len(blind) == len(pairs):
+            # Every single one. Let it out; the wait knows what to do with it.
+            integrity_log("stage4", "arrival_entry_all_unreadable")
+            raise RuntimeError(
+                f"all {len(pairs)} entry address(es) unreadable: "
+                f"{str(blind[0][2])[:60]}")
+        now = state["clock"]()
+        if (blind or stale) and now - state["beat"] >= UNREADABLE_REPORT_S:
+            state["beat"] = now
+            if blind:
+                integrity_log("stage4", "arrival_entry_partly_unreadable")
+                echo(f"  [!] {len(blind)} of {len(pairs)} entry address(es) "
+                     f"could NOT be read this tick "
+                     f"({str(blind[0][2])[:50]}); the total below is therefore "
+                     f"LOWER than what may actually be on ENTRY. If this "
+                     f"persists, the shortfall is your wallet-rpc, not the "
+                     f"swap.")
+            else:
+                integrity_log("stage4", "arrival_refresh_failed")
+                echo(f"  [!] The wallet would not refresh this tick "
+                     f"({str(stale[0][2])[:50]}); balances may be stale. If "
+                     f"this persists the wallet is not reaching its daemon, "
+                     f"and no arrival will ever be seen.")
+        return (sum((t for t, _u in rows), Decimal(0)),
+                sum((u for _t, u in rows), Decimal(0)))
+
+    return _read
+
+
+def read_entry_balances_strict(rpc_primary, pairs: list, what: str,
+                               attempts: int = 3, sleep_fn=None) -> list:
+    """entry_set_balances for a DECISION, not for a poll. Fails closed.
+
+    The poll loop can afford to under-report: it just polls again. The read
+    that feeds select_funded_entries cannot, and that is where treating an
+    unreadable subaddress as an empty one costs real money.
+
+    select_funded_entries drops every entry whose unlocked balance is at or
+    below dust and continues with the rest. That is right for a swap chunk
+    that genuinely never landed. Fed a zero that is really an RPC failure, it
+    drops a chunk that is FULLY FUNDED: the distribution never sizes a slice
+    for it, no fan-out spends it, and it sits on ENTRY -- the address the swap
+    memo names in public -- unmixed, while the run prints
+
+        [!] 1 of 4 swap chunk(s) have NOT arrived on their entry address.
+
+    which is false, and finishes reporting success on the other three. One
+    dropped RPC read, one quarter of the money left behind and mislabelled.
+
+    So: retry, and if a subaddress is still unreadable, stop. Nothing has been
+    spent at this point in the run -- this read happens before the veil -- so
+    aborting costs the operator a re-run and keeps every chunk recoverable,
+    which is strictly better than silently mixing three quarters of it.
+    """
+    sleep_fn = sleep_fn or time.sleep
+    last = []
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        bad = []
+        rows = entry_set_balances(
+            rpc_primary, pairs,
+            lambda a, i, e: bad.append((a, i, e)) if a is not None else None)
+        if not bad:
+            return rows
+        last = bad
+        if attempt < attempts:
+            print(f"  [!] {len(bad)} of {len(pairs)} entry address(es) could "
+                  f"not be read ({what}); retrying "
+                  f"({attempt}/{attempts - 1}).")
+            sleep_fn(min(10, 2 ** attempt))
+    integrity_log("stage4", "entry_balance_unreadable_abort")
+    sys.exit(
+        f"[!] {len(last)} of {len(pairs)} entry address(es) could not be read "
+        f"from wallet-rpc ({str(last[0][2])[:80]}).\n"
+        f"    NOTHING HAS BEEN SPENT. This read decides which swap chunks the "
+        f"run distributes,\n"
+        f"    and an unreadable address is indistinguishable from an empty "
+        f"one: continuing would\n"
+        f"    drop a chunk that is fully funded, leave its money on ENTRY "
+        f"unmixed, and tell you\n"
+        f"    it never arrived. Fix the wallet-rpc connection and run again — "
+        f"every chunk is\n"
+        f"    still where the swap put it.")
 
 
 def swap_expected_total(deposits: list) -> tuple:
@@ -2388,20 +2593,57 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
     last_beat = started
     total = unlocked = Decimal(0)
     locked_reported = False
+    # HOW MUCH OF THIS WAIT WAS BLIND, carried out in the result.
+    #
+    # Every non-'funded' outcome here is worded by the caller as a statement
+    # about the SWAP -- "nothing new arrived", "the time limit was reached" --
+    # and those are the right words only when the wallet was actually being
+    # read. A wallet-rpc that answered nothing for two hours produces the
+    # identical verdict, and sends the operator to go looking at ThorChain for
+    # money that is sitting on ENTRY. The counts go back so the caller can tell
+    # the two apart instead of guessing.
+    polls = poll_errors = 0
+    last_err = ""
+    last_err_beat = None
     while True:
         if shutdown_requested():
-            return {"state": "interrupted", "total": total, "unlocked": unlocked}
+            return {"state": "interrupted", "total": total, "unlocked": unlocked,
+                    "polls": polls, "poll_errors": poll_errors,
+                    "last_error": last_err}
+        polls += 1
         try:
             total, unlocked = balance_fn()
         except Exception as e:                               # noqa: BLE001
             # Transient by assumption: a wallet that is momentarily busy or
             # resyncing is normal across a multi-hour wait, and dropping the
             # run over one bad poll would lose hours for nothing.
+            poll_errors += 1
+            last_err = str(e)
             integrity_log("stage4", "arrival_poll_error")
-            echo(f"  [!] wallet-rpc did not answer this tick ({str(e)[:50]}); retrying.")
+            # FIRST one immediately, then at most one per UNREADABLE_REPORT_S.
+            # Unrate-limited, a wallet that is down for the whole stall window
+            # printed this every XMR_ARRIVAL_POLL seconds -- 240 identical
+            # lines across a two-hour stall, which is exactly the flood the
+            # heartbeat was made time-based to avoid, and it buries the run's
+            # real events in the console's line buffer.
+            _now = clock()
+            if last_err_beat is None or _now - last_err_beat >= UNREADABLE_REPORT_S:
+                _rep = ("" if last_err_beat is None else
+                        f" [{poll_errors} failed poll(s) so far]")
+                last_err_beat = _now
+                # 200, not 50. This line is the ONLY thing that tells the
+                # operator a multi-hour wait is stuck on their wallet rather
+                # than on the swap, and 50 characters truncated the reason away
+                # -- "could not be read (" reads as if there were no reason at
+                # all. The chain log above still records only the FACT; this
+                # goes to the terminal.
+                echo(f"  [!] wallet-rpc did not answer this tick "
+                     f"({str(e)[:200]}); retrying.{_rep}")
 
         if unlocked > dust and (floor_ <= 0 or unlocked >= floor_):
-            return {"state": "funded", "total": total, "unlocked": unlocked}
+            return {"state": "funded", "total": total,
+                    "unlocked": unlocked, "polls": polls,
+                    "poll_errors": poll_errors, "last_error": last_err}
 
         if total - marked >= step:
             marked = total
@@ -2454,12 +2696,16 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
                  f"{progress_line(unlocked, total, floor_)}"
                  f" · {int((now - started) // 60)} min elapsed")
         if now - started >= timeout_s:
-            return {"state": "timeout", "total": total, "unlocked": unlocked}
+            return {"state": "timeout", "total": total,
+                    "unlocked": unlocked, "polls": polls,
+                    "poll_errors": poll_errors, "last_error": last_err}
         # The stall clock runs from the start too, so a swap that is never sent
         # at all fails in one stall window rather than holding the run for the
         # full absolute cap.
         if now - last_arrival >= stall_s:
-            return {"state": "stalled", "total": total, "unlocked": unlocked}
+            return {"state": "stalled", "total": total,
+                    "unlocked": unlocked, "polls": polls,
+                    "poll_errors": poll_errors, "last_error": last_err}
         sleep_fn(poll_s)
 
 
@@ -4493,7 +4739,7 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
               f"{args.swap_tolerance * 100:.0f}% tolerance). "
               f"{unlocked_bal} XMR unlocked so far.")
         _rarr = wait_for_swap_arrival(
-            lambda: entry_set_balance(rpc, entry_pair_list), _rfloor, n_chunks)
+            entry_balance_reader(rpc, entry_pair_list), _rfloor, n_chunks)
         total_bal, unlocked_bal = _rarr["total"], _rarr["unlocked"]
         if _rarr["state"] == "interrupted":
             sys.exit("[!] Shutdown requested while waiting for XMR arrival.")
@@ -4507,6 +4753,7 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
                 f"({'nothing new arrived' if _rarr['state'] == 'stalled' else 'the time limit was reached'}).\n"
                 f"    On ENTRY now: {unlocked_bal} XMR unlocked "
                 f"({total_bal} XMR total); expected ~{_rfloor}.\n"
+                + arrival_blindness_note(_rarr) +
                 f"    Nothing has been spent. Planning against a fraction "
                 f"leaves the rest UNMIXED on ENTRY -- the address your swap "
                 f"memo names in public -- and nothing in this run will ever "
@@ -4563,7 +4810,7 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
         integrity_log("stage4", "arrival_no_target")
 
     arrival = wait_for_swap_arrival(
-        lambda: entry_set_balance(rpc, entry_pair_list), floor_, n_chunks)
+        entry_balance_reader(rpc, entry_pair_list), floor_, n_chunks)
     total_bal, unlocked_bal = arrival["total"], arrival["unlocked"]
 
     if arrival["state"] == "interrupted":
@@ -4586,6 +4833,7 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
     why = (f"nothing new arrived for {XMR_ARRIVAL_STALL // 60} min"
            if arrival["state"] == "stalled"
            else f"the {XMR_ARRIVAL_TIMEOUT // 3600}h limit was reached")
+    _blind = arrival_blindness_note(arrival)
     if not args.accept_partial_swap:
         sys.exit(
             f"[!] The swap has NOT fully arrived: {why}.\n"
@@ -4594,7 +4842,8 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
             + (f"    Expected:     ~{floor_} XMR — short by {short}.\n"
                if floor_ > 0 else "")
             + f"    Chunks expected: {n_chunks}.\n"
-            f"\n"
+            + _blind
+            + f"\n"
             f"    NOTHING HAS BEEN SPENT. The funds are on ENTRY and they are "
             f"safe.\n"
             f"    Planning against part of the money is what leaves the rest "
@@ -4621,6 +4870,16 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
             f"    describe an existing one.")
     print(f"  [!] --accept-partial-swap: proceeding with {unlocked_bal} XMR "
           f"after {why}.")
+    # AND SAY IF THE NUMBER MIGHT BE WRONG. --accept-partial-swap means "mix
+    # what is here", and it is about to be taken literally: the figure becomes
+    # the whole run's budget. If some balance polls FAILED, that figure is
+    # lower than what is really on ENTRY, and the difference is not a chunk
+    # that is still in flight -- it is money already sitting there that this
+    # run is about to walk past and leave unmixed on the address the swap memo
+    # names. The flag was consent to proceed on a short swap, not consent to
+    # proceed on a balance the wallet would not report.
+    if _blind:
+        print(_blind.strip("\n").replace("\n    ", "\n      "))
     if floor_ > 0:
         print(f"  [!] That is {short} XMR short of the ~{floor_} expected.")
     print("  [!] ANYTHING THAT ARRIVES FROM HERE ON is NOT mixed by this run. "
@@ -5565,8 +5824,10 @@ def main():
         # chunks are not equal (quotes differ; JoinMarket's UTXOs differ by
         # design), and sizing them equally would plan a fan-out one carrier
         # cannot afford while another sits under-spent.
-        _entry_unlocked = [u for _t, u in
-                           entry_set_balances(rpc_primary, ENTRY_PAIRS)]
+        # STRICT, not best-effort: select_funded_entries cannot tell a zero
+        # that means "never arrived" from a dropped socket. See the helper.
+        _entry_unlocked = [u for _t, u in read_entry_balances_strict(
+            rpc_primary, ENTRY_PAIRS, "sizing the distribution")]
 
         ENTRY_SET_FUNDED, _entry_unlocked = select_funded_entries(
             ENTRY_SET, _entry_unlocked)
@@ -5821,6 +6082,12 @@ def _write_plans(args, meta, fanout_plan, veil_plan, dag_plan) -> tuple:
     print(f"  [+] Fan-out plan: {fanout_file} ({len(fanout_plan)} TXs)")
     if dag_file:
         print(f"  [+] DAG hop plan: {dag_file} ({len(dag_plan)} hops)")
+    # However this run ends, the operator gets told these exist. Registered
+    # HERE, at the one place all three are created, so no later path can
+    # forget: a complete run wipes them and the report stays silent; every
+    # other ending -- including an uncaught exception, where nothing else runs
+    # at all -- names them. See register_sensitive_plan.
+    register_sensitive_plan(fanout_file, veil_file, dag_file)
     return fanout_file, veil_file, dag_file
 
 
@@ -5846,6 +6113,70 @@ def _warn_unwiped_outdir(outdir: Path) -> bool:
           f"erase them yourself, or pass --search-dir {outdir.resolve()} to "
           f"paranoia_mode.")
     return True
+
+
+#: Plan files this run has written that are NOT safe to leave lying around.
+#: Each unsigned_*.json carries every hop's source, destination, amount and
+#: account index -- including --exit-to -- in plaintext.
+_SENSITIVE_PLANS = []
+
+
+def register_sensitive_plan(*paths) -> None:
+    """Remember a plan file so an ABNORMAL exit can still name it.
+
+    A COMPLETE run erases its own plans (_wipe_spent_plans) and this list goes
+    quiet. Every other ending was silent about them:
+
+      * An INCOMPLETE run keeps its plans deliberately -- those accounts are
+        mid-flight and the operator may need to see what was meant to happen --
+        and report_completion's incomplete branch says "Funds are safe in the
+        wallet" and exits 1 WITHOUT ever mentioning that the run's whole
+        routing table is sitting in ./unsigned.
+      * An UNCAUGHT EXCEPTION is worse: report_completion never runs at all, so
+        there is no message of any kind. The operator sees a traceback, and the
+        plans stay until the START of some later run (_stage5_cleanup) or a
+        paranoia_mode they have to remember to invoke -- forever, if neither
+        happens.
+
+    _warn_unwiped_outdir already covers ONE corner of it -- an --output outside
+    paranoia_mode's four search roots -- but it fires when the directory is
+    chosen, which is hours before the failure it warns about, and says nothing
+    at all for the DEFAULT output directory, where most runs put them.
+
+    Not a wipe. Deleting a plan on a crash would destroy the only record of
+    what a half-executed run intended, which is exactly what the operator needs
+    after a crash. This tells them it exists.
+    """
+    for pth in paths:
+        if pth and pth not in _SENSITIVE_PLANS:
+            _SENSITIVE_PLANS.append(pth)
+
+
+def _report_surviving_plans() -> None:
+    """atexit: name the plan files still on disk, however this run ended.
+
+    Runs on a clean exit, on sys.exit, and after an uncaught exception -- the
+    three ways this pipeline actually stops. (Not on SIGKILL, where nothing
+    can run.) Silent when there is nothing left, so a complete run that wiped
+    its own plans prints exactly what it printed before.
+    """
+    left = [p for p in _SENSITIVE_PLANS if p and Path(p).exists()]
+    if not left:
+        return
+    try:
+        print(f"\n  [!] {len(left)} unsigned plan file(s) are STILL ON DISK. "
+              f"Each holds every hop's source, destination and amount in "
+              f"plaintext — including your --exit-to destination:")
+        for _p in left:
+            print(f"        {Path(_p).resolve()}")
+        print("      They were kept on purpose: this run did not complete, and "
+              "they are the only record of what it intended. Read them if you "
+              "need to, then erase them — paranoia_mode, or `shred -u` on "
+              "each. Nothing else will: a later run only clears its own output "
+              "directory, and if there is no later run they stay here.")
+    except Exception:                                        # noqa: BLE001
+        # An atexit hook must never turn a bad ending into a worse one.
+        pass
 
 
 def _wipe_spent_plans(*plan_files):
@@ -7429,4 +7760,9 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
 
 
 if __name__ == "__main__":
+    # Registered before main() so it fires on EVERY ending: a clean return, a
+    # sys.exit from any gate, and an uncaught exception (atexit hooks run after
+    # the traceback). Only under __main__ -- importing this module for its
+    # helpers, which every test does, must not install a process-wide hook.
+    atexit.register(_report_surviving_plans)
     main()
