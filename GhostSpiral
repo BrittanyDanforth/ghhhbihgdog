@@ -4008,6 +4008,10 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
     """
     n_chunks = len(swap_deposits) or max(args.split, 1)
     quoted, unreadable, chunk_amounts = swap_expected_total(swap_deposits)
+    # KEPT BEFORE THE OVERRIDE BELOW REPLACES IT. The rescale further down
+    # needs the quotes' own sum as its denominator, and `quoted` stops being
+    # that the moment --expect-total-xmr is applied. See the comment there.
+    _quoted_sum = quoted
     if args.expect_total_xmr is not None:
         # An explicit target overrides the quotes: in manual mode there are
         # none, and where there are both, the operator holding the
@@ -4042,9 +4046,35 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
     # breakdown is scaled onto the new total rather than discarded. With no
     # quotes at all (manual mode) there is genuinely nothing to scale, and the
     # count-only path below says so out loud.
+    # AGAINST THE QUOTES' OWN SUM, not against `quoted`. This divided by
+    # `quoted`, which the block above has already REPLACED with
+    # args.expect_total_xmr -- so the expression was
+    # `args.expect_total_xmr / args.expect_total_xmr`, _scale was exactly 1,
+    # and "rescale the breakdown" left the breakdown untouched. Proven in the
+    # real path, not by reading: asserting `_scale == 1` here runs four times
+    # in test_swap_arrival and never fires, and the suite stays green with it
+    # asserted -- no existing test could tell the rescale from a no-op.
+    #
+    # The cost is a gate on MISMATCHED SCALES: `quoted` carried the operator's
+    # total while chunk_amounts still carried the quotes' raw magnitudes, and
+    # swap_arrival_floor keys "everything except the smallest chunk" off the
+    # smaller of the two. When the operator's total is BELOW the quotes' sum --
+    # the case ten lines up prints a dedicated warning for, so it is expected,
+    # not exotic -- the unscaled smallest is too LARGE, the floor drops to the
+    # bare tolerance, and the gate opens with a whole chunk still in flight.
+    #
+    # Driven on quotes of 0.60/0.30/0.08/0.02 with --expect-total-xmr 0.1:
+    # unscaled floor 0.095, correct floor 0.098000000001, and the balance with
+    # the smallest swap still unarrived is 0.098 -- ARRIVED on the broken gate,
+    # still waiting on the fixed one. That chunk then lands after the run has
+    # planned against a fraction and is never mixed, which is verbatim the
+    # failure the comment above says this block was written to stop.
+    #
+    # Above the quotes' sum it fails the safe way (too strict, waits longer),
+    # which is why it never showed up as a stall anyone chased.
     if args.expect_total_xmr is not None:
-        if quoted > 0 and chunk_amounts:
-            _scale = args.expect_total_xmr / quoted
+        if _quoted_sum > 0 and chunk_amounts:
+            _scale = args.expect_total_xmr / _quoted_sum
             chunk_amounts = [_a * _scale for _a in chunk_amounts]
         else:
             chunk_amounts = []

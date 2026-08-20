@@ -809,6 +809,57 @@ check("UNEQUAL STAGE4: ...and the full rescaled delivery still proceeds",
 check("control: the plain tolerance alone WOULD have accepted 1.90 of 2.00",
       D("1.90") >= ghost.accept_floor(D("2.00"), D("0.10")))
 
+# THE RESCALE ITSELF, which the two checks above cannot see.
+#
+# stage4 computed `_scale = args.expect_total_xmr / quoted` -- AFTER the block
+# above had already assigned `quoted = args.expect_total_xmr`. So the
+# expression was x/x, _scale was exactly 1, and the block commented "RESCALE
+# the breakdown; do not throw it away" left the breakdown at the quotes' raw
+# magnitudes while `quoted` carried the operator's total. Asserting _scale == 1
+# in the shipped code runs four times in this file and never fires.
+#
+# The checks above miss it because _UQ's smallest chunk is 5% of the total and
+# the tolerance there is 5% too, so the chunk floor and the tolerance floor sit
+# on top of each other and both versions agree. Seeing it needs a smallest
+# chunk well BELOW the tolerance, and a total BELOW the quotes' sum -- the case
+# stage4 prints a dedicated warning for, so it is an expected input.
+#
+# Quotes 0.60/0.30/0.08/0.02 (sum 1.00, smallest 2%), --expect-total-xmr 0.1,
+# tolerance 5%. Correctly scaled the smallest is 0.002 and the floor is
+# 0.098000000001; unscaled it is 0.02, the chunk term drops below the tolerance
+# term and the floor collapses to 0.095. A balance of 0.098 is exactly "every
+# chunk but the smallest", so the broken gate calls it ARRIVED and the run
+# plans against a fraction.
+_SKEW = [quote(x) for x in ("0.60", "0.30", "0.08", "0.02")]
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("0.098"), D("0.098"))] + [(D("0.098"), D("0.098"))] * 20,
+    deposits=_SKEW, expect=D("0.1"), tolerance=D("0.05"))
+check("UNEQUAL STAGE4: --expect-total-xmr RESCALES the breakdown onto the new "
+      "total — 0.098 of 0.1 with the smallest chunk in flight still EXITS "
+      "(unscaled, the floor collapses to the bare tolerance and it proceeds)",
+      _exit is not None)
+# ...and the fully-arrived swap on the same quotes still goes through, so the
+# fix is not just "refuse more".
+_res, _out, _exit = drive_stage4(
+    [(0, 0), (D("0.098"), D("0.098")), (D("0.1"), D("0.1"))],
+    deposits=_SKEW, expect=D("0.1"), tolerance=D("0.05"))
+check("UNEQUAL STAGE4: ...and the full 0.1 still proceeds",
+      _exit is None and _res == (D("0.1"), D("0.1")))
+# Non-vacuity: the plain tolerance would have opened at 0.098, so this check is
+# about the rescaled breakdown and not about the numbers lining up.
+check("control: the plain tolerance alone WOULD have accepted 0.098 of 0.1",
+      D("0.098") >= ghost.accept_floor(D("0.1"), D("0.05")))
+# And the floor really does move when the breakdown is scaled -- the property
+# stated directly against the shipped helper, independent of the drive.
+check("control: scaling the breakdown onto the operator's total RAISES the "
+      "floor above the bare tolerance",
+      _gsc.swap_arrival_floor(D("0.1"), D("0.05"),
+                             [D(x) * (D("0.1") / D("1.00"))
+                              for x in ("0.60", "0.30", "0.08", "0.02")], 4)[0]
+      > _gsc.swap_arrival_floor(D("0.1"), D("0.05"),
+                               [D(x) for x in ("0.60", "0.30", "0.08", "0.02")],
+                               4)[0])
+
 
 
 # ---- the floor must always be REACHABLE ---------------------------------

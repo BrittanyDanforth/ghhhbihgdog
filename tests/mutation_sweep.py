@@ -396,6 +396,17 @@ MUTATIONS = [
   '    integrity_log_once("thor", "dest_from_bundle")',
   '    integrity_log("thor", f"dest_from_bundle:{scrub_address(addr)}")',
   ["test_chain_redaction"]),
+
+ # `quoted` has already been replaced by args.expect_total_xmr twenty lines up,
+ # so dividing by it makes _scale exactly 1 and "RESCALE the breakdown" is a
+ # no-op. The gate then compares the operator's total against the quotes' raw
+ # per-chunk magnitudes, and below the quotes' sum it opens with a whole chunk
+ # still in flight.
+ ("the --expect-total-xmr breakdown rescale is a no-op (_scale is always 1)",
+  "GhostSpiral",
+  "            _scale = args.expect_total_xmr / _quoted_sum",
+  "            _scale = args.expect_total_xmr / quoted",
+  ["test_swap_arrival"]),
 ]
 
 
