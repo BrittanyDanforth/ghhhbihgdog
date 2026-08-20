@@ -786,7 +786,21 @@ FEE_PLAUSIBLE_MAX_XMR = 1.0
 
 
 def _flag_fees(res):
-    """Attach a warning when the daemon's numbers are not believable."""
+    """Attach a warning when the daemon's numbers are not believable, or when
+    they are believable but belong to a chain nobody else can see."""
+    _nt = str(res.get("nettype") or "")
+    if _nt and _nt != "mainnet":
+        # NOT an implausibility -- regtest's fees are real numbers -- so this
+        # is its own line rather than a hijack of the fee warning. GhostSpiral
+        # refuses this chain at stage 0 unless --allow-test-chain is given; the
+        # point of saying it here is that the operator finds out BEFORE filling
+        # in an exit address and clicking Run.
+        res["nettype_warning"] = (
+            f"This daemon is on {_nt.upper()}, not mainnet. Nothing here would "
+            f"touch real funds, and the pipeline will refuse to run against it "
+            f"unless you pass --allow-test-chain. Note that `monerod --regtest` "
+            f"binds the MAINNET port 18081 by default, so this can be the "
+            f"daemon you get without changing the address.")
     top = max(res.get("xmr") or [0])
     lo = min(res.get("xmr") or [0])
     if top > FEE_PLAUSIBLE_MAX_XMR:
@@ -931,6 +945,28 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
         proxies = None
         if host not in gs._LOCALHOST_NAMES and tor_proxy:
             proxies = gs.validate_proxy(tor_proxy)
+        # WHICH CHAIN, on the panel, not only when the run refuses.
+        #
+        # check_daemon_relay_egress already returns nettype and GhostSpiral now
+        # refuses a non-mainnet one at stage 0 -- but the operator only found
+        # out after clicking Run. And it is easy to land on by accident:
+        # `monerod --regtest` with no port flag BINDS THE MAINNET PORT (its own
+        # log says "Binding on 127.0.0.1 (IPv4):18081"), so detect-daemon finds
+        # a fakechain at exactly the address the field already contains, and
+        # the fee numbers it returns are ordinary-looking.
+        #
+        # Driven against real daemons on separate ports:
+        #   regtest  -> nettype=fakechain, fees [0.0024 .. 0.48], implausible False
+        #   testnet  -> nettype=testnet,   fees [4.0 .. 664.0],   implausible True
+        #   stagenet -> nettype=stagenet,  fees [4.0 .. 664.0],   implausible True
+        # so the fee heuristic catches a FRESH testnet/stagenet by accident,
+        # and cannot see regtest at all -- regtest's fees are real.
+        _net = ""
+        try:
+            _net = str((gs.check_daemon_relay_egress(daemon_url, proxies)
+                        or {}).get("nettype") or "")
+        except Exception:                                    # noqa: BLE001
+            _net = ""
         est = gs.daemon_fee_estimate(daemon_url, proxies)
         fees = est.get("fees")
         if isinstance(fees, list) and fees:
@@ -938,7 +974,7 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
             _rounds, _totals = _run_totals(_per, wallets, deep)
             return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
                                "xmr": _per, "rounds": _rounds,
-                               "total_xmr": _totals})
+                               "total_xmr": _totals, "nettype": _net})
         base = est.get("fee")
         if base:
             mult = [1, 4, 20, 166]
@@ -946,7 +982,7 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
             _rounds, _totals = _run_totals(_per, wallets, deep)
             return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
                                "xmr": _per, "rounds": _rounds,
-                               "total_xmr": _totals})
+                               "total_xmr": _totals, "nettype": _net})
         return {"ok": False, "xmr": None, "implausible": False,
                 "source": "no estimate — the daemon returned no fee data",
                 "warning": ("Could not reach a daemon at "
@@ -1881,7 +1917,10 @@ function renderFees(){
    <div class="p">${esc(n)}</div><div class="v">${tot?esc(tot[i])+' XMR':(vals?esc(vals[i])+' XMR':'<span class="noest">no estimate</span>')}</div>${tot&&vals?`<div class="pertx">${esc(vals[i])} × ${esc(feeData.rounds)} rounds</div>`:''}</button>`).join('');
  $$('.fee').forEach(b=>b.addEventListener('click',()=>{setFee(+b.dataset.p);sync();}));
  if(!feeData){$('#fsrc').textContent='loading…';return;}
- $('#fsrc').innerHTML=(tot?`TOTAL reserved across ${esc(feeData.rounds)} rounds at ${esc($('#wallets').value)} wallets · depth ${esc($('#deep').value)} · `:(vals?'estimate per ~2 kB tx · ':''))+esc(feeData.source)
+ // The chain first: a fee is meaningless if it is not the chain you think.
+ const ntw=feeData&&feeData.nettype_warning;
+ $('#fsrc').innerHTML=(ntw?`<div class="warnbox" style="margin-bottom:7px">${esc(ntw)}</div>`:'')
+   +(tot?`TOTAL reserved across ${esc(feeData.rounds)} rounds at ${esc($('#wallets').value)} wallets · depth ${esc($('#deep').value)} · `:(vals?'estimate per ~2 kB tx · ':''))+esc(feeData.source)
    +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'')
    +(vals?'':`<div style="margin-top:7px"><button id="dfind" class="pfre" type="button">Find my daemon</button></div>`);
  const df=$('#dfind'); if(df) df.addEventListener('click',detectDaemon);

@@ -1182,6 +1182,56 @@ def test_daemon_chain_is_reported_not_assumed():
           == "unknown")
 
 
+def test_fee_panel_says_which_chain_the_daemon_is_on():
+    """The panel must name a non-mainnet chain, not only refuse it at Run.
+
+    check_daemon_relay_egress already returns nettype and GhostSpiral's stage 0
+    now refuses a non-mainnet daemon -- but the operator only learned that after
+    filling in an exit address and clicking Run.
+
+    It is easy to land on by accident: `monerod --regtest` with no port flag
+    BINDS THE MAINNET PORT (its own log: "Binding on 127.0.0.1 (IPv4):18081"),
+    so detect-daemon finds a fakechain at exactly the address already in the
+    field, and its fee numbers look ordinary.
+
+    The fee heuristic is not a substitute. Measured against real daemons:
+        regtest  nettype=fakechain  fees [0.0024..0.48]   implausible False
+        testnet  nettype=testnet    fees [4.0..664.0]     implausible True
+        stagenet nettype=stagenet   fees [4.0..664.0]     implausible True
+    -- it catches a FRESH testnet/stagenet only by accident (their fees are
+    absurd because the chain is empty) and cannot see regtest at all, because
+    regtest's fees are genuine.
+    """
+    c = load_console()
+    # A non-mainnet chain is called out...
+    for _nt in ("fakechain", "testnet", "stagenet"):
+        r = c._flag_fees({"ok": True, "xmr": [0.0024, 0.0094, 0.038, 0.48],
+                          "nettype": _nt})
+        check(f"chain panel: {_nt} is named on the panel",
+              _nt.upper() in (r.get("nettype_warning") or ""))
+        check(f"chain panel: ...and it is NOT reported as an implausible fee "
+              f"({_nt} fees can be real)", not r.get("implausible"))
+    # ...mainnet is not nagged about.
+    r = c._flag_fees({"ok": True, "xmr": [0.0024, 0.0094, 0.038, 0.48],
+                      "nettype": "mainnet"})
+    check("chain panel: mainnet gets no chain warning",
+          not r.get("nettype_warning"))
+    r = c._flag_fees({"ok": True, "xmr": [0.0024, 0.0094, 0.038, 0.48]})
+    check("chain panel: an unknown chain is not invented as a warning",
+          not r.get("nettype_warning"))
+    # The fee implausibility check must still work independently of it.
+    r = c._flag_fees({"ok": True, "xmr": [4.0, 4.0, 4.0, 4.0],
+                      "nettype": "mainnet"})
+    check("chain panel: a fresh/offline daemon's absurd fee is STILL flagged",
+          r.get("implausible") is True)
+    # And the warning names the trap that makes this reachable at all.
+    r = c._flag_fees({"ok": True, "xmr": [0.0024], "nettype": "fakechain"})
+    check("chain panel: the warning names the regtest-binds-18081 trap",
+          "18081" in (r.get("nettype_warning") or ""))
+    check("chain panel: ...and names the flag that would allow it",
+          "--allow-test-chain" in (r.get("nettype_warning") or ""))
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):
