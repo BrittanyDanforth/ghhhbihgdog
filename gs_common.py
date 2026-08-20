@@ -798,6 +798,54 @@ def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
     secure_write_bytes(path, data.encode(), mode)
 
 
+#: Cardinality events already chained, as (stage, kind). One entry per KIND.
+#:
+#: Process-scoped, which is run-scoped for every tool here: one process is one
+#: run, and GhostSpiral's run lock guarantees it.
+_CARDINAL_EVENTS_LOGGED = set()
+
+
+def integrity_log_once(stage: str, kind: str, log_path: Path = INTEGRITY_LOG) -> str:
+    """Chain an event AT MOST ONCE per process. Returns "" when suppressed.
+
+    COUNTING DEFEATS chain_safe, and chain_safe's own docstring claims
+    otherwise -- "which output or address it happened to, AND HOW MANY THERE
+    WERE, does not [survive]". It strips the digits, so `delay:idx=7` becomes
+    `delay:idx=#` -- and a twelve-transaction round still writes TWELVE
+    identical lines. Measured: 12 relays produce 12 `broadcast|delay:idx=#`
+    entries, so the batch size is read straight off the file by counting.
+
+    GhostSpiral already found this for round events and fixed it there. Its
+    _ROUND_EVENTS_LOGGED comment states the rule outright: "Redacting the
+    digits out of 'Exit 7/11' gives 'exit #/#', which is fine on its own and
+    useless as a defence: an analyst counts the broadcast_ok:exit lines
+    instead... Cardinality survives redaction whenever a loop writes a line per
+    turn." That fix covered one loop. The per-transaction, per-chunk and
+    per-carrier loops in the broadcaster, stage 2 and stage 5 kept writing one
+    line each.
+
+    The counts this leaks are the run's structure: how many transactions a
+    round relayed, how many swap chunks --split made, how many carriers exist.
+    Those are the search keys the whole pipeline is built to withhold, and
+    integrity_log's own docstring assumes a reader who has the file ("An
+    attacker with the log can only narrow the operation to a 10-min window").
+
+    So the chain records THAT the kind of thing happened. How many, and which,
+    are printed to the terminal at the moment they happen, where they reach the
+    operator and stop -- the same trade _ROUND_EVENTS_LOGGED made, and the same
+    one paranoia_mode made for the spoofed MAC.
+
+    Failure events are deliberately NOT routed through this: counting them
+    yields the number of things that went wrong, not the size of the run, and
+    they are the entries an audit most needs.
+    """
+    key = (stage, kind)
+    if key in _CARDINAL_EVENTS_LOGGED:
+        return ""
+    _CARDINAL_EVENTS_LOGGED.add(key)
+    return integrity_log(stage, kind, log_path)
+
+
 def secure_delete_or_warn(path, what: str) -> bool:
     """secure_delete_file, but a FAILURE IS NEVER SILENT.
 

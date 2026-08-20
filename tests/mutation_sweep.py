@@ -340,6 +340,15 @@ MUTATIONS = [
   "        _dsts.pop(next(iter(_dsts)), None) if _dsts else None\n"
   "        _unassigned = [s for s in _fundable if s not in _dsts]",
   ["test_split_pipeline"]),
+
+ # chain_safe strips the digits, so `delay:idx=7` becomes `delay:idx=#` -- and
+ # a twelve-transaction round wrote TWELVE identical lines. Counting them gives
+ # the batch size, which is what chain_safe's docstring says it prevents.
+ ("a per-transaction line is chained again, so counting gives the batch size",
+  "gs_common.py",
+  "    if key in _CARDINAL_EVENTS_LOGGED:\n        return \"\"",
+  "    if False:\n        return \"\"",
+  ["test_units"]),
 ]
 
 

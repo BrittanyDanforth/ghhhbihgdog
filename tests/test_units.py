@@ -758,8 +758,40 @@ check("chain: the sync height is coarsened, not exact",
 #    delays exist to destroy.
 check("chain: the delay LENGTH is not written to the integrity chain",
       'delay:idx={real_idx}:secs={item.delay}' not in _bc_a)
+# DRIVEN, and asserting the property that actually matters. This read
+#     'f"delay:idx={real_idx}"' in _bc_a
+# -- the literal -- so it went red when the call was routed through
+# integrity_log_once while the delay was still being chained, exactly as
+# before. It also could not see the defect that routing fixed: ONE LINE PER
+# TRANSACTION. chain_safe strips the digits, so `delay:idx=7` becomes
+# `delay:idx=#` and a twelve-transaction round wrote TWELVE identical lines --
+# the batch size read straight off the file by counting, which is the leak
+# chain_safe's own docstring says it prevents ("and how many there were, does
+# not").
+_chain_tmp = Path(tempfile.mkdtemp(prefix="cardinality_")) / "chain.log"
+for _i in range(12):
+    _gsc.integrity_log_once("broadcast", "delay", log_path=_chain_tmp)
+_chain_lines = _chain_tmp.read_text().splitlines()
 check("chain: that a delay happened is still chained",
-      'f"delay:idx={real_idx}"' in _bc_a)
+      any("|delay" in _l for _l in _chain_lines))
+check("chain: ...ONCE, however many transactions the round relayed — twelve "
+      "identical lines would give the batch size away by counting",
+      len(_chain_lines) == 1)
+# ...and a DIFFERENT kind is not swallowed by the first one.
+_gsc.integrity_log_once("broadcast", "relayed", log_path=_chain_tmp)
+check("chain: ...but a different event kind still gets its own line",
+      len(_chain_tmp.read_text().splitlines()) == 2)
+# ...and the chain still verifies after the collapse.
+check("chain: the collapsed chain still verifies link by link",
+      _gsc.verify_integrity_chain(_chain_tmp)[0] is True)
+# FAILURES ARE NOT COLLAPSED: counting them gives the number of things that
+# went wrong, not the size of the run, and they are what an audit most needs.
+for _i in range(4):
+    _gsc.integrity_log("broadcast", f"error:idx={_i}", log_path=_chain_tmp)
+check("chain: failure events are still recorded per occurrence",
+      len(_chain_tmp.read_text().splitlines()) == 6)
+check("chain: the broadcaster routes its delay through the once-only logger",
+      'integrity_log_once("broadcast", "delay")' in _bc_a)
 
 # 5. WHAT paranoia_mode CANNOT DO. "Every phase reported success" reads as
 #    "this host is clean of the run". The wallet is untouched by design -- it

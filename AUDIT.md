@@ -1710,3 +1710,54 @@ Second instance of one shape this round — the BTC distinctness check was the
 first. **A test that is really a coin flip reports SURVIVED and CAUGHT for the
 same mutation on different runs**, and passes verification sweeps by luck. Both
 are deterministic now.
+
+### B10 (FIXED): the integrity chain still leaked the run's size by line count
+
+`chain_safe` strips every number out of a chain payload, and its docstring
+claims the result: *"which output or address it happened to, **and how many
+there were**, does not [survive]."*
+
+It does survive. `delay:idx=7` redacts to `delay:idx=#` — and a
+twelve-transaction round writes **twelve identical lines**. Measured: 12 relays
+produce 12 `broadcast|delay:idx=#` entries, so the batch size is read off the
+file by counting.
+
+The repo already found this and fixed it in one place. `_ROUND_EVENTS_LOGGED`'s
+comment states the rule outright:
+
+> Redacting the digits out of "Exit 7/11" gives "exit #/#", which is fine on its
+> own and useless as a defence: an analyst counts the `broadcast_ok:exit` lines
+> instead and has the number of outputs the run holds… **Cardinality survives
+> redaction whenever a loop writes a line per turn.**
+
+That fix covered round events. Six per-turn loops kept writing one line each:
+
+| site | what counting it yields |
+|------|-------------------------|
+| `broadcast_signed_xmr` `delay:idx=` | transactions in the round |
+| `broadcast_signed_xmr` `relayed:idx=:n=` | transactions relayed |
+| `GhostSpiral` `quote_ready:{i}` | **`--split N`** |
+| `GhostSpiral` `carrier_ready:idx=` | carriers, i.e. swap chunks |
+| `GhostSpiral` `change_settled` | change locations |
+| `thor_swap_preparer` `pair_{i}:ready` | swaps in the batch |
+
+Those counts are the run's structure — the search keys the pipeline exists to
+withhold — and `integrity_log`'s own docstring assumes a reader who has the
+file ("An attacker with the log can only narrow the operation to a 10-min
+window").
+
+`gs_common.integrity_log_once(stage, kind)` chains an event at most once per
+process, mirroring `_ROUND_EVENTS_LOGGED` but shared. Per-item detail still
+reaches the terminal, which is the same trade the round-event fix and
+paranoia_mode's MAC redaction already made. **Failure events are deliberately
+not routed through it** — counting those yields the number of things that went
+wrong, not the size of the run, and they are what an audit most needs.
+
+Verified: 12 relays now write 2 lines (one `delay`, one `relayed`), distinct
+kinds still get their own line, failure lines are still per-occurrence, and the
+chain verifies link by link after the collapse.
+
+The test that guarded this was another source-substring proxy — it asserted the
+literal `f"delay:idx={real_idx}"`, so it went red when the call was routed
+through the fix while the delay was still being chained, and it could not see
+the twelve-lines defect at all. It drives the chain now.

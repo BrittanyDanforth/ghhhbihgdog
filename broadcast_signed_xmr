@@ -39,6 +39,7 @@ import requests
 from gs_common import (
     integrity_log, verify_tor, tor_recheck, validate_proxy,
     newnym, secure_delay, atomic_write_json, check_daemon_relay_egress,
+    integrity_log_once,
     install_signal_handlers, shutdown_requested, redact_addresses,
 )
 
@@ -779,7 +780,7 @@ def main():
             # exact relay schedule -- the very correlation the delays exist to
             # destroy -- and pairs it with the tx index. That the delay
             # HAPPENED is worth chaining; how long it was is not.
-            integrity_log("broadcast", f"delay:idx={real_idx}")
+            integrity_log_once("broadcast", "delay")
             if not _sleep_interruptible(item.delay):
                 integrity_log("broadcast", f"shutdown_during_delay:idx={real_idx}")
                 print(f"  [!] Shutdown during the planned delay for TX {real_idx}: NOT "
@@ -861,7 +862,7 @@ def main():
                     outcome = "relayed"
                     extra = f" (+{len(tx_hashes) - 1} more)" if len(tx_hashes) > 1 else ""
                     print(f"  [+] TX {real_idx} -> relayed | {str(tx_hashes[0])[:16]}...{extra}")
-                    integrity_log("broadcast", f"relayed:idx={real_idx}:n={len(tx_hashes)}")
+                    integrity_log_once("broadcast", "relayed")
                     break
 
                 ecode = err.get("code") if isinstance(err, dict) else None

@@ -45,6 +45,7 @@ from gs_common import (
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_or_warn,
+    integrity_log_once,
     secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
     finite_decimal,
@@ -2495,7 +2496,7 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         # so this always prints and always names the operator's own address.
         print(f"      With memo: {str(memo)[:40]}...")
         print(f"      Expected: ~{expected_dec} XMR")
-        integrity_log("stage2", f"quote_ready:{i}")
+        integrity_log_once("stage2", "quote_ready")
 
         secure_delay(5.0, 15.0)
 
@@ -5761,7 +5762,7 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
             rpc.raw_request("refresh", {})
             _t, unlk = rpc.get_subaddress_balance(account, sub_idx)
             if unlk and int(unlk) >= need_atomic:
-                integrity_log("stage5", f"carrier_ready:idx={sub_idx}")
+                integrity_log_once("stage5", "carrier_ready")
                 print(f"  [+] {label}: carrier funded and unlocked.")
                 return True
         except Exception as e:
@@ -5928,7 +5929,7 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
             tot, unlk = rpc.get_subaddress_balance(account, sub_idx)
             tot, unlk = int(tot or 0), int(unlk or 0)
             if tot > 0 and tot == unlk:
-                integrity_log("stage5", "change_settled")
+                integrity_log_once("stage5", "change_settled")
                 return True, tot
         except Exception as e:                               # noqa: BLE001
             integrity_log("stage5", f"change_settle_poll_err:{type(e).__name__}")

@@ -38,6 +38,7 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     bech32_checksum_ok, secure_delete_file, secure_write_text,
     load_receive_bundle, memo_binds_destination, env_or_argv,
+    integrity_log_once,
     btc_per_xmr_oracle, quote_deviation, decimal_arg,
     validate_xmr_address,
     decimal_env,
@@ -489,7 +490,7 @@ def main():
             "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
         }
         pairs.append(pair)
-        integrity_log("thor", f"pair_{i}:ready")
+        integrity_log_once("thor", "pair_ready")
         print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
               f"(expected {expected_xmr} XMR)")
 
