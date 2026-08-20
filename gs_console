@@ -677,12 +677,32 @@ def stop(jid):
         return False
 
 
-#: A ~2 kB transaction costs single-digit milli-XMR on a healthy mainnet.
-#: Anything past this is not a real fee, it is a misconfigured or freshly
-#: initialised chain -- a fresh offline testnet daemon reports a base fee that
-#: works out to ~4 XMR per transaction (observed). Selecting that silently
-#: would be a very expensive click, so the console flags it instead.
-FEE_PLAUSIBLE_MAX_XMR = 0.1
+#: The ceiling above which a daemon's fee is not believable.
+#:
+#: THIS WAS 0.1 AND IT FLAGGED HEALTHY DAEMONS. _flag_fees compares
+#: max(res["xmr"]) -- which is always the PRIORITY 4 figure -- against this, so
+#: the number being tested is the flash-priority fee while the ceiling was
+#: chosen for priority 1. A real monerod 0.18.3.1 returns
+#: fees = [1200000, 4700000, 19000000, 240000000] piconero/byte, i.e. 0.0024 /
+#: 0.0094 / 0.038 / 0.48 XMR per ~2 kB transaction. 0.48 > 0.1, so the console
+#: told the operator "far above a real mainnet fee ... the daemon is on a fresh
+#: or offline chain. Do NOT treat these as real costs" about the correct
+#: numbers from a correctly working node. Reproduced against a real local
+#: daemon, which is the only reason it was noticed.
+#:
+#: Worse, GhostSpiral -- the tool that actually SPENDS -- accepts those same
+#: numbers: its FEE_IMPLAUSIBLE_XMR is 1.0, deliberately "set FAR above any
+#: real fee (even an extreme-congestion priority-4 mainnet fee is a fraction of
+#: an XMR) and far below the fresh-chain value". So the console warned about a
+#: fee the pipeline would happily spend against, which trains the operator to
+#: ignore the panel exactly when it is right.
+#:
+#: One number now, read from the orchestrator, with tests/test_console.py
+#: enforcing they agree -- the same fix the --split ceiling and the job timeout
+#: each needed after drifting.
+#: A fresh/offline daemon still trips it: it reports ~2e9 piconero/byte, which
+#: is ~4 XMR at priority 1, well above 1.0.
+FEE_PLAUSIBLE_MAX_XMR = 1.0
 
 
 def _flag_fees(res):
@@ -727,7 +747,81 @@ def _gs_common():
     return _GS_MOD
 
 
-def live_fees(daemon_url, tor_proxy=""):
+_GHOST = [None]
+
+
+def _ghost():
+    """Lazily load GhostSpiral for its PURE fee arithmetic.
+
+    Same lazy pattern as _gs_common: nothing is imported at console start-up,
+    so the page still serves on a machine where the orchestrator's own
+    dependencies are missing. The console already spawns GhostSpiral as its
+    main job, so this is not a new dependency -- and compute_fee_budget is
+    documented PURE (no RPC, no logging, no exit), which is why it is safe to
+    call inside a request handler.
+
+    Imported rather than reimplemented. Copying the rounds formula here is the
+    single-source-of-truth mistake this repo has already paid for twice: the
+    --split ceiling drifting from gs_common.MAX_SPLIT, and the job timeout
+    drifting 6x from the pipeline's own waits.
+    """
+    if _GHOST[0] is None:
+        import importlib.machinery as _im, importlib.util as _iu
+        _ld = _im.SourceFileLoader("gs_console_ghost", os.path.join(REPO, "GhostSpiral"))
+        _m = _iu.module_from_spec(_iu.spec_from_loader(_ld.name, _ld))
+        _ld.exec_module(_m)
+        _GHOST[0] = _m
+    return _GHOST[0]
+
+
+def _run_totals(per_tx_xmr, wallets, deep):
+    """What the WHOLE run reserves at each priority, not one transaction.
+
+    THE PANEL SHOWED A PER-TRANSACTION FEE while the operator was choosing the
+    two settings that decide HOW MANY TRANSACTIONS there are. live_fees took
+    only (daemon_url, tor_proxy), so the number could not move when --wallets
+    or --deep changed -- and it did not, which is exactly what an operator
+    reported: "the fee doesn't change even if I up the wallets or depth".
+
+    It is not a small difference. At the real priority-1 fee of 0.0024 XMR/tx:
+
+        3 wallets  · depth 1     6 rounds     0.0216 XMR reserved
+        20 wallets · depth 2    80 rounds     0.288  XMR
+        60 wallets · depth 6   720 rounds     2.592  XMR
+
+    a 120x span, on settings the operator picks by clicking a preset. At
+    60/6 that is a quarter of a 10 XMR balance held back, with the panel
+    still reading 0.0024.
+
+    Returns (rounds, [total per priority]) or (None, None) when wallets/deep
+    are not both usable -- in which case the panel keeps saying per-tx, rather
+    than inventing a total.
+    """
+    try:
+        w, d = int(wallets), int(deep)
+    except (TypeError, ValueError):
+        return None, None
+    if w < 1 or d < 1 or not per_tx_xmr:
+        return None, None
+    try:
+        g = _ghost()
+        from decimal import Decimal as _D
+        totals = []
+        rounds = None
+        for f in per_tx_xmr:
+            # A nominal balance: total_fees is hop_fee_reserve(fee) * rounds and
+            # does not depend on it. The SHIPPED function computes both, so the
+            # panel and the run cannot disagree about what a round costs.
+            _usable, _fees, _rounds = g.compute_fee_budget(
+                _D("1000"), _D(str(f)), w, d)
+            rounds = _rounds
+            totals.append(round(float(_fees), 6))
+        return rounds, totals
+    except Exception:                                        # noqa: BLE001
+        return None, None
+
+
+def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
     """Real per-priority fees from the operator's own daemon, or none at all.
 
     THERE IS NO FALLBACK TABLE. This used to answer an unreachable daemon with
@@ -760,13 +854,19 @@ def live_fees(daemon_url, tor_proxy=""):
         est = gs.daemon_fee_estimate(daemon_url, proxies)
         fees = est.get("fees")
         if isinstance(fees, list) and fees:
+            _per = [round(int(f) * 2000 / 1e12, 6) for f in fees[:4]]
+            _rounds, _totals = _run_totals(_per, wallets, deep)
             return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
-                               "xmr": [round(int(f) * 2000 / 1e12, 6) for f in fees[:4]]})
+                               "xmr": _per, "rounds": _rounds,
+                               "total_xmr": _totals})
         base = est.get("fee")
         if base:
             mult = [1, 4, 20, 166]
+            _per = [round(int(base) * 2000 * m / 1e12, 6) for m in mult]
+            _rounds, _totals = _run_totals(_per, wallets, deep)
             return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
-                               "xmr": [round(int(base) * 2000 * m / 1e12, 6) for m in mult]})
+                               "xmr": _per, "rounds": _rounds,
+                               "total_xmr": _totals})
         return {"ok": False, "xmr": None, "implausible": False,
                 "source": "no estimate — the daemon returned no fee data",
                 "warning": ("Could not reach a daemon at "
@@ -1207,7 +1307,9 @@ class H(BaseHTTPRequestHandler):
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
                 live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"),
-                          c["params"].get("tor_proxy", ""))))
+                          c["params"].get("tor_proxy", ""),
+                          c["params"].get("wallets"),
+                          c["params"].get("deep"))))
         if self.path == "/api/preflight":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(mandatory_preflight(c["params"])))
@@ -1654,6 +1756,10 @@ function applyPreset(p){
  if('clearnet' in c) $('#allow_clearnet_relay').checked=c.clearnet;
  $('#preset-note').textContent=c.note;
  $$('#presets button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.p===p)));
+ // A preset sets wallets/deep PROGRAMMATICALLY, which fires no 'input' event,
+ // so the fee total would keep showing the previous preset's figure -- and the
+ // presets are exactly where wallets/deep swing hardest (8/1 to 20/6).
+ if(typeof scheduleFees==='function') scheduleFees();
  sync();
 }
 $$('#presets button').forEach(b=>b.addEventListener('click',()=>applyPreset(b.dataset.p)));
@@ -1666,11 +1772,16 @@ function renderFees(){
  // assume an array. Indexing it blindly used to throw and kill the panel.
  const vals=(feeData && Array.isArray(feeData.xmr))?feeData.xmr:null;
  const imp=!!(feeData&&feeData.implausible);
+ // TOTAL for the run, not one transaction. The panel used to show only the
+ // per-tx fee while the operator was choosing --wallets and --deep, the two
+ // settings that decide how MANY transactions there are, so the number never
+ // moved when they changed it. total_xmr is what the run actually reserves.
+ const tot=(feeData && Array.isArray(feeData.total_xmr))?feeData.total_xmr:null;
  $('#fees').innerHTML=names.map((n,i)=>`<button class="fee${imp?' imp':''}" data-p="${i+1}" aria-pressed="${feePriority===i+1}">
-   <div class="p">${esc(n)}</div><div class="v">${vals?esc(vals[i])+' XMR':'<span class="noest">no estimate</span>'}</div></button>`).join('');
+   <div class="p">${esc(n)}</div><div class="v">${tot?esc(tot[i])+' XMR':(vals?esc(vals[i])+' XMR':'<span class="noest">no estimate</span>')}</div>${tot&&vals?`<div class="pertx">${esc(vals[i])} × ${esc(feeData.rounds)} rounds</div>`:''}</button>`).join('');
  $$('.fee').forEach(b=>b.addEventListener('click',()=>{setFee(+b.dataset.p);sync();}));
  if(!feeData){$('#fsrc').textContent='loading…';return;}
- $('#fsrc').innerHTML=(vals?'estimate per ~2 kB tx · ':'')+esc(feeData.source)
+ $('#fsrc').innerHTML=(tot?`TOTAL reserved across ${esc(feeData.rounds)} rounds at ${esc($('#wallets').value)} wallets · depth ${esc($('#deep').value)} · `:(vals?'estimate per ~2 kB tx · ':''))+esc(feeData.source)
    +(feeData.warning?`<div class="warnbox" style="margin-top:7px">${esc(feeData.warning)}</div>`:'')
    +(vals?'':`<div style="margin-top:7px"><button id="dfind" class="pfre" type="button">Find my daemon</button></div>`);
  const df=$('#dfind'); if(df) df.addEventListener('click',detectDaemon);
@@ -1689,6 +1800,10 @@ async function detectDaemon(){
  $('#fsrc').innerHTML=esc((r&&r.detail)||'no daemon found');
 }
 function setFee(p){feePriority=p;renderFees();}
+// Debounced: --wallets is typed a digit at a time, and each keystroke would
+// otherwise be its own daemon round-trip.
+let _feeTimer=null;
+function scheduleFees(){ clearTimeout(_feeTimer); _feeTimer=setTimeout(loadFees,350); }
 async function loadFees(){
  feeData=await fetch('/api/fees',{method:'POST',headers:HDR,
    body:JSON.stringify({params:collect()})}).then(r=>r.json()).catch(()=>null);
@@ -1822,6 +1937,11 @@ async function sync(){
 const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
 $$('input,select').forEach(el=>el.addEventListener('input',()=>{
  if(el.id==='arm') return;
+ // The fee panel now reports the TOTAL the run reserves, which depends on
+ // --wallets and --deep, so it has to be refetched when either moves. Without
+ // this the number is simply stale rather than fixed -- the operator changes
+ // depth and still sees the old total, which is the same complaint.
+ if(el.id==='wallets'||el.id==='deep') scheduleFees();
  if(PF_FIELDS.has(el.id)) schedulePreflight(); else sync();
 }));
 $('#pfre').addEventListener('click',runPreflight);

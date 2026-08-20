@@ -982,6 +982,102 @@ def test_watchdog_lets_the_job_clean_up_before_killing_it():
           j["rc"] == 0)
 
 
+def test_fee_panel_answers_the_setting_the_operator_is_changing():
+    """The fee shown must move when --wallets or --deep move.
+
+    live_fees took only (daemon_url, tor_proxy) and returned the PER-TRANSACTION
+    fee, while the operator was choosing the two settings that decide how many
+    transactions there are. So the panel could not change when they did, and an
+    operator reported exactly that: "the fee doesn't change even if I up the
+    wallets or depth".
+
+    It is not a rounding difference. At the real priority-1 fee of 0.0024:
+
+        3 wallets  · depth 1     6 rounds     0.0216 XMR
+        20 wallets · depth 2    80 rounds     0.288  XMR
+        60 wallets · depth 6   720 rounds     2.592  XMR
+
+    a 120x span on settings picked by clicking a preset.
+
+    compute_fee_budget is IMPORTED from GhostSpiral, not reimplemented -- the
+    console has drifted from the orchestrator twice already (the --split
+    ceiling, the job timeout) and both times the copy was the bug.
+    """
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "ghost_fees", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(g)
+
+    per = [0.0024, 0.0094, 0.038, 0.48]
+    seen = {}
+    for w, d in ((3, 1), (10, 2), (20, 2), (60, 6)):
+        rounds, totals = c._run_totals(per, w, d)
+        seen[(w, d)] = (rounds, totals)
+        check(f"fee panel: {w} wallets/depth {d} produces a round count",
+              rounds and rounds > 0)
+    check("fee panel: the TOTAL changes when wallets/deep change "
+          "(this is the whole defect)",
+          len({t[1][0] for t in seen.values()}) == len(seen))
+    check("fee panel: more wallets and more depth cost MORE, not less",
+          seen[(3, 1)][1][0] < seen[(20, 2)][1][0] < seen[(60, 6)][1][0])
+    # ...and it agrees with what the pipeline will actually reserve.
+    from decimal import Decimal as _D
+    _u, _f, _r = g.compute_fee_budget(_D("1000"), _D("0.0024"), 20, 2)
+    check("fee panel: the total EQUALS the orchestrator's own reserve",
+          abs(seen[(20, 2)][1][0] - float(_f)) < 1e-9
+          and seen[(20, 2)][0] == _r)
+    # Per-tx must stay per-tx: it is the number that legitimately does not move.
+    check("fee panel: the per-transaction figure is unchanged by wallets/deep",
+          per == [0.0024, 0.0094, 0.038, 0.48])
+    # Missing/garbage settings must not invent a total.
+    for bad in ((None, None), ("x", 2), (0, 2), (10, 0)):
+        r_, t_ = c._run_totals(per, *bad)
+        check(f"fee panel: {bad} yields no invented total", r_ is None and t_ is None)
+
+
+def test_console_does_not_call_a_healthy_daemon_broken():
+    """A real daemon's real fees must not be flagged as a fresh/offline chain.
+
+    _flag_fees compares max(res["xmr"]) -- always the PRIORITY 4 figure --
+    against FEE_PLAUSIBLE_MAX_XMR, which was 0.1, a priority-1 sized ceiling.
+    A real monerod 0.18.3.1 returns fees = [1200000, 4700000, 19000000,
+    240000000] piconero/byte = 0.0024 / 0.0094 / 0.038 / 0.48 XMR per ~2 kB tx,
+    so 0.48 > 0.1 and the console announced "far above a real mainnet fee ...
+    the daemon is on a fresh or offline chain. Do NOT treat these as real
+    costs" -- about correct numbers from a working node.
+
+    And GhostSpiral, the tool that actually spends, accepts them: its
+    FEE_IMPLAUSIBLE_XMR is 1.0. The console warned about a fee the pipeline
+    would spend against, which teaches the operator to ignore the panel.
+    """
+    c = load_console()
+    l = importlib.machinery.SourceFileLoader(
+        "ghost_imp", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))
+    l.exec_module(g)
+    check("fee ceiling: the console and the SPENDING tool use one number",
+          float(c.FEE_PLAUSIBLE_MAX_XMR) == float(g.FEE_IMPLAUSIBLE_XMR))
+
+    def per_tx(fees):
+        return [round(f * 2000 / 1e12, 6) for f in fees]
+
+    real = c._flag_fees({"ok": True, "xmr": per_tx(
+        [1200000, 4700000, 19000000, 240000000])})
+    check("fee ceiling: a REAL mainnet daemon is not called broken",
+          not real.get("implausible"))
+    check("fee ceiling: ...and gets no scary warning",
+          not real.get("warning"))
+    # The true positive must survive: a fresh/offline daemon reports ~2e9
+    # piconero/byte, i.e. ~4 XMR per transaction.
+    fresh = c._flag_fees({"ok": True, "xmr": per_tx([2000000000] * 4)})
+    check("fee ceiling: a FRESH/offline daemon is STILL flagged "
+          "(control: the check was not just switched off)",
+          fresh.get("implausible") is True)
+    check("fee ceiling: ...and still says why", "fresh or offline"
+          in (fresh.get("warning") or ""))
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):
