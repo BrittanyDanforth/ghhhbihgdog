@@ -25,7 +25,9 @@ from typing import Dict, Optional
 from urllib.parse import urlparse
 
 import requests
-from tenacity import retry, wait_exponential_jitter, stop_after_attempt
+from tenacity import (
+    retry, retry_if_exception, wait_exponential_jitter, stop_after_attempt,
+)
 
 # ---------------------------------------------------------------------------
 #  Constants
@@ -1467,7 +1469,69 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
 #  Retry-wrapped HTTP
 # ---------------------------------------------------------------------------
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
+def _retry_http_error(exc: BaseException) -> bool:
+    """Retry timeouts, 429 and 5xx. Do NOT retry other 4xx.
+
+    Measured against a live SwapKit call from this host: Cloudflare answered
+    HTTP 403 with HTML "Sorry, you have been blocked" / "unable to access
+    swapkit.dev". safe_post retried that four times (~48s of identical
+    refusals) and the console then showed
+    "403 Client Error: Forbidden for url: https://api.swapkit.dev" -- which
+    looks like a quote-API or pair problem rather than an IP block, and the
+    operator sat through three more copies of a decision that was already
+    final. 401/403/404 will not become 200 by waiting.
+    """
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        code = int(exc.response.status_code)
+        if code == 429 or code >= 500:
+            return True
+        if 400 <= code < 500:
+            return False
+    if isinstance(exc, requests.RequestException):
+        return True
+    return False
+
+
+def format_quote_failure(exc: BaseException, label: str) -> str:
+    """Operator-facing abort for a failed swap quote.
+
+    Truncating str(exc) to 60 characters (the old quote catch) cut the path
+    off at "https://api.swapkit.dev" and hid that the body was Cloudflare's
+    block page, not SwapKit's JSON.
+    """
+    resp = getattr(exc, "response", None)
+    if isinstance(exc, requests.HTTPError) and resp is not None:
+        code = int(resp.status_code)
+        body = (getattr(resp, "text", None) or "")[:1200].lower()
+        cf = (
+            "cloudflare" in body
+            or "attention required" in body
+            or "you have been blocked" in body
+            or "just a moment" in body
+            or "unable to access" in body
+        )
+        host = ""
+        try:
+            host = urlparse(resp.url or "").netloc
+        except Exception:                                    # noqa: BLE001
+            host = ""
+        where = host or "the quote host"
+        if code == 403 and cf:
+            return (
+                f"[!] {label}: HTTP 403 — Cloudflare blocked {where} from this IP.\n"
+                f"    Tor exits and datacenter addresses are routinely blocked "
+                f"BEFORE the quote is evaluated. This is not a Tor leak and not "
+                f"a missing BTC/XMR pair.\n"
+                f"    A live quote cannot be fetched from this host."
+            )
+        return f"[!] {label}: HTTP {code}: {str(exc)[:120]}"
+    return f"[!] {label}: {str(exc)[:120]}"
+
+
+@retry(stop=stop_after_attempt(4),
+       wait=wait_exponential_jitter(initial=4, max=30),
+       retry=retry_if_exception(_retry_http_error),
+       reraise=True)
 def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     # `not proxies`, NOT `is None`. requests treats proxies={} exactly like no
     # proxy at all and connects DIRECTLY, so an empty dict slipped past an
@@ -1480,7 +1544,10 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     return r.json()
 
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential_jitter(initial=4, max=30), reraise=True)
+@retry(stop=stop_after_attempt(4),
+       wait=wait_exponential_jitter(initial=4, max=30),
+       retry=retry_if_exception(_retry_http_error),
+       reraise=True)
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
     if not proxies:      # proxies={} means DIRECT in requests -- see safe_get
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
