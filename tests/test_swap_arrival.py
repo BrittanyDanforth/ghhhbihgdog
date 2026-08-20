@@ -1000,6 +1000,83 @@ check("multi: ...and the shortfall names what is missing",
       _exit3 and "short by" in str(_exit3.code))
 
 
+
+# ==========================================================================
+# THE WAIT MUST SAY IT IS ALIVE, not only when something changes.
+#
+# Every reporting branch in wait_for_swap_arrival fires on a CHANGE. While a
+# cross-chain swap is still settling -- the entire purpose of this wait, and
+# routinely hours -- nothing changes, so the loop printed NOTHING at all, for
+# up to XMR_ARRIVAL_TIMEOUT (24h). Driven on the pre-fix code: a 60-minute wait
+# with no arrival produced ZERO lines. An operator who had just sent real BTC
+# saw a console pane that had not moved since the run started, with no way to
+# tell "waiting" from "hung" -- which is exactly what "it just went nowhere"
+# looks like from the outside.
+#
+# receive_watch answers the same question and has always echoed progress_line
+# on every poll; gs_console even documents tuning its output buffering around
+# that cadence. Stage 4 was the waiter that stayed silent.
+# ==========================================================================
+print("\n=== the arrival wait reports that it is alive ===")
+
+
+class _HBClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, n):
+        self.t += n
+
+
+_hb_lines = []
+_hbc = _HBClock()
+_hb = ghost.wait_for_swap_arrival(
+    lambda: (D(0), D(0)), D("2.0"), 4, stall_s=3600, timeout_s=7200,
+    poll_s=30, sleep_fn=_hbc.sleep, clock=_hbc, echo=_hb_lines.append)
+check("heartbeat: a swap that has not landed still reports progress "
+      f"(got {len(_hb_lines)} lines across {int(_hbc.t // 60)} min; the "
+      f"pre-fix loop printed 0)", len(_hb_lines) >= 5)
+check("heartbeat: ...and says what it is waiting for",
+      any("still waiting for the swap" in l for l in _hb_lines))
+check("heartbeat: ...and how long it has been waiting, so a stuck run is "
+      "visible", any("min elapsed" in l for l in _hb_lines))
+# Cadence: bounded, so a 24h wait cannot flood the console's line buffer and
+# push the run's real events out of it.
+check(f"heartbeat: paced at ARRIVAL_HEARTBEAT_S, not every poll "
+      f"({ghost.ARRIVAL_HEARTBEAT_S}s)",
+      len(_hb_lines) <= int(_hbc.t / ghost.ARRIVAL_HEARTBEAT_S) + 1)
+
+# It must carry the REAL figures, not a fixed string -- a heartbeat that always
+# says the same thing cannot distinguish a stalled swap from a partial one.
+_hb2 = []
+_hbc2 = _HBClock()
+_state = {"n": 0}
+
+
+def _partial():
+    _state["n"] += 1
+    return (D("1.2"), D("0.5")) if _state["n"] > 3 else (D(0), D(0))
+
+
+ghost.wait_for_swap_arrival(_partial, D("2.0"), 4, stall_s=1800,
+                            timeout_s=3600, poll_s=30, sleep_fn=_hbc2.sleep,
+                            clock=_hbc2, echo=_hb2.append)
+_beats = [l for l in _hb2 if "still waiting for the swap" in l]
+check("heartbeat: reports what has UNLOCKED so far",
+      any("unlocked 0.5 XMR" in l for l in _beats))
+check("heartbeat: ...what is still confirming",
+      any("still confirming" in l for l in _beats))
+check("heartbeat: ...and how far from the target, as a percentage",
+      any("to go (25.0%)" in l for l in _beats))
+# ...and the shared helper really is shared, so the two waiters cannot drift
+# into describing the same balance differently.
+check("heartbeat: GhostSpiral and receive_watch use ONE progress_line",
+      ghost.progress_line is _gsc.progress_line)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

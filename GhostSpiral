@@ -51,6 +51,7 @@ from gs_common import (
     finite_decimal,
     decimal_env, XMR_ABSURD_TOTAL,
     swap_arrival_floor,
+    progress_line,
     create_fresh_account, run_lock,
     btc_per_xmr_oracle, quote_deviation, wipe_covers, decimal_arg,
     MAX_SPLIT, fmt_btc, SATOSHI_BTC,
@@ -340,6 +341,18 @@ FANOUT_CONFIRM_POLL = 30        # seconds between balance polls
 XMR_ARRIVAL_STALL = 7200        # seconds with NOTHING new arriving -> give up
 XMR_ARRIVAL_TIMEOUT = 86400     # absolute cap on the whole arrival wait
 XMR_ARRIVAL_POLL = 30           # seconds between arrival polls
+
+# How often the arrival wait says it is still alive, even when nothing has
+# changed. Every branch in wait_for_swap_arrival fires only on a CHANGE, so a
+# swap that has not landed yet produced no output at all -- for up to
+# XMR_ARRIVAL_TIMEOUT, i.e. a full day of a blank console pane immediately
+# after the operator sent real BTC. receive_watch, which waits for the same
+# thing, has always printed on every poll.
+#
+# Five minutes rather than every poll: at XMR_ARRIVAL_POLL=30 a per-poll line
+# would be ~2900 entries across a 24-hour wait, which pushes the run's actual
+# events out of the console's 5000-line job buffer.
+ARRIVAL_HEARTBEAT_S = 300
 
 #: How far below the summed quotes still counts as "all of it arrived".
 #: A swap never pays its quote to the digit (the rate moves between quote and
@@ -2365,6 +2378,7 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
     # receive_watch's marked_total.
     marked = Decimal(0)
     last_arrival = started
+    last_beat = started
     total = unlocked = Decimal(0)
     locked_reported = False
     while True:
@@ -2404,7 +2418,34 @@ def wait_for_swap_arrival(balance_fn, floor_: Decimal, chunks: int,
             echo(f"  [*] Seen {total} XMR total; waiting for it to unlock...")
             locked_reported = True
 
+
         now = clock()
+        # A HEARTBEAT, because silence here is indistinguishable from a dead run.
+        #
+        # Every branch above prints only when something CHANGES. While a
+        # cross-chain swap is still settling -- which is the entire purpose of
+        # this wait, and routinely takes hours -- nothing changes, so this loop
+        # printed NOTHING for up to XMR_ARRIVAL_TIMEOUT (24 hours). An operator
+        # watching the console saw a pane that had not moved since the run
+        # started, with no way to tell "waiting" from "hung", right after
+        # sending real BTC. That is the moment they most need to see the run is
+        # alive.
+        #
+        # receive_watch answers the same question and has always echoed
+        # progress_line on EVERY poll; the console even documents tuning its
+        # output buffering around that cadence. Stage 4 was the waiter that
+        # stayed quiet. Same shared helper now, so the two cannot describe the
+        # same balance differently.
+        #
+        # Time-based rather than every poll: at a 30s poll that would be ~2900
+        # lines over a full 24-hour wait, which pushes the run's real events out
+        # of the console's line buffer. Every ARRIVAL_HEARTBEAT_S keeps it
+        # obviously alive without burying anything.
+        if now - last_beat >= ARRIVAL_HEARTBEAT_S:
+            last_beat = now
+            echo(f"  [*] still waiting for the swap — "
+                 f"{progress_line(unlocked, total, floor_)}"
+                 f" · {int((now - started) // 60)} min elapsed")
         if now - started >= timeout_s:
             return {"state": "timeout", "total": total, "unlocked": unlocked}
         # The stall clock runs from the start too, so a swap that is never sent

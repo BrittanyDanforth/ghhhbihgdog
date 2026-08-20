@@ -60,6 +60,7 @@ from gs_common import (
     sum_quoted_xmr,
     swap_arrival_floor,
     decimal_env, XMR_ABSURD_TOTAL,
+    progress_line,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -222,24 +223,6 @@ def fmt(x: Decimal) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s or "0"
-
-
-def progress_line(unlocked: Decimal, total: Decimal, floor_: Decimal) -> str:
-    """One human line: what has landed, what is still locked, how far to go."""
-    pending = total - unlocked
-    if pending < 0:
-        pending = Decimal(0)
-    bits = [f"unlocked {fmt(unlocked)} XMR"]
-    if pending > 0:
-        bits.append(f"{fmt(pending)} still confirming")
-    if floor_ > 0:
-        remain = floor_ - unlocked
-        if remain > 0:
-            pct = (unlocked / floor_ * 100) if floor_ > 0 else Decimal(0)
-            bits.append(f"{fmt(remain)} to go ({pct.quantize(Decimal('0.1'))}%)")
-        else:
-            bits.append("target reached")
-    return " · ".join(bits)
 
 
 # ── what to do with it, once it is there ───────────────────────────────────

@@ -2153,6 +2153,51 @@ def swap_arrival_floor(total: Decimal, tolerance: Decimal,
     return floor_, False
 
 
+def fmt_xmr(x: Decimal) -> str:
+    """Render an XMR amount for a human.
+
+    str(Decimal) uses scientific notation for a quantized zero -- a balance of
+    nothing printed as "0E-12 XMR", which reads as a malfunction to someone
+    watching a payment they are anxious about. Fixed-point always, and trailing
+    zeros trimmed so 3.000000000000 shows as 3.
+    """
+    s = f"{x:f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def progress_line(unlocked: Decimal, total: Decimal, floor_: Decimal) -> str:
+    """One human line: what has landed, what is still locked, how far to go.
+
+    SHARED, because two waiters answer the same question and only one of them
+    was speaking. receive_watch echoed this on EVERY poll, so an operator saw a
+    live figure every 45-90 seconds. GhostSpiral's stage-4 wait
+    (wait_for_swap_arrival) printed only when a MEANINGFUL amount arrived -- so
+    while a cross-chain swap was still settling, which is the whole point of
+    that wait and can take hours, it printed nothing at all. The operator
+    watching the console saw a pane that had not moved since the run started
+    and no way to tell "waiting" from "hung".
+
+    Kept here rather than imported from receive_watch so neither copy can drift
+    into describing the same balance differently.
+    """
+    pending = total - unlocked
+    if pending < 0:
+        pending = Decimal(0)
+    bits = [f"unlocked {fmt_xmr(unlocked)} XMR"]
+    if pending > 0:
+        bits.append(f"{fmt_xmr(pending)} still confirming")
+    if floor_ > 0:
+        remain = floor_ - unlocked
+        if remain > 0:
+            pct = (unlocked / floor_ * 100) if floor_ > 0 else Decimal(0)
+            bits.append(f"{fmt_xmr(remain)} to go ({pct.quantize(Decimal('0.1'))}%)")
+        else:
+            bits.append("target reached")
+    return " · ".join(bits)
+
+
 def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
     """The amount at which a swap's payment counts as having FULLY arrived.
 
