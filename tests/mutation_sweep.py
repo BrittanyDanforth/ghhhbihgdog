@@ -139,11 +139,25 @@ MUTATIONS = [
 
  # One give-back pass instead of sweeping to convergence: stalls whenever the
  # staircase is already tight, which is exactly the small-total case.
- ("the distinctness give-back runs once instead of to convergence",
+ #
+ # TWO of them, with anchors that name which. This was ONE entry anchored on
+ # "while _excess > 0:\n        _moved = False", which appears TWICE -- the BTC
+ # split and the fan-out sizing grew the same give-back loop -- so the sweep
+ # could not tell them apart and scored it SKIP on every run. A skipped
+ # mutation is an untested guarantee wearing the same green as a caught one,
+ # and it was skipped for both copies at once. The `for` line disambiguates
+ # them: the BTC split iterates `n`, the fan-out `_n`.
+ ("the distinctness give-back runs once instead of to convergence (BTC split)",
   "GhostSpiral",
-  "    while _excess > 0:\n        _moved = False",
-  "    while _excess > 0 and False:\n        _moved = False",
+  "    while _excess > 0:\n        _moved = False\n        for _pos in range(n - 1, -1, -1):",
+  "    while _excess > 0 and False:\n        _moved = False\n        for _pos in range(n - 1, -1, -1):",
   ["test_dag_entry"]),
+
+ ("the distinctness give-back runs once instead of to convergence (fan-out)",
+  "GhostSpiral",
+  "    while _excess > 0:\n        _moved = False\n        for _pos in range(_n - 1, -1, -1):",
+  "    while _excess > 0 and False:\n        _moved = False\n        for _pos in range(_n - 1, -1, -1):",
+  ["test_units", "test_dag_entry"]),
 
  # n satoshis, not 1+2+...+n: accepts totals whose only split is repeats.
  ("--btc-amount is bounded at n satoshis, not n distinct ones", "GhostSpiral",
