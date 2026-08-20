@@ -1103,6 +1103,127 @@ finally:
      ghost._run_round) = _cs_saved
 
 
+
+# ==========================================================================
+# HOW MANY DESTINATIONS, NOT JUST WHICH ONES.
+#
+# reject_self_exit checks that a destination is not one of this run's own
+# addresses. Nothing checked how MANY there were -- and the exit sends ONE
+# TRANSACTION PER OUTPUT, so with a single destination every one of them lands
+# on the same address.
+#
+# Observed in the first end-to-end run of the real pipeline (--wallets 4):
+#
+#     === EXIT: withdrawing 9 output(s) in 9 SEPARATE transactions
+#         to 1 destination(s) ===
+#
+# and nothing anywhere called that a problem. Whoever watches that address
+# sees nine arrivals and knows they are one person's -- the separation the run
+# spent hours building, handed back at the last step. --exit-to's own help
+# says "repeat the flag to spread the withdrawal" and the comment beside it
+# says a single destination "re-joins them off-chain, which no amount of
+# mixing can undo"; neither reaches an operator who has already typed the
+# command.
+#
+# It has to be said EARLY. resolve_exit_destinations runs before
+# stage0_preflight and long before _stage5_run, so the operator hears it while
+# they can still add an address -- once the exit starts, nothing can.
+# ==========================================================================
+print("\n=== how many exit destinations ===")
+
+_EA = ("43ZYYZBkwxZJNJFo6rGHf5KREAGR3LizKKXN3aPDCHYj1AAfkqEipXs4x9nnrTq2"
+       "FuaqXMqLrVtED1kV2Z77b6NGE6FFTCm")
+_EB = ("44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaB"
+       "YBb98uNbr2VBBEt7f2wfn3RVGQBEP3A")
+_EC = ("47BDEBFVTx8DwkcmD3isorD69HXCwxk8WU56eb9dp9k9hE1sjbYgFHV2rtXChvDW"
+       "DFhhYYxBGWqxRZz4g7BBFCVqHUhQ5Fe")
+
+_ed_saved_il = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+_ed_saved_env = os.environ.pop("GS_EXIT_TO", None)
+try:
+    def _dests(ds, wallets):
+        _o = io.StringIO()
+        with contextlib.redirect_stdout(_o):
+            ghost.resolve_exit_destinations(
+                types.SimpleNamespace(exit_to=list(ds), wallets=wallets))
+        # The argv-vs-environment warning is a different guarantee, tested
+        # elsewhere; it fires on every call here and would mask the rest.
+        return "\n".join(l for l in _o.getvalue().splitlines()
+                          if "command line" not in l)
+
+    _one = _dests([_EA], 12)
+    check("exitdests: ONE destination for a many-output run is warned about",
+          "ONE exit destination" in _one)
+    check("exitdests: ...with the number of arrivals that address will see",
+          "12 separate output(s)" in _one and "~12 arrivals" in _one)
+    check("exitdests: ...saying what it costs, not just that it is unusual",
+          "no amount of mixing undoes that" in _one)
+    check("exitdests: ...and how to fix it, including the env form",
+          "--exit-to" in _one and 'GS_EXIT_TO="addr1 addr2 addr3"' in _one)
+    check("exitdests: ...and that it must be fixed NOW, not at the exit",
+          "the exit is the last step" in _one)
+
+    # Several destinations but still lopsided: quieter, still said.
+    _few = _dests([_EA, _EB, _EC], 12)
+    check("exitdests: 3 destinations for 12 outputs is still reported",
+          "3 exit destinations" in _few and "4 arrivals per address" in _few)
+    check("exitdests: ...but not as the ONE-destination alarm",
+          "ONE exit destination" not in _few)
+
+    # Silence where there is nothing to say -- or the warning is noise and
+    # gets tuned out on the run where it matters.
+    check("exitdests: 3 destinations for 4 outputs says nothing",
+          _dests([_EA, _EB, _EC], 4).strip() == "")
+    check("exitdests: a single-output run with one destination says nothing",
+          _dests([_EA], 1).strip() == "")
+
+    # A REFUSAL WOULD BE WRONG. An exchange deposit address is one address and
+    # cannot be spread; the operator has to be told the cost, not overruled.
+    check("exitdests: one destination is a WARNING, and the run continues",
+          _dests([_EA], 40) != "" )
+finally:
+    ghost.integrity_log = _ed_saved_il
+    if _ed_saved_env is not None:
+        os.environ["GS_EXIT_TO"] = _ed_saved_env
+
+# And the exit itself repeats it with the REAL count, so the operator reads it
+# while the arrivals are happening.
+from srcutil import code_only as _ed_code                       # noqa: E402
+_ed_src = " ".join(_ed_code(os.path.join(REPO, "GhostSpiral")).split())
+check("exitdests: the exit re-states it with the real numbers",
+      "if total > len(dest_pool):" in _ed_src
+      and "outputs_exceed_destinations" in _ed_src)
+# EARLY, or it is useless: nothing can add a destination once the exit starts.
+#
+# AST over main()'s own body, NOT a substring search. The first draft compared
+# source .index() positions and went red on correct code, because
+# "resolve_exit_destinations(args)" matches its own `def` line hundreds of
+# lines above the call -- the same definition-matches-the-needle trap that let
+# an earlier check in this session pass while the call site was reverted.
+import ast as _ed_ast                                           # noqa: E402
+
+_ed_tree = _ed_ast.parse(open(os.path.join(REPO, "GhostSpiral")).read())
+_ed_main = [n for n in _ed_ast.walk(_ed_tree)
+            if isinstance(n, _ed_ast.FunctionDef) and n.name == "main"][0]
+_ed_calls = {}
+for _n in _ed_ast.walk(_ed_main):
+    if isinstance(_n, _ed_ast.Call):
+        _fn = getattr(_n.func, "id", None)
+        if _fn in ("resolve_exit_destinations", "stage0_preflight",
+                   "_stage5_run") and _fn not in _ed_calls:
+            _ed_calls[_fn] = _n.lineno
+check("exitdests: main() actually calls all three",
+      len(_ed_calls) == 3)
+check("exitdests: the warning is raised before stage 0, while it is still "
+      "actionable",
+      _ed_calls.get("resolve_exit_destinations", 10**9)
+      < _ed_calls.get("stage0_preflight", 0))
+check("exitdests: ...and long before anything is spent",
+      _ed_calls.get("resolve_exit_destinations", 10**9)
+      < _ed_calls.get("_stage5_run", 0))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -4335,6 +4335,50 @@ def resolve_exit_destinations(args) -> None:
         seen.add(d)
         validate_xmr_address(d, "--exit-to address")
     integrity_log("exit", f"exit_destinations_validated:{len(dests)}")
+    # HOW MANY, not just which. Said HERE, hours before the exit runs, because
+    # by the time the exit runs it is far too late to add one.
+    #
+    # The run spends hours giving the money separate accounts and separate
+    # outputs. The exit then sends ONE TRANSACTION PER OUTPUT -- and with a
+    # single destination all of them land on the same address. This flag's own
+    # help says "repeat the flag to spread the withdrawal", and the comment
+    # beside it says a single destination "re-joins them off-chain, which no
+    # amount of mixing can undo". Neither of those reaches an operator who has
+    # already typed the command.
+    #
+    # Observed in the first end-to-end run of this pipeline: with --wallets 4
+    # the exit reported
+    #
+    #     === EXIT: withdrawing 9 output(s) in 9 SEPARATE transactions
+    #         to 1 destination(s) ===
+    #
+    # and nothing anywhere called that a problem. Whoever watches that one
+    # address sees nine arrivals and knows they are one person's -- the
+    # separation the run just bought, handed back at the last step.
+    #
+    # A WARNING, NOT A REFUSAL. One destination is a legitimate choice: an
+    # exchange deposit address is one address and cannot be spread. The
+    # operator has to be told what it costs, not overruled.
+    _n_out = max(int(getattr(args, "wallets", 0) or 0), 1)
+    if len(dests) == 1 and _n_out > 1:
+        integrity_log("exit", "single_exit_destination")
+        print(f"  [!] ONE exit destination, and this run will withdraw roughly "
+              f"{_n_out} separate output(s) to it.")
+        print(f"      Each goes in its own transaction, so whoever watches "
+              f"that address sees ~{_n_out} arrivals and knows they belong "
+              f"together. The run spends hours giving these outputs separate "
+              f"accounts precisely so they cannot be grouped; one destination "
+              f"groups them again off-chain, and no amount of mixing undoes "
+              f"that.")
+        print(f"      Repeat --exit-to for more addresses, or set several in "
+              f"one variable: GS_EXIT_TO=\"addr1 addr2 addr3\". Say this now "
+              f"— the exit is the last step, and nothing can add a "
+              f"destination once it starts.")
+    elif len(dests) > 1 and _n_out > len(dests) * 2:
+        integrity_log("exit", "few_exit_destinations")
+        print(f"  [!] {len(dests)} exit destinations for roughly {_n_out} "
+              f"output(s): about {_n_out // len(dests)} arrivals per address. "
+              f"More destinations means fewer arrivals each.")
 
 
 def reject_self_exit(args, addr_index: dict, entry_addr: str) -> None:
@@ -7512,6 +7556,17 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     total = len(targets)
     print(f"  [*] === EXIT: withdrawing {total} output(s) in {total} SEPARATE "
           f"transactions to {len(dest_pool)} destination(s) ===")
+    # SAY IT AGAIN HERE, with the real numbers rather than the estimate the
+    # early warning had. Too late to fix on this run -- the point is that the
+    # operator reads it while the arrivals are happening and knows to spread
+    # the next one, instead of discovering the shape later on-chain.
+    if total > len(dest_pool):
+        integrity_log("exit", "outputs_exceed_destinations")
+        print(f"  [!] {total} outputs into {len(dest_pool)} address(es): "
+              f"~{-(-total // len(dest_pool))} arrivals on each. Whoever "
+              f"watches one sees that group and knows it is one person's — "
+              f"the separation this run spent hours building, re-joined "
+              f"off-chain at the last step. Next run: repeat --exit-to.")
     integrity_log("exit", f"withdraw_start:{total}_outputs:{len(dest_pool)}_dests")
 
     relayed = failed = skipped = unclean = 0
