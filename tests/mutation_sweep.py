@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""MUTATION SWEEP: break each guarantee on purpose, and see if anything notices.
+
+A green suite proves nothing on its own. This breaks ONE guarantee at a time,
+in the way a plausible refactor would, and reports whether any test turns red.
+Run it after changing anything in the --split / entry-set / exit machinery:
+
+    python3 tests/mutation_sweep.py          # all mutations
+    python3 tests/mutation_sweep.py 4 11     # just these two
+
+THIS HARNESS HAS LIED IN BOTH DIRECTIONS, and both guards below exist because
+of it. Neither is theoretical; each cost a wrong conclusion during the audit
+that produced this file.
+
+  * IT REPORTED GREEN ON A MUTATION THAT NEVER REACHED DISK. Two sweeps once
+    shared a scratch directory and one's cleanup wiped the other mid-run, so
+    suites ran UNMUTATED and every result was meaningless -- which produced a
+    confident, false finding that a real invariant was untested. Hence: a
+    unique mktemp per mutation, serial execution, and a grep -qF that PROVES
+    the replacement is on disk before any result is believed.
+
+  * IT REPORTED SURVIVED FOR GUARANTEES THAT WERE TESTED. Four mutations named
+    the wrong suite -- the tests existed and passed, in a file the mutation
+    never ran -- and two anchored on the integrity_log() line ABOVE a guard, so
+    the sys.exit() below still fired and the mutation changed no behaviour at
+    all. That is the more expensive direction: green makes you complacent,
+    SURVIVED makes you rewrite working code.
+
+  * A SUITE THAT CRASHES IS NOT A CATCH. A mutation that makes a test file die
+    with a traceback prints no RESULT line, and a crashed suite proves nothing
+    about its checks. Those score NO-RESULT, never CAUGHT -- and the right fix
+    is usually in the TEST (make it fail with its own words instead of dying).
+
+  * SKIP IS NOT A PASS EITHER. An anchor that matches zero or several times
+    means the mutation did not apply, so that guarantee went UNSWEPT. Re-anchor
+    it; do not read the tally as coverage.
+
+Each entry is (name, file, find, replace, [suites that must go red]).
+"""
+import os, re, shutil, subprocess, sys, tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# (name, file, find, replace, [suites that must go red])
+MUTATIONS = [
+ ("entry set mints ONE address however many chunks", "GhostSpiral",
+  "    for _ in range(max(1, int(n))):",
+  "    for _ in range(1):",
+  ["test_dag_entry", "test_send_gates"]),
+
+ ("every chunk quoted to the FIRST destination (the original G5)", "GhostSpiral",
+  "        chunk_dest = xmr_dests[i]",
+  "        chunk_dest = xmr_dests[0]",
+  ["test_send_gates"]),
+
+ ("the per-chunk/per-dest count mismatch is not refused", "GhostSpiral",
+  "    if len(xmr_dests) != len(chunks):",
+  "    if False:",
+  ["test_dag_entry", "test_send_gates"]),
+
+ ("duplicate swap destinations allowed", "GhostSpiral",
+  "    if len(set(xmr_dests)) != len(xmr_dests):",
+  "    if False:",
+  ["test_dag_entry", "test_send_gates"]),
+
+ ("all veils pay ONE shared carrier", "GhostSpiral",
+  "    if len(set(_caddrs)) != len(_caddrs) or len(set(_caccts)) != len(_caccts):",
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("duplicate entry ADDRESS not refused", "GhostSpiral",
+  "    if len(set(_addrs)) != len(_addrs):",
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("duplicate entry ACCOUNT not refused", "GhostSpiral",
+  "    _accts = [c for _, c, _ in entries]\n    if len(set(_accts)) != len(_accts):",
+  "    _accts = [c for _, c, _ in entries]\n    if False:",
+  ["test_dag_entry"]),
+
+ ("ONE distribution over every destination (the convergence)", "GhostSpiral",
+  "        for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES):",
+  "        for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES[:1]):",
+  ["test_dag_entry"]),
+
+ ("only the first carrier's change is a change location", "GhostSpiral",
+  "        change_accounts = [a for _d, a, _i in SPEND_SOURCES]",
+  "        change_accounts = [SPEND_SOURCES[0][1]]",
+  ["test_dag_entry"]),
+
+ ("the arrival gate watches ONE entry address", "GhostSpiral",
+  "    for acct, idx in pairs:",
+  "    for acct, idx in pairs[:1]:",
+  ["test_swap_arrival"]),
+
+ ("every slice's budget is the WHOLE usable", "GhostSpiral",
+  "    slice_usable = [usable * (u / total) for u in entry_unlocked]",
+  "    slice_usable = [usable for u in entry_unlocked]",
+  ["test_dag_entry"]),
+
+ ("DAG hops may cross swap chunks", "GhostSpiral",
+  "        _groups = _slices + ([_residual] if _residual else [])",
+  "        _groups = [list(mix_targets)]",
+  ["test_dag_entry"]),
+
+ ("the BTC chunks are all equal again", "GhostSpiral",
+  "    weights = [Decimal(1) + SPLIT_JITTER",
+  "    weights = [Decimal(1) + Decimal(0) * SPLIT_JITTER",
+  ["test_dag_entry", "test_send_gates"]),
+
+ ("a sub-satoshi --btc-amount is accepted", "GhostSpiral",
+  "    if amt != amt.quantize(SATOSHI_BTC):",
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("--split with --peel is allowed at parse time", "GhostSpiral",
+  '    if n > 1 and getattr(args, "peel", False):',
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("the clean-exit message tests the container, not the counts", "GhostSpiral",
+  "        elif _relayed and not (_held_entry or _held_change):",
+  "        elif _relayed and not _held:",
+  ["test_exit_withdraw"]),
+
+ ("an unfunded chunk is not dropped", "GhostSpiral",
+  "    funded = [(e, u) for e, u in zip(entry_set, entry_unlocked) if u > DUST_XMR]",
+  "    funded = [(e, u) for e, u in zip(entry_set, entry_unlocked)]",
+  ["test_dag_entry"]),
+
+ ("two BTC chunks may be equal", "GhostSpiral",
+  "    for _ in range(n * 4):\n        _seen = {}",
+  "    for _ in range(0):\n        _seen = {}",
+  ["test_dag_entry"]),
+
+ ("the console split bound drifts from gs_common", "gs_console",
+  '    "split":        ("int", (1, 8)),',
+  '    "split":        ("int", (1, 20)),',
+  ["test_console"]),
+
+ ("only the FIRST entry pair is verified against the wallet", "GhostSpiral",
+  "    for _pos, entry_addr in enumerate(entry_addr_list):",
+  "    for _pos, entry_addr in enumerate(entry_addr_list[:1]):",
+  ["test_units"]),
+
+ ("the exit holds only the FIRST entry address", "GhostSpiral",
+  "    return [addr_index[a] for a in _addrs if a in addr_index]",
+  "    return [addr_index[a] for a in _addrs[:1] if a in addr_index]",
+  ["test_dag_entry", "test_exit_withdraw"]),
+
+ ("held outputs are all reported as ENTRY", "GhostSpiral",
+  '            _held_kinds["entry" if _is_entry else "change"] += 1',
+  '            _held_kinds["entry"] += 1',
+  ["test_exit_withdraw"]),
+
+ ("a chunk with no destinations is silently dropped", "GhostSpiral",
+  "    if any(not sl for sl in slices):",
+  "    if False:",
+  ["test_dag_entry"]),
+
+ ("--split has no upper bound", "GhostSpiral",
+  "    if n > MAX_SPLIT:\n        integrity_log(\"stage0\", \"split_too_large\")",
+  "    if False:\n        integrity_log(\"stage0\", \"split_too_large\")",
+  ["test_dag_entry"]),
+
+ ("JoinMarket's UTXO count is unbounded", "GhostSpiral",
+  "        if n > MAX_SPLIT:",
+  "        if False:",
+  ["test_dag_entry"]),
+
+ ("a plan carries tx_extra again (the inert field, re-added)", "GhostSpiral",
+  '            "dst": addr,\n            "sweep": True,',
+  '            "dst": addr,\n            "extra": secure_hex(16),\n            "sweep": True,',
+  ["test_dag_entry", "test_exit_withdraw"]),
+
+ ("the veil delay is a fixed value, not jittered", "GhostSpiral",
+  '            "delay": hop_delay(delay_window),\n        })\n        carriers.append',
+  '            "delay": (delay_window or DEFAULT_HOP_DELAY)[0],\n        })\n        carriers.append',
+  ["test_dag_entry"]),
+
+ ("--btc-amount positivity is not enforced", "GhostSpiral",
+  "    if amt <= 0:\n        integrity_log(\"stage0\", \"btc_amount_not_positive\")",
+  "    if False:\n        integrity_log(\"stage0\", \"btc_amount_not_positive\")",
+  ["test_units"]),
+
+ ("the DAG round is costed as the confirm wait only", "GhostSpiral",
+  "        secs += confirm + mean * mix_outputs",
+  "        secs += confirm",
+  ["test_dag_entry"]),
+
+ ("the runtime estimate ignores a custom --hop-delay", "GhostSpiral",
+  "    lo, hi = delay_window or DEFAULT_HOP_DELAY",
+  "    lo, hi = DEFAULT_HOP_DELAY",
+  ["test_dag_entry"]),
+
+ ("--deep silently buys no transactions", "GhostSpiral",
+  "                          f\"(min {MIN_DEEP}). It does NOT add hop rounds: \"",
+  "                          f\"(min {MIN_DEEP}). Depth multiplier. \"",
+  ["test_dag_entry"]),
+
+ ("the signer accepts a key-image plan entry", "airgap_tx_signer",
+  '        if tx.get("key_image") is not None or tx.get("sweep_single"):',
+  "        if False:",
+  ["test_signer_schema"]),
+
+ ("the DAG may hop back to a non-first entry address", "GhostSpiral",
+  "        others = [b for b in subs if b != a and b not in _entry_set]",
+  "        others = [b for b in subs if b != a and b not in list(_entry_set)[:1]]",
+  ["test_dag_entry", "test_units"]),
+
+ ("the holdings report names only the first entry account", "GhostSpiral",
+  "    _entry_funded = sorted(_entry_accts & {a for a, _ in funded})",
+  "    _entry_funded = sorted(list(_entry_accts)[:1])[:0]",
+  ["test_dag_entry", "test_units"]),
+
+ ("manual mode prints one --dests for every chunk", "GhostSpiral",
+  '                      + " ".join(scrub_address(_a) for _a in ENTRY_ADDRS)',
+  '                      + scrub_address(ENTRY_ADDRS[0])',
+  ["test_send_gates"]),
+]
+
+
+def run(idx, name, fname, find, repl, suites):
+    tmp = tempfile.mkdtemp(prefix=f"mutg5_{idx}_")
+    dst = os.path.join(tmp, "repo")
+    shutil.copytree(REPO, dst, ignore=shutil.ignore_patterns(
+        ".git", "__pycache__", "*.pyc", "integrity_chain.log*"))
+    path = os.path.join(dst, fname)
+    src = open(path).read()
+    if src.count(find) != 1:
+        print(f"[{idx:2d}] SKIP  {name}\n       anchor appears {src.count(find)}x")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return "SKIP"
+    open(path, "w").write(src.replace(find, repl, 1))
+    # PROVE the mutation is on disk. A sweep that silently failed to apply
+    # reports green and proves nothing.
+    check = subprocess.run(["grep", "-qF", repl, path])
+    if check.returncode != 0:
+        print(f"[{idx:2d}] BROKEN {name}: replacement not found on disk")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return "BROKEN"
+    caught, verdicts = False, []
+    for suite in suites:
+        p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
+                           capture_output=True, text=True, timeout=900)
+        out = p.stdout + p.stderr
+        m = re.findall(r"(\d+) passed, (\d+) failed", out)
+        if not m:
+            verdicts.append(f"{suite}=NO-RESULT")
+            continue
+        failed = int(m[-1][1])
+        verdicts.append(f"{suite}={'RED' if failed else 'green'}({failed})")
+        if failed:
+            caught = True
+    shutil.rmtree(tmp, ignore_errors=True)
+    tag = "CAUGHT" if caught else "*** SURVIVED ***"
+    print(f"[{idx:2d}] {tag:16s} {name}\n       {'  '.join(verdicts)}")
+    return "CAUGHT" if caught else "SURVIVED"
+
+
+if __name__ == "__main__":
+    only = set(sys.argv[1:])
+    tally = {}
+    for i, mut in enumerate(MUTATIONS):
+        if only and str(i) not in only:
+            continue
+        r = run(i, *mut)
+        tally[r] = tally.get(r, 0) + 1
+    print("\n", tally)
