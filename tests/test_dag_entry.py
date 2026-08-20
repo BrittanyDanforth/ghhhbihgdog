@@ -958,6 +958,109 @@ check("control: slices with room to hop produce NO such warning",
 _p3 = _hop_plan(_BY_OK, [list(_ALL)])
 check("control: with one chunk hops range over every mix subaddress",
       len(_p3) > 0 and len({t["dst"] for t in _p3}) == len(_p3))
+
+# NO DESTINATION TWICE, ACROSS EVERY assign_hop_destinations CALL.
+#
+# That function guarantees "no destination used twice" only WITHIN ONE CALL,
+# and build_dag_plan calls it once per chunk group PLUS once for orphans, then
+# merges with _dsts.update() — which merges by SOURCE and never looked at the
+# destinations. The per-group calls are safe only because the groups are
+# disjoint, which nothing checked; the orphan call passed the FULL mix_targets
+# and re-picked addresses the group calls had already taken.
+#
+# Two hops onto one address put value from two swap chunks on it, and the exit
+# issues ONE sweep_all per funded subaddress — so both leave in a single
+# multi-input transaction. That is the merge the whole split exists to prevent,
+# produced by the branch written as a safety net, and it contradicted the
+# policy this same function prints: "a missed hop costs mixing depth, sharing a
+# destination would cost the no-merge guarantee."
+#
+# Driven directly, both doors, before the fix: TRUE-ORPHAN 200/200 plans shared
+# a destination, OVERLAPPING slices 180/200.
+
+# DOOR 1: sources outside mix_targets entirely, so they reach the orphan pass.
+_orph_srcs = list(_ALL) + ["Z0", "Z1"]
+_orph_by = {a: Decimal("1") for a in _orph_srcs}
+_orph_ai = dict(_AI); _orph_ai.update({"Z0": (91, 1), "Z1": (92, 1)})
+_orph_dup = 0
+for _trial in range(40):
+    _dagj = ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod)
+    _dagj.update({"Z0": list(_ALL), "Z1": list(_ALL)})
+    with contextlib.redirect_stdout(io.StringIO()):
+        _po = ghost.build_dag_plan(_HA, Decimal("0.0024"), _orph_srcs, _orph_by,
+                                   _dagj, _ALL, _orph_ai, _secretsmod,
+                                   dest_slices=[_CHUNK_A, _CHUNK_B])
+    _d = [t["dst"] for t in _po]
+    if len(set(_d)) != len(_d):
+        _orph_dup += 1
+check("hop: a source belonging to NO chunk group never takes a destination "
+      "another hop already has — over 40 plans", _orph_dup == 0)
+
+# ...AND IT STILL GETS TO HOP WHEN THERE IS SOMEWHERE FREE TO GO.
+#
+# Two defences sit here and they do different jobs. The cross-call check below
+# keeps the INVARIANT: a duplicate destination is dropped. Restricting the
+# orphan pass to unclaimed destinations keeps the MIXING DEPTH: without it the
+# orphan picks from the full pool, collides with a destination a group already
+# took, and is then dropped by that check — so the invariant holds and the hop
+# is lost for no reason. A test that only looked for collisions would call that
+# a pass.
+#
+# Eight targets, four group sources, so four destinations are still free when
+# the orphans are assigned. They must take them.
+_SLACK = [f"S{i}" for i in range(8)]
+_slack_ai = {a: (80 + i, 1) for i, a in enumerate(_SLACK)}
+_slack_ai.update({"Y0": (95, 1), "Y1": (96, 1)})
+_slack_srcs = [_SLACK[0], _SLACK[1], _SLACK[4], _SLACK[5], "Y0", "Y1"]
+_slack_by = {a: Decimal("1") for a in _slack_srcs}
+_orph_hopped = 0
+for _trial in range(40):
+    _dslack = ghost.build_dag_adjacency(_SLACK, [], 2, _secretsmod)
+    _dslack.update({"Y0": list(_SLACK), "Y1": list(_SLACK)})
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ps = ghost.build_dag_plan(_HA, Decimal("0.0024"), _slack_srcs,
+                                   _slack_by, _dslack, _SLACK, _slack_ai,
+                                   _secretsmod,
+                                   dest_slices=[_SLACK[0:4], _SLACK[4:8]])
+    if {t["src"] for t in _ps} >= {"Y0", "Y1"}:
+        _orph_hopped += 1
+check("hop: an orphan is offered the destinations nothing has claimed, so it "
+      "still hops when one is free — dropping it would cost mixing depth for "
+      "no gain", _orph_hopped == 40)
+
+# DOOR 2: overlapping slices. build_dag_plan takes dest_slices as a parameter
+# and never verifies they partition, so this is a second way in.
+_ov_dup = 0
+for _trial in range(40):
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pv = _hop_plan(_BY_OK, [_ALL[0:5], _ALL[3:8]])
+    _d = [t["dst"] for t in _pv]
+    if len(set(_d)) != len(_d):
+        _ov_dup += 1
+check("hop: OVERLAPPING slices cannot merge two chunks onto one address "
+      "either — the collision is checked, not assumed away", _ov_dup == 0)
+
+# ...and a dropped hop is REPORTED, because losing mixing depth silently is
+# the failure mode this project keeps finding.
+_drop_out = io.StringIO()
+with contextlib.redirect_stdout(_drop_out):
+    _dagj2 = ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod)
+    _dagj2.update({"Z0": list(_ALL), "Z1": list(_ALL)})
+    ghost.build_dag_plan(_HA, Decimal("0.0024"), _orph_srcs, _orph_by,
+                         _dagj2, _ALL, _orph_ai, _secretsmod,
+                         dest_slices=[_CHUNK_A, _CHUNK_B])
+_dt = _drop_out.getvalue()
+check("hop: a hop that could not get its OWN destination is reported, not "
+      "silently missing", "could not be given a hop destination" in _dt
+      or "DROPPED" in _dt)
+
+# CONTROL: the ordinary split path is untouched — every source still hops and
+# every destination is still distinct.
+_p_norm = _hop_plan(_BY_OK, [_CHUNK_A, _CHUNK_B])
+check("control: the ordinary two-chunk round still hops every output",
+      len(_p_norm) == len(_ALL))
+check("control: ...each to its own destination",
+      len({t["dst"] for t in _p_norm}) == len(_p_norm))
 _spans = False
 for _trial in range(25):
     _p4 = _hop_plan(_BY_OK, [list(_ALL)])
@@ -1145,6 +1248,29 @@ except SystemExit as _e:
 check("btc: a total with a satoshi per chunk but no DISTINCT split is refused "
       "too — the old bound accepted it and the chunks came back equal",
       _between is not None)
+
+# THE "TOTAL IS EXACT" PROMISE HOLDS FOR EVERY INPUT split_btc_amount ACCEPTS.
+#
+# It works in integer satoshis, so a sub-satoshi total would come back
+# QUANTISED — 0.1234567891 BTC summing to 0.12345679 — silently breaking the
+# guarantee its own docstring makes. (The nudge loop this replaced kept the sum
+# by putting the sub-satoshi remainder on one chunk, which is the other half of
+# the same problem: a chunk that is not a whole number of satoshis and cannot
+# be sent.) resolve_btc_amount refuses these at parse time; refusing here too
+# means the promise holds for every input the function takes, not merely for
+# every input the caller happened to filter.
+_subsat = None
+try:
+    ghost.split_btc_amount(Decimal("0.1234567891"), 3, _R)
+except ValueError as _e:
+    _subsat = str(_e)
+check("btc: a sub-satoshi total is REFUSED rather than silently rounded",
+      _subsat is not None)
+check("btc: ...and says the total cannot be split into whole satoshis",
+      _subsat and "finer than one satoshi" in _subsat)
+check("control: a satoshi-exact total of the same size is accepted and EXACT",
+      sum(_split_or_none(Decimal("0.12345679"), 3, _R) or [], Decimal(0))
+      == Decimal("0.12345679"))
 # AS A NUMBER THE OPERATOR CAN TYPE. Decimal renders small values in
 # scientific notation, so this message read "3 chunks need at least 3E-8 BTC"
 # — not a figure anyone can enter into a wallet, describing a payment.

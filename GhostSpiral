@@ -670,6 +670,23 @@ def split_btc_amount(total: Decimal, n: int, rng) -> list:
     changes what they are told.
     """
     n = max(1, int(n))
+    # A TOTAL THAT IS NOT A WHOLE NUMBER OF SATOSHIS HAS NO EXACT SPLIT, and
+    # this docstring promises one ("The total is EXACT"). The construction
+    # below works in integer satoshis, so a sub-satoshi total would come back
+    # quantised -- 0.1234567891 BTC summing to 0.12345679 -- silently breaking
+    # the guarantee two paragraphs up. The nudge loop this replaced kept the
+    # sum by putting the sub-satoshi remainder on a random chunk, which is the
+    # other half of the same problem: a chunk that is not a whole number of
+    # satoshis and cannot be sent.
+    #
+    # resolve_btc_amount refuses these at parse time and says why. Refusing
+    # here too means the promise holds for every input this function accepts,
+    # rather than for every input the caller happens to have filtered.
+    if total != total.quantize(SATOSHI_BTC):
+        raise ValueError(
+            f"{total} BTC is finer than one satoshi, so it cannot be split "
+            f"into whole-satoshi chunks that sum to it exactly. "
+            f"resolve_btc_amount refuses this at parse time.")
     if n == 1:
         return [total]
     # WEIGHTS FIRST, NORMALISED, THEN QUANTISED -- in that order, and the order
@@ -3260,8 +3277,57 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
         # same-chunk restriction is meaningless for a source no chunk claims.
         _orphans = [s for s in _fundable if s not in _placed]
         if _orphans:
-            _dsts.update(assign_hop_destinations(_orphans, dag, mix_targets,
+            # ONLY THE DESTINATIONS NOTHING HAS CLAIMED. This passed the FULL
+            # mix_targets, and assign_hop_destinations guarantees "no
+            # destination used twice" only WITHIN ONE CALL -- so the orphan
+            # pass happily re-picked addresses the per-group passes had already
+            # assigned. Driven directly: 300 of 300 plans put two hops on one
+            # destination, and 300 of 300 of those merged sources from
+            # DIFFERENT chunk groups. That address then holds value from two
+            # swap chunks, and the exit's single sweep_all for it spends both
+            # in one transaction -- the convergence the whole split exists to
+            # prevent, produced by the branch written as a safety net.
+            #
+            # It contradicted the policy stated fifteen lines below, in this
+            # same function: "a missed hop costs mixing depth, sharing a
+            # destination would cost the no-merge guarantee". An orphan with
+            # nowhere legal to go now falls into _unassigned, which already
+            # reports exactly that.
+            _free = [d for d in mix_targets if d not in set(_dsts.values())]
+            _free_dag = {k: [d for d in v if d in set(_free)]
+                         for k, v in dag.items()}
+            _dsts.update(assign_hop_destinations(_orphans, _free_dag, _free,
                                                  _secrets))
+        # NO DESTINATION TWICE, ACROSS EVERY CALL, checked rather than assumed.
+        #
+        # The per-group passes above are safe only because the groups are
+        # DISJOINT -- and nothing here checks that. dest_slices arrives as a
+        # parameter; split_by_weight partitions today, but this function does
+        # not verify it, so overlapping slices would let two groups pick the
+        # same address by the same mechanism as the orphan pass. Rather than
+        # add a second unstated assumption, the merged result is verified.
+        #
+        # Keeping the FIRST claim and dropping the rest is the policy this
+        # function already states: a dropped hop costs mixing depth, a shared
+        # destination costs the no-merge guarantee. The dropped sources fall
+        # into _unassigned and are reported there.
+        _by_dst = {}
+        _dupe_srcs = []
+        for _s in list(_dsts):
+            _d = _dsts[_s]
+            if _d in _by_dst:
+                _dupe_srcs.append(_s)
+                del _dsts[_s]
+            else:
+                _by_dst[_d] = _s
+        if _dupe_srcs:
+            integrity_log("stage4", f"dag_dest_collision_dropped:{len(_dupe_srcs)}")
+            print(f"  [!] {len(_dupe_srcs)} hop(s) had been given a destination "
+                  f"another hop was already sweeping to, so they were DROPPED "
+                  f"rather than relayed. Two hops onto one address put value "
+                  f"from two swap chunks on it, and the exit spends a "
+                  f"subaddress in ONE transaction — which is the merge this "
+                  f"run's whole structure exists to prevent.")
         _unassigned = [s for s in _fundable if s not in _dsts]
         # A SLICE OF ONE CANNOT HOP AT ALL, and with several chunks and few
         # wallets that is most of them. A hop's destination must differ from

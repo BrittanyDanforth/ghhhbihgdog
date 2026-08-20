@@ -292,6 +292,30 @@ MUTATIONS = [
   '        if _held_kinds["entry"] > 1:',
   "        if False:",
   ["test_exit_withdraw"]),
+
+ # assign_hop_destinations guarantees "no destination twice" only WITHIN one
+ # call, and build_dag_plan calls it once per chunk group plus once for
+ # orphans. The orphan pass over the FULL mix_targets shared a destination in
+ # 200 of 200 plans, every one of them merging two chunk groups.
+ ("the orphan hop pass may re-take a destination another group has",
+  "GhostSpiral",
+  "            _free = [d for d in mix_targets if d not in set(_dsts.values())]",
+  "            _free = list(mix_targets)",
+  ["test_dag_entry"]),
+
+ # ...and the cross-call check that also covers overlapping slices, which
+ # build_dag_plan never verifies are a partition.
+ ("two hops may share a destination across calls", "GhostSpiral",
+  "            if _d in _by_dst:",
+  "            if False:",
+  ["test_dag_entry"]),
+
+ # split_btc_amount works in integer satoshis, so a sub-satoshi total comes
+ # back quantised while the docstring promises "The total is EXACT".
+ ("a sub-satoshi total is quantised instead of refused", "GhostSpiral",
+  "    if total != total.quantize(SATOSHI_BTC):",
+  "    if False:",
+  ["test_dag_entry"]),
 ]
 
 

@@ -1577,3 +1577,70 @@ still sitting in `/dev/shm`.
   a mutation is only as good as the suite list it runs.)
 * **No dead functions** anywhere in the toolchain (AST call-graph); the three
   apparent ones in `gs_console` are `BaseHTTPRequestHandler` overrides.
+
+### B6 (FIXED): the DAG's safety net could merge two swap chunks
+
+`assign_hop_destinations` exists because of a measured defect — independent
+per-source picking put 4.2 of 7 outputs on a shared destination in 200/200
+planning runs — and it guarantees "no destination used twice". It guarantees it
+**within one call**.
+
+`build_dag_plan` calls it repeatedly: once per chunk group, then once more for
+sources belonging to no group. The results are merged with `_dsts.update()`,
+which merges by SOURCE and never looked at the destinations. Two ways in:
+
+* **The orphan pass** was given the FULL `mix_targets`, so it re-picked
+  addresses the per-group passes had already assigned. Driven directly:
+  **200 of 200 plans shared a destination, and every one merged sources from
+  different chunk groups.**
+* **Overlapping slices.** The per-group passes are safe only because the groups
+  are disjoint — and `dest_slices` arrives as a parameter that this function
+  never verifies partitions anything. Driven: **180 of 200.**
+
+A shared destination holds value from two swap chunks, and the exit issues one
+`sweep_all` per funded subaddress — so both leave in a single multi-input
+transaction. That is the convergence the entire split exists to prevent,
+produced by the branch written as a safety net, and it contradicted the policy
+this same function prints fifteen lines below: *"a missed hop costs mixing
+depth, sharing a destination would cost the no-merge guarantee."*
+
+**Fix, in two parts that do different jobs:**
+
+| defence | preserves |
+|---------|-----------|
+| orphan pass restricted to unclaimed destinations | mixing depth — the orphan can still hop instead of colliding and being dropped |
+| cross-call duplicate check, keeping the first claim | the invariant — covers overlapping slices and any future third call site |
+
+Both are needed, and a test that only looked for collisions would have called
+the first one redundant. Measured before and after:
+
+| case | before (collided plans, hops) | after |
+|------|-------------------------------|-------|
+| normal `--split 2` | 0 / 200, 6.0 hops | 0 / 200, 6.0 hops |
+| normal, one slice  | 0 / 200, 8.0 | 0 / 200, 8.0 |
+| no slices at all   | 0 / 200, 8.0 | 0 / 200, 8.0 |
+| sources outside `mix_targets` | **200 / 200**, 8.0 | 0 / 200, 6.0 |
+| overlapping slices | **180 / 200**, 6.0 | 0 / 200, 4.7 |
+
+The three normal paths are behaviourally identical; only the two broken ones
+change, and they trade hops for the guarantee — the trade the code already
+said it wanted.
+
+Unreachable today (`fanout_dests = mix_targets[:fanout_count]` and
+`hop_sources = list(fanout_dests)`, so every source is in `mix_targets`), which
+is exactly why it survived: it is the branch no run takes and no test drove.
+
+### B7 (FIXED): a promise B1's rewrite had quietly broken — my own
+
+`split_btc_amount`'s new construction works in integer satoshis, so a total
+finer than a satoshi came back QUANTISED: 0.1234567891 BTC summed to
+0.12345679, while the docstring two paragraphs up says "The total is EXACT".
+
+The nudge loop it replaced kept the sum, by putting the sub-satoshi remainder
+on a random chunk — the other half of the same problem, and the reason
+`resolve_btc_amount` refuses these at parse time. Neither is correct; the
+function now refuses too, so the promise holds for every input it accepts
+rather than for every input the caller happened to filter.
+
+Found by re-probing the change against inputs the parse gate normally hides,
+not by a test — the same way B1 itself was found.
