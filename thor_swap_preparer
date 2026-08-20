@@ -385,7 +385,7 @@ def main():
         # correlation the rotation is here to break. The header claims this
         # rotation happens, so it must not be best-effort.
         if i > 0 and proxy:
-            newnym(required=True)
+            newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
             secure_delay(3.0, 8.0)
 
         # AND A CIRCUIT THIS PAIR OWNS. The comment above names the failure
@@ -415,7 +415,7 @@ def main():
             quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, _qproxy)
         except Exception as e:
             if proxy:
-                newnym()
+                newnym(proxy_url=getattr(args, "tor_proxy", ""))
             integrity_log("thor", f"quote_fail_{i}:{type(e).__name__}")
             # Abort cleanly with an OPSEC-safe message instead of re-raising a
             # raw requests traceback (which every other abort here avoids).
@@ -636,7 +636,7 @@ def main():
                   f"{_out} — remove it manually.")
 
     if proxy:
-        newnym()
+        newnym(proxy_url=getattr(args, "tor_proxy", ""))
 
 
 if __name__ == "__main__":

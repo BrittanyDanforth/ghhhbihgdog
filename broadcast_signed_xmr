@@ -69,7 +69,7 @@ def _single_post(url: str, payload: dict, proxies=None) -> dict:
         # relay a transaction over clearnet -- revealing to the receiving node
         # that this IP submitted it. Any falsy value aborts.
         sys.exit("[!] _single_post to non-localhost without proxies — clearnet leak. Aborting.")
-    r = requests.post(url, json=payload, timeout=30, proxies=proxies)
+    r = requests.post(url, json=payload, timeout=30, proxies=proxies, allow_redirects=False)
     r.raise_for_status()
     return r.json()
 

@@ -119,7 +119,18 @@ HOPDELAY_RE = re.compile(r"^\d{1,7}(-\d{1,7})?$")
 #: only; the CHECKSUM is verified by GhostSpiral's resolve_exit_destinations
 #: before anything moves, because a stdlib-only console cannot compute Monero's
 #: keccak variant and inventing a weaker check here would be worse than none.
-XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+#: Same shape gs_common.XMR_ADDR_RE accepts, and it must stay that way: the
+#: console is a FORMAT gate in front of the checksum check GhostSpiral runs, so
+#: anything it refuses here the operator can never submit at all.
+#:
+#: The old class [0-9AB] for the second character was wrong about MAINNET. It
+#: included '0', which base58 does not contain, and excluded real ones: a
+#: mainnet subaddress beginning "8C" (1.586% of the subaddress keyspace, ~1 in
+#: 63) was rejected by the form, as was every integrated address -- both by the
+#: character class and by the 95-only length. tests/test_console.py enforces
+#: that this and gs_common.XMR_ADDR_RE accept exactly the same strings.
+_B58_C = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}$|^4[{_B58_C}]{{105}}$")
 
 SCHEMA = {
     "mode":         ("choice", ["send", "receive"]),

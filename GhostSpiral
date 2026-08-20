@@ -2647,7 +2647,7 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
             continue
 
         if i > 0:
-            newnym(required=True)   # per-chunk quote isolation
+            newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # per-chunk quote isolation
             secure_delay(3.0, 10.0)
 
         # AND A CIRCUIT THIS CHUNK OWNS, not merely a hope of a fresh one.
@@ -2690,7 +2690,7 @@ def stage2_get_swap_quotes(args, proxy, chunks: List[Decimal],
         try:
             quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, _qproxy)
         except Exception as e:
-            newnym()
+            newnym(proxy_url=getattr(args, "tor_proxy", ""))
             integrity_log("stage2", f"quote_api_error:{i}")
             sys.exit(f"[!] SwapKit quote API failed for chunk {i}: {str(e)[:60]}")
 
@@ -3263,8 +3263,8 @@ def stage0_preflight(args, proxy) -> tuple:
     # Fee estimation done after RPC is connected (needs the RPC)
     integrity_log("stage0", "env_checks_ok")
 
-    rpc_primary = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
-    rpc_alt = connect_rpc(args.rpc_alt, proxy_url=args.tor_proxy) if args.rpc_alt else None
+    rpc_primary = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
+    rpc_alt = connect_rpc(args.rpc_alt, proxy_url=getattr(args, "tor_proxy", "")) if args.rpc_alt else None
 
     # Sync guard: wait for nodes to agree on height
     for attempt in range(30):
@@ -5266,7 +5266,7 @@ def main():
     ###########################################################################
     # Stage 1 - JoinMarket (optional BTC tumble before ThorChain)
     ###########################################################################
-    newnym(required=True)   # anonymity gate before stage 1 network ops
+    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before stage 1 network ops
 
     if receive_mode:
         jm_utxos = []
@@ -5283,7 +5283,7 @@ def main():
     # Stage 3 - Build wallets & DAG (runs BEFORE stage2 invocation so
     # the ENTRY receive address exists for ThorChain destination)
     ###########################################################################
-    newnym(required=True)   # anonymity gate before stage 3
+    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before stage 3
     tor_recheck(proxy, "stage3_pre")
 
     # ONE RUN AT A TIME, AND THE GUARD STARTS BEFORE THE FIRST WALLET
@@ -5342,7 +5342,7 @@ def main():
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
         ###########################################################################
-        newnym(required=True)   # anonymity gate before ThorChain execution
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before ThorChain execution
         tor_recheck(proxy, "stage2_exec")
 
         # The quotes outlive the stage that fetched them: the arrival wait below
@@ -5655,7 +5655,7 @@ def main():
         ###########################################################################
         # Stage 5 - Auto sign + broadcast
         ###########################################################################
-        newnym(required=True)   # anonymity gate before broadcast
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before broadcast
         tor_recheck(proxy, "stage5_pre")
 
         _stage5_cleanup(Path(args.output), fanout_file, dag_file, veil_file)
@@ -6053,7 +6053,7 @@ def _run_round_body(args, plan_file, staging_dir, label):
         _round_log("create_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: unsigned TX creation failed (exit {e.returncode})")
 
-    newnym()
+    newnym(proxy_url=getattr(args, "tor_proxy", ""))
     secure_delay(3.0, 8.0)
 
     try:
@@ -6087,7 +6087,7 @@ def _run_round_body(args, plan_file, staging_dir, label):
         _round_log("sign_fail", label, str(e.returncode))
         sys.exit(f"[!] {label}: signing failed (exit {e.returncode})")
 
-    newnym()
+    newnym(proxy_url=getattr(args, "tor_proxy", ""))
     secure_delay(5.0, 15.0)
 
     try:
@@ -6189,7 +6189,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
     if not targets:
         return False
     try:
-        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        rpc = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
     except Exception as e:
         integrity_log("stage5", f"confirm_rpc_connect_fail:{type(e).__name__}")
         print(f"  [!] Could not connect wallet-rpc to await fan-out confirmation: {e}")
@@ -6241,7 +6241,7 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
     caller can stop cleanly with the remaining balance intact.
     """
     try:
-        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        rpc = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
     except Exception as e:
         integrity_log("stage5", f"carrier_rpc_connect_fail:{type(e).__name__}")
         print(f"  [!] {label}: cannot connect wallet-rpc to await the carrier: {e}")
@@ -6363,7 +6363,7 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
                 integrity_log("stage5", f"peel_carrier_timeout:{i}")
                 _partial(relayed)
                 break
-        newnym(required=True)
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
         tor_recheck(proxy, f"stage5_peel_{i}")
         one_path = Path(str(peel_file)[:-5] + f"_peel{i}.json") \
             if str(peel_file).endswith(".json") else Path(str(peel_file) + f".peel{i}")
@@ -6408,7 +6408,7 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
     whatever the real fee left over.
     """
     try:
-        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        rpc = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
     except Exception as e:                                   # noqa: BLE001
         integrity_log("stage5", f"change_settle_rpc_fail:{type(e).__name__}")
         print(f"  [!] {label}: cannot connect wallet-rpc to await the change: {e}")
@@ -6439,7 +6439,7 @@ def _wait_for_change_settled(args, account, sub_idx, proxy, label):
 def _change_residue(args, account, sub_idx):
     """Atomic balance left on the change subaddress, or None if unreadable."""
     try:
-        rpc = connect_rpc(args.rpc_primary, proxy_url=args.tor_proxy)
+        rpc = connect_rpc(args.rpc_primary, proxy_url=getattr(args, "tor_proxy", ""))
         rpc.raw_request("refresh", {})
         tot, _ = rpc.get_subaddress_balance(account, sub_idx)
         return int(tot or 0)
@@ -6780,7 +6780,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     destination is now publicly tied to your swap" is not fixable at all.
     """
     targets = _funded_subaddresses(connect_rpc(args.rpc_primary,
-                                               proxy_url=args.tor_proxy),
+                                               proxy_url=getattr(args, "tor_proxy", "")),
                                    accounts)
     held = [t for t in targets if (t[0], t[1]) in {(int(a), int(i))
                                                    for a, i in (hold or ())}]
@@ -6955,7 +6955,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         # so the exit plan -- which holds --exit-to -- is still wiped.
         _gates_passed = False
         try:
-            newnym(required=True)
+            newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
             tor_recheck(proxy, f"exit_{n}")
             _gates_passed = True
             _run_round(args, path, stage, label.capitalize())
@@ -7035,7 +7035,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     withheld = []
     if veil_file:
         print("  [*] === Round 0: entry veil ===")
-        newnym(required=True)
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
         tor_recheck(proxy, "stage5_veil")
         _run_round(args, veil_file, f"{staging_dir}/veil", "Entry veil")
         # ONE WAIT PER CARRIER, and ALL of them must land.
@@ -7204,7 +7204,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
 
     # -- Round 2: DAG hop-mixing (only if planned) ------------------------
     if dag_file:
-        newnym(required=True)   # anonymity gate before DAG broadcast round
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before DAG broadcast round
         secure_delay(5.0, 15.0)
         if _wait_for_fanout_confirm(args, fanout_targets, proxy):
             print("  [*] === Round 2: DAG hop-mixing ===")
@@ -7216,7 +7216,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                               "did not confirm in time) — the second mixing round "
                               "did not happen")
 
-    newnym()
+    newnym(proxy_url=getattr(args, "tor_proxy", ""))
     secure_delay(5.0, 15.0)
 
     # -- Stage 5d: THE EXIT. This is the step that moves value off this wallet.

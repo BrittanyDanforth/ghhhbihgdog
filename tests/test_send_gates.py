@@ -865,6 +865,105 @@ check("control: three chunks sharing one destination would be visible here — "
       len({_addr(3000)}) == 1 and len(set(_dests)) == 3)
 
 
+
+# ==========================================================================
+# THE ADDRESS FORMAT GATE WAS WRONG ABOUT MAINNET.
+#
+#     XMR_ADDR_RE = ^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$
+#
+# The second character was pinned to a hand-derived class [0-9AB]. It contains
+# '0', which Monero's base58 alphabet EXCLUDES outright, so one member can
+# never occur -- and it omits characters that genuinely do.
+#
+# The first base58 block encodes netbyte || 7 key bytes as 11 characters, so
+# the netbyte fixes char 1 and BOUNDS char 2. Enumerating each mainnet
+# netbyte's range gives the real alphabets:
+#
+#     standard   (18)  4 + [123456789AB]    all allowed
+#     subaddress (42)  8 + [23456789ABC]    'C' was REFUSED
+#     integrated (19)  4 + [BCDEFGHJKLM]    all but 'B' REFUSED
+#
+# So a real mainnet subaddress beginning "8C" was rejected as a bad format --
+# 1.586% of the subaddress keyspace, about one in 63 -- and subaddresses are
+# the ordinary case: create_receive_wallet mints one and an exchange deposit
+# address is normally one. Every integrated address was rejected twice over,
+# by the class and by the 95-only length, while validate_xmr_address's own
+# comment says the factory "also covers integrated addresses, which carry a
+# payment ID and are equally legitimate here".
+# ==========================================================================
+print("\n=== the address format gate accepts every real mainnet form ===")
+
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58_first_block(netbyte):
+    """The 2nd-character alphabet a netbyte can actually produce."""
+    lo, hi = netbyte << 56, ((netbyte + 1) << 56) - 1
+    seen = set()
+    step = max(1, (hi - lo) // 40000)
+    v = lo
+    while v <= hi:
+        x, out = v, ""
+        for _ in range(11):
+            x, r = divmod(x, 58)
+            out = _B58[r] + out
+        seen.add(out[1])
+        v += step
+    return "".join(sorted(seen))
+
+
+for _name, _nb, _first, _ln in (("standard", 18, "4", 95),
+                                ("subaddress", 42, "8", 95),
+                                ("integrated", 19, "4", 106)):
+    _alpha = _b58_first_block(_nb)
+    _refused = [c for c in _alpha
+                if not gs.XMR_ADDR_RE.match(_first + c + "1" * (_ln - 2))]
+    check(f"addr: every 2nd character a real mainnet {_name} can produce is "
+          f"accepted (alphabet {_alpha})", not _refused)
+
+# The specific ones that used to be refused, as named cases.
+check("addr: a mainnet subaddress beginning '8C' is accepted (1 in 63 of them)",
+      bool(gs.XMR_ADDR_RE.match("8C" + "1" * 93)))
+check("addr: a mainnet integrated address (106 chars) is accepted at all",
+      bool(gs.XMR_ADDR_RE.match("4B" + "1" * 104)))
+# Non-vacuity: the OLD pattern really did refuse both.
+_old = __import__("re").compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+check("control: the old pattern refused the '8C' subaddress",
+      not _old.match("8C" + "1" * 93))
+check("control: the old pattern refused every integrated address",
+      not _old.match("4B" + "1" * 104))
+
+# It must not have become a rubber stamp. The CHECKSUM is the real gate and it
+# runs right after this; the regex only has to keep non-addresses out.
+for _bad in ("", "not-an-address", "8" + "1" * 93, "8" + "1" * 95,
+             "5" + "1" * 94, "9" + "1" * 94, "8" + "0" * 94,
+             "8" + "O" * 94, "8" + "l" * 94, "4" + "1" * 104,
+             "8" + "1" * 105):
+    check(f"addr: {_bad[:14]!r}... is still refused by the format gate",
+          not gs.XMR_ADDR_RE.match(_bad))
+# ...and a well-formed string with a bad checksum still dies at the next gate.
+_cs = False
+try:
+    gs.validate_xmr_address("8" + "1" * 94, "probe")
+except SystemExit as _e:
+    _cs = "checksum" in str(_e)
+check("addr: a well-formed address with a BAD checksum is still refused "
+      "(the format gate did not become the whole check)", _cs)
+
+# The console is a format gate in FRONT of this one, so anything it refuses can
+# never be submitted at all. They must agree exactly.
+_con = _load_console_module() if "_load_console_module" in dir() else None
+import importlib.machinery as _im, importlib.util as _iu
+_ld = _im.SourceFileLoader("gs_console_addr", os.path.join(REPO, "gs_console"))
+_con = _iu.module_from_spec(_iu.spec_from_loader(_ld.name, _ld))
+_ld.exec_module(_con)
+_probe = ["4" + c + "1" * 93 for c in _B58] + ["8" + c + "1" * 93 for c in _B58] \
+    + ["4" + c + "1" * 104 for c in _B58] + ["", "x", "8" + "1" * 93]
+_dis = [a for a in _probe
+        if bool(gs.XMR_ADDR_RE.match(a)) != bool(_con.XMR_RE.match(a))]
+check(f"addr: the console and gs_common accept EXACTLY the same strings "
+      f"({len(_probe)} probed, {len(_dis)} disagreements)", not _dis)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -474,7 +474,50 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
 #: Standard Monero address: 95 chars, base58 (no 0OIl), 4/8 mainnet prefix.
 #: Integrated (106) and subaddress forms are deliberately NOT matched loosely
 #: here -- see validate_xmr_address.
-XMR_ADDR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+#: Monero's base58 alphabet -- Bitcoin's, minus the visually ambiguous 0/O/I/l.
+#: Defined here rather than beside _ADDRESS_RE further down, because BOTH need
+#: it and two hand-written character classes for one alphabet is how the one
+#: below came to include a character the alphabet does not contain.
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+#: A mainnet Monero address: 95 chars for standard (4...) and subaddress (8...),
+#: 106 for integrated (4..., carries a payment ID).
+#:
+#: THE OLD PATTERN WAS WRONG ABOUT MAINNET, not merely strict about testnet:
+#:
+#:     ^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$
+#:
+#: The second character was pinned to [0-9AB], a class someone derived by hand.
+#: It contains '0', which base58 EXCLUDES outright, so one of its members can
+#: never occur -- and it omits characters that genuinely do.
+#:
+#: The first base58 block of an address encodes netbyte || 7 key bytes as 11
+#: characters, so the netbyte fixes the first character and BOUNDS the second.
+#: Enumerating each mainnet netbyte's range gives the real alphabets:
+#:
+#:     standard   (netbyte 18)  4 + [123456789AB]     -- all allowed, fine
+#:     subaddress (netbyte 42)  8 + [23456789ABC]     -- 'C' was REFUSED
+#:     integrated (netbyte 19)  4 + [BCDEFGHJKLM]     -- all but 'B' REFUSED
+#:
+#: So a real mainnet SUBADDRESS beginning "8C" was rejected as a bad format.
+#: That is 1.586% of the subaddress keyspace -- about one in 63 -- and
+#: subaddresses are the ordinary case here: create_receive_wallet mints one,
+#: and an exchange deposit address is normally one too.
+#:
+#: Every mainnet INTEGRATED address was rejected twice over: by that character
+#: class and by the length, which allowed only 95. validate_xmr_address's own
+#: comment says the factory "also covers integrated addresses, which carry a
+#: payment ID and are equally legitimate here" -- while the regex three lines
+#: above it refused all of them. An exchange deposit address with a payment ID
+#: is exactly that shape.
+#:
+#: The second character is not re-derived here. It is a function of the netbyte
+#: and the key, the CHECKSUM is what actually proves an address, and
+#: validate_xmr_address runs monero.address.address() immediately below to
+#: verify it. This is the cheap pre-filter it always was; it no longer refuses
+#: real addresses in the name of being one.
+XMR_ADDR_RE = re.compile(
+    f"^[48][{_B58}]{{94}}$|^4[{_B58}]{{105}}$")
 
 
 def validate_xmr_address(addr: str, what: str = "XMR address") -> None:
@@ -1074,7 +1117,7 @@ def check_daemon_relay_egress(daemon_url: str,
     try:
         info = requests.post(
             endpoint, json={"jsonrpc": "2.0", "id": "0", "method": "get_info"},
-            timeout=20, proxies=use_proxies).json().get("result") or {}
+            timeout=20, proxies=use_proxies, allow_redirects=False).json().get("result") or {}
         # WHICH CHAIN. get_info already told us; nothing was reading it.
         #
         # monerod reports nettype as "mainnet" | "testnet" | "stagenet" |
@@ -1096,7 +1139,7 @@ def check_daemon_relay_egress(daemon_url: str,
 
         conns = requests.post(
             endpoint, json={"jsonrpc": "2.0", "id": "0", "method": "get_connections"},
-            timeout=20, proxies=use_proxies).json().get("result") or {}
+            timeout=20, proxies=use_proxies, allow_redirects=False).json().get("result") or {}
         peers = conns.get("connections")
         if peers is None:
             out["detail"] = ("daemon did not return a peer list (restricted RPC?) -- "
@@ -1276,7 +1319,7 @@ def _verify_tor_once(proxy: Dict[str, str]) -> dict:
     if not proxy:
         sys.exit("[!] Tor verification called without proxies — that request "
                  "would go clearnet. Aborting.")
-    r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy)
+    r = requests.get(CHECK_TOR_URL, timeout=15, proxies=proxy, allow_redirects=False)
     r.raise_for_status()
     return r.json()
 
@@ -1318,7 +1361,7 @@ def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
         sys.exit("[!] Tor recheck called without proxies — that request would go "
                  "clearnet. Aborting.")
     try:
-        r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy)
+        r = requests.get(CHECK_TOR_URL, timeout=10, proxies=proxy, allow_redirects=False)
         r.raise_for_status()
         if not r.json().get("IsTor"):
             integrity_log("tor", f"LEAK_mid_{stage}")
@@ -1343,7 +1386,72 @@ _NEWNYM_REQUIRED_ATTEMPTS = 3
 _NEWNYM_RETRY_BACKOFF = 2.0
 
 
-def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
+def tor_control_targets(proxy_url: str = "") -> list:
+    """Where to look for the control port of the Tor serving `proxy_url`.
+
+    newnym() rotated a HARDCODED /var/run/tor/control regardless of which Tor
+    the traffic actually used, and returned True on success. Every call site --
+    all 21 of them -- takes that default. So an operator on Tor Browser
+    (`--tor-proxy socks5h://127.0.0.1:9150`) had their requests carried by
+    Tor Browser's tor while newnym rotated the SYSTEM tor, a different daemon,
+    and every "anonymity gate" in the run silently rotated nothing.
+
+    That is not an exotic setup: gs_console's daemon/Tor detection offers 9150
+    and tests/test_console.py pins it ("detect finds the Tor Browser port").
+
+    Ordered most-specific first: the control port paired with this SOCKS port
+    (Tor's convention, and Tor Browser's, is SOCKS+1), then the conventional
+    unix socket, then the system default port. The caller verifies which Tor it
+    reached -- see _control_owns_socks -- so a wrong guess here is caught
+    rather than acted on.
+    """
+    out = []
+    host, port = "127.0.0.1", None
+    if proxy_url:
+        try:
+            _p = urlparse(proxy_url)
+            host = _p.hostname or host
+            port = _p.port
+        except Exception:                                    # noqa: BLE001
+            port = None
+    if port:
+        out.append(f"{host}:{port + 1}")
+    out.append("/var/run/tor/control")
+    if not port or port != 9050:
+        out.append(f"{host}:9051")
+    return out
+
+
+def _control_owns_socks(controller, proxy_url: str) -> bool:
+    """Is this control connection the SAME tor that serves `proxy_url`?
+
+    Answerable, and worth answering: Tor's control port reports its own SOCKS
+    listeners. Verified against a running tor --
+
+        GETINFO net/listeners/socks -> "127.0.0.1:9050"
+
+    -- so rotating the wrong daemon is detectable instead of silent. Returns
+    True when it cannot tell (an old tor without the key), because refusing on
+    a missing diagnostic would be worse than the rotation this is guarding.
+    """
+    if not proxy_url:
+        return True
+    try:
+        want = urlparse(proxy_url)
+        wport = want.port
+        if not wport:
+            return True
+        listeners = controller.get_info("net/listeners/socks", "")
+    except Exception:                                        # noqa: BLE001
+        return True
+    if not listeners:
+        return True
+    return any(str(wport) == l.strip().strip('"').rsplit(":", 1)[-1]
+               for l in listeners.split() if ":" in l)
+
+
+def newnym(ctrl: str = "/var/run/tor/control", required: bool = False,
+           proxy_url: str = "") -> bool:
     """Request a new Tor circuit. With required=True: rotate, or STOP.
 
     WHAT THIS USED TO DO, AND WHY IT WAS A FAKE GUARANTEE. Every caller passing
@@ -1388,8 +1496,42 @@ def newnym(ctrl: str = "/var/run/tor/control", required: bool = False) -> bool:
         try:
             from stem import Signal as StemSignal
             from stem.control import Controller
-            with Controller.from_socket_file(ctrl) as c:
-                c.authenticate()
+            # THE TOR THE TRAFFIC USES, not whichever one owns a fixed path.
+            #
+            # `ctrl` keeps its default so no call site changes, but when a
+            # proxy_url is supplied the control port paired with THAT SOCKS
+            # port is tried first, and whichever connection is made is then
+            # asked whether it owns that SOCKS listener. Rotating a different
+            # daemon and reporting success is the failure this closes.
+            _targets = [ctrl] if not proxy_url else (
+                tor_control_targets(proxy_url) + [ctrl])
+            _seen, _c, _err = set(), None, None
+            for _t in _targets:
+                if _t in _seen:
+                    continue
+                _seen.add(_t)
+                try:
+                    _c = (Controller.from_socket_file(_t) if _t.startswith("/")
+                          else Controller.from_port(*_t.rsplit(":", 1)[0:1],
+                                                    port=int(_t.rsplit(":", 1)[1])))
+                    _c.authenticate()
+                except Exception as _e:                      # noqa: BLE001
+                    _err = _e
+                    _c = None
+                    continue
+                if _control_owns_socks(_c, proxy_url):
+                    break
+                # Right protocol, WRONG tor. Keep looking rather than rotate a
+                # daemon that carries none of this run's traffic.
+                try:
+                    _c.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+                _c = None
+                _err = RuntimeError("control port belongs to a different tor")
+            if _c is None:
+                raise _err or RuntimeError("no usable tor control port")
+            with _c as c:
                 c.signal(StemSignal.NEWNYM)
             time.sleep(5)
             _NEWNYM_CONSECUTIVE_FAILURES = 0
@@ -1475,7 +1617,7 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
     # observing one actually reach the target. Any falsy value must abort.
     if not proxies:
         sys.exit("[!] safe_get called without proxies — clearnet leak. Aborting.")
-    r = requests.get(url, timeout=20, proxies=proxies)
+    r = requests.get(url, timeout=20, proxies=proxies, allow_redirects=False)
     r.raise_for_status()
     return r.json()
 
@@ -1484,7 +1626,7 @@ def safe_get(url: str, proxies: Dict[str, str] = None) -> dict:
 def safe_post(url: str, payload: dict, proxies: Dict[str, str] = None) -> dict:
     if not proxies:      # proxies={} means DIRECT in requests -- see safe_get
         sys.exit("[!] safe_post called without proxies — clearnet leak. Aborting.")
-    r = requests.post(url, json=payload, timeout=25, proxies=proxies)
+    r = requests.post(url, json=payload, timeout=25, proxies=proxies, allow_redirects=False)
     r.raise_for_status()
     return r.json()
 
@@ -1554,8 +1696,34 @@ class MoneroRPC:
         else:
             self._backend = JSONRPCWallet(host=host, port=port,
                                           proxy_url=proxy_url)
+            # BOTH SCHEMES, because monero-python only sets ONE.
+            #
+            # JSONRPCWallet.__init__ does `self.proxies = {protocol: proxy_url}`
+            # -- a single-key map keyed on the scheme of the URL it was given.
+            # Inspected on the installed library: passing socks5h://... yields
+            # exactly {'http': 'socks5h://127.0.0.1:9050'}. Any request the
+            # backend makes over the OTHER scheme carries no proxy at all and
+            # goes out clearnet to the operator's remote node.
+            #
+            # And the verification below could not see it: it asks whether ANY
+            # value in the map matches, which a half-covered map satisfies. The
+            # comment above it says "an assignment that looks right is not
+            # evidence the traffic is proxied", and this was the same mistake
+            # one level in -- the map was checked, its COVERAGE was not.
+            #
+            # Filled in rather than merely asserted, because a missing key is a
+            # library detail with an obvious correct value, and refusing here
+            # would strand every remote-node operator on a working setup.
+            _applied = getattr(self._backend, "proxies", None)
+            if isinstance(_applied, dict):
+                for _scheme in ("http", "https"):
+                    if _applied.get(_scheme) != proxy_url:
+                        _applied[_scheme] = proxy_url
             applied = getattr(self._backend, "proxies", None) or {}
-            if not any(str(v) == str(proxy_url) for v in applied.values()):
+            # EVERY scheme, not any: a map covering one of them is how the
+            # traffic escaped in the first place.
+            if not all(str(applied.get(_s)) == str(proxy_url)
+                       for _s in ("http", "https")):
                 # THE HOST ITSELF STAYS OFF THE CHAIN. This wrote
                 # `non_local_rpc:<host>:<port>` — the operator's remote node,
                 # which is very often a v3 onion service they run. chain_safe
@@ -1856,8 +2024,7 @@ def daemon_fee_estimate(daemon_url: str, proxies: Optional[Dict[str, str]] = Non
         r = requests.post(
             endpoint,
             json={"jsonrpc": "2.0", "id": "0", "method": "get_fee_estimate"},
-            timeout=20, proxies=use_proxies,
-        )
+            timeout=20, proxies=use_proxies, allow_redirects=False)
         r.raise_for_status()
         return r.json().get("result", {}) or {}
     except Exception:
@@ -2461,12 +2628,11 @@ def load_receive_bundle(path) -> dict:
 #  Sensitive data scrubbing
 # ---------------------------------------------------------------------------
 
-#: Monero's base58 alphabet -- Bitcoin's, minus the visually ambiguous
-#: 0/O/I/l. A standard address is 95 chars, a subaddress 95, an integrated
-#: address 106; nothing else this toolchain prints is a 90+ char base58 run,
-#: so the length floor makes false positives effectively impossible while
-#: still catching all three forms and any future longer one.
-_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+#: A standard address is 95 chars, a subaddress 95, an integrated address 106;
+#: nothing else this toolchain prints is a 90+ char base58 run, so the length
+#: floor makes false positives effectively impossible while still catching all
+#: three forms and any future longer one. _B58 is defined once, up beside
+#: XMR_ADDR_RE.
 _ADDRESS_RE = re.compile(f"[{_B58}]{{90,}}")
 
 

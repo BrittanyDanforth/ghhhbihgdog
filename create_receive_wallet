@@ -252,7 +252,7 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # required=True: the header claims this rotation happens, and a silent
     # failure leaves the subaddress creation on the same circuit as whatever
     # follows it -- which is the correlation the rotation exists to break.
-    newnym(required=True)
+    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
     # (account, subaddress) alongside the address, so main() can compare
     # SUCCESSIVE mints -- see refuse_duplicate_receive.
     #
@@ -471,7 +471,7 @@ def main():
     verify_tor(proxy)
 
     try:
-        wallet_rpc = connect_rpc(args.rpc, proxy_url=args.tor_proxy)
+        wallet_rpc = connect_rpc(args.rpc, proxy_url=getattr(args, "tor_proxy", ""))
     except Exception as e:
         integrity_log("wallet", f"rpc_connect_fail:{type(e).__name__}")
         sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")

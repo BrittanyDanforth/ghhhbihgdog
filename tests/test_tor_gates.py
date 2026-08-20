@@ -72,7 +72,7 @@ def drive(fn, *args, payload=None, raises=None, status_ok=True, **kw):
     saved_get = gs.requests.get
     saved_log = gs.integrity_log
     try:
-        def _get(url, timeout=None, proxies=None):
+        def _get(url, timeout=None, proxies=None, **_kw):
             _get.seen = {"url": url, "proxies": proxies, "timeout": timeout}
             if raises is not None:
                 raise raises

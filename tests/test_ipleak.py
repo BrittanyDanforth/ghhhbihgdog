@@ -541,7 +541,7 @@ def _egress_with(peers, offline=False):
     """Drive the real check with a scripted get_info/get_connections pair."""
     calls = {"n": 0}
 
-    def fake_post(url, json=None, timeout=None, proxies=None):
+    def fake_post(url, json=None, timeout=None, proxies=None, **_kw):
         calls["n"] += 1
         if json.get("method") == "get_info":
             return _FakeResp({"result": {"offline": offline}})
@@ -785,8 +785,33 @@ check("isolation: ...and posts the quote through it, not the shared proxy",
 check("isolation: thor_swap_preparer's per-pair loop does the same",
       'isolated_proxy(args.tor_proxy, f"pair:{i}")' in _th_src)
 # Additive, not a replacement: newnym must still run.
-check("isolation: newnym is KEPT alongside it (defence in depth)",
-      "newnym(required=True)" in _gs_src and "newnym(required=True)" in _th_src)
+# The PROPERTY, not the literal. This read "newnym(required=True)" and went red
+# when proxy_url= was threaded through the call -- the same trap srcutil's
+# docstring names: "asserting that a particular call appears on a particular
+# line does not [survive]". What matters is that a REQUIRED rotation still
+# happens, whatever else the call carries.
+import ast as _ast
+
+
+def _required_newnyms(path):
+    n = 0
+    for node in _ast.walk(_ast.parse(open(path).read())):
+        if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "newnym":
+            if any(k.arg == "required" and getattr(k.value, "value", None) is True
+                   for k in node.keywords):
+                n += 1
+    return n
+
+
+_gs_req = _required_newnyms(os.path.join(REPO, "GhostSpiral"))
+_th_req = _required_newnyms(os.path.join(REPO, "thor_swap_preparer"))
+check(f"isolation: newnym is KEPT alongside it, defence in depth "
+      f"(GhostSpiral {_gs_req} required rotations, thor {_th_req})",
+      _gs_req > 0 and _th_req > 0)
+# ...and it now names WHICH tor to rotate, or it can rotate a daemon that
+# carries none of this run's traffic and report success.
+check("isolation: ...and every required rotation says which tor it means",
+      "proxy_url=getattr(args, \"tor_proxy\", \"\")" in _gs_src)
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed, {len(UNPROVEN)} UNPROVEN")
 if UNPROVEN:
