@@ -126,7 +126,15 @@ try:
           all(h.get("sweep") is True and "amt" not in h for h in hops))
 
     # Go VIEW-ONLY: this is what the pipeline's online machine actually runs.
+    # The spend wallet that signs must NEVER have refreshed from a daemon --
+    # wallet-cli refuses import_outputs on a previously-synced ('hot') file,
+    # and hop 1's unsigned set carries outputs to import. Restore from keys
+    # into a new --offline file; the RPC wallet stays hot and is only the
+    # view-only constructor after this point.
     vk = wj("query_key", {"key_type": "view_key"})["result"]["key"]
+    sk = wj("query_key", {"key_type": "spend_key"})["result"]["key"]
+    cold = lab.restore_cold_wallet(os.path.join(BASE, "cold", "spend"),
+                                   primary, sk, vk)
     kimages = wj("export_key_images", {"all": True}).get("result", {}).get("signed_key_images")
     wj("close_wallet")
     wj("generate_from_keys", {"restore_height": 0, "filename": "view",
@@ -158,7 +166,7 @@ try:
         stage = os.path.join(BASE, f"hop{i}")
         args = A_(tor_proxy="socks5h://127.0.0.1:9050",
                   rpc=WR.replace("/json_rpc", ""), outdir=stage, fee_priority=1,
-                  wallet_file=os.path.join(BASE, "w", "full"), wallet_password="",
+                  wallet_file=cold, wallet_password="",
                   wallet_cli=shim)
         # SHIPPED phase_create -- must take the sweep branch (sweep_all).
         airgap.phase_create(args, [hop], {"account_index": ACC})

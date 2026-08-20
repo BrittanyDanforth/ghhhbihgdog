@@ -95,6 +95,7 @@ try:
                           "account_index": 0, "subaddr_indices": [0], "priority": 1})
     h = dj("get_info")["result"]["height"]; mine(primary, h + 12); wj("refresh")
     vk = wj("query_key", {"key_type": "view_key"})["result"]["key"]
+    sk = wj("query_key", {"key_type": "spend_key"})["result"]["key"]
     print(f"ENTRY subaddr {E} funded {subbal(E)[0] / 1e12} XMR")
 
     # SHIPPED plan: unequal amounts + peel sources.
@@ -111,6 +112,11 @@ try:
     print("peel amounts:", [str(a) for a in amounts])
 
     # 2. Go VIEW-ONLY (this is what the pipeline's online machine runs).
+    # The spend wallet that signs must NEVER have refreshed from a daemon --
+    # wallet-cli refuses import_outputs on a previously-synced ('hot') file,
+    # and peels 2..N spend carrier outputs the hot RPC wallet never held.
+    cold = lab.restore_cold_wallet(os.path.join(BASE, "cold", "spend"),
+                                   primary, sk, vk)
     kimages = wj("export_key_images", {"all": True}).get("result", {}).get("signed_key_images")
     wj("close_wallet")
     wj("generate_from_keys", {"restore_height": 0, "filename": "view", "address": primary,
@@ -228,7 +234,7 @@ try:
 
         # SHIPPED phase_sign (offline) -> imports outputs, then signs
         airgap.phase_sign(
-            A(outdir=stage, wallet_file=os.path.join(BASE, "w", "full"),
+            A(outdir=stage, wallet_file=cold,
               wallet_password="", wallet_cli=shim), one)
         sb = os.path.join(stage, "signed", "tx_0.signed")
         check(f"peel {i + 1}/{N}: SHIPPED phase_sign COLD-SIGNED it"

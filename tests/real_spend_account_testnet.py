@@ -129,8 +129,10 @@ try:
     check("SEND: no output was placed in account 0 (its subaddr 0 is PRIMARY)",
           all(addr_index[a][0] != 0 for a in subs))
     # The shipped resolver must read ENTRY's account back, not be told it.
+    # Plural: --split N mints one entry per chunk, so the live path returns a
+    # list of pairs. A send with one ENTRY is a one-element list.
     check("SEND: the shipped resolver agrees on ENTRY's (account, index)",
-          ghost.resolve_entry_account(rpc, addr_index, ENTRY, None) == (ACC, E))
+          ghost.resolve_entry_accounts(rpc, addr_index, [ENTRY], None) == [(ACC, E)])
 
     # 3. THE FIX: the spend account is the mix account. Prove that (ACC, E)
     #    really is ENTRY, and that (0, E) is a DIFFERENT address -- which is
