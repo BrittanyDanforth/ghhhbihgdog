@@ -44,7 +44,8 @@ from gs_common import (
     secure_hex, secure_delay, atomic_write_json, secure_file_perms,
     validate_proxy, install_signal_handlers, shutdown_requested,
     scrub_address, bech32_checksum_ok, secure_mkdir,
-    check_daemon_relay_egress, secure_delete_file, secure_delete_tree,
+    check_daemon_relay_egress, secure_delete_file, secure_delete_or_warn,
+    secure_delete_tree,
     load_receive_bundle, memo_binds_destination, env_or_argv, sum_quoted_xmr,
     finite_decimal,
     decimal_env, XMR_ABSURD_TOTAL,
@@ -56,10 +57,6 @@ from gs_common import (
 )
 
 DUST_XMR = Decimal("0.0001")
-
-#: One piconero, the smallest amount Monero represents. Used to put a gate
-#: strictly ABOVE a computed quantity rather than merely at it.
-PICONERO = Decimal("0.000000000001")
 
 # How many fee-widths to hold back per remaining peel when sizing what a peel
 # forwards to the next rotating carrier. See the reserve comment in the peel
@@ -219,15 +216,14 @@ def hop_delay(window=None) -> int:
 # with certainty: the DESTINATION of the change, not its size.
 FANOUT_SPEND_FRACTION = Decimal("0.9")
 
-# How many fee-widths the fan-out holds back for the real fee. Anything the
-# fan-out does not allocate becomes monerod's change, and monerod's change goes
-# to the account's subaddress 0 -- the wallet's identity address -- so this
-# buffer is the ONLY thing that lands there and it must be sized against the
-# fee, not against the balance. Kept tighter than the peel chain's carrier
-# reserve on purpose: a fan-out is one transaction, so an under-sized buffer
-# fails before anything moves, while an under-sized peel reserve strands funds
-# mid-chain.
-FANOUT_FEE_BUFFER_MULT = Decimal("3")
+# (FANOUT_FEE_BUFFER_MULT = 3 used to sit here: "how many fee-widths the fan-out
+# holds back for the real fee". It was the leftover of the fee-sized buffer the
+# block above says was written and NOT shipped -- nothing read it, so the
+# fan-out has always held back 10% of the balance, not three fee-widths, while a
+# constant in the present tense said otherwise. Its comment also called the
+# change destination "the wallet's identity address", which the account rotation
+# stopped being true: these are per-run accounts, and _run_change_sweep records
+# the verification that the wallet's real primary address is spent zero times.)
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
 
@@ -490,11 +486,14 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     if rng is None:
         import secrets as _s
         rng = _s.SystemRandom()
-    # spend_fraction=1 means "the caller already held back an ABSOLUTE fee
-    # buffer, so distribute the rest". See FANOUT_FEE_BUFFER_MULT: whatever is
-    # not distributed becomes monerod's change, and monerod's change goes to
-    # the account's subaddress 0 -- so an unallocated percentage is not a
-    # safety margin, it is a deposit into the wallet's identity address.
+    # spend_fraction OVERRIDES the default budget; it does not add a reserve.
+    # The only caller that passes one is fit_peel_distribution, walking
+    # PEEL_BUDGET_FRACTIONS (0.80 down to 0.40) to find a distribution a peel
+    # chain can afford -- so every value ever passed here is SMALLER than the
+    # default, never larger. Whatever is not distributed becomes monerod's
+    # change on the spending account's subaddress 0, which is why the change
+    # sweep exists (see _run_change_sweep) and why a lower fraction means MORE
+    # change to sweep, not more safety margin.
     budget = usable * (FANOUT_SPEND_FRACTION if spend_fraction is None
                        else spend_fraction)
     min_each = (hop_fee_reserve(fee_xmr) + DUST_XMR) if dag_enabled else (DUST_XMR * 2)
@@ -586,7 +585,7 @@ def size_distribution(fanout_dests: list, entry_unlocked: list,
         return slices, [], [], None
     total = sum(entry_unlocked, Decimal(0)) or Decimal(1)
     slice_usable = [usable * (u / total) for u in entry_unlocked]
-    amounts = []
+    by_addr = {}
     for i, sl in enumerate(slices):
         got = compute_fanout_amounts(slice_usable[i], len(sl), fee_xmr,
                                      dag_enabled, rng)
@@ -597,7 +596,40 @@ def size_distribution(fanout_dests: list, entry_unlocked: list,
             # every other chunk was fine, under a message about the wallet
             # balance being too small -- which it was not.
             return slices, slice_usable, [], i
-        amounts.extend(got)
+        for _addr, _amt in zip(sl, got):
+            by_addr[_addr] = _amt
+    # BY ADDRESS, NOT BY POSITION, and that is the whole point of this block.
+    #
+    # This was `amounts.extend(got)` -- a flat concatenation of the per-slice
+    # amounts -- and the caller does `dict(zip(fanout_dests, fanout_amounts))`.
+    # That is only correct while concat(slices) == fanout_dests EXACTLY, i.e.
+    # while split_by_weight hands back CONTIGUOUS slices IN ORDER. Nothing
+    # anywhere said so. split_by_weight's own docstring justifies contiguity as
+    # a readability choice -- "contiguity keeps the mapping obvious when a plan
+    # is read back by hand" -- and explicitly names round-robin as the
+    # equivalent alternative, so the one edit its comment invites is the edit
+    # that breaks this silently.
+    #
+    # Measured, 9 mix targets across chunks weighted 4/3/1: contiguous slices
+    # ask each carrier for 2.70/2.02/0.67 XMR against budgets of
+    # 3.00/2.25/0.75. The same code with round-robin slices asks for
+    # 1.55/0.72/3.12 -- the third carrier holds 0.75 and is told to pay 3.12.
+    # The fan-out then dies "not enough money" AFTER the veils have relayed and
+    # paid their fees, which is the exact failure the per-carrier sizing above
+    # exists to prevent.
+    #
+    # Keyed by address, any partition works and the coupling is gone. A
+    # partition that does not COVER every destination stops the run here, at
+    # plan time, before a veil has moved anything -- rather than handing the
+    # planner a short list to misalign against.
+    _missing = [a for a in fanout_dests if a not in by_addr]
+    if _missing:
+        raise RuntimeError(
+            f"size_distribution: {len(_missing)} of {len(fanout_dests)} mix "
+            f"destinations were in no slice, so they have no amount and no "
+            f"carrier to pay them. split_by_weight must PARTITION its items. "
+            f"Refusing to plan a distribution that would leave them unfunded.")
+    amounts = [by_addr[a] for a in fanout_dests]
     return slices, slice_usable, amounts, None
 
 
@@ -5631,7 +5663,7 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
             # The staging subdir itself is wiped by _run_round -- this loop used
             # to be the ONLY caller that did it, which is precisely why the
             # veil, fan-out and DAG rounds did not.
-            secure_delete_file(one_path)
+            secure_delete_or_warn(one_path, "this peel's plan (its destination and amount)")
     integrity_log("stage5", f"peel_chain_done:{relayed}_of_{n}")
     print(f"  [+] Peeling chain: {relayed}/{n} peels relayed.")
     return relayed
@@ -5869,7 +5901,7 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
                   f"verified nothing is parked on that change address.")
         return True
     finally:
-        secure_delete_file(path)
+        secure_delete_or_warn(path, "the change-sweep plan (its destination)")
         _cs = Path(stage)
         if _cs.is_dir() and not secure_delete_tree(_cs):
             print(f"  [!] Could not securely wipe {stage}; remove it manually.")
@@ -6159,7 +6191,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   f"NOT withdrawn and its funds are still on this wallet.")
             failed += 1
         finally:
-            secure_delete_file(path)
+            secure_delete_or_warn(path, "the exit plan (YOUR --exit-to destination)")
             _es = Path(stage)
             if _es.is_dir() and not secure_delete_tree(_es):
                 print(f"  [!] Could not securely wipe {stage}; remove it manually.")

@@ -5,7 +5,7 @@ Every test here drives the REAL main() with the network, Tor and sleep calls
 stubbed -- nothing reimplements the logic under test. Each one was confirmed to
 FAIL against the pre-fix build before being committed (see run_all's banner).
 """
-import sys, os, json, hashlib, tempfile, importlib.util, importlib.machinery
+import sys, os, io, json, hashlib, shutil, tempfile, importlib.util, importlib.machinery
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -98,8 +98,19 @@ class Harness:
         sys.argv = ["broadcast_signed_xmr", path or self.dir,
                     "--tor-proxy", "socks5h://127.0.0.1:9050",
                     "--rebroadcast", "1", *extra]
+        # CAPTURED, NOT DISCARDED. This sent stdout to /dev/null, so no test
+        # in this file could assert on what the operator is TOLD -- in a
+        # toolchain where the message is frequently the whole protection (the
+        # withheld-output explanation, the no-delays warning, the unprovable
+        # -identity warning). A check written against `msg` alone silently
+        # tests the exit path only, which is how an operator-facing warning
+        # can be deleted with every suite still green.
+        #
+        # `self.out` holds everything printed; the return signature is
+        # unchanged so existing checks keep working.
         out = sys.stdout
-        sys.stdout = open(os.devnull, "w")
+        buf = io.StringIO()
+        sys.stdout = buf
         try:
             self.mod.main()
             return 0, ""
@@ -111,7 +122,8 @@ class Harness:
             # tell "refused cleanly" from "crashed".
             return 70, f"CRASH: {type(e).__name__}: {e}"
         finally:
-            sys.stdout.close(); sys.stdout = out
+            sys.stdout = out
+            self.out = buf.getvalue()
 
     def progress(self):
         with open(os.path.join(self.work, "broadcast_progress.json")) as f:
@@ -201,6 +213,107 @@ def test_absent_blob_does_not_brick_resume():
     check("resume relays only the outstanding TX", len(h.posts) == 3)
     check("resume never re-broadcasts a relayed TX",
           len([p for p in h.posts if p["params"]["tx_data_hex"] == "0101010101010101"]) == 1)
+
+
+# --------------------------------------------------------------------------
+# 4b. THE BATCH FENCE MUST ACTUALLY TELL TWO BATCHES APART.
+#
+# load_progress calls the fingerprint "a fingerprint of the blob set: a
+# progress file written for a different batch must not be applied to this
+# one". It was taken over the blob NAMES only -- and every batch this
+# toolchain produces is named tx_0.signed, tx_1.signed, ... So two DIFFERENT
+# batches with the same number of transactions fingerprinted IDENTICALLY: the
+# second loaded the first's `relayed` set, skipped its own transactions as
+# already-sent, and exited 0 reporting success, having broadcast nothing.
+#
+# The fence now covers each blob's manifest HASH as well as its name. The
+# hashes come from the manifest rather than from reading the blobs, so the
+# earlier fix -- one momentarily-absent blob must not change the fingerprint --
+# still holds.
+#
+# GhostSpiral never hit this: it passes --resume <staging>/bcast_progress.json,
+# a fresh path per round. The exposure is the documented STANDALONE use, where
+# progF defaults to ./broadcast_progress.json and is never deleted after a
+# successful run.
+# --------------------------------------------------------------------------
+def test_progress_fence_distinguishes_different_batches():
+    # Batch A relays and leaves a progress file behind.
+    a = Harness(n=1)
+    a.entries[0]  # noqa: B018  (documents that the blob is tx_0.signed)
+    code_a, _ = a.run(path=a.manifest)
+    check("fence: batch A relays its transaction", code_a == 0 and len(a.posts) == 1)
+    prog_a = a.progress()
+    check("fence: ...and records it", prog_a.get("relayed"))
+
+    # Batch B: a DIFFERENT transaction under the SAME blob name. The Harness
+    # generates identical bytes for a given index, so rewrite B's blob and its
+    # recorded hash -- two batches with byte-identical transactions cannot
+    # occur in reality and the fence is right to call those the same batch.
+    b = Harness(n=1)
+    _bp = b.entries[0]["file"]
+    with open(_bp, "wb") as _f:
+        _f.write(b"FANOUT-TX-DIFFERENT")
+    b.entries[0]["hash"] = hashlib.sha256(b"FANOUT-TX-DIFFERENT").hexdigest()
+    with open(b.manifest, "w") as _f:
+        json.dump(b.entries, _f)
+    check("fence: both batches use the same blob name",
+          os.path.basename(a.entries[0]["file"])
+          == os.path.basename(b.entries[0]["file"]))
+    check("fence: ...but carry different transactions",
+          a.entries[0]["hash"] != b.entries[0]["hash"])
+    # Move A's progress file next to B, which is what happens when an operator
+    # broadcasts two batches from one directory without --resume.
+    shutil.copy(os.path.join(a.work, "broadcast_progress.json"),
+                os.path.join(b.work, "broadcast_progress.json"))
+    code_b, msg_b = b.run(path=b.manifest)
+    check("fence: batch B does NOT silently skip its own transaction as "
+          "already-relayed", not (code_b == 0 and b.posts == []))
+    check("fence: ...it refuses, naming the mismatch",
+          code_b != 0 and "DIFFERENT set of blobs" in msg_b)
+    check("fence: ...and relays nothing while refusing", b.posts == [])
+
+
+def test_progress_fence_still_resumes_the_same_batch():
+    # The fence must not break the thing it exists to enable.
+    h = Harness(n=3)
+    h.responder = lambda payload: (
+        {"error": {"message": "timeout"}}
+        if payload["params"]["tx_data_hex"] == "0303030303030303"
+        else {"result": {"tx_hash_list": ["a" * 64]}})
+    code, _ = h.run(path=h.manifest)
+    check("fence control: a partly-failed batch does not report success",
+          code != 0)
+    sent = len(h.posts)
+    h.posts.clear()
+    h.responder = lambda payload: {"result": {"tx_hash_list": ["a" * 64]}}
+    code2, _ = h.run(path=h.manifest)
+    check("fence control: the SAME batch resumes and finishes", code2 == 0)
+    check("fence control: ...re-sending only what was outstanding, not all "
+          f"{sent}", len(h.posts) == 1)
+
+
+def test_progress_fence_warns_when_identity_is_unprovable():
+    # A legacy manifest records no hashes, so the fence degrades to names and
+    # cannot prove identity. Not fatal -- refusing would strand an operator
+    # mid-batch -- but never silent, because the failure mode is "reports
+    # success, broadcast nothing".
+    h = Harness(n=2, hashes=False)
+    names = [os.path.basename(e["file"]) if isinstance(e, dict) else os.path.basename(e)
+             for e in h.entries]
+    fp = hashlib.sha256(
+        "|".join(sorted(f"{n}:" for n in names)).encode()).hexdigest()[:32]
+    with open(os.path.join(h.work, "broadcast_progress.json"), "w") as f:
+        json.dump({"schema": "broadcast_progress_v2", "relayed": [], 
+                   "failed_perm": [], "log": [], "blob_fingerprint": fp}, f)
+    code, msg = h.run(path=h.manifest)
+    # ON STDOUT, which is where the operator reads it -- `msg` is only the
+    # exit message and this warning is not fatal.
+    check("fence: a hashless manifest WARNS that identity cannot be proven",
+          "matched by FILENAME" in h.out)
+    check("fence: ...and says what the failure mode is",
+          "report success" in h.out and "SKIPPED" in h.out)
+    check("fence: ...and it is a warning, not an abort — refusing would strand "
+          "an operator mid-batch on a legacy manifest", code == 0)
 
 
 # --------------------------------------------------------------------------

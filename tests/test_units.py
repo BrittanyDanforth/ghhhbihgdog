@@ -986,14 +986,76 @@ check("changesweep: ...and the settle condition is 'nothing still confirming'",
 # The success message must be VERIFIED, not asserted.
 check("changesweep: it re-reads the balance instead of claiming success",
       "_change_residue(" in _cs_fn)
+# DRIVEN, not grepped. These were four source-substring checks against a slice
+# of GhostSpiral -- they asserted that certain STRINGS appear near
+# _run_change_sweep, which is a proxy for the behaviour and not the behaviour.
+# The wipe check in particular read
+#
+#     check(..., "secure_delete_file(path)" in _cs_fn)
+#
+# so renaming the call (to route it through secure_delete_or_warn, which does
+# the same thing and reports a FAILED wipe instead of swallowing it) turned it
+# red while the plan file was still being erased -- a check that fails for a
+# change that improved the thing it was guarding, and would equally have
+# stayed GREEN if the delete had been moved outside the `finally`.
+import io as _io, contextlib as _ctx
+
+
+def _drive_change_sweep(residue, settle=True):
+    """Run the REAL _run_change_sweep. Returns (ok, stdout, plan_path_existed)."""
+    seen = {}
+    saved = (ghost._run_round, ghost._wait_for_change_settled,
+             ghost._change_residue, ghost.newnym, ghost.tor_recheck,
+             ghost.integrity_log, ghost.secure_delay, ghost.hop_delay)
+    stg = os.path.join(tempfile.mkdtemp(prefix="csdrive_"), "tx_staging")
+    os.makedirs(stg, exist_ok=True)
+    try:
+        def _rr(args, path, stage, label, **k):
+            # capture whether the plan file exists DURING the round
+            seen["path"] = path
+            seen["existed_during"] = os.path.exists(path)
+            return 1
+        ghost._run_round = _rr
+        ghost._wait_for_change_settled = lambda *a, **k: (settle, 1)
+        ghost._change_residue = lambda *a, **k: residue
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
+        ghost.integrity_log = lambda *a, **k: None
+        ghost.secure_delay = lambda *a, **k: None
+        ghost.hop_delay = lambda *a, **k: 0
+        buf = _io.StringIO()
+        _a = types.SimpleNamespace(rpc_primary="http://127.0.0.1:18083",
+                                   tor_proxy="socks5h://127.0.0.1:9050")
+        with _ctx.redirect_stdout(buf):
+            ok = ghost._run_change_sweep(_a, 4, 0, "DEST", 1, stg, None, {},
+                                         delay_window=(0, 0))
+        after = os.path.exists(seen.get("path", "")) if seen.get("path") else None
+        return ok, buf.getvalue(), seen.get("existed_during"), after
+    finally:
+        (ghost._run_round, ghost._wait_for_change_settled,
+         ghost._change_residue, ghost.newnym, ghost.tor_recheck,
+         ghost.integrity_log, ghost.secure_delay, ghost.hop_delay) = saved
+
+
+_ok_c, _out_c, _during, _after = _drive_change_sweep(0)
+check("changesweep: the plan file EXISTS while the round runs",
+      _during is True)
+check("changesweep: ...and is GONE afterwards — the file itself, not the name "
+      "of the call that erases it", _after is False)
+check("changesweep: a clean sweep reports success", _ok_c is True)
+check("changesweep: the clean case says the result was VERIFIED, not assumed",
+      "verified nothing is parked" in _out_c)
+
+_ok_r, _out_r, _, _after_r = _drive_change_sweep(5_000_000)
 check("changesweep: a residual is reported honestly",
-      "STILL on account" in _cs_fn)
-check("changesweep: the clean case says the result was verified",
-      "verified nothing is parked" in _cs_fn)
-check("changesweep: a timeout is reported honestly, not silently swallowed",
-      "NOT swept" in _cs_fn and "UNMIXED" in _cs_fn)
-check("changesweep: the plan file is wiped after the round",
-      "secure_delete_file(path)" in _cs_fn)
+      "STILL on account" in _out_r)
+check("changesweep: ...and the plan file is still erased on that path",
+      _after_r is False)
+
+_ok_t, _out_t, _, _after_t = _drive_change_sweep(0, settle=False)
+check("changesweep: a settle timeout is reported, not silently swallowed",
+      "NOT swept" in _out_t and "UNMIXED" in _out_t)
+check("changesweep: ...and it does NOT claim success", _ok_t is not True)
 
 # The entry it builds must satisfy the signer's own validator.
 _cs_entry = {"src": "change", "src_index": 0, "dst": "D", "sweep": True,

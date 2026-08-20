@@ -81,9 +81,6 @@ def _shell_histories() -> list:
     return out
 
 
-#: Kept as a module name for the tests and for anything that introspects it.
-SHELL_HISTORIES = _shell_histories()
-
 PYCACHE_GLOBS = [
     str(Path.home() / "**/__pycache__"),
     "/tmp/**/__pycache__",

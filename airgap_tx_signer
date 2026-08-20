@@ -39,6 +39,7 @@ from gs_common import (
     install_signal_handlers, shutdown_requested, scrub_address,
     redact_addresses, env_or_argv,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
+    secure_delete_or_warn,
     secure_write_text, secure_write_bytes, secure_mkdir, secure_delete_tree,
 )
 
@@ -792,7 +793,7 @@ def _offline_account_count(wallet_file: str, args) -> int:
     except Exception:                                        # noqa: BLE001
         return 0
     finally:
-        secure_delete_file(Path(pw_path))
+        secure_delete_or_warn(Path(pw_path), "the wallet password")
 
 
 def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
@@ -871,7 +872,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
         print(f"  [!] Could not create accounts on the offline wallet "
               f"({str(e)[:60]}).")
     finally:
-        secure_delete_file(Path(pw_path))
+        secure_delete_or_warn(Path(pw_path), "the wallet password")
 
 
 def _import_view_outputs(outdir, wallet_file: str, args) -> None:
@@ -952,11 +953,11 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
             print(f"  [!] import_outputs failed: {str(e)[:80]}")
         finally:
             if _ipw:
-                secure_delete_file(Path(_ipw))
+                secure_delete_or_warn(Path(_ipw), "the wallet password")
             try:
                 for _lf in sorted(Path(_iw).rglob("*"), reverse=True):
                     if _lf.is_file() or _lf.is_symlink():
-                        secure_delete_file(_lf)
+                        secure_delete_or_warn(_lf, "a leftover signer scratch file")
             except OSError:
                 pass
             shutil.rmtree(_iw, ignore_errors=True)
@@ -1160,7 +1161,7 @@ def phase_sign(args, plan: List[dict]):
             # scratch tree the rmtree below covers, so it would otherwise
             # survive the whole run.
             for _pw in pw_files:
-                secure_delete_file(Path(_pw))
+                secure_delete_or_warn(Path(_pw), "the wallet password")
             # SECURE cleanup, not shutil.rmtree. This scratch dir held
             # unsigned_monero_tx AND the wallet-cli-produced signed_monero_tx --
             # a fully signed, relayable transaction. A plain rmtree only unlinks
@@ -1170,7 +1171,7 @@ def phase_sign(args, plan: List[dict]):
             try:
                 for _leftover in sorted(Path(work_dir).rglob("*"), reverse=True):
                     if _leftover.is_file() or _leftover.is_symlink():
-                        secure_delete_file(_leftover)
+                        secure_delete_or_warn(_leftover, "a leftover signed blob")
             except OSError:
                 pass
             shutil.rmtree(work_dir, ignore_errors=True)

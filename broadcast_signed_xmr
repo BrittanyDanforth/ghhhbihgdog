@@ -424,6 +424,29 @@ def load_progress(args, blob_fp: str, items: list) -> tuple:
                     "    it records which TXs are already on-chain, and re-broadcasting\n"
                     "    them is what the check exists to prevent."
                 )
+            # IDENTITY THAT CANNOT BE PROVEN IS SAID OUT LOUD. The
+            # fingerprint covers each blob's name AND its manifest hash, so
+            # two different batches are distinguishable -- unless the manifest
+            # is the legacy plain-filename form, which records no hashes. Then
+            # the fingerprint degrades to names, every batch is
+            # tx_0.signed/tx_1.signed/..., and a progress file from a
+            # DIFFERENT batch of the same size would pass this check and make
+            # us skip transactions that were never sent.
+            #
+            # Not fatal -- refusing would strand an operator mid-batch on a
+            # legacy manifest -- but never silent, because the failure mode is
+            # "reports success, broadcast nothing".
+            if not any(i.sha for i in items):
+                integrity_log("broadcast", "resume_identity_unprovable")
+                print("  [!] This manifest records no blob hashes, so the "
+                      "progress file can only be matched by FILENAME.")
+                print("      Every batch is named tx_0.signed, tx_1.signed, "
+                      "... — so if this progress file came from a DIFFERENT "
+                      "batch of the same size, the transactions it lists as "
+                      "relayed will be SKIPPED here and never sent, and the "
+                      "run will report success.")
+                print("      Check that "
+                      f"{progF} belongs to THIS batch before continuing.")
             relayed = {str(k) for k in prog.get("relayed", [])}
             failed_perm = {str(k) for k in prog.get("failed_perm", [])}
         else:
@@ -644,12 +667,37 @@ def main():
               f"{', '.join(sorted(absent)[:5])}")
         print(f"  [!] They keep their slot and will be retried with --resume.")
 
-    # Fingerprint over the SET of blob names, so a momentarily-absent blob does
-    # not change it. The old fingerprint was over the presence-filtered list,
-    # so one unreadable blob made --resume abort with "delete the progress
-    # file" -- and deleting it re-broadcasts everything already relayed.
+    # Fingerprint over the SET of blob names AND THEIR RECORDED HASHES, so a
+    # momentarily-absent blob does not change it. The old fingerprint was over
+    # the presence-filtered list, so one unreadable blob made --resume abort
+    # with "delete the progress file" -- and deleting it re-broadcasts
+    # everything already relayed. That fix is kept: the hashes come from the
+    # MANIFEST, not from reading the blobs, so an absent blob still fingerprints.
+    #
+    # NAMES ALONE COULD NOT TELL TWO BATCHES APART, which is the one job this
+    # fingerprint has. load_progress calls it "fenced by a fingerprint of the
+    # blob set: a progress file written for a different batch must not be
+    # applied to this one" -- and every batch this toolchain produces is named
+    # tx_0.signed, tx_1.signed, ... So two DIFFERENT batches with the same
+    # number of transactions fingerprinted IDENTICALLY, and the second one
+    # loaded the first one's `relayed` set, skipped its own transactions as
+    # already-sent, and exited 0 reporting success. Nothing was broadcast.
+    #
+    # Reproduced directly against load_progress: two single-transaction batches
+    # with different contents, same names -> same fingerprint -> the second
+    # skips its only transaction.
+    #
+    # GhostSpiral does not hit this: it passes
+    # --resume <staging>/bcast_progress.json, a fresh path per round. The
+    # exposure is the documented STANDALONE use -- two batches broadcast by
+    # hand from one directory, where progF defaults to ./broadcast_progress.json
+    # and is never deleted after a successful run.
+    #
+    # A missing hash (the legacy plain-filename manifest form) contributes an
+    # empty string, so such a manifest is no worse off than before -- and
+    # load_progress warns when it cannot prove identity that way.
     blob_fp = hashlib.sha256(
-        "|".join(sorted(i.key for i in items)).encode()
+        "|".join(sorted(f"{i.key}:{i.sha or ''}" for i in items)).encode()
     ).hexdigest()[:32]
 
     # Progress state, split by outcome so resume and success-reporting are both

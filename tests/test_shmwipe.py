@@ -305,6 +305,147 @@ else:
 import shutil as _sh
 _sh.rmtree(sandbox, ignore_errors=True)
 
+# ==========================================================================
+# A FAILED SECURE DELETE IS NEVER SILENT.
+#
+# secure_delete_file returns True/False, and ELEVEN call sites discarded it
+# against ONE that checked. What those sites erase is the most sensitive
+# material this toolchain creates:
+#
+#   * the WALLET SPEND-KEY PASSWORD, written to a 0600 temp file because
+#     monero-wallet-cli cannot take a password on argv (/proc/<pid>/cmdline is
+#     world-readable) -- four sites in airgap_tx_signer, all in `finally`;
+#   * the EXIT PLAN, carrying the operator's --exit-to destination;
+#   * per-peel and change-sweep plans, carrying destinations and amounts;
+#   * atomic_write's partial temp file, holding the same plaintext it staged.
+#
+# Every one of those deletions can fail -- read-only or full filesystem, a
+# permission change, the O_NOFOLLOW open losing a race -- and every one failed
+# SILENTLY. The password file's own comment says it "may live in /dev/shm,
+# outside the scratch tree the rmtree below covers, so it would otherwise
+# survive the whole run": its survival was understood to matter, and then not
+# checked.
+#
+# .gs_pw_* is already in paranoia_mode's artifact patterns because "it is
+# deleted in a finally, but a SIGKILL runs no finally". That covers the
+# process dying. It never covered the delete returning False.
+# ==========================================================================
+print()
+import io as _io2, contextlib as _ctx2, tempfile as _tf2
+
+_gsm = load_gs_common() if "load_gs_common" in dir() else None
+if _gsm is None:
+    _l2 = importlib.machinery.SourceFileLoader(
+        "gs_common_wipewarn", os.path.join(REPO, "gs_common.py"))
+    _gsm = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_l2.name, _l2))
+    _l2.exec_module(_gsm)
+
+# A directory is a path secure_delete_file REFUSES (non-regular file), so this
+# exercises the real failure return rather than a mocked one.
+# dir="/tmp" explicitly: this file re-points TMPDIR for its own scenarios
+# and the old value may already be gone by the time these run.
+_undeletable = _tf2.mkdtemp(prefix="wipefail_", dir="/tmp")
+_b2 = _io2.StringIO()
+with _ctx2.redirect_stdout(_b2):
+    _rc = _gsm.secure_delete_or_warn(_undeletable, "the wallet password")
+_out2 = _b2.getvalue()
+check("wipe-warn: a failed secure delete returns False", _rc is False)
+check("wipe-warn: ...and SAYS SO, rather than returning quietly",
+      "Could not securely erase" in _out2)
+check("wipe-warn: ...naming WHAT the file holds, which is what tells an "
+      "operator whether to care", "the wallet password" in _out2)
+check("wipe-warn: ...and the path, so they can go and remove it",
+      _undeletable in _out2)
+check("wipe-warn: ...and says nothing else will clean it up later",
+      "STILL ON DISK" in _out2)
+
+# The chain records that a wipe failed and NOTHING about where -- the path is
+# operator-facing only, like every other location in this toolchain.
+_chained = []
+_saved_il = _gsm.integrity_log
+try:
+    _gsm.integrity_log = lambda stage, msg, **k: _chained.append((stage, msg))
+    with _ctx2.redirect_stdout(_io2.StringIO()):
+        _gsm.secure_delete_or_warn(_undeletable, "the wallet password")
+finally:
+    _gsm.integrity_log = _saved_il
+check("wipe-warn: the failure is recorded on the integrity chain",
+      any("secure_delete_failed" in m for _s, m in _chained))
+check("wipe-warn: ...without the path, and without naming the content",
+      all(_undeletable not in m and "password" not in m
+          for _s, m in _chained))
+
+# CONTROL: a real file is deleted, silently, returning True.
+_fd2, _real = _tf2.mkstemp(prefix="wipeok_", dir="/tmp")
+os.write(_fd2, b"secret"); os.close(_fd2)
+_b3 = _io2.StringIO()
+with _ctx2.redirect_stdout(_b3):
+    _rc2 = _gsm.secure_delete_or_warn(_real, "the wallet password")
+check("control: a deletable file returns True", _rc2 is True)
+check("control: ...is actually gone", not os.path.exists(_real))
+check("control: ...and warns about nothing", _b3.getvalue() == "")
+
+_sh.rmtree(_undeletable, ignore_errors=True)
+
+# A FILE THAT WAS NEVER THERE IS NOT A FILE LEFT ON DISK. secure_delete_file
+# lstats first and returns False when the path does not exist, which is
+# indistinguishable from a wipe that could not run -- and the warning says
+# "It is STILL ON DISK". atomic_write_json/atomic_write_text call this from
+# `except BaseException` precisely when secure_write_bytes may have failed
+# BEFORE creating the temp file, so this is the ordinary case, not an edge.
+_missing = os.path.join("/tmp", f"never_written_{os.getpid()}.tmp")
+if os.path.exists(_missing):
+    os.unlink(_missing)
+_chain_m = []
+_b4 = _io2.StringIO()
+_saved_il2 = _gsm.integrity_log
+try:
+    _gsm.integrity_log = lambda stage, msg, **k: _chain_m.append((stage, msg))
+    with _ctx2.redirect_stdout(_b4):
+        _rc3 = _gsm.secure_delete_or_warn(_missing, "the wallet password")
+finally:
+    _gsm.integrity_log = _saved_il2
+check("wipe-warn: a path that never existed reports success", _rc3 is True)
+check("wipe-warn: ...and prints no wipe-failure warning",
+      "STILL ON DISK" not in _b4.getvalue())
+check("wipe-warn: ...and writes no secure_delete_failed to the chain",
+      not any("secure_delete_failed" in m for _s, m in _chain_m))
+
+# ...and the real caller does not cry wolf either. Drive atomic_write_json
+# into a directory that does not exist: secure_write_bytes cannot create the
+# temp file, the BaseException handler runs, and nothing is on disk to warn
+# about.
+_b5 = _io2.StringIO()
+_chain_a = []
+_saved_il3 = _gsm.integrity_log
+try:
+    _gsm.integrity_log = lambda stage, msg, **k: _chain_a.append((stage, msg))
+    with _ctx2.redirect_stdout(_b5):
+        try:
+            _gsm.atomic_write_json({"a": 1},
+                                   Path("/tmp/gs_no_such_dir_x9/plan.json"))
+        except Exception:
+            pass
+finally:
+    _gsm.integrity_log = _saved_il3
+check("wipe-warn: atomic_write_json's failure path does not claim a "
+      "nonexistent temp file is still on disk",
+      "STILL ON DISK" not in _b5.getvalue())
+check("wipe-warn: ...and does not write secure_delete_failed for it",
+      not any("secure_delete_failed" in m for _s, m in _chain_a))
+
+# NO CALLER MAY GO BACK TO DISCARDING THE RESULT. An unchecked
+# secure_delete_file( in statement position is the defect this replaced.
+import re as _re2
+for _f2 in ("GhostSpiral", "gs_common.py", "airgap_tx_signer",
+            "broadcast_signed_xmr", "thor_swap_preparer",
+            "create_receive_wallet"):
+    _src2 = open(os.path.join(REPO, _f2)).read()
+    _bare = _re2.findall(r"^\s*secure_delete_file\(", _src2, _re2.M)
+    check(f"wipe-warn: {_f2} has no bare secure_delete_file() whose result is "
+          f"thrown away", not _bare)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAIL:
     print("FAILURES: " + ", ".join(FAILURES))

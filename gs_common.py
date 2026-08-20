@@ -798,6 +798,75 @@ def secure_write_text(path: Path, data: str, mode: int = 0o600) -> None:
     secure_write_bytes(path, data.encode(), mode)
 
 
+def secure_delete_or_warn(path, what: str) -> bool:
+    """secure_delete_file, but a FAILURE IS NEVER SILENT.
+
+    True if nothing of `path` is left on disk -- erased, or never there.
+
+    secure_delete_file returns True/False and eleven call sites discarded it,
+    against one that checked. The files those sites erase are the most
+    sensitive artifacts this toolchain creates:
+
+      * the WALLET SPEND-KEY PASSWORD, written to a 0600 temp file because
+        monero-wallet-cli cannot take a password on argv (/proc/<pid>/cmdline
+        is world-readable), then fed on stdin -- four sites in
+        airgap_tx_signer, all in `finally` blocks;
+      * the EXIT PLAN, which carries the operator's --exit-to destination, the
+        single value the whole pipeline exists to keep unlinked;
+      * per-peel and change-sweep plans, which carry destinations and amounts;
+      * atomic_write's partial temp file, which holds the same plaintext as the
+        file it was staging.
+
+    Every one of those deletions can fail -- a read-only filesystem, a full
+    one, a permission change, or the O_NOFOLLOW open losing a race -- and every
+    one failed SILENTLY. The password file's own comment says it "may live in
+    /dev/shm, outside the scratch tree the rmtree below covers, so it would
+    otherwise survive the whole run": its survival was understood to matter,
+    and then not checked.
+
+    The repo already knew the shape of this: `.gs_pw_*` is in paranoia_mode's
+    artifact patterns precisely because "it is deleted in a finally, but a
+    SIGKILL runs no finally, and 0600 is not gone". That covers the process
+    dying. It does not cover the delete returning False.
+
+    A HELPER RATHER THAN ELEVEN `if not ...` BLOCKS, for the reason
+    secure_delete_file itself gives for existing: one primitive, one place to
+    audit. A new caller gets the warning without remembering to write it.
+
+    `what` names the CONTENT, not the path -- "the wallet password", "the exit
+    plan" -- because that is what tells an operator whether to care. The path
+    is printed too so they can go and remove it, but only to the terminal: the
+    integrity chain records that a wipe failed and nothing about where.
+    """
+    ok = secure_delete_file(path)
+    if ok:
+        return True
+    # NOTHING TO ERASE IS NOT A FAILED ERASE. secure_delete_file lstats first
+    # and returns False when that raises, so a path that was never created
+    # reports exactly like a wipe that could not run -- and the warning below
+    # says "It is STILL ON DISK", which for a missing file is simply untrue.
+    #
+    # It is not hypothetical. atomic_write_json/atomic_write_text call this
+    # from `except BaseException` to clear the partial temp file, and the
+    # commonest reason those raise is secure_write_bytes failing to CREATE the
+    # temp file at all (read-only or full filesystem, bad perms on the
+    # directory). Every one of those would have printed a wipe failure for a
+    # file that does not exist and written secure_delete_failed into the
+    # integrity chain. An operator who sees that warning cry wolf is an
+    # operator who ignores the one that means their spend-key password is
+    # still sitting in /dev/shm.
+    #
+    # lexists, not exists: a broken symlink is still a directory entry to
+    # report, and secure_delete_file unlinks those rather than following them.
+    if not os.path.lexists(path):
+        return True
+    integrity_log("wipe", "secure_delete_failed")
+    print(f"  [!] Could not securely erase {what}: {path}")
+    print(f"      It is STILL ON DISK. Remove it yourself -- this file is "
+          f"not covered by anything else that runs later.")
+    return False
+
+
 def secure_delete_tree(path: Path) -> bool:
     """Overwrite every file in a directory tree, then remove the tree.
 
@@ -1000,7 +1069,7 @@ def atomic_write_json(obj, path: Path, perms: int = 0o600) -> None:
         secure_write_bytes(tmp, json.dumps(obj, indent=2).encode(), perms)
         os.replace(tmp, path)
     except BaseException:
-        secure_delete_file(tmp)
+        secure_delete_or_warn(tmp, "a partly-written file holding the same plaintext")
         raise
     with open(path) as f:
         json.load(f)
@@ -1016,7 +1085,7 @@ def atomic_write_text(data: str, path: Path, perms: int = 0o600) -> None:
         secure_write_text(tmp, data, perms)   # 0600 at creation, see above
         os.replace(tmp, path)
     except BaseException:
-        secure_delete_file(tmp)
+        secure_delete_or_warn(tmp, "a partly-written file holding the same plaintext")
         raise
 
 # ---------------------------------------------------------------------------

@@ -46,10 +46,16 @@ from gs_common import (
 )
 
 SWAPKIT_API = "https://api.swapkit.dev"
-CG_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=btc"
 PAIR_SCHEMA = "thor_pairs_v1"
 BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
-_XMR_RE = re.compile(r"^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$")
+# (CG_PRICE and _XMR_RE used to live here and nothing read either. CG_PRICE was
+# a second copy of gs_common.CG_PRICE_URL -- the oracle this tool actually calls
+# through btc_per_xmr_oracle -- so a URL edit here would have changed nothing.
+# _XMR_RE was a format-only address regex that _validate_xmr_addr does NOT use:
+# it delegates to gs_common.validate_xmr_address, which checks format AND the
+# base58 checksum. A checksum-less regex sitting next to the validator is an
+# invitation to "validate" with the wrong one; the format check it embodies is
+# already the first line of the shared checker, XMR_ADDR_RE.)
 
 
 def _btc_per_xmr(proxy):

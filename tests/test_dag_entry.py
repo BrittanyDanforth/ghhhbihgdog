@@ -692,6 +692,73 @@ check("split: an under-funded chunk is IDENTIFIED, not returned as a bare "
 check("split: ...and it is the small one that is named, not chunk 0",
       _tiny_res[3] == 1)
 
+# EACH CARRIER CAN PAY ITS OWN SLICE, mapped BY ADDRESS.
+#
+# The check above reads `sum(_amts[:3]) <= _su[0]`, which slices the amounts
+# POSITIONALLY -- it assumes concat(slices) == fanout_dests, the same
+# assumption the code used to make. A test written that way stays green under
+# exactly the change that breaks the code, so the real property is asserted
+# here instead: for every slice, the amounts belonging to THAT SLICE'S
+# ADDRESSES fit THAT slice's budget. True for any partition, in any order.
+_dests4 = ["m0", "m1", "m2", "m3"]
+_sl4, _su4, _am4, _bad4 = ghost.size_distribution(
+    _dests4, [Decimal("3"), Decimal("1")], Decimal("8"),
+    Decimal("0.0024"), False, _secretsmod.SystemRandom())
+_by4 = dict(zip(_dests4, _am4))       # exactly what main() does
+check("split: every destination gets an amount", len(_by4) == len(_dests4))
+check("split: each carrier is asked for no more than ITS OWN budget "
+      "(by address, not by position)",
+      all(sum(_by4[a] for a in sl) <= bud
+          for sl, bud in zip(_sl4, _su4)))
+
+# THE PARTITION ORDER MUST NOT MATTER. split_by_weight's docstring names
+# round-robin as the equivalent alternative to contiguous slices, so that is
+# the edit its own comment invites. Under the old positional concatenation it
+# asked a carrier holding 0.75 XMR to pay 3.12 -- and the fan-out dies "not
+# enough money" AFTER the veils have relayed and paid their fees.
+_saved_sbw = ghost.split_by_weight
+try:
+    def _round_robin(items, weights):
+        n = len(weights)
+        out = [[] for _ in range(n)]
+        for i, it in enumerate(items):
+            out[i % n].append(it)
+        return out
+    ghost.split_by_weight = _round_robin
+    _dests9 = [f"m{i}" for i in range(9)]
+    _slR, _suR, _amR, _badR = ghost.size_distribution(
+        _dests9, [Decimal("4"), Decimal("3"), Decimal("1")], Decimal("6"),
+        Decimal("0.0002"), False, _secretsmod.SystemRandom())
+    _byR = dict(zip(_dests9, _amR))
+    check("split: a NON-CONTIGUOUS partition still funds every destination",
+          _badR is None and len(_byR) == len(_dests9))
+    check("split: ...and each carrier is STILL only asked for its own budget "
+          "— the amounts follow the address, not the list position",
+          all(sum(_byR[a] for a in sl) <= bud
+              for sl, bud in zip(_slR, _suR)))
+
+    # A partition that does not COVER every destination must stop the run at
+    # plan time, not hand back a short list for the caller to zip against.
+    def _drops_one(items, weights):
+        out = _round_robin(items, weights)
+        out[-1] = out[-1][:-1] if len(out[-1]) > 1 else out[-1]
+        return out
+    ghost.split_by_weight = _drops_one
+    _raised = ""
+    try:
+        ghost.size_distribution(_dests9, [Decimal("4"), Decimal("3"),
+                                          Decimal("1")], Decimal("6"),
+                                Decimal("0.0002"), False,
+                                _secretsmod.SystemRandom())
+    except RuntimeError as _e:
+        _raised = str(_e)
+    check("split: a partition that leaves a destination in NO slice is "
+          "refused, not silently misaligned", "no slice" in _raised)
+    check("split: ...and the refusal says the destinations would go unfunded",
+          "unfunded" in _raised)
+finally:
+    ghost.split_by_weight = _saved_sbw
+
 # -- --split bounds --------------------------------------------------------
 for _ok in (1, 2, 8, None):
     _r = None
