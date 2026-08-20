@@ -104,6 +104,15 @@ python3 tests/real_fanout_change_testnet.py # WHERE the fan-out's change lands: 
 python3 tests/real_peel_testnet.py       # SHIPPED peeling chain: N destinations via N
                                           #   SEPARATE confirmation-gated txs (not one
                                           #   fan-out), change carrying between peels
+python3 tests/real_delay_pipeline_testnet.py # DOES A PLANNED DELAY REACH THE WIRE?
+                                          #   plan -> SHIPPED phase_create ->
+                                          #   phase_sign -> broadcast main(), two TXs
+                                          #   with DIFFERENT delays, proving each one
+                                          #   is served before its own submit. Negative
+                                          #   control: strip them and the "minimal gap"
+                                          #   warning must fire. real_broadcast_testnet
+                                          #   patches the delay into the signed manifest
+                                          #   by hand, so it covers only the last link
 python3 tests/real_receive_watch_testnet.py # SHIPPED watch loop vs a real wallet-rpc:
                                           #   proves get_subaddress_balance is really
                                           #   PER-SUBADDRESS (account funded heavily,
