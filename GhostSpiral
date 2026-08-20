@@ -3110,7 +3110,23 @@ def verify_spend_source(rpc_primary, account: int, index: int,
             f"    Spending would move funds from the wrong account, and this run's\n"
             f"    change would come to rest on THAT account's subaddress 0.\n"
             f"    Refusing.")
-    integrity_log("stage4", f"spend_source_ok:acct={account}:idx={index}")
+    # ONCE PER RUN, NOT ONCE PER ENTRY. resolve_entry_accounts calls this in a
+    # loop -- "Once per entry", as the comment at the call site says -- and
+    # chain_safe redacts the payload to `spend_source_ok:acct=#:idx=#`, so a
+    # --split 5 run wrote five byte-identical lines and the split count came
+    # straight off the file by tallying them. That is the number of swap
+    # chunks, which is the run's whole shape, and it is a SUCCESS line so the
+    # "failure events stay countable" exemption does not cover it.
+    #
+    # chain_safe's docstring uses THIS payload as its worked example of what
+    # redaction removes -- "spend_source_ok:acct=3:idx=1 becomes
+    # spend_source_ok:acct=#:idx=#... which output or address it happened to,
+    # and how many there were, does not [survive]" -- and the second half of
+    # that sentence was false for its own example.
+    #
+    # The account and index are redacted to nothing on disk anyway; they are in
+    # the abort messages above, where they reach the operator and stop.
+    integrity_log_once("stage4", "spend_source_ok")
 
 
 def build_dag_adjacency(subs: list, entry_addrs, deep: int, rng) -> dict:

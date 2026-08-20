@@ -33,7 +33,7 @@ import argparse, stat, sys, time
 from pathlib import Path
 
 from gs_common import (
-    integrity_log, verify_tor, validate_proxy, connect_rpc,
+    integrity_log, integrity_log_once, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
     create_fresh_account,
@@ -119,7 +119,14 @@ def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int,
             "    wallet's primary address, which would defeat the per-hop isolation\n"
             "    the receive flow depends on. Refusing."
         )
-    integrity_log("wallet", f"addr_verified:acct={acct_idx}:idx={sub_idx}:{v.get('nettype', '?')}")
+    # ONCE, not once per --count. chain_safe redacts this to
+    # `addr_verified:acct=#:idx=#:mainnet`, so with --count 4 the file holds
+    # four byte-identical lines and the count is read off by tallying them --
+    # the cardinality integrity_log_once exists to withhold, and --count is
+    # exactly the number of swap chunks the run is built around. The account,
+    # index and nettype are already redacted to nothing on disk and are printed
+    # in full on the next line, where they reach the operator and stop.
+    integrity_log_once("wallet", "addr_verified")
     print(f"  [+] Address verified against the wallet "
           f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
 
@@ -174,7 +181,7 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
               "the wallet's PRIMARY address, so every leftover from mixing this "
               "receive will come to rest there, on the same address as every "
               "other receive.")
-    integrity_log("wallet", f"receive_account:{acct_idx}")
+    integrity_log_once("wallet", "receive_account")
 
     addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
         account_index=acct_idx, label=args.label,
@@ -190,8 +197,7 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # label got it written straight back out into a second artifact. Whether a
     # label exists is all an audit trail needs; what it says is the leak.
     _has_label = "set" if args.label else "none"
-    integrity_log("wallet",
-                  f"created:{scrub_address(addr_str)}:label={_has_label}")
+    integrity_log_once("wallet", f"created:label={_has_label}")
 
     out = {
         "schema": "gs_receive_wallet_v1",
@@ -230,7 +236,7 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # address and its (account, subaddress) -- the pair report_holdings refuses
     # to put on disk -- and --output-dir sends it wherever the operator says.
     if not wipe_covers(fname):
-        integrity_log("wallet", "bundle_outside_wipe_roots")
+        integrity_log_once("wallet", "bundle_outside_wipe_roots")
         print(f"  [!] {outdir} is OUTSIDE the directories paranoia_mode "
               f"sweeps, so this bundle will NOT be wiped with the rest of the "
               f"run. It names the receive address and its account/subaddress. "
@@ -241,7 +247,7 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     print(f"  [+] Address: {addr_str}")
     print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
 
-    integrity_log("wallet", f"saved:{fname.name}")
+    integrity_log_once("wallet", "saved")
 
     # required=True: the header claims this rotation happens, and a silent
     # failure leaves the subaddress creation on the same circuit as whatever

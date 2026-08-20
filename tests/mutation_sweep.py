@@ -370,6 +370,23 @@ MUTATIONS = [
   "    _order = sorted(range(n), key=lambda i: (_sat[i], rng.random()))",
   "    _order = sorted(range(n), key=lambda i: _sat[i])",
   ["test_dag_entry"]),
+
+ # THE SAME CARDINALITY LEAK ONE CALL DEEPER. verify_spend_source logs once per
+ # CALL, and resolve_entry_accounts calls it once per entry -- so re-indexing it
+ # puts one identical redacted line per --split chunk back on the chain.
+ ("the per-entry spend-source proof is chained once per chunk again",
+  "GhostSpiral",
+  '    integrity_log_once("stage4", "spend_source_ok")',
+  '    integrity_log("stage4", f"spend_source_ok:acct={account}:idx={index}")',
+  ["test_units"]),
+
+ # create_receive_wallet's mint_one_receive is called once per --count, so any
+ # one of its success lines tallies to the number of receive addresses.
+ ("the mint chains a line per --count turn again, giving the count away",
+  "create_receive_wallet",
+  '    integrity_log_once("wallet", "receive_account")',
+  '    integrity_log("wallet", f"receive_account:{acct_idx}")',
+  ["test_units"]),
 ]
 
 

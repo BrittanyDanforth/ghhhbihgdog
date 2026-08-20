@@ -793,6 +793,59 @@ check("chain: failure events are still recorded per occurrence",
 check("chain: the broadcaster routes its delay through the once-only logger",
       'integrity_log_once("broadcast", "delay")' in _bc_a)
 
+# THE SAME LEAK ONE CALL DEEPER, which the fix above did not reach.
+#
+# That fix found the loops that call integrity_log directly. It missed the
+# other shape: a function that logs ONCE PER CALL on its success path, called
+# in a loop by somebody else. Nothing in the logging function looks wrong, and
+# nothing at the call site mentions logging, so neither end reads as a defect.
+#
+# Two were live. verify_spend_source chained
+# `spend_source_ok:acct={account}:idx={index}` and resolve_entry_accounts calls
+# it once per entry ("Once per entry -- see the docstring", at the call site),
+# so a --split 5 run left five byte-identical `spend_source_ok:acct=#:idx=#`
+# lines. And create_receive_wallet's mint_one_receive chained five separate
+# success lines, with main() looping over --count, so --count 4 gave the count
+# away four times over.
+#
+# Both are SUCCESS lines, so the "failure events stay countable" exemption does
+# not cover them, and both leak the same number: how many swap chunks this run
+# is built around.
+#
+# DRIVEN, not grepped -- the count is the property, so it is counted.
+_card_tmp = Path(tempfile.mkdtemp(prefix="cardinal2_")) / "chain.log"
+for _i in range(5):                       # resolve_entry_accounts, --split 5
+    _gsc.integrity_log_once("stage4", "spend_source_ok", log_path=_card_tmp)
+check("chain: the per-entry spend-source proof is chained ONCE, not once per "
+      "--split chunk — five identical lines would give the chunk count away",
+      len(_card_tmp.read_text().splitlines()) == 1)
+
+_mint_tmp = Path(tempfile.mkdtemp(prefix="cardinal3_")) / "chain.log"
+for _i in range(4):                       # create_receive_wallet --count 4
+    _gsc.integrity_log_once("wallet", "addr_verified", log_path=_mint_tmp)
+    _gsc.integrity_log_once("wallet", "receive_account", log_path=_mint_tmp)
+    _gsc.integrity_log_once("wallet", "created:label=none", log_path=_mint_tmp)
+    _gsc.integrity_log_once("wallet", "saved", log_path=_mint_tmp)
+_mint_lines = _mint_tmp.read_text().splitlines()
+check("chain: a --count 4 mint leaves ONE line per event kind, not four — "
+      "tallying any one of them would give --count",
+      len(_mint_lines) == 4)
+check("chain: ...and the four distinct kinds are all still recorded",
+      len({_l.split("|")[-1] for _l in _mint_lines}) == 4)
+check("chain: ...and that chain still verifies link by link",
+      _gsc.verify_integrity_chain(_mint_tmp)[0] is True)
+
+# The source side, so a future edit cannot quietly re-index them.
+_crw_src = Path(REPO, "create_receive_wallet").read_text()
+check("chain: verify_spend_source no longer chains the account/index pair "
+      "once per entry", 'f"spend_source_ok:acct={account}:idx={index}"'
+      not in _gs_a and 'integrity_log_once("stage4", "spend_source_ok")' in _gs_a)
+for _bad in ('f"addr_verified:acct={acct_idx}:idx={sub_idx}',
+             'f"receive_account:{acct_idx}"',
+             'f"saved:{fname.name}"'):
+    check(f"chain: the mint no longer chains {_bad.split(':')[0][2:]} per "
+          f"--count turn", _bad not in _crw_src)
+
 # 5. WHAT paranoia_mode CANNOT DO. "Every phase reported success" reads as
 #    "this host is clean of the run". The wallet is untouched by design -- it
 #    is the money -- and it holds the balances, the history and every
