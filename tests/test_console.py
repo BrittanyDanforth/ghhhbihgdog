@@ -1323,6 +1323,81 @@ def test_every_settable_field_reaches_the_request():
           f"({len(_seen)} of them)", len(_seen) >= 12)
 
 
+def test_every_settable_field_recomputes_the_page():
+    """Editing any SCHEMA field must re-run the preview, the ETA and the fees.
+
+    collect() sending a field is not enough: something has to CALL collect().
+    The page does that from one delegated listener,
+
+        $$('input,select,textarea').forEach(el=>el.addEventListener('input', ...
+
+    and that selector used to read `input,select`. exit_to is the page's only
+    <textarea>, so the ONE field that changes the run's size the most was the
+    one field whose edits recomputed nothing. Measured by driving the shipped
+    page in a browser at the "Maximum safe" preset:
+
+        exit_to empty                35 transactions  ~2.1 days
+        three exit addresses typed   35 transactions  ~2.1 days   <- the
+                                     operator's view, and the line still read
+                                     "(no exit destination set, so no
+                                     withdrawals are counted)" with three of
+                                     them in the box
+        after touching any other     52 transactions  ~3.0 days   <- the truth
+        control
+
+    17 transactions and about 21 hours missing. run_eta's own docstring is
+    about why that number matters: an operator told the wrong one "concludes
+    the run has hung and interrupts it -- and an interrupt mid-round is the one
+    failure this pipeline has no automatic recovery from". FEE_FIELDS names
+    exit_to for the same reason and never fired either, so the reserved-fee
+    panel was stale on the shape change that adds one transaction per withdrawn
+    output.
+
+    Same family as the hop_delay defect above, one link further along: SCHEMA
+    had it, the presets set it, collect() sent it, and nothing asked collect()
+    for it. So this asserts THAT join: every control carrying a SCHEMA field id
+    must be a tag the listener's selector actually matches.
+    """
+    import re as _re
+    c = load_console()
+    _page = c.PAGE
+    _m = _re.search(r"\$\$\('([^']+)'\)\.forEach\(el=>el\.addEventListener\('input'",
+                    _page)
+    check("the delegated input listener was found (the scan is not vacuous)",
+          _m is not None)
+    _tags = {t.strip() for t in (_m.group(1) if _m else "").split(",")}
+    _unbound = []
+    _controls = {}
+    for _k in c.SCHEMA:
+        _mm = _re.search(r"<(input|select|textarea)\b[^>]*id=\"%s\"" % _re.escape(_k),
+                         _page)
+        if not _mm:
+            continue
+        _controls[_k] = _mm.group(1)
+        if _mm.group(1) not in _tags:
+            _unbound.append(f"{_k} (<{_mm.group(1)}>)")
+    check(f"every SCHEMA control on the page is bound to the recompute "
+          f"listener ({_unbound} are not)", not _unbound)
+    check(f"...and the scan really walked the page's controls "
+          f"({len(_controls)} found)", len(_controls) >= 12)
+    # The selector must cover the tags the page ACTUALLY uses, as a set --
+    # not "textarea, because exit_to happens to be one today". Pinning the tag
+    # would fail the day someone legitimately makes it a single-line input,
+    # which is a refactor, not a regression.
+    _used = set(_controls.values())
+    check(f"the listener's selector covers every tag the page's SCHEMA "
+          f"controls use ({sorted(_used - _tags)} uncovered)",
+          not (_used - _tags))
+    # The field that was unbound, by name, so a revert reads as itself.
+    check("the exit destinations reach the recompute listener",
+          "exit_to" in _controls and _controls["exit_to"] in _tags)
+    # FEE_FIELDS is keyed on el.id from that same listener, so a field the
+    # listener never sees can be in FEE_FIELDS and still never refresh a fee.
+    check("exit_to is in FEE_FIELDS, and now actually reaches it",
+          "'exit_to'" in _page and "if(FEE_FIELDS.has(el.id)) scheduleFees();"
+          in _page)
+
+
 def test_presets_set_the_hop_delay():
     """A preset must set the delay, and applyPreset must apply it.
 
