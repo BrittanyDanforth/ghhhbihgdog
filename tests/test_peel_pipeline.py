@@ -21,6 +21,12 @@ balances at the START of the round and then applied together, which is what
 monerod does. Applying them one after another -- so a hop's destination is
 already credited when its own hop is built -- makes the merge invariant
 untestable, because every path looks safe.
+
+A FAN-OUT CONTROL runs at the end, for two reasons. It is the only place the
+change sweep and the exit have ever run against each other through main()
+(test_split_pipeline stubs _run_change_sweeps and never reaches the exit), and
+it is what makes the peel assertions above mean something: an invariant that
+only holds in one mode is an accident of that mode.
 """
 import contextlib
 import importlib.machinery
@@ -35,6 +41,8 @@ from decimal import Decimal as D
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from srcutil import fail_loudly_on_crash                    # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -51,6 +59,15 @@ def check(name, cond):
         FAILS.append(name)
         print("  FAIL:", name)
 
+
+# A CRASH IS NOT A CATCH. mutation_sweep scores a suite by parsing its RESULT
+# line, so a mutation that makes this file DIE is recorded as a SURVIVOR --
+# and this file indexes into lists a mutation can empty (the fan-out plan, the
+# change sweeps). Verified: dropping the change-sweep destination from
+# addr_index made the shipped code raise, and this died on _sweeps[0] with
+# three checks already red and no RESULT line at all.
+_finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
+                                 "test_peel_pipeline.py")
 
 ld = importlib.machinery.SourceFileLoader("GhostSpiral",
                                           os.path.join(REPO, "GhostSpiral"))
@@ -74,7 +91,7 @@ EXIT_ADDR = addr(9999)
 class Run:
     """One driven pipeline: its wallet, its rounds and what they moved."""
 
-    def __init__(self, stop_at_peel=None):
+    def __init__(self, stop_at_peel=None, peel=True):
         self.subs = [addr(2000 + i) for i in range(WALLETS + 4)]
         self.idx = {a: (30 + i, 1) for i, a in enumerate(self.subs)}
         self.bal = {}                    # (acct, sub) -> atomic
@@ -84,6 +101,7 @@ class Run:
         self.spent = {}                  # (acct, sub) -> what a round spent
         self.left_wallet = 0             # atomic that reached EXIT_ADDR
         self.stop_at_peel = stop_at_peel
+        self.peel = peel
         self.carrier_waits = []
         self.acct = 200
 
@@ -263,12 +281,14 @@ class Run:
             for k, v in stubs.items():
                 setattr(g, k, v)
             g.run_lock = nolock
-            sys.argv = ["GhostSpiral",
-                        "--btc-entry", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-                        "--btc-amount", "0.6", "--wallets", str(WALLETS),
-                        "--peel", "--dag-mixing", "--hop-delay", "0-0",
-                        "--exit-to", EXIT_ADDR, "--output", outdir,
-                        "--tor-proxy", "socks5h://127.0.0.1:9050"]
+            sys.argv = (["GhostSpiral",
+                         "--btc-entry",
+                         "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                         "--btc-amount", "0.6", "--wallets", str(WALLETS)]
+                        + (["--peel"] if self.peel else [])
+                        + ["--dag-mixing", "--hop-delay", "0-0",
+                           "--exit-to", EXIT_ADDR, "--output", outdir,
+                           "--tor-proxy", "socks5h://127.0.0.1:9050"])
             with contextlib.redirect_stdout(out):
                 g.main()
             self.outcome = "returned"
@@ -403,6 +423,46 @@ check("...while every MIXED output still left",
       len(part.exits) == len(part.dag))
 
 
+
+# ===========================================================================
+print("\n== the FAN-OUT control: the change sweep and the exit, together ==")
+fan = Run(peel=False).go()
+check(f"a fan-out run finishes too ({fan.outcome})", fan.outcome == "returned")
+_fanouts = [t for _l, txs in fan.by_label("Fan-out") for t in txs]
+_sweeps = [t for _l, txs in fan.by_label("Change sweep") for t in txs]
+check("ONE fan-out transaction creates every mix output",
+      len(_fanouts) == 1
+      and len(_fanouts[0].get("destinations") or []) > 1)
+check("...and its unallocated remainder is swept, in its own transaction",
+      len(_sweeps) == 1 and _sweeps[0].get("sweep") is True)
+check("...from the SPENDING account's subaddress 0, which is where monerod "
+      "puts change",
+      bool(_sweeps) and int(_sweeps[0]["src_index"]) == 0)
+check("no address ends the DAG round holding TWO outputs here either",
+      fan.merges() == [])
+
+# THE POINT OF THIS CONTROL. _stage5_run REPLACES its landing list with the
+# DAG round's destinations, which drops the change-sweep destinations it had
+# accumulated -- so the exit has to find that address by enumeration, not by
+# having been told about it. If it does not, the swept change is left on the
+# wallet while the run reports a clean exit.
+_swept_to = {fan.pair_of(t["dst"]) for t in _sweeps} - {None}
+_taken = {(t["account_index"], t["src_index"]) for t in fan.exits}
+check("the exit finds and withdraws the SWEPT CHANGE, which the landing gate "
+      "no longer names by the time the exit runs",
+      bool(_swept_to) and _swept_to <= _taken)
+check(f"...so the exit is mix outputs PLUS the swept change "
+      f"({len(fan.exits)} = {len(fan.dag)} + {len(_swept_to)})",
+      len(fan.exits) == len(fan.dag) + len(_swept_to))
+check("...the wallet is empty afterwards",
+      not [v for v in fan.bal.values() if v > 0])
+_ffees = FEE * (len(_fanouts) + len(_sweeps) + len(fan.dag) + len(fan.exits) + 1)
+check(f"...and value is conserved: {fan.left_wallet / 10**12:.4f} XMR out + "
+      f"fees == {ENTRY_ATOMIC / 10**12} XMR in",
+      fan.left_wallet + _ffees == ENTRY_ATOMIC)
+
+
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
