@@ -1142,6 +1142,14 @@ _ed_saved_il = ghost.integrity_log
 ghost.integrity_log = lambda *a, **k: None
 _ed_saved_env = os.environ.pop("GS_EXIT_TO", None)
 try:
+    def _dests_kw(ds, **kw):
+        _o = io.StringIO()
+        with contextlib.redirect_stdout(_o):
+            ghost.resolve_exit_destinations(
+                types.SimpleNamespace(exit_to=list(ds), **kw))
+        return "\n".join(l for l in _o.getvalue().splitlines()
+                          if "command line" not in l)
+
     def _dests(ds, wallets):
         _o = io.StringIO()
         with contextlib.redirect_stdout(_o):
@@ -1160,11 +1168,25 @@ try:
     # 14-19. The first version printed 12, and two real end-to-end runs at
     # --wallets 4 withdrew 8 and 9 outputs while it said "roughly 4" --
     # understating the one number the warning exists to convey.
-    check("exitdests: ...with the real output RANGE, not the --wallets figure",
-          f"{12 + ghost.DECOY_MIN}-{12 + ghost.DECOY_MAX} separate output(s)"
-          in _one)
-    check("exitdests: ...and 4 wallets brackets what real runs measured (8, 9)",
-          (4 + ghost.DECOY_MIN) <= 8 and 9 <= (4 + ghost.DECOY_MAX))
+    # A FLOOR, and it must never be above what a real run withdraws.
+    #
+    # Three measured end-to-end runs, all --wallets 4: 8 outputs, 9 outputs,
+    # and 18 with --peel --dag-mixing. The first draft of this warning printed
+    # args.wallets (4); the second printed wallets+DECOY_MIN..DECOY_MAX (6-11),
+    # which brackets the first two and understates the third by half. A number
+    # that can be too LOW is the wrong failure for a warning about how many
+    # arrivals land on one address, so it states the certain part as certain.
+    check("exitdests: ...as a FLOOR, so it can never understate",
+          f"AT LEAST {12 + ghost.DECOY_MIN} separate output(s)" in _one)
+    check("exitdests: ...and the floor is at or below every measured run",
+          (4 + ghost.DECOY_MIN) <= min(8, 9, 18))
+    check("exitdests: ...and says the real number is higher",
+          "usually more" in _one)
+    # The deeper settings get the measured figure, because 'usually more' is
+    # too soft for a run that withdrew three times the floor.
+    _deep = _dests_kw([_EA], wallets=4, peel=True, dag_mixing=True)
+    check("exitdests: --peel/--dag-mixing name what was actually measured",
+          "withdrew 18" in _deep and "--dag-mixing/--peel" in _deep)
     check("exitdests: ...saying what it costs, not just that it is unusual",
           "no amount of mixing undoes that" in _one)
     check("exitdests: ...and how to fix it, including the env form",
@@ -1176,7 +1198,7 @@ try:
     _few = _dests([_EA, _EB, _EC], 12)
     check("exitdests: 3 destinations for a 12-wallet run is still reported",
           "3 exit destinations" in _few
-          and f"{12 + ghost.DECOY_MIN}-{12 + ghost.DECOY_MAX} output(s)" in _few)
+          and f"at least {12 + ghost.DECOY_MIN} output(s)" in _few)
     check("exitdests: ...but not as the ONE-destination alarm",
           "ONE exit destination" not in _few)
 

@@ -4422,11 +4422,34 @@ def resolve_exit_destinations(args) -> None:
     # in two real end-to-end runs. Understating is the wrong direction for a
     # warning whose whole force is HOW MANY arrivals land on one address.
     _w = max(int(getattr(args, "wallets", 0) or 0), 1)
-    _lo, _hi = _w + DECOY_MIN, _w + DECOY_MAX
-    if len(dests) == 1 and _hi > 1:
+    # A FLOOR, not a range, and not --wallets.
+    #
+    # Three measured end-to-end runs, all --wallets 4:
+    #     fan-out, no DAG          ->  8 outputs
+    #     fan-out, no DAG          ->  9 outputs
+    #     --peel --dag-mixing      -> 18 outputs
+    # The first draft printed args.wallets (4). The second printed
+    # wallets + DECOY_MIN..DECOY_MAX (6-11), which brackets the first two and
+    # still understates the third by half: --dag-mixing and --peel leave more
+    # funded outputs behind than the fan-out alone, and the exact count depends
+    # on how the hops and peel change carriers land.
+    #
+    # So: the part that is certain, stated as certain, plus a plain sentence
+    # that the real number is higher on the deeper settings. A number that can
+    # be too LOW is the wrong failure for a warning whose whole force is how
+    # many arrivals land on one address -- and pretending to a precision this
+    # cannot have is how the last two versions of this line came to be wrong.
+    _lo = _w + DECOY_MIN
+    _deeper = bool(getattr(args, "dag_mixing", False)
+                   or getattr(args, "peel", False))
+    if len(dests) == 1:
         integrity_log("exit", "single_exit_destination")
-        print(f"  [!] ONE exit destination, and this run will withdraw "
-              f"{_lo}-{_hi} separate output(s) to it.")
+        print(f"  [!] ONE exit destination, and this run will withdraw AT "
+              f"LEAST {_lo} separate output(s) to it"
+              + (" — measurably more than that with --dag-mixing/--peel, "
+                 "which leave more funded outputs behind (a measured "
+                 "--wallets 4 run with both withdrew 18)."
+                 if _deeper else ", and usually more."))
         print(f"      Each goes in its own transaction, so whoever watches "
               f"that address sees that many arrivals and knows they belong "
               f"together. The run spends hours giving these outputs separate "
@@ -4439,9 +4462,9 @@ def resolve_exit_destinations(args) -> None:
               f"destination once it starts.")
     elif len(dests) > 1 and _lo > len(dests) * 2:
         integrity_log("exit", "few_exit_destinations")
-        print(f"  [!] {len(dests)} exit destinations for {_lo}-{_hi} "
-              f"output(s): about {_lo // len(dests)}-{_hi // len(dests)} "
-              f"arrivals per address. More destinations means fewer each.")
+        print(f"  [!] {len(dests)} exit destinations for at least {_lo} "
+              f"output(s): {_lo // len(dests)}+ arrivals on each, and more on "
+              f"the deeper settings. More destinations means fewer each.")
 
 
 def reject_self_exit(args, addr_index: dict, entry_addr: str) -> None:
