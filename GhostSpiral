@@ -1834,8 +1834,22 @@ def build_peel_plan(entry_index: int, change_index: int,
 
     So the whole chain leaves nothing on subaddress 0, there are no change
     sweeps for a peel run (n fewer transactions), and no change-sweep
-    destinations for the exit to withdraw (another n fewer). The measured
-    36-transaction run becomes 22.
+    destinations for the exit to withdraw (another n fewer).
+
+    CONFIRMED by re-running the same --peel --dag-mixing shape end to end
+    against a real chain afterwards. Before and after, same 12 XMR entry:
+
+                             before          after
+        transactions            36              22
+        output counts       {2:30, 3:6}      {2:22}
+        tx_extra          {44:30, 131:6}   {44:16, 99:6}
+        exit arrivals           14               7
+        total fee          0.072714 XMR    0.045544 XMR
+        exit cluster      six inside 3 pico    none
+
+    Every transaction the run makes is now 2-output, every peel emptied its
+    carrier, every withdrawal reported "emptied", and the run finished clean
+    enough to wipe its own plans.
 
     WHY NOT subtract_fee_from_outputs. Monero v0.18.3.1 accepts the field on
     transfer_split and silently ignores it -- measured: both destinations were
