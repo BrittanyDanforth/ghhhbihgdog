@@ -443,12 +443,18 @@ try:
     # FAN-OUT + DAG: the gate must name the DAG destinations, not the
     # distribution's -- every hop source swept itself empty.
     _calls.clear()
+    _dag.write_text(json.dumps({"meta": META, "txs": [
+        {"src": "s1", "src_index": 1, "account_index": 1, "dst": "D3",
+         "sweep": True},
+        {"src": "s2", "src_index": 1, "account_index": 2, "dst": "D4",
+         "sweep": True}]}))
+    _DAGIX = {"D3": (3, 1), "D4": (4, 1)}
     with contextlib.redirect_stdout(io.StringIO()):
         ghost._stage5_run(Args(), str(_fan), str(_dag), [(1, 1), (2, 1)],
                           str(_tmp / "stg"), None, Decimal("9"),
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1, 2],
-                          dag_targets=[(3, 1), (4, 1)], sweep_targets=[])
+                          dag_dst_index=_DAGIX, sweep_targets=[])
     _kinds = [c[0] for c in _calls]
     check("fan-out+DAG: a wait runs before the exit",
           "wait" in _kinds and "exit" in _kinds
@@ -458,6 +464,8 @@ try:
           _last_wait[1] == ((3, 1), (4, 1)))
     check("...labelled as the last round, not as the fan-out",
           "fan-out" not in _last_wait[2])
+    check("fan-out: the DAG plan is left exactly as it was written",
+          len(json.loads(_dag.read_text())["txs"]) == 2)
 
     # PEEL that stopped at 3 of 8: the gate must not poll the five carriers
     # nobody paid. An hour of polling, then the exit runs anyway.
@@ -470,10 +478,82 @@ try:
                           str(_tmp / "stg2"), None, Decimal("9"),
                           distribution_mode="peel", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1],
-                          dag_targets=[], sweep_targets=[])
+                          dag_dst_index={}, sweep_targets=[])
     _w2 = [c for c in _calls if c[0] == "wait"]
     check("peel stopped at 3/8: the gate waits on exactly the 3 that relayed",
           _w2 and _w2[-1][1] == tuple(_peel_targets[:3]))
+
+    # ---- a partial peel chain must still get its second mixing round -------
+    #
+    # The five carriers the chain never reached hold nothing, so the five hops
+    # that would sweep them cannot be built. Leaving them in the plan makes
+    # phase_create exit 1, which _run_round turns into sys.exit -- the run dies
+    # after the peels are on-chain and before the exit. Leaving the WAIT
+    # untrimmed costs an hour and then skips the round outright.
+    _calls.clear()
+    _rounds = []
+    ghost._run_round = lambda a, pf, sd, lb, **k: _rounds.append((str(pf), lb))
+    _peel8 = [(20 + i, 1) for i in range(8)]
+    _dag8 = _tmp / "dag8.json"
+    _dag8.write_text(json.dumps({"meta": META, "txs": [
+        {"src": f"m{i}", "src_index": 1, "account_index": 20 + i,
+         "dst": f"D{(i + 1) % 8}", "sweep": True} for i in range(8)]}))
+    _ix8 = {f"D{i}": (20 + i, 1) for i in range(8)}
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost._stage5_run(Args(), str(_fan), str(_dag8), _peel8,
+                          str(_tmp / "stg2b"), None, Decimal("9"),
+                          distribution_mode="peel", change_target=(4, 0),
+                          change_sweep_jobs=[], exit_accounts=[1],
+                          dag_dst_index=_ix8, sweep_targets=[])
+    _kept8 = json.loads(_dag8.read_text())["txs"]
+    check("partial peel: the DAG round still RUNS over what was funded",
+          any(lb == "DAG" for _pf, lb in _rounds))
+    check("...with only the hops whose source the chain actually funded",
+          [t["account_index"] for t in _kept8] == [20, 21, 22])
+    check("...so no hop is built from a carrier that holds nothing",
+          all((t["account_index"], t["src_index"]) in set(_peel8[:3])
+              for t in _kept8))
+    _w2b = [c for c in _calls if c[0] == "wait"]
+    check("...and the pre-round wait polls only those three",
+          _w2b and _w2b[0][1] == tuple(_peel8[:3]))
+    check("...while the exit's gate names the surviving hops' DESTINATIONS",
+          _w2b and _w2b[-1][1] == tuple(_ix8[t["dst"]] for t in _kept8))
+
+    # NO ADDRESS MAY END THE ROUND HOLDING TWO OUTPUTS -- the invariant the
+    # whole hop planner exists to keep, re-checked on the FILTERED plan.
+    # An address holds its own output only if the distribution funded it, and
+    # a funded source's hop is exactly what the filter keeps, so the two can
+    # never both be true. Asserted rather than argued.
+    _funded8 = {f"m{i}" for i in range(3)}          # peels 0..2 relayed
+    _hopped8 = {t["src"] for t in _kept8}
+    _holders8 = _funded8 - _hopped8                 # still hold their own
+    _receivers8 = {t["dst"] for t in _kept8}
+    _srcname = {f"D{i}": f"m{i}" for i in range(8)}
+    check("filtered round: nothing that keeps its own output also receives one",
+          not {_srcname[d] for d in _receivers8} & _holders8)
+
+    # A chain that relayed NOTHING has no hop to build at all.
+    _calls.clear()
+    _rounds.clear()
+    ghost._run_peel_chain = lambda *a, **k: 0
+    _dag0 = _tmp / "dag0.json"
+    _dag0.write_text(json.dumps({"meta": META, "txs": [
+        {"src": "m0", "src_index": 1, "account_index": 20, "dst": "D1",
+         "sweep": True}]}))
+    with contextlib.redirect_stdout(io.StringIO()):
+        _inc0, _wh0 = ghost._stage5_run(
+            Args(), str(_fan), str(_dag0), _peel8, str(_tmp / "stg2c"), None,
+            Decimal("9"), distribution_mode="peel", change_target=(4, 0),
+            change_sweep_jobs=[], exit_accounts=[1],
+            dag_dst_index=_ix8, sweep_targets=[])
+    check("a peel chain that relayed nothing does not run a DAG round",
+          not any(lb == "DAG" for _pf, lb in _rounds))
+    check("...and says the second mixing round did not happen",
+          any("second mixing" in m for m in _inc0))
+    check("...without an hour of polling first",
+          not [c for c in _calls if c[0] == "wait" and c[1]])
+    ghost._run_peel_chain = lambda *a, **k: 3
+    ghost._run_round = lambda *a, **k: 1
 
     # A change sweep that FAILED left its destination unfunded; waiting on it
     # is an hour of polling an address nobody paid.
@@ -485,7 +565,7 @@ try:
                           str(_tmp / "stg3"), None, Decimal("9"),
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[(4, 0, "addr", 1)],
-                          exit_accounts=[1], dag_targets=[],
+                          exit_accounts=[1], dag_dst_index={},
                           sweep_targets=[(77, 1)])
     _w3 = [c for c in _calls if c[0] == "wait"]
     check("a change sweep that failed is not waited on",
@@ -504,7 +584,7 @@ try:
                           str(_tmp / "stg4"), None, Decimal("9"),
                           distribution_mode="fanout", change_target=(4, 0),
                           change_sweep_jobs=[], exit_accounts=[1],
-                          dag_targets=[], sweep_targets=[])
+                          dag_dst_index={}, sweep_targets=[])
     check("without --exit-to there is no landing gate to pay for",
           not [c for c in _calls if c[0] == "wait"])
 finally:
@@ -521,13 +601,17 @@ _dag_t, _sw_t = ghost._landing_targets(
     _ai, [{"dst": "dstA"}, {"dst": "dstB"}, {"dst": "unknown"}],
     [(1, 0, "sweepA", 5), (2, 0, "missing", 7)])
 check("hop destinations are resolved through addr_index",
-      _dag_t == [(3, 1), (4, 2)])
+      _dag_t == {"dstA": (3, 1), "dstB": (4, 2)})
 check("an unresolvable destination is DROPPED, never guessed",
-      (0, 0) not in _dag_t and len(_dag_t) == 2)
+      "unknown" not in _dag_t and (0, 0) not in _dag_t.values())
+# A MAP, because _stage5_run may remove hops before the round runs and then
+# has to name what survived. A positional list cannot answer that.
+check("...and it is keyed by the destination address the plan entry carries",
+      isinstance(_dag_t, dict))
 check("a change sweep's destination account comes from addr_index",
       _sw_t == [(9, 5)])
 check("...and an unresolvable one is dropped too", len(_sw_t) == 1)
-check("empty in, empty out", ghost._landing_targets({}, None, None) == ([], []))
+check("empty in, empty out", ghost._landing_targets({}, None, None) == ({}, []))
 
 
 print("\n== every balance reader still syncs first ==")
