@@ -2427,7 +2427,31 @@ async function sync(){
 // Network/OPSEC fields re-trigger the preflight; everything else just re-syncs.
 const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
 const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing','exit_to','split','split_recv']);
-$$('input,select').forEach(el=>el.addEventListener('input',()=>{
+// TEXTAREA TOO. exit_to is the page's only <textarea>, and this selector did
+// not name it -- so the ONE field that changes the run's size the most was the
+// one field whose edits recomputed nothing. Measured on the shipped page at the
+// "Maximum safe" preset:
+//
+//   exit_to empty                 35 transactions  ~2.1 days
+//   three exit addresses typed    35 transactions  ~2.1 days  <- what you see,
+//                                 and the line still reads "(no exit
+//                                 destination set, so no withdrawals are
+//                                 counted)" with three of them in the box
+//   after touching ANY other      52 transactions  ~3.0 days  <- the truth
+//   control
+//
+// 17 transactions and about 21 hours missing, on a page whose own run_eta
+// docstring says an operator told the wrong number "concludes the run has hung
+// and interrupts it -- and an interrupt mid-round is the one failure this
+// pipeline has no automatic recovery from". FEE_FIELDS lists exit_to for the
+// same reason and never fired either, so the reserved-fee panel was stale on
+// the shape change that adds one transaction per withdrawn output.
+//
+// Same family as the hop_delay defect recorded in collect(): the schema had
+// the field, the presets set it, collect() sent it -- and one link in the
+// chain did not know about it. tests/test_console.py now walks the page's own
+// controls and requires this selector to cover every tag they use.
+$$('input,select,textarea').forEach(el=>el.addEventListener('input',()=>{
  if(el.id==='arm') return;
  // The fee panel reports the TOTAL the run reserves, and that reserve is now
  // one fee per transaction the run will actually make -- so it moves with the
