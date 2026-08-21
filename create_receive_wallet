@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+create_receive_wallet - GhostSpiral companion (v10-ready)
+==========================================================
+Creates a fresh receive SUBADDRESS on the wallet that monero-wallet-rpc
+already has open, and writes a gs_receive_wallet_v1 reference (address +
+account/subaddress index + rpc_endpoint) for GhostSpiral receive mode.
+It does NOT create a new wallet and does NOT export spend/view keys --
+GhostSpiral reaches the funds through the same wallet-rpc endpoint.
+
+OPSEC hardening:
+  - Tor leak check before RPC contact
+  - NEWNYM after subaddress creation to break timing correlation
+  - Output files written 0600 (owner-only), output dir 0700
+  - Addresses scrubbed in the INTEGRITY LOG (see below re: the terminal)
+  - Integrity hash-chain for every wallet event
+  - Atomic JSON writes with fsync
+  - Resource sentinel
+
+CORRECTNESS: the address this prints is where money will be sent, so it is not
+taken on the RPC's word. After creation the wallet is asked to resolve the
+index back to an address and to validate that address, and the two must agree
+with what new_address returned. A wrong or substituted address here would be
+copied into a swap memo and paid to someone else, irreversibly.
+
+THE FULL ADDRESS IS PRINTED, deliberately -- this header used to claim
+"Addresses scrubbed in terminal output" while printing it in full on the very
+next line. The operator has to read the address to use it, so it is shown; the
+scrubbed form is what goes into the persistent integrity log.
+"""
+from __future__ import annotations
+import argparse, stat, sys, time
+from pathlib import Path
+
+from gs_common import (
+    integrity_log, integrity_log_once, verify_tor, validate_proxy, connect_rpc,
+    require_resources, atomic_write_json,
+    install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
+    create_fresh_account,
+    wipe_covers,
+)
+
+
+def verify_receive_address(wallet_rpc, addr_str: str, sub_idx: int,
+                           acct_idx: int = 0) -> None:
+    """Confirm the wallet really owns `addr_str` at `acct_idx` / `sub_idx`.
+
+    Everything downstream treats this string as "where my money arrives": it is
+    printed for the operator, written into the gs_receive_wallet_v1 bundle, and
+    pasted into a ThorChain swap memo. Until this check existed the string was
+    accepted purely on the RPC's say-so, so a misdirected endpoint, a stale
+    wallet, or a tampered response would have been copied straight into a swap
+    the operator could not reverse.
+
+    Two independent confirmations, both from the wallet itself:
+      * get_address(account_index=acct_idx, address_index=[sub_idx]) must resolve the
+        index back to the SAME address -- proving the wallet holds it there.
+      * validate_address must call it a valid, non-integrated SUBADDRESS on
+        this wallet's own network -- catching a mainnet/testnet mix-up and an
+        address that is well-formed but of the wrong kind.
+    """
+    try:
+        res = wallet_rpc.raw_request("get_address", {
+            "account_index": int(acct_idx), "address_index": [int(sub_idx)],
+        })
+        entries = (res or {}).get("addresses") or []
+    except Exception as e:
+        integrity_log("wallet", "addr_readback_failed")
+        sys.exit(
+            f"[!] Could not read the new subaddress back from the wallet ({str(e)[:60]}).\n"
+            f"    Refusing to hand you an address the wallet has not confirmed it owns."
+        )
+
+    match = [e for e in entries if e.get("address_index") == int(sub_idx)]
+    if not match:
+        integrity_log("wallet", "addr_readback_missing_index")
+        sys.exit(
+            f"[!] The wallet does not report a subaddress at account {acct_idx} "
+            f"index {sub_idx}.\n"
+            f"    Refusing to use an address the wallet cannot confirm."
+        )
+    if match[0].get("address") != addr_str:
+        integrity_log("wallet", "ADDR_READBACK_MISMATCH")
+        sys.exit(
+            f"[!] ADDRESS MISMATCH. new_address returned\n"
+            f"      {scrub_address(addr_str)}\n"
+            f"    but the wallet reports index {sub_idx} as\n"
+            f"      {scrub_address(match[0].get('address'))}\n"
+            f"    Do NOT use either. The wallet-rpc endpoint may be wrong or tampered\n"
+            f"    with; money sent to an unverified address cannot be recovered."
+        )
+
+    try:
+        v = wallet_rpc.raw_request("validate_address", {
+            "address": addr_str, "any_net_type": False, "allow_openalias": False,
+        }) or {}
+    except Exception as e:
+        integrity_log("wallet", "addr_validate_unavailable")
+        # Older wallet-rpc builds lack validate_address. The read-back above
+        # already proved ownership, so this is a downgrade in assurance, not a
+        # failure -- say exactly that rather than implying a full check ran.
+        print(f"  [!] validate_address unavailable ({str(e)[:50]}); the address was "
+              f"confirmed by index read-back only.")
+        return
+
+    if not v.get("valid"):
+        integrity_log("wallet", "addr_invalid")
+        sys.exit(f"[!] The wallet rejects its own new address as invalid. Refusing.")
+    if v.get("integrated"):
+        integrity_log("wallet", "addr_integrated_unexpected")
+        sys.exit(
+            "[!] The new address is an INTEGRATED address, not a plain subaddress.\n"
+            "    GhostSpiral's receive mode expects a subaddress; refusing."
+        )
+    if not v.get("subaddress"):
+        integrity_log("wallet", "addr_not_subaddress")
+        sys.exit(
+            "[!] The wallet says this is not a subaddress. It is probably the\n"
+            "    wallet's primary address, which would defeat the per-hop isolation\n"
+            "    the receive flow depends on. Refusing."
+        )
+    # ONCE, not once per --count. chain_safe redacts this to
+    # `addr_verified:acct=#:idx=#:mainnet`, so with --count 4 the file holds
+    # four byte-identical lines and the count is read off by tallying them --
+    # the cardinality integrity_log_once exists to withhold, and --count is
+    # exactly the number of swap chunks the run is built around. The account,
+    # index and nettype are already redacted to nothing on disk and are printed
+    # in full on the next line, where they reach the operator and stop.
+    integrity_log_once("wallet", "addr_verified")
+    print(f"  [+] Address verified against the wallet "
+          f"(index read-back + validate_address, nettype {v.get('nettype', '?')})")
+
+
+def mint_one_receive(wallet_rpc, args) -> tuple:
+    """Create ONE receive address in its own account and write its bundle.
+
+    Returns (address, bundle_path). Extracted from main() so --count can mint
+    several without duplicating the verification, the bundle write or the
+    circuit rotation -- and so a single receive can be driven from a test
+    without standing up the whole CLI.
+    """
+    # A FRESH ACCOUNT PER RECEIVE, not just a fresh subaddress in account 0.
+    #
+    # Verified against real monerod 0.18: change is returned to the SPENDING
+    # ACCOUNT's subaddress 0. Everything the mix later leaves over -- the
+    # fan-out's unallocated remainder, the dust from every DAG hop -- therefore
+    # comes to rest on the subaddress 0 of whichever account the receive
+    # landed in. Issuing receives into account 0 makes that the wallet's own
+    # primary address, shared by every receive ever taken, so two receives are
+    # trivially the same wallet and that one address accumulates a slice of
+    # every mix.
+    #
+    # An account of its own gives this receive a change sink used for nothing
+    # else, and leaves the wallet's primary address untouched by the pipeline.
+    # --account lets an operator override for an existing layout.
+    if args.account is not None:
+        acct_idx = int(args.account)
+    else:
+        try:
+            # Shared, fail-closed helper -- see gs_common.create_fresh_account.
+            # This read `int((acct or {}).get("account_index", 0))`, so a
+            # create_account that succeeded with an unexpected shape silently
+            # put the receive in account 0, whose subaddress 0 is the wallet's
+            # PRIMARY address. The warning below could not tell that apart from
+            # an operator who had deliberately chosen `--account 0`.
+            acct_idx = create_fresh_account(wallet_rpc, args.label)
+        except Exception as e:                                   # noqa: BLE001
+            integrity_log("wallet", "account_create_FAILED")
+            sys.exit(
+                f"[!] Could not create a fresh account for this receive "
+                f"({str(e)[:60]}).\n"
+                f"    Refusing to fall back to account 0: its subaddress 0 is the\n"
+                f"    wallet's primary address, and every leftover from mixing this\n"
+                f"    receive would come to rest there. Use --account N to choose an\n"
+                f"    account deliberately if that is what you want.")
+    if acct_idx == 0:
+        # Only reachable via an explicit `--account 0` now: the fresh-account
+        # path refuses to report 0 at all. So this is a deliberate operator
+        # choice, and the message says so rather than implying the tool did it.
+        print("  [!] You asked for account 0 (--account 0). Its subaddress 0 is "
+              "the wallet's PRIMARY address, so every leftover from mixing this "
+              "receive will come to rest there, on the same address as every "
+              "other receive.")
+    integrity_log_once("wallet", "receive_account")
+
+    addr_str, sub_idx = wallet_rpc.new_subaddress_indexed(
+        account_index=acct_idx, label=args.label,
+    )
+
+    verify_receive_address(wallet_rpc, addr_str, sub_idx, acct_idx)
+
+    # The label's CONTENT never reaches the integrity chain -- only whether one
+    # was set. This logged `label={args.label}` verbatim. The entire reason
+    # this tool defaults to no label is that a label describes an address's
+    # role to whoever reads it, and the integrity chain is a file on disk that
+    # outlives the run and is wiped LAST, so an operator who set a meaningful
+    # label got it written straight back out into a second artifact. Whether a
+    # label exists is all an audit trail needs; what it says is the leak.
+    _has_label = "set" if args.label else "none"
+    integrity_log_once("wallet", f"created:label={_has_label}")
+
+    out = {
+        "schema": "gs_receive_wallet_v1",
+        "created": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        "address": addr_str,
+        "account_index": acct_idx,
+        "subaddress_index": sub_idx,
+        "label": args.label,
+        "rpc_endpoint": args.rpc,
+    }
+
+    outdir = Path(args.output_dir)
+    # narrow_existing=False: --output-dir defaults to ".", so this chmod'ed
+    # the operator's current working directory to 0700 on every run. It only
+    # ever narrowed, so nothing leaked — but silently changing the permissions
+    # of a directory you were merely asked to write a file into is not this
+    # tool's business. A directory it CREATES is still made owner-only.
+    _pre_existing = outdir.exists()
+    secure_mkdir(outdir, narrow_existing=False)
+    if _pre_existing:
+        try:
+            _mode = stat.S_IMODE(outdir.stat().st_mode)
+        except OSError:
+            _mode = 0
+        if _mode & 0o077:
+            print(f"  [!] {outdir} is mode {_mode:o}: other local accounts can "
+                  f"list it. The bundle itself is written 0600, so its "
+                  f"CONTENTS stay private — but the filename, its size and its "
+                  f"timestamp are visible, which dates a receive-wallet "
+                  f"operation on this host. chmod 700 it yourself if that "
+                  f"matters; this tool no longer changes a directory you "
+                  f"chose.")
+    fname = outdir / f"wallet_{secure_hex(8)}.json"
+    atomic_write_json(out, fname)
+    # WIPE COVERAGE, same helper, same reason. The bundle names the receive
+    # address and its (account, subaddress) -- the pair report_holdings refuses
+    # to put on disk -- and --output-dir sends it wherever the operator says.
+    if not wipe_covers(fname):
+        integrity_log_once("wallet", "bundle_outside_wipe_roots")
+        print(f"  [!] {outdir} is OUTSIDE the directories paranoia_mode "
+              f"sweeps, so this bundle will NOT be wiped with the rest of the "
+              f"run. It names the receive address and its account/subaddress. "
+              f"Delete it yourself, or keep it under the working directory or "
+              f"$HOME.")
+
+    print(f"  [+] Receive subaddress bundle saved -> {fname}")
+    print(f"  [+] Address: {addr_str}")
+    print(f"  [+] Subaddress index: {sub_idx} (account {acct_idx})")
+
+    integrity_log_once("wallet", "saved")
+
+    # required=True: the header claims this rotation happens, and a silent
+    # failure leaves the subaddress creation on the same circuit as whatever
+    # follows it -- which is the correlation the rotation exists to break.
+    newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
+    # (account, subaddress) alongside the address, so main() can compare
+    # SUCCESSIVE mints -- see refuse_duplicate_receive.
+    #
+    # THIS IS AN ARITY CHANGE, and the comment that used to sit here claimed it
+    # was not: "a third element rather than a new shape, so
+    # `addr, path = mint_one_receive(...)` still unpacks for every existing
+    # caller". That is simply false -- a 3-tuple does not unpack into two
+    # names, it raises ValueError -- and writing it down did not make it true.
+    #
+    # It survived a full offline suite and a 63-mutation sweep because the one
+    # offline test that calls this INDEXES the result (b[0], b[1]) instead of
+    # unpacking it. tests/real_receive_count_testnet.py unpacks, and that is a
+    # real-binary suite that cannot run without monerod installed -- so nothing
+    # in reach at the time executed the line that breaks. Every caller is
+    # updated now; the list is short and it is in this file plus tests/.
+    return addr_str, fname, (acct_idx, sub_idx)
+
+
+def refuse_duplicate_receive(addr, acct, seen_addrs, seen_accts,
+                             n, count) -> None:
+    """Refuse a mint the wallet has already handed back this run.
+
+    A FUNCTION so a test drives the SHIPPED guard rather than a copy of it.
+    This started inline in main()'s loop, and the test meant to pin it
+    reimplemented the loop body instead of calling it -- so the mutation
+    sweep turned both checks into `if False:` and the suite stayed GREEN,
+    twice. Same lesson compute_hop_amount records: "a modelled formula in a
+    test cannot catch a regression in the shipped one."
+    """
+    # THE SIXTH MINTING LOOP, and the only one that did not check.
+    #
+    # create_fresh_account validates a SINGLE answer and has no memory
+    # across calls -- build_change_sweep_jobs says so in as many words:
+    # "it validates a single answer and has no memory across calls". Every
+    # other bulk-minting loop in this toolchain closes that gap itself, and
+    # there are seven of them: DUPLICATE_SUBADDRESS, DUPLICATE_MIX_ACCOUNT,
+    # DUPLICATE_ENTRY_SUBADDRESS, DUPLICATE_ENTRY_ACCOUNT,
+    # DUPLICATE_VEIL_CARRIER, DUPLICATE_PEEL_CARRIER,
+    # DUPLICATE_CHANGE_SWEEP_TARGET. This loop merged N results into a list
+    # and compared them with nothing.
+    #
+    # Driven with a wallet-rpc that repeats its answer -- proxied, older,
+    # or re-opened, which is the threat model the other seven accept:
+    # --count 3 returned three "independent receives" that were ONE address
+    # in ONE account, and wrote three separate bundle files pointing at it.
+    #
+    # thor_swap_preparer does refuse duplicate destinations, so the money
+    # does not actually converge on the documented path. But it refuses
+    # THERE -- after three accounts exist, three bundles are on disk and
+    # three Tor circuits have been rotated -- and it blames the swap
+    # destinations, which is the symptom. The fault is a wallet-rpc handing
+    # back the same account twice, and nothing said so.
+    #
+    # An account collision is its own harm even when the addresses differ:
+    # change lands on the SPENDING account's subaddress 0, so two receives
+    # in one account pool their leftovers onto a single address, which is
+    # the exact reason each receive gets an account of its own.
+    if addr in seen_addrs:
+        integrity_log("wallet", "DUPLICATE_RECEIVE_ADDRESS")
+        sys.exit(
+            f"[!] The wallet returned an address it has ALREADY given this "
+            f"run (receive {n + 1} of {count}).\n"
+            f"    Each receive must be a fresh, unused address: several "
+            f"swaps delivering to one\n"
+            f"    address links them to the aggregator and puts the same "
+            f"destination in every\n"
+            f"    public swap memo. Refusing rather than writing bundles "
+            f"that all name it.\n"
+            f"    Check that monero-wallet-rpc is the wallet you think it "
+            f"is and is not being\n"
+            f"    served from a cache or a stale session.")
+    if acct in seen_accts:
+        integrity_log("wallet", "DUPLICATE_RECEIVE_ACCOUNT")
+        sys.exit(
+            f"[!] The wallet put receive {n + 1} of {count} in "
+            f"account {acct}, which this run has\n"
+            f"    already used. Change is returned to the SPENDING "
+            f"account's subaddress 0, so two\n"
+            f"    receives sharing an account pool every leftover from "
+            f"mixing onto ONE address --\n"
+            f"    which is the whole reason each receive gets an account "
+            f"of its own. Refusing.")
+
+
+def print_next_steps(bundles: list) -> None:
+    """What to run next, and what the next step costs you.
+
+    REWRITTEN, because the old version taught the leak this toolchain spent
+    the rest of its effort closing. It printed
+
+        python3 thor_swap_preparer --amounts <BTC_AMOUNT> --dests <address>
+
+    -- putting BOTH the swap amount and the 95-character XMR destination on a
+    command line. /proc/<pid>/cmdline is mode 444, so any local account can
+    read `ps -eo args` and learn how much is being swapped and where the
+    Monero lands. thor_swap_preparer already prefers GS_SWAP_AMOUNTS and
+    already has --dest-from-receive-wallet for exactly this, and the tool's
+    own next-steps text recommended neither. A fix that the guidance walks
+    the operator around is not a fix.
+
+    The disclosure paragraph is here rather than buried in a doc because this
+    is the moment the operator is about to hand the address to an aggregator,
+    and it is the last moment the choice is still open.
+    """
+    n = len(bundles)
+    print()
+    print("  === RECEIVER FLOW: NEXT STEPS ===")
+    print("  1. Get the BTC deposit address + memo. The destination comes from")
+    print("     the bundle(s) above — never retype a 95-character address, and")
+    print("     never put the address or the amount on the command line (any")
+    print("     local user can read those from ps / /proc/<pid>/cmdline):")
+    print(f"       GS_SWAP_AMOUNTS='{' '.join(['<BTC_AMOUNT>'] * n)}' \\")
+    print("       python3 thor_swap_preparer \\")
+    # INDEXED, not unpacked. main() passes (address, path) pairs while
+    # mint_one_receive returns a 3-tuple, so an unpack here is correct only for
+    # as long as those two shapes stay different -- and a caller that hands its
+    # mint results straight in (which the real-binary suite does) would hit the
+    # ValueError that shape mismatch already caused once.
+    print(f"         --dest-from-receive-wallet "
+          f"{' '.join(str(b[1]) for b in bundles)} \\")
+    print("         --tor-proxy <SOCKS5H_PROXY>")
+    if n == 1:
+        print("     (Splitting into several swaps? Each one needs its OWN address —")
+        print("      re-run this tool with --count N and pass all N bundles.)")
+    print("  2. Give the BTC deposit address + memo to the sender.")
+    print("  3. Wait for the payment. Do NOT refresh a block explorer to check —")
+    print("     asking one whether that BTC address has been paid tells a party")
+    print("     that did not know it that someone is watching it. This polls your")
+    print("     OWN wallet instead, and asks what to do once the money lands:")
+    print(f"       python3 receive_watch \\")
+    print(f"         --receive-wallet {bundles[0][1]} \\")
+    print(f"         --pairs <THOR_PAIRS_JSON> \\")
+    print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print("  4. It prints the mix command for whichever option you pick, e.g.:")
+    print(f"       python3 GhostSpiral \\")
+    print(f"         --receive-wallet {bundles[0][1]} \\")
+    print(f"         --tor-proxy <SOCKS5H_PROXY>")
+    print()
+    print("  === WHAT THE SWAP WILL DISCLOSE (decide now, not after) ===")
+    print("  A BTC->XMR aggregator has to be TOLD where to deliver the Monero.")
+    print("  That instruction travels in the memo attached to the sender's BTC")
+    print("  payment, so the aggregator — and anyone it shares with, or anyone")
+    print("  who later compels it — can tie THAT BTC PAYMENT to THE ADDRESS")
+    print("  ABOVE. Tor hides who arranged the swap. It does not hide the link.")
+    print()
+    print("  The mixing that follows hides what you do NEXT with the Monero. It")
+    print("  cannot retract what the aggregator already saw. So treat the")
+    print("  address above as burned: use it for this one swap, let the mix move")
+    print("  the funds off it, and do not reuse it. Keep the memo off anything")
+    print("  public — a paste site, an issue, a group chat — because the memo")
+    print("  names that address in plain text, and publishing it turns a link")
+    print("  one company holds into a link everyone holds.")
+    print()
+    print("  What is NOT at risk here: nobody reads your wallet off the")
+    print("  blockchain. Monero hides the amount and the spender, and your view")
+    print("  key is not derivable from chain data. A view key leaks one way —")
+    print("  somebody gets your FILES: the online view-only machine, a laptop")
+    print("  that auto-unlocks, a backup, or a key you pasted somewhere. That is")
+    print("  a disk-encryption and physical-custody problem, not a chain problem,")
+    print("  and it is the one paranoia_mode deliberately cannot solve for you.")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "create_receive_wallet v10",
+        description="Generate a fresh Monero receive subaddress for GhostSpiral",
+    )
+    ap.add_argument("--rpc", default="http://127.0.0.1:18083",
+                    help="monero-wallet-rpc endpoint")
+    ap.add_argument("--tor-proxy",
+                    help="socks5h://host:port if routing via Tor")
+    ap.add_argument("--label", default="",
+                    help="label for the new subaddress. Empty by default and best "
+                         "left that way: labels live in the WALLET FILE, which is "
+                         "the one artifact paranoia_mode never deletes, so a "
+                         "seized or auto-unlocking wallet hands a reader the "
+                         "role of every address -- and a label naming the tool "
+                         "names the tool.")
+    ap.add_argument("--account", type=int, default=None,
+                    help="use this existing account instead of creating a fresh one. "
+                         "Only for an existing wallet layout — a fresh account per "
+                         "receive is what keeps the mix's change off the wallet's "
+                         "primary address.")
+    ap.add_argument("--count", type=int, default=1, metavar="N",
+                    help="mint N receive addresses, each in its OWN account, each "
+                         "with its own bundle file. Use one per swap: a swap "
+                         "aggregator is told the destination, so reusing one address "
+                         "across several swaps hands it a link between those BTC "
+                         "payments. thor_swap_preparer refuses a batch that reuses "
+                         "a destination, and this is how you satisfy it in one go.")
+    ap.add_argument("--output-dir", default=".",
+                    help="directory for wallet JSON output")
+    args = ap.parse_args()
+
+    if args.count < 1:
+        sys.exit("[!] --count must be at least 1.")
+    if args.count > 1 and args.account is not None:
+        sys.exit(
+            "[!] --count > 1 with --account pins every receive to ONE account, so "
+            "they would\n"
+            "    share a change sink and the separation --count exists for is lost. "
+            "Drop\n"
+            "    --account to let each receive get its own account, or mint them one "
+            "at a time.")
+
+    require_resources(min_disk_gb=2.0)
+
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. The Tor verification check itself needs\n"
+            "    a proxy to confirm safe operation. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+
+    try:
+        wallet_rpc = connect_rpc(args.rpc, proxy_url=getattr(args, "tor_proxy", ""))
+    except Exception as e:
+        integrity_log("wallet", f"rpc_connect_fail:{type(e).__name__}")
+        sys.exit(f"[!] Cannot connect to monero-wallet-rpc: {e}")
+
+    # A subaddress can only be created on an already-open wallet. The old code
+    # here did `if not wallet_rpc.accounts: new_account(...)`, which is a dead,
+    # confused branch: accessing .accounts with no open wallet RAISES (never
+    # returns empty), and if it somehow did, new_account creates account 1 while
+    # the next line spends from account 0. Fail clearly instead.
+    try:
+        if not wallet_rpc.accounts:
+            raise RuntimeError("no accounts")
+    except Exception as ex:
+        integrity_log("wallet", "no_open_wallet")
+        sys.exit(f"[!] monero-wallet-rpc has no open wallet ({str(ex)[:50]}). "
+                 f"Open/create a wallet in wallet-rpc first, then re-run.")
+    bundles = []
+    _seen_addrs, _seen_accts = set(), set()
+    for n in range(args.count):
+        if args.count > 1:
+            print(f"\n  === receive {n + 1} of {args.count} ===")
+        _addr, _path, (_acct, _sub) = mint_one_receive(wallet_rpc, args)
+        refuse_duplicate_receive(_addr, _acct, _seen_addrs,
+                                 _seen_accts, n, args.count)
+        _seen_addrs.add(_addr)
+        _seen_accts.add(_acct)
+        bundles.append((_addr, _path))
+
+    print_next_steps(bundles)
+
+
+if __name__ == "__main__":
+    main()

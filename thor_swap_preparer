@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""
+thor_swap_preparer v10.0 - ThorChain BTC -> XMR quote fetcher
+==============================================================
+Generates integrity-logged deposit/memo pairs that GhostSpiral v10
+can consume later.
+
+OPSEC hardening:
+  - Tor verified with retry before any API contact
+  - NEWNYM circuit rotation ENFORCED between each quote request (a silent
+    rotation failure would put every quote on one circuit, which is exactly
+    the correlation the rotation exists to break)
+  - Timing jitter between quotes to frustrate correlation
+  - XMR destination addresses validated (regex + checksum)
+  - BTC deposit addresses validated (full BIP173/BIP350 checksum + witness)
+  - The returned MEMO is checked to actually carry your destination address
+  - Slippage oracle cross-check: warns at 5%, refuses past --max-slippage
+  - Atomic fsync-rename on all output files (0600 perms)
+  - GPG encryption support with import guard
+  - Integrity hash-chain per pair
+
+WHAT THIS TOOL NECESSARILY DISCLOSES: the swap aggregator is told your XMR
+destination address and the BTC amount, and it returns the deposit address the
+sender will pay. That party can therefore link "this BTC deposit" to "this XMR
+address". Tor hides WHO asked; it does not hide the linkage itself. The
+GhostSpiral hops after the swap exist precisely because this first hop is
+known to a third party -- do not treat the swap destination as private.
+"""
+from __future__ import annotations
+import argparse, json, os, sys, time, re
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List
+
+from gs_common import (
+    integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
+    safe_get, safe_post, secure_delay, atomic_write_json,
+    install_signal_handlers, shutdown_requested, scrub_address,
+    bech32_checksum_ok, secure_delete_file, secure_write_text,
+    load_receive_bundle, memo_binds_destination, env_or_argv,
+    integrity_log_once,
+    btc_per_xmr_oracle, quote_deviation, decimal_arg,
+    validate_xmr_address,
+    decimal_env,
+    finite_decimal,
+    wipe_covers, fmt_btc,
+    PAIR_SCHEMA,
+)
+
+SWAPKIT_API = "https://api.swapkit.dev"
+# PAIR_SCHEMA is gs_common's now. It was declared here AND in receive_watch --
+# one constant, two copies, held by the writer and the reader, which are exactly
+# the two sides that must agree about it.
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
+# (CG_PRICE and _XMR_RE used to live here and nothing read either. CG_PRICE was
+# a second copy of gs_common.CG_PRICE_URL -- the oracle this tool actually calls
+# through btc_per_xmr_oracle -- so a URL edit here would have changed nothing.
+# _XMR_RE was a format-only address regex that _validate_xmr_addr does NOT use:
+# it delegates to gs_common.validate_xmr_address, which checks format AND the
+# base58 checksum. A checksum-less regex sitting next to the validator is an
+# invitation to "validate" with the wrong one; the format check it embodies is
+# already the first line of the shared checker, XMR_ADDR_RE.)
+
+
+def _btc_per_xmr(proxy):
+    """Shared oracle (gs_common.btc_per_xmr_oracle), with this tool's warning.
+
+    Was a private copy here; GhostSpiral's stage 2 then had no oracle at all,
+    so one swap path cross-checked its quotes and the other accepted anything.
+    Both use the shared helper now. It still fails CLOSED (None) rather than
+    returning an invented rate, and the caller disables the check out loud.
+    """
+    # getter=safe_get resolves from THIS module at call time, so the
+    # suites that stub thor's safe_get still intercept the fetch.
+    rate = btc_per_xmr_oracle(proxy, getter=safe_get)
+    if rate is None:
+        print("  [!] Price oracle unreachable — the slippage cross-check will be "
+              "DISABLED for this batch. Verify each quote manually.")
+    return rate
+
+
+#: The memo check now lives in gs_common so GhostSpiral's own swap stage
+#: enforces the identical rule -- it previously had no memo check at all and
+#: would print deposit instructions for a memo naming someone else's address.
+#: Kept as a module-level name because it is part of this file's tested surface.
+_memo_binds_destination = memo_binds_destination
+
+
+def _dest_from_bundle(path: str) -> str:
+    """Read the XMR destination out of a gs_receive_wallet_v1 bundle.
+
+    Validated strictly rather than trusted: this address becomes the swap memo,
+    and a swap delivering to the wrong address cannot be undone. The shared
+    loader refuses a file of the wrong schema outright instead of probing it
+    for an "address" key, so an unrelated JSON that happens to have one can
+    never become the destination of somebody's money.
+    """
+    try:
+        d = load_receive_bundle(path)
+    except ValueError as e:
+        sys.exit(f"[!] {path}: {e}")
+    addr = d["address"]
+    # ONCE, NOT ONCE PER BUNDLE. resolve_destinations calls this in a list
+    # comprehension over every bundle, so a five-swap run wrote five
+    # `dest_from_bundle:<addr>` lines -- byte-identical after chain_safe --
+    # and the batch size came off the file by counting them. That is the
+    # number of swap chunks, which is exactly what chain_safe's docstring
+    # says redaction removes ("and how many there were, does not").
+    #
+    # This file already had the fix 393 lines below (integrity_log_once for
+    # "pair_ready"); the sweep that added it looked for `for` and `while`
+    # loops and a comprehension is neither.
+    #
+    # The address is redacted to <addr> here anyway, so the per-call form
+    # carried nothing on disk that this does not.
+    integrity_log_once("thor", "dest_from_bundle")
+    return addr
+
+
+def resolve_destinations(amounts: List[Decimal], dests, bundles) -> List[str]:
+    """Decide where each swap delivers. ONE FRESH ADDRESS PER SWAP, and NEVER
+    THE ADDRESS THE MIX EXITS TO. Both enforced, both refusals.
+
+    This is the most dangerous field in the tool -- whatever lands here goes
+    into the swap memo and the XMR is delivered to it irreversibly -- and it
+    had grown into a run of conditionals in main() with no invariant of its
+    own. It is a function now so the rule can be stated once and tested.
+
+    THE RULE, and why it is a refusal rather than a warning:
+
+      args.dests = [_dest_from_bundle(bundle)] * len(args.amounts)
+
+    was the old one-liner. Split a swap into three amounts to avoid one large
+    one, and all three quotes went out naming the SAME XMR address. Two
+    consequences, and the second is worse than the first.
+
+      * ThorChain (or any aggregator) sees three BTC deposits routed to one
+        Monero address, so the three payments -- and the people who made them
+        -- are linked to each other by the party that already has to know the
+        destination. Splitting the amount bought nothing and cost three sets
+        of fees.
+
+      * It silently defeats the NEWNYM rotation between quotes. That rotation
+        exists so the aggregator sees N unrelated clients rather than one
+        client arranging N swaps -- and the code comment says exactly that.
+        A new Tor circuit cannot help when every request body carries the
+        same unique 95-character identifier. The rotation was theatre for any
+        batch of more than one.
+
+    A destination is reused ONLY because the operator asked for it, so it is
+    refused here rather than warned about: by the time a warning is read the
+    quotes are already fetched and the aggregator already has the linkage.
+
+    What the swap discloses no matter what: the aggregator is told the XMR
+    destination and returns the BTC deposit address, so it can always tie
+    "this BTC payment" to "this first XMR address". Tor hides who asked; it
+    does not hide the linkage. Mixing afterwards hides what happens NEXT --
+    it cannot retract what the aggregator already saw. A fresh address per
+    swap is what keeps that disclosure from also linking the swaps together.
+    """
+    if dests and bundles:
+        sys.exit(
+            "[!] Give either --dests or --dest-from-receive-wallet, not both — "
+            "with both set it is ambiguous which address the XMR is sent to.")
+
+    if bundles:
+        # One bundle per amount. A single bundle for a single amount is the
+        # normal case and reads exactly as before.
+        if len(bundles) != len(amounts):
+            sys.exit(
+                f"[!] {len(amounts)} amount(s) but {len(bundles)} receive bundle(s).\n"
+                f"    Each swap needs its OWN destination address: reusing one across\n"
+                f"    a batch tells the aggregator that these BTC payments belong\n"
+                f"    together, which is the linkage splitting the amount was meant\n"
+                f"    to avoid.\n"
+                f"    Mint {len(amounts)} of them in one go:\n"
+                f"        python3 create_receive_wallet --count {len(amounts)} "
+                f"--tor-proxy <SOCKS5H_PROXY>\n"
+                f"    then pass every bundle it writes:\n"
+                f"        --dest-from-receive-wallet wallet_a.json wallet_b.json ...")
+        out = [_dest_from_bundle(b) for b in bundles]
+    else:
+        out = list(dests)
+
+    if len(out) != len(amounts):
+        sys.exit(f"[!] Mismatch: {len(amounts)} amounts vs {len(out)} dests")
+
+    # AND IT MUST NOT BE THE OPERATOR'S EXIT ADDRESS.
+    #
+    # This is the worst outcome the whole toolchain has, and nothing checked
+    # it. The swap memo is written into a Bitcoin OP_RETURN -- public,
+    # permanent, and it names the XMR destination in full. Put the FINAL
+    # address there and the memo publishes it directly: there is no mixing to
+    # follow and no ring to unpick, the answer is simply printed on the
+    # Bitcoin chain. GhostSpiral's every defence -- the entry veil, the
+    # per-output accounts, the peel chain, the exit's refusal to sweep ENTRY
+    # -- exists to stop an analyst deriving that address, and none of them
+    # retract a memo.
+    #
+    # It is an ordinary mistake to make. --dests asks "where does the XMR
+    # go?", and the honest answer an operator holds in their head is their own
+    # wallet; that the answer here must be a THROWAWAY is a property of the
+    # design, not of the question. The tool prefers
+    # --dest-from-receive-wallet, but --dests takes any address and said
+    # nothing.
+    #
+    # WHAT THIS CAN AND CANNOT SEE, stated so it is not mistaken for more.
+    # GS_EXIT_TO is where the exit destination lives (GhostSpiral's
+    # resolve_exit_destinations made it the canonical home, precisely so it
+    # stays off argv), so a setup that follows OPSEC_SETUP.md has it set and
+    # this catches the collision. An operator who has not set it yet is not
+    # protected here -- this tool has nothing to compare against and does not
+    # pretend otherwise. That is a smaller check than none, not a substitute
+    # for reading the flag.
+    _exit_env = os.environ.get("GS_EXIT_TO") or ""
+    _exit_set = {x for x in re.split(r"[\s,]+", _exit_env) if x}
+    for i, d in enumerate(out):
+        if d in _exit_set:
+            integrity_log("thor", "SWAP_DEST_IS_EXIT_DEST")
+            sys.exit(
+                f"[!] Swap {i} would deliver to {scrub_address(d)}, which is "
+                f"also in GS_EXIT_TO —\n"
+                f"    the address you withdraw to at the END of the mix.\n"
+                f"    The swap memo goes into a Bitcoin OP_RETURN, in public "
+                f"and for ever, and it\n"
+                f"    names this address in full. Sending the swap straight "
+                f"there publishes your\n"
+                f"    final destination on the Bitcoin chain: nothing "
+                f"downstream can retract it,\n"
+                f"    and every later hop becomes decoration.\n"
+                f"    The swap destination is a THROWAWAY that GhostSpiral "
+                f"then mixes away from:\n"
+                f"        python3 create_receive_wallet --count "
+                f"{len(amounts)} --tor-proxy <SOCKS5H_PROXY>\n"
+                f"    and pass the bundle(s) with "
+                f"--dest-from-receive-wallet.")
+
+    # The invariant, checked on the FINAL list so it holds however the
+    # addresses were supplied -- bundles, --dests, or the environment.
+    seen: Dict[str, int] = {}
+    for i, d in enumerate(out):
+        if d in seen:
+            sys.exit(
+                f"[!] Swaps {seen[d]} and {i} both deliver to "
+                f"{scrub_address(d)}.\n"
+                f"    Refusing: the aggregator is told each destination, so one\n"
+                f"    address across several swaps hands it a link between those\n"
+                f"    BTC payments -- and no amount of mixing afterwards retracts\n"
+                f"    a link it already recorded. It also defeats the circuit\n"
+                f"    rotation between quotes, which cannot disguise identical\n"
+                f"    request bodies.\n"
+                f"    Use one fresh receive address per swap "
+                f"(create_receive_wallet --count {len(amounts)}).")
+        seen[d] = i
+    return out
+
+
+def _validate_xmr_addr(addr: str) -> None:
+    """Validate an XMR destination. Delegates to the shared checker.
+
+    THIS REJECTED EVERY SUBADDRESS, which broke this repo's own documented
+    money-in flow. It validated with monero.address.Address, the STANDARD
+    address class, which raises "Invalid address netbyte 42" on a subaddress --
+    and create_receive_wallet mints a SUBADDRESS, so
+    `--dest-from-receive-wallet` fed this function an address it always
+    refused. The operator saw "XMR checksum invalid" naming the one thing that
+    was not wrong.
+
+    gs_common.validate_xmr_address uses the address() FACTORY, which accepts
+    standard, sub and integrated addresses and still verifies the checksum.
+    Shared rather than re-fixed here, because the withdrawal destination needs
+    exactly the same check and two copies is how they came to disagree.
+    """
+    validate_xmr_address(addr, "XMR address")
+
+
+def main():
+    install_signal_handlers()
+
+    ap = argparse.ArgumentParser(
+        "thor_swap_preparer v10.0",
+        description="Fetch ThorChain BTC->XMR quotes with OPSEC hardening",
+    )
+    ap.add_argument("--amounts", nargs="+", type=decimal_arg,
+                    help="BTC amounts to swap. Prefer GS_SWAP_AMOUNTS='0.05 0.03' : "
+                         "an argv amount is world-readable via ps and "
+                         "/proc/<pid>/cmdline (mode 444), and the amount is the "
+                         "value that links this swap to the sender.")
+    ap.add_argument("--dests", nargs="+",
+                    help="XMR destination addresses, ONE PER AMOUNT and all distinct. "
+                         "Prefer GS_SWAP_DESTS or --dest-from-receive-wallet: an argv "
+                         "address is world-readable via ps and /proc/<pid>/cmdline "
+                         "(mode 444), and it is the value that says where the swapped "
+                         "Monero lands.")
+    ap.add_argument("--dest-from-receive-wallet", nargs="+", metavar="BUNDLE",
+                    help="take the XMR destinations from gs_receive_wallet_v1 bundles "
+                         "written by create_receive_wallet, instead of --dests. Give "
+                         "ONE BUNDLE PER AMOUNT (create_receive_wallet --count N writes "
+                         "N of them). Each address was already read back and validated "
+                         "by the wallet itself, so this avoids retyping a 95-character "
+                         "address into the one field where a typo is irreversible, and "
+                         "keeps it off argv.")
+    ap.add_argument("--tor-proxy",
+                    help="SOCKS5 proxy (required for production use)")
+    ap.add_argument("--gpg-recipient",
+                    help="GPG recipient for encrypted output")
+    ap.add_argument("--max-slippage", type=decimal_arg, default=Decimal("0.25"),
+                    help="refuse a quote deviating more than this fraction from the "
+                         "price oracle (default 0.25 = 25%%). A 5%% deviation still "
+                         "only warns; this is the hard stop. Ignored when the oracle "
+                         "is unreachable, which disables the cross-check entirely.")
+    ap.add_argument("--allow-unbound-memo", action="store_true",
+                    help="proceed even when the returned memo does not contain your "
+                         "XMR destination address. ONLY for a genuine aggregator "
+                         "format change -- normally this means the swap would "
+                         "deliver to someone else's address.")
+    ap.add_argument("--outfile", default="thor_pairs_batch.json")
+    args = ap.parse_args()
+
+    # The BTC amounts move off the command line for the same reason the wallet
+    # password and the BTC entry address did: /proc/<pid>/cmdline is 0444, so
+    # every local account could read the size of the swap being arranged.
+    _amts = env_or_argv("GS_SWAP_AMOUNTS",
+                        " ".join(str(a) for a in args.amounts) if args.amounts else None,
+                        "The swap amount(s)")
+    if not _amts:
+        sys.exit("[!] No amounts. Set GS_SWAP_AMOUNTS='0.05 0.03' (preferred) or "
+                 "pass --amounts.")
+    # decimal_env per amount, matching --amounts' own type=decimal_arg. A bare
+    # Decimal() here accepted "Infinity", which then went into a swap quote.
+    args.amounts = [decimal_env("GS_SWAP_AMOUNTS", x, positive=True)
+                    for x in str(_amts).split()]
+    if not args.amounts:
+        sys.exit("[!] No amounts given.")
+
+    if args.max_slippage <= 0:
+        sys.exit("[!] --max-slippage must be positive.")
+
+    # The XMR destination is the single most linkable value this tool handles:
+    # the aggregator is told it, and it is the address the swap output lands
+    # on. Keep it off argv for the same reason as the amounts -- /proc/<pid>/
+    # cmdline is mode 444, so any local account could read where the swapped
+    # Monero is going while the process runs.
+    _env_dests = env_or_argv("GS_SWAP_DESTS",
+                             " ".join(args.dests) if args.dests else None,
+                             "The XMR destination address(es)")
+    args.dests = str(_env_dests).split() if _env_dests else []
+
+    if not args.dests and not args.dest_from_receive_wallet:
+        sys.exit("[!] No XMR destination. Pass --dest-from-receive-wallet with the "
+                 "JSON create_receive_wallet wrote (preferred — the wallet already "
+                 "verified that address), set GS_SWAP_DESTS, or pass --dests.")
+
+    args.dests = resolve_destinations(args.amounts, args.dests,
+                                      args.dest_from_receive_wallet)
+
+    for amt in args.amounts:
+        if amt <= 0:
+            sys.exit(f"[!] Amount must be positive: {amt}")
+
+    if not args.tor_proxy:
+        sys.exit(
+            "[!] --tor-proxy is REQUIRED. Clearnet queries to ThorChain API leak\n"
+            "    your IP and reveal you are performing BTC->XMR swaps. Aborting."
+        )
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+
+    for d in args.dests:
+        _validate_xmr_addr(d)
+
+    btc_per_xmr = _btc_per_xmr(proxy)
+    # _btc_per_xmr already logs price_oracle_ok / price_oracle_fail with the
+    # error string. The old unconditional "oracle_fetched" line above claimed
+    # success right after a failure -- misleading in the very log meant to be
+    # audited later.
+
+    pairs: List[dict] = []
+
+    for i, (amt, dest) in enumerate(zip(args.amounts, args.dests)):
+        if shutdown_requested():
+            integrity_log("thor", f"shutdown_at_pair_{i}")
+            break
+
+        # Rotate circuit between quotes. required=True: a silently-failed
+        # rotation puts every quote in the batch on ONE circuit, so the
+        # aggregator sees one client asking for N swaps -- the exact
+        # correlation the rotation is here to break. The header claims this
+        # rotation happens, so it must not be best-effort.
+        if i > 0 and proxy:
+            newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
+            secure_delay(3.0, 8.0)
+
+        # AND A CIRCUIT THIS PAIR OWNS. The comment above names the failure
+        # exactly -- "a silently-failed rotation puts every quote in the batch
+        # on ONE circuit, so the aggregator sees one client asking for N swaps"
+        # -- and a NEWNYM that Tor COALESCES fails silently in precisely that
+        # way, while still answering 250 OK. Verified against a running Tor:
+        # three NEWNYM signals in a row each accepted in 0.000s, against an
+        # internal MAX_SIGNEWNYM_RATE of 10 seconds.
+        #
+        # A distinct SOCKS username puts this quote on its own circuit
+        # deterministically (Tor's IsolateSOCKSAuth, on by default), which is
+        # the guarantee the rotation was reaching for. Additive: newnym still
+        # runs above.
+        _qproxy = isolated_proxy(args.tor_proxy, f"pair:{i}") if (
+            proxy and args.tor_proxy) else proxy
+
+        # SwapKit v3 API (replaces defunct thorswap aggregator)
+        payload = {
+            "sellAsset": "BTC.BTC",
+            "buyAsset": "XMR.XMR",
+            "sellAmount": str(amt),
+            "destinationAddress": dest,
+        }
+
+        try:
+            quote_resp = safe_post(f"{SWAPKIT_API}/v3/quote", payload, _qproxy)
+        except Exception as e:
+            if proxy:
+                newnym(proxy_url=getattr(args, "tor_proxy", ""))
+            integrity_log("thor", f"quote_fail_{i}:{type(e).__name__}")
+            # Abort cleanly with an OPSEC-safe message instead of re-raising a
+            # raw requests traceback (which every other abort here avoids).
+            sys.exit(f"[!] SwapKit quote failed for pair {i}: {str(e)[:60]}")
+
+        routes = quote_resp.get("routes", [])
+        if not routes:
+            error = quote_resp.get("error", "unknown")
+            integrity_log("thor", f"no_routes_{i}")
+            sys.exit(f"[!] No swap routes for pair {i}: {str(error)[:80]}")
+
+        # `or` fallbacks, not .get() defaults: the API frequently returns these
+        # keys PRESENT but null. .get("k", default) hands back None (not the
+        # default) for a null value, so route.get("transaction", {}) -> None ->
+        # None.get(...) AttributeError, and Decimal(str(None)) -> InvalidOperation.
+        route = routes[0]
+        tx_info = route.get("transaction") or route.get("calldata") or {}
+        deposit = tx_info.get("depositAddress") or tx_info.get("to") or ""
+        memo = tx_info.get("memo") or tx_info.get("data") or ""
+        try:
+            expected_xmr = finite_decimal(route.get("expectedOutput"), Decimal(0))
+        except Exception:
+            expected_xmr = Decimal(0)
+        if expected_xmr <= 0:
+            # A silent expected_xmr=0 defeats the slippage cross-check below and
+            # prints "Expected XMR: ~0" in the sender instructions. Say so loudly
+            # -- it usually means the route field name changed.
+            integrity_log("thor", f"expected_output_unreadable_{i}")
+            print(f"  [!] Pair {i}: could not read expected XMR from the quote "
+                  f"(field name may have changed) — slippage check disabled for it.")
+
+        if not deposit:
+            integrity_log("thor", f"no_deposit_{i}")
+            sys.exit(f"[!] ThorChain returned no deposit address for pair {i}")
+
+        # Real checksum validation, not just charset/length: a typo'd but
+        # in-charset address would pass BTC_RE and send real BTC into the void.
+        if not BTC_RE.match(deposit) or not bech32_checksum_ok(deposit):
+            integrity_log("thor", f"bad_deposit_{i}")
+            sys.exit(f"[!] Deposit address failed bech32 checksum validation: "
+                     f"{scrub_address(deposit)} — refusing to instruct a BTC send to it.")
+
+        # THE MEMO IS THE ONLY BINDING between this swap and our address. The
+        # deposit address is a shared ThorChain inbound vault -- paying it with
+        # a memo naming someone else's address delivers the XMR to them, and
+        # the tool would have printed those instructions itself. Checked here,
+        # before the pair is recorded or shown to the sender.
+        if not memo:
+            integrity_log("thor", f"no_memo_{i}")
+            sys.exit(
+                f"[!] Pair {i}: the quote returned NO memo. A BTC->XMR swap is routed\n"
+                f"    entirely by the memo -- BTC sent to the inbound address without\n"
+                f"    one is not routed to you. Refusing to issue sender instructions."
+            )
+        if not _memo_binds_destination(memo, dest):
+            integrity_log("thor", f"memo_dest_mismatch_{i}")
+            if not args.allow_unbound_memo:
+                sys.exit(
+                    f"[!] Pair {i}: the returned memo does NOT contain your XMR\n"
+                    f"    destination {scrub_address(dest)}.\n"
+                    f"    The memo is what tells ThorChain where to deliver the XMR, so\n"
+                    f"    following these instructions could pay someone else and the\n"
+                    f"    payment is irreversible. Refusing.\n"
+                    f"    Override only if you have verified the memo by hand: "
+                    f"--allow-unbound-memo"
+                )
+            print(f"  [!] Pair {i}: memo does not name your destination — continuing "
+                  f"because --allow-unbound-memo was given. VERIFY IT BY HAND.")
+
+        # Slippage check
+        deviation = quote_deviation(expected_xmr, amt, btc_per_xmr)
+        if deviation is not None:
+            oracle_xmr = amt / btc_per_xmr
+            if deviation > args.max_slippage:
+                integrity_log("thor", f"slippage_ABORT_{i}:dev={deviation:.4f}")
+                sys.exit(
+                    f"[!] Pair {i}: the quote is {deviation * 100:.1f}% away from the price\n"
+                    f"    oracle ({expected_xmr} XMR quoted vs ~{oracle_xmr:.4f} expected),\n"
+                    f"    past the --max-slippage limit of {args.max_slippage * 100:.0f}%.\n"
+                    f"    That is either a bad route or a stale/incorrect oracle -- either\n"
+                    f"    way, not something to hand a sender unexamined.\n"
+                    f"    Raise --max-slippage only after checking the rate yourself."
+                )
+            if deviation > Decimal("0.05"):
+                print(f"  [!] Pair {i}: quote deviates {deviation * 100:.1f}% from oracle")
+                integrity_log("thor", f"slippage_warn_{i}:dev={deviation:.4f}")
+
+        pair = {
+            "schema": PAIR_SCHEMA,
+            # fmt_btc, not str(): a Decimal renders a small amount in
+            # scientific notation, and this string is printed verbatim as
+            # "Send exactly: <x> BTC". GhostSpiral had the same defect on the
+            # same line of the same instruction; the formatter lives in
+            # gs_common so the two swap paths cannot drift again.
+            "btc_in": fmt_btc(amt),
+            "deposit": deposit,
+            "memo": memo,
+            "dest_xmr": dest,
+            "expected_xmr": str(expected_xmr),
+            "ts": int(time.time()) // 600 * 600,  # coarsen to 10-min bucket
+        }
+        pairs.append(pair)
+        integrity_log_once("thor", "pair_ready")
+        print(f"  [+] Pair {i}: {amt} BTC -> {scrub_address(deposit)} "
+              f"(expected {expected_xmr} XMR)")
+
+    if not pairs:
+        sys.exit("[!] No pairs generated")
+
+    _out = Path(args.outfile)
+    atomic_write_json(pairs, _out)
+    # WIPE COVERAGE. gs_common.wipe_covers exists for precisely this, and names
+    # `--outfile /srv/exit.json` in its own docstring as the case it was
+    # written for -- and it was wired into GhostSpiral and
+    # exit_strategy_simulator only. This file is the worst one to leave
+    # uncovered: each pair carries the deposit address AND the memo, and the
+    # memo contains the destination XMR address in full. paranoia_mode globs
+    # fixed roots (cwd, $HOME, $HOME/ghostspiral, $HOME/GhostSpiral) at depth 0
+    # and 1, so anything written outside them is never looked at -- while this
+    # tool prints "Saved N pair(s)" identically wherever it wrote.
+    if not wipe_covers(_out):
+        try:
+            _wdir = _out.resolve().parent
+        except OSError:
+            _wdir = _out.parent
+        integrity_log("thor", "outfile_outside_wipe_roots")
+        print(f"  [!] {_wdir} is OUTSIDE the directories paranoia_mode sweeps, "
+              f"so this file will NOT be wiped with the rest of the run.")
+        print(f"      It holds every deposit address and every memo, and a "
+              f"memo contains the destination XMR address in full — it is the "
+              f"single artifact that ties the BTC side to the XMR side.")
+        print(f"      Delete it yourself, or write it under the working "
+              f"directory or $HOME so the sweep can find it.")
+    integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
+    print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
+
+    print()
+    print("  ============================================================")
+    print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
+    print("  ============================================================")
+    for i, pair in enumerate(pairs):
+        print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
+        print(f"  Send exactly: {pair['btc_in']} BTC")
+        print(f"  To address:   {pair['deposit']}")
+        # A pair with no memo never reaches this point -- it aborts at the
+        # quote. The old "(none required)" branch was actively dangerous: for
+        # BTC->XMR the memo is mandatory, so telling a sender none was needed
+        # would have cost them the payment.
+        print(f"  With memo:    {pair['memo']}")
+        print(f"  Expected XMR: ~{pair['expected_xmr']}")
+    print()
+    print("  ============================================================")
+    print("  IMPORTANT: The sender must include the memo in the BTC")
+    print("  transaction's OP_RETURN field. Without it, ThorChain cannot")
+    print("  route the swap. Quotes expire — send promptly.")
+    print("  ============================================================")
+    print()
+    # What this step costs you, stated where the operator is looking at the
+    # values it costs. Everything below is a property of using an aggregator at
+    # all -- none of it is a defect in this tool, and none of it is fixable by
+    # this tool, which is exactly why it has to be said rather than hidden.
+    print("  ---- WHAT THE SWAP DISCLOSES (unavoidable, read once) ----")
+    print("  The aggregator was told your XMR address and gave back the deposit")
+    print("  address above. It can therefore always tie THIS BTC PAYMENT to")
+    print("  THAT FIRST XMR ADDRESS. Tor hid who asked; it did not hide the")
+    print("  link. Mixing afterwards hides what you do NEXT with the Monero —")
+    print("  it does not retract what the aggregator already recorded.")
+    print()
+    print("  So:")
+    print("   * Do not reuse the destination address above for anything else.")
+    print("     It is burned: one party already associates it with a BTC payer.")
+    print(f"   * The memo{'s' if len(pairs) > 1 else ''} above "
+          f"name{'' if len(pairs) > 1 else 's'} that address in plain text. Send "
+          f"{'them' if len(pairs) > 1 else 'it'} to the payer")
+    print("     the same way you would a password — not into a public paste site,")
+    print("     an issue tracker, a support chat or a group thread. Anything that")
+    print("     indexes it publishes the BTC-to-XMR link to everyone, not just")
+    print("     to the aggregator that already had it.")
+    print("   * If you do not want ANY party to see the destination, an")
+    print("     aggregator swap is the wrong tool. This one cannot route without")
+    print("     being told where to deliver.")
+    print("  ----------------------------------------------------------")
+
+    if args.gpg_recipient:
+        # Encryption was explicitly requested. The plaintext bundle (deposit
+        # addresses, memos, XMR destinations) is already on disk from
+        # atomic_write_json above. If we cannot produce the encrypted copy, do
+        # NOT continue as if the file were protected -- abort loudly, and once
+        # the .gpg exists, securely remove the plaintext so it isn't left
+        # readable (the old code left the plaintext on disk in every case).
+        try:
+            import gnupg
+        except ImportError:
+            integrity_log("thor", "gpg_missing")
+            sys.exit(
+                f"[!] --gpg-recipient given but python-gnupg is not installed.\n"
+                f"    The UNENCRYPTED bundle is at {_out} — encrypt or securely\n"
+                f"    delete it yourself. Aborting rather than pretend it's protected."
+            )
+        enc = gnupg.GPG().encrypt(json.dumps(pairs, indent=2), args.gpg_recipient)
+        if not enc.ok:
+            integrity_log("thor", f"gpg_fail:{enc.status}")
+            sys.exit(
+                f"[!] GPG encryption failed ({enc.status}). The UNENCRYPTED bundle\n"
+                f"    remains at {_out}. Fix the recipient key or delete it — not\n"
+                f"    leaving you a plaintext file with a false sense of protection."
+            )
+        gpg_path = Path(str(_out) + ".gpg")
+        # 0600 at creation, not chmod'ed after: write_text + chmod left the
+        # bundle 0644 in between, and permanently so if killed in that window.
+        secure_write_text(gpg_path, str(enc))
+        if secure_delete_file(_out):
+            integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wiped")
+            print(f"  [+] GPG bundle -> {gpg_path}  (plaintext {_out.name} securely deleted)")
+        else:
+            integrity_log("thor", f"gpg_ok:{gpg_path.name}:plaintext_wipe_FAILED")
+            print(f"  [!] GPG bundle -> {gpg_path}, but could NOT delete plaintext "
+                  f"{_out} — remove it manually.")
+
+    if proxy:
+        newnym(proxy_url=getattr(args, "tor_proxy", ""))
+
+
+if __name__ == "__main__":
+    main()
