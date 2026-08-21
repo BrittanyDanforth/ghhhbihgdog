@@ -932,7 +932,7 @@ def _thin(n_subs, wallets, decoys, chunks):
         try:
             ghost.refuse_thin_mix([f"m{_i}" for _i in range(n_subs)],
                                   [f"e{_i}" for _i in range(chunks)],
-                                  wallets, decoys, chunks)
+                                  set(), wallets, decoys, chunks)
             return None
         except SystemExit as _e:
             return str(_e.code)

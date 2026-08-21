@@ -66,6 +66,19 @@ python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
+python3 tests/test_peel_pipeline.py # THE PEEL CHAIN, THE DAG ROUND AND THE
+                                    #   EXIT, driven through the REAL main()
+                                    #   against a wallet that MOVES MONEY.
+                                    #   test_split_pipeline drives the FAN-OUT
+                                    #   and never reaches the exit; nothing
+                                    #   ran a --peel run past the planner. It
+                                    #   found that a chain stopping part-way
+                                    #   leaves EVERYTHING on one carrier (each
+                                    #   peel consumes its carrier exactly and
+                                    #   pays the rest forward) and the exit
+                                    #   swept that -- 9.62 of 12 XMR, unmixed,
+                                    #   to --exit-to -- then printed "EXIT
+                                    #   COMPLETE"
 
 python3 tests/real_roundtrip_testnet.py  # FULL cold-signing round-trip vs real
                                           # monero binaries (SKIPs if not installed)

@@ -2366,7 +2366,7 @@ def planned_chunk_count(args, jm_utxos) -> int:
     return max(1, int(getattr(args, "split", 1) or 1))
 
 
-def refuse_thin_mix(subs: list, entry_addrs, wallets: int,
+def refuse_thin_mix(subs: list, entry_addrs, decoy_addrs, wallets: int,
                     num_decoys: int, n_chunks: int) -> None:
     """Refuse a run with fewer mix outputs than swap chunks, BEFORE the swap.
 
@@ -2390,8 +2390,15 @@ def refuse_thin_mix(subs: list, entry_addrs, wallets: int,
 
     EXACT, not conservative. The decoy count is drawn at random
     (DECOY_MIN..DECOY_MAX) and it is drawn ALREADY by the time this runs, so
-    this asks select_fanout_targets -- the same function stage 4 asks -- rather
-    than bounding it. Nothing is refused that would have fitted.
+    this asks select_fanout_targets -- the same function stage 4 asks, with the
+    same four arguments -- rather than bounding it. Nothing is refused that
+    would have fitted.
+
+    `decoy_addrs` is threaded through even though select_fanout_targets ignores
+    it today ("accepted for signature compatibility but no longer changes
+    behaviour"). Passing an empty set instead would be a second call with
+    DIFFERENT inputs, and this gate is only worth anything while it cannot
+    answer differently from the stage it is standing in front of.
 
     The one run this newly refuses is one that would have fitted only because
     some of its swaps FAILED TO ARRIVE: select_funded_entries drops an empty
@@ -2402,7 +2409,7 @@ def refuse_thin_mix(subs: list, entry_addrs, wallets: int,
     if n_chunks <= 1:
         return
     _mix = [a for a in subs if a not in set(entry_addrs or ())]
-    _dests, _ = select_fanout_targets(_mix, set(), wallets, num_decoys)
+    _dests, _ = select_fanout_targets(_mix, decoy_addrs, wallets, num_decoys)
     if len(_dests) >= n_chunks:
         return
     integrity_log("stage3", "thin_mix_refused")
@@ -2468,11 +2475,12 @@ def refuse_peel_multichunk(args, jm_utxos) -> None:
     if n <= 1:
         return
     integrity_log("stage1", "peel_multichunk_refused")
+    # `n`, not args.split: planned_chunk_count normalises None and 0 to 1, so
+    # reading the flag back here could print "--split None".
     _why = (f"JoinMarket's tumble produced {len(jm_utxos)} UTXOs, so this run "
             f"has {n} swap chunks"
             if jm_utxos else
-            f"--split {getattr(args, 'split', n)} gives this run {n} swap "
-            f"chunks")
+            f"--split {n} gives this run {n} swap chunks")
     sys.exit(
         f"[!] --peel needs a SINGLE swap chunk, and {_why}.\n"
         f"    Each chunk needs its own peel chain — merging them into one "
@@ -2766,7 +2774,7 @@ def arrival_blindness_note(arrival: dict) -> str:
             f"    wallet-rpc before concluding the swap is short.\n")
 
 
-def entry_balance_reader(rpc_primary, pairs: list, echo=print):
+def entry_balance_reader(rpc_primary, pairs: list, echo=print, clock=None):
     """A balance_fn for wait_for_swap_arrival that cannot go silently blind.
 
     Returns a zero-argument callable with the same (total, unlocked) contract
@@ -2807,7 +2815,36 @@ def entry_balance_reader(rpc_primary, pairs: list, echo=print):
     heartbeat is time-based: at a 30s poll a permanently half-dead wallet
     would otherwise push every real event out of the console's line buffer.
     """
-    state = {"last": None, "beat": 0.0, "clock": time.monotonic}
+    # `None`, NOT 0.0, and the difference is a fresh boot.
+    #
+    # time.monotonic() is CLOCK_MONOTONIC on Linux -- seconds since BOOT, not
+    # since the epoch. Starting the rate-limiter at 0.0 makes the first tick
+    # ask "is the host older than UNREADABLE_REPORT_S?" instead of "have I
+    # reported yet?", so within ten minutes of boot the FIRST warning is
+    # suppressed entirely. Driven against the shipped reader with one of three
+    # entry addresses unreadable:
+    #
+    #     host up    5s   reports 7 XMR of 10, SILENT
+    #     host up  599s   reports 7 XMR of 10, SILENT
+    #     host up  601s   reports 7 XMR of 10, warns
+    #
+    # The total is the same either way; the line is the ONLY thing that says
+    # the missing 3 XMR was unreadable rather than absent, and this feeds the
+    # swap-arrival gate, where "less than expected" reads as a short swap.
+    # Ten minutes after boot is exactly when a run starts on the freshly
+    # booted machine this toolchain is meant to be run from.
+    #
+    # The sibling limiter in wait_for_swap_arrival already gets this right and
+    # says so -- "FIRST one immediately, then at most one per
+    # UNREADABLE_REPORT_S" -- with a None sentinel. This is that, here.
+    #
+    # (Found because the offline suite went red on a container that had been
+    # up for four minutes, and green on the same tree ten minutes later.)
+    # `clock` is injected for the same reason wait_for_swap_arrival takes one:
+    # the branch below is a TIME decision, and a test that cannot move the
+    # clock can only assert it on whatever the host happens to read -- which
+    # is precisely how the bug above survived.
+    state = {"beat": None, "clock": clock or time.monotonic}
 
     def _read():
         blind = []
@@ -2824,7 +2861,8 @@ def entry_balance_reader(rpc_primary, pairs: list, echo=print):
                 f"all {len(pairs)} entry address(es) unreadable: "
                 f"{str(blind[0][2])[:60]}")
         now = state["clock"]()
-        if (blind or stale) and now - state["beat"] >= UNREADABLE_REPORT_S:
+        if (blind or stale) and (state["beat"] is None
+                                 or now - state["beat"] >= UNREADABLE_REPORT_S):
             state["beat"] = now
             if blind:
                 integrity_log("stage4", "arrival_entry_partly_unreadable")
@@ -6955,8 +6993,8 @@ def main():
         # here -- and this is still before the first quote. See refuse_thin_mix
         # for the stage-4 exit it replaces, which is reached only after the
         # swap has landed.
-        refuse_thin_mix(subs, ENTRY_ADDRS, args.wallets, _num_decoys,
-                        len(ENTRY_SET))
+        refuse_thin_mix(subs, ENTRY_ADDRS, decoy_addrs, args.wallets,
+                        _num_decoys, len(ENTRY_SET))
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
@@ -6968,8 +7006,9 @@ def main():
         # needs the SUM of what every chunk was quoted to deliver, not just the
         # instructions that were printed here. It used to be a local inside the
         # `if btc_chunks:` arm, so the wait had no idea how many chunks were
-        # coming or how much they were worth, and stopped on the first one.
-        swap_deposits = []
+        # coming or how much they were worth, and stopped on the first one --
+        # which is why this is a RETURN VALUE and every path in there sets it,
+        # manual mode included.
         swap_deposits = resolve_swap_deposits(
             args, proxy, jm_utxos, receive_mode, ENTRY, ENTRY_ADDRS, ENTRY_SET)
 
@@ -7936,6 +7975,38 @@ def _wait_for_carrier(args, account, sub_idx, min_unlocked_xmr, proxy, label):
     return False
 
 
+def peel_stuck_carrier(peels: list, relayed: int, fallback) -> tuple:
+    """(account, subaddress) holding a stopped chain's UNDISTRIBUTED remainder.
+
+    A peel consumes its carrier EXACTLY and pays the rest FORWARD to the next
+    one (build_peel_plan), so when the chain stops at peel `relayed` the whole
+    remainder is sitting on that peel's SOURCE -- the carrier it would have
+    spent. Everything the chain had left is there: on a 10-peel chain that
+    stopped at 3, that was 9.62 of 12 XMR.
+
+    None when the chain finished: the last peel is a sweep_all, so there is no
+    remainder to name.
+
+    A function rather than two copies, because it is read in two places that
+    must agree -- the operator message _run_peel_chain prints, and the hold
+    _stage5_run gives the exit. They did not agree: the message said "the
+    undistributed balance is safe on account N, subaddress M ... distribute it
+    manually", and the exit then swept exactly that output to --exit-to and
+    printed EXIT COMPLETE.
+    """
+    _acct, _sub = fallback
+    if relayed >= len(peels) or relayed < 0:
+        return None
+    _e = peels[relayed] or {}
+    try:
+        return (int(_e.get("account_index", _acct)), int(_e.get("src_index", _sub)))
+    except (TypeError, ValueError):                          # noqa: BLE001
+        # A plan entry we cannot read must not resolve to SOME OTHER account's
+        # subaddress and get that one held instead. The same rule the DAG
+        # filter's _hop_src follows.
+        return None
+
+
 def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
     """Run a peeling chain: each peel is its OWN confirmation-gated round.
 
@@ -7974,8 +8045,8 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
         print(f"  [!] Peeling chain stopped at {done}/{n} peels. The {done} relayed "
               f"peel(s) are on-chain; the remaining ~{n - done} destination(s) were "
               f"NOT sent.")
-        _stuck = peels[done].get("src_index", csub) if done < n else csub
-        _stuck_acct = peels[done].get("account_index", acct) if done < n else acct
+        _pair = peel_stuck_carrier(peels, done, (acct, csub)) or (acct, csub)
+        _stuck_acct, _stuck = _pair
         print(f"  [!] The undistributed balance is safe on this wallet's account "
               f"{_stuck_acct}, subaddress {_stuck} (the carrier this peel would "
               f"have spent). There is no auto-"
@@ -8517,14 +8588,22 @@ def _funded_subaddresses(rpc, accounts) -> tuple:
 
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
-                          delay_window=None, hold=(), entry_pairs=()) -> tuple:
+                          delay_window=None, hold=(), entry_pairs=(),
+                          remainder_pairs=()) -> tuple:
     """ACTUALLY SPEND THE MIXED FUNDS OUT.
     Returns (relayed, failed, skipped, held, unclean), where `held` is a
-    {"entry": n, "change": n} breakdown -- NOT a count. The caller words its
-    report from it: an ENTRY hold and a distribution-CHANGE hold are different
-    addresses with different reasons and different remedies. Test the numbers,
-    never the dict: a two-key dict is always truthy, and `not held` in the
-    caller silenced the clean-exit message entirely.
+    {"entry": n, "change": n, "remainder": n} breakdown -- NOT a count. The
+    caller words its report from it: the three are different addresses with
+    different reasons and different remedies. Test the numbers, never the
+    dict: a populated dict is always truthy, and `not held` in the caller
+    silenced the clean-exit message entirely.
+
+    `remainder_pairs` is the third kind, and it is the largest: the carrier a
+    PEELING CHAIN stopped on holds everything the chain had left to distribute
+    (see peel_stuck_carrier). Calling that "a distribution CHANGE address"
+    would print the change sweep's remedy -- "The change sweep would have
+    moved it once, to a fresh address" -- about a mode that has no change
+    sweeps at all.
 
     THIS IS THE EXIT, and it moves real value. Everything before it only
     rearranges coins inside one wallet; until this runs, the operator still
@@ -8650,7 +8729,26 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     # wrong remedy attached. Counts only -- the per-output detail stays on the
     # terminal below, because the NUMBER of outputs is itself the on-chain
     # search key the entry veil exists to hide.
-    _held_kinds = {"entry": 0, "change": 0}
+    _entry_set = {(int(_a), int(_i)) for _a, _i in (entry_pairs or ())}
+    _remainder_set = {(int(_a), int(_i)) for _a, _i in (remainder_pairs or ())}
+
+    def _held_kind(pair):
+        """Which of the three a held output is. ENTRY wins a tie: it is the
+        only one whose address a public memo names, so if a pair were somehow
+        in two sets the strictest description is the right one."""
+        if pair in _entry_set:
+            return "entry"
+        if pair in _remainder_set:
+            return "remainder"
+        return "change"
+
+    #: What each kind IS, in the operator's words. One place, because the
+    #: initial enumeration and the straggler passes both print it and they said
+    #: different things when only the first was updated.
+    _HELD_WHAT = {"entry": "the swap ENTRY",
+                  "remainder": "the peel chain's UNDISTRIBUTED balance",
+                  "change": "a distribution CHANGE"}
+    _held_kinds = {"entry": 0, "change": 0, "remainder": 0}
     # EVERY HELD ADDRESS THIS HAS ALREADY NAMED, so the straggler passes below
     # cannot report one twice. A held output is never withdrawn -- that is what
     # holding it means -- so it is STILL FUNDED on every later re-read, and the
@@ -8681,14 +8779,23 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             # chunks as "a distribution CHANGE address" -- the wrong risk and
             # the wrong remedy, on the outputs where getting it wrong costs
             # the most.
-            _is_entry = (_ha, _hi) in {(int(_a), int(_i))
-                                       for _a, _i in (entry_pairs or ())}
-            _held_kinds["entry" if _is_entry else "change"] += 1
+            _kind = _held_kind((_ha, _hi))
+            _is_entry = _kind == "entry"
+            _held_kinds[_kind] += 1
             print(f"  [!] EXIT: {Decimal(_hamt) / Decimal(10 ** 12)} XMR is on "
-                  f"{'the swap ENTRY' if _is_entry else 'a distribution CHANGE'}"
+                  f"{_HELD_WHAT[_kind]}"
                   f" address (account {_ha} / subaddr {_hi}) and was NOT "
                   f"withdrawn.")
-            if _is_entry:
+            if _kind == "remainder":
+                print("      The peeling chain stopped before it spent this. "
+                      "It went through NO fan-out and NO hop round — it is the "
+                      "run's whole undistributed balance, sitting where the "
+                      "chain left it, and it can be most of what you swapped. "
+                      "Sending it to your exit destination would put unmixed "
+                      "value on the same address as the mixed outputs, which "
+                      "tells whoever watches that address that all of it is "
+                      "one owner's.")
+            elif _is_entry:
                 print("      It landed after the run had planned — usually a "
                       "swap chunk that settled late. The swap memo names that "
                       "address in public, so sending it to your exit "
@@ -8737,14 +8844,26 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                   f"them one at a time, as separate runs.")
     if not targets:
         if held:
-            print("  [!] EXIT: nothing was withdrawn — the only funded output "
-                  "is the unmixed one on ENTRY described above.")
+            # NAME WHAT IS ACTUALLY HELD. This said "the unmixed one on ENTRY"
+            # for every case, so a run whose only funded output was a
+            # distribution change -- or a peel chain's undistributed
+            # remainder -- sent the operator to look at an address the swap
+            # memo does not name, with the wrong remedy attached. Same defect
+            # the per-output lines above were fixed for; this line was left
+            # asserting the old single kind.
+            _only = [_k for _k in ("entry", "remainder", "change")
+                     if _held_kinds[_k]]
+            print(f"  [!] EXIT: nothing was withdrawn — the only funded "
+                  f"output(s) are the unmixed ones on "
+                  + " and ".join(f"{_HELD_WHAT[_k]}" for _k in _only)
+                  + " described above.")
             return (0, len(_unreadable), 0, dict(_held_kinds), 0)
         print("  [!] EXIT: no funded output was found on this run's accounts, "
               "so nothing was withdrawn. If you expected funds here, do NOT "
               "assume they are gone — check the wallet before re-running.")
         integrity_log("exit", "no_funded_outputs")
-        return (0, len(_unreadable), 0, {"entry": 0, "change": 0}, 0)
+        return (0, len(_unreadable), 0,
+                {"entry": 0, "change": 0, "remainder": 0}, 0)
 
     # `secrets`, the module-level import -- NOT `_secrets`, which is a local
     # alias created inside main() and passed around as a parameter. Writing the
@@ -8962,12 +9081,11 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             # BEFORE the report, not after the loop: two passes is the bound
             # today, and a third would otherwise re-open the same hole.
             _named_held.add((_la, _li))
-            _is_entry = (_la, _li) in {(int(_a), int(_i))
-                                       for _a, _i in (entry_pairs or ())}
-            _held_kinds["entry" if _is_entry else "change"] += 1
+            _lkind = _held_kind((_la, _li))
+            _held_kinds[_lkind] += 1
             print(f"  [!] EXIT: {Decimal(_lamt) / Decimal(10 ** 12)} XMR "
                   f"arrived on "
-                  f"{'the swap ENTRY' if _is_entry else 'a distribution CHANGE'}"
+                  f"{_HELD_WHAT[_lkind]}"
                   f" address (account {_la} / subaddr {_li}) while this exit "
                   f"was running, and was NOT withdrawn — for the same reason "
                   f"the held outputs above were not. It is safe where it is; "
@@ -9146,13 +9264,40 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 return (["the entry sweep did not confirm, so nothing was distributed"],
                         withheld)
 
+    # WHERE A STOPPED PEEL CHAIN LEFT ITS REMAINDER. Set below when the chain
+    # stops part-way; the exit HOLDS it rather than withdrawing it. See
+    # peel_stuck_carrier.
+    _stuck_carrier = None
     if distribution_mode == "peel":
+        _peel_txs = []
         try:
             with open(fanout_file) as _pf:
-                _total_peels = len(json.load(_pf).get("txs", []))
-        except Exception:
-            _total_peels = 0
+                _peel_txs = list(json.load(_pf).get("txs") or [])
+        except Exception:                                    # noqa: BLE001
+            _peel_txs = []
+        _total_peels = len(_peel_txs)
         _relayed = _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
+        # THE UNDISTRIBUTED REMAINDER IS NOT SPARE CHANGE, and it is not mixed.
+        #
+        # Every peel consumes its carrier exactly and pays the rest forward, so
+        # a chain that stops at peel R leaves EVERYTHING IT HAD LEFT on peel R's
+        # source. Driven through the shipped main() with a 10-peel chain stopped
+        # at 3: the exit withdrew 9.62 of the run's 12 XMR from that carrier,
+        # straight to --exit-to, and printed "EXIT COMPLETE: 4 output(s)
+        # withdrawn" -- while _run_peel_chain had already told the operator the
+        # balance was "safe on this wallet's account N, subaddress M ...
+        # distribute it manually".
+        #
+        # It is the same object the fan-out's change hold refuses: the
+        # distribution's unallocated remainder, through NO hop round. The peel
+        # just moved it off subaddress 0 onto a rotating carrier, so the hold
+        # built from change_accounts -- empty in peel mode -- never covered it.
+        # The exit sends it to the SAME address as the mixed outputs, so an
+        # analyst watching that address gets the barely-mixed 80% and the mixed
+        # remainder as one owner's.
+        if _relayed < _total_peels:
+            _stuck_carrier = peel_stuck_carrier(_peel_txs, _relayed,
+                                                tuple(change_target))
         # Peel i pays fanout_dests[i] (build_peel_plan walks them in order), so
         # a chain that stopped at _relayed funded exactly the first _relayed
         # targets. The rest can never hold anything and waiting on them would
@@ -9461,13 +9606,19 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             _hold.append((int(_ca), 0))
         if change_target:
             _hold.append((int(change_target[0]), int(change_target[1])))
+        # AND THE CARRIER A STOPPED PEEL CHAIN LEFT EVERYTHING ON. See the note
+        # where _stuck_carrier is set.
+        if _stuck_carrier:
+            _hold.append((int(_stuck_carrier[0]), int(_stuck_carrier[1])))
         _relayed, _failed, _skipped, _held, _unclean = _run_exit_withdrawals(
             args, exit_accounts or [], args.exit_to, staging_dir, proxy,
             _exit_meta, delay_window, hold=_hold,
-            entry_pairs=list(exit_hold or ()))
+            entry_pairs=list(exit_hold or ()),
+            remainder_pairs=([_stuck_carrier] if _stuck_carrier else []))
         _held_entry = (_held or {}).get("entry", 0)
         _held_change = (_held or {}).get("change", 0)
-        if _held_entry or _held_change:
+        _held_remainder = (_held or {}).get("remainder", 0)
+        if _held_entry or _held_change or _held_remainder:
             # WITHHELD, NOT INCOMPLETE, and the distinction is not cosmetic.
             #
             # This started life in `incomplete`, which reads as "the mix is not
@@ -9502,6 +9653,16 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                     f" was NOT withdrawn — it never went through the hop "
                     f"rounds, so it is unmixed, and it is an output of the "
                     f"transaction that spent your swapped funds")
+            if _held_remainder:
+                # ITS OWN LINE, not folded into the change one. This is not a
+                # rounding remainder: it is everything the peel chain had left
+                # when it stopped, which can be most of the run.
+                withheld.append(
+                    "the UNDISTRIBUTED balance the peeling chain stopped on "
+                    "was NOT withdrawn — the chain never spent it, so it went "
+                    "through no fan-out and no hop round at all. It is the "
+                    "same money _run_peel_chain told you to distribute by "
+                    "hand")
         if _failed or _skipped:
             incomplete.append(
                 f"the exit withdrew {_relayed} output(s) but {_failed + _skipped} "
@@ -9528,7 +9689,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # and a two-key dict is ALWAYS truthy -- so this branch, the only place
         # a clean exit is announced, could never be reached after the return
         # type changed. Count, never test the container.
-        elif _relayed and not (_held_entry or _held_change):
+        elif _relayed and not (_held_entry or _held_change or _held_remainder):
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
                   f"its own transaction. The wallet was re-read afterwards and "
                   f"nothing further is funded on this run's accounts.")
