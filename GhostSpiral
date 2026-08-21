@@ -4412,13 +4412,23 @@ def resolve_exit_destinations(args) -> None:
     # A WARNING, NOT A REFUSAL. One destination is a legitimate choice: an
     # exchange deposit address is one address and cannot be spread. The
     # operator has to be told what it costs, not overruled.
-    _n_out = max(int(getattr(args, "wallets", 0) or 0), 1)
-    if len(dests) == 1 and _n_out > 1:
+    # THE REAL COUNT, which is not --wallets.
+    #
+    # select_fanout_targets funds `wallets + num_decoys` outputs, and
+    # num_decoys is randint(DECOY_MIN, DECOY_MAX) per run -- deliberately, so
+    # the output count is not a fingerprint of the --wallets setting. The first
+    # version of this warning printed args.wallets, so with --wallets 4 it said
+    # "roughly 4 separate output(s)" while the run measurably withdrew 8 and 9
+    # in two real end-to-end runs. Understating is the wrong direction for a
+    # warning whose whole force is HOW MANY arrivals land on one address.
+    _w = max(int(getattr(args, "wallets", 0) or 0), 1)
+    _lo, _hi = _w + DECOY_MIN, _w + DECOY_MAX
+    if len(dests) == 1 and _hi > 1:
         integrity_log("exit", "single_exit_destination")
-        print(f"  [!] ONE exit destination, and this run will withdraw roughly "
-              f"{_n_out} separate output(s) to it.")
+        print(f"  [!] ONE exit destination, and this run will withdraw "
+              f"{_lo}-{_hi} separate output(s) to it.")
         print(f"      Each goes in its own transaction, so whoever watches "
-              f"that address sees ~{_n_out} arrivals and knows they belong "
+              f"that address sees that many arrivals and knows they belong "
               f"together. The run spends hours giving these outputs separate "
               f"accounts precisely so they cannot be grouped; one destination "
               f"groups them again off-chain, and no amount of mixing undoes "
@@ -4427,11 +4437,11 @@ def resolve_exit_destinations(args) -> None:
               f"one variable: GS_EXIT_TO=\"addr1 addr2 addr3\". Say this now "
               f"— the exit is the last step, and nothing can add a "
               f"destination once it starts.")
-    elif len(dests) > 1 and _n_out > len(dests) * 2:
+    elif len(dests) > 1 and _lo > len(dests) * 2:
         integrity_log("exit", "few_exit_destinations")
-        print(f"  [!] {len(dests)} exit destinations for roughly {_n_out} "
-              f"output(s): about {_n_out // len(dests)} arrivals per address. "
-              f"More destinations means fewer arrivals each.")
+        print(f"  [!] {len(dests)} exit destinations for {_lo}-{_hi} "
+              f"output(s): about {_lo // len(dests)}-{_hi // len(dests)} "
+              f"arrivals per address. More destinations means fewer each.")
 
 
 def reject_self_exit(args, addr_index: dict, entry_addr: str) -> None:

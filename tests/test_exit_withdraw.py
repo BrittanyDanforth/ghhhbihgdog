@@ -1155,8 +1155,16 @@ try:
     _one = _dests([_EA], 12)
     check("exitdests: ONE destination for a many-output run is warned about",
           "ONE exit destination" in _one)
-    check("exitdests: ...with the number of arrivals that address will see",
-          "12 separate output(s)" in _one and "~12 arrivals" in _one)
+    # THE REAL RANGE, not --wallets. select_fanout_targets funds
+    # `wallets + randint(DECOY_MIN, DECOY_MAX)` outputs, so --wallets 12 means
+    # 14-19. The first version printed 12, and two real end-to-end runs at
+    # --wallets 4 withdrew 8 and 9 outputs while it said "roughly 4" --
+    # understating the one number the warning exists to convey.
+    check("exitdests: ...with the real output RANGE, not the --wallets figure",
+          f"{12 + ghost.DECOY_MIN}-{12 + ghost.DECOY_MAX} separate output(s)"
+          in _one)
+    check("exitdests: ...and 4 wallets brackets what real runs measured (8, 9)",
+          (4 + ghost.DECOY_MIN) <= 8 and 9 <= (4 + ghost.DECOY_MAX))
     check("exitdests: ...saying what it costs, not just that it is unusual",
           "no amount of mixing undoes that" in _one)
     check("exitdests: ...and how to fix it, including the env form",
@@ -1166,17 +1174,22 @@ try:
 
     # Several destinations but still lopsided: quieter, still said.
     _few = _dests([_EA, _EB, _EC], 12)
-    check("exitdests: 3 destinations for 12 outputs is still reported",
-          "3 exit destinations" in _few and "4 arrivals per address" in _few)
+    check("exitdests: 3 destinations for a 12-wallet run is still reported",
+          "3 exit destinations" in _few
+          and f"{12 + ghost.DECOY_MIN}-{12 + ghost.DECOY_MAX} output(s)" in _few)
     check("exitdests: ...but not as the ONE-destination alarm",
           "ONE exit destination" not in _few)
 
     # Silence where there is nothing to say -- or the warning is noise and
     # gets tuned out on the run where it matters.
-    check("exitdests: 3 destinations for 4 outputs says nothing",
+    check("exitdests: 3 destinations for a small run says nothing",
           _dests([_EA, _EB, _EC], 4).strip() == "")
-    check("exitdests: a single-output run with one destination says nothing",
-          _dests([_EA], 1).strip() == "")
+    # There is no run small enough to be silent with ONE destination: even
+    # --wallets 1 funds 1+DECOY_MIN outputs. Assert that rather than pretend
+    # a silent case exists.
+    check("exitdests: even the smallest run warns on a single destination, "
+          "because even it withdraws several outputs",
+          "ONE exit destination" in _dests([_EA], 1))
 
     # A REFUSAL WOULD BE WRONG. An exchange deposit address is one address and
     # cannot be spread; the operator has to be told the cost, not overruled.
