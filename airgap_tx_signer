@@ -411,6 +411,17 @@ def _validate_manifest_entries(entries: List[dict], outdir: Path) -> None:
                      f"digest, got {h!r}")
 
 
+#: How many times to rebuild an exact-consume peel chasing a matching fee.
+#:
+#: The fee is not deterministic across builds -- ring offsets are delta-encoded
+#: varints, so the drawn decoys change the transaction's size by a few bytes.
+#: Measured on one real 8-peel chain, 6 of 7 matched on the first build and the
+#: seventh was 1200 piconero out. Each rebuild is an independent draw and costs
+#: one do_not_relay RPC, so a handful of tries takes the odds of leaving dust
+#: from roughly 1-in-7 to negligible without ever being able to hang.
+_EXACT_CONSUME_TRIES = 5
+
+
 def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
     """Build a transaction that spends its source subaddress EXACTLY.
 
@@ -427,8 +438,27 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
       pass 1  destinations sum to (unlocked - fixed - slack)   -> fee
       pass 2  destinations sum to (unlocked - fee)             -> no change
 
-    do_not_relay on both, so pass 1 costs nothing and reserves nothing --
-    verified: pass 2 builds from the same output immediately afterwards.
+    do_not_relay on every pass, so a discarded build costs nothing and reserves
+    nothing -- verified: the next build uses the same output immediately
+    afterwards.
+
+    AND THE FEE IS NOT QUITE DETERMINISTIC, which is why this loops. A ring's
+    member offsets are delta-encoded varints, so a transaction's SIZE -- and
+    therefore its fee -- depends on which decoys the wallet happened to draw.
+    Measured across one real 8-peel chain: six 1-in/2-out peels paid
+    0.0026328 and one paid 0.0026340, a difference of 1200 piconero. That one
+    peel's build came in 1200 piconero under its probe, so 1200 piconero had
+    nowhere to go and became a THIRD OUTPUT: a 1-in/3-out transaction with a
+    131-byte tx_extra among six at 99, which is exactly the shape this function
+    exists to remove -- and a 0.0000012 XMR dust output that cannot pay its own
+    sweep fee, which the exit then failed on.
+
+    So each build is CHECKED against the fee it was priced with, and rebuilt
+    with the fee it actually came back with. Every rebuild redraws decoys, so
+    it is a fresh sample rather than a repeat; 6 of 7 matched first time in
+    the measured run, and the loop is bounded because a build that never
+    matches is still usable -- it just leaves the dust, which the caller
+    reports.
 
     WHY NOT subtract_fee_from_outputs, which is what this field is nominally
     for. Monero v0.18.3.1 accepts it on transfer_split and silently ignores
@@ -497,13 +527,36 @@ def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
             "the fee probe returned no fee, so the exact amount cannot be "
             "computed; refusing to build a transaction that would leave "
             "change and a third output.")
-    forward = unlocked - fixed - fee
-    if forward <= 0:
-        raise RuntimeError(
-            f"after the {fee}-unit fee there is nothing left to forward from "
-            f"{tx_acct}/{src_index}: the carrier holds {unlocked} and this "
-            f"peel pays {fixed}.")
-    result = _build(forward)
+    result, residue = None, None
+    for _ in range(_EXACT_CONSUME_TRIES):
+        forward = unlocked - fixed - fee
+        if forward <= 0:
+            raise RuntimeError(
+                f"after the {fee}-unit fee there is nothing left to forward "
+                f"from {tx_acct}/{src_index}: the carrier holds {unlocked} and "
+                f"this peel pays {fixed}.")
+        attempt = _build(forward)
+        got = int(attempt.get("fee") or 0)
+        # PRICED AT `fee`, BUILT AT `got`. Equal means the two destinations and
+        # the fee account for the input exactly and there is no third output.
+        if got == fee:
+            result, residue = attempt, 0
+            break
+        if result is None or abs(fee - got) < residue:
+            result, residue = attempt, abs(fee - got)
+        fee = got
+    if result is None:                                       # unreachable
+        raise RuntimeError("no build was produced for the exact-consume peel")
+    if residue:
+        # NOT FATAL, and not silent. The leftover is the fee difference --
+        # measured at 1200 piconero -- so refusing here would strand a chain
+        # over 0.0000012 XMR. It becomes a dust change output the exit reports
+        # as too small to move; see _funded_subaddresses.
+        integrity_log("signer", "exact_consume_residue")
+        print(f"  [!] TX {tx.get('peel_num', '?')}: the fee moved between "
+              f"builds ({residue} piconero), so this peel leaves that much as "
+              f"a dust change output. It is far below the fee to move it, so "
+              f"the exit will report it rather than withdraw it.")
     # transfer returns scalars where transfer_split returns lists. phase_create
     # reads amount_list/fee_list, so normalise rather than special-casing it
     # there: one shape for the caller, whichever RPC produced it.

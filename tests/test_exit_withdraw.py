@@ -1143,6 +1143,80 @@ finally:
 
 
 # ==========================================================================
+# AN OUTPUT SMALLER THAN ITS OWN SWEEP FEE IS NOT A FAILED WITHDRAWAL.
+#
+# Measured on a real chain: a peel whose fee moved 1200 piconero between the
+# signer's two build passes left a 0.0000012 XMR change output.
+# _funded_subaddresses returned it (balance > 0), _wait_for_change_settled
+# reported it settled (it was -- total == unlocked), and sweep_all answered
+# "No unlocked balance in the specified subaddress(es)", which is monerod's
+# way of saying no output there is worth more than the fee to spend it. The
+# exit counted that as a FAILED withdrawal, so the run was reported incomplete
+# and its plans were left on disk -- over one millionth of an XMR.
+# ==========================================================================
+print("\n=== dust below the sweep fee is reported, not attempted ===")
+
+_d_saved = (ghost.connect_rpc, ghost._funded_subaddresses,
+            ghost._wait_for_change_settled, ghost._change_residue,
+            ghost.newnym, ghost.tor_recheck, ghost._run_round,
+            ghost.integrity_log, ghost.secure_delete_or_warn,
+            ghost.secure_delete_tree)
+try:
+    ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
+        raw_request=lambda m, p=None: {})
+    # one real output, one 1200-piconero crumb
+    ghost._funded_subaddresses = lambda *a, **k: (
+        [(3, 1, 5_000_000_000_000), (16, 0, 1_200_000)], [])
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost._run_round = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delete_or_warn = lambda *a, **k: True
+    ghost.secure_delete_tree = lambda *a, **k: True
+    _d_args = types.SimpleNamespace(
+        rpc_primary="http://127.0.0.1:18083", tor_proxy="",
+        exit_to=["dest1"], output=tempfile.mkdtemp(prefix="gs_dust_"))
+    _d_buf = io.StringIO()
+    _real_d = sys.stdout
+    sys.stdout = _d_buf
+    try:
+        _d_res = ghost._run_exit_withdrawals(
+            _d_args, [3, 16], _d_args.exit_to,
+            tempfile.mkdtemp(prefix="gs_duststage_"),
+            {"http": "x", "https": "x"}, {"fee_per_round": "0.0036"},
+            (1, 2), hold=[], entry_pairs=[])
+    finally:
+        sys.stdout = _real_d
+    _d_out = _d_buf.getvalue()
+    check("exit: the crumb is NOT attempted",
+          "withdrawing 1 output(s)" in _d_out)
+    check("exit: ...it is reported, with its size and the reason",
+          "smaller than the" in _d_out and "0.0000012" in _d_out)
+    check("exit: ...and it does NOT count as a failed withdrawal",
+          _d_res[1] == 0 and _d_res[0] == 1)
+    # WITHOUT a fee estimate nothing may be dropped: an unknown threshold must
+    # not silently abandon an output.
+    _d_buf2 = io.StringIO()
+    sys.stdout = _d_buf2
+    try:
+        _d_res2 = ghost._run_exit_withdrawals(
+            _d_args, [3, 16], _d_args.exit_to,
+            tempfile.mkdtemp(prefix="gs_duststage2_"),
+            {"http": "x", "https": "x"}, {}, (1, 2), hold=[], entry_pairs=[])
+    finally:
+        sys.stdout = _real_d
+    check("exit: with no fee estimate in the plan, nothing is filtered",
+          "withdrawing 2 output(s)" in _d_buf2.getvalue())
+finally:
+    (ghost.connect_rpc, ghost._funded_subaddresses,
+     ghost._wait_for_change_settled, ghost._change_residue, ghost.newnym,
+     ghost.tor_recheck, ghost._run_round, ghost.integrity_log,
+     ghost.secure_delete_or_warn, ghost.secure_delete_tree) = _d_saved
+
+
+# ==========================================================================
 # A FAILED CHANGE SWEEP MUST NOT TAKE THE EXIT DOWN WITH IT.
 #
 # _run_change_sweeps' docstring promises "A failure is reported and the

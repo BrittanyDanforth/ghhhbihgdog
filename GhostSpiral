@@ -34,7 +34,7 @@ OPSEC hardening (v10.5):
 """
 from __future__ import annotations
 import argparse, atexit, json, os, re, sys, time, subprocess, secrets
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import List
 
@@ -8155,6 +8155,40 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         connect_rpc(args.rpc_primary,
                     proxy_url=getattr(args, "tor_proxy", "")),
         accounts)
+    # AN OUTPUT SMALLER THAN ITS OWN SWEEP FEE CANNOT BE WITHDRAWN AT ALL, and
+    # trying is not a failure to report as one.
+    #
+    # Measured: a peel whose fee moved 1200 piconero between the signer's two
+    # build passes left a 0.0000012 XMR change output. _funded_subaddresses
+    # returned it (balance > 0), _wait_for_change_settled reported it settled
+    # (it was: total == unlocked), and sweep_all then answered "No unlocked
+    # balance in the specified subaddress(es)" -- monerod's way of saying no
+    # output there is worth more than the fee to spend it. The exit counted
+    # that as a FAILED withdrawal and the run was reported incomplete over
+    # a millionth of an XMR.
+    #
+    # The fee estimate comes from the plan's own meta, so the threshold is the
+    # number this run actually priced its transactions with rather than a
+    # constant that could drift from it. Absent, nothing is filtered -- an
+    # unknown threshold must not silently drop an output.
+    _dust = []
+    try:
+        _sweep_cost = Decimal(str((meta or {}).get("fee_per_round") or 0))
+    except (TypeError, ValueError, InvalidOperation):        # noqa: BLE001
+        _sweep_cost = Decimal(0)
+    if _sweep_cost > 0:
+        _floor = int(_sweep_cost * Decimal(10 ** 12))
+        _dust = [t for t in targets if t[2] <= _floor]
+        if _dust:
+            targets = [t for t in targets if t not in _dust]
+            integrity_log("exit", f"dust_below_sweep_fee:{len(_dust)}")
+            _dtot = Decimal(sum(t[2] for t in _dust)) / Decimal(10 ** 12)
+            print(f"  [!] EXIT: {len(_dust)} output(s) totalling {_dtot} XMR "
+                  f"are smaller than the {_sweep_cost} XMR it would cost to "
+                  f"move them, so they were NOT withdrawn.")
+            print(f"      Sweeping one costs more than it is worth and "
+                  f"monerod refuses it outright. This is not money you can "
+                  f"recover on its own; it stays where it is.")
     if _unreadable:
         # LOUD, AND COUNTED AS A FAILURE. An account this could not read may
         # hold anything, so the run must not be reported as a complete exit --
