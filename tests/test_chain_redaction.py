@@ -343,7 +343,8 @@ def _sweep_chain_lines(n_jobs):
     os.makedirs(stg, exist_ok=True)
     seen = []
     saved = (ghost._run_round, ghost._wait_for_change_settled,
-             ghost._change_residue, ghost.integrity_log)
+             ghost._change_residue, ghost.integrity_log,
+             ghost.newnym, ghost.tor_recheck)
     try:
         def _round(args, path, stage, label):
             seen.append(label)
@@ -351,6 +352,11 @@ def _sweep_chain_lines(n_jobs):
         ghost._run_round = _round
         ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
         ghost._change_residue = lambda *a, **k: 0
+        # The change sweep passes the same relay gates as every other round
+        # now; offline they would abort on the missing Tor control socket.
+        # tests/test_tor_gates.py drives the gates themselves.
+        ghost.newnym = lambda *a, **k: None
+        ghost.tor_recheck = lambda *a, **k: None
         ghost.integrity_log = lambda stage, msg: gsc.integrity_log(
             stage, msg, log_path=log)
         args = types.SimpleNamespace(
@@ -361,7 +367,8 @@ def _sweep_chain_lines(n_jobs):
             ghost._run_change_sweeps(args, jobs, stg, None, {})
     finally:
         (ghost._run_round, ghost._wait_for_change_settled,
-         ghost._change_residue, ghost.integrity_log) = saved
+         ghost._change_residue, ghost.integrity_log,
+         ghost.newnym, ghost.tor_recheck) = saved
     return seen, (payloads(log) if log.exists() else [])
 
 

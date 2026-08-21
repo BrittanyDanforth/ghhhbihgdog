@@ -542,6 +542,66 @@ def compute_hop_amount(fanout_amt: Decimal, fee_xmr: Decimal) -> Decimal:
         DUST_XMR, rounding=ROUND_DOWN)
 
 
+class RelayGateAbort(SystemExit):
+    """A Tor gate stopped the run. NOT a transaction that failed to build.
+
+    Both arrive as SystemExit, and the loops that relay several transactions
+    catch SystemExit so one bad round does not strand the rest. That catch
+    swallowed the gates: _run_exit_withdrawals reproduced it with three funded
+    outputs and a real leak -- the operator got three "FAILED ... funds are
+    still on this wallet" lines, the words Tor and leak appeared nowhere, and
+    the loop re-ran the same failing gate on every remaining output. A retry is
+    the one response a live deanonymising leak must not get.
+
+    A distinct type so those loops can re-raise the gate and keep catching the
+    round. _run_exit_withdrawals tracked it with a local flag instead, which
+    worked and did not travel: the change-sweep loop has the same shape and had
+    no such flag -- and no gates either, which is what this pass fixes.
+    """
+
+
+def relay_gates(args, proxy, stage: str) -> None:
+    """Rotate the circuit or STOP; re-verify Tor or STOP. Before EVERY relay.
+
+    ONE HELPER, because the pair was written out at each relay site and two
+    sites did not have it. Audited by walking every _run_round call in this
+    file:
+
+        entry veil      newnym(required=True) + tor_recheck   OK
+        peel i          newnym(required=True) + tor_recheck   OK
+        fan-out         NOTHING
+        DAG round       tor_recheck only, and the newnym sat above a wait
+                        that can last an hour
+        change sweep    NOTHING
+        exit output     newnym(required=True) + tor_recheck   OK
+
+    The two bare ones are not minor rounds. The FAN-OUT is the single
+    transaction that creates every mix output the run has, and it relays after
+    the entry veil's carrier wait -- up to an hour with no gate in between. The
+    CHANGE SWEEP moves the one output the distribution could not allocate: its
+    input is the transaction that spent the swapped funds, so it is the relay
+    that most directly links "the spend of my swap" to a fresh address, and
+    with --split N there is one per chunk relaying back to back.
+
+    What they did still have is the best-effort newnym inside _run_round_body,
+    which prints on failure and carries on. That is a rotation ATTEMPT, not the
+    gate: required=True is what turns "the circuit could not be rotated" into a
+    stop instead of a warning, and tor_recheck is the only thing that asks
+    whether this is still a real Tor exit at all.
+
+    Raises RelayGateAbort (a SystemExit) rather than plain SystemExit so a
+    relay loop can tell a leak from a failed transaction. The message is the
+    gate's own -- newnym and tor_recheck already say exactly what happened.
+    """
+    try:
+        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
+        tor_recheck(proxy, stage)
+    except RelayGateAbort:
+        raise
+    except SystemExit as e:
+        raise RelayGateAbort(str(e) or f"Tor gate failed before {stage}")
+
+
 def _tool(name: str) -> str:
     """Absolute path to a sibling tool in this repo.
 
@@ -7804,13 +7864,16 @@ def _run_peel_chain(args, peel_file, staging_dir, proxy, change_target):
                 integrity_log("stage5", f"peel_carrier_timeout:{i}")
                 _partial(relayed)
                 break
-        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
-        tor_recheck(proxy, f"stage5_peel_{i}")
         one_path = Path(str(peel_file)[:-5] + f"_peel{i}.json") \
             if str(peel_file).endswith(".json") else Path(str(peel_file) + f".peel{i}")
         atomic_write_json({"meta": meta, "txs": [peel]}, one_path)
         peel_stage = f"{staging_dir}/peel{i}"
         try:
+            # INSIDE the try, next to the relay it guards, so the `finally`
+            # below still erases this peel's plan -- destination and amount --
+            # when a gate stops the run. Every relay site in this file now
+            # reads the same way; test_tor_gates walks them and proves it.
+            relay_gates(args, proxy, f"stage5_peel_{i}")
             _run_round(args, one_path, peel_stage, f"Peel {i + 1}/{n}")
             relayed += 1
         finally:
@@ -7941,6 +8004,12 @@ def _run_change_sweeps(args, jobs, staging_dir, proxy, meta,
                                        label=label, seq=n,
                                        delay_window=delay_window,
                                        outcomes=_outcomes)
+        except RelayGateAbort:
+            # NOT a failed sweep. Reporting a live Tor leak as "FAILED to
+            # create, sign or broadcast" invites a retry, and this loop would
+            # then re-run the same gate on every remaining sweep and hand the
+            # run on to the exit. Out it goes, with its own message.
+            raise
         except SystemExit:
             _outcomes.add("round_failed")
             print(f"  [!] {label}: FAILED to create, sign or broadcast. The "
@@ -8061,6 +8130,9 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
     atomic_write_json({"meta": meta, "txs": [sweep_tx]}, path)
     stage = f"{staging_dir}/changesweep{seq}" if seq else f"{staging_dir}/changesweep"
     try:
+        # INSIDE the try, so the `finally` still erases this plan -- it carries
+        # the change destination -- when a gate stops the run.
+        relay_gates(args, proxy, f"stage5_changesweep_{seq or 1}")
         _run_round(args, path, stage, label.capitalize())
         # VERIFY, do not assert. This printed "nothing is parked on the change
         # address" unconditionally -- a claim the code never checked, and one
@@ -8327,6 +8399,37 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         connect_rpc(args.rpc_primary,
                     proxy_url=getattr(args, "tor_proxy", "")),
         accounts)
+    # ZERO FUNDED OUTPUTS, ACROSS EVERY ACCOUNT OF THE RUN, IS ANOMALOUS.
+    #
+    # This function is only reached because --exit-to was given and a
+    # distribution has just been relayed, so these accounts should be holding
+    # the run's whole balance. Reading nothing is far more likely to mean the
+    # wallet has not caught up than that the money is not there.
+    #
+    # It cannot be rescued further down either: the straggler pass at the
+    # bottom is only reached when there was something to withdraw in the first
+    # place -- the empty case returns before it. So the second look has to be
+    # HERE, and it has to WAIT. A re-read taken in the same millisecond as the
+    # first re-reads the same wallet state and only looks diligent; the refresh
+    # inside _funded_subaddresses closes the wallet's scan lag but cannot make
+    # the daemon hand over a transaction it has not relayed yet.
+    #
+    # Two extra looks, one poll interval apart. Against a run that has been
+    # going for hours that is a minute, and against accounts that really are
+    # empty it is a minute spent proving it instead of asserting it.
+    for _look in range(2):
+        if targets or shutdown_requested():
+            break
+        integrity_log("exit", "nothing_visible_retrying")
+        print(f"  [!] EXIT: no funded output is visible on any of this run's "
+              f"accounts. That should not happen straight after a "
+              f"distribution, so waiting {FANOUT_CONFIRM_POLL}s and looking "
+              f"again rather than reporting an empty wallet.")
+        time.sleep(FANOUT_CONFIRM_POLL)
+        targets, _unreadable = _funded_subaddresses(
+            connect_rpc(args.rpc_primary,
+                        proxy_url=getattr(args, "tor_proxy", "")),
+            accounts)
     # AN OUTPUT SMALLER THAN ITS OWN SWEEP FEE CANNOT BE WITHDRAWN AT ALL, and
     # trying is not a failure to report as one.
     #
@@ -8571,11 +8674,8 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         # So the gates are tracked separately and their abort is RE-RAISED,
         # carrying its own message. Re-raising still runs the `finally` below,
         # so the exit plan -- which holds --exit-to -- is still wiped.
-        _gates_passed = False
         try:
-            newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
-            tor_recheck(proxy, f"exit_{_tok}")
-            _gates_passed = True
+            relay_gates(args, proxy, f"exit_{_tok}")
             _run_round(args, path, stage, label.capitalize())
             _left = _change_residue(args, acct, sub)
             if _left is None:
@@ -8595,14 +8695,17 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
                 _outcomes.add("emptied")
                 print(f"  [+] {label}: account {acct} / subaddr {sub} emptied.")
             relayed += 1
-        except SystemExit:
-            # THE TOR GATES ABOVE ARE NOT ROUNDS. If the abort came from
-            # newnym/tor_recheck rather than from the round, let it out: it is
-            # a fail-closed safety stop about the network, it carries its own
+        except RelayGateAbort:
+            # THE TOR GATES ABOVE ARE NOT ROUNDS. A gate abort is a
+            # fail-closed safety stop about the network, it carries its own
             # message, and continuing the loop would re-run the same gate on
             # every remaining output. `finally` still wipes the plan.
-            if not _gates_passed:
-                raise
+            #
+            # A distinct exception type rather than the local flag this used to
+            # keep: the flag could not travel to the change-sweep loop, which
+            # has the same shape and the same catch. See RelayGateAbort.
+            raise
+        except SystemExit:
             # _run_round aborts the PROCESS on a failed round. An exit is a
             # loop over independent transactions and the rest are still
             # withdrawable, so one failure must not strand them -- and it must
@@ -8773,8 +8876,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     _dist_landed = []
     if veil_file:
         print("  [*] === Round 0: entry veil ===")
-        newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
-        tor_recheck(proxy, "stage5_veil")
+        relay_gates(args, proxy, "stage5_veil")
         _run_round(args, veil_file, f"{staging_dir}/veil", "Entry veil")
         # ONE WAIT PER CARRIER, and ALL of them must land.
         #
@@ -8935,6 +9037,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                     f"hop's change address")
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
+        # THE ONE TRANSACTION THAT CREATES EVERY MIX OUTPUT, and it was the
+        # only main round with no gate of its own. It relays after the entry
+        # veil's carrier wait, which can be a full hour: the last gate this
+        # round passed was the one before the veil.
+        relay_gates(args, proxy, "stage5_fanout")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
         # One transaction, every target paid. Nothing to trim.
         _dist_landed = list(fanout_targets or ())
@@ -9004,10 +9111,24 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # caller that passed no targets at all must not have its plan emptied.
         if fanout_targets and len(_dist_landed) < len(fanout_targets):
             _funded_srcs = {(int(a), int(i)) for a, i in _dist_landed}
-            _kept = [_e for _e in _dag_txs
-                     if (int(_e.get("account_index",
-                                    _dag_meta.get("account_index", -1))),
-                         int(_e.get("src_index", -1))) in _funded_srcs]
+            def _hop_src(_e):
+                """(account, subaddress) a hop spends, or None if unreadable.
+
+                None -- and therefore DROPPED -- rather than an exception or a
+                guess. This runs on a file that has been on disk since stage 4;
+                a truncated write or a hand-edited plan must not take the run
+                down here, and must certainly not resolve to some other
+                account's subaddress and get that one swept instead.
+                """
+                try:
+                    _a = _e.get("account_index")
+                    if _a is None:
+                        _a = _dag_meta.get("account_index")
+                    return (int(_a), int(_e["src_index"]))
+                except (TypeError, ValueError, KeyError):    # noqa: BLE001
+                    return None
+
+            _kept = [_e for _e in _dag_txs if _hop_src(_e) in _funded_srcs]
             _dropped_hops = len(_dag_txs) - len(_kept)
             if _dropped_hops:
                 integrity_log("stage5", "dag_hops_dropped_unfunded_source")
@@ -9028,7 +9149,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         elif _wait_for_fanout_confirm(args, _dist_landed, proxy,
                                       what="distribution"):
             print("  [*] === Round 2: DAG hop-mixing ===")
-            tor_recheck(proxy, "stage5_dag")
+            # HERE, not above the wait. The newnym at the top of this block
+            # guards the balance polling; by the time the round actually
+            # relays, that rotation is up to FANOUT_CONFIRM_TIMEOUT old and
+            # nothing has re-asked whether Tor is still up.
+            relay_gates(args, proxy, "stage5_dag")
             _run_round(args, dag_file, f"{staging_dir}/dag", "DAG")
             # EVERY HOP SOURCE IS NOW EMPTY. A hop is a sweep_all, so the
             # distribution targets this list held have paid their whole balance
