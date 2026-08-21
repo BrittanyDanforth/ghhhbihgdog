@@ -678,14 +678,22 @@ check("control: ...each hop leaving its change on its OWN account",
 _VA2 = types.SimpleNamespace
 
 
-def _dist(sources, slices, by_addr, peel=False):
+def _dist(sources, slices, by_addr, peel=False, bal=None, usable=None):
+    """Drive the real planner. bal/usable are REQUIRED by the planner now --
+    the peel branch runs the affordability gate with them, and defaulting them
+    to None is what let that gate be skipped. Default here to a balance that
+    comfortably covers these tiny fixtures, so the fan-out cases read as before
+    and the peel cases exercise the gate rather than trip over it."""
     _args = _VA2(peel=peel, dag_mixing=False)
     _ai = {a: (c, i) for a, c, i in sources}
+    _tot = sum(by_addr.values(), Decimal(0))
+    _bal = bal if bal is not None else _tot * Decimal("50") + Decimal("10")
+    _use = usable if usable is not None else _bal * Decimal("0.9")
     with contextlib.redirect_stdout(io.StringIO()):
         return ghost.build_distribution_plan(
             _args, None, _ai, sources, [d for sl in slices for d in sl],
             by_addr, slices, Decimal("0.0024"), sources[0][1],
-            sum(len(sl) for sl in slices), (0, 0), _secretsmod)
+            sum(len(sl) for sl in slices), (0, 0), _secretsmod, _bal, _use)
 
 
 _SRC = [("C0", 20, 1), ("C1", 21, 1), ("C2", 22, 1)]

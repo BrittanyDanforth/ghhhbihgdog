@@ -5512,9 +5512,17 @@ def resolve_entry_veils(rpc, args, addr_index: dict, entries: list,
 def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             fanout_dests, fanout_by_addr, _dest_slices,
                             fee_xmr, bal_account, fanout_count,
-                            _delay_window, _secrets) -> tuple:
+                            _delay_window, _secrets, bal,
+                            usable) -> tuple:
     """Build the plan that spends the carriers. Returns
     (fanout_plan, change_accounts, distribution_mode).
+
+    `bal` and `usable` are REQUIRED, not defaulted. They exist so the peel
+    branch can run fit_peel_distribution, and a default of None would let a
+    caller skip the affordability gate by simply not knowing about it -- which
+    is how that gate came to be dead code in the first place. A caller that
+    forgets now fails at the call, loudly, instead of building a peel chain
+    that strands funds on a carrier.
 
     Extracted from main() so the N-chunk shape can be driven directly by a
     test: this is where the invariant "no transaction ever spends value from
@@ -5570,6 +5578,71 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                 f"--peel), or --peel with a\n"
                 f"    single chunk.")
         _hop_fee = fee_xmr * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT
+        # AND NOW ACTUALLY CHECK IT. The comment above has claimed this gate
+        # since it was written; fit_peel_distribution implements it, is fully
+        # unit-tested, and was called from NOWHERE. Confirmed by walking the
+        # AST of this file: `fit_peel_distribution` appears in one comment and
+        # in tests, and in no call. peel_entry_requirement, the arithmetic it
+        # exists to evaluate, is reachable only from inside it.
+        #
+        # So the peel chain built a plan without ever asking whether peel 0
+        # could afford it, which is the exact failure fit_peel_distribution's
+        # docstring records: "failed on peel 2 with 'not enough money' and
+        # stranded the entire remaining balance on a carrier subaddress, which
+        # this pipeline has no auto-resume for."
+        #
+        # Not a corner case. Comparing peel_entry_requirement against the
+        # spendable balance across the shipped compute_fee_budget at fee
+        # 0.0024, 28 (balance, --wallets) combinations are unaffordable and
+        # every one of them was built anyway -- including --wallets 10, THE
+        # DEFAULT, on a 1 XMR balance (short by 0.12) and on 2 XMR (short by
+        # 0.02).
+        _peel_amounts = [fanout_by_addr[_a] for _a in fanout_dests]
+        try:
+            _fitted, _frac = fit_peel_distribution(
+                _peel_amounts, bal, usable, fanout_count, fee_xmr,
+                bool(getattr(args, "dag_mixing", False)), _secrets, _hop_fee)
+        except PeelBudgetError as _pbe:
+            integrity_log("stage4", "peel_refused:unaffordable")
+            sys.exit(
+                f"[!] A peel chain of {_pbe.hops} hops cannot be built from "
+                f"this balance.\n"
+                f"    Every hop must leave {_pbe.hop_headroom} XMR behind so "
+                f"the NEXT one can be\n"
+                f"    constructed at all, and {_pbe.hops} hops need "
+                f"{_pbe.hop_headroom * _pbe.hops} XMR of headroom on top of "
+                f"everything\n"
+                f"    being distributed. This balance does not cover it at any "
+                f"distribution size\n"
+                f"    the planner will try.\n"
+                f"\n"
+                f"    NOTHING HAS BEEN SPENT. A peel chain that runs out "
+                f"part-way strands the\n"
+                f"    remainder on a carrier subaddress and there is no "
+                f"auto-resume, so this\n"
+                f"    stops before the first transaction rather than during "
+                f"the chain.\n"
+                f"    Use fewer --wallets, drop --peel for the fan-out "
+                f"distribution, or fund\n"
+                f"    the wallet more.")
+        if _frac is not None:
+            # SHRUNK, and said so. The operator asked to distribute a certain
+            # amount and is getting less; the remainder stays on ENTRY rather
+            # than being silently absorbed.
+            integrity_log("stage4", f"peel_distribution_shrunk:{_frac}")
+            print(f"  [!] The peel chain could not carry the full "
+                  f"distribution: {fanout_count} hops need "
+                  f"{_hop_fee * (fanout_count - 1)} XMR of headroom on top of "
+                  f"it, which this balance does not leave.")
+            print(f"      Distributing {_frac * 100:.0f}% of the usable "
+                  f"balance instead. The rest stays on ENTRY — it is not "
+                  f"lost, and it is not mixed either.")
+        _peel_amounts = _fitted
+        # ONE SOURCE OF TRUTH for the amounts from here down. fanout_by_addr is
+        # what build_peel_stage_plan reads, so a shrunk plan that did not
+        # rebuild it would size the check against one set of amounts and the
+        # transactions against another.
+        fanout_by_addr = dict(zip(fanout_dests, _peel_amounts))
         # A peel chain has exactly ONE source: the refusal above guarantees
         # len(SPEND_SOURCES) == 1 here, so read it from there rather than from
         # a separate variable that could drift out of step with it.
@@ -6356,7 +6429,7 @@ def main():
         fanout_plan, change_accounts, distribution_mode = build_distribution_plan(
             args, rpc_primary, addr_index, SPEND_SOURCES, fanout_dests,
             fanout_by_addr, _dest_slices, fee_xmr, bal_account,
-            fanout_count, _delay_window, _secrets)
+            fanout_count, _delay_window, _secrets, bal, usable)
 
         # Subaddresses that will receive a fan-out output, with the (account, index)
         # pair Stage 5 polls to confirm they've unlocked before hop-mixing.

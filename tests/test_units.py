@@ -2647,6 +2647,108 @@ check("PEEL_CARRIER_RESERVE_MULT is not the pre-RingCT artifact value",
       ghost.PEEL_CARRIER_RESERVE_MULT < Decimal("50"))
 
 
+# ==========================================================================
+# AND THE GATE HAS TO BE WIRED IN.
+#
+# fit_peel_distribution is fully implemented, fully unit-tested above, and was
+# called from NOWHERE. Confirmed by walking this file's AST: the name appeared
+# in one comment and in these tests, and in no call. peel_entry_requirement --
+# the arithmetic the gate exists to evaluate -- was reachable only from inside
+# it.
+#
+# So the peel chain built a plan without ever asking whether peel 0 could
+# afford it, which is precisely the failure fit_peel_distribution's own
+# docstring records: "failed on peel 2 with 'not enough money' and stranded the
+# entire remaining balance on a carrier subaddress, which this pipeline has no
+# auto-resume for."
+#
+# Measured against the shipped compute_fee_budget at fee 0.0024: 28
+# (balance, --wallets) combinations produce a chain peel 0 cannot afford, and
+# every one was built anyway. Among them --wallets 10 -- THE DEFAULT -- on a
+# 1 XMR balance (short by 0.12 XMR) and on 2 XMR (short by 0.02).
+#
+# AST, not a substring: "fit_peel_distribution" matches its own `def` line, so
+# a substring check passes on a file where nothing calls it -- which is exactly
+# how it went unnoticed.
+import ast as _pf_ast
+
+_pf_tree = _pf_ast.parse(open(os.path.join(REPO, "GhostSpiral")).read())
+_pf_fns = {n.name: n for n in _pf_ast.walk(_pf_tree)
+           if isinstance(n, _pf_ast.FunctionDef)}
+
+
+def _pf_calls_within(fn_name, callee):
+    fn = _pf_fns.get(fn_name)
+    if fn is None:
+        return False
+    return any(isinstance(c, _pf_ast.Call)
+               and (getattr(c.func, "id", None) == callee
+                    or getattr(c.func, "attr", None) == callee)
+               for c in _pf_ast.walk(fn))
+
+
+check("peel: the affordability gate is actually CALLED by the planner",
+      _pf_calls_within("build_distribution_plan", "fit_peel_distribution"))
+check("peel: ...and PeelBudgetError is handled where it is called, so an "
+      "unaffordable chain aborts instead of raising a traceback",
+      any(isinstance(h, _pf_ast.ExceptHandler)
+          and "PeelBudgetError" in _pf_ast.dump(h)
+          for h in _pf_ast.walk(_pf_fns["build_distribution_plan"])))
+
+# DRIVEN, across the settings that were broken. Every one must now either be
+# shrunk to something peel 0 can afford, or refused before any money moves --
+# never built as-is.
+_pf_hh = (Decimal("0.0024") * ghost.FEE_SAFETY_MARGIN
+          * ghost.PEEL_CARRIER_RESERVE_MULT)
+_pf_bad = _pf_shrunk = _pf_refused = _pf_still = 0
+for _pb in ("0.5", "1", "2", "3", "5", "10"):
+    for _pw in (5, 10, 20, 30, 40, 50, 60):
+        _pB = Decimal(_pb)
+        _pu = ghost.compute_fee_budget(_pB, Decimal("0.0024"), _pw, deep=1)
+        if isinstance(_pu, tuple):
+            _pu = _pu[0]
+        if _pu <= 0:
+            continue
+        _pa = ghost.compute_fanout_amounts(_pu, _pw, Decimal("0.0024"), True,
+                                           _fo_rng)
+        if not _pa:
+            continue
+        _pneed = ghost.peel_entry_requirement(
+            _pa, ghost.peel_carrier_reserves(_pa, _pf_hh))
+        if _pneed <= _pB - _pf_hh:
+            continue                      # was affordable to begin with
+        _pf_bad += 1
+        try:
+            _pfit, _pfrac = ghost.fit_peel_distribution(
+                _pa, _pB, _pu, len(_pa), Decimal("0.0024"), True, _fo_rng,
+                _pf_hh)
+        except ghost.PeelBudgetError:
+            _pf_refused += 1
+            continue
+        _pn2 = ghost.peel_entry_requirement(
+            _pfit, ghost.peel_carrier_reserves(_pfit, _pf_hh))
+        if _pn2 <= _pB - _pf_hh:
+            _pf_shrunk += 1
+        else:
+            _pf_still += 1
+check(f"peel: every unaffordable setting is shrunk or refused, never built "
+      f"({_pf_bad} found: {_pf_shrunk} shrunk, {_pf_refused} refused)",
+      _pf_bad > 0 and _pf_still == 0)
+# NON-VACUITY: the sweep must actually be finding broken settings, or
+# "_pf_still == 0" is an empty claim.
+check("peel: ...and the sweep really did find the broken settings",
+      _pf_bad >= 20)
+
+# A SHRUNK PLAN MUST BE THE ONE THAT GETS BUILT. fanout_by_addr is what
+# build_peel_stage_plan reads; fitting the amounts and then handing the old
+# dict to the builder would check one plan and execute another -- the exact
+# strand-on-a-carrier this gate exists to prevent, with a passing gate in
+# front of it.
+_pf_src = " ".join(code_only(os.path.join(REPO, "GhostSpiral")).split())
+check("peel: the fitted amounts are written back into fanout_by_addr",
+      "fanout_by_addr = dict(zip(fanout_dests, _peel_amounts))" in _pf_src)
+
+
 # build_peel_stage_plan is the only peel code that touches the wallet, so it
 # is the piece a pure-arithmetic test cannot reach. It shipped once with a
 # NameError on a module-vs-local alias that every other test passed straight
