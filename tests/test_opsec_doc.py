@@ -145,16 +145,82 @@ print("=== §1: 'Telegram never gets: XMR address, memo ... ' ===")
 # The doc is explicit that the pager is NOT in this repo. If a Telegram
 # integration ever lands without the split being honoured, this catches it:
 # nothing here may hold a bot token or post to a chat.
+# The wake channel is included: gs_doorbell is the program most likely to grow
+# a bot, because it is the one a trigger would talk to.
 ALL_SRC = "\n".join([CONSOLE, RECV_W, CRW, THOR, GHOST, src("gs_common.py"),
                      src("airgap_tx_signer"), src("broadcast_signed_xmr"),
-                     src("paranoia_mode")])
+                     src("paranoia_mode"), src("gs_doorbell"),
+                     src("gs_wake_agent"), src("gs_wake_keys"),
+                     src("gs_wake_proto.py")])
 for marker in ("api.telegram.org", "sendMessage", "bot_token", "TELEGRAM_TOKEN",
                "chat_id"):
     check(f"no shipped code talks to Telegram ({marker})", marker not in ALL_SRC)
-check("the doc is honest that the pager is not shipped",
-      "not in this repo yet" in DOC or "not a\nshipped binary" in DOC
-      or "not\nshipped" in DOC or "is **not** in this repo" in DOC
-      or "operator procedure" in DOC)
+
+# TWO INDEPENDENT CLAIMS, TWO INDEPENDENT CHECKS.
+#
+# This was ONE five-way OR over both of them:
+#
+#   check("the doc is honest that the pager is not shipped",
+#         "not in this repo yet" in DOC or "not a\nshipped binary" in DOC
+#         or ... or "operator procedure" in DOC)
+#
+# The doc makes two claims that are true at different times. "The Telegram
+# pager is not in this repo yet" stays true -- no bot ships. "The Pi doorbell
+# is operator procedure, not a shipped binary" became FALSE the moment
+# gs_doorbell landed. Under the OR, shipping the doorbell and changing nothing
+# in the doc still matched the FIRST clause: ALL GREEN, while the repo shipped
+# a doorbell its own security document said it did not. That is the failure
+# this file's docstring names -- "the document becomes a confident lie ...
+# worse than having no document, because it is invisible" -- committed by the
+# test written to prevent it.
+check("the doc is honest that the TELEGRAM PAGER is still not shipped",
+      "not in this repo yet" in DOC or "is **not** in this repo" in DOC)
+check("...and does NOT still call the doorbell operator procedure, now that "
+      "it ships",
+      "operator procedure" not in DOC and "not a\nshipped binary" not in DOC)
+check("...and the doorbell the doc describes actually exists on disk",
+      all(os.path.isfile(os.path.join(REPO, f))
+          for f in ("gs_doorbell", "gs_wake_agent", "gs_wake_keys",
+                    "gs_wake_proto.py")))
+check("...and the doc names the real invocations, not a sketch",
+      "gs_doorbell wake" in DOC and "gs_wake_agent" in DOC
+      and "gs_wake_keys" in DOC)
+
+print("=== §3: 'What the Pi must never hold' — enforced, not asserted ===")
+# The doorbell runs on the box the doc defines by what it must NOT hold. This
+# turns that paragraph into a test. code_only, so the header that NAMES these
+# as forbidden does not satisfy the check.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from srcutil import code_only                                # noqa: E402
+_bell_code = code_only(os.path.join(REPO, "gs_doorbell"))
+import ast as _ast
+_bell_mods = set()
+for _n in _ast.walk(_ast.parse(src("gs_doorbell"))):
+    if isinstance(_n, _ast.Import):
+        _bell_mods.update(a.name.split(".")[0] for a in _n.names)
+    elif isinstance(_n, _ast.ImportFrom) and _n.module:
+        _bell_mods.add(_n.module.split(".")[0])
+for _m in ("gs_common", "monero", "stem", "psutil", "requests", "tenacity"):
+    check(f"the Pi doorbell does not import {_m}", _m not in _bell_mods)
+for _w in ("wallet_", "thor_pairs", "view_key", "spend_key", "mnemonic", "seed"):
+    check(f"...and its code never mentions {_w}", _w not in _bell_code)
+check("the doorbell binds an exact address, never all interfaces",
+      '"0.0.0.0"' in _bell_code and "refusing to bind" in _bell_code.lower())
+
+print("=== §4: 'Do not use the Pi as a Tor proxy' — checked, not promised ===")
+# The vault's proxy comes from ITS OWN keyfile. If any argv template sourced a
+# proxy from the note, a pwned Pi could put itself on the path -- which is the
+# one thing §4 forbids by name, and which nothing verified until now.
+_agent_code = code_only(os.path.join(REPO, "gs_wake_agent"))
+check("the agent takes its Tor proxy from its keyfile",
+      'key["tor_proxy"]' in _agent_code)
+check("...and no schema field a note can carry is a free-form string",
+      '"--tor-proxy", proxy' in _agent_code)
+# The contiguous half of the sentence -- the markdown wrap splits it after
+# "Do not use", and a check that matches across a line break is a check that
+# breaks on a reflow rather than on a behaviour change.
+check("§4: the doc still says not to proxy through the Pi",
+      "the Pi as a Tor proxy" in DOC)
 
 print("=== §1: the memo is the address — it must never reach a log ===")
 

@@ -1,0 +1,18 @@
+# The vault's power-off, as a ROOT-OWNED unit that does not depend on the agent
+# being alive. This is path 2 and 3 of the three independent power-off paths;
+# gs_wake_agent's own `finally` is path 1.
+#
+# SIGTERM THE JOB'S GROUP FIRST. Every tool in this toolchain installs a
+# SIGTERM handler and its `finally` blocks are what erase the plan files and
+# the wallet-password scratch file. gs_console's job watchdog records what a
+# straight kill cost: "a timed-out run left all of it on disk."
+[Unit]
+Description=GhostSpiral wake: stop the job cleanly, then power off
+DefaultDependencies=no
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+# Give the agent's process group a chance to run its cleanup, then insist.
+ExecStart=/bin/sh -c 'systemctl kill --signal=SIGTERM gs-wake-agent.service 2>/dev/null || true; sleep 20; systemctl kill --signal=SIGKILL gs-wake-agent.service 2>/dev/null || true'
+ExecStart=/usr/bin/systemctl --no-block poweroff

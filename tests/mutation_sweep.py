@@ -500,6 +500,194 @@ MUTATIONS = [
  # Every fan-out share is quantised onto a 0.0001 XMR grid, so independent
  # draws collide: 81% of plans held a repeat at 0.5 XMR / --wallets 20. The
  # docstring's first line promises "DELIBERATELY UNEQUAL".
+ # ---- the Pi/vault wake channel -----------------------------------------
+ # The reflection: crypto_box gives ONE key both directions, so an M2 sealed to
+ # the vault's STATIC key instead of its per-boot ephemeral makes the vault's
+ # own M1, replayed, a valid answer that echoes the right challenge.
+ ("the wake M2 is sealed to the static key, not the per-boot ephemeral",
+  "gs_wake_agent",
+  "    body = proto.open_record(eph, pi_pk, m2, proto.TAG_M2)",
+  "    body = proto.open_record(tp_sk, pi_pk, m2, proto.TAG_M2)",
+  ["test_wake_agent", "test_wake_endtoend"]),
+
+ # The domain tag is the only thing separating M1 from M3, which DO share a key.
+ ("the wake domain tag is not checked", "gs_wake_proto.py",
+  "    if not hmac.compare_digest(inner[:TAG_LEN], expect_tag):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # Unpadded, the job is readable off the wire by ciphertext length alone
+ # (measured: 76 / 91 / 100 bytes for the three jobs).
+ ("wake records are not padded, so the job leaks by length",
+  "gs_wake_proto.py",
+  "    padded = bindings.sodium_pad(inner, PAD_BLOCK)",
+  "    padded = inner",
+  ["test_wake_protocol"]),
+
+ # The closed schema is the whole defence against flag injection from the
+ # least-trusted box into the most-trusted one.
+ ("the wake job schema accepts any key set", "gs_wake_proto.py",
+  "    if got != want:",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ ("the wake job whitelist accepts any job id", "gs_wake_proto.py",
+  "    if not isinstance(job, str) or job not in JOBS:",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # THE ONE THAT MATTERS MOST: without this the vault stays powered on, on the
+ # LAN, with the disk auto-unlocked, on every refusal path there is.
+ ("the vault does not power off when a wake refuses", "gs_wake_agent",
+  '        if code not in ("inhibited", "mix_running"):\n'
+  "            power_off(dry_run=args.dry_run)",
+  "        pass",
+  ["test_wake_agent"]),
+
+ # Every refusal PAST COLLECTION owes the doorbell an answer. Without this the
+ # Pi times out and tells the operator "this job may already be done. CHECK THE
+ # VAULT" when nothing ran.
+ ("a post-collection refusal never reaches the doorbell", "gs_wake_agent",
+  "    except (Refused, SystemExit) as e:\n"
+  '        report_back(key, job_id, challenge.hex(), "refused", "",\n'
+  '                    poster=d.get("post_record"))\n'
+  "        raise e",
+  "    except (Refused, SystemExit) as e:\n        raise e",
+  ["test_wake_agent"]),
+
+ # A slow answer was structurally unreportable while the window was checked
+ # before the job_id had been read out of the note.
+ ("a slow answer is refused without telling the doorbell", "gs_wake_agent",
+  "        raise _reported(key, d, job_id, challenge, Refused(\n"
+  '            "slow_answer",',
+  "        raise (lambda k, dd, j, c, e: e)(key, d, job_id, challenge, "
+  "Refused(\n"
+  '            "slow_answer",',
+  ["test_wake_agent"]),
+
+ # 65536 handles: at ~300 recorded, a repeat is more likely than not, and this
+ # dict is keyed on the handle -- a repeat overwrites the record it lands on
+ # and a later watch follows the newer job's address.
+ ("a colliding handle overwrites the record it lands on", "gs_wake_agent",
+  "    for _ in range(64):\n"
+  "        if handle not in handles:\n"
+  "            break\n"
+  "        handle = proto.new_handle()",
+  "    for _ in range(0):\n"
+  "        if handle not in handles:\n"
+  "            break\n"
+  "        handle = proto.new_handle()",
+  ["test_wake_agent"]),
+
+ # A built-in SD reader with no card publishes removable=1 forever, so without
+ # the size check the vault refuses EVERY boot: a feature that never runs.
+ ("an empty card slot counts as attached media", "gs_wake_agent",
+  '        try:\n'
+  '            if (Path(p).parent / "size").read_text().strip() == "0":\n'
+  "                continue\n"
+  "        except OSError:\n"
+  "            pass\n",
+  "",
+  ["test_wake_agent"]),
+
+ # paranoia_mode sweeps cwd/$HOME; systemd starts a unit with cwd=/ and
+ # HOME=/root. Without this line the wake artifacts sit where the wipe never
+ # looks -- and the agent, correctly, refuses to run at all.
+ ("the wake artifacts land outside every wipe root",
+  "systemd/gs-wake-agent.service",
+  "WorkingDirectory=/var/lib/ghostspiral\nEnvironment=HOME=/var/lib/ghostspiral",
+  "WorkingDirectory=/\nEnvironment=HOME=/root",
+  ["test_wake_agent"]),
+
+ # A pairing that half-succeeded reads as a pairing that must be re-keyed on
+ # both boxes, when in fact nothing was ever paired.
+ ("a relative artifact dir is written into the keyfile", "gs_wake_keys",
+  "    if not os.path.isabs(args.artifact_dir):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # The dwell shipped as two dead constants and a doc claim for a whole draft.
+ # An anchor here is the standing guard against it going dead again.
+ ("a no-job boot powers off the instant it is told there is no job",
+  "gs_wake_agent",
+  "        if not args.dry_run:\n"
+  "            _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))",
+  "        pass",
+  ["test_wake_agent"]),
+
+ # A Tor-down boot must refuse BEFORE asking, or it silently burns the poke.
+ ("a Tor-down boot consumes the job anyway", "gs_wake_agent",
+  '    if not _tor(key.get("tor_proxy", "")):',
+  "    if False:",
+  ["test_wake_agent"]),
+
+ # A watch is a watch against a QUOTE. Without this the literal string "None"
+ # reached receive_watch's --pairs, and the only alternative -- --any -- would
+ # page the operator that their money landed when what landed was dust.
+ ("a handle with no swap quote is watched anyway", "gs_wake_agent",
+  '        if not slip:\n'
+  '            raise Refused(\n'
+  '                "no_quote",',
+  "        if False:\n"
+  "            raise Refused(\n"
+  '                "no_quote",',
+  ["test_wake_agent"]),
+
+ # One handle, one address. --count 4 writes four bundles and new[0] is
+ # whichever sorts first.
+ ("a multi-bundle handle resolves to an arbitrary one of them",
+  "gs_wake_agent",
+  '            handles[handle] = {"bundle": new[0] if len(new) == 1 else None,\n'
+  '                               "minted": len(new), "slip": None}',
+  '            handles[handle] = {"bundle": new[0], "slip": None}',
+  ["test_wake_agent"]),
+
+ # "did not authenticate" and "authenticated, then refused" are different facts
+ # about who is on the other end. Collapsed, a duplicate result from the vault
+ # reads as a stranger posting noise on the switch.
+ ("a refused result is reported as one that did not authenticate",
+  "gs_doorbell",
+  "                except Doorbell:\n"
+  "                    # AUTHENTICATED AND THEN REFUSED",
+  "                except Doorbell:\n"
+  '                    pending.events.append("result_bad")\n'
+  "                    return self._reply(204)\n"
+  "                except Doorbell:\n"
+  "                    # AUTHENTICATED AND THEN REFUSED",
+  ["test_wake_doorbell"]),
+
+ # The event that means "your job did not go where you think" was collected
+ # and read by nothing.
+ ("a second authenticated boot takes the job silently", "gs_doorbell",
+  "def report(pending: Pending) -> int:\n    _report_events(pending)",
+  "def report(pending: Pending) -> int:",
+  ["test_wake_doorbell"]),
+
+ # The ledger is what stops a re-issued job_id running twice and overwriting a
+ # slip the operator may already have sent BTC against.
+ ("the wake ledger does not stop a replayed job_id", "gs_wake_agent",
+  '    if job_id in {j.get("id") for j in state["jobs"]}:',
+  "    if False:",
+  ["test_wake_agent"]),
+
+ # One job, once: the doorbell caches its answer against (eph_pk, challenge) so
+ # a retry and a LAN replay are the same request.
+ ("the doorbell hands the job over on every fetch", "gs_doorbell",
+  "        cached = self._issued.get((eph, chal))\n"
+  "        if cached is not None:\n"
+  '            self.events.append("m1_retry")\n'
+  "            return cached",
+  "        pass",
+  ["test_wake_doorbell"]),
+
+ # The doorbell may learn a 4-hex label and nothing else.
+ ("the doorbell accepts any handle length", "gs_doorbell",
+  '        if status == "done":\n'
+  "            if not proto.HANDLE_RE.match(handle):",
+  "        if False:\n"
+  "            if not proto.HANDLE_RE.match(handle):",
+  ["test_wake_doorbell"]),
+
  # time.monotonic() is seconds since BOOT on Linux, so a rate-limiter starting
  # at 0.0 asks "is this host older than ten minutes?" instead of "have I
  # reported yet?" -- and suppresses the FIRST "an entry address could not be
