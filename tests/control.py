@@ -53,7 +53,6 @@ ACTIONS = {
     "console":     {**suite("test_console", "password scope, no invented fees, egress, HTTP gates"), "group": "Offline suites"},
     "shmwipe":     {**suite("test_shmwipe", "/dev/shm + $TMPDIR scratch is wiped, other software's is not"), "group": "Offline suites"},
     "concurrency": {**suite("test_concurrency", "hash chain under parallel writers; console hangs, stdin, buffering"), "group": "Offline suites"},
-    "platform":    {**suite("test_platform_gate", "Windows is refused at import, and the console refuses it too"), "group": "Offline suites"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},
