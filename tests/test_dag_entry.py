@@ -1136,6 +1136,166 @@ check("hop: ...and A0 really is unfundable (the fixture bites)",
       ghost.compute_hop_amount(Decimal("0.0001"), Decimal("0.0024"))
       <= ghost.DUST_XMR)
 
+# ...AND THE SAME-CHUNK MERGE, which the assertion above deliberately did not
+# cover and which the docstring called "harmless -- both outputs are the same
+# money". It is not harmless under --peel: a peeling chain creates its outputs
+# in SEPARATE transactions precisely so no public transaction groups them, and
+# one merged exit sweep groups two of them again.
+#
+# A hop is a sweep_all and the whole round is CREATED before any of it is
+# broadcast, so a target that hops ends holding exactly the output it received.
+# A target that does NOT hop keeps its own AND takes delivery -- two outputs on
+# one subaddress, which _funded_subaddresses returns as one row and the exit
+# sweeps in ONE multi-input transaction.
+#
+# Driven before the fix, single chunk, one unfundable output among ten:
+# 275 of 300 planned rounds routed a hop onto it. 0 of 300 with every output
+# fundable, which is what makes it this defect and not noise.
+def _merges(by_addr, slices, trials=60):
+    _bad = 0
+    for _ in range(trials):
+        _pl = _hop_plan(by_addr, slices)
+        _hs = {t["src"] for t in _pl}          # these sweep themselves empty
+        if any(t["dst"] not in _hs for t in _pl):
+            _bad += 1
+    return _bad
+
+_ONE = [list(_ALL)]
+check("hop: an output that cannot fund a hop is never PAID one either — it "
+      "would keep its own output and hold two",
+      _merges(_BY_DUST, _ONE) == 0)
+_BY_D3 = dict(_BY_OK)
+for _d in _ALL[:3]:
+    _BY_D3[_d] = Decimal("0.0001")
+check("hop: ...still true with three of them", _merges(_BY_D3, _ONE) == 0)
+check("hop: ...and inside one chunk of a split run",
+      _merges(_BY_DUST, [_CHUNK_A, _CHUNK_B]) == 0)
+check("hop: control — every output fundable, no merge either",
+      _merges(_BY_OK, _ONE) == 0)
+# NON-VACUITY: the fixture must actually make an output unhoppable, or the
+# checks above pass because nothing was ever at risk.
+check("hop: ...and the dust fixture really does remove a source from the round",
+      len(_hop_plan(_BY_DUST, _ONE)) == len(_ALL) - 1
+      and len(_hop_plan(_BY_OK, _ONE)) == len(_ALL))
+
+# THE MECHANISM, on its own. close_hop_cycles turns every path into a cycle, so
+# every address that receives also sends. Tested directly because the planner
+# only reaches some of its shapes by chance.
+_paths = {"a": "b", "b": "c", "c": "d"}          # one path, tail d
+_cl = ghost.close_hop_cycles(_paths, {"a", "b", "c", "d"})
+check("close_hop_cycles: a path becomes a cycle, so its tail hops too",
+      _cl == {"a": "b", "b": "c", "c": "d", "d": "a"})
+check("close_hop_cycles: ...and every destination is also a source",
+      all(_v in _cl for _v in _cl.values()))
+_cyc = {"a": "b", "b": "a"}
+check("close_hop_cycles: an existing cycle is left alone",
+      ghost.close_hop_cycles(_cyc, {"a", "b"}) == _cyc)
+check("close_hop_cycles: a tail that holds NOTHING is not made a source — its "
+      "sweep would be built before its only output arrives",
+      ghost.close_hop_cycles({"a": "b"}, {"a"}) == {"a": "b"})
+check("close_hop_cycles: two separate paths both close",
+      ghost.close_hop_cycles({"a": "b", "c": "d"}, set("abcd"))
+      == {"a": "b", "b": "a", "c": "d", "d": "c"})
+check("close_hop_cycles: it never gives an address two incoming hops",
+      len(set(ghost.close_hop_cycles(
+          {"a": "b", "b": "c", "d": "e"}, set("abcde")).values())) == 5)
+check("close_hop_cycles: nothing is dropped — closing only ADDS hops",
+      len(ghost.close_hop_cycles({"a": "b", "b": "c"}, set("abc"))) == 3)
+
+# THE OTHER DOOR: OVERLAPPING SLICES. dest_slices arrives as a parameter and
+# this function does not verify it partitions, so two groups can pick the same
+# address; the cross-call dedupe then DROPS one hop, and its source is left
+# holding its own output while somebody else is already hopping onto it.
+#
+# That is the same merge by a different route, and it needs no dust at all.
+# Driven with close_hop_cycles disabled: 62 of 150 plans merged.
+_OV = [_CHUNK_A + _CHUNK_B[:1], _CHUNK_B]        # one address in both slices
+_ov_merge = 0
+_ov_min = 99
+for _trial in range(60):
+    _po = _hop_plan(_BY_OK, _OV)
+    _ohs = {t["src"] for t in _po}
+    if any(t["dst"] not in _ohs for t in _po):
+        _ov_merge += 1
+    _ov_min = min(_ov_min, len(_po))
+check(f"hop: overlapping slices never leave a hop paying a non-hopper "
+      f"({_ov_merge} of 60 plans)", _ov_merge == 0)
+# ...and the repair is CLOSING the paths, not dropping the hops. With cycle
+# closing disabled the same fixture keeps as few as 4 of 8; with it, 7 or 8.
+check(f"hop: ...and it repairs them by closing the chain, not by dropping "
+      f"hops (worst plan kept {_ov_min} of {len(_ALL)})",
+      _ov_min >= len(_ALL) - 1)
+
+# THE BACKSTOP, exercised on its own. close_hop_cycles and the destination-pool
+# filter each close this independently, so a single-point mutation of either is
+# invisible -- which is what defence in depth means and also how a layer gets
+# quietly deleted. Neutering the repair here forces the backstop to be the one
+# holding the invariant.
+_real_close = ghost.close_hop_cycles
+ghost.close_hop_cycles = lambda d, m: dict(d)
+try:
+    _bs_merge = 0
+    _bs_fired = 0
+    for _trial in range(60):
+        _bo = io.StringIO()
+        with contextlib.redirect_stdout(_bo):
+            _pb = ghost.build_dag_plan(
+                _HA, Decimal("0.0024"), list(_ALL), _BY_OK,
+                ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod),
+                _ALL, _AI, _secretsmod, dest_slices=_OV)
+        _bhs = {t["src"] for t in _pb}
+        if any(t["dst"] not in _bhs for t in _pb):
+            _bs_merge += 1
+        if "is not sweeping its own output away" in _bo.getvalue():
+            _bs_fired += 1
+finally:
+    ghost.close_hop_cycles = _real_close
+check(f"hop: with the path repair disabled the BACKSTOP still admits no merge "
+      f"({_bs_merge} of 60)", _bs_merge == 0)
+check(f"hop: ...and it says so rather than dropping hops silently "
+      f"(reported in {_bs_fired} of 60)", _bs_fired > 0)
+
+# ORPHANS AND A DUST HOLDER TOGETHER. A source that belongs to no slice falls
+# to the orphan pass, whose pool is drawn from mix_targets directly -- so the
+# unfundable holder has to be filtered out there too, not only in the per-group
+# pools.
+_ORPH = list(_ALL) + ["Z0", "Z1"]
+_orph_ai2 = dict(_AI); _orph_ai2.update({"Z0": (91, 1), "Z1": (92, 1)})
+_orph_by2 = {a: Decimal("1") for a in _ORPH}
+_orph_by2[_ALL[0]] = Decimal("0.0001")           # a holder that cannot hop
+_od_merge = 0
+for _trial in range(40):
+    _dagj = ghost.build_dag_adjacency(_ALL, [], 2, _secretsmod)
+    _dagj.update({"Z0": list(_ALL), "Z1": list(_ALL)})
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pod = ghost.build_dag_plan(_HA, Decimal("0.0024"), _ORPH, _orph_by2,
+                                    _dagj, _ALL, _orph_ai2, _secretsmod,
+                                    dest_slices=[list(_ALL)])
+    _ohs2 = {t["src"] for t in _pod}
+    if any((t["dst"] in set(_ORPH) and t["dst"] not in _ohs2) for t in _pod):
+        _od_merge += 1
+check(f"hop: an orphan is never handed the one target that cannot hop "
+      f"({_od_merge} of 40)", _od_merge == 0)
+
+# EACH LAYER IS PINNED IN SOURCE. The three are individually redundant, so no
+# single-point mutation of any one of them changes an observable -- which is
+# exactly how one gets deleted as "dead". Named here so the deletion is a test
+# failure and the next reader has to argue with this comment first.
+from srcutil import code_only as _code_only_hp              # noqa: E402
+_dp_src = " ".join(_code_only_hp(os.path.join(REPO, "GhostSpiral")).split())
+check("hop: layer 1 — the per-group destination pool excludes unfundable "
+      "holders",
+      "_grp_pool = [d for d in _grp if d in _safe_dsts]" in _dp_src)
+check("hop: layer 1b — and so does the orphan pool",
+      "if d in _safe_dsts and d not in set(_dsts.values())]" in _dp_src)
+check("hop: layer 2 — paths are closed into cycles",
+      "_dsts = close_hop_cycles(_dsts, _holds_output & _fundable_set)"
+      in _dp_src)
+check("hop: layer 3 — the backstop runs to a FIXED POINT, because dropping "
+      "one hop can create the next merge",
+      "for _ in range(len(_dsts) + 1):" in _dp_src
+      and "if not _merge_dsts:" in _dp_src)
+
 # A SLICE OF ONE CANNOT HOP, and with several chunks and few wallets that is
 # most of them: a hop must leave its source and stay inside its chunk, so a
 # chunk holding one mix subaddress has nowhere legal to send it. The run must

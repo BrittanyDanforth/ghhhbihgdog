@@ -2657,20 +2657,22 @@ check("peel extras: control -- the flat schedule really does leave eight "
 # THE CHECK AND THE PLAN MUST USE THE SAME DRAW. Two draws would size the
 # affordability gate against one reserve schedule and build the transactions
 # against another, handing a carrier less than the plan assumed -- a strand,
-# with a passing gate in front of it.
+# with a passing gate in front of it. ONE call site, inside the gate itself.
 _pf_src2 = " ".join(code_only(os.path.join(REPO, "GhostSpiral")).split())
-check("peel extras: the planner draws them ONCE",
-      _pf_src2.count("peel_change_extras(max(0, fanout_count - 1)") == 1)
+check("peel extras: exactly one place draws them",
+      _pf_src2.count("peel_change_extras(") == 2)   # the def, and fit's call
+check("peel extras: ...and it is the affordability gate, which is the only "
+      "code that knows the slack",
+      "_ex = peel_change_extras(max(0, len(trial) - 1), hop_headroom, rng, "
+      "budget=cap - _flat_need)" in _pf_src2)
 # _peel_rng, NOT _secrets. `_secrets` is main()'s alias for the secrets
 # MODULE, and the module has no .random() -- passing it here raised
 # AttributeError on the first peel of a real chain while every offline test
 # passed, because they all inject a generator. Pinning the argument by name
 # is what makes that a test failure instead of a live one.
-check("peel extras: ...passes them to the affordability check",
-      "_peel_rng, _hop_fee, _extras)" in _pf_src2)
 check("peel extras: ...drawn from a GENERATOR, not the secrets module",
       "_peel_rng = _secrets.SystemRandom()" in _pf_src2
-      and "_hop_fee, _peel_rng)" in _pf_src2)
+      and "_peel_rng, _hop_fee)" in _pf_src2)
 check("peel extras: ...and passes the SAME list to the plan builder",
       "delay_window=_delay_window, extras=_extras)" in _pf_src2)
 check("peel extras: peel_forward_amounts forwards them to the reserves",
@@ -2691,18 +2693,125 @@ for _cb in ("0.5", "1", "2", "3", "5", "10", "20"):
         if not _ca:
             continue
 
-        def _verdict(ex):
+        # The FLAT verdict is what the schedule decided before the extras
+        # existed; the shipped gate must reach the same one every time.
+        def _flat_verdict():
+            _cap = _cB - _EXHR
+            for _fr in ghost.PEEL_BUDGET_FRACTIONS:
+                _t = (_ca if _fr is None else ghost.compute_fanout_amounts(
+                    _cu, len(_ca), Decimal("0.0024"), True, _ex_rng,
+                    spend_fraction=_fr))
+                if not _t:
+                    continue
+                if ghost.peel_entry_requirement(
+                        _t, ghost.peel_carrier_reserves(_t, _EXHR)) <= _cap:
+                    return str(_fr)
+            return "REFUSED"
+
+        def _verdict():
             try:
                 return str(ghost.fit_peel_distribution(
                     _ca, _cB, _cu, len(_ca), Decimal("0.0024"), True, _ex_rng,
-                    _EXHR, ex)[1])
+                    _EXHR)[1])
             except ghost.PeelBudgetError:
                 return "REFUSED"
-        if _verdict(None) != _verdict(
-                ghost.peel_change_extras(len(_ca) - 1, _EXHR, _ex_rng)):
-            _chg += 1
+        _fv = _flat_verdict()
+        for _ in range(8):
+            if _verdict() != _fv:
+                _chg += 1
 check(f"peel extras: cost nothing in affordability -- no setting changes "
       f"verdict ({_chg} changed)", _chg == 0)
+
+# THE BUDGET IS THE WHOLE POINT of the bound. An unbounded draw totalled
+# 0.14 XMR at 40 wallets and turned 3 plans in 40 into refusals.
+_over = 0
+for _n in (2, 5, 9, 19, 39, 59):
+    for _bt in (0, 1, _n * (_n - 1) // 2 - 1, _n * (_n - 1) // 2,
+                _n * (_n - 1), _n * 40):
+        _bud = ghost.DUST_XMR * Decimal(_bt)
+        _e = ghost.peel_change_extras(_n, _EXHR, _ex_rng, budget=_bud)
+        if not _e:
+            continue
+        if len(_e) != _n or len(set(_e)) != _n or min(_e) < 0 or sum(_e) > _bud:
+            _over += 1
+check(f"peel extras: a draw never exceeds the budget it was given, and is "
+      f"still distinct and non-negative inside it ({_over} violations)",
+      _over == 0)
+# The cheapest distinct set is 0,1,...,n-1 ticks; one tick less than that and
+# nothing distinct fits, so the draw must decline rather than overspend.
+_nn = 19
+_floor = ghost.DUST_XMR * Decimal(_nn * (_nn - 1) // 2)
+check("peel extras: declines when the budget cannot afford even the cheapest "
+      "distinct set",
+      ghost.peel_change_extras(_nn, _EXHR, _ex_rng,
+                               budget=_floor - ghost.DUST_XMR) == [])
+check("peel extras: ...and takes it when it exactly can",
+      len(ghost.peel_change_extras(_nn, _EXHR, _ex_rng, budget=_floor)) == _nn)
+# The caller must SAY SO when it falls back to the flat schedule, or the run
+# quietly ships the cluster the extras exist to break.
+check("peel extras: the planner reports an unaffordable spread",
+      "if not _extras and len(_fitted) > 2:" in _pf_src2
+      and "peel_change_spread_unaffordable" in _pf_src2)
+
+# ---------------------------------------------------------------------------
+# THE FAN-OUT FLOOR AND THE HOP TEST MUST AGREE, and they did not.
+#
+# min_each was hop_fee_reserve + DUST rounded up, and build_dag_plan called an
+# output unfundable at `compute_hop_amount(...) <= DUST_XMR` -- so an output
+# sitting exactly on the floor whose job is "every output can fund its hop"
+# could not fund one. Measured: 19/60 planned distributions at 0.2 XMR / 10
+# wallets contained at least one.
+_ff = Decimal("0.0024")
+check("hop floor: min_hop_fundable really can fund a hop",
+      ghost.hop_is_fundable(ghost.min_hop_fundable(_ff), _ff))
+check("hop floor: ...and is MINIMAL -- one tick less cannot",
+      not ghost.hop_is_fundable(ghost.min_hop_fundable(_ff) - ghost.DUST_XMR,
+                                _ff))
+check("hop floor: the old expression is the one that could not",
+      not ghost.hop_is_fundable(
+          (ghost.hop_fee_reserve(_ff) + ghost.DUST_XMR).quantize(
+              ghost.DUST_XMR, rounding=ghost.ROUND_UP), _ff))
+_unf = 0
+_drawn = 0
+for _fb in ("0.2", "0.5", "1", "2", "5", "12"):
+    for _fw in (10, 20, 40, 60):
+        _fu = ghost.compute_fee_budget(Decimal(_fb), _ff, _fw, deep=2)
+        if isinstance(_fu, tuple):
+            _fu = _fu[0]
+        if _fu <= 0:
+            continue
+        for _ in range(15):
+            _fa = ghost.compute_fanout_amounts(_fu, _fw, _ff, True, _ex_rng)
+            if not _fa:
+                continue
+            _drawn += 1
+            if any(not ghost.hop_is_fundable(_x, _ff) for _x in _fa):
+                _unf += 1
+check(f"hop floor: no fan-out draw produces an output the hop round calls "
+      f"unfundable ({_unf} of {_drawn} draws)", _drawn > 0 and _unf == 0)
+check("hop floor: build_dag_plan asks the shared predicate, not its own "
+      "inequality",
+      "if not hop_is_fundable(fanout_by_addr[s], fee_xmr):" in _pf_src2
+      and "min_each = (min_hop_fundable(fee_xmr) if dag_enabled" in _pf_src2)
+# The closed form in min_hop_fundable is an INVERSION of compute_hop_amount,
+# and an inversion is a copy -- the copy this replaced drifted by one tick. The
+# re-check makes them agree by construction; it is correct today, so no fee
+# makes the loop run, and no behavioural test can see it removed. Pinned by
+# name so deleting it is a failure rather than a silent return to a bare copy.
+check("hop floor: min_hop_fundable checks its own answer against the predicate",
+      "for _ in range(4): if hop_is_fundable(amt, fee_xmr): return amt "
+      "amt += DUST_XMR" in _pf_src2)
+_bad_fee = 0
+for _fx in ("0.00001", "0.00008", "0.0001", "0.0007", "0.0024", "0.01", "0.05",
+            "0.13", "1.7"):
+    _fd = Decimal(_fx)
+    _m = ghost.min_hop_fundable(_fd)
+    if (not ghost.hop_is_fundable(_m, _fd)
+            or ghost.hop_is_fundable(_m - ghost.DUST_XMR, _fd)
+            or _m != _m.quantize(ghost.DUST_XMR)):
+        _bad_fee += 1
+check(f"hop floor: minimal and fundable at every fee tried ({_bad_fee} bad)",
+      _bad_fee == 0)
 
 # THE INVARIANT. Walk the chain the way the daemon will and assert every hop
 # is constructible: each carrier must receive at least what its peel spends

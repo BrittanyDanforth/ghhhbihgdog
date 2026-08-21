@@ -557,6 +557,58 @@ def hop_fee_reserve(fee_xmr: Decimal) -> Decimal:
     return fee_xmr * FEE_SAFETY_MARGIN
 
 
+def hop_is_fundable(fanout_amt: Decimal, fee_xmr: Decimal) -> bool:
+    """Can this output pay for a hop of its own? ONE predicate, TWO callers.
+
+    build_dag_plan decides whether an output hops, and compute_fanout_amounts
+    picks a floor that is supposed to guarantee every output it produces can.
+    They were two separate expressions of the same rule, and they DISAGREED BY
+    ONE TICK.
+
+        min_each          = hop_fee_reserve + DUST          = 0.0037   (fee 0.0024)
+        compute_hop_amount(0.0037)                          = 0.0001
+        the hop test                    amount <= DUST_XMR  -> UNFUNDABLE
+
+    So an output sitting exactly on the fan-out's own floor was rejected by the
+    round the floor exists to guarantee. Measured over 60 planned distributions
+    per setting: 19/60 at 0.2 XMR / 10 wallets, 12/60 at 1 XMR / 40, 12/60 at
+    2 XMR / 60. The comment above min_each even says "rounding it down could
+    leave an output a tick short of funding its hop" -- it was rounded up, and
+    the value it rounded up from was already a tick short.
+
+    Two costs, and the second is the one that matters. The output silently
+    skips the second mixing round, which is depth the operator paid for and
+    did not get. AND, before the destination-pool fix in build_dag_plan, a
+    non-hopping output was still a legal hop DESTINATION -- so it kept its own
+    output, took delivery of another, and the exit's per-subaddress sweep_all
+    spent BOTH IN ONE TRANSACTION. Measured: with one unfundable output among
+    ten, 275 of 300 planned rounds put a hop onto it.
+
+    A predicate rather than two inequalities, so the next reader changing one
+    changes both.
+    """
+    return compute_hop_amount(fanout_amt, fee_xmr) > DUST_XMR
+
+
+def min_hop_fundable(fee_xmr: Decimal) -> Decimal:
+    """The smallest DUST-grid amount hop_is_fundable() accepts.
+
+    DERIVED, THEN CHECKED AGAINST THE PREDICATE ITSELF. The closed form is an
+    inversion of compute_hop_amount, and an inversion is a copy -- the last
+    copy drifted by exactly one tick (see hop_is_fundable). Stepping until the
+    predicate agrees costs at most a tick or two, because compute_hop_amount
+    rises by exactly one tick for each tick added, and it makes the two
+    functions agree BY CONSTRUCTION rather than by comment.
+    """
+    amt = (hop_fee_reserve(fee_xmr) + DUST_XMR * 2).quantize(
+        DUST_XMR, rounding=ROUND_UP)
+    for _ in range(4):
+        if hop_is_fundable(amt, fee_xmr):
+            return amt
+        amt += DUST_XMR
+    return amt
+
+
 def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
     """Per-destination fan-out amount.
 
@@ -617,11 +669,13 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     # change to sweep, not more safety margin.
     budget = usable * (FANOUT_SPEND_FRACTION if spend_fraction is None
                        else spend_fraction)
-    min_each = (hop_fee_reserve(fee_xmr) + DUST_XMR) if dag_enabled else (DUST_XMR * 2)
-    # Round the floor UP so every output is genuinely at least min_each after
-    # quantisation -- rounding it down could leave an output a tick short of
-    # funding its hop.
-    min_each = min_each.quantize(DUST_XMR, rounding=ROUND_UP)
+    # min_hop_fundable, NOT a second spelling of the rule. This was
+    # `hop_fee_reserve(fee_xmr) + DUST_XMR` rounded up, which is exactly one
+    # tick BELOW what build_dag_plan's fundability test accepts -- so the floor
+    # whose entire job is "no hop later fails" produced outputs that could not
+    # hop at all. See hop_is_fundable for the measurements.
+    min_each = (min_hop_fundable(fee_xmr) if dag_enabled
+                else (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP))
     floor_total = min_each * Decimal(fanout_count)
     if budget < floor_total:
         return []                       # cannot fund this many viable outputs
@@ -1148,7 +1202,7 @@ def split_btc_amount(total: Decimal, n: int, rng) -> list:
 
 
 def peel_change_extras(n_carriers: int, hop_headroom: Decimal, rng,
-                       dust: Decimal = DUST_XMR) -> list:
+                       dust: Decimal = DUST_XMR, budget: Decimal = None) -> list:
     """Per-carrier EXTRA reserve, so no two peels leave the same change.
 
     WHY THIS HAS TO EXIST. A peel spends its carrier, sends one destination its
@@ -1193,13 +1247,31 @@ def peel_change_extras(n_carriers: int, hop_headroom: Decimal, rng,
         peel constructible, and violating it strands funds mid-chain -- the
         failure peel_carrier_reserves exists to prevent. Non-negative extras
         can only ever leave MORE headroom than the flat schedule, never less.
-      * BOUNDED AS A FRACTION OF hop_headroom, so the cost does not grow
-        without limit with --wallets. The extras are reserve, not fee: they are
-        not lost, they simply arrive as change instead of being distributed --
-        but they do count against the affordability gate, so a large spread
-        would start refusing runs that used to fit.
+      * WITHIN `budget`, when one is given. The extras are reserve, not fee:
+        they are not lost, they simply arrive as change instead of being
+        distributed -- but they DO count against the affordability gate.
+        Measured before this bound existed: at 2 XMR / 40 wallets a draw
+        totalled 0.14 XMR, and 3 draws in 40 turned a plan the flat schedule
+        accepted into a refusal. A refused run is not a safe default: the
+        operator's alternative to it is not running at all.
 
-    Returns n_carriers extras. Empty for a chain with no carriers.
+        So the caller passes the slack the trial actually has and the span is
+        capped so the WORST case fits. The n largest ticks in a pool of `span`
+        sum to n*span - n(n+1)/2, so
+
+            span <= budget_ticks / n + (n + 1) / 2
+
+        guarantees it, and at span == n_carriers the cost is the theoretical
+        minimum for n distinct non-negative multiples of dust, n(n-1)/2 ticks.
+        Below that, distinctness is unaffordable and this returns [] -- the
+        caller then takes the flat schedule for that trial, or moves to a
+        smaller distribution where the spread does fit. At every balance and
+        --wallets setting measured the cap lands well above n_carriers (62 vs
+        39 at the tightest), so the draw stays a sample rather than a
+        permutation.
+
+    Returns n_carriers extras, or [] when the budget cannot afford a distinct
+    set. Empty for a chain with no carriers.
     """
     if n_carriers <= 0:
         return []
@@ -1207,6 +1279,18 @@ def peel_change_extras(n_carriers: int, hop_headroom: Decimal, rng,
     # permutation), and at least a quarter of the headroom expressed in ticks
     # (so the spread is a visible fraction of the value being varied).
     span = max(n_carriers * 2, int(hop_headroom / dust / 4), 8)
+    if budget is not None:
+        # THE WORST CASE, not the average. The draw is random, so bounding the
+        # expected total would still refuse a run whenever the draw came in
+        # high -- which is the failure this cap exists to remove, arrived at
+        # less often. Integer arithmetic throughout, and every division
+        # truncates DOWNWARD, so the bound is conservative by construction.
+        _bt = int(budget / dust)
+        if _bt < 0:
+            return []
+        span = min(span, _bt // n_carriers + (n_carriers + 1) // 2)
+        if span < n_carriers:
+            return []               # cannot be distinct inside this budget
     # PARTIAL FISHER-YATES over rng.random(), NOT rng.sample().
     #
     # rng.sample exists on random.Random and on secrets.SystemRandom, and not
@@ -1330,8 +1414,7 @@ class PeelBudgetError(Exception):
 
 def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
                           fanout_count: int, fee_xmr: Decimal,
-                          dag_enabled: bool, rng, hop_headroom: Decimal,
-                          extras: list = None):
+                          dag_enabled: bool, rng, hop_headroom: Decimal):
     """Shrink the distribution until peel 0 is affordable. Returns (amounts, frac).
 
     A PEEL CHAIN CANNOT DISTRIBUTE AS MUCH AS A FAN-OUT, and the planner has to
@@ -1352,10 +1435,21 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     talk to the operator. Raises PeelBudgetError when nothing fits, so the
     caller fails BEFORE any money moves.
 
-    Returns (amounts, frac, extras). The EXTRAS come back because the plan must
-    be built from the identical list this affordability check used: they raise
-    every carrier's reserve, so a plan built from a different draw would hand
-    the carrier less than the check assumed and strand the chain part-way.
+    Returns (amounts, frac, extras). THE EXTRAS ARE DRAWN HERE, not passed in,
+    for two reasons that the previous arrangement got wrong in both directions:
+
+      * The plan must be built from the IDENTICAL list this check used. They
+        raise every carrier's reserve, so a plan built from a different draw
+        would hand the carrier less than the check assumed and strand the
+        chain part-way. Returning them is the only way the caller can be
+        holding the same list; drawing them at the call site and passing them
+        in left two draws one edit apart.
+      * A draw made before this function runs cannot know how much slack the
+        trial has, so it could not be bounded by it -- and an unbounded draw
+        turns plans the flat schedule accepts into refusals. Here the slack is
+        known exactly: the requirement grows by precisely sum(extras), so
+        drawing inside that slack makes the affordability verdict IDENTICAL to
+        the flat schedule's, by construction rather than by measurement.
     """
     # Peel 0 spends from ENTRY and needs the same per-hop headroom as every
     # later hop, so it comes off the balance before anything is distributed.
@@ -1366,16 +1460,24 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
             spend_fraction=frac))
         if not trial:
             continue
-        # THE EXTRAS ARE PART OF THE REQUIREMENT. They raise every reserve, so
-        # checking affordability without them would clear a chain the plan
-        # then cannot build -- the gate passing in front of the strand it
-        # exists to prevent. A shrunk trial has its own length, so its extras
-        # are re-cut to match rather than reused at the wrong size.
-        _ex = (extras if (extras and len(extras) == max(0, len(trial) - 1))
-               else peel_change_extras(max(0, len(trial) - 1), hop_headroom, rng))
+        # THE FLAT SCHEDULE DECIDES AFFORDABILITY. Whether this trial can run
+        # at all must not depend on a random draw, or the same balance and the
+        # same settings would sometimes run and sometimes refuse.
+        _flat_need = peel_entry_requirement(
+            trial, peel_carrier_reserves(trial, hop_headroom))
+        if _flat_need > cap:
+            continue
+        # ...and the extras then spend the slack this trial actually has.
+        # peel_entry_requirement is sum(amounts) + reserves[0], and
+        # reserves[0] is the flat reserve plus sum(extras) exactly, so a draw
+        # bounded by the slack can never push the trial over the cap. The
+        # re-check below is belt and braces, not the argument.
+        _ex = peel_change_extras(max(0, len(trial) - 1), hop_headroom, rng,
+                                 budget=cap - _flat_need)
         reserves = peel_carrier_reserves(trial, hop_headroom, _ex)
         if peel_entry_requirement(trial, reserves) <= cap:
             return trial, frac, _ex
+        return trial, frac, []
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
@@ -4172,6 +4274,87 @@ def assign_hop_destinations(sources: list, dag: dict, mix_targets: list,
     return assigned
 
 
+def close_hop_cycles(dsts: dict, must_hop) -> dict:
+    """Make every hop destination a hop SOURCE too, by closing paths into cycles.
+
+    THE MERGE THIS EXISTS TO PREVENT. A hop is a sweep_all, and every hop in a
+    round is CREATED before any is broadcast -- so a target that hops sends its
+    own output away and ends holding exactly the one it received. A target that
+    does NOT hop keeps its own output AND takes delivery, so that subaddress
+    holds TWO. The exit issues one sweep_all per funded subaddress
+    (_funded_subaddresses), so those two leave in ONE MULTI-INPUT TRANSACTION
+    -- the permanent, ring-independent proof of common ownership that
+    create_subs gives every output its own account to make "IMPOSSIBLE rather
+    than merely discouraged", and that _run_change_sweeps pays ~0.005 XMR in
+    extra fees to avoid.
+
+    Measured on the shipped planner with one unfundable output among ten:
+    275 of 300 planned rounds routed a hop onto it, against 0 of 300 with every
+    output fundable. With overlapping dest_slices -- the other door, where the
+    cross-call dedupe drops a hop and leaves its source holding its own output
+    -- 62 of 150 rounds merged without this function.
+
+    build_dag_plan's docstring already described this and called it "harmless"
+    when all the value is one swap chunk, so the only guard added was the
+    per-chunk restriction. It is not harmless under --peel: the whole point of
+    a peeling chain is that the distribution outputs are NOT co-created, so
+    there is no public transaction already grouping them -- and one merged
+    sweep re-groups two of them, on the setting whose help text calls itself
+    "Strongest unlinkability".
+
+    HOW. assign_hop_destinations returns a partial INJECTIVE map, so the hop
+    graph is a disjoint union of simple paths and cycles. A cycle is already
+    safe: every node on it hops. A path is not: its tail receives and never
+    hops. Closing tail -> head turns the path into a cycle, which
+
+      * keeps every hop already planned rather than dropping any (a dropped
+        hop is mixing depth the operator paid for),
+      * ADDS one, for the tail that was not hopping at all,
+      * cannot break the per-chunk rule, because in-degree is at most one so a
+        path's nodes are reached only through its own group's edges, and
+      * cannot break injectivity, because the head had in-degree zero -- that
+        is what made it the head.
+
+    The tail always differs from the head: the tail has a predecessor, and a
+    node on a path cannot reach itself.
+
+    ONLY TAILS IN `must_hop` ARE CLOSED, and that set is the addresses holding
+    an output of their OWN -- the distribution's targets. An address holding
+    nothing is already safe as a destination (it ends the round with exactly
+    the one output it received) and must NOT be made a source: every hop in a
+    round is created before any is broadcast, so a sweep_all built for an
+    address whose only output has not arrived yet would find nothing to sweep.
+    Callers must also keep unfundable holders out of the destination pool; a
+    tail that holds an output and cannot fund a hop cannot be closed, so its
+    incoming edge is dropped instead and the caller reports it.
+    """
+    out = dict(dsts)
+    _must = set(must_hop)
+    # Bounded by the number of paths, and each pass closes one. The explicit
+    # bound is a backstop, not the termination argument.
+    for _ in range(len(out) + 1):
+        _rev = {}
+        for _k, _v in out.items():
+            _rev[_v] = _k
+        _tails = sorted(d for d in _rev if d not in out and d in _must)
+        if not _tails:
+            return out
+        _d = _tails[0]
+        _head = _d
+        _seen = {_head}
+        while _head in _rev and _rev[_head] not in _seen:
+            _head = _rev[_head]
+            _seen.add(_head)
+        if _head == _d or _head in _rev:
+            # Unreachable on the shipped path (a tail always has a predecessor,
+            # and the walk stops at a node with none). Drop rather than build a
+            # second in-edge, which is the merge this function exists to stop.
+            del out[_rev[_d]]
+            continue
+        out[_d] = _head
+    return out
+
+
 def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                    mix_targets, addr_index, _secrets,
                    delay_window=None, dest_slices=None) -> list:
@@ -4242,7 +4425,7 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
         _unfundable = 0
         _fundable = []
         for s in hop_sources:
-            if compute_hop_amount(fanout_by_addr[s], fee_xmr) <= DUST_XMR:
+            if not hop_is_fundable(fanout_by_addr[s], fee_xmr):
                 _unfundable += 1
                 continue
             _fundable.append(s)
@@ -4263,6 +4446,22 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
         # So the leftovers are collected into their own group over the targets
         # no slice claimed. With dest_slices absent that group is EVERYTHING,
         # which is the behaviour this had before chunks existed.
+        # NO ADDRESS MAY END THE ROUND HOLDING TWO OUTPUTS.
+        #
+        # After the round an address holds its OWN distribution output (unless
+        # it hopped it away) plus any arrival. Two of those on one subaddress
+        # is one multi-input exit transaction -- see close_hop_cycles.
+        #
+        # So a destination is safe when it holds nothing of its own, OR when it
+        # will sweep what it holds away. An UNFUNDABLE HOLDER is neither: it
+        # can never hop, so paying it always merges. That is the first of the
+        # two doors; the second -- a fundable holder that greedy leaves with no
+        # destination of its own -- is closed by close_hop_cycles below, once
+        # the assignment is known.
+        _fundable_set = set(_fundable)
+        _holds_output = set(hop_sources_real)
+        _safe_dsts = {d for d in mix_targets
+                      if d not in _holds_output or d in _fundable_set}
         _claimed = {d for sl in _slices for d in sl}
         _residual = [d for d in mix_targets if d not in _claimed]
         _groups = _slices + ([_residual] if _residual else [])
@@ -4279,9 +4478,10 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
             _placed.update(_grp_srcs)
             # The adjacency is restricted to this group too, or the graph
             # fallback would reach across it and undo the point.
-            _grp_dag = {k: [d for d in v if d in _grp_set]
+            _grp_pool = [d for d in _grp if d in _safe_dsts]
+            _grp_dag = {k: [d for d in v if d in _grp_set and d in _safe_dsts]
                         for k, v in dag.items() if k in _grp_set}
-            _dsts.update(assign_hop_destinations(_grp_srcs, _grp_dag, _grp,
+            _dsts.update(assign_hop_destinations(_grp_srcs, _grp_dag, _grp_pool,
                                                  _secrets))
         # A source in NO group at all (a caller whose slices and mix_targets
         # disagree) would otherwise never hop and never be reported. Give it
@@ -4305,7 +4505,8 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
             # destination would cost the no-merge guarantee". An orphan with
             # nowhere legal to go now falls into _unassigned, which already
             # reports exactly that.
-            _free = [d for d in mix_targets if d not in set(_dsts.values())]
+            _free = [d for d in mix_targets
+                     if d in _safe_dsts and d not in set(_dsts.values())]
             _free_dag = {k: [d for d in v if d in set(_free)]
                          for k, v in dag.items()}
             _dsts.update(assign_hop_destinations(_orphans, _free_dag, _free,
@@ -4340,6 +4541,40 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
                   f"from two swap chunks on it, and the exit spends a "
                   f"subaddress in ONE transaction — which is the merge this "
                   f"run's whole structure exists to prevent.")
+        # SECOND DOOR: a fundable source that greedy left without a
+        # destination still RECEIVES one, and then holds two outputs. Closing
+        # each path into a cycle gives it a hop of its own instead of dropping
+        # somebody else's. See close_hop_cycles.
+        _pre_close = len(_dsts)
+        _dsts = close_hop_cycles(_dsts, _holds_output & _fundable_set)
+        if len(_dsts) > _pre_close:
+            integrity_log("stage4", "dag_paths_closed")
+        # CHECKED, NOT ASSUMED. Every destination must also be a source, or
+        # some subaddress ends the round holding two outputs and the exit
+        # spends them together. Cheap, and it is the invariant the exit's
+        # one-transaction-per-subaddress rule rests on.
+        # TO A FIXED POINT, not one pass. Dropping s -> d makes S itself a
+        # non-hopper, so if anything was hopping onto s that is a NEW merge --
+        # and a single sweep left it in place. Driven with overlapping slices
+        # and close_hop_cycles disabled: one pass still merged 62 of 150 plans
+        # while reporting that it had cleaned them up. Each pass strictly
+        # shrinks _dsts, so the loop terminates; the bound is a backstop.
+        _dropped = 0
+        for _ in range(len(_dsts) + 1):
+            _merge_dsts = {d for d in set(_dsts.values())
+                           if d in _holds_output and d not in _dsts}
+            if not _merge_dsts:
+                break
+            for _ms in [_s for _s, _d in _dsts.items() if _d in _merge_dsts]:
+                del _dsts[_ms]
+                _dropped += 1
+        if _dropped:
+            integrity_log("stage4", f"dag_merge_hops_dropped:{_dropped}")
+            print(f"  [!] {_dropped} hop(s) would have paid an address "
+                  f"that is not sweeping its own output away, leaving two "
+                  f"outputs on one subaddress — and the exit spends a "
+                  f"subaddress in ONE transaction, which proves they share an "
+                  f"owner. Those hops were DROPPED.")
         _unassigned = [s for s in _fundable if s not in _dsts]
         # A SLICE OF ONE CANNOT HOP AT ALL, and with several chunks and few
         # wallets that is most of them. A hop's destination must differ from
@@ -5726,16 +5961,15 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # chain. Same family as this file's other rng trap, recorded in
         # hop_delay: "secrets.randbelow, NOT secrets.SystemRandom().randbelow".
         _peel_rng = _secrets.SystemRandom()
-        # ONE draw of the per-carrier extras, used by the affordability check
-        # AND by the plan. Two draws would check one reserve schedule and build
-        # another. See peel_change_extras.
-        _extras = peel_change_extras(max(0, fanout_count - 1), _hop_fee,
-                                     _peel_rng)
+        # THE EXTRAS ARE DRAWN INSIDE fit_peel_distribution and come back with
+        # the fitted amounts. They used to be drawn here and passed in, which
+        # meant the draw could not be bounded by the slack the trial turned out
+        # to have -- and an unbounded draw refused plans the flat schedule
+        # accepted. One draw, in the one place that knows the budget.
         try:
             _fitted, _frac, _extras = fit_peel_distribution(
                 _peel_amounts, bal, usable, fanout_count, fee_xmr,
-                bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee,
-                _extras)
+                bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee)
         except PeelBudgetError as _pbe:
             integrity_log("stage4", "peel_refused:unaffordable")
             sys.exit(
@@ -5759,6 +5993,31 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                 f"    Use fewer --wallets, drop --peel for the fan-out "
                 f"distribution, or fund\n"
                 f"    the wallet more.")
+        # THE SPREAD DID NOT FIT, and that is not something to swallow.
+        #
+        # peel_change_extras returns [] when the slack cannot pay for even the
+        # cheapest distinct set (n(n-1)/2 ticks). The chain then falls back to
+        # the FLAT reserve schedule, which is the equal-value cluster the
+        # extras exist to break -- every carrier leaving the identical change.
+        # Taking a smaller distribution to buy the spread would be the worse
+        # trade: the undistributed remainder stays on ENTRY, the one address a
+        # public swap memo already names.
+        #
+        # Reached at extreme output counts only: 59 carriers need 0.1711 XMR of
+        # slack for distinct changes, and at 5 XMR / 60 wallets there is not
+        # that much. Measured across 1250 draws over nine balances and six
+        # wallet counts, this is the only setting that hits it.
+        if not _extras and len(_fitted) > 2:
+            integrity_log("stage4", "peel_change_spread_unaffordable")
+            print(f"  [!] This chain's {len(_fitted) - 1} carriers will each "
+                  f"leave the SAME change (about {_hop_fee} XMR minus the "
+                  f"fee): there is not enough slack to vary them.")
+            print(f"      Those become {len(_fitted) - 1} near-identical "
+                  f"arrivals at your exit address, which is a cluster anyone "
+                  f"watching it can group — and the value is 12x the going "
+                  f"fee, which is a published constant of this tool.")
+            print(f"      Fewer --wallets, or more balance, and the chain "
+                  f"varies them instead.")
         if _frac is not None:
             # SHRUNK, and said so. The operator asked to distribute a certain
             # amount and is getting less; the remainder stays on ENTRY rather
