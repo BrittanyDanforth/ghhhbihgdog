@@ -4089,7 +4089,15 @@ _r_round = ghost._run_round
 _r_res = ghost._change_residue
 _r_sdf = ghost.secure_delete_file
 _r_awj = ghost.atomic_write_json
+# The change sweep now passes the same two Tor gates as every other relay
+# (relay_gates -> newnym(required=True) + tor_recheck). Unstubbed, the required
+# rotation reaches a control socket that is not there and aborts the suite --
+# which is the gate doing its job; a test that drives the sweep offline has to
+# say so. tests/test_tor_gates.py drives the gate itself.
+_r_nn2, _r_tr2 = ghost.newnym, ghost.tor_recheck
 try:
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
     ghost._wait_for_change_settled = lambda *a, **k: (True, 5_000_000_000)
     ghost._run_round = lambda *a, **k: None
     ghost._change_residue = lambda *a, **k: 0
@@ -4118,6 +4126,7 @@ finally:
     ghost._change_residue = _r_res
     ghost.secure_delete_file = _r_sdf
     ghost.atomic_write_json = _r_awj
+    ghost.newnym, ghost.tor_recheck = _r_nn2, _r_tr2
 
 # The delay helper takes NO rng, so the wrong one cannot be handed to it again.
 import inspect as _insp
