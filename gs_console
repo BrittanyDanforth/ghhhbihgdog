@@ -38,6 +38,34 @@ import argparse, hmac, json, os, re, secrets, shlex, shutil, signal, subprocess,
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------------------------------------------------------------------
+#  Platform gate -- this file needs its OWN, and it is the one that matters
+# ---------------------------------------------------------------------------
+#: gs_common carries the real refusal, but this file deliberately does not
+#: import it (stdlib only, so it also runs on the air-gapped machine). That
+#: exemption is exactly what made Windows dangerous: with no gs_common import
+#: there was nothing to fail, so on Windows the console STARTED, printed its
+#: URL, served all five wizard steps, accepted the SPEND arm phrase and queued
+#: a run -- and only the CHILD died, on `import fcntl`, in a log the operator
+#: was not reading. A dashboard that looks like it is mixing and is not is the
+#: worst failure mode this toolchain has.
+#:
+#: So gate here too, and get the message by importing gs_common ON THE FAILING
+#: PATH ONLY -- its gate raises SystemExit with the full explanation. That way
+#: there is one copy of the text and it cannot drift, while POSIX runs still
+#: import nothing extra.
+if os.name != "posix":
+    try:
+        import gs_common  # noqa: F401  -- raises SystemExit with the real message
+    except ImportError:
+        pass
+    sys.exit(
+        f"[!] The GhostSpiral console requires Linux. Detected: os.name={os.name!r}.\n"
+        "    Refusing at startup rather than serving a dashboard whose every "
+        "action would\n"
+        "    fail in a child process. Run it under WSL2 or a Linux VM.")
+
 PY = sys.executable
 VENV_PY = os.environ.get("GS_VENV_PY", PY)
 ARM_PHRASE = "SPEND"

@@ -17,8 +17,74 @@ OPSEC design principles
 - Signal handlers for graceful shutdown on SIGINT/SIGTERM.
 """
 from __future__ import annotations
+import os, sys
+
+# ---------------------------------------------------------------------------
+#  Platform gate -- BEFORE the first Unix-only import, on purpose
+# ---------------------------------------------------------------------------
+#: This toolchain is POSIX-only, and it fails in the worst possible way if that
+#: is discovered late. On Windows the very next line raises
+#: `ModuleNotFoundError: No module named 'fcntl'` -- a traceback that names a
+#: module the operator has never heard of and says nothing about what to do.
+#: Worse, gs_console does not import this file, so on Windows the DASHBOARD
+#: STARTS, prints its URL, renders all five wizard steps and accepts the SPEND
+#: arm phrase; the failure only surfaces when the child process dies. An
+#: operator can therefore configure an entire run, believe it is under way, and
+#: have nothing happen at all.
+#:
+#: Four load-bearing guarantees have no Windows equivalent, so this is a real
+#: refusal and not a missing shim:
+#:   * fcntl.flock -- the integrity chain and the run lock are serialised with
+#:     it; without it two rounds can interleave and the hash chain forks;
+#:   * /proc/<pid>/environ is mode 0400 while /proc/<pid>/cmdline is 0444 --
+#:     that asymmetry is the entire reason the wallet password travels in the
+#:     environment. Windows exposes a process's environment block to any
+#:     process running as the same user, so the argv-vs-env distinction this
+#:     toolchain is built around simply does not hold there;
+#:   * /dev/shm -- the password file handed to monero-wallet-cli is staged on
+#:     tmpfs so it never reaches a physical disk. Windows has no tmpfs, so the
+#:     spend-key password would be written to a real, recoverable file;
+#:   * os.killpg + SIGTERM-then-SIGKILL -- the console's watchdog stops a run
+#:     by signalling the whole process group. Windows has no process groups in
+#:     this sense, so a stopped run would leave children alive holding plans.
+#:
+#: WSL2 is a real Linux kernel and satisfies all four; a Linux VM does too.
+if os.name != "posix":
+    sys.exit(
+        "[!] GhostSpiral requires Linux (or another POSIX system). Detected: "
+        f"os.name={os.name!r}, sys.platform={sys.platform!r}.\n"
+        "    NOTHING HAS RUN. This is a refusal at import, before any wallet, "
+        "network or file\n"
+        "    is touched.\n"
+        "\n"
+        "    This is not a missing shim. Four things the OPSEC design rests on "
+        "do not exist\n"
+        "    on Windows:\n"
+        "      * fcntl.flock -- serialises the integrity hash-chain; without it "
+        "the chain forks;\n"
+        "      * /proc/<pid>/environ being mode 0400 while cmdline is 0444 -- "
+        "the whole reason\n"
+        "        the wallet password travels in the environment instead of on "
+        "argv;\n"
+        "      * /dev/shm -- the spend-key password is staged on tmpfs so it "
+        "never reaches a\n"
+        "        physical disk. Windows would write it to a recoverable file;\n"
+        "      * process groups -- the console stops a run by signalling the "
+        "group; on Windows\n"
+        "        a stopped run would leave children alive holding plans.\n"
+        "\n"
+        "    Run it under WSL2 (a real Linux kernel) or a Linux VM:\n"
+        "        wsl --install -d Ubuntu       # in an Administrator PowerShell, then reboot\n"
+        "        wsl                           # from then on, this drops you into Linux\n"
+        "        sudo apt update && sudo apt install -y python3 python3-pip tor\n"
+        "    Then clone or copy this directory INSIDE the WSL filesystem (~/), "
+        "not under\n"
+        "    /mnt/c -- files on /mnt/c cannot hold 0600 permissions, so every "
+        "plan and key\n"
+        "    would be world-readable to Windows.")
+
 import argparse
-import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import contextlib, errno, fcntl, hashlib, json, re, secrets, shutil, signal, stat as stat_module, time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional
