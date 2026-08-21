@@ -777,6 +777,102 @@ check("control: ONE chunk with --peel is NOT refused by that check",
           (lambda: [_dist([("C0", 20, 1)], [["m0"]], {"m0": Decimal("1")},
                           peel=True)] and "")() or ""))
 
+# ==========================================================================
+# THE SINGLE-SOURCE PEEL PLANNER, DRIVEN WITH THE OBJECT PRODUCTION PASSES.
+#
+# Every peel test above either has SEVERAL sources -- which hits the
+# "--split with --peel" refusal before the planner runs -- or ONE source with
+# ONE destination, which needs zero carriers and so returns before touching
+# the rng. So the single-source, many-destination peel plan, the one a real
+# run builds, had NO offline coverage at all.
+#
+# That gap let a live crash through. build_distribution_plan receives
+# `_secrets`, which main() sets with `import secrets as _secrets` -- the
+# MODULE, not a generator. Every other user in that function writes
+# `_secrets.SystemRandom()` first. Code that called rng.random() on it died
+# with "module 'secrets' has no attribute 'random'" on the first peel of a
+# real chain, while every offline test passed, because the tests inject a real
+# SystemRandom or a stub.
+#
+# So this passes the MODULE, exactly as main() does.
+import secrets as _peel_secmod                                   # noqa: E402
+
+
+class _PeelRpc:
+    """Enough wallet for build_peel_stage_plan: fresh accounts and fresh
+    subaddresses, in the shapes gs_common's helpers actually require."""
+
+    def __init__(self):
+        self.n = 100
+
+    def raw_request(self, method, params=None):
+        if method == "create_account":
+            self.n += 1
+            return {"account_index": self.n,
+                    "address": f"ACCT{self.n}ADDR"}
+        return {}
+
+    def new_subaddress_indexed(self, account_index, label=""):
+        self.n += 1
+        return (f"CARRIER{self.n}", self.n)
+
+
+_pl_dests = [f"pm{i}" for i in range(6)]
+_pl_by = {d: Decimal("1") for d in _pl_dests}
+_pl_args = types.SimpleNamespace(peel=True, dag_mixing=True)
+_pl_err = None
+_pl_plan = _pl_mode = None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pl_plan, _pl_chg, _pl_mode = ghost.build_distribution_plan(
+            _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
+            _pl_dests, _pl_by, [_pl_dests], Decimal("0.0024"), 20,
+            len(_pl_dests), (0, 0), _peel_secmod, Decimal("50"),
+            Decimal("45"))
+except BaseException as _e:                                      # noqa: BLE001
+    _pl_err = f"{type(_e).__name__}: {_e}"
+check(f"peel planner: a single-source chain builds with the secrets MODULE, "
+      f"which is what main() passes ({_pl_err or 'no error'})",
+      _pl_err is None)
+check("peel planner: ...and produces one transaction per destination",
+      _pl_plan is not None and len(_pl_plan) == len(_pl_dests))
+check("peel planner: ...in peel mode", _pl_mode == "peel")
+
+# AND THE SHRINK PATH, which is the other half of the same hazard.
+#
+# fit_peel_distribution only touches the rng when the default distribution
+# does NOT fit: it then calls compute_fanout_amounts for a smaller fraction,
+# and that calls rng.random(). A comfortable balance never reaches it, so a
+# test that only covers the affordable case leaves the module hazard live on
+# exactly the runs that are tight enough to need shrinking. Verified: a
+# mutation restoring the module on the fit call alone survived until this
+# existed.
+#
+# The balance here is chosen from the arithmetic, not by eye: six 1 XMR
+# destinations need 6 + 5*headroom = 6.14400, and a 6.10 balance leaves a cap
+# of 6.07120, so the default distribution CANNOT fit and the shrink branch has
+# to run. A first attempt used 6.2, whose cap is 6.17120 -- it fits, the shrink
+# never ran, and the mutation this check exists for survived.
+_pl_tight_err = None
+_pl_tight_mode = None
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        _pt_plan, _pt_chg, _pl_tight_mode = ghost.build_distribution_plan(
+            _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
+            _pl_dests, _pl_by, [_pl_dests], Decimal("0.0024"), 20,
+            len(_pl_dests), (0, 0), _peel_secmod,
+            Decimal("6.10"), Decimal("6.0"))
+except SystemExit:
+    # A clean refusal is a legitimate outcome for a tight balance; what must
+    # not happen is an AttributeError from the rng.
+    _pl_tight_mode = "refused"
+except BaseException as _e:                                      # noqa: BLE001
+    _pl_tight_err = f"{type(_e).__name__}: {_e}"
+check(f"peel planner: the SHRINK path also survives the secrets module "
+      f"({_pl_tight_err or 'no error'})", _pl_tight_err is None)
+check("peel planner: ...and it either built or refused, never crashed",
+      _pl_tight_mode in ("peel", "refused"))
+
 # -- the budget follows the money -----------------------------------------
 _slices, _su, _amts, _bad = ghost.size_distribution(
     ["m0", "m1", "m2", "m3"], [Decimal("3"), Decimal("1")], Decimal("8"),

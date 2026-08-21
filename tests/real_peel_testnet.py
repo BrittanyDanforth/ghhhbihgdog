@@ -136,7 +136,7 @@ try:
     amounts = ghost.compute_fanout_amounts(usable, N, fee_xmr, False,
                                            random.Random(99))
     hop_fee = fee_xmr * ghost.FEE_SAFETY_MARGIN * ghost.PEEL_CARRIER_RESERVE_MULT
-    amounts, frac = ghost.fit_peel_distribution(amounts, bal, usable, N, fee_xmr,
+    amounts, frac, _pex = ghost.fit_peel_distribution(amounts, bal, usable, N, fee_xmr,
                                                 False, random.Random(99), hop_fee)
     check("the shipped planner funds this chain at the default distribution",
           frac is None)

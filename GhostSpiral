@@ -1147,7 +1147,87 @@ def split_btc_amount(total: Decimal, n: int, rng) -> list:
     return amounts
 
 
-def peel_carrier_reserves(amounts: list, hop_headroom: Decimal) -> list:
+def peel_change_extras(n_carriers: int, hop_headroom: Decimal, rng,
+                       dust: Decimal = DUST_XMR) -> list:
+    """Per-carrier EXTRA reserve, so no two peels leave the same change.
+
+    WHY THIS HAS TO EXIST. A peel spends its carrier, sends one destination its
+    amount and forwards the remainder to the next carrier; the fee is not known
+    when those amounts are chosen, so a remainder is unavoidable (the same
+    reason the DAG round uses sweep_all and this cannot). That remainder lands
+    on the carrier's subaddress 0, the change sweep moves it once, and the exit
+    withdraws it.
+
+    With flat reserves, reserve_i - reserve_{i+1} is exactly hop_headroom for
+    every i, so EVERY carrier leaves the identical change:
+
+        leftover_i = reserve_i - reserve_{i+1} - actual_fee
+                   = hop_headroom - actual_fee
+
+    Measured on a real chain, a --peel --dag-mixing run delivered these to the
+    exit address (XMR):
+
+        0.022543  0.022543  0.022544  0.022544  0.022544  0.022546
+
+    Six arrivals inside THREE PICONERO. Anyone watching that address sees one
+    batch. It is the equal-value cluster compute_fanout_amounts has a whole
+    distinctness staircase to prevent and split_btc_amount refuses outright to
+    produce -- arriving by a different door, on the setting whose help text
+    calls it "Strongest unlinkability".
+
+    Worse than equal: PREDICTABLE. hop_headroom is
+    fee * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT = fee * 12, from two
+    public constants. Under the Kerckhoffs standard this file applies
+    elsewhere, an analyst who knows the tool recognises "several outputs of
+    about twelve times the going fee" as its peel change.
+
+    THE FIX IS AN EXTRA PER CARRIER, and it has to be shaped carefully:
+
+      * DISTINCT, so the leftovers differ. That is the whole point.
+      * NOT CONSECUTIVE. A permutation of 0,1,2,...,n-2 ticks is distinct and
+        is an arithmetic sequence, which is a worse tell than equality. The
+        values are drawn from a population several times larger than the
+        number needed so they do not form one.
+      * NON-NEGATIVE, so reserve_i - reserve_{i+1} = hop_headroom + extras[i]
+        is never BELOW hop_headroom. That inequality is what makes the next
+        peel constructible, and violating it strands funds mid-chain -- the
+        failure peel_carrier_reserves exists to prevent. Non-negative extras
+        can only ever leave MORE headroom than the flat schedule, never less.
+      * BOUNDED AS A FRACTION OF hop_headroom, so the cost does not grow
+        without limit with --wallets. The extras are reserve, not fee: they are
+        not lost, they simply arrive as change instead of being distributed --
+        but they do count against the affordability gate, so a large spread
+        would start refusing runs that used to fit.
+
+    Returns n_carriers extras. Empty for a chain with no carriers.
+    """
+    if n_carriers <= 0:
+        return []
+    # Population: at least twice what we need (so the draw is a sample, not a
+    # permutation), and at least a quarter of the headroom expressed in ticks
+    # (so the spread is a visible fraction of the value being varied).
+    span = max(n_carriers * 2, int(hop_headroom / dust / 4), 8)
+    # PARTIAL FISHER-YATES over rng.random(), NOT rng.sample().
+    #
+    # rng.sample exists on random.Random and on secrets.SystemRandom, and not
+    # on the minimal rng stubs this codebase's own suites pass in -- the first
+    # version used it and killed test_units with AttributeError on the suite's
+    # `_R`. Every other rng consumer here sticks to random()/shuffle(), and
+    # this file has already been bitten once by assuming a method exists
+    # (secrets.SystemRandom().randbelow, which does not, and raised on every
+    # change sweep it built). Distinct by construction, terminating, and no
+    # method beyond random().
+    pool = list(range(span))
+    for i in range(n_carriers):
+        j = i + int(rng.random() * (span - i))
+        if j >= span:
+            j = span - 1
+        pool[i], pool[j] = pool[j], pool[i]
+    return [dust * Decimal(p) for p in pool[:n_carriers]]
+
+
+def peel_carrier_reserves(amounts: list, hop_headroom: Decimal,
+                          extras: list = None) -> list:
     """How much each carrier must keep so the NEXT peel is CONSTRUCTIBLE.
 
     Returns n-1 reserves, one per carrier. PURE, so the arithmetic that decides
@@ -1180,7 +1260,21 @@ def peel_carrier_reserves(amounts: list, hop_headroom: Decimal) -> list:
     n = len(amounts)
     if n <= 1:
         return []
-    return [hop_headroom * Decimal(n - 1 - i) for i in range(n - 1)]
+    if not extras:
+        return [hop_headroom * Decimal(n - 1 - i) for i in range(n - 1)]
+    # reserve_i = sum over k >= i of (hop_headroom + extras[k]).
+    #
+    # Written as a running total from the END so the invariant this schedule
+    # exists for is structural rather than asserted: consecutive reserves
+    # differ by hop_headroom + extras[i], and extras are non-negative, so the
+    # difference is NEVER below one headroom. That inequality is what makes
+    # peel i+1 constructible; breaking it strands funds on a carrier.
+    out = [Decimal(0)] * (n - 1)
+    run = Decimal(0)
+    for i in range(n - 2, -1, -1):
+        run += hop_headroom + extras[i]
+        out[i] = run
+    return out
 
 
 def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
@@ -1194,7 +1288,8 @@ def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
     return sum(amounts, Decimal(0)) + (reserves[0] if reserves else Decimal(0))
 
 
-def peel_forward_amounts(amounts: list, hop_headroom: Decimal) -> list:
+def peel_forward_amounts(amounts: list, hop_headroom: Decimal,
+                         extras: list = None) -> list:
     """What each peel hands to the NEXT carrier: the undistributed remainder
     plus that carrier's reserve. Returns n-1 values, one per carrier.
 
@@ -1208,7 +1303,11 @@ def peel_forward_amounts(amounts: list, hop_headroom: Decimal) -> list:
     n = len(amounts)
     if n <= 1:
         return []
-    reserves = peel_carrier_reserves(amounts, hop_headroom)
+    # THE SAME extras the affordability check used. If these two ever compute
+    # different reserves, the carrier is handed less than the plan assumed and
+    # the chain strands part-way -- which is why they are threaded from one
+    # place rather than each drawing their own.
+    reserves = peel_carrier_reserves(amounts, hop_headroom, extras)
     return [sum(amounts[i + 1:], Decimal(0)) + reserves[i] for i in range(n - 1)]
 
 
@@ -1231,7 +1330,8 @@ class PeelBudgetError(Exception):
 
 def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
                           fanout_count: int, fee_xmr: Decimal,
-                          dag_enabled: bool, rng, hop_headroom: Decimal):
+                          dag_enabled: bool, rng, hop_headroom: Decimal,
+                          extras: list = None):
     """Shrink the distribution until peel 0 is affordable. Returns (amounts, frac).
 
     A PEEL CHAIN CANNOT DISTRIBUTE AS MUCH AS A FAN-OUT, and the planner has to
@@ -1251,6 +1351,11 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     fraction that did -- the caller reports it rather than this deciding how to
     talk to the operator. Raises PeelBudgetError when nothing fits, so the
     caller fails BEFORE any money moves.
+
+    Returns (amounts, frac, extras). The EXTRAS come back because the plan must
+    be built from the identical list this affordability check used: they raise
+    every carrier's reserve, so a plan built from a different draw would hand
+    the carrier less than the check assumed and strand the chain part-way.
     """
     # Peel 0 spends from ENTRY and needs the same per-hop headroom as every
     # later hop, so it comes off the balance before anything is distributed.
@@ -1261,9 +1366,16 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
             spend_fraction=frac))
         if not trial:
             continue
-        reserves = peel_carrier_reserves(trial, hop_headroom)
+        # THE EXTRAS ARE PART OF THE REQUIREMENT. They raise every reserve, so
+        # checking affordability without them would clear a chain the plan
+        # then cannot build -- the gate passing in front of the strand it
+        # exists to prevent. A shrunk trial has its own length, so its extras
+        # are re-cut to match rather than reused at the wrong size.
+        _ex = (extras if (extras and len(extras) == max(0, len(trial) - 1))
+               else peel_change_extras(max(0, len(trial) - 1), hop_headroom, rng))
+        reserves = peel_carrier_reserves(trial, hop_headroom, _ex)
         if peel_entry_requirement(trial, reserves) <= cap:
-            return trial, frac
+            return trial, frac, _ex
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
@@ -1555,7 +1667,7 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
 def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
                           entry_index: int, dests: list,
                           amount_by_addr: dict, hop_fee: Decimal,
-                          delay_window=None):
+                          delay_window=None, extras: list = None):
     """Provision the peel chain's carriers and turn a peel plan into stage-5
     entries. Returns (plan, change_accounts).
 
@@ -1638,7 +1750,7 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
     core = build_peel_plan(
         entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
         carriers=carriers,
-        remainders=peel_forward_amounts(amounts, hop_fee))
+        remainders=peel_forward_amounts(amounts, hop_fee, extras))
     plan = []
     for p in core:
         # Peel 0 spends ENTRY, which lives in the mix account. Peel i>0 spends
@@ -5598,10 +5710,32 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # DEFAULT, on a 1 XMR balance (short by 0.12) and on 2 XMR (short by
         # 0.02).
         _peel_amounts = [fanout_by_addr[_a] for _a in fanout_dests]
+        # _secrets IS THE MODULE HERE, not a generator. main() does
+        # `import secrets as _secrets` and every other user in this function
+        # writes `_secrets.SystemRandom()` before drawing anything. Passing the
+        # module straight through gave
+        #
+        #     AttributeError: module 'secrets' has no attribute 'random'
+        #
+        # from inside peel_change_extras -- and fit_peel_distribution has the
+        # same hazard, because it hands rng to compute_fanout_amounts, which
+        # calls rng.random() whenever it has to shrink.
+        #
+        # Every offline test passed: they inject a real SystemRandom or a stub.
+        # Only running the pipeline found it, on the first peel of a real
+        # chain. Same family as this file's other rng trap, recorded in
+        # hop_delay: "secrets.randbelow, NOT secrets.SystemRandom().randbelow".
+        _peel_rng = _secrets.SystemRandom()
+        # ONE draw of the per-carrier extras, used by the affordability check
+        # AND by the plan. Two draws would check one reserve schedule and build
+        # another. See peel_change_extras.
+        _extras = peel_change_extras(max(0, fanout_count - 1), _hop_fee,
+                                     _peel_rng)
         try:
-            _fitted, _frac = fit_peel_distribution(
+            _fitted, _frac, _extras = fit_peel_distribution(
                 _peel_amounts, bal, usable, fanout_count, fee_xmr,
-                bool(getattr(args, "dag_mixing", False)), _secrets, _hop_fee)
+                bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee,
+                _extras)
         except PeelBudgetError as _pbe:
             integrity_log("stage4", "peel_refused:unaffordable")
             sys.exit(
@@ -5650,7 +5784,7 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         fanout_plan, change_accounts = build_peel_stage_plan(
             rpc_primary, _peel_acct, _peel_addr, _peel_idx,
             fanout_dests, fanout_by_addr,
-            _hop_fee, delay_window=_delay_window)
+            _hop_fee, delay_window=_delay_window, extras=_extras)
         integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
         print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
               f"(~{len(fanout_plan) * 20} min). Each output is created in its own "

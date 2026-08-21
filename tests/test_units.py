@@ -2568,6 +2568,142 @@ check("peel_entry_requirement: empty plan needs nothing",
 check("peel_entry_requirement: a lone destination needs only itself",
       ghost.peel_entry_requirement([Decimal("2")], []) == Decimal("2"))
 
+
+# ==========================================================================
+# EVERY PEEL LEFT THE IDENTICAL CHANGE, BY CONSTRUCTION.
+#
+# The reserves above are flat: reserve_i - reserve_(i+1) is exactly one
+# headroom for every i. A peel spends its carrier, pays one destination and
+# forwards the rest; the fee is not known when those amounts are chosen, so a
+# remainder is unavoidable, and that remainder is
+#
+#     leftover_i = reserve_i - reserve_(i+1) - actual_fee = headroom - fee
+#
+# which does not depend on i. Every carrier leaves the same change, the change
+# sweep moves it, and the exit delivers it. Measured on a real chain, a
+# --peel --dag-mixing run put these on the exit address (XMR):
+#
+#     0.022543  0.022543  0.022544  0.022544  0.022544  0.022546
+#
+# Six arrivals inside THREE PICONERO -- the equal-value cluster that
+# compute_fanout_amounts has a distinctness staircase to prevent and that
+# split_btc_amount refuses outright to produce, arriving by a different door on
+# the setting the help calls "Strongest unlinkability".
+#
+# And predictable, not merely equal: headroom is
+# fee * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT = fee * 12, both public
+# constants.
+# ==========================================================================
+_ex_rng = _secmod.SystemRandom()
+_EXHR = Decimal("0.0288")        # the real headroom at fee 0.0024
+
+
+def _gaps(res):
+    """reserve_i - reserve_(i+1); the leftover is this minus the actual fee,
+    so distinct gaps mean distinct change."""
+    return [res[i] - (res[i + 1] if i + 1 < len(res) else Decimal(0))
+            for i in range(len(res))]
+
+
+# THE OLD BEHAVIOUR IS EXACTLY PRESERVED when no extras are supplied. Every
+# check above still passes, and this states why that matters: the extras are
+# additive, and a caller that does not know about them gets the schedule it
+# always got.
+check("peel extras: no extras means the flat schedule, unchanged",
+      ghost.peel_carrier_reserves(_AMTS, _HR, None)
+      == ghost.peel_carrier_reserves(_AMTS, _HR))
+
+_bad_gap = _bad_distinct = _bad_neg = _seq = 0
+_spreads = []
+for _n in (2, 3, 5, 8, 12, 20, 40, 67):
+    for _ in range(120):
+        _a = [Decimal(1)] * _n
+        _e = ghost.peel_change_extras(_n - 1, _EXHR, _ex_rng)
+        if any(x < 0 for x in _e):
+            _bad_neg += 1
+        _r = ghost.peel_carrier_reserves(_a, _EXHR, _e)
+        _g = _gaps(_r)
+        # CONSTRUCTIBILITY. Every carrier must keep at least one full headroom
+        # more than the next, or peel i+1 cannot be built and the chain strands
+        # -- which is the failure peel_carrier_reserves exists to prevent.
+        if any(x < _EXHR for x in _g):
+            _bad_gap += 1
+        if len(set(_g)) != len(_g):
+            _bad_distinct += 1
+        if _n > 3:
+            _spreads.append(max(_g) - min(_g))
+        # NOT AN ARITHMETIC SEQUENCE. A permutation of 0,1,...,n-2 ticks is
+        # distinct and is a worse tell than equality.
+        _ticks = sorted(int(x / ghost.DUST_XMR) for x in _e)
+        if len(_ticks) > 3 and _ticks == list(range(len(_ticks))):
+            _seq += 1
+check("peel extras: never below one headroom, so no chain can strand "
+      f"({_bad_gap} violations)", _bad_gap == 0)
+check(f"peel extras: never negative ({_bad_neg} violations)", _bad_neg == 0)
+check(f"peel extras: every carrier leaves a DIFFERENT change "
+      f"({_bad_distinct} draws with a repeat)", _bad_distinct == 0)
+check(f"peel extras: ...and not as a 0,1,2,... sequence, which would be a "
+      f"worse tell than equality ({_seq} draws)", _seq == 0)
+check(f"peel extras: the leftovers actually spread "
+      f"(min spread {min(_spreads) if _spreads else 0})",
+      _spreads and min(_spreads) > Decimal(0))
+
+# NON-VACUITY: the FLAT schedule must fail the distinctness check, or the
+# check above is passing for some reason other than the fix.
+_flat_g = _gaps(ghost.peel_carrier_reserves([Decimal(1)] * 9, _EXHR))
+check("peel extras: control -- the flat schedule really does leave eight "
+      "identical changes", len(set(_flat_g)) == 1)
+
+# THE CHECK AND THE PLAN MUST USE THE SAME DRAW. Two draws would size the
+# affordability gate against one reserve schedule and build the transactions
+# against another, handing a carrier less than the plan assumed -- a strand,
+# with a passing gate in front of it.
+_pf_src2 = " ".join(code_only(os.path.join(REPO, "GhostSpiral")).split())
+check("peel extras: the planner draws them ONCE",
+      _pf_src2.count("peel_change_extras(max(0, fanout_count - 1)") == 1)
+# _peel_rng, NOT _secrets. `_secrets` is main()'s alias for the secrets
+# MODULE, and the module has no .random() -- passing it here raised
+# AttributeError on the first peel of a real chain while every offline test
+# passed, because they all inject a generator. Pinning the argument by name
+# is what makes that a test failure instead of a live one.
+check("peel extras: ...passes them to the affordability check",
+      "_peel_rng, _hop_fee, _extras)" in _pf_src2)
+check("peel extras: ...drawn from a GENERATOR, not the secrets module",
+      "_peel_rng = _secrets.SystemRandom()" in _pf_src2
+      and "_hop_fee, _peel_rng)" in _pf_src2)
+check("peel extras: ...and passes the SAME list to the plan builder",
+      "delay_window=_delay_window, extras=_extras)" in _pf_src2)
+check("peel extras: peel_forward_amounts forwards them to the reserves",
+      "peel_carrier_reserves(amounts, hop_headroom, extras)" in _pf_src2)
+
+# ...and adding them must not start refusing runs that used to fit.
+_chg = 0
+for _cb in ("0.5", "1", "2", "3", "5", "10", "20"):
+    for _cw in (5, 10, 20, 40):
+        _cB = Decimal(_cb)
+        _cu = ghost.compute_fee_budget(_cB, Decimal("0.0024"), _cw, deep=1)
+        if isinstance(_cu, tuple):
+            _cu = _cu[0]
+        if _cu <= 0:
+            continue
+        _ca = ghost.compute_fanout_amounts(_cu, _cw, Decimal("0.0024"), True,
+                                           _ex_rng)
+        if not _ca:
+            continue
+
+        def _verdict(ex):
+            try:
+                return str(ghost.fit_peel_distribution(
+                    _ca, _cB, _cu, len(_ca), Decimal("0.0024"), True, _ex_rng,
+                    _EXHR, ex)[1])
+            except ghost.PeelBudgetError:
+                return "REFUSED"
+        if _verdict(None) != _verdict(
+                ghost.peel_change_extras(len(_ca) - 1, _EXHR, _ex_rng)):
+            _chg += 1
+check(f"peel extras: cost nothing in affordability -- no setting changes "
+      f"verdict ({_chg} changed)", _chg == 0)
+
 # THE INVARIANT. Walk the chain the way the daemon will and assert every hop
 # is constructible: each carrier must receive at least what its peel spends
 # PLUS one headroom, or that peel cannot be built and the funds stop there.
@@ -2608,7 +2744,7 @@ class _R:
 
 _usable = Decimal("9.5")
 _base = ghost.compute_fanout_amounts(_usable, 6, Decimal("0.0024"), False, _R())
-_fit, _frac = ghost.fit_peel_distribution(
+_fit, _frac, _fex = ghost.fit_peel_distribution(
     _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _HR)
 check("fit_peel_distribution: a fundable chain is left at the default fraction",
       _frac is None and _fit == _base)
@@ -2619,7 +2755,7 @@ check("fit_peel_distribution: ...and the result really is affordable",
 # A headroom large enough to make the default distribution unaffordable must
 # shrink it rather than hand back a plan that strands funds.
 _big = Decimal("0.4")
-_fit2, _frac2 = ghost.fit_peel_distribution(
+_fit2, _frac2, _fex2 = ghost.fit_peel_distribution(
     _base, Decimal("10"), _usable, 6, Decimal("0.0024"), False, _R(), _big)
 check("fit_peel_distribution: an expensive chain is shrunk, not accepted",
       _frac2 is not None and sum(_fit2, Decimal(0)) < sum(_base, Decimal(0)))
@@ -2719,7 +2855,7 @@ for _pb in ("0.5", "1", "2", "3", "5", "10"):
             continue                      # was affordable to begin with
         _pf_bad += 1
         try:
-            _pfit, _pfrac = ghost.fit_peel_distribution(
+            _pfit, _pfrac, _pfex = ghost.fit_peel_distribution(
                 _pa, _pB, _pu, len(_pa), Decimal("0.0024"), True, _fo_rng,
                 _pf_hh)
         except ghost.PeelBudgetError:
