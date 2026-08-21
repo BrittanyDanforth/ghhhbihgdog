@@ -132,6 +132,25 @@ HOPDELAY_RE = re.compile(r"^\d{1,7}(-\d{1,7})?$")
 _B58_C = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 XMR_RE = re.compile(f"^[48][{_B58_C}]{{94}}$|^4[{_B58_C}]{{105}}$")
 
+
+def _js_xmr_re() -> str:
+    """XMR_RE as a JavaScript literal, so the page cannot drift from the server.
+
+    The page hand-copied this pattern and the copy went stale: it was still the
+    pre-fix `[48][0-9AB]...{93}` while the Python side had been corrected. The
+    page is where an operator's exit addresses are judged, and the box tells
+    them a rejected one "will be refused before it starts" -- a claim about the
+    server, made by a regex the server does not use.
+
+    Derived rather than duplicated. The character class is written as a range
+    set because a 58-character literal class in a JS regex is legal but
+    unreadable; it is asserted equal to _B58_C in tests/test_console.py, which
+    already pins XMR_RE against gs_common.XMR_ADDR_RE for the same reason.
+    """
+    cls = "[1-9A-HJ-NP-Za-km-z]"
+    return f"/^[48]{cls}{{94}}$|^4{cls}{{105}}$/"
+
+
 SCHEMA = {
     "mode":         ("choice", ["send", "receive"]),
     "btc_entry":    ("re", BTC_RE),
@@ -1443,7 +1462,8 @@ class H(BaseHTTPRequestHandler):
             page = PAGE.replace("__ACTIONS__", json.dumps(meta)) \
                        .replace("__ARM__", json.dumps(ARM_PHRASE)) \
                        .replace("__TOKEN__", json.dumps(TOKEN)) \
-                       .replace("__PWSET__", json.dumps(bool(os.environ.get("GS_WALLET_PASSWORD"))))
+                       .replace("__PWSET__", json.dumps(bool(os.environ.get("GS_WALLET_PASSWORD")))) \
+                       .replace("__XMR_RE__", _js_xmr_re())
             self._send(200, page, "text/html; charset=utf-8")
         elif base.startswith("/job/"):
             j = JOBS.get(base[5:])
@@ -2163,7 +2183,19 @@ function syncExitNote(){
  const box=$('#exitnote'); if(!box) return;
  const raw=($('#exit_to')?.value||'').split(/[\s,]+/).filter(Boolean);
  const uniq=[...new Set(raw)];
- const bad=uniq.filter(a=>!/^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/.test(a));
+ // __XMR_RE__ is substituted from the SAME pattern the server validates with.
+ // It used to be a hand-written copy, /^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/,
+ // and it was the OLD pattern -- the one SCHEMA's own comment records as wrong
+ // about mainnet and fixed on the Python side. The copy in the page was not.
+ // Measured against 841 real addresses from monero-wallet-rpc: 16 of them
+ // (1.9%, every one starting "8C") were called invalid here while the server
+ // accepts them, and EVERY integrated address (the 106-character "4..." form,
+ // which is what an exchange deposit often is) was rejected outright.
+ // The box then told the operator "the run will refuse them before it starts",
+ // which is false -- so they delete good destinations and end up sending
+ // everything to one address, which is the exact concentration the note
+ // directly below is warning them about.
+ const bad=uniq.filter(a=>!__XMR_RE__.test(a));
  box.hidden=false;
  if(!raw.length){
   box.innerHTML='<b>No exit set.</b> The mix will run and the funds will stay on '

@@ -964,6 +964,88 @@ _dis = [a for a in _probe
 check(f"addr: the console and gs_common accept EXACTLY the same strings "
       f"({len(_probe)} probed, {len(_dis)} disagreements)", not _dis)
 
+# AND THE PAGE, which is the gate an operator actually meets.
+#
+# The two checks above compare the two PYTHON patterns. The dashboard's exit
+# box judged addresses with a THIRD, hand-copied one in JavaScript --
+#
+#     /^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}$/
+#
+# -- which is the pre-fix pattern, the exact one SCHEMA's comment records as
+# "wrong about MAINNET" and corrected on the Python side. The copy in the page
+# was never touched, and nothing compared them.
+#
+# Measured against 841 real addresses from monero-wallet-rpc: 16 of them
+# (1.9%, every one beginning "8C") were called invalid by the page while the
+# server accepts them, and EVERY integrated address -- the 106-character "4..."
+# form, which is what an exchange deposit frequently is -- was rejected
+# outright. The box then says "the run will refuse them before it starts",
+# which is a claim about the server made by a regex the server does not use.
+#
+# The harm is not cosmetic. The operator is on that screen to list SEVERAL exit
+# destinations; the page tells them some are invalid, they delete those, and
+# they end up sending every output to one address -- the exact concentration
+# the note immediately below the box is warning them about.
+#
+# gs_console._js_xmr_re() now derives the page's pattern from XMR_RE, so this
+# checks the derivation rather than a fourth copy.
+import re as _re_sg                                             # noqa: E402
+from srcutil import code_only as _code_only_sg                  # noqa: E402
+_js_src = _con._js_xmr_re()
+check("addr: the page's regex is delivered as a JS literal", 
+      _js_src.startswith("/") and _js_src.endswith("/"))
+_js_py = _re_sg.compile(_js_src[1:-1])
+# NAMED, not positional. These were referenced as _probe_js[-2] / [-1] and the
+# references silently pointed at something else the moment the list grew.
+_REAL_8C = ("8C8RJR1fVGsfXbztYy7YddQ4NttvZNMG4G7m96y6kpu459GKLjJ5VuH22cSrUWP1"
+            "J5gr3N2dMyyk7CAdXDPoYt7nNgYZUYc")
+_REAL_INT = ("4EX5Xd3Lk3V2nWjns2MKiUGpv3ZiqSeHAFhcWdmNJfADcFn8c7yw6UvZuBYp9zxu"
+             "zY7exzte6SNSSNYSevFaMS3f1xmuzjRKqxwQ4xdAsX")
+# Both are real, from monero-wallet-rpc, and both are shapes the old page
+# pattern refused while the server accepted them.
+_probe_js = _probe + [_REAL_8C, _REAL_INT]
+# THE CHARACTERS BASE58 DOES NOT HAVE. Without these the probe cannot tell a
+# correct class from a WIDER one: a mutation that added "0" to the page's class
+# survived, because every probe string was built from _B58 and _B58 has no "0".
+# A validator that accepts a character the encoding cannot produce will pass an
+# address that is a typo, and the exit box is where a typo is unrecoverable.
+for _nb in "0OIl":
+    _probe_js += ["4" + _nb + "1" * 93, "8" + _nb + "1" * 93,
+                  "4" + "1" * 50 + _nb + "1" * 43,
+                  "4" + "1" * 60 + _nb + "1" * 44]
+_dis_js = [a for a in _probe_js
+           if bool(_con.XMR_RE.match(a)) != bool(_js_py.match(a))]
+check(f"addr: the PAGE and the server accept exactly the same strings "
+      f"({len(_probe_js)} probed, {len(_dis_js)} disagreements)", not _dis_js)
+check("addr: ...including a real 8C subaddress the old page pattern refused",
+      bool(_js_py.match(_REAL_8C)) and bool(_con.XMR_RE.match(_REAL_8C)))
+check("addr: ...and a real integrated address, which it refused entirely",
+      bool(_js_py.match(_REAL_INT)) and bool(_con.XMR_RE.match(_REAL_INT)))
+
+# The page must actually USE it -- deriving it and then leaving the old literal
+# in the HTML would pass everything above.
+_pg = _con.PAGE
+# THE LIVE LINE, not the whole page. The first version of this asserted the old
+# pattern appears nowhere in PAGE, and went red on correct code because the
+# JS comment ABOVE the fix quotes the old pattern to record what it replaced --
+# the same a-check-matching-its-own-post-mortem trap srcutil.code_only exists
+# for on the Python side, and which has now caught prose several times in this
+# session. What matters is what the filter actually runs.
+_bad_line = [l for l in _pg.splitlines()
+             if "const bad=uniq.filter" in l]
+check("addr: the page has exactly one address filter", len(_bad_line) == 1)
+check("addr: ...and it uses the substituted pattern, not a hand-written one",
+      _bad_line and "__XMR_RE__.test(a)" in _bad_line[0]
+      and "0-9AB" not in _bad_line[0])
+# The SUBSTITUTION, named precisely. "_js_xmr_re()" also matches the function's
+# own `def` line, so deleting the .replace() left this green -- and the page
+# would then ship the literal text __XMR_RE__, which is a JavaScript syntax
+# error that breaks the whole dashboard. Behavioural coverage for that lives in
+# test_console (test_page_regex_is_substituted), which fetches a real page.
+check("addr: ...and the server substitutes it when the page is served",
+      '.replace("__XMR_RE__", _js_xmr_re())'
+      in _code_only_sg(os.path.join(REPO, "gs_console")))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

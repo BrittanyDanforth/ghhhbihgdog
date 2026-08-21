@@ -1163,6 +1163,54 @@ def test_console_can_express_the_timing_parameter():
                   f"GhostSpiral", ok)
 
 
+def test_page_regex_is_substituted():
+    """The served page must carry a real regex, not the placeholder.
+
+    The exit box's address filter is substituted from the server's own XMR_RE
+    (gs_console._js_xmr_re) so the page cannot drift from what the run will
+    actually accept -- it had drifted, and was still the pre-fix pattern that
+    calls every integrated address and ~1.9% of real subaddresses invalid.
+
+    Checked by FETCHING A PAGE, because the failure mode of a missing
+    substitution is not a wrong regex, it is the literal text __XMR_RE__
+    reaching the browser -- a JavaScript syntax error that kills every script
+    on the dashboard. A source check cannot see that; deleting the .replace()
+    left the source checks in test_send_gates green.
+    """
+    import re as _re
+    s = Server()
+    try:
+        st, body = s.req("GET", "/", headers=s.auth())
+        check("page: it is served", st == 200)
+        txt = body.decode("utf-8", "replace")
+        left = sorted(set(_re.findall(r"__[A-Z_]+__", txt)))
+        check(f"page: no placeholder survives into the browser (found {left})",
+              not left)
+        _line = [l for l in txt.splitlines() if "const bad=uniq.filter" in l]
+        check("page: the exit filter is present exactly once", len(_line) == 1)
+        if _line:
+            _m = _re.search(r"!(/.+/)\.test\(a\)", _line[0])
+            check("page: ...and it carries a real JS regex literal", bool(_m))
+            if _m:
+                _served = _re.compile(_m.group(1)[1:-1])
+                # It must agree with the server on the shapes that mattered.
+                _real_sub = ("8C8RJR1fVGsfXbztYy7YddQ4NttvZNMG4G7m96y6kpu459"
+                             "GKLjJ5VuH22cSrUWP1J5gr3N2dMyyk7CAdXDPoYt7nNgYZUYc")
+                _real_int = ("4EX5Xd3Lk3V2nWjns2MKiUGpv3ZiqSeHAFhcWdmNJfADcFn8"
+                             "c7yw6UvZuBYp9zxuzY7exzte6SNSSNYSevFaMS3f1xmuzjRK"
+                             "qxwQ4xdAsX")
+                for _a, _what in ((_real_sub, "an 8C subaddress"),
+                                  (_real_int, "an integrated address")):
+                    check(f"page: the SERVED regex accepts {_what}, as the "
+                          f"server does",
+                          bool(s.c.XMR_RE.match(_a))
+                          and bool(_served.match(_a)))
+                check("page: ...and still rejects a non-base58 character",
+                      not _served.match("4" + "0" + "1" * 93))
+    finally:
+        s.close()
+
+
 def test_console_can_express_the_expected_total():
     """The dashboard must be able to say how much XMR the run is waiting for.
 
