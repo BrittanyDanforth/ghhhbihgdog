@@ -1277,6 +1277,52 @@ def test_console_can_express_the_timing_parameter():
                   f"GhostSpiral", ok)
 
 
+def test_every_settable_field_reaches_the_request():
+    """collect() must read every SCHEMA field the page actually offers.
+
+    --hop-delay was in SCHEMA (so the server would accept it), had a real
+    dropdown (so the operator could choose one), and was set by every preset
+    (so the strong ones stopped shipping the weakest value) -- and collect()
+    never read the box. Every run launched from this page therefore went out at
+    GhostSpiral's DEFAULT_HOP_DELAY whatever was selected.
+
+    Three separate fixes to the same parameter, each verified at its own layer,
+    and the one layer between them was checked by none of them. So this asserts
+    the JOIN rather than another link: every key in SCHEMA that has an input on
+    the page must appear in collect(), whatever it is.
+
+    `output` and `label` are exempt and named here rather than pattern-matched:
+    neither has a page field. label is deliberately absent -- the page used to
+    hardcode 'GhostSpiral_entry', which stamped the tool's name into the wallet
+    file, the one artifact paranoia_mode never deletes.
+    """
+    import re as _re
+    c = load_console()
+    _page = c.PAGE
+    _collect = _page[_page.index("function collect()"):]
+    _collect = _collect[:_collect.index("\n}")]
+    _missing = []
+    for _k in c.SCHEMA:
+        if _k in ("output", "label", "mode"):
+            continue
+        # does the page even offer it?
+        if f'id="{_k}"' not in _page:
+            continue
+        if _re.search(r"\b" + _re.escape(_k) + r"\s*:", _collect) is None:
+            _missing.append(_k)
+    check(f"collect: every SCHEMA field with an input on the page is sent "
+          f"({_missing} are not)", not _missing)
+    # ...and the one that was missing, by name, so the regression is legible.
+    check("collect: the hop delay specifically", "hop_delay:v('hop_delay')"
+          in _page)
+    # NON-VACUITY: the scan must actually be looking at fields, not zero of
+    # them.
+    _seen = [k for k in c.SCHEMA
+             if k not in ("output", "label", "mode") and f'id="{k}"' in _page]
+    check(f"collect: ...and the scan really covered the page's fields "
+          f"({len(_seen)} of them)", len(_seen) >= 12)
+
+
 def test_presets_set_the_hop_delay():
     """A preset must set the delay, and applyPreset must apply it.
 
