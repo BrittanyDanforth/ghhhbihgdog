@@ -548,24 +548,34 @@ check("runtime: a longer --hop-delay makes the estimate longer — it is not a "
 _MEAN = (Decimal(180) + Decimal(720)) / 2
 _CONF = Decimal(ghost.FANOUT_CONFIRM_POLL_ESTIMATE)
 _peelexit = _A(peel=True, dag_mixing=True, exit_to=["x"])
-check("runtime: a peel+DAG+exit run of 7 outputs is 36 delayed transactions, "
-      "which is what the chain recorded",
-      ghost._runtime_terms(_peelexit, 1, 7, _MEAN, _CONF)[1] == 36)
+# 22, NOT 36. The measured 36-transaction run was veil 1 + peels 7 + hops 7 +
+# change sweeps 7 + exits 14. The peel leaves no change now (it consumes each
+# carrier exactly and the last hop sweeps), so the 7 change sweeps are gone and
+# the exit has 7 fewer destinations to withdraw: veil 1 + peels 7 + hops 7 +
+# exits 7.
+check("runtime: a zero-change peel+DAG+exit run of 7 outputs is 22 delayed "
+      "transactions, down from the 36 the chain recorded before",
+      ghost._runtime_terms(_peelexit, 1, 7, _MEAN, _CONF)[1] == 22)
 _fanexit = _A(peel=False, dag_mixing=False, exit_to=["x"])
 check("runtime: ...and a fan-out run of 7 outputs is 11, likewise measured",
       ghost._runtime_terms(_fanexit, 1, 7, _MEAN, _CONF)[1] == 11)
 # The two phases that were missing, isolated.
-check("runtime: the change sweeps are counted — one per carrier under --peel",
+check("runtime: a peel run has NO change sweeps to count",
       ghost._runtime_terms(_A(peel=True, dag_mixing=False, exit_to=None),
-                           1, 7, _MEAN, _CONF)[1] == 1 + 7 + 7)
+                           1, 7, _MEAN, _CONF)[1] == 1 + 7)
 check("runtime: ...and one per chunk otherwise",
       ghost._runtime_terms(_A(peel=False, dag_mixing=False, exit_to=None),
                            1, 7, _MEAN, _CONF)[1] == 1 + 1 + 1)
-check("runtime: the exit withdraws the change destinations too, so under "
-      "--peel it is 2x the mix outputs",
+check("runtime: the exit withdraws one output per mix subaddress and nothing "
+      "else, because a peel run leaves no change destinations",
       ghost._runtime_terms(_peelexit, 1, 7, _MEAN, _CONF)[1]
       - ghost._runtime_terms(_A(peel=True, dag_mixing=True, exit_to=None),
-                             1, 7, _MEAN, _CONF)[1] == 14)
+                             1, 7, _MEAN, _CONF)[1] == 7)
+# ...and a FAN-OUT still has its one change location, so the exit is
+# mix_outputs + 1 there. The two shapes must not be conflated.
+check("runtime: a fan-out still has its change sweep and its extra withdrawal",
+      ghost._runtime_terms(_A(peel=False, dag_mixing=False, exit_to=["x"]),
+                           1, 7, _MEAN, _CONF)[1] == 1 + 1 + 1 + 8)
 # A run measured in weeks must not be reported as "~900.0h".
 check("runtime: a very long run is reported in days, not three-digit hours",
       "day" in ghost.estimate_runtime(_peelexit, 1, 12, (21600, 86400)))
@@ -689,7 +699,7 @@ for _lbl, _rpc in [("carrier address", _DupTargetRPC(dup_addr=True)),
     _pdup = None
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            ghost.build_peel_stage_plan(_rpc, 9, "PENTRY", 1, _PD, _PBY,
+            ghost.build_peel_stage_plan(_rpc, {}, 9, "PENTRY", 1, _PD, _PBY,
                                         Decimal("0.0024"), delay_window=(0, 0))
     except SystemExit as _e:
         _pdup = str(_e.code)
@@ -699,14 +709,21 @@ for _lbl, _rpc in [("carrier address", _DupTargetRPC(dup_addr=True)),
           f"twice-spent address and the 2-input change sweep",
           _pdup and "twice" in _pdup and "2-input" in _pdup)
 
+_pai = {}
 with contextlib.redirect_stdout(io.StringIO()):
     _pok, _paccts = ghost.build_peel_stage_plan(
-        _DupTargetRPC(dup_addr=False), 9, "PENTRY", 1, _PD, _PBY,
+        _DupTargetRPC(dup_addr=False), _pai, 9, "PENTRY", 1, _PD, _PBY,
         Decimal("0.0024"), delay_window=(0, 0))
 check("control: distinct peel carriers are accepted",
       len(_pok) == 4 and len({t["src"] for t in _pok}) == 4)
-check("control: ...each hop leaving its change on its OWN account",
-      len(set(_paccts)) == len(_paccts))
+# NO CHANGE ACCOUNTS. The hops each still run in their own account -- that is
+# what the duplicate check above enforces -- but none of them ends up holding
+# change, so the run mints no sweep destinations and issues no sweeps.
+check("control: ...and a zero-change chain reports no change locations",
+      _paccts == [])
+check("control: ...while every carrier is still registered for the exit to "
+      "look at, in case a fee moves between the signer's two build passes",
+      all(t["consume_to"] in _pai for t in _pok[:-1]))
 
 # -- the distribution is N transactions, one per carrier -------------------
 _VA2 = types.SimpleNamespace

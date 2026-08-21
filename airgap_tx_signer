@@ -156,7 +156,41 @@ def _validate_plan(plan: List[dict], phase: str = "create") -> None:
                 sys.exit(f"[!] Schema error at TX {i}: a sweep must not carry 'amt' -- "
                          f"it sends the whole subaddress balance, and an amount here "
                          f"would be silently ignored while looking authoritative.")
+            if tx.get("consume_to"):
+                sys.exit(f"[!] Schema error at TX {i}: a sweep already sends "
+                         f"everything, so there is nothing for 'consume_to' to "
+                         f"forward. One of the two is a mistake.")
             continue
+        # CONSUME_TO: "everything that is left, minus the real fee, goes here".
+        #
+        # A peel names one fixed destination and forwards the rest to the next
+        # carrier. The forwarded amount cannot be in the plan: it is
+        # (balance - fixed - fee) and the real fee is not knowable until the
+        # transaction is built, which is why the old plan named a fixed second
+        # destination and let monerod's change absorb the difference -- turning
+        # every peel into a 1-in/3-out transaction with a 131-byte tx_extra
+        # among a run of 1-in/2-out/44-byte ones.
+        #
+        # So the plan states the INTENT and phase_create resolves the number
+        # against the live balance. Validated as strictly as an address
+        # destination, and refused alongside 'sweep' (a sweep has nothing left
+        # over to forward) and alongside a multi-destination entry (the fixed
+        # part must be exactly one output, or "the rest" is ambiguous).
+        _consume = tx.get("consume_to")
+        if _consume is not None:
+            if not isinstance(_consume, str) or not _consume:
+                sys.exit(f"[!] Schema error at TX {i}: 'consume_to' must be a "
+                         f"non-empty address")
+            if not isinstance(tx.get("destinations"), list) or len(tx["destinations"]) != 1:
+                sys.exit(f"[!] Schema error at TX {i}: 'consume_to' needs "
+                         f"EXACTLY ONE fixed destination alongside it -- it "
+                         f"means 'the rest', and 'the rest' of an unspecified "
+                         f"number of fixed outputs is not a number.")
+            if _consume == tx["destinations"][0].get("address"):
+                sys.exit(f"[!] Schema error at TX {i}: 'consume_to' is the "
+                         f"same address as the fixed destination, so the "
+                         f"transaction would pay one address twice and the "
+                         f"peel would not move forward.")
         dests = tx.get("destinations")
         if dests is not None:
             if not isinstance(dests, list) or not dests:
@@ -250,6 +284,12 @@ def _canonical_plan(plan: List[dict]) -> list:
                       into "send everything", which is a completely different
                       spend from the same src_index and dst, and the manifest
                       would otherwise still verify.
+      consume_to   -- WHERE the unallocated remainder goes. Its AMOUNT cannot
+                      be covered because it does not exist until the
+                      transaction is built (see the validator), so the address
+                      is the whole of its identity -- and it is the address
+                      that receives nearly the entire balance on every peel but
+                      the last. Swapping it silently redirects the chain.
     """
     out = []
     for tx in plan:
@@ -268,6 +308,8 @@ def _canonical_plan(plan: List[dict]) -> list:
                 {"address": d.get("address"), "amount": str(d.get("amount"))}
                 for d in dests
             ]
+            if tx.get("consume_to"):
+                entry["consume_to"] = tx.get("consume_to")
         else:
             entry["dst"] = tx.get("dst")
             entry["amt"] = str(tx.get("amt")) if tx.get("amt") is not None else None
@@ -367,6 +409,111 @@ def _validate_manifest_entries(entries: List[dict], outdir: Path) -> None:
         if not isinstance(h, str) or len(h) != 64:
             sys.exit(f"[!] Manifest entry {n}: 'hash' must be a 64-char sha256 hex "
                      f"digest, got {h!r}")
+
+
+def _build_exact_consume(rpc, tx, dests, tx_acct, src_index, priority):
+    """Build a transaction that spends its source subaddress EXACTLY.
+
+    One fixed destination, and everything left after the REAL FEE forwarded to
+    tx["consume_to"]. The result has no change output at all.
+
+    WHY TWO PASSES. The forwarded amount is (unlocked - fixed - fee) and the
+    fee is not knowable until the transaction exists: it depends on the input
+    count, the output count and the ring, and the daemon's estimate is only
+    close (measured: estimate 0.0024, real 1-in/2-out fee 0.0026328, ~1.1x).
+    So this builds once with slack purely to READ THE FEE BACK, then builds
+    again with the amount that consumes the source exactly.
+
+      pass 1  destinations sum to (unlocked - fixed - slack)   -> fee
+      pass 2  destinations sum to (unlocked - fee)             -> no change
+
+    do_not_relay on both, so pass 1 costs nothing and reserves nothing --
+    verified: pass 2 builds from the same output immediately afterwards.
+
+    WHY NOT subtract_fee_from_outputs, which is what this field is nominally
+    for. Monero v0.18.3.1 accepts it on transfer_split and silently ignores
+    it: measured, both destinations were paid their FULL requested amounts,
+    the change output still appeared, the fee was identical, and an
+    out-of-range index in that list raised no error -- which is how you can
+    tell it is never parsed. Asking for destinations summing to the whole
+    balance fails "not enough money" with or without the field. epee drops
+    unknown JSON fields, so adding it would look like a fix and change nothing.
+
+    transfer, NOT transfer_split. A peel carrier holds exactly one output and
+    the transaction has two, so it can never need splitting -- and
+    transfer_split MAY return several transactions, which would silently turn
+    one peel into two and break the one-transaction-per-hop shape the whole
+    chain is built on. transfer returns one or fails.
+
+    Verified end to end on a real chain through the cold-signing path: a
+    view-only wallet built it, an offline wallet signed it, the daemon accepted
+    it, and the result was in=1 out=2 extra=99 with the carrier's balance at
+    zero afterwards.
+
+    FAILS CLOSED. Every error here happens at CREATE time, before anything is
+    signed or relayed, so the cost of refusing is a re-run.
+    """
+    if len(dests) != 1:
+        raise RuntimeError(
+            f"exact-consume needs exactly one fixed destination, got {len(dests)}")
+    bal = rpc.raw_request("get_balance", {
+        "account_index": tx_acct, "address_indices": [src_index]}) or {}
+    per = [b for b in (bal.get("per_subaddress") or [])
+           if int(b.get("address_index", -1)) == src_index]
+    unlocked = int(per[0].get("unlocked_balance", 0)) if per else 0
+    fixed = int(dests[0]["amount"])
+    if unlocked <= fixed:
+        raise RuntimeError(
+            f"source subaddress {tx_acct}/{src_index} holds "
+            f"{unlocked} atomic units unlocked, which does not cover the "
+            f"{fixed} this peel must pay before any fee. The carrier was "
+            f"under-funded or has not finished unlocking.")
+
+    def _build(forward):
+        return rpc.raw_request("transfer", {
+            "destinations": [dict(dests[0]),
+                             {"amount": int(forward), "address": tx["consume_to"]}],
+            "account_index": tx_acct,
+            "subaddr_indices": [src_index],
+            "priority": priority,
+            "get_tx_hex": False,
+            "do_not_relay": True,
+        })
+
+    # SLACK for pass 1 only. Large enough to clear any plausible fee (the
+    # measured 1-in/2-out fee is ~0.0026 XMR; this is 0.02) and it is thrown
+    # away -- pass 2 is the transaction that gets signed.
+    _SLACK = 20_000_000_000
+    probe_forward = unlocked - fixed - _SLACK
+    if probe_forward <= 0:
+        raise RuntimeError(
+            f"source subaddress {tx_acct}/{src_index} has only "
+            f"{unlocked - fixed} atomic units above its fixed destination, "
+            f"which is not enough to probe the fee with.")
+    probe = _build(probe_forward)
+    fee = int(probe.get("fee") or 0)
+    if fee <= 0:
+        raise RuntimeError(
+            "the fee probe returned no fee, so the exact amount cannot be "
+            "computed; refusing to build a transaction that would leave "
+            "change and a third output.")
+    forward = unlocked - fixed - fee
+    if forward <= 0:
+        raise RuntimeError(
+            f"after the {fee}-unit fee there is nothing left to forward from "
+            f"{tx_acct}/{src_index}: the carrier holds {unlocked} and this "
+            f"peel pays {fixed}.")
+    result = _build(forward)
+    # transfer returns scalars where transfer_split returns lists. phase_create
+    # reads amount_list/fee_list, so normalise rather than special-casing it
+    # there: one shape for the caller, whichever RPC produced it.
+    if "amount_list" not in result and "amount" in result:
+        result["amount_list"] = [result["amount"]]
+    if "fee_list" not in result and "fee" in result:
+        result["fee_list"] = [result["fee"]]
+    if "tx_hash_list" not in result and result.get("tx_hash"):
+        result["tx_hash_list"] = [result["tx_hash"]]
+    return result
 
 
 def phase_create(args, plan: List[dict], meta: dict = None):
@@ -470,9 +617,16 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                  "address": d["address"]}
                 for d in tx["destinations"]
             ]
-            mani_dst = f"{len(dests)}_dests"
-            mani_amt = str(sum(Decimal(str(d["amount"])) for d in tx["destinations"]))
-            desc = f"{len(dests)} dests, {mani_amt} XMR total"
+            if tx.get("consume_to"):
+                mani_dst = f"{len(dests)}_dests+rest"
+                mani_amt = str(sum(Decimal(str(d["amount"]))
+                                   for d in tx["destinations"]))
+                desc = (f"{mani_amt} XMR -> {scrub_address(dests[0]['address'])}"
+                        f", the REST -> {scrub_address(tx['consume_to'])}")
+            else:
+                mani_dst = f"{len(dests)}_dests"
+                mani_amt = str(sum(Decimal(str(d["amount"])) for d in tx["destinations"]))
+                desc = f"{len(dests)} dests, {mani_amt} XMR total"
         else:
             dests = [{"amount": int(Decimal(tx["amt"]) * Decimal(10 ** 12)),
                       "address": tx["dst"]}]
@@ -495,23 +649,10 @@ def phase_create(args, plan: List[dict], meta: dict = None):
                     "get_tx_hex": False,
                     "do_not_relay": True,
                 })
+            elif tx.get("consume_to"):
+                result = _build_exact_consume(
+                    rpc, tx, dests, tx_acct, src_index, args.fee_priority)
             else:
-                # A peel pays its mix destination AND the next carrier, so
-                # transfer_split leaves a change output and the transaction is
-                # 1-in/3-out. Two outputs is by far the commonest shape on the
-                # network, so the obvious improvement is to spend the input
-                # EXACTLY and have no change -- which is what
-                # subtract_fee_from_outputs is for.
-                #
-                # DO NOT ADD IT. Monero v0.18.3.1 (wallet RPC 1.26) accepts the
-                # field and silently ignores it: measured, a transfer_split
-                # carrying subtract_fee_from_outputs delivered both
-                # destinations their FULL requested amounts, still produced the
-                # change output, and charged an identical fee -- and an
-                # out-of-range output index in that list is accepted without
-                # any error, which is how you can tell the field is never
-                # parsed. epee drops unknown JSON fields, so adding it would
-                # look like a fix, change nothing, and read as done.
                 result = rpc.raw_request("transfer_split", {
                     "destinations": dests,
                     "account_index": tx_acct,

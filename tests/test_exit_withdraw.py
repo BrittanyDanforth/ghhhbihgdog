@@ -1293,13 +1293,23 @@ try:
           f"AT LEAST {12 + ghost.DECOY_MIN} separate output(s)" in _one)
     check("exitdests: ...and the floor is at or below every measured run",
           (4 + ghost.DECOY_MIN) <= min(8, 9, 18))
-    check("exitdests: ...and says the real number is higher",
-          "usually more" in _one)
-    # The deeper settings get the measured figure, because 'usually more' is
-    # too soft for a run that withdrew three times the floor.
+    # A FAN-OUT still returns its remainder to the spending account, so the
+    # exit has one more withdrawal per swap chunk than the floor.
+    check("exitdests: a fan-out says the real number is higher, and why",
+          "one more per swap chunk" in _one and "change" in _one)
+    # A PEEL CHAIN leaves no change at all now -- it consumes each carrier
+    # exactly and the last hop sweeps -- so its withdrawals ARE the mix
+    # outputs. The old wording pointed at a measured 18-output run, which was
+    # 8 mix outputs plus 8 peel-change destinations plus the fan-out change;
+    # saying "measurably more" now would overstate it in the other direction.
     _deep = _dests_kw([_EA], wallets=4, peel=True, dag_mixing=True)
-    check("exitdests: --peel/--dag-mixing name what was actually measured",
-          "withdrew 18" in _deep and "--dag-mixing/--peel" in _deep)
+    check("exitdests: --peel says its chain leaves no change to withdraw",
+          "leaves no change" in _deep)
+    check("exitdests: ...and does NOT still quote the change-heavy measurement",
+          "withdrew 18" not in _deep)
+    check("exitdests: ...while still giving the floor, because the decoy count "
+          "is drawn at random",
+          f"AT LEAST {4 + ghost.DECOY_MIN} separate output(s)" in _deep)
     check("exitdests: ...saying what it costs, not just that it is unusual",
           "no amount of mixing undoes that" in _one)
     check("exitdests: ...and how to fix it, including the env form",

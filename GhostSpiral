@@ -82,10 +82,24 @@ DUST_XMR = Decimal("0.0001")
 #:       16     0.0147360        6.14         10x
 #:
 #: A peel carrier is paid by exactly one previous peel, so it holds ONE output
-#: and lands in the top row: ~1.25x. 8 (x FEE_SAFETY_MARGIN = 12x the estimate)
-#: clears even the 16-input row, which only the first hop out of ENTRY could
-#: ever approach, and leaves room for the fee drifting upward between the
-#: single estimate taken at stage 0 and a peel relayed hours later.
+#: and lands in the top row: ~1.25x.
+#:
+#: 1, NOT 8, SINCE THE PEEL BECAME ZERO-CHANGE. This was 8 (x
+#: FEE_SAFETY_MARGIN = 12x the estimate) to clear even the 16-input row, on the
+#: reasoning that over-reserving only shrinks the distribution slightly. That
+#: reasoning stopped holding when peels started consuming their carrier
+#: EXACTLY (see build_peel_plan): the surplus no longer sits on ENTRY, it flows
+#: down the chain and lands in the FINAL peel's destination. At 8 an 8-hop
+#: chain would deliver its last destination roughly 0.19 XMR more than planned
+#: -- one conspicuously large output among seven ordinary ones, which is the
+#: cluster problem inverted.
+#:
+#: What the headroom still has to cover is only ESTIMATE DRIFT: the fee is
+#: estimated once at stage 0 and a peel is relayed hours later. 1 x
+#: FEE_SAFETY_MARGIN = 1.5x the estimate against a measured 1.1x requirement,
+#: so the per-hop surplus is ~0.4x the estimate (~0.001 XMR) and seven hops
+#: leave under 0.007 XMR extra on the last destination -- inside the spread the
+#: distribution amounts already have.
 #:
 #: TRAP, and the reason this constant has been wrong twice: measure it on a
 #: chain that is actually running current consensus. `monerod --regtest` is
@@ -105,7 +119,7 @@ DUST_XMR = Decimal("0.0001")
 #: chain as a fee shortfall. 1 was in fact adequate under real consensus --
 #: 1 x 1.5 = 1.5x clears the 1-input requirement -- so those "fixes" were
 #: chasing a testnet ghost too.)
-PEEL_CARRIER_RESERVE_MULT = Decimal("8")
+PEEL_CARRIER_RESERVE_MULT = Decimal("1")
 
 
 # Single source of truth for the fee safety margin. It was written inline as
@@ -1201,117 +1215,9 @@ def split_btc_amount(total: Decimal, n: int, rng) -> list:
     return amounts
 
 
-def peel_change_extras(n_carriers: int, hop_headroom: Decimal, rng,
-                       dust: Decimal = DUST_XMR, budget: Decimal = None) -> list:
-    """Per-carrier EXTRA reserve, so no two peels leave the same change.
-
-    WHY THIS HAS TO EXIST. A peel spends its carrier, sends one destination its
-    amount and forwards the remainder to the next carrier; the fee is not known
-    when those amounts are chosen, so a remainder is unavoidable (the same
-    reason the DAG round uses sweep_all and this cannot). That remainder lands
-    on the carrier's subaddress 0, the change sweep moves it once, and the exit
-    withdraws it.
-
-    With flat reserves, reserve_i - reserve_{i+1} is exactly hop_headroom for
-    every i, so EVERY carrier leaves the identical change:
-
-        leftover_i = reserve_i - reserve_{i+1} - actual_fee
-                   = hop_headroom - actual_fee
-
-    Measured on a real chain, a --peel --dag-mixing run delivered these to the
-    exit address (XMR):
-
-        0.022543  0.022543  0.022544  0.022544  0.022544  0.022546
-
-    Six arrivals inside THREE PICONERO. Anyone watching that address sees one
-    batch. It is the equal-value cluster compute_fanout_amounts has a whole
-    distinctness staircase to prevent and split_btc_amount refuses outright to
-    produce -- arriving by a different door, on the setting whose help text
-    calls it "Strongest unlinkability".
-
-    Worse than equal: PREDICTABLE. hop_headroom is
-    fee * FEE_SAFETY_MARGIN * PEEL_CARRIER_RESERVE_MULT = fee * 12, from two
-    public constants. Under the Kerckhoffs standard this file applies
-    elsewhere, an analyst who knows the tool recognises "several outputs of
-    about twelve times the going fee" as its peel change.
-
-    THE FIX IS AN EXTRA PER CARRIER, and it has to be shaped carefully:
-
-      * DISTINCT, so the leftovers differ. That is the whole point.
-      * NOT CONSECUTIVE. A permutation of 0,1,2,...,n-2 ticks is distinct and
-        is an arithmetic sequence, which is a worse tell than equality. The
-        values are drawn from a population several times larger than the
-        number needed so they do not form one.
-      * NON-NEGATIVE, so reserve_i - reserve_{i+1} = hop_headroom + extras[i]
-        is never BELOW hop_headroom. That inequality is what makes the next
-        peel constructible, and violating it strands funds mid-chain -- the
-        failure peel_carrier_reserves exists to prevent. Non-negative extras
-        can only ever leave MORE headroom than the flat schedule, never less.
-      * WITHIN `budget`, when one is given. The extras are reserve, not fee:
-        they are not lost, they simply arrive as change instead of being
-        distributed -- but they DO count against the affordability gate.
-        Measured before this bound existed: at 2 XMR / 40 wallets a draw
-        totalled 0.14 XMR, and 3 draws in 40 turned a plan the flat schedule
-        accepted into a refusal. A refused run is not a safe default: the
-        operator's alternative to it is not running at all.
-
-        So the caller passes the slack the trial actually has and the span is
-        capped so the WORST case fits. The n largest ticks in a pool of `span`
-        sum to n*span - n(n+1)/2, so
-
-            span <= budget_ticks / n + (n + 1) / 2
-
-        guarantees it, and at span == n_carriers the cost is the theoretical
-        minimum for n distinct non-negative multiples of dust, n(n-1)/2 ticks.
-        Below that, distinctness is unaffordable and this returns [] -- the
-        caller then takes the flat schedule for that trial, or moves to a
-        smaller distribution where the spread does fit. At every balance and
-        --wallets setting measured the cap lands well above n_carriers (62 vs
-        39 at the tightest), so the draw stays a sample rather than a
-        permutation.
-
-    Returns n_carriers extras, or [] when the budget cannot afford a distinct
-    set. Empty for a chain with no carriers.
-    """
-    if n_carriers <= 0:
-        return []
-    # Population: at least twice what we need (so the draw is a sample, not a
-    # permutation), and at least a quarter of the headroom expressed in ticks
-    # (so the spread is a visible fraction of the value being varied).
-    span = max(n_carriers * 2, int(hop_headroom / dust / 4), 8)
-    if budget is not None:
-        # THE WORST CASE, not the average. The draw is random, so bounding the
-        # expected total would still refuse a run whenever the draw came in
-        # high -- which is the failure this cap exists to remove, arrived at
-        # less often. Integer arithmetic throughout, and every division
-        # truncates DOWNWARD, so the bound is conservative by construction.
-        _bt = int(budget / dust)
-        if _bt < 0:
-            return []
-        span = min(span, _bt // n_carriers + (n_carriers + 1) // 2)
-        if span < n_carriers:
-            return []               # cannot be distinct inside this budget
-    # PARTIAL FISHER-YATES over rng.random(), NOT rng.sample().
-    #
-    # rng.sample exists on random.Random and on secrets.SystemRandom, and not
-    # on the minimal rng stubs this codebase's own suites pass in -- the first
-    # version used it and killed test_units with AttributeError on the suite's
-    # `_R`. Every other rng consumer here sticks to random()/shuffle(), and
-    # this file has already been bitten once by assuming a method exists
-    # (secrets.SystemRandom().randbelow, which does not, and raised on every
-    # change sweep it built). Distinct by construction, terminating, and no
-    # method beyond random().
-    pool = list(range(span))
-    for i in range(n_carriers):
-        j = i + int(rng.random() * (span - i))
-        if j >= span:
-            j = span - 1
-        pool[i], pool[j] = pool[j], pool[i]
-    return [dust * Decimal(p) for p in pool[:n_carriers]]
 
 
-def peel_carrier_reserves(amounts: list, hop_headroom: Decimal,
-                          extras: list = None) -> list:
+def peel_carrier_reserves(amounts: list, hop_headroom: Decimal) -> list:
     """How much each carrier must keep so the NEXT peel is CONSTRUCTIBLE.
 
     Returns n-1 reserves, one per carrier. PURE, so the arithmetic that decides
@@ -1344,21 +1250,20 @@ def peel_carrier_reserves(amounts: list, hop_headroom: Decimal,
     n = len(amounts)
     if n <= 1:
         return []
-    if not extras:
-        return [hop_headroom * Decimal(n - 1 - i) for i in range(n - 1)]
-    # reserve_i = sum over k >= i of (hop_headroom + extras[k]).
+    # FLAT AGAIN, and this time the flatness leaks nothing.
     #
-    # Written as a running total from the END so the invariant this schedule
-    # exists for is structural rather than asserted: consecutive reserves
-    # differ by hop_headroom + extras[i], and extras are non-negative, so the
-    # difference is NEVER below one headroom. That inequality is what makes
-    # peel i+1 constructible; breaking it strands funds on a carrier.
-    out = [Decimal(0)] * (n - 1)
-    run = Decimal(0)
-    for i in range(n - 2, -1, -1):
-        run += hop_headroom + extras[i]
-        out[i] = run
-    return out
+    # It briefly carried a per-carrier random EXTRA, because with a flat
+    # schedule reserve_i - reserve_{i+1} is exactly one headroom for every i,
+    # so every peel left the IDENTICAL change and the exit delivered a cluster
+    # of near-equal outputs. That was a real leak and the jitter did break it.
+    #
+    # The peel does not create change at all now (see build_peel_plan): every
+    # hop consumes its carrier exactly and the last one sweeps. There is no
+    # leftover to be equal, so there is nothing to de-cluster, and the
+    # schedule's only remaining job is to answer "how much must ENTRY hold for
+    # the whole chain to be constructible" -- which is a sizing question with
+    # one right answer.
+    return [hop_headroom * Decimal(n - 1 - i) for i in range(n - 1)]
 
 
 def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
@@ -1372,27 +1277,6 @@ def peel_entry_requirement(amounts: list, reserves: list) -> Decimal:
     return sum(amounts, Decimal(0)) + (reserves[0] if reserves else Decimal(0))
 
 
-def peel_forward_amounts(amounts: list, hop_headroom: Decimal,
-                         extras: list = None) -> list:
-    """What each peel hands to the NEXT carrier: the undistributed remainder
-    plus that carrier's reserve. Returns n-1 values, one per carrier.
-
-    Kept beside peel_carrier_reserves because the two only make sense together:
-    carrier i receives sum(amounts[i+1:]) + reserve_i, then peel i+1 spends
-    amounts[i+1] of it and forwards the rest, and the difference between
-    consecutive reserves is exactly the headroom that lets peel i+1 be built.
-    Getting this wrong does not raise -- it strands funds on a carrier
-    part-way down a chain that has no auto-resume.
-    """
-    n = len(amounts)
-    if n <= 1:
-        return []
-    # THE SAME extras the affordability check used. If these two ever compute
-    # different reserves, the carrier is handed less than the plan assumed and
-    # the chain strands part-way -- which is why they are threaded from one
-    # place rather than each drawing their own.
-    reserves = peel_carrier_reserves(amounts, hop_headroom, extras)
-    return [sum(amounts[i + 1:], Decimal(0)) + reserves[i] for i in range(n - 1)]
 
 
 #: Fractions of `usable` the peel planner will try, in order, when the default
@@ -1435,21 +1319,7 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
     talk to the operator. Raises PeelBudgetError when nothing fits, so the
     caller fails BEFORE any money moves.
 
-    Returns (amounts, frac, extras). THE EXTRAS ARE DRAWN HERE, not passed in,
-    for two reasons that the previous arrangement got wrong in both directions:
-
-      * The plan must be built from the IDENTICAL list this check used. They
-        raise every carrier's reserve, so a plan built from a different draw
-        would hand the carrier less than the check assumed and strand the
-        chain part-way. Returning them is the only way the caller can be
-        holding the same list; drawing them at the call site and passing them
-        in left two draws one edit apart.
-      * A draw made before this function runs cannot know how much slack the
-        trial has, so it could not be bounded by it -- and an unbounded draw
-        turns plans the flat schedule accepts into refusals. Here the slack is
-        known exactly: the requirement grows by precisely sum(extras), so
-        drawing inside that slack makes the affordability verdict IDENTICAL to
-        the flat schedule's, by construction rather than by measurement.
+    Returns (amounts, frac).
     """
     # Peel 0 spends from ENTRY and needs the same per-hop headroom as every
     # later hop, so it comes off the balance before anything is distributed.
@@ -1460,24 +1330,9 @@ def fit_peel_distribution(amounts: list, bal: Decimal, usable: Decimal,
             spend_fraction=frac))
         if not trial:
             continue
-        # THE FLAT SCHEDULE DECIDES AFFORDABILITY. Whether this trial can run
-        # at all must not depend on a random draw, or the same balance and the
-        # same settings would sometimes run and sometimes refuse.
-        _flat_need = peel_entry_requirement(
-            trial, peel_carrier_reserves(trial, hop_headroom))
-        if _flat_need > cap:
-            continue
-        # ...and the extras then spend the slack this trial actually has.
-        # peel_entry_requirement is sum(amounts) + reserves[0], and
-        # reserves[0] is the flat reserve plus sum(extras) exactly, so a draw
-        # bounded by the slack can never push the trial over the cap. The
-        # re-check below is belt and braces, not the argument.
-        _ex = peel_change_extras(max(0, len(trial) - 1), hop_headroom, rng,
-                                 budget=cap - _flat_need)
-        reserves = peel_carrier_reserves(trial, hop_headroom, _ex)
+        reserves = peel_carrier_reserves(trial, hop_headroom)
         if peel_entry_requirement(trial, reserves) <= cap:
-            return trial, frac, _ex
-        return trial, frac, []
+            return trial, frac
     raise PeelBudgetError(hop_headroom, max(0, fanout_count - 1))
 
 
@@ -1766,10 +1621,10 @@ def build_entry_veils(rpc, entries: list, delay_window=None) -> tuple:
             f"candidate rings.")
     return plan, carriers
 
-def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
-                          entry_index: int, dests: list,
+def build_peel_stage_plan(rpc, addr_index: dict, entry_account: int,
+                          entry_addr: str, entry_index: int, dests: list,
                           amount_by_addr: dict, hop_fee: Decimal,
-                          delay_window=None, extras: list = None):
+                          delay_window=None):
     """Provision the peel chain's carriers and turn a peel plan into stage-5
     entries. Returns (plan, change_accounts).
 
@@ -1806,9 +1661,17 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
     (they are only a subaddress derivation domain) and invisible on-chain;
     this buys the sweep structure, nothing else.
 
-    The returned change_accounts are the accounts whose subaddress 0 will hold
-    change once the chain runs, in hop order, so the caller can provision one
-    sweep destination each.
+    The second return value is EMPTY. It used to be the accounts whose
+    subaddress 0 would hold change, one per hop, so the caller could provision
+    a sweep destination for each; the chain leaves no change now (see
+    build_peel_plan), so there is nothing to sweep and no destination to mint.
+
+    The carrier accounts are registered in `addr_index` instead. That is what
+    puts them on the EXIT's account list, so if a fee moves between
+    _build_exact_consume's two passes and monerod does emit a small change
+    output after all, the exit finds it and withdraws it rather than
+    abandoning it. Registering them also makes reject_self_exit refuse an
+    --exit-to that happens to be one of this run's own carriers.
     """
     amounts = [amount_by_addr[a] for a in dests]
     carriers = []
@@ -1822,6 +1685,12 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
         addr, idx = rpc.new_subaddress_indexed(account_index=acct, label="")
         hop_accounts.append(acct)
         carriers.append((addr, idx))
+        # SO THE EXIT CAN SEE IT. _exit_account_list is built from
+        # addr_index's values plus change_accounts plus bal_account, and
+        # change_accounts is empty now -- without this the carrier accounts
+        # would be invisible to the exit, which is the "silently leaves money
+        # behind" failure _funded_subaddresses names.
+        addr_index[addr] = (acct, idx)
     # VERIFIED, not assumed -- the same check build_entry_veils, create_subs
     # and create_entry_set all make, and this loop mints the same way from the
     # same RPC without it. create_fresh_account validates the SHAPE of one
@@ -1851,8 +1720,7 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
             f"    spent. Check the wallet RPC.")
     core = build_peel_plan(
         entry_index=entry_index, change_index=0, dests=dests, amounts=amounts,
-        carriers=carriers,
-        remainders=peel_forward_amounts(amounts, hop_fee, extras))
+        carriers=carriers)
     plan = []
     for p in core:
         # Peel 0 spends ENTRY, which lives in the mix account. Peel i>0 spends
@@ -1863,22 +1731,36 @@ def build_peel_stage_plan(rpc, entry_account: int, entry_addr: str,
             "src_index": p["src_index"],
             "account_index": hop_acct,
             "dst": p["dst"],
-            "amt": p["amt"],
             "delay": hop_delay(delay_window),
             "peel_num": p["peel_num"],
         }
-        if p.get("destinations"):
+        if p.get("sweep"):
+            # The last peel. sweep_all carries no amount -- one would look
+            # authoritative and be ignored, which is the rule the DAG hops
+            # already follow.
+            entry["sweep"] = True
+        else:
+            entry["amt"] = p["amt"]
             entry["destinations"] = p["destinations"]
+            entry["consume_to"] = p["consume_to"]
             entry["carrier"] = p["carrier"]
             entry["carrier_index"] = p["carrier_index"]
         plan.append(entry)
-    # Every hop leaves change on its own account's subaddress 0.
-    return plan, [entry_account] + hop_accounts
+    # NO CHANGE ACCOUNTS. Every hop consumes its carrier exactly and the last
+    # one sweeps, so nothing lands on any subaddress 0 -- there is nothing for
+    # a change sweep to move. The caller used to be handed
+    # [entry_account] + hop_accounts here and minted a fresh account and a
+    # sweep transaction for each of them.
+    #
+    # The accounts are still in addr_index, so the EXIT still looks at them:
+    # if a fee moves between the two build passes and monerod does emit a small
+    # change output after all, it is found and withdrawn rather than abandoned.
+    return plan, []
 
 
 def build_peel_plan(entry_index: int, change_index: int,
                     dests: list, amounts: list,
-                    carriers: list = None, remainders: list = None) -> list:
+                    carriers: list = None) -> list:
     """A PEELING CHAIN: N single-destination transactions instead of one
     N-output fan-out.
 
@@ -1920,21 +1802,55 @@ def build_peel_plan(entry_index: int, change_index: int,
     one-time addresses instead of collapsing onto one, so there is no repeated
     spender to anchor on and no single address that names the wallet.
 
-    HONEST LIMIT: monerod still creates its own change output on every peel,
-    and it lands on the spending account's subaddress 0. Calling that "dust"
-    would understate it: peel 0's change is whatever FANOUT_SPEND_FRACTION did
-    not allocate -- around a TENTH of the run -- and each later peel adds its
-    unused fee reserve. So subaddress 0 accumulates one output per peel, the
-    first of them large.
+    ZERO CHANGE, on every hop. This is the second thing the peel got wrong and
+    it was the larger of the two.
 
-    That is why the change sweep is load-bearing here rather than tidy-up, and
-    why it must wait for EVERY peel's change to confirm before it runs:
-    sweep_all can only spend unlocked outputs (verified on a real chain), so a
-    sweep fired while later change is still locked takes some and strands the
-    rest. See _wait_for_change_settled.
+    A peel used to name BOTH its destination and the next carrier as
+    fixed-amount destinations, which leaves monerod's own change output -- so
+    each peel was 1-input / 3-output with a 131-byte tx_extra, against the
+    1-input / 2-output / 44-byte shape of everything else in the run. Measured
+    on a completed --peel --dag-mixing chain: 30 transactions at
+    out=2 extra=44 fee=0.001810, and six at out=3 extra=131 fee=0.002633,
+    identical to the piconero. The six peels were the only transactions of
+    their shape in the run and they were indistinguishable from each other.
 
-    Only sweep_all is genuinely zero-change, and sweep_all cannot also pay a
-    destination -- which is why the peels themselves cannot use it.
+    Worse, that change was a FIXED quantity by construction -- one headroom
+    minus the fee, from two public constants -- so the six change outputs
+    reached the exit as a cluster of near-equal amounts (measured: six arrivals
+    inside three piconero). Jittering the reserve broke the equality; it could
+    not remove the third output, the longer tx_extra or the higher fee.
+
+    The change is gone entirely now:
+
+      * peels 0..n-2 name ONE fixed destination and CONSUME THE CARRIER
+        EXACTLY. The plan says `consume_to`, and phase_create computes that
+        output's amount at build time as (unlocked - fixed destination - the
+        real fee), which it learns by building the transaction once with slack
+        and reading the fee back. Verified end to end through the cold-signing
+        path on a real chain -- view-only build, offline sign, relay:
+        in=1 out=2 extra=99, carrier balance afterwards 0.
+      * the LAST peel is a sweep_all to its destination, which is genuinely
+        zero-change and needs no second output at all.
+
+    So the whole chain leaves nothing on subaddress 0, there are no change
+    sweeps for a peel run (n fewer transactions), and no change-sweep
+    destinations for the exit to withdraw (another n fewer). The measured
+    36-transaction run becomes 22.
+
+    WHY NOT subtract_fee_from_outputs. Monero v0.18.3.1 accepts the field on
+    transfer_split and silently ignores it -- measured: both destinations were
+    paid in full, the change output still appeared, the fee was identical, and
+    an out-of-range index in that list raised no error, which is how you can
+    tell it is never parsed. Asking for destinations that sum to the whole
+    balance fails "not enough money" whether the field is present or not. The
+    two-pass build is what actually works.
+
+    WHERE THE SURPLUS GOES. Each hop's headroom is slightly more than its real
+    fee, and with exact consumption that difference is no longer left behind --
+    it flows down the chain into the final sweep's destination. That is why
+    PEEL_CARRIER_RESERVE_MULT is 1 and not 8: at 8 the last destination would
+    arrive roughly 0.19 XMR fatter than planned on an 8-hop chain, which is the
+    cluster problem inverted.
 
     Because each peel spends an output the previous peel created, the peels are
     necessarily SEQUENTIAL and CONFIRMATION-GATED (unspendable until ~10 blocks
@@ -1942,16 +1858,20 @@ def build_peel_plan(entry_index: int, change_index: int,
     as its own gated round.
 
     `carriers` is a list of (address, subaddress_index) for the fresh carriers,
-    one per peel; the last peel needs none and any extra is ignored.
-    `remainders[i]` is what peel i forwards to carrier i. Pure and
+    one per peel; the last peel needs none and any extra is ignored. Pure and
     deterministic; returns core entries the caller decorates with the src
     address, a per-peel delay and tx 'extra'. Returns [] for no dests.
+
+    There is no `remainders` argument any more. It used to carry what each peel
+    forwarded, computed from the reserve schedule at PLANNING time -- hours
+    before the transaction is built, against an estimated fee. Nothing can know
+    the real fee then, which is precisely why the old plan needed a change
+    output to absorb the difference.
     """
     n = min(len(dests), len(amounts))
     if n <= 0:
         return []
     carriers = list(carriers or [])
-    remainders = list(remainders or [])
     plan = []
     for i in range(n):
         if i == 0:
@@ -1972,33 +1892,40 @@ def build_peel_plan(entry_index: int, change_index: int,
             "amt": str(amounts[i]),
             "peel_num": i,
         }
-        # Every peel but the last carries the remainder forward explicitly.
+        # Every peel but the last consumes its carrier EXACTLY: one fixed
+        # destination, and everything else (minus the real fee, learned at
+        # build time) forwarded to the next carrier. No change output.
         #
-        # REFUSE rather than silently skip, for the same reason the carrier
-        # branch above raises. A non-last peel with no remainder pays only its
-        # destination, so the leftover falls to monerod's change on subaddress 0
-        # -- rebuilding the hub this function exists to remove -- AND the next
-        # peel then waits forever on a carrier nobody funded. The real caller
-        # always supplies n-1 positive remainders, so this is unreachable
-        # today; it is here so a future caller cannot reintroduce the hub by
-        # passing a short list, which is exactly how the carrier case would
-        # have gone wrong before it was made to raise.
+        # REFUSE rather than silently skip when there is no carrier, for the
+        # same reason the branch above raises. A non-last peel with nowhere to
+        # forward pays only its destination, so the leftover falls to monerod's
+        # change on subaddress 0 -- rebuilding the hub this function exists to
+        # remove -- AND the next peel then waits forever on a carrier nobody
+        # funded.
         if i < n - 1:
-            if (i >= len(carriers) or i >= len(remainders)
-                    or remainders[i] is None
-                    or Decimal(str(remainders[i])) <= 0):
+            if i >= len(carriers):
                 raise ValueError(
-                    f"peel {i} has no remainder to carry forward "
-                    f"({len(remainders)} remainder(s) for {n} peels, need at "
-                    f"least {n - 1}, all positive). Refusing to let the "
-                    f"leftover fall to subaddress 0 as change, which would "
-                    f"rebuild the hub and strand the next carrier unfunded.")
+                    f"peel {i} has no carrier to forward to "
+                    f"({len(carriers)} carrier(s) for {n} peels, need at least "
+                    f"{n - 1}). Refusing to let the leftover fall to "
+                    f"subaddress 0 as change, which would rebuild the hub and "
+                    f"strand the next carrier unfunded.")
             entry["destinations"] = [
                 {"address": dests[i], "amount": str(amounts[i])},
-                {"address": carriers[i][0], "amount": str(remainders[i])},
             ]
+            # THE REST, MINUS THE REAL FEE. phase_create resolves this amount
+            # against the live balance; the plan states the intent, because the
+            # number cannot be known until the transaction is built.
+            entry["consume_to"] = carriers[i][0]
             entry["carrier"] = carriers[i][0]
             entry["carrier_index"] = carriers[i][1]
+        else:
+            # THE LAST PEEL IS A SWEEP. It has nothing to forward, so sweep_all
+            # -- genuinely zero-change -- is exactly right, and it is what
+            # carries the chain's accumulated fee surplus to its destination
+            # instead of leaving it as one final change output.
+            entry["sweep"] = True
+            entry.pop("amt", None)
         plan.append(entry)
     return plan
 
@@ -4766,8 +4693,25 @@ def announce_distribution_shape(args, n_outputs: int) -> None:
     Eight outputs where the chain's overwhelming default is two, a tx_extra six
     times the length, and a fee two and a half times everything around it. All
     three are public. It is the transaction an analyst picks out without
-    trying, and --peel is the flag that removes it -- N ordinary 2-output
-    transactions spread over time instead of one that co-creates every output.
+    trying, and --peel is the flag that removes it.
+
+    WHAT --peel LOOKS LIKE, also measured, because the notice used to call its
+    transactions "ordinary" and they were not. On a completed --peel
+    --dag-mixing run:
+
+        30 tx   in=1 out=2 extra= 44  fee 0.001810   <- veils, hops, sweeps
+         6 tx   in=1 out=3 extra=131  fee 0.002633   <- the peels
+
+    The six peels were the only transactions of their shape in the run and
+    identical to each other to the piconero. That third output was monerod's
+    change, left because a peel named a FIXED amount for the next carrier and
+    the real fee is not knowable at planning time.
+
+    A peel consumes its carrier EXACTLY now and the last one sweeps, so there
+    is no change output: in=1 out=2 extra=99, verified end to end through the
+    cold-signing path. 99 rather than 44 because two real destinations need two
+    output pubkeys -- that is the whole of what is left, and it is stated to
+    the operator rather than described as "ordinary".
 
     The entry veil's own notice, printed moments earlier, says the transaction
     spending the swap output is "an ordinary 2-output send rather than one an
@@ -4792,8 +4736,14 @@ def announce_distribution_shape(args, n_outputs: int) -> None:
           f"outputs. The entry veil keeps that shape one hop away from the "
           f"address your swap memo names; it does not make it ordinary.")
     print(f"      --peel creates the same {n_outputs} outputs in "
-          f"{n_outputs} separate ordinary transactions instead, spread over "
-          f"time. It is much slower — each one is confirmation-gated, so "
+          f"{n_outputs} separate transactions instead, spread over time. "
+          f"Each is 1-input / 2-output, the commonest shape on the network: "
+          f"a peel consumes its carrier exactly and the last one sweeps, so "
+          f"none of them leaves a change output. Measured, the only thing "
+          f"still setting them apart from an ordinary payment is a 99-byte "
+          f"tx_extra against 44 — two real destinations need two output "
+          f"pubkeys.")
+    print(f"      It is much slower — each one is confirmation-gated, so "
           f"roughly {n_outputs} * 20 min — and it is the stronger choice when "
           f"time is not the constraint.")
 
@@ -4894,32 +4844,38 @@ def resolve_exit_destinations(args) -> None:
     _w = max(int(getattr(args, "wallets", 0) or 0), 1)
     # A FLOOR, not a range, and not --wallets.
     #
-    # Three measured end-to-end runs, all --wallets 4:
-    #     fan-out, no DAG          ->  8 outputs
-    #     fan-out, no DAG          ->  9 outputs
-    #     --peel --dag-mixing      -> 18 outputs
-    # The first draft printed args.wallets (4). The second printed
-    # wallets + DECOY_MIN..DECOY_MAX (6-11), which brackets the first two and
-    # still understates the third by half: --dag-mixing and --peel leave more
-    # funded outputs behind than the fan-out alone, and the exact count depends
-    # on how the hops and peel change carriers land.
+    # Four measured end-to-end runs, all --wallets 4:
+    #     fan-out, no DAG                      ->  8 outputs
+    #     fan-out, no DAG                      ->  9 outputs
+    #     --peel --dag-mixing, WITH peel change -> 18 outputs
+    #     --peel --dag-mixing, zero-change peel ->  8 outputs
     #
-    # So: the part that is certain, stated as certain, plus a plain sentence
-    # that the real number is higher on the deeper settings. A number that can
-    # be too LOW is the wrong failure for a warning whose whole force is how
-    # many arrivals land on one address -- and pretending to a precision this
-    # cannot have is how the last two versions of this line came to be wrong.
+    # The first draft printed args.wallets (4). The second printed
+    # wallets + DECOY_MIN..DECOY_MAX (6-11), which brackets the fan-out runs
+    # and understated the third by half, because a peel chain then left one
+    # change output per carrier and the exit had to withdraw each of them.
+    #
+    # It no longer does: a peel consumes its carrier exactly and the last one
+    # sweeps (see build_peel_plan), so a peel run's withdrawals are its mix
+    # outputs and nothing else -- which is exactly this floor. A FAN-OUT still
+    # returns its remainder to the spending account, so it adds one more per
+    # swap chunk.
+    #
+    # A number that can be too LOW is the wrong failure for a warning whose
+    # whole force is how many arrivals land on one address, so the floor stays
+    # a floor: the decoy count is drawn at random in DECOY_MIN..DECOY_MAX and
+    # the run may hold dust the operator does not know about.
     _lo = _w + DECOY_MIN
-    _deeper = bool(getattr(args, "dag_mixing", False)
-                   or getattr(args, "peel", False))
+    _deeper = not bool(getattr(args, "peel", False))
     if len(dests) == 1:
         integrity_log("exit", "single_exit_destination")
         print(f"  [!] ONE exit destination, and this run will withdraw AT "
               f"LEAST {_lo} separate output(s) to it"
-              + (" — measurably more than that with --dag-mixing/--peel, "
-                 "which leave more funded outputs behind (a measured "
-                 "--wallets 4 run with both withdrew 18)."
-                 if _deeper else ", and usually more."))
+              + (" — and one more per swap chunk for the fan-out's change, "
+                 "which --peel does not produce."
+                 if _deeper else
+                 " — a peel chain leaves no change, so that is the whole of "
+                 "it plus however many decoys this run drew."))
         print(f"      Each goes in its own transaction, so whoever watches "
               f"that address sees that many arrivals and knows they belong "
               f"together. The run spends hours giving these outputs separate "
@@ -6035,13 +5991,8 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # chain. Same family as this file's other rng trap, recorded in
         # hop_delay: "secrets.randbelow, NOT secrets.SystemRandom().randbelow".
         _peel_rng = _secrets.SystemRandom()
-        # THE EXTRAS ARE DRAWN INSIDE fit_peel_distribution and come back with
-        # the fitted amounts. They used to be drawn here and passed in, which
-        # meant the draw could not be bounded by the slack the trial turned out
-        # to have -- and an unbounded draw refused plans the flat schedule
-        # accepted. One draw, in the one place that knows the budget.
         try:
-            _fitted, _frac, _extras = fit_peel_distribution(
+            _fitted, _frac = fit_peel_distribution(
                 _peel_amounts, bal, usable, fanout_count, fee_xmr,
                 bool(getattr(args, "dag_mixing", False)), _peel_rng, _hop_fee)
         except PeelBudgetError as _pbe:
@@ -6067,31 +6018,6 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                 f"    Use fewer --wallets, drop --peel for the fan-out "
                 f"distribution, or fund\n"
                 f"    the wallet more.")
-        # THE SPREAD DID NOT FIT, and that is not something to swallow.
-        #
-        # peel_change_extras returns [] when the slack cannot pay for even the
-        # cheapest distinct set (n(n-1)/2 ticks). The chain then falls back to
-        # the FLAT reserve schedule, which is the equal-value cluster the
-        # extras exist to break -- every carrier leaving the identical change.
-        # Taking a smaller distribution to buy the spread would be the worse
-        # trade: the undistributed remainder stays on ENTRY, the one address a
-        # public swap memo already names.
-        #
-        # Reached at extreme output counts only: 59 carriers need 0.1711 XMR of
-        # slack for distinct changes, and at 5 XMR / 60 wallets there is not
-        # that much. Measured across 1250 draws over nine balances and six
-        # wallet counts, this is the only setting that hits it.
-        if not _extras and len(_fitted) > 2:
-            integrity_log("stage4", "peel_change_spread_unaffordable")
-            print(f"  [!] This chain's {len(_fitted) - 1} carriers will each "
-                  f"leave the SAME change (about {_hop_fee} XMR minus the "
-                  f"fee): there is not enough slack to vary them.")
-            print(f"      Those become {len(_fitted) - 1} near-identical "
-                  f"arrivals at your exit address, which is a cluster anyone "
-                  f"watching it can group — and the value is 12x the going "
-                  f"fee, which is a published constant of this tool.")
-            print(f"      Fewer --wallets, or more balance, and the chain "
-                  f"varies them instead.")
         if _frac is not None:
             # SHRUNK, and said so. The operator asked to distribute a certain
             # amount and is getting less; the remainder stays on ENTRY rather
@@ -6115,13 +6041,16 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # a separate variable that could drift out of step with it.
         _peel_addr, _peel_acct, _peel_idx = SPEND_SOURCES[0]
         fanout_plan, change_accounts = build_peel_stage_plan(
-            rpc_primary, _peel_acct, _peel_addr, _peel_idx,
+            rpc_primary, addr_index, _peel_acct, _peel_addr, _peel_idx,
             fanout_dests, fanout_by_addr,
-            _hop_fee, delay_window=_delay_window, extras=_extras)
+            _hop_fee, delay_window=_delay_window)
         integrity_log("stage4", f"peel_plan:{len(fanout_plan)}_peels")
         print(f"  [*] PEELING CHAIN: {len(fanout_plan)} confirmation-gated peels "
               f"(~{len(fanout_plan) * 20} min). Each output is created in its own "
               f"transaction — no co-created fan-out for an analyst to cluster.")
+        print(f"      Every peel consumes its carrier EXACTLY and the last one "
+              f"sweeps, so none of them leaves a change output: there are no "
+              f"change sweeps for this run and nothing rests on a subaddress 0.")
     else:
         fanout_plan = []
         for _si, (_src_addr, _src_acct, _src_idx) in enumerate(SPEND_SOURCES):
@@ -6477,10 +6406,15 @@ def _runtime_terms(args, n_chunks: int, mix_outputs: int, mean: Decimal,
     a number to doubt, "36 transactions, ~14h" is a number to check.
     """
     _peel = bool(getattr(args, "peel", False))
-    # One change location per carrier under --peel, one per chunk otherwise:
-    # the distribution's remainder lands on the spending account's subaddress 0
-    # and there is one spending account per peel.
-    change_locations = mix_outputs if _peel else n_chunks
+    # ZERO under --peel. Every peel consumes its carrier exactly and the last
+    # one sweeps, so nothing lands on any subaddress 0 and there is nothing to
+    # sweep -- see build_peel_plan. This was `mix_outputs`, one change sweep
+    # per carrier, which is n transactions the run no longer makes and n
+    # withdrawals the exit no longer has to issue.
+    #
+    # A fan-out still leaves its remainder on the spending account's
+    # subaddress 0, one per chunk.
+    change_locations = 0 if _peel else n_chunks
     txs = n_chunks                                   # one veil per chunk
     secs = mean * n_chunks
     secs += confirm                                  # carriers confirm+unlock
@@ -6496,8 +6430,9 @@ def _runtime_terms(args, n_chunks: int, mix_outputs: int, mean: Decimal,
     # ONE GATE PER PHASE, not per transaction. Everything a phase spends was
     # relayed together, so the first _wait_for_change_settled absorbs the
     # unlock and the rest are already unlocked when their turn comes.
-    secs += confirm + mean * change_locations
-    txs += change_locations
+    if change_locations:
+        secs += confirm + mean * change_locations
+        txs += change_locations
     if getattr(args, "exit_to", None):
         _exits = mix_outputs + change_locations
         secs += confirm + mean * _exits
