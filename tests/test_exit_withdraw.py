@@ -139,9 +139,50 @@ class _BalRPC:
 _rpc = _BalRPC({4: {0: 0, 1: 5_000_000_000_000},
                 5: {0: 250_000_000_000, 1: 0},
                 6: {}})
-_found = ghost._funded_subaddresses(_rpc, [4, 5, 6])
+_found, _unread = ghost._funded_subaddresses(_rpc, [4, 5, 6])
 check("exit: finds every FUNDED subaddress across the run's accounts",
       sorted((a, s) for a, s, _ in _found) == [(4, 1), (5, 0)])
+check("exit: ...and reports nothing unreadable when every read worked",
+      _unread == [])
+
+
+# AN UNREADABLE ACCOUNT IS MONEY LEFT BEHIND, and it was silently skipped.
+#
+# The loop did `except Exception: continue`, so one transient wallet-rpc error
+# during the exit dropped every output on that account out of the withdrawal
+# list. The exit then announced "withdrawing N output(s)" with N too small and
+# finished reporting success. This function's own docstring names that failure:
+# "an exit that silently leaves money behind is the same defect as a wipe that
+# silently leaves files behind."
+class _FlakyRPC(_BalRPC):
+    def __init__(self, table, fail_accounts, fail_times=99):
+        super().__init__(table)
+        self.fail = dict.fromkeys(fail_accounts, fail_times)
+        self.calls = 0
+
+    def raw_request(self, method, params=None):
+        self.calls += 1
+        acct = (params or {}).get("account_index")
+        if self.fail.get(acct, 0) > 0:
+            self.fail[acct] -= 1
+            raise RuntimeError("wallet-rpc busy")
+        return super().raw_request(method, params)
+
+
+_flaky = _FlakyRPC({4: {1: 5_000_000_000_000},
+                    5: {0: 250_000_000_000},
+                    6: {1: 900_000_000_000}}, [5])
+_ff, _fu = ghost._funded_subaddresses(_flaky, [4, 5, 6])
+check("exit: an account that cannot be read is REPORTED, not skipped silently",
+      _fu == [5])
+check("exit: ...and the readable ones are still returned",
+      sorted(a for a, _, _ in _ff) == [4, 6])
+# A transient error must not cost the account: retry before giving up.
+_trans = _FlakyRPC({4: {1: 5_000_000_000_000},
+                    5: {0: 250_000_000_000}}, [5], fail_times=2)
+_tf, _tu = ghost._funded_subaddresses(_trans, [4, 5])
+check("exit: a transient read error is retried, not treated as empty",
+      _tu == [] and sorted(a for a, _, _ in _tf) == [4, 5])
 check("exit: ...and skips zero-balance subaddresses",
       all(amt > 0 for _, _, amt in _found))
 check("exit: ...including swept change on a subaddress that is not index 1 "
@@ -955,8 +996,9 @@ _rounds_reached = []
 try:
     ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
         raw_request=lambda m, p=None: {})
-    ghost._funded_subaddresses = lambda *a, **k: [(3, 1, 1000), (4, 1, 1000),
-                                                  (5, 1, 1000)]
+    ghost._funded_subaddresses = lambda *a, **k: (
+        [(3, 1, 1000), (4, 1, 1000), (5, 1, 1000)], [])
+    # (the unreadable-account path gets its own driver below)
     ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
     ghost._change_residue = lambda *a, **k: 0
     ghost.newnym = lambda *a, **k: None
@@ -1027,6 +1069,77 @@ finally:
      ghost._wait_for_change_settled, ghost._change_residue, ghost.newnym,
      ghost.tor_recheck, ghost._run_round, ghost.integrity_log,
      ghost.secure_delete_or_warn, ghost.secure_delete_tree) = _tor_saved
+
+
+# ==========================================================================
+# AN ACCOUNT THE EXIT COULD NOT READ IS NOT A CLEAN EXIT.
+#
+# _funded_subaddresses now reports what it could not read; the withdrawal loop
+# has to act on that. Silently skipping it produced "withdrawing 2 output(s)"
+# on a wallet with three funded accounts and then a success report -- money
+# left behind, with nothing said.
+# ==========================================================================
+print("\n=== an unreadable account is reported and counted as a failure ===")
+
+_ur_saved = (ghost.connect_rpc, ghost._funded_subaddresses,
+             ghost._wait_for_change_settled, ghost._change_residue,
+             ghost.newnym, ghost.tor_recheck, ghost._run_round,
+             ghost.integrity_log, ghost.secure_delete_or_warn,
+             ghost.secure_delete_tree)
+try:
+    ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
+        raw_request=lambda m, p=None: {})
+    ghost._funded_subaddresses = lambda *a, **k: ([(3, 1, 1000)], [4, 5])
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 0)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost._run_round = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delete_or_warn = lambda *a, **k: True
+    ghost.secure_delete_tree = lambda *a, **k: True
+    _ur_args = types.SimpleNamespace(
+        rpc_primary="http://127.0.0.1:18083", tor_proxy="",
+        exit_to=["dest1"], output=tempfile.mkdtemp(prefix="gs_unread_"))
+    _ur_buf = io.StringIO()
+    _real = sys.stdout
+    sys.stdout = _ur_buf
+    try:
+        _ur_res = ghost._run_exit_withdrawals(
+            _ur_args, [3, 4, 5], _ur_args.exit_to,
+            tempfile.mkdtemp(prefix="gs_unreadstage_"),
+            {"http": "x", "https": "x"}, {}, (1, 2), hold=[], entry_pairs=[])
+    finally:
+        sys.stdout = _real
+    _ur_out = _ur_buf.getvalue()
+    check("exit: the unreadable accounts are named on the terminal",
+          "could not be read" in _ur_out and "4, 5" in _ur_out)
+    check("exit: ...and the run is told its exit is NOT complete",
+          "NOT complete" in _ur_out)
+    check("exit: ...and they are COUNTED as failures, so the caller reports "
+          "the run as incomplete",
+          _ur_res[1] == 2)
+    check("exit: ...while the readable output is still withdrawn",
+          _ur_res[0] == 1)
+    # The empty case must count them too, or a wallet the exit could not read
+    # AT ALL reports a clean 'nothing to withdraw'.
+    ghost._funded_subaddresses = lambda *a, **k: ([], [7, 8, 9])
+    _ur_buf2 = io.StringIO()
+    sys.stdout = _ur_buf2
+    try:
+        _ur_res2 = ghost._run_exit_withdrawals(
+            _ur_args, [7, 8, 9], _ur_args.exit_to,
+            tempfile.mkdtemp(prefix="gs_unread2_"),
+            {"http": "x", "https": "x"}, {}, (1, 2), hold=[], entry_pairs=[])
+    finally:
+        sys.stdout = _real
+    check("exit: a wallet it could not read at all is NOT a clean 'nothing to "
+          "withdraw'", _ur_res2[1] == 3)
+finally:
+    (ghost.connect_rpc, ghost._funded_subaddresses,
+     ghost._wait_for_change_settled, ghost._change_residue, ghost.newnym,
+     ghost.tor_recheck, ghost._run_round, ghost.integrity_log,
+     ghost.secure_delete_or_warn, ghost.secure_delete_tree) = _ur_saved
 
 
 # ==========================================================================

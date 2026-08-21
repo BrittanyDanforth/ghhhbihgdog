@@ -5725,15 +5725,24 @@ def report_holdings(rpc, accounts, entry_account=None) -> list:
     persists, and per-account amounts are the one quantity that correlates
     directly against the on-chain outputs.
     """
-    funded = []
+    funded, blind = [], 0
     for acct in sorted(set(accounts)):
         try:
             bal = rpc.raw_request("get_balance", {"account_index": int(acct)}) or {}
         except Exception:                                    # noqa: BLE001
+            # NOT SILENT. This `continue` made the total a floor while the
+            # report presented it as the amount the operator holds -- the same
+            # silent-skip the exit had, in the report the operator reads to
+            # decide whether the exit left anything behind.
+            blind += 1
             continue
         total = int(bal.get("balance", 0) or 0)
         if total > 0:
             funded.append((int(acct), total))
+    if blind:
+        print(f"  [!] {blind} of {len(set(accounts))} account(s) could not be "
+              f"read, so the total below is a FLOOR, not the whole of it. "
+              f"Check the wallet directly before assuming the run is done.")
     if not funded:
         return funded
 
@@ -8111,7 +8120,7 @@ def _exit_hold_list(args, addr_index, entry_addr) -> list:
     return [addr_index[a] for a in _addrs if a in addr_index]
 
 
-def _funded_subaddresses(rpc, accounts) -> list:
+def _funded_subaddresses(rpc, accounts) -> tuple:
     """Every (account, subaddress, atomic_balance) in `accounts` holding money.
 
     The exit spends per SUBADDRESS, not per account, because that is the unit a
@@ -8121,19 +8130,48 @@ def _funded_subaddresses(rpc, accounts) -> list:
     it find swept change and any dust the operator does not know about -- an
     exit that silently leaves money behind is the same defect as a wipe that
     silently leaves files behind.
+    Returns (found, unreadable). THE SECOND HALF IS THE POINT.
+
+    An account whose balance could not be read was `continue`d past -- silently
+    -- so a single transient wallet-rpc error during the exit dropped every
+    output on that account out of the withdrawal list. The exit then announced
+    "withdrawing N output(s)" with N too small and finished reporting success,
+    while the money stayed on the wallet with nothing said about it.
+
+    That is the failure this function's own docstring names: "an exit that
+    silently leaves money behind is the same defect as a wipe that silently
+    leaves files behind". The wipe side of that comparison already fails loudly
+    (secure_delete_or_warn, wipe_covers); this side did not.
+
+    Read errors are retried first, because the overwhelmingly likely cause is a
+    busy wallet-rpc mid-refresh rather than a real problem -- and a retry is
+    free next to leaving funds behind. What survives the retries is returned so
+    the caller can report it; nothing here decides what an unreadable account
+    means, the same rule the rest of this file follows.
     """
-    found = []
+    found, unreadable = [], []
     for acct in sorted(set(int(a) for a in accounts)):
-        try:
-            bal = rpc.raw_request("get_balance", {"account_index": acct,
-                                                  "all_accounts": False}) or {}
-        except Exception:                                    # noqa: BLE001
+        bal = None
+        for _try in range(3):
+            if shutdown_requested():
+                break
+            try:
+                bal = rpc.raw_request("get_balance",
+                                      {"account_index": acct,
+                                       "all_accounts": False}) or {}
+                break
+            except Exception:                                # noqa: BLE001
+                bal = None
+                if _try < 2:
+                    time.sleep(2 * (_try + 1))
+        if bal is None:
+            unreadable.append(acct)
             continue
         for sub in bal.get("per_subaddress", []) or []:
             amt = int(sub.get("balance", 0) or 0)
             if amt > 0:
                 found.append((acct, int(sub.get("address_index", 0)), amt))
-    return found
+    return found, unreadable
 
 
 def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
@@ -8178,9 +8216,22 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     address" is a problem the operator can fix with another run and "your
     destination is now publicly tied to your swap" is not fixable at all.
     """
-    targets = _funded_subaddresses(connect_rpc(args.rpc_primary,
-                                               proxy_url=getattr(args, "tor_proxy", "")),
-                                   accounts)
+    targets, _unreadable = _funded_subaddresses(
+        connect_rpc(args.rpc_primary,
+                    proxy_url=getattr(args, "tor_proxy", "")),
+        accounts)
+    if _unreadable:
+        # LOUD, AND COUNTED AS A FAILURE. An account this could not read may
+        # hold anything, so the run must not be reported as a complete exit --
+        # see the `failed` term in the return below.
+        integrity_log("exit", f"accounts_unreadable:{len(_unreadable)}")
+        print(f"  [!] EXIT: {len(_unreadable)} of "
+              f"{len(set(int(a) for a in accounts))} account(s) could not be "
+              f"read after three tries, so anything on them was NOT "
+              f"withdrawn.")
+        print(f"      Accounts: {', '.join(str(a) for a in _unreadable)}. "
+              f"Check each one and withdraw it yourself; the wallet-rpc was "
+              f"probably busy, not broken. This run's exit is NOT complete.")
     held = [t for t in targets if (t[0], t[1]) in {(int(a), int(i))
                                                    for a, i in (hold or ())}]
     # WHICH KIND, not just how many. The caller's report used to assert ENTRY
@@ -8267,12 +8318,12 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         if held:
             print("  [!] EXIT: nothing was withdrawn — the only funded output "
                   "is the unmixed one on ENTRY described above.")
-            return (0, 0, 0, dict(_held_kinds), 0)
+            return (0, len(_unreadable), 0, dict(_held_kinds), 0)
         print("  [!] EXIT: no funded output was found on this run's accounts, "
               "so nothing was withdrawn. If you expected funds here, do NOT "
               "assume they are gone — check the wallet before re-running.")
         integrity_log("exit", "no_funded_outputs")
-        return (0, 0, 0, {"entry": 0, "change": 0}, 0)
+        return (0, len(_unreadable), 0, {"entry": 0, "change": 0}, 0)
 
     # `secrets`, the module-level import -- NOT `_secrets`, which is a local
     # alias created inside main() and passed around as a parameter. Writing the
@@ -8300,7 +8351,10 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
               f"off-chain at the last step. Next run: repeat --exit-to.")
     integrity_log("exit", f"withdraw_start:{total}_outputs:{len(dest_pool)}_dests")
 
-    relayed = failed = skipped = unclean = 0
+    # An unreadable account starts the failure count, so a run that could not
+    # even LOOK at part of the wallet cannot be reported as a clean exit.
+    relayed = skipped = unclean = 0
+    failed = len(_unreadable)
     # ONE CHAIN LINE PER OUTCOME KIND, not one per output.
     #
     # Redacting the numbers out of `withdrawn:<acct>/<sub>` is not enough
