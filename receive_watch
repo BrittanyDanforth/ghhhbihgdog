@@ -206,21 +206,36 @@ def fmt(x: Decimal) -> str:
 # Kept in the same shape as the console's PRESETS, and asserted equal to them
 # by the test suite, so the menu can never drift into recommending a mix the
 # console would not actually run.
+# EVERY CHOICE NAMES ITS OWN hop_delay, for the reason gs_console's PRESETS
+# now do: none of them set one, so the command this menu PRINTED ran at
+# GhostSpiral's DEFAULT_HOP_DELAY of 180-720s -- which its own --hop-delay help
+# calls out as spending each carrier output "at roughly 11-16 blocks of age,
+# close to the youngest an output can legally be spent", so the real output
+# tends to be the newest member of its own ring. The entry named "Maximum safe"
+# shipped the weakest value of the one setting the help calls "AN OPSEC
+# PARAMETER".
+#
+# The wall-clock figures are from GhostSpiral.estimate_runtime at each entry's
+# own settings, counting every transaction that sleeps -- the veil, each peel
+# or fan-out, each hop, each change sweep and each withdrawal.
 CHOICES = [
     {"key": "1", "id": "paranoid", "name": "Maximum safe (peel + DAG)",
      "flags": {"wallets": 10, "deep": 2, "dag_mixing": True, "peel": True,
-               "fee_priority": 3},
+               "fee_priority": 3, "hop_delay": "1800-7200"},
      "blurb": "Peeling chain first (one tx per destination, nothing co-created), "
-              "then a DAG hop round over those outputs. Strongest, slowest — hours."},
+              "then a DAG hop round over those outputs. 30 min - 2 h before "
+              "each broadcast. Strongest, and about three days end to end."},
     {"key": "2", "id": "peel", "name": "Peeling chain only",
      "flags": {"wallets": 8, "deep": 1, "dag_mixing": False, "peel": True,
-               "fee_priority": 2},
+               "fee_priority": 2, "hop_delay": "1800-7200"},
      "blurb": "One transaction per destination, each spending the previous "
-              "change. Strong graph unlinkability, one round instead of two."},
+              "change. Strong graph unlinkability, one round instead of two. "
+              "Same 30 min - 2 h delay; about two days end to end."},
     {"key": "3", "id": "balanced", "name": "Balanced",
      "flags": {"wallets": 12, "deep": 2, "dag_mixing": True, "peel": False,
-               "fee_priority": 2},
-     "blurb": "12 subaddresses, depth 2, DAG hops on. Sensible for most amounts."},
+               "fee_priority": 2, "hop_delay": "600-1800"},
+     "blurb": "12 subaddresses, depth 2, DAG hops on, 10 - 30 min before each "
+              "broadcast. Sensible for most amounts; about half a day."},
     {"key": "4", "id": "hold", "name": "Nothing yet — just leave it",
      "flags": None,
      "blurb": "The funds stay on the receive subaddress. Nothing is spent and "
@@ -293,6 +308,12 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
             "--wallets", str(f["wallets"]),
             "--deep", str(f["deep"]),
             "--fee-priority", str(f["fee_priority"])]
+    # THE TIMING THE CHOICE PROMISED. Omitted, every command this tool printed
+    # ran at DEFAULT_HOP_DELAY -- the weakest setting -- however the entry was
+    # labelled. Emitted only when the choice sets one, so the default still
+    # lives in exactly one place (GhostSpiral) rather than being restated here.
+    if f.get("hop_delay"):
+        argv += ["--hop-delay", str(f["hop_delay"])]
     # The bundle itself, when this watch was driven from one. GhostSpiral
     # re-reads it and gets the PER-SWAP amounts, which --expect-total-xmr
     # cannot carry: on 0.50/0.30/0.15/0.05 the gate tightens to 0.95 XMR with
@@ -303,7 +324,10 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
     if pairs:
         argv += ["--swap-pairs", pairs]
     if target is not None and target > 0:
-        argv += ["--expect-total-xmr", str(target)]
+        # THE AMOUNT GOES IN THE ENVIRONMENT -- see mix_command_env. It used to
+        # be composed onto argv here, and GhostSpiral's own --expect-total-xmr
+        # help says why that is wrong: "an argv amount is world-readable via ps
+        # and /proc/<pid>/cmdline (mode 444) for the whole run".
         # How many payments make up that total. In receiver mode this is what
         # stage4's n_chunks becomes, and it tightens the gate when the implied
         # per-chunk size is smaller than the tolerance -- so a single missing
@@ -325,7 +349,34 @@ def build_mix_command(choice: dict, receive_wallet: str, tor_proxy: str,
     return argv
 
 
-def format_mix_command(argv: list) -> str:
+def mix_command_env(target=None) -> dict:
+    """Environment for the printed mix command: the amount, and only the amount.
+
+    /proc/<pid>/cmdline is mode 0444, so every account on the host can read a
+    running process's argv for as long as it runs -- hours, here. The total XMR
+    a swap is delivering is exactly the class of number this toolchain keeps
+    off argv everywhere else: gs_console.secret_env moves the Bitcoin address,
+    the BTC amount and the exit destination into the environment for that
+    reason, GhostSpiral's own env_or_argv exists because the value "kept
+    reappearing on argv anyway", and --expect-total-xmr's help says outright to
+    prefer GS_EXPECT_TOTAL_XMR.
+
+    This tool composed it onto the command it PRINTS, which is worse than a
+    spawned argv in one way and better in another: it also lands in the
+    operator's shell history, but they can see it and edit it. Printing it as
+    an environment assignment fixes both -- the pasted line still works, and
+    the amount never reaches the process's command line.
+
+    Separate from build_mix_command rather than folded into its return value:
+    changing that function's arity has already broken four call sites once in
+    this codebase, and the argv contract is what the suites and the real-chain
+    tests are written against.
+    """
+    return ({"GS_EXPECT_TOTAL_XMR": str(target)}
+            if target is not None and target > 0 else {})
+
+
+def format_mix_command(argv: list, env: dict = None) -> str:
     """Render an argv list as a line the operator can paste into a shell.
 
     build_mix_command's own docstring says the command is "built as a list,
@@ -339,8 +390,13 @@ def format_mix_command(argv: list) -> str:
 
     shlex.quote leaves ordinary paths untouched, so the common case still reads
     as a plain command; only an argument that actually needs quoting gets it.
+
+    `env` is rendered as leading VAR=value assignments, which is how a POSIX
+    shell passes a variable to one command without exporting it to the session.
+    See mix_command_env for why the amount travels that way.
     """
-    return " ".join(shlex.quote(str(a)) for a in argv)
+    _pre = [f"{k}={shlex.quote(str(v))}" for k, v in sorted((env or {}).items())]
+    return " ".join(_pre + [shlex.quote(str(a)) for a in argv])
 
 
 def render_choices() -> str:
@@ -1124,7 +1180,7 @@ def main():
                              tolerance=args.tolerance,
                              pairs=(args.pairs or ""))
     print(f"\n  [+] {c['name']} — run this to start the mix:\n")
-    print("      " + format_mix_command(argv))
+    print("      " + format_mix_command(argv, mix_command_env(target)))
     print("\n  This tool does not spend. Nothing moves until you run that command,")
     print("  or arm and launch the same preset from the console.")
     return 0

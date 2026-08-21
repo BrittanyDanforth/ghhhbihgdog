@@ -815,6 +815,13 @@ def preset_of(name):
             out[k] = int(mm.group(1))
     for k in ("dag_mixing", "peel"):
         out[k] = (k + ":true") in body.replace(" ", "")
+    # THE DELAY IS PART OF THE PRESET NOW. Neither side set one, so both shipped
+    # GhostSpiral's DEFAULT_HOP_DELAY -- the weakest value of the setting its
+    # own help calls "AN OPSEC PARAMETER" -- under entries named "Maximum safe"
+    # and "MAXIMUM SAFETY". They agreed only because both were silent, which is
+    # exactly the drift this comparison exists to catch.
+    mm = re.search(r"hop_delay:'([^']*)'", body)
+    out["hop_delay"] = mm.group(1) if mm else None
     return out
 
 
@@ -824,6 +831,27 @@ for _cid in ("paranoid", "peel", "balanced"):
     check(f"sync: receive_watch '{_cid}' matches the console preset exactly",
           all(_c["flags"][k] == _p[k] for k in
               ("wallets", "deep", "fee_priority", "dag_mixing", "peel")))
+    check(f"sync: ...including the hop delay ({_cid})",
+          _c["flags"].get("hop_delay") == _p["hop_delay"])
+    check(f"sync: ...and it is not the weak default ({_cid})",
+          bool(_p["hop_delay"]))
+
+# THE COMMAND MUST CARRY IT. A choice that names a delay and then prints a
+# command without one is the same defect one layer along.
+for _ck in ("1", "2", "3"):
+    _cc = rw.choice_by_key(_ck)
+    _cav = rw.build_mix_command(_cc, "w.json", "socks5h://127.0.0.1:9050")
+    check(f"the printed command carries --hop-delay for choice {_ck}",
+          "--hop-delay" in _cav
+          and _cav[_cav.index("--hop-delay") + 1] == _cc["flags"]["hop_delay"])
+# ...and a choice WITHOUT one must not invent a value: the default belongs to
+# GhostSpiral, in one place, or it drifts.
+_nohd = {"key": "9", "id": "t", "name": "t",
+         "flags": {"wallets": 4, "deep": 1, "dag_mixing": False, "peel": False,
+                   "fee_priority": 1},
+         "blurb": ""}
+check("a choice with no hop delay leaves the flag off entirely",
+      "--hop-delay" not in rw.build_mix_command(_nohd, "w.json", "p"))
 
 
 print("=== no-leak: the watch must not reach a third party ===")
@@ -915,8 +943,24 @@ def _flag(argv, name):
 
 
 _h = _mix(target=D("4.0"), chunks=4, tolerance=D("0.1"))
-check("handoff: the quoted total is passed as --expect-total-xmr",
-      _flag(_h, "--expect-total-xmr") == "4.0")
+# THE TOTAL TRAVELS IN THE ENVIRONMENT, NOT ON THE COMMAND LINE.
+#
+# /proc/<pid>/cmdline is mode 0444, so an argv amount is readable by every
+# account on the host for the whole life of a run that lasts hours -- and
+# GhostSpiral's own --expect-total-xmr help says exactly that and says to
+# prefer GS_EXPECT_TOTAL_XMR. gs_console.secret_env already moved the Bitcoin
+# address, the BTC amount and the exit destination off argv for this reason;
+# this printed command was the one place that still put an amount there.
+check("handoff: the quoted total is NOT on the command line",
+      "--expect-total-xmr" not in _h)
+check("handoff: ...it is in the environment prefix instead",
+      rw.mix_command_env(D("4.0")) == {"GS_EXPECT_TOTAL_XMR": "4.0"})
+check("handoff: ...and the printed line carries it as a shell assignment",
+      rw.format_mix_command(_h, rw.mix_command_env(D("4.0"))).startswith(
+          "GS_EXPECT_TOTAL_XMR=4.0 "))
+check("handoff: ...which GhostSpiral reads in preference to argv",
+      "GS_EXPECT_TOTAL_XMR" in open(
+          os.path.join(REPO, "GhostSpiral")).read())
 check("handoff: how many swaps make it up is passed as --split",
       _flag(_h, "--split") == "4")
 check("handoff: the tolerance goes too, so both sides use ONE number",
@@ -930,8 +974,9 @@ _hp = _mix(target=D("1.0"), chunks=4, tolerance=D("0.1"),
            pairs="thor_pairs.json")
 check("handoff: the pairs bundle is passed through as --swap-pairs",
       _flag(_hp, "--swap-pairs") == "thor_pairs.json")
-check("handoff: ...alongside the total this watch actually waited for",
-      _flag(_hp, "--expect-total-xmr") == "1.0")
+check("handoff: ...alongside the total this watch actually waited for, in "
+      "the environment",
+      rw.mix_command_env(D("1.0")) == {"GS_EXPECT_TOTAL_XMR": "1.0"})
 check("handoff: ...and no bundle means no flag",
       "--swap-pairs" not in _mix(target=D("1.0"), chunks=1,
                                  tolerance=D("0.1")))
@@ -961,8 +1006,22 @@ _gld.exec_module(_ghost)
 _ns = _ghost.build_cli().parse_args(_h[2:])
 check("handoff: GhostSpiral's own parser accepts the command, with the "
       "values intact",
-      _ns.expect_total_xmr == D("4.0") and _ns.split == 4
+      _ns.expect_total_xmr is None and _ns.split == 4
       and _ns.swap_tolerance == D("0.1"))
+# ...and the total the parser did NOT get from argv must arrive from the
+# environment, or the gate this handoff exists to arm is disarmed instead.
+_old_env = os.environ.get("GS_EXPECT_TOTAL_XMR")
+os.environ.update(rw.mix_command_env(D("4.0")))
+try:
+    _ns2 = _ghost.build_cli().parse_args(_h[2:])
+    _ghost.resolve_swap_arrival(_ns2)
+    check("handoff: the environment total reaches args.expect_total_xmr",
+          _ns2.expect_total_xmr == D("4.0"))
+finally:
+    if _old_env is None:
+        os.environ.pop("GS_EXPECT_TOTAL_XMR", None)
+    else:
+        os.environ["GS_EXPECT_TOTAL_XMR"] = _old_env
 
 # AND IT MUST NEVER REFUSE A RUN THIS WATCH JUST APPROVED. GhostSpiral's
 # receiver gate calls swap_arrival_floor with an EMPTY chunk-amount list, so

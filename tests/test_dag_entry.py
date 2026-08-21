@@ -538,6 +538,40 @@ check("runtime: a longer --hop-delay makes the estimate longer — it is not a "
       "constant",
       _mins(ghost.estimate_runtime(_dag, 1, 15, (3600, 7200)))
       > _mins(ghost.estimate_runtime(_dag, 1, 15, None)) * 4)
+
+# THE COUNT, AGAINST TWO MEASURED RUNS. The estimate is only as honest as the
+# number of delayed transactions behind it, and that number was wrong: the
+# change sweeps were not counted at all, and the exit was counted as
+# mix_outputs when it withdraws the mix outputs AND the change-sweep
+# destinations. On a full --peel --dag-mixing run with one chunk and seven mix
+# outputs the chain recorded 36 sends; the old terms summed to 22.
+_MEAN = (Decimal(180) + Decimal(720)) / 2
+_CONF = Decimal(ghost.FANOUT_CONFIRM_POLL_ESTIMATE)
+_peelexit = _A(peel=True, dag_mixing=True, exit_to=["x"])
+check("runtime: a peel+DAG+exit run of 7 outputs is 36 delayed transactions, "
+      "which is what the chain recorded",
+      ghost._runtime_terms(_peelexit, 1, 7, _MEAN, _CONF)[1] == 36)
+_fanexit = _A(peel=False, dag_mixing=False, exit_to=["x"])
+check("runtime: ...and a fan-out run of 7 outputs is 11, likewise measured",
+      ghost._runtime_terms(_fanexit, 1, 7, _MEAN, _CONF)[1] == 11)
+# The two phases that were missing, isolated.
+check("runtime: the change sweeps are counted — one per carrier under --peel",
+      ghost._runtime_terms(_A(peel=True, dag_mixing=False, exit_to=None),
+                           1, 7, _MEAN, _CONF)[1] == 1 + 7 + 7)
+check("runtime: ...and one per chunk otherwise",
+      ghost._runtime_terms(_A(peel=False, dag_mixing=False, exit_to=None),
+                           1, 7, _MEAN, _CONF)[1] == 1 + 1 + 1)
+check("runtime: the exit withdraws the change destinations too, so under "
+      "--peel it is 2x the mix outputs",
+      ghost._runtime_terms(_peelexit, 1, 7, _MEAN, _CONF)[1]
+      - ghost._runtime_terms(_A(peel=True, dag_mixing=True, exit_to=None),
+                             1, 7, _MEAN, _CONF)[1] == 14)
+# A run measured in weeks must not be reported as "~900.0h".
+check("runtime: a very long run is reported in days, not three-digit hours",
+      "day" in ghost.estimate_runtime(_peelexit, 1, 12, (21600, 86400)))
+check("runtime: ...and a short one is still minutes",
+      "min" in ghost.estimate_runtime(
+          _A(peel=False, dag_mixing=False, exit_to=None), 1, 1, (1, 2)))
 check("runtime: --peel is estimated as sequential confirmation-gated hops",
       _mins(ghost.estimate_runtime(_A(peel=True, dag_mixing=False,
                                       exit_to=None), 1, 7, None)) > 120)

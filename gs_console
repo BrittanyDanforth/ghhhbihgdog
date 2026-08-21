@@ -333,8 +333,12 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
     # and in send mode it is the fallback for when a quote is unreadable and
     # the summed-from-quotes target would silently be built from fewer chunks
     # than the operator actually paid for.
-    if p.get("expect_total_xmr"):
-        a += ["--expect-total-xmr", str(p["expect_total_xmr"])]
+    # THE TOTAL GOES IN GS_EXPECT_TOTAL_XMR -- see secret_env. It was composed
+    # onto argv here, which is the same mistake --exit-to made two fields
+    # along: GhostSpiral's own --expect-total-xmr help says "an argv amount is
+    # world-readable via ps and /proc/<pid>/cmdline (mode 444) for the whole
+    # run", and prefers the variable. The console had just been taught to send
+    # this value at all (it was not in SCHEMA), and sent it the exposed way.
     if not p.get("tor_proxy"):
         why.append("A socks5h:// Tor proxy is required — the pipeline refuses to run without one.")
     else:
@@ -564,6 +568,34 @@ LOCK = threading.Lock()
 #: suite or a third-party script that has no business holding the spend
 #: password of a funded wallet.
 PASSWORD_ACTIONS = {"run_pipeline"}
+
+#: Which GS_ secrets each action is allowed to see. DEFAULT-DENY: an action
+#: absent from this map gets none of them.
+#:
+#: secret_env's whole argument is that these are the values that tie a run to
+#: an identity -- the operator's Bitcoin address, the sum being moved, and "THE
+#: EXIT DESTINATION ... the value with the most to lose" -- and its answer was
+#: to move them off argv and into the environment. They were then handed to
+#: EVERY child: `env.update(extra_env or {})` in start() runs for the unit
+#: suites, py_compile, paranoia_mode, receive_watch and the disk-leak audit,
+#: none of which read a GS_ variable.
+#:
+#: That is the same defect _child_env below was written to fix for the wallet
+#: password, on the same call path, left standing for the other four. And
+#: GhostSpiral already reached this conclusion for its OWN children:
+#: _child_env there is `{k: v for k, v in os.environ.items() if not
+#: k.startswith("GS_")}`, with the note "Default-deny is free here: nothing
+#: GhostSpiral spawns reads a GS_ variable except the SIGN phase".
+#:
+#: GS_EXIT_TO for swap_quote is DELIBERATE, not an oversight: thor_swap_preparer
+#: reads it to refuse a swap whose destination is also the exit destination --
+#: which would publish the final address in a Bitcoin OP_RETURN. That check is
+#: the reason the variable reaches that child at all.
+ACTION_SECRETS = {
+    "run_pipeline": {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_EXIT_TO",
+                     "GS_EXPECT_TOTAL_XMR"},
+    "swap_quote": {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"},
+}
 _JOB_SEQ = [0]
 
 
@@ -603,6 +635,11 @@ def secret_env(params: dict) -> dict:
         env["GS_BTC_AMOUNT"] = str(params["btc_amount"])
     if params.get("swap_btc"):
         env["GS_SWAP_AMOUNTS"] = str(params["swap_btc"])
+    # HOW MUCH XMR THIS RUN IS WAITING FOR. Same class as GS_BTC_AMOUNT above,
+    # and GhostSpiral's own help for the flag says to prefer the variable
+    # because the argv form is world-readable for the life of the run.
+    if params.get("expect_total_xmr"):
+        env["GS_EXPECT_TOTAL_XMR"] = str(params["expect_total_xmr"])
     if params.get("exit_to"):
         env["GS_EXIT_TO"] = " ".join(params["exit_to"])
     return env
@@ -620,6 +657,17 @@ def _child_env(action_id):
     env = dict(os.environ)
     if action_id not in PASSWORD_ACTIONS:
         env.pop("GS_WALLET_PASSWORD", None)
+    # EVERY OTHER GS_ VARIABLE TOO, by the same argument. The console may have
+    # been started from a shell that already exports GS_EXIT_TO or
+    # GS_BTC_ENTRY -- OPSEC_SETUP.md tells the operator to do exactly that --
+    # and those were inherited verbatim by every action. Stripped here and
+    # re-added per action from ACTION_SECRETS, so the allow-list is the only
+    # way in, whether the value came from the page or from the shell.
+    for _k in [k for k in env if k.startswith("GS_")]:
+        if _k not in ACTION_SECRETS.get(action_id, ()):
+            env.pop(_k, None)
+    if action_id in PASSWORD_ACTIONS and os.environ.get("GS_WALLET_PASSWORD") is not None:
+        env["GS_WALLET_PASSWORD"] = os.environ["GS_WALLET_PASSWORD"]
     return env
 
 
@@ -680,8 +728,14 @@ def start(argv, label, action_id=None, extra_env=None, timeout_s=None):
     def run():
         try:
             env = _child_env(action_id)     # password only for PASSWORD_ACTIONS
-            # The BTC address and amounts ride here, not on argv.
-            env.update(extra_env or {})
+            # The BTC address and amounts ride here, not on argv -- but only
+            # for the actions ACTION_SECRETS names. This was an unconditional
+            # update(), so a click on "Unit suite" or "Compile all" handed
+            # py_compile the operator's exit destination.
+            _allowed = ACTION_SECRETS.get(action_id, ())
+            for _k, _v in (extra_env or {}).items():
+                if _k in _allowed:
+                    env[_k] = _v
             # stdin=DEVNULL: a job must never be able to WAIT FOR A HUMAN.
             # Children inherited the console's fd 0, so receive_watch's
             # `if pick is None and sys.stdin.isatty()` was True for a job
@@ -979,6 +1033,55 @@ def _run_totals(per_tx_xmr, wallets, deep):
         return rounds, totals
     except Exception:                                        # noqa: BLE001
         return None, None
+
+
+def run_eta(p: dict) -> str:
+    """How long THIS run will take, from the shipped estimator. "" if unknown.
+
+    THE DELAY DROPDOWN WAS LABELLED WITH RUN LENGTHS THAT WERE NOT RUN LENGTHS.
+    Its options said things like "6 - 24 h · days (recommended for ring-age)",
+    but --hop-delay is PER TRANSACTION and a run is dozens of them: at the
+    console's own default preset (10 wallets, peel + DAG, an exit set) that
+    option is 36 transactions x ~15 h, which is about a month, not "days".
+
+    That mattered in the direction that costs money. GhostSpiral's own
+    estimate_runtime docstring says an operator who is told twenty minutes and
+    sees two hours of silence "concludes the run has hung and interrupts it --
+    and an interrupt mid-round is the one failure this pipeline has no
+    automatic recovery from". A label out by 20x is that, with the wrong number
+    coming from the page rather than from a misunderstanding.
+
+    Computed by calling the SHIPPED estimate_runtime, exactly as _run_totals
+    calls the shipped compute_fee_budget: the page and the run must not be able
+    to disagree about how long the run is. Returns "" rather than a guess when
+    GhostSpiral cannot be loaded -- the same rule live_fees applies to a fee it
+    cannot obtain.
+    """
+    try:
+        g = _ghost()
+        w = max(1, int(p.get("wallets") or 10))
+        # The estimator's mix_outputs is the FUNDED output count, which is
+        # --wallets plus the decoys the run adds (DECOY_MIN..DECOY_MAX). Use
+        # the low end: an estimate that runs long is the safe direction here.
+        outs = w + int(getattr(g, "DECOY_MIN", 2))
+        window = g.parse_hop_delay(p.get("hop_delay") or None)
+
+        class _A:
+            peel = bool(p.get("peel"))
+            dag_mixing = bool(p.get("dag_mixing"))
+            exit_to = list(p.get("exit_to") or [])
+        from decimal import Decimal as _D
+        _mean = (_D(window[0]) + _D(window[1])) / 2
+        _txs = g._runtime_terms(_A, max(1, int(p.get("split") or 1)), outs,
+                                _mean, _D(g.FANOUT_CONFIRM_POLL_ESTIMATE))[1]
+        _eta = g.estimate_runtime(_A, max(1, int(p.get("split") or 1)), outs,
+                                  window)
+        _tail = ("" if _A.exit_to else
+                 " (no exit destination set, so no withdrawals are counted)")
+        return (f"About {_txs} broadcast transactions at this delay: {_eta} "
+                f"end to end, most of it deliberate waiting.{_tail}")
+    except Exception:                                        # noqa: BLE001
+        return ""
 
 
 def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
@@ -1485,7 +1588,8 @@ class H(BaseHTTPRequestHandler):
             argv, why = pipeline_argv(c["params"])
             return self._send(200, json.dumps({
                 "argv": argv, "pretty": " ".join(shlex.quote(x) for x in argv),
-                "problems": c["errors"] + why}))
+                "problems": c["errors"] + why,
+                "eta": run_eta(c["params"])}))
         if self.path == "/api/fees":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(
@@ -1835,13 +1939,16 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <div class="f" style="grid-template-columns:110px 1fr;margin-top:8px">
         <label for="hop_delay">Hop delay</label>
         <select id="hop_delay">
-          <option value="">default · 180-720s (3-12 min) — fastest, WEAKEST</option>
-          <option value="1800-7200">30 min - 2 h · a few hours per chain</option>
-          <option value="7200-21600">2 - 6 h · most of a day</option>
-          <option value="21600-86400">6 - 24 h · days (recommended for ring-age)</option>
-          <option value="86400-259200">1 - 3 days · slowest</option>
+          <option value="">default · 3-12 min per transaction — WEAKEST</option>
+          <option value="600-1800">10 - 30 min per transaction</option>
+          <option value="900-3600">15 - 60 min per transaction</option>
+          <option value="1800-7200">30 min - 2 h per transaction</option>
+          <option value="7200-21600">2 - 6 h per transaction</option>
+          <option value="21600-86400">6 - 24 h per transaction (best ring-age)</option>
+          <option value="86400-259200">1 - 3 days per transaction</option>
         </select>
       </div>
+      <div class="d" id="eta" style="margin:-2px 0 8px 0"></div>
       <div class="d" style="margin:-2px 0 8px 0">
         Seconds to wait before broadcasting each transaction. A hop cannot be
         built until the previous output confirms and unlocks (~10 blocks); this
@@ -1850,6 +1957,13 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
         while Monero picks ring decoys from a distribution whose bulk sits far
         above that, so the real output tends to be the newest member of its own
         ring. Longer costs time and buys ring-age plausibility.
+        <b>PER TRANSACTION, and a run is dozens of them</b> — a peel chain
+        relays one per destination, then one hop, one change sweep and one
+        withdrawal each, so the wall clock is that count times this delay.
+        These options used to be labelled with a run length ("days") that was
+        out by an order of magnitude; the line above is computed from the
+        settings actually selected, by the same function the pipeline prints
+        before it starts.
       </div>
       <label class="chk"><input type="checkbox" id="dag_mixing" checked>
         <span>DAG hop-mixing<span class="d">second round of per-subaddress hops; waits for on-chain confirmation (~20 min longer)</span></span></label>
@@ -1942,21 +2056,48 @@ const HDR={'Content-Type':'application/json','X-GS-Token':TOK};
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let cur=null,timer=null,mode='send',preset='balanced',armed=false;
 
+// EVERY PRESET NAMES ITS OWN hop_delay.
+//
+// applyPreset set wallets, depth, DAG, peel, priority and clearnet, and never
+// touched the delay -- so the preset labelled "MAXIMUM SAFETY — the two
+// strongest layers COMBINED" shipped the WEAKEST value of the one setting
+// GhostSpiral's own --hop-delay help calls "AN OPSEC PARAMETER", whose default
+// it says "is not a strong one": at 3-12 minutes each carrier output is spent
+// at roughly 11-16 blocks of age, close to the youngest an output can legally
+// be spent, while Monero draws ring decoys from a distribution whose bulk sits
+// far above that -- so the real output tends to be the newest member of its
+// own ring.
+//
+// The console had already made the setting REACHABLE (it was not even in
+// SCHEMA before, so no dashboard run could set one); this is the other half,
+// because a preset that does not set it is the default for everyone who does
+// not know the parameter exists.
+//
+// The times below are from run_eta at each preset's own settings with an exit
+// destination, and they are why these are 30 min - 2 h rather than the
+// dropdown's strongest option: at 6-24 h the Maximum preset is 38 DAYS.
 const PRESETS={
  paranoid:{wallets:10,deep:2,dag_mixing:true,peel:true,fee_priority:3,clearnet:false,
-      note:'MAXIMUM SAFETY — the two strongest layers COMBINED. First a PEELING CHAIN: ~10 destinations plus a few decoys are each sent as their OWN transaction, spending the previous change, so nothing is ever co-created in a fan-out an analyst could cluster. THEN a DAG hop round mixes those outputs a second time. Clearnet relay forced OFF, highest priority. By far the SLOWEST — every peel AND every hop waits ~10 blocks, so many hours. Use for high-value sends where time is no object.'},
+      hop_delay:'1800-7200',
+      note:'MAXIMUM SAFETY — the two strongest layers COMBINED. First a PEELING CHAIN: ~10 destinations plus a few decoys are each sent as their OWN transaction, spending the previous change, so nothing is ever co-created in a fan-out an analyst could cluster. THEN a DAG hop round mixes those outputs a second time. Clearnet relay forced OFF, highest priority, and a 30 min - 2 h delay before each broadcast so outputs are not spent at the youngest age a ring can contain. By far the SLOWEST — about 3 days end to end. Use for high-value sends where time is no object.'},
  peel:{wallets:8,deep:1,dag_mixing:false,peel:true,fee_priority:2,clearnet:false,
-      note:'PEELING CHAIN ONLY (no second DAG round). ~8 destinations plus decoys are sent ONE TRANSACTION AT A TIME, each spending the previous change — no co-created fan-out. Strong graph unlinkability and faster than Maximum safe (one round, not two), but without the extra hop layer. Every peel waits ~10 blocks (~hours).'},
+      hop_delay:'1800-7200',
+      note:'PEELING CHAIN ONLY (no second DAG round). ~8 destinations plus decoys are sent ONE TRANSACTION AT A TIME, each spending the previous change — no co-created fan-out. Strong graph unlinkability and fewer transactions than Maximum safe (one round, not two), at the same 30 min - 2 h broadcast delay. About 2 days end to end.'},
  churn:{wallets:20,deep:6,dag_mixing:true,fee_priority:2,clearnet:false,
-      note:'DEEP CHURN. 20 subaddresses at maximum depth 6 — the longest hop chains, so the funds cross the most intermediate outputs before they settle. Emphasises trail length over breadth; slowest to finish.'},
+      hop_delay:'900-3600',
+      note:'DEEP CHURN. 20 subaddresses at maximum depth 6 — the longest hop chains, so the funds cross the most intermediate outputs before they settle. Emphasises trail length over breadth. 15 - 60 min before each broadcast; about a day and a half end to end.'},
  max:{wallets:25,deep:3,dag_mixing:true,fee_priority:3,clearnet:false,
-      note:'25 subaddresses, depth 3, DAG hops on, priority 3, clearnet relay off. Wide anonymity set.'},
+      hop_delay:'900-3600',
+      note:'25 subaddresses, depth 3, DAG hops on, priority 3, clearnet relay off. Wide anonymity set. 15 - 60 min before each broadcast; about a day and a half end to end.'},
  balanced:{wallets:12,deep:2,dag_mixing:true,fee_priority:2,clearnet:false,
-      note:'12 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts.'},
+      hop_delay:'600-1800',
+      note:'12 subaddresses, depth 2, DAG hops on, priority 2, clearnet relay off. Sensible default for most amounts. 10 - 30 min before each broadcast; about half a day end to end.'},
  lowfee:{wallets:8,deep:2,dag_mixing:true,fee_priority:1,clearnet:false,
-      note:'8 subaddresses, depth 2, DAG hops on, priority 1 (cheapest fees). Real mixing on a budget — fewer hops means lower total fees, worth it for smaller amounts where fees would otherwise eat the balance.'},
+      hop_delay:'600-1800',
+      note:'8 subaddresses, depth 2, DAG hops on, priority 1 (cheapest fees). Real mixing on a budget — fewer hops means lower total fees, worth it for smaller amounts where fees would otherwise eat the balance. 10 - 30 min before each broadcast; under half a day end to end.'},
  fast:{wallets:3,deep:1,dag_mixing:false,fee_priority:1,clearnet:false,
-      note:'3 subaddresses, depth 1, no DAG round, priority 1. Fan-out only — least mixing, cheapest, no confirmation wait. Weakest privacy.'}};
+      hop_delay:'',
+      note:'3 subaddresses, depth 1, no DAG round, priority 1, and the DEFAULT 3-12 min broadcast delay — which is the weakest setting, chosen here deliberately because this preset is the fast one. Fan-out only: least mixing, cheapest, no confirmation wait. Weakest privacy, about two hours.'}};
 
 function applyPreset(p){
  preset=p; const c=PRESETS[p];
@@ -1965,6 +2106,11 @@ function applyPreset(p){
  // peel defaults OFF unless the preset asks for it, so switching away from the
  // peel preset clears it rather than silently leaving the slow mode on.
  $('#peel').checked=!!c.peel;
+ // THE DELAY IS PART OF THE PRESET. Left out, "Maximum safe" ran at the
+ // dropdown's own "WEAKEST" option. Assigned unconditionally (never `if(c...)`)
+ // so switching AWAY from a slow preset relaxes it again, the same rule the
+ // peel checkbox above already follows.
+ $('#hop_delay').value=c.hop_delay||'';
  // Every preset leaves clearnet relay OFF — a preset should never quietly
  // widen the IP exposure, and turning it on is a deliberate per-run override.
  if('clearnet' in c) $('#allow_clearnet_relay').checked=c.clearnet;
@@ -2148,6 +2294,10 @@ async function sync(){
    body:JSON.stringify({params:collect()})}).then(r=>r.json());
  $('#prev').textContent=r.pretty;
  $('#probs').innerHTML=r.problems.map(p=>`<li>${esc(p)}</li>`).join('');
+ // The wall clock for THESE settings, from the pipeline's own estimator. The
+ // delay dropdown used to carry hand-written run lengths that were out by 20x
+ // because --hop-delay is per TRANSACTION -- see run_eta.
+ if($('#eta')) $('#eta').textContent=r.eta||'';
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
  const btn=document.querySelector('.act[data-id="run_pipeline"]');

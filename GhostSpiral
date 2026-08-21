@@ -6362,20 +6362,72 @@ def estimate_runtime(args, n_chunks: int, mix_outputs: int,
     lo, hi = delay_window or DEFAULT_HOP_DELAY
     mean = (Decimal(lo) + Decimal(hi)) / 2
     confirm = Decimal(FANOUT_CONFIRM_POLL_ESTIMATE)
-    # veil round + distribution + (dag confirm + dag round) + (exit)
-    secs = mean * n_chunks                       # one veil per chunk
-    secs += confirm                              # carriers confirm+unlock
-    if getattr(args, "peel", False):
-        secs += (mean + confirm) * mix_outputs   # sequential, gated per peel
-    else:
-        secs += mean * n_chunks                  # one fan-out per chunk
-    if getattr(args, "dag_mixing", False):
-        secs += confirm + mean * mix_outputs
-    if getattr(args, "exit_to", None):
-        secs += mean * mix_outputs               # one withdrawal per output
+    secs, _ = _runtime_terms(args, n_chunks, mix_outputs, mean, confirm)
     hours = secs / Decimal(3600)
+    if hours >= 48:
+        return f"~{hours / 24:.1f} days"
     return (f"~{hours:.1f}h" if hours >= 1
             else f"~{int(secs / 60)} min")
+
+
+def _runtime_terms(args, n_chunks: int, mix_outputs: int, mean: Decimal,
+                   confirm: Decimal):
+    """(seconds, delayed_transaction_count) for a run of this shape.
+
+    COUNT EVERY TRANSACTION THAT SLEEPS, and the old version counted 22 of the
+    36 a measured run actually relayed.
+
+    broadcast_signed_xmr sleeps a per-transaction --hop-delay before EVERY
+    submit, so the wall clock is (transactions x mean delay) plus the
+    confirmation gates. Two whole phases were missing from the sum:
+
+      * THE CHANGE SWEEPS. A peel chain leaves change on every carrier and
+        _run_change_sweeps moves each one in its OWN transaction (deliberately
+        -- see its docstring). That is one delayed transaction per carrier, and
+        the estimate counted none of them.
+      * HALF THE EXIT. The exit withdraws every funded subaddress, which is the
+        mix outputs AND the change-sweep destinations, so under --peel it is
+        2 x mix_outputs, not mix_outputs. This is the same undercount
+        resolve_exit_destinations' arrival warning had before it was corrected
+        to a floor.
+
+    Measured against a full --peel --dag-mixing run with one chunk and seven
+    mix outputs: veil 1 + peels 7 + hops 7 + change sweeps 7 + exits 14 = 36
+    transactions on chain. The old terms summed to 22 -- a 39% undercount, on
+    the number whose own docstring says an operator who believes it and then
+    waits longer "concludes the run has hung and interrupts it", which is the
+    one failure this pipeline cannot recover from automatically.
+
+    Returned as a pair so the count can be shown alongside the time: "~14h" is
+    a number to doubt, "36 transactions, ~14h" is a number to check.
+    """
+    _peel = bool(getattr(args, "peel", False))
+    # One change location per carrier under --peel, one per chunk otherwise:
+    # the distribution's remainder lands on the spending account's subaddress 0
+    # and there is one spending account per peel.
+    change_locations = mix_outputs if _peel else n_chunks
+    txs = n_chunks                                   # one veil per chunk
+    secs = mean * n_chunks
+    secs += confirm                                  # carriers confirm+unlock
+    if _peel:
+        secs += (mean + confirm) * mix_outputs       # sequential, gated per peel
+        txs += mix_outputs
+    else:
+        secs += mean * n_chunks                      # one fan-out per chunk
+        txs += n_chunks
+    if getattr(args, "dag_mixing", False):
+        secs += confirm + mean * mix_outputs
+        txs += mix_outputs
+    # ONE GATE PER PHASE, not per transaction. Everything a phase spends was
+    # relayed together, so the first _wait_for_change_settled absorbs the
+    # unlock and the rest are already unlocked when their turn comes.
+    secs += confirm + mean * change_locations
+    txs += change_locations
+    if getattr(args, "exit_to", None):
+        _exits = mix_outputs + change_locations
+        secs += confirm + mean * _exits
+        txs += _exits
+    return secs, txs
 
 
 def build_change_sweep_jobs(rpc_primary, addr_index, change_accounts) -> list:

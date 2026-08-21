@@ -85,16 +85,96 @@ def test_password_scope():
 
 
 def test_child_env_is_otherwise_intact():
+    """Strip the GS_ secrets, keep everything else.
+
+    The marker used to be GS_TEST_MARKER, which asserted the OPPOSITE of what
+    the console now does. _child_env popped only GS_WALLET_PASSWORD, so every
+    other GS_ variable reached every child -- and OPSEC_SETUP.md tells the
+    operator to export GS_EXIT_TO and GS_BTC_ENTRY in the shell they start the
+    console from, so those were inherited by the unit suites, py_compile,
+    paranoia_mode and the disk-leak audit. GhostSpiral's own _child_env already
+    default-denies the whole GS_ prefix to its children for exactly this
+    reason. PATH and the rest of the environment are untouched.
+    """
     c = load_console(SECRET)
-    os.environ["GS_TEST_MARKER"] = "keepme"
+    os.environ["CONSOLE_TEST_MARKER"] = "keepme"
+    os.environ["GS_EXIT_TO"] = "shell_exported_exit_address"
     try:
         env = c._child_env("units")
-        check("stripping the password leaves the rest of the environment",
-              env.get("GS_TEST_MARKER") == "keepme" and "PATH" in env)
+        check("stripping the secrets leaves the rest of the environment",
+              env.get("CONSOLE_TEST_MARKER") == "keepme" and "PATH" in env)
+        check("a GS_ value exported in the operator's own shell does NOT "
+              "reach a child that has no business with it",
+              "GS_EXIT_TO" not in env)
+        check("...and no GS_ variable at all survives into such a child",
+              not [k for k in env if k.startswith("GS_")])
+        check("the pipeline child still gets the password",
+              c._child_env("run_pipeline").get("GS_WALLET_PASSWORD") == SECRET)
+        check("...and no GS_ variable it was not allow-listed for",
+              not [k for k in c._child_env("run_pipeline")
+                   if k.startswith("GS_")
+                   and k not in c.ACTION_SECRETS["run_pipeline"]
+                   and k != "GS_WALLET_PASSWORD"])
         check("the real environment is not mutated",
-              os.environ.get("GS_WALLET_PASSWORD") == SECRET)
+              os.environ.get("GS_WALLET_PASSWORD") == SECRET
+              and os.environ.get("GS_EXIT_TO")
+              == "shell_exported_exit_address")
     finally:
-        os.environ.pop("GS_TEST_MARKER", None)
+        os.environ.pop("CONSOLE_TEST_MARKER", None)
+        os.environ.pop("GS_EXIT_TO", None)
+
+
+def test_secrets_are_scoped_to_the_actions_that_need_them():
+    """secret_env's values must reach ONLY the action that reads them.
+
+    secret_env's own docstring calls the exit destination "the value with the
+    most to lose" and exists to keep these four off argv -- and start() then
+    did `env.update(extra_env or {})` unconditionally, so a click on "Unit
+    suite", "Compile all" or "Wipe preview" handed that child the operator's
+    final withdrawal address, their Bitcoin entry address and the sum being
+    moved. Verified by building the environment each action would actually get.
+
+    swap_quote's GS_EXIT_TO is deliberate: thor_swap_preparer reads it to
+    refuse a swap whose destination is also the exit destination, which would
+    publish that address in a Bitcoin OP_RETURN.
+    """
+    c = load_console()
+    se = c.secret_env({"btc_entry": "bc1x", "btc_amount": "0.4",
+                       "swap_btc": "0.4", "expect_total_xmr": "1.25",
+                       "exit_to": ["EXIT_A", "EXIT_B"]})
+    check("secret_env still produces the four values",
+          set(se) == {"GS_BTC_ENTRY", "GS_BTC_AMOUNT", "GS_SWAP_AMOUNTS",
+                      "GS_EXIT_TO", "GS_EXPECT_TOTAL_XMR"})
+
+    def child_env(aid):
+        env = c._child_env(aid)
+        for k, v in se.items():
+            if k in c.ACTION_SECRETS.get(aid, ()):
+                env[k] = v
+        return {k: v for k, v in env.items() if k.startswith("GS_")}
+
+    for aid in ("units", "integration", "ipleak", "compile", "paranoia_dry",
+                "leakaudit", "make_receive", "watch_receive",
+                "preflight_tor", "preflight_egress", "preflight_wallet"):
+        check(f"'{aid}' gets NO secret at all", child_env(aid) == {})
+    _rp = child_env("run_pipeline")
+    check("the pipeline gets the entry, the amount, the total and the exit",
+          _rp.get("GS_EXIT_TO") == "EXIT_A EXIT_B"
+          and _rp.get("GS_BTC_ENTRY") == "bc1x"
+          and _rp.get("GS_BTC_AMOUNT") == "0.4"
+          and _rp.get("GS_EXPECT_TOTAL_XMR") == "1.25")
+    _sq = child_env("swap_quote")
+    check("the swap quote gets the swap amounts, and GS_EXIT_TO only because "
+          "thor_swap_preparer reads it to refuse a colliding destination",
+          set(_sq) == {"GS_SWAP_AMOUNTS", "GS_EXIT_TO"})
+    check("...and that really is why -- the tool reads the variable",
+          "GS_EXIT_TO" in open(
+              os.path.join(REPO, "thor_swap_preparer")).read())
+    check("an unknown action id is denied everything", child_env(None) == {})
+    check("start() filters extra_env through the allow-list rather than "
+          "updating with all of it",
+          "if _k in _allowed:" in open(
+              os.path.join(REPO, "gs_console")).read())
 
 
 # ==========================================================================
@@ -1163,6 +1243,85 @@ def test_console_can_express_the_timing_parameter():
                   f"GhostSpiral", ok)
 
 
+def test_presets_set_the_hop_delay():
+    """A preset must set the delay, and applyPreset must apply it.
+
+    applyPreset set wallets, depth, DAG, peel, priority and clearnet, and never
+    the delay -- so the preset whose note opens "MAXIMUM SAFETY" ran at the
+    dropdown's own "WEAKEST" option, silently. The delay was made REACHABLE
+    earlier in this audit (it was not in SCHEMA at all); this is the other
+    half, because a preset that leaves it alone is what everyone who does not
+    know the parameter exists actually runs.
+    """
+    import re as _re
+    c = load_console()
+    _l = importlib.machinery.SourceFileLoader(
+        "ghost_pre", os.path.join(REPO, "GhostSpiral"))
+    g = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_l.name, _l))
+    _l.exec_module(g)
+    _pre = c.PAGE[c.PAGE.index("const PRESETS={"):]
+    _pre = _pre[:_pre.index("};") + 2]
+    names = _re.findall(r"\n ([a-z]+):\{", _pre)
+    check("presets: the block parses into entries", len(names) >= 5)
+    _missing = [n for n in names
+                if not _re.search(n + r":\{[^}]*hop_delay:", _pre)]
+    check(f"presets: every one names a hop_delay ({_missing} do not)",
+          not _missing)
+    # ...and the strong ones must not name the weak default. `fast` is allowed
+    # to: it is the preset whose whole point is speed, and it says so.
+    for n in ("paranoid", "peel", "balanced", "churn", "max", "lowfee"):
+        m = _re.search(n + r":\{[^}]*hop_delay:'([^']*)'", _pre)
+        check(f"presets: {n} sets a real delay, not the weak default",
+              bool(m and m.group(1)))
+        if m and m.group(1):
+            try:
+                g.parse_hop_delay(m.group(1))
+                _ok = True
+            except ValueError:
+                _ok = False
+            check(f"presets: ...and {n}'s value parses", _ok)
+            check(f"presets: ...and {n}'s value is offered in the dropdown",
+                  f'<option value="{m.group(1)}"' in c.PAGE)
+    check("presets: applyPreset assigns it UNCONDITIONALLY, so switching away "
+          "from a slow preset relaxes it again",
+          "$('#hop_delay').value=c.hop_delay||''" in c.PAGE)
+
+
+def test_eta_is_computed_by_the_shipped_estimator():
+    """The page must state the wall clock, and get it from the pipeline.
+
+    The delay dropdown carried hand-written run lengths ("6 - 24 h · days")
+    while --hop-delay is PER TRANSACTION: at the console's own strongest preset
+    that option is 61 transactions x ~15 h, about 38 days. GhostSpiral's
+    estimate_runtime docstring says an operator who is told one duration and
+    then waits far longer "concludes the run has hung and interrupts it -- and
+    an interrupt mid-round is the one failure this pipeline has no automatic
+    recovery from".
+    """
+    c = load_console()
+    base = {"mode": "send", "tor_proxy": "socks5h://127.0.0.1:9050",
+            "wallets": 10, "deep": 2, "peel": True, "dag_mixing": True,
+            "exit_to": ["4" + "1" * 94]}
+    fast = c.run_eta(dict(base, hop_delay=""))
+    slow = c.run_eta(dict(base, hop_delay="21600-86400"))
+    check("eta: the console answers with an estimate at all", bool(fast))
+    check("eta: ...and it names the transaction count, not just a duration",
+          "transactions" in fast)
+    check("eta: a longer delay gives a longer run", fast != slow)
+    check("eta: ...and the strongest option really is measured in days",
+          "day" in slow)
+    check("eta: no exit destination is said to be uncounted",
+          "no exit destination" in c.run_eta(
+              dict(base, exit_to=[], hop_delay="")))
+    check("eta: the endpoint returns it, so the page has something to render",
+          '"eta": run_eta(c["params"])' in open(
+              os.path.join(REPO, "gs_console")).read())
+    check("eta: ...and the page renders it into the slot next to the delay",
+          "$('#eta').textContent=r.eta" in c.PAGE
+          and 'id="eta"' in c.PAGE)
+
+
 def test_page_regex_is_substituted():
     """The served page must carry a real regex, not the placeholder.
 
@@ -1252,9 +1411,24 @@ def test_console_can_express_the_expected_total():
         return a, cl["errors"]
 
     a, _ = argv_for({"expect_total_xmr": "4.0", "split": 4})
-    check("expected total: it reaches the argv",
-          "--expect-total-xmr" in a
-          and a[a.index("--expect-total-xmr") + 1] == "4.0")
+    # IT REACHES THE RUN THROUGH THE ENVIRONMENT, NOT THE COMMAND LINE.
+    #
+    # It was composed onto argv, which is the mistake --exit-to made two fields
+    # along and secret_env exists to correct: /proc/<pid>/cmdline is mode 0444,
+    # so an amount there is readable by every account on the host for the whole
+    # life of a run that lasts hours. GhostSpiral's own --expect-total-xmr help
+    # says so and prefers GS_EXPECT_TOTAL_XMR. The console had just been taught
+    # to send this value at all, and sent it the exposed way.
+    check("expected total: it does NOT reach the argv",
+          "--expect-total-xmr" not in a)
+    check("expected total: it reaches the child as GS_EXPECT_TOTAL_XMR",
+          c.secret_env({"expect_total_xmr": "4.0"}).get("GS_EXPECT_TOTAL_XMR")
+          == "4.0")
+    check("expected total: ...and the pipeline action is allowed to see it",
+          "GS_EXPECT_TOTAL_XMR" in c.ACTION_SECRETS["run_pipeline"])
+    check("expected total: ...and nothing else is",
+          not [k for k, v in c.ACTION_SECRETS.items()
+               if k != "run_pipeline" and "GS_EXPECT_TOTAL_XMR" in v])
 
     # --split is NOT dead in receive mode: stage4 computes n_chunks as
     # `len(swap_deposits) or max(args.split, 1)`, and receive mode has no
@@ -1267,20 +1441,25 @@ def test_console_can_express_the_expected_total():
     a, _ = argv_for()
     check("expected total: unset omits the flag, so behaviour is unchanged",
           "--expect-total-xmr" not in a)
-    a, _ = argv_for({"expect_total_xmr": ""})
+    check("expected total: unset sets no variable either",
+          c.secret_env({}) == {})
     check("expected total: ...and an empty field does the same",
-          "--expect-total-xmr" not in a)
+          "GS_EXPECT_TOTAL_XMR" not in c.secret_env({"expect_total_xmr": ""}))
 
     # Send mode gets it too -- the fallback for an unreadable quote.
-    a, _ = argv_for({"expect_total_xmr": "1.25"}, mode="send")
     check("expected total: send mode can set it as well",
-          "--expect-total-xmr" in a)
+          c.secret_env({"expect_total_xmr": "1.25"}).get("GS_EXPECT_TOTAL_XMR")
+          == "1.25")
 
-    # Garbage must not reach an argv that ends in a spend.
+    # Garbage must not reach the child at all -- clean() DROPS what it cannot
+    # validate, so the check is that the value never survives validation, which
+    # is what secret_env is fed from.
     for bad in ("abc", "4.0;rm -rf /", "1 2", "$(id)", "--wallets"):
         a, errs = argv_for({"expect_total_xmr": bad})
-        check(f"expected total: {bad!r} is refused and never reaches the argv",
+        _cl = c.clean({"expect_total_xmr": bad})
+        check(f"expected total: {bad!r} is refused and never reaches the child",
               "--expect-total-xmr" not in a
+              and not c.secret_env(_cl["params"])
               and any("expect_total_xmr" in e for e in errs))
 
     # AND GhostSpiral MUST ACCEPT WHAT THE CONSOLE BUILDS. A flag that passes
@@ -1288,11 +1467,25 @@ def test_console_can_express_the_expected_total():
     # flag at all: it fails after the operator has filled the form in.
     a, _ = argv_for({"expect_total_xmr": "4.0", "split": 4})
     ns = g.build_cli().parse_args(a[2:])
-    check("expected total: GhostSpiral's parser accepts the console's argv, "
-          "with the value intact",
-          ns.expect_total_xmr == Decimal("4.0") and ns.split == 4)
-    check("expected total: ...and it is the type stage 4 compares against",
-          isinstance(ns.expect_total_xmr, Decimal))
+    check("expected total: GhostSpiral's parser accepts the console's argv",
+          ns.expect_total_xmr is None and ns.split == 4)
+    # ...and the value the console now sends by environment must land on the
+    # same attribute, with the same type stage 4 compares against. Moving it
+    # off argv is only a fix if it still arrives.
+    _old = os.environ.get("GS_EXPECT_TOTAL_XMR")
+    os.environ.update(c.secret_env({"expect_total_xmr": "4.0"}))
+    try:
+        ns2 = g.build_cli().parse_args(a[2:])
+        g.resolve_swap_arrival(ns2)
+        check("expected total: the environment value reaches "
+              "args.expect_total_xmr", ns2.expect_total_xmr == Decimal("4.0"))
+        check("expected total: ...and it is the type stage 4 compares against",
+              isinstance(ns2.expect_total_xmr, Decimal))
+    finally:
+        if _old is None:
+            os.environ.pop("GS_EXPECT_TOTAL_XMR", None)
+        else:
+            os.environ["GS_EXPECT_TOTAL_XMR"] = _old
 
     # The field has to exist on the page, or the schema entry is unreachable.
     _page = getattr(c, "PAGE", "")
