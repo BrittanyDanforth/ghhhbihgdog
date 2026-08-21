@@ -2366,6 +2366,134 @@ def planned_chunk_count(args, jm_utxos) -> int:
     return max(1, int(getattr(args, "split", 1) or 1))
 
 
+def refuse_thin_mix(subs: list, entry_addrs, wallets: int,
+                    num_decoys: int, n_chunks: int) -> None:
+    """Refuse a run with fewer mix outputs than swap chunks, BEFORE the swap.
+
+    split_by_weight hands back an EMPTY slice for every chunk it has no
+    destination left for ("If there are fewer items than weights the extra
+    slices come back empty and the caller has to say so"), and stage 4 answers
+    that with sys.exit: "N swap chunk(s) would have no mix subaddress to
+    distribute into ... Use more --wallets, or fewer --split chunks."
+
+    Both of those are FLAGS, and the count they decide is known here -- one
+    screen after create_subs drew the decoys and establish_entry_set minted the
+    entries, and BEFORE stage 2 fetches a quote or prints a deposit address.
+    The stage-4 exit is reached only after stage4_await_swap has watched the
+    XMR land, so the operator is told to change a flag with their money already
+    sitting on entry addresses a public ThorChain memo names, and a send-mode
+    re-run mints a NEW entry set rather than adopting those.
+
+    Same family as refuse_peel_multichunk, and the same argument: the answer
+    was always knowable before the swap, and only the question was being asked
+    late.
+
+    EXACT, not conservative. The decoy count is drawn at random
+    (DECOY_MIN..DECOY_MAX) and it is drawn ALREADY by the time this runs, so
+    this asks select_fanout_targets -- the same function stage 4 asks -- rather
+    than bounding it. Nothing is refused that would have fitted.
+
+    The one run this newly refuses is one that would have fitted only because
+    some of its swaps FAILED TO ARRIVE: select_funded_entries drops an empty
+    chunk, so the surviving chunks then fit the slices. That is not a shape to
+    preserve, and the remedy costs nothing -- more --wallets works whether the
+    chunks arrive or not.
+    """
+    if n_chunks <= 1:
+        return
+    _mix = [a for a in subs if a not in set(entry_addrs or ())]
+    _dests, _ = select_fanout_targets(_mix, set(), wallets, num_decoys)
+    if len(_dests) >= n_chunks:
+        return
+    integrity_log("stage3", "thin_mix_refused")
+    sys.exit(
+        f"[!] {n_chunks} swap chunks, but only {len(_dests)} mix "
+        f"subaddress(es) to distribute into.\n"
+        f"    {n_chunks - len(_dests)} chunk(s) would have NOWHERE to go: "
+        f"their value would sit on a\n"
+        f"    carrier, unmixed, while the run reported success — so this "
+        f"refuses to plan it.\n"
+        f"\n"
+        f"    NOTHING HAS BEEN SWAPPED. No quote has been fetched and no "
+        f"deposit address has\n"
+        f"    been printed. The same refusal used to happen at the "
+        f"distribution, which runs\n"
+        f"    AFTER stage 4 has watched the XMR arrive — at which point the "
+        f"money is on entry\n"
+        f"    addresses the swap memo names in public and a send-mode re-run "
+        f"mints new ones.\n"
+        f"    Use --wallets {n_chunks} or more, or fewer chunks.")
+
+
+def refuse_peel_multichunk(args, jm_utxos) -> None:
+    """Refuse --peel with more than one swap chunk, BEFORE the swap.
+
+    resolve_split already refuses `--split N --peel` at parse time, and its
+    comment says exactly why the answer has to come early: the refusal used to
+    live in build_distribution_plan, which "runs after the quotes are fetched,
+    after the deposit instructions are printed, and therefore possibly after
+    the operator has already sent Bitcoin -- at which point 'refused' means
+    their money is mid-swap with no run to receive it."
+
+    IT ONLY CLOSED THE --split DOOR. The chunk count is not --split; it is
+    planned_chunk_count, and that function's first line is "JoinMarket first,
+    because when it ran its UTXOs ARE the chunks and --split is not consulted".
+    So `--peel --joinmarket` with a tumbler that produced two or more UTXOs
+    walks straight past the parse-time gate and lands on the stage-4 backstop
+    -- after the tumble, after the entry set is minted, after the quotes, after
+    the deposit instructions, and after stage4_await_swap has watched the XMR
+    arrive. Driven through the shipped functions: resolve_split passes,
+    planned_chunk_count returns 3 with --split still 1, and
+    build_distribution_plan exits.
+
+    The message it lands on is wrong too. It reads "--split 3 with --peel is
+    not supported" and its remedy is "Use --split with the fan-out
+    distribution" -- naming a flag this operator never passed, about a count
+    they did not choose, so the one instruction they are given does not apply
+    to their command line.
+
+    HERE is the earliest moment the answer can be known: the tumbler has run,
+    so the UTXO count exists, and nothing Monero-side has been created, no
+    quote has been fetched and no deposit address has been printed. The BTC
+    tumble is not undone by refusing -- those coins are the operator's and
+    were going to be tumbled either way -- but the swap has not started, which
+    is the part that cannot be taken back.
+
+    Asks planned_chunk_count rather than re-deriving the count, so this gate
+    and the entry set it is protecting cannot answer differently.
+    """
+    if not getattr(args, "peel", False):
+        return
+    n = planned_chunk_count(args, jm_utxos)
+    if n <= 1:
+        return
+    integrity_log("stage1", "peel_multichunk_refused")
+    _why = (f"JoinMarket's tumble produced {len(jm_utxos)} UTXOs, so this run "
+            f"has {n} swap chunks"
+            if jm_utxos else
+            f"--split {getattr(args, 'split', n)} gives this run {n} swap "
+            f"chunks")
+    sys.exit(
+        f"[!] --peel needs a SINGLE swap chunk, and {_why}.\n"
+        f"    Each chunk needs its own peel chain — merging them into one "
+        f"would re-create\n"
+        f"    exactly the convergence that splitting the swap exists to avoid "
+        f"— and a peel\n"
+        f"    chain is sequential and confirmation-gated, so {n} of them would "
+        f"take\n"
+        f"    {n} x hops x ~20 minutes with no resume if one stops part-way.\n"
+        f"\n"
+        f"    NOTHING HAS BEEN SWAPPED. No quote has been fetched, no deposit "
+        f"address has been\n"
+        f"    printed and no Monero has moved — this stops here rather than "
+        f"at the distribution,\n"
+        f"    which is after the swap has landed.\n"
+        f"    Drop --peel for the fan-out distribution, which handles "
+        f"{n} chunks, or run the\n"
+        f"    tumbler with a single output address and swap the rest in "
+        f"another run.")
+
+
 def create_entry_set(rpc, n: int) -> list:
     """Mint N entry subaddresses, ONE PER SWAP CHUNK. Returns [(addr, acct, idx)].
 
@@ -6607,6 +6735,112 @@ def build_change_sweep_jobs(rpc_primary, addr_index, change_accounts) -> list:
     return change_sweep_jobs
 
 
+def resolve_swap_deposits(args, proxy, jm_utxos, receive_mode, entry_addr,
+                          entry_addrs, entry_set) -> list:
+    """Stage 2 execution: turn this run's BTC into deposit instructions.
+
+    Returns the deposit list stage 4 waits on -- the --swap-pairs bundle in
+    receiver mode, one quote per chunk when there is BTC to split, and [] in
+    manual mode, where the operator drives thor_swap_preparer themselves.
+
+    Extracted from main() unchanged. It is 80-odd lines of branching that
+    decides how much BTC goes to how many swaps and which entry address each
+    one names -- the binding the whole --split invariant rests on -- and it sat
+    inline in the one function nothing executes, which is the reason given
+    every other time something was lifted out of here (see establish_entry_set,
+    build_distribution_plan, size_and_prune_chunks). `swap_deposits` is the
+    only name that escaped the block, so this is a move, not a rewrite.
+    """
+    swap_deposits = []
+    if receive_mode:
+        integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
+        print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
+        print(f"  [+] Entry address: {scrub_address(entry_addr)}")
+        swap_deposits = _receive_pairs_for(args, entry_addr)   # --swap-pairs
+    else:
+        btc_chunks = []
+
+        if jm_utxos:
+            btc_chunks = jm_utxos
+        elif args.btc_amount is not None and args.btc_amount <= 0:
+            # Falling through the `> 0` test below landed in the manual-mode
+            # branch, which told the operator "No --btc-amount specified"
+            # for an amount they had plainly specified.
+            sys.exit(f"[!] --btc-amount must be positive (got "
+                     f"{args.btc_amount}).")
+        elif args.btc_amount and args.btc_amount > 0:
+            num_splits = max(args.split, 1)
+            btc_chunks = split_btc_amount(args.btc_amount, num_splits,
+                                          secrets.SystemRandom())
+            # COUNT only, never the per-chunk BTC amount: the integrity log
+            # persists, and the exact BTC-per-swap correlates directly with the
+            # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
+            # the fan-out/hop amounts stay off the chain.
+            integrity_log("stage2", f"btc_split:{num_splits}_chunks")
+            print(f"\n  [*] Splitting {args.btc_amount} BTC into "
+                  f"{num_splits} UNEQUAL chunk(s) — equal deposits made "
+                  f"minutes apart are one cluster on the Bitcoin chain, "
+                  f"and their memos read out every destination.")
+
+        if btc_chunks:
+            # ONE DESTINATION PER CHUNK. entry_addrs is in chunk
+            # order and was sized from planned_chunk_count, so a drift
+            # between the two is caught inside the quote loop rather
+            # than silently re-using an address.
+            swap_deposits = stage2_get_swap_quotes(
+                args, proxy, btc_chunks, entry_addrs)
+            # READ BACK what each chunk was actually quoted to. The
+            # deposits carry the destination they used (xmr_dest), and
+            # until this existed nothing consumed it -- the binding
+            # between "chunk 2's quote" and "entry address 2" was list
+            # POSITION and a comment claiming that mattered. A reordering
+            # anywhere between here and the arrival wait would pair a
+            # chunk with another chunk's address, which is the merge the
+            # split exists to prevent, reached by a bookkeeping slip.
+            _quoted_dests = [d.get("xmr_dest") for d in swap_deposits]
+            if _quoted_dests != entry_addrs[:len(_quoted_dests)]:
+                integrity_log("stage2", "QUOTE_DEST_MISMATCH")
+                sys.exit(
+                    "[!] The quotes were not fetched against this run's "
+                    "entry addresses, in order.\n"
+                    "    Refusing to issue deposit instructions: a chunk "
+                    "quoted to another chunk's\n"
+                    "    address would route two swaps to one entry, "
+                    "which links them at the\n"
+                    "    aggregator and merges them on-chain.")
+            integrity_log("stage2", "swap_quotes_generated")
+            total_expected, _unreadable_quotes, _ = swap_expected_total(swap_deposits)
+            print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
+            print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
+            print_sender_instructions(swap_deposits)
+        else:
+            integrity_log("stage2", "manual_mode")
+            print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
+            print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
+            print(f"        python3 thor_swap_preparer \\")
+            print(f"          --amounts <BTC_AMOUNT> \\")
+            # ONE --dests PER entry_addr ADDRESS, and printing only the first
+            # would be this defect issued as an instruction: with
+            # --split N the operator would send N swaps to one address,
+            # which is precisely what the entry set exists to stop --
+            # and thor_swap_preparer would refuse the repeat anyway.
+            print(f"          --dests "
+                  + " ".join(scrub_address(_a) for _a in entry_addrs)
+                  + " \\")
+            print(f"          --tor-proxy {args.tor_proxy}")
+            if len(entry_addrs) > 1:
+                print(f"  [!] The addresses are SCRUBBED above. Read the "
+                      f"{len(entry_addrs)} full ones from the wallet: they "
+                      f"are subaddress 1 of accounts "
+                      + ", ".join(str(_c) for _a, _c, _i in entry_set)
+                      + ".")
+                print(f"  [!] One per swap, never the same one twice — "
+                      f"that is what keeps the aggregator from linking "
+                      f"them.")
+            print(f"  [!] Then wait for the XMR to arrive before proceeding.")
+    return swap_deposits
+
+
 def main():
     install_signal_handlers()
 
@@ -6646,6 +6880,12 @@ def main():
     else:
         jm_utxos = stage1_joinmarket(args, args.btc_entry)
     integrity_log("stage1", f"done:jm_utxos={len(jm_utxos)}")
+    # THE CHUNK COUNT IS KNOWN NOW, AND --peel NEEDS ONE. resolve_split can
+    # only see --split; JoinMarket's UTXOs decide the count without it. Asked
+    # here, before the entry set, the quotes and the deposit instructions --
+    # see refuse_peel_multichunk for the walk that lands on the stage-4
+    # backstop instead.
+    refuse_peel_multichunk(args, jm_utxos)
 
     ###########################################################################
     # Stage 2 - ThorChain swap definition
@@ -6710,6 +6950,13 @@ def main():
         # whether --exit-to points back at itself -- and it is still the last
         # moment before any money moves. See reject_self_exit.
         reject_self_exit(args, addr_index, ENTRY_ADDRS)
+        # AND THE SHAPE HAS TO FIT. The decoys are drawn, the entries are
+        # minted, so the mix-output count and the chunk count are both exact
+        # here -- and this is still before the first quote. See refuse_thin_mix
+        # for the stage-4 exit it replaces, which is reached only after the
+        # swap has landed.
+        refuse_thin_mix(subs, ENTRY_ADDRS, args.wallets, _num_decoys,
+                        len(ENTRY_SET))
 
         ###########################################################################
         # Stage 2 execution - ThorChain swap (now that ENTRY address exists)
@@ -6723,92 +6970,8 @@ def main():
         # `if btc_chunks:` arm, so the wait had no idea how many chunks were
         # coming or how much they were worth, and stopped on the first one.
         swap_deposits = []
-        if receive_mode:
-            integrity_log("stage2", "skipped:receive_mode:xmr_already_on_entry")
-            print(f"\n  [+] RECEIVER MODE: Skipping ThorChain swap (XMR already on entry address).")
-            print(f"  [+] Entry address: {scrub_address(ENTRY)}")
-            swap_deposits = _receive_pairs_for(args, ENTRY)   # --swap-pairs
-        else:
-            btc_chunks = []
-
-            if jm_utxos:
-                btc_chunks = jm_utxos
-            elif args.btc_amount is not None and args.btc_amount <= 0:
-                # Falling through the `> 0` test below landed in the manual-mode
-                # branch, which told the operator "No --btc-amount specified"
-                # for an amount they had plainly specified.
-                sys.exit(f"[!] --btc-amount must be positive (got "
-                         f"{args.btc_amount}).")
-            elif args.btc_amount and args.btc_amount > 0:
-                num_splits = max(args.split, 1)
-                btc_chunks = split_btc_amount(args.btc_amount, num_splits,
-                                              secrets.SystemRandom())
-                # COUNT only, never the per-chunk BTC amount: the integrity log
-                # persists, and the exact BTC-per-swap correlates directly with the
-                # on-chain BTC deposit and the ThorChain swap it feeds. Same reason
-                # the fan-out/hop amounts stay off the chain.
-                integrity_log("stage2", f"btc_split:{num_splits}_chunks")
-                print(f"\n  [*] Splitting {args.btc_amount} BTC into "
-                      f"{num_splits} UNEQUAL chunk(s) — equal deposits made "
-                      f"minutes apart are one cluster on the Bitcoin chain, "
-                      f"and their memos read out every destination.")
-
-            if btc_chunks:
-                # ONE DESTINATION PER CHUNK. ENTRY_ADDRS is in chunk
-                # order and was sized from planned_chunk_count, so a drift
-                # between the two is caught inside the quote loop rather
-                # than silently re-using an address.
-                swap_deposits = stage2_get_swap_quotes(
-                    args, proxy, btc_chunks, ENTRY_ADDRS)
-                # READ BACK what each chunk was actually quoted to. The
-                # deposits carry the destination they used (xmr_dest), and
-                # until this existed nothing consumed it -- the binding
-                # between "chunk 2's quote" and "entry address 2" was list
-                # POSITION and a comment claiming that mattered. A reordering
-                # anywhere between here and the arrival wait would pair a
-                # chunk with another chunk's address, which is the merge the
-                # split exists to prevent, reached by a bookkeeping slip.
-                _quoted_dests = [d.get("xmr_dest") for d in swap_deposits]
-                if _quoted_dests != ENTRY_ADDRS[:len(_quoted_dests)]:
-                    integrity_log("stage2", "QUOTE_DEST_MISMATCH")
-                    sys.exit(
-                        "[!] The quotes were not fetched against this run's "
-                        "entry addresses, in order.\n"
-                        "    Refusing to issue deposit instructions: a chunk "
-                        "quoted to another chunk's\n"
-                        "    address would route two swaps to one entry, "
-                        "which links them at the\n"
-                        "    aggregator and merges them on-chain.")
-                integrity_log("stage2", "swap_quotes_generated")
-                total_expected, _unreadable_quotes, _ = swap_expected_total(swap_deposits)
-                print(f"\n  [+] {len(swap_deposits)} deposit instruction(s) generated.")
-                print(f"  [+] Expected total: ~{total_expected} XMR after swaps")
-                print_sender_instructions(swap_deposits)
-            else:
-                integrity_log("stage2", "manual_mode")
-                print(f"\n  [!] MANUAL MODE: No --btc-amount specified.")
-                print(f"  [!] Use thor_swap_preparer to generate deposit addresses:")
-                print(f"        python3 thor_swap_preparer \\")
-                print(f"          --amounts <BTC_AMOUNT> \\")
-                # ONE --dests PER ENTRY ADDRESS, and printing only the first
-                # would be this defect issued as an instruction: with
-                # --split N the operator would send N swaps to one address,
-                # which is precisely what the entry set exists to stop --
-                # and thor_swap_preparer would refuse the repeat anyway.
-                print(f"          --dests "
-                      + " ".join(scrub_address(_a) for _a in ENTRY_ADDRS)
-                      + " \\")
-                print(f"          --tor-proxy {args.tor_proxy}")
-                if len(ENTRY_ADDRS) > 1:
-                    print(f"  [!] The addresses are SCRUBBED above. Read the "
-                          f"{len(ENTRY_ADDRS)} full ones from the wallet: they "
-                          f"are subaddress 1 of accounts "
-                          + ", ".join(str(_c) for _a, _c, _i in ENTRY_SET)
-                          + ".")
-                    print(f"  [!] One per swap, never the same one twice — "
-                          f"that is what keeps the aggregator from linking "
-                          f"them.")
-                print(f"  [!] Then wait for the XMR to arrive before proceeding.")
+        swap_deposits = resolve_swap_deposits(
+            args, proxy, jm_utxos, receive_mode, ENTRY, ENTRY_ADDRS, ENTRY_SET)
 
         # THE WHOLE ENTRY SET, not ENTRY_ADDRS[0]. Every entry address is one
         # a public swap settlement points at, so a hop paying any of them puts
@@ -8488,6 +8651,17 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     # terminal below, because the NUMBER of outputs is itself the on-chain
     # search key the entry veil exists to hide.
     _held_kinds = {"entry": 0, "change": 0}
+    # EVERY HELD ADDRESS THIS HAS ALREADY NAMED, so the straggler passes below
+    # cannot report one twice. A held output is never withdrawn -- that is what
+    # holding it means -- so it is STILL FUNDED on every later re-read, and the
+    # only thing keeping the second pass quiet was the `held` list, which the
+    # first pass never adds to. Reproduced: one late chunk on ENTRY plus one
+    # ordinary late output (which is what keeps the loop alive for a second
+    # pass) printed the "arrived on the swap ENTRY address" paragraph twice and
+    # returned held["entry"] == 2 -- so the caller's report said "2 entry
+    # addresses" about one address, and sent the operator looking for a second
+    # one that does not exist.
+    _named_held = {(t[0], t[1]) for t in held}
     if held:
         targets = [t for t in targets if t not in held]
         # Once, outside the loop, and naming nothing: one line per held output
@@ -8783,8 +8957,11 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         # address a public ThorChain memo names, and nothing anywhere saying so.
         _late_held = [t for t in _late
                       if (t[0], t[1]) in _hold_set
-                      and (t[0], t[1]) not in {(h[0], h[1]) for h in held}]
+                      and (t[0], t[1]) not in _named_held]
         for _la, _li, _lamt in _late_held:
+            # BEFORE the report, not after the loop: two passes is the bound
+            # today, and a third would otherwise re-open the same hole.
+            _named_held.add((_la, _li))
             _is_entry = (_la, _li) in {(int(_a), int(_i))
                                        for _a, _i in (entry_pairs or ())}
             _held_kinds["entry" if _is_entry else "change"] += 1

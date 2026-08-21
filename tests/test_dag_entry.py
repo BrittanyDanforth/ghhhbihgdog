@@ -31,6 +31,7 @@ import re
 import types
 import io
 import contextlib
+import ast as _ast
 import secrets
 import secrets as _secretsmod
 import sys
@@ -830,6 +831,287 @@ check("control: ONE chunk with --peel is NOT refused by that check",
       "convergence" not in str(
           (lambda: [_dist([("C0", 20, 1)], [["m0"]], {"m0": Decimal("1")},
                           peel=True)] and "")() or ""))
+
+# -- ...AND THE OTHER DOOR INTO THE SAME REFUSAL --------------------------
+#
+# The parse-time gate above reads --split. The chunk count is not --split: it
+# is planned_chunk_count, whose first line is "JoinMarket first, because when
+# it ran its UTXOs ARE the chunks and --split is not consulted". So
+# `--peel --joinmarket` with a tumbler that produced two or more UTXOs walked
+# past resolve_split and landed on the stage-4 backstop -- after the tumble,
+# after the entry set, after the quotes, after the deposit instructions and
+# after the swap had arrived, which is precisely the situation the comment
+# above says the early gate exists to prevent. The message it landed on read
+# "--split 3 with --peel is not supported" and told the operator to "use
+# --split with the fan-out distribution", naming a flag they never passed.
+_jm_args = types.SimpleNamespace(split=1, peel=True, joinmarket=True)
+_jm_msg = None
+_jm_buf = io.StringIO()
+with contextlib.redirect_stdout(_jm_buf):
+    try:
+        ghost.refuse_peel_multichunk(_jm_args, [Decimal("0.1")] * 3)
+    except SystemExit as _e:
+        _jm_msg = str(_e.code)
+check("split: --peel with a MULTI-UTXO JoinMarket tumble is refused, even "
+      "though --split is 1", _jm_msg is not None)
+check("split: ...naming JoinMarket's UTXOs rather than a --split the "
+      "operator never passed",
+      _jm_msg and "JoinMarket" in _jm_msg.splitlines()[0]
+      and "--split" not in _jm_msg.splitlines()[0])
+check("split: ...and saying the swap has NOT happened, which is the whole "
+      "value of refusing here",
+      _jm_msg and "NOTHING HAS BEEN SWAPPED" in _jm_msg)
+check("split: ...still naming the convergence and the time cost",
+      _jm_msg and "convergence" in _jm_msg and "20 minutes" in _jm_msg)
+
+# The controls: one chunk is the supported shape, and no --peel means the
+# chunk count is none of this gate's business.
+_jm_ctrl = []
+for _lbl, _a, _u in (
+        ("one JoinMarket UTXO", types.SimpleNamespace(split=1, peel=True,
+                                                      joinmarket=True),
+         [Decimal("0.1")]),
+        ("no JoinMarket at all", types.SimpleNamespace(split=1, peel=True,
+                                                       joinmarket=False), []),
+        ("three chunks without --peel",
+         types.SimpleNamespace(split=1, peel=False, joinmarket=True),
+         [Decimal("0.1")] * 3)):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ghost.refuse_peel_multichunk(_a, _u)
+        _jm_ctrl.append(None)
+    except SystemExit as _e:
+        _jm_ctrl.append(f"{_lbl}: {_e.code}")
+check("control: the gate refuses none of the supported shapes",
+      _jm_ctrl == [None, None, None])
+
+# AND IT HAS TO BE CALLED BEFORE THE SWAP. Nothing executes main(), so the
+# ordering is asserted against its source: the gate must appear before the
+# entry set is minted and before the quotes are fetched, or it is the stage-4
+# backstop again under a new name.
+_pm_tree = _ast.parse(Path(REPO, "GhostSpiral").read_text())
+_pm_main = [n for n in _pm_tree.body
+            if isinstance(n, _ast.FunctionDef) and n.name == "main"]
+_pm_lines = {}
+for _n in _ast.walk(_pm_main[0] if _pm_main else _ast.Module(body=[],
+                                                             type_ignores=[])):
+    if isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name):
+        _pm_lines.setdefault(_n.func.id, _n.lineno)
+check("split: main() calls refuse_peel_multichunk at all",
+      "refuse_peel_multichunk" in _pm_lines)
+check("split: ...after stage1_joinmarket, which is where the UTXO count "
+      "becomes known",
+      _pm_lines.get("refuse_peel_multichunk", 0)
+      > _pm_lines.get("stage1_joinmarket", 10 ** 9))
+check("split: ...and BEFORE the entry set is minted",
+      _pm_lines.get("refuse_peel_multichunk", 10 ** 9)
+      < _pm_lines.get("establish_entry_set", 0))
+check("split: ...and before stage 2 runs at all",
+      _pm_lines.get("refuse_peel_multichunk", 10 ** 9)
+      < _pm_lines.get("resolve_swap_deposits", 0))
+
+# -- FEWER MIX OUTPUTS THAN CHUNKS, refused before the swap too -----------
+#
+# split_by_weight returns an EMPTY slice for every chunk it has no destination
+# left for, and stage 4 answers that with sys.exit: "N swap chunk(s) would have
+# no mix subaddress to distribute into ... Use more --wallets, or fewer --split
+# chunks." Both are flags, and the counts they decide are known one screen
+# after create_subs draws the decoys -- but that exit is reached only after
+# stage4_await_swap has watched the XMR land, so the operator is told to change
+# a flag with the money already on entry addresses a public memo names.
+#
+# --wallets 3 --split 8 reaches it whenever the random decoy draw is low:
+# fanout_count is wallets + decoys, so 3 + 2 = 5 destinations for 8 chunks.
+_tm_sl = ghost.split_by_weight([f"m{_i}" for _i in range(5)], [Decimal(1)] * 8)
+check("split: control — split_by_weight really does leave chunks with no "
+      "destination", sum(1 for _x in _tm_sl if not _x) == 3)
+
+
+def _thin(n_subs, wallets, decoys, chunks):
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            ghost.refuse_thin_mix([f"m{_i}" for _i in range(n_subs)],
+                                  [f"e{_i}" for _i in range(chunks)],
+                                  wallets, decoys, chunks)
+            return None
+        except SystemExit as _e:
+            return str(_e.code)
+
+
+_tm_msg = _thin(5, 3, 2, 8)
+check("split: 8 chunks into 5 mix subaddresses is refused before the swap",
+      _tm_msg is not None)
+check("split: ...naming both counts, so the operator can see the arithmetic",
+      _tm_msg and "8 swap chunks" in _tm_msg and "only 5 mix" in _tm_msg)
+check("split: ...and saying the swap has NOT happened",
+      _tm_msg and "NOTHING HAS BEEN SWAPPED" in _tm_msg)
+check("split: ...with a remedy that is a flag, not a recovery procedure",
+      _tm_msg and "--wallets 8 or more" in _tm_msg)
+
+# EXACT, not conservative: the decoys are already drawn when this runs, so a
+# high draw that DOES fit must not be refused. Refusing it would deny a shape
+# that works, which is the failure mode a bound would have.
+check("control: the same flags with a HIGH decoy draw are not refused",
+      _thin(10, 3, 7, 8) is None)
+check("control: the default shape is not refused", _thin(17, 10, 7, 8) is None)
+check("control: one chunk is never refused, however thin the mix",
+      _thin(5, 3, 2, 1) is None)
+# It must ask select_fanout_targets rather than count `subs`, or it disagrees
+# with stage 4 the moment either changes: 20 subs but --wallets 2 + 3 decoys is
+# 5 fan-out destinations, not 20.
+check("split: the count comes from select_fanout_targets, not from len(subs)",
+      _thin(20, 2, 3, 8) is not None)
+
+_pm_lines2 = {}
+for _n in _ast.walk(_pm_main[0]):
+    if isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name):
+        _pm_lines2.setdefault(_n.func.id, _n.lineno)
+check("split: main() calls refuse_thin_mix", "refuse_thin_mix" in _pm_lines2)
+check("split: ...after create_subs and establish_entry_set, which is what "
+      "makes both counts exact",
+      _pm_lines2.get("refuse_thin_mix", 0) > _pm_lines2.get("create_subs", 10 ** 9)
+      and _pm_lines2.get("refuse_thin_mix", 0)
+      > _pm_lines2.get("establish_entry_set", 10 ** 9))
+check("split: ...and before stage 2 runs at all",
+      _pm_lines2.get("refuse_thin_mix", 10 ** 9)
+      < _pm_lines2.get("resolve_swap_deposits", 0))
+
+# ...and "stage 2" has to still MEAN the quotes and the deposit instructions,
+# or both orderings above are satisfied by a call that does neither. Asserted
+# against resolve_swap_deposits itself rather than trusting the name: the two
+# gates were written against a main() that inlined this, and a move is exactly
+# what turns an ordering check into a check on nothing.
+_rsd = [n for n in _pm_tree.body
+        if isinstance(n, _ast.FunctionDef) and n.name == "resolve_swap_deposits"]
+_rsd_calls = {n.func.id for n in _ast.walk(_rsd[0])
+              if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)} \
+    if _rsd else set()
+check("split: ...and stage 2 is what fetches the quotes and prints the "
+      "deposit instructions",
+      {"stage2_get_swap_quotes", "print_sender_instructions"} <= _rsd_calls)
+check("split: ...and main() no longer does either itself",
+      "stage2_get_swap_quotes" not in _pm_lines2
+      and "print_sender_instructions" not in _pm_lines2)
+
+
+# ==========================================================================
+# STAGE 2 EXECUTION, NOW THAT IT IS CALLABLE.
+#
+# resolve_swap_deposits was 86 lines inline in main(), so none of its
+# branching had ever been executed by a test -- including two guards that
+# refuse before any BTC is sent. It is the code that decides how much BTC goes
+# to how many swaps and WHICH ENTRY ADDRESS each one names, which is the
+# binding the whole --split invariant rests on.
+# ==========================================================================
+print("\n== stage 2 execution: chunks, quotes and the entry binding ==")
+
+_S2A = [f"8{_c * 94}" for _c in "XYZ"]
+_S2SET = [(_a, 30 + _i, 1) for _i, _a in enumerate(_S2A)]
+
+
+def _dep(i, dest):
+    """The shape stage2_get_swap_quotes really returns -- every key
+    print_sender_instructions and swap_expected_total read."""
+    return {"chunk": i, "btc_amount": "0.1", "deposit_address": "bc1qdeposit",
+            "memo": "=:XMR.XMR:x", "expected_xmr": "1.0", "quote_id": "q",
+            "xmr_dest": dest}
+
+
+def _s2(args, jm=(), receive=False, quotes=None, pairs=None):
+    """Drive the real resolve_swap_deposits; only the network edges are stubbed."""
+    _sv = (ghost.stage2_get_swap_quotes, ghost._receive_pairs_for,
+           ghost.integrity_log)
+    _seen = {}
+
+    def _q(a, proxy, chunks, dests):
+        _seen["chunks"] = list(chunks)
+        _seen["dests"] = list(dests)
+        return (quotes if quotes is not None else
+                [_dep(_i, d) for _i, d in enumerate(dests)])
+
+    try:
+        ghost.stage2_get_swap_quotes = _q
+        ghost._receive_pairs_for = lambda a, e: (pairs if pairs is not None
+                                                 else [{"xmr_dest": e}])
+        ghost.integrity_log = lambda *a, **k: None
+        _b = io.StringIO()
+        with contextlib.redirect_stdout(_b):
+            try:
+                _r = ghost.resolve_swap_deposits(args, {"http": "x"}, list(jm),
+                                                 receive, _S2A[0], _S2A, _S2SET)
+                return _r, _b.getvalue(), None, _seen
+            except SystemExit as _e:
+                return None, _b.getvalue(), str(_e.code), _seen
+    finally:
+        (ghost.stage2_get_swap_quotes, ghost._receive_pairs_for,
+         ghost.integrity_log) = _sv
+
+
+_S2ARGS = lambda **k: types.SimpleNamespace(
+    **{**dict(btc_amount=None, split=3, tor_proxy="socks5h://127.0.0.1:9050"), **k})
+
+# Receiver mode takes the --swap-pairs bundle and asks for no quote at all.
+_r, _o, _x, _seen = _s2(_S2ARGS(), receive=True)
+check("stage2: receiver mode skips the swap and uses the --swap-pairs bundle",
+      _x is None and _r == [{"xmr_dest": _S2A[0]}] and "chunks" not in _seen)
+
+# JoinMarket's UTXOs ARE the chunks -- they are not re-split by --split.
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("1")),
+                        jm=[Decimal("0.4"), Decimal("0.6")])
+check("stage2: JoinMarket's UTXOs are the chunks, not --btc-amount re-split",
+      _x is None and _seen.get("chunks") == [Decimal("0.4"), Decimal("0.6")])
+check("stage2: ...and each chunk is quoted to its OWN entry address, in order",
+      _seen.get("dests") == _S2A)
+
+# --btc-amount is split into --split UNEQUAL chunks, and each still gets its
+# own address.
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0.3")))
+check("stage2: --btc-amount is split into --split chunks",
+      _x is None and len(_seen.get("chunks") or []) == 3
+      and sum(_seen["chunks"]) == Decimal("0.3"))
+check("stage2: ...unequal, because equal deposits minutes apart are a cluster",
+      len(set(_seen.get("chunks") or [])) == 3)
+check("stage2: ...and the deposit instructions are printed",
+      "deposit instruction" in _o)
+
+# A NON-POSITIVE --btc-amount is refused rather than falling through to the
+# manual-mode branch, which used to tell the operator "No --btc-amount
+# specified" for an amount they had plainly specified.
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0")))
+check("stage2: --btc-amount 0 is REFUSED, not read as 'no amount given'",
+      _x is not None and "must be positive" in _x)
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("-1")))
+check("stage2: ...and so is a negative one",
+      _x is not None and "must be positive" in _x)
+
+# Manual mode names EVERY entry address on the thor_swap_preparer line.
+# Printing only the first would be the merge the entry set exists to stop,
+# issued as an instruction.
+_r, _o, _x, _seen = _s2(_S2ARGS())
+check("stage2: manual mode returns no deposits and asks for none",
+      _x is None and _r == [] and "chunks" not in _seen)
+check("stage2: ...and its --dests line names EVERY entry address",
+      all(ghost.scrub_address(_a) in _o for _a in _S2A))
+check("stage2: ...saying one per swap, never the same one twice",
+      "never the same one twice" in _o)
+
+# THE BINDING ITSELF. A quote fetched against another chunk's address routes
+# two swaps to one entry, which links them at the aggregator and merges them
+# on-chain -- so it is refused before any deposit instruction is printed.
+_bad = [_dep(0, _S2A[1]), _dep(1, _S2A[0]), _dep(2, _S2A[2])]
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0.3")), quotes=_bad)
+check("stage2: quotes fetched against the WRONG entry addresses are refused",
+      _x is not None and "not fetched against this run's entry addresses" in _x)
+check("stage2: ...before any deposit instruction is printed",
+      "deposit instruction" not in _o)
+_short = [_dep(0, _S2A[0])]
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0.3")), quotes=_short)
+check("stage2: ...and a SHORT quote list is accepted only if it is a prefix",
+      _x is None)
+_wrongshort = [_dep(0, _S2A[1])]
+_r, _o, _x, _seen = _s2(_S2ARGS(btc_amount=Decimal("0.3")), quotes=_wrongshort)
+check("stage2: ...a short list that is NOT a prefix is still refused",
+      _x is not None)
 
 # ==========================================================================
 # THE SINGLE-SOURCE PEEL PLANNER, DRIVEN WITH THE OBJECT PRODUCTION PASSES.
