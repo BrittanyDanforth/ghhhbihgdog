@@ -23,6 +23,7 @@ Pure-function checks: no daemon, no wallet, no binaries. The end-to-end proof
 that value really leaves the wallet is a separate regtest run.
 """
 import importlib.machinery, importlib.util, io, os, sys, contextlib, types, json, tempfile
+from decimal import Decimal
 from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -389,7 +390,7 @@ check("control: a single held ENTRY output does not get the "
 # ENTRY for both -- sending the operator to look at an address the swap does
 # not name.
 check("exit: ...and the breakdown says it was an ENTRY hold, not a change one",
-      _h2 == {"entry": 1, "change": 0})
+      _h2 == {"entry": 1, "change": 0, "remainder": 0})
 
 # THE OTHER SIDE OF THE BREAKDOWN. Every held-output test passed a pair that
 # WAS an entry, so hard-coding the counter to "entry" survived a mutation
@@ -457,7 +458,7 @@ check("change hold: ...and is NOT told it 'never moves' — the exit used to "
 
 
 check("exit: a held output that is NOT an entry is counted as CHANGE",
-      _ch2 == {"entry": 0, "change": 1})
+      _ch2 == {"entry": 0, "change": 1, "remainder": 0})
 check("exit: ...and described as a distribution change address, not as ENTRY",
       "distribution CHANGE" in _chg_out.getvalue()
       and "swap ENTRY" not in _chg_out.getvalue())
@@ -612,7 +613,7 @@ finally:
      ghost.secure_delay) = _saved5
 check("ALL HELD: when the held ENTRY output is the ONLY funded one the hold is "
       "still reported, not a silent clean exit",
-      _hh == {"entry": 1, "change": 0} and _hr == 0)
+      _hh == {"entry": 1, "change": 0, "remainder": 0} and _hr == 0)
 check("ALL HELD: ...and the operator is told nothing was withdrawn",
       "nothing was withdrawn" in _hout.getvalue())
 
@@ -1356,6 +1357,194 @@ finally:
      ghost.secure_delete_tree, ghost.atomic_write_json, ghost.connect_rpc,
      ghost._run_round, ghost.newnym, ghost.tor_recheck, ghost.secure_delay,
      ghost.hop_delay) = _cs_saved
+
+
+# ==========================================================================
+# A PEELING CHAIN THAT STOPS PART-WAY LEAVES EVERYTHING ON ONE CARRIER, AND
+# THE EXIT USED TO WITHDRAW IT.
+#
+# Every peel consumes its carrier EXACTLY and pays the rest FORWARD, so when
+# the chain stops at peel R the whole undistributed balance is on peel R's
+# SOURCE. _run_peel_chain already tells the operator so -- "the undistributed
+# balance is safe on this wallet's account N, subaddress M ... distribute it
+# manually" -- and then the exit swept exactly that output to --exit-to.
+#
+# Driven through the shipped main() with a wallet that moves money, a 10-peel
+# chain stopped at 3: the exit withdrew 9.62 of the run's 12 XMR from that
+# carrier and printed "EXIT COMPLETE: 4 output(s) withdrawn". It is the same
+# object the fan-out's change hold refuses -- the distribution's unallocated
+# remainder, through NO hop round -- and it went to the SAME address as the
+# mixed outputs, so whoever watches that address gets the barely-mixed 80% and
+# the mixed remainder as one owner's.
+# ==========================================================================
+print("\n=== a stopped peel chain's remainder is held, not withdrawn ===")
+
+_PEELS = [{"src_index": 1, "account_index": 50, "dst": "d0",
+           "carrier": "c0", "carrier_index": 1},
+          {"src_index": 1, "account_index": 51, "dst": "d1",
+           "carrier": "c1", "carrier_index": 1},
+          {"src_index": 1, "account_index": 52, "dst": "d2", "sweep": True}]
+
+check("peel remainder: a chain stopped at 1 names peel 1's SOURCE",
+      ghost.peel_stuck_carrier(_PEELS, 1, (99, 0)) == (51, 1))
+check("peel remainder: ...stopped at 2, peel 2's source",
+      ghost.peel_stuck_carrier(_PEELS, 2, (99, 0)) == (52, 1))
+check("peel remainder: a chain that FINISHED has no remainder to name — the "
+      "last peel is a sweep",
+      ghost.peel_stuck_carrier(_PEELS, 3, (99, 0)) is None)
+check("peel remainder: an entry with no account falls back to the caller's, "
+      "not to some other account",
+      ghost.peel_stuck_carrier([{"src_index": 4}], 0, (99, 0)) == (99, 4))
+check("peel remainder: an UNREADABLE entry resolves to nothing rather than "
+      "holding the wrong address",
+      ghost.peel_stuck_carrier([{"src_index": "x", "account_index": 5}], 0,
+                               (99, 0)) is None)
+check("peel remainder: a negative count is not read backwards off the end",
+      ghost.peel_stuck_carrier(_PEELS, -1, (99, 0)) is None)
+
+# THE EXIT CLASSIFIES IT AS ITS OWN KIND. Calling it "a distribution CHANGE
+# address" would print the change sweep's remedy -- "The change sweep would
+# have moved it once, to a fresh address" -- about a mode that has no change
+# sweeps at all (build_peel_stage_plan returns no change accounts).
+_rm_saved = (ghost._run_round, ghost._wait_for_change_settled,
+             ghost._change_residue, ghost.connect_rpc, ghost.newnym,
+             ghost.tor_recheck, ghost.integrity_log, ghost.secure_delay,
+             ghost.relay_gates)
+_rm_txs = []
+try:
+    ghost._run_round = lambda a, p, st, l, wipe=True: _rm_txs.append(
+        json.load(open(p))["txs"][0]) or 1
+    ghost._wait_for_change_settled = lambda *a, **k: (True, 10)
+    ghost._change_residue = lambda *a, **k: 0
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.relay_gates = lambda *a, **k: None
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
+        raw_request=lambda m, p=None: (
+            {} if m == "refresh" else
+            {"per_subaddress": [{"address_index": 1, "balance": (
+                10 * 10 ** 12 if int((p or {}).get("account_index", 0)) == 60
+                else 5 * 10 ** 11)}]}))
+    _rmargs = types.SimpleNamespace(
+        rpc_primary="x", tor_proxy="", rpc_daemon="", fee_priority=1,
+        wallet_password="", wallet_file="w", allow_clearnet_relay=False,
+        output="/tmp/gs-rm", exit_to=[A1])
+    _rmstg = os.path.join(tempfile.mkdtemp(prefix="peelrem_"), "tx_staging")
+    os.makedirs(_rmstg, exist_ok=True)
+    _rmout = io.StringIO()
+    with contextlib.redirect_stdout(_rmout):
+        _rmres = ghost._run_exit_withdrawals(
+            _rmargs, [60, 61], [A1], _rmstg, None, {}, (0, 0),
+            hold=[(60, 1)], entry_pairs=[], remainder_pairs=[(60, 1)])
+finally:
+    (ghost._run_round, ghost._wait_for_change_settled, ghost._change_residue,
+     ghost.connect_rpc, ghost.newnym, ghost.tor_recheck, ghost.integrity_log,
+     ghost.secure_delay, ghost.relay_gates) = _rm_saved
+_rmtxt = _rmout.getvalue()
+check("peel remainder: the exit does NOT withdraw it",
+      all((t["account_index"], t["src_index"]) != (60, 1) for t in _rm_txs))
+check("peel remainder: ...while the mixed output still leaves",
+      [(t["account_index"], t["src_index"]) for t in _rm_txs] == [(61, 1)])
+check("peel remainder: ...counted under its own kind, not as change",
+      _rmres[3] == {"entry": 0, "change": 0, "remainder": 1})
+check("peel remainder: ...and named as the peel chain's undistributed balance",
+      "UNDISTRIBUTED balance" in _rmtxt)
+check("peel remainder: ...not as a distribution CHANGE, whose remedy is a "
+      "change sweep this mode never runs",
+      "distribution CHANGE" not in _rmtxt
+      and "remainder the distribution could not allocate" not in _rmtxt)
+check("peel remainder: ...nor as the swap ENTRY, which is a different address "
+      "with a different risk", "swap ENTRY" not in _rmtxt)
+check("peel remainder: ...and the operator is told it went through NO hop round",
+      "NO fan-out and NO hop round" in _rmtxt)
+
+# AND _stage5_run HAS TO HAND IT OVER. The classification above is worth
+# nothing if the pipeline never puts the pair in `hold`.
+_s5_saved = (ghost._run_peel_chain, ghost._run_exit_withdrawals,
+             ghost._wait_for_fanout_confirm, ghost._run_change_sweeps,
+             ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+             ghost.secure_delay, ghost.relay_gates, ghost._run_round)
+_s5_seen = {}
+try:
+    ghost._run_peel_chain = lambda *a, **k: 2          # 2 of 3 peels relayed
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.relay_gates = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost._run_round = lambda *a, **k: 1
+
+    def _cap_exit(a, accounts, dests, stg, proxy, meta, dw=None, hold=(),
+                  entry_pairs=(), remainder_pairs=()):
+        _s5_seen["hold"] = list(hold)
+        _s5_seen["remainder"] = list(remainder_pairs)
+        return (1, 0, 0, {"entry": 0, "change": 0, "remainder": 1}, 0)
+    ghost._run_exit_withdrawals = _cap_exit
+
+    _s5dir = Path(tempfile.mkdtemp(prefix="s5peel_"))
+    _s5stg = _s5dir / "tx_staging"
+    _s5stg.mkdir()
+    _s5plan = str(_s5dir / "peel.json")
+    with open(_s5plan, "w") as _fh:
+        json.dump({"meta": {"account_index": 7}, "txs": _PEELS}, _fh)
+    _s5args = types.SimpleNamespace(
+        exit_to=[A1], tor_proxy="", dag_mixing=False, rpc_primary="x",
+        output=str(_s5dir))
+    _s5out = io.StringIO()
+    with contextlib.redirect_stdout(_s5out):
+        _s5inc, _s5wh = ghost._stage5_run(
+            _s5args, _s5plan, None, [(90, 1), (91, 1), (92, 1)], str(_s5stg),
+            None, Decimal("9"), distribution_mode="peel",
+            change_target=(7, 0), change_sweep_jobs=[], change_accounts=[],
+            delay_window=(0, 0), exit_accounts=[90, 91, 92], exit_hold=[])
+finally:
+    (ghost._run_peel_chain, ghost._run_exit_withdrawals,
+     ghost._wait_for_fanout_confirm, ghost._run_change_sweeps,
+     ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+     ghost.secure_delay, ghost.relay_gates, ghost._run_round) = _s5_saved
+check("peel remainder: _stage5_run HOLDS the carrier the chain stopped on",
+      (52, 1) in _s5_seen.get("hold", []))
+check("peel remainder: ...and tells the exit which kind it is",
+      _s5_seen.get("remainder") == [(52, 1)])
+check("peel remainder: ...and reports it as value deliberately left behind",
+      any("UNDISTRIBUTED" in w for w in (_s5wh or [])))
+check("peel remainder: ...instead of announcing a clean exit over it",
+      "EXIT COMPLETE" not in _s5out.getvalue())
+
+# A chain that FINISHED must hold nothing extra -- the last peel is a sweep,
+# so there is no remainder, and holding a carrier that is empty would be
+# harmless but holding the WRONG one would not.
+_s5_seen.clear()
+try:
+    ghost._run_peel_chain = lambda *a, **k: 3          # all 3 relayed
+    ghost._run_change_sweeps = lambda *a, **k: 0
+    ghost._wait_for_fanout_confirm = lambda *a, **k: True
+    ghost.integrity_log = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.relay_gates = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost._run_round = lambda *a, **k: 1
+    ghost._run_exit_withdrawals = _cap_exit
+    _s5stg2 = _s5dir / "tx_staging2"
+    _s5stg2.mkdir()
+    with contextlib.redirect_stdout(io.StringIO()):
+        ghost._stage5_run(
+            _s5args, _s5plan, None, [(90, 1), (91, 1), (92, 1)], str(_s5stg2),
+            None, Decimal("9"), distribution_mode="peel",
+            change_target=(7, 0), change_sweep_jobs=[], change_accounts=[],
+            delay_window=(0, 0), exit_accounts=[90, 91, 92], exit_hold=[])
+finally:
+    (ghost._run_peel_chain, ghost._run_exit_withdrawals,
+     ghost._wait_for_fanout_confirm, ghost._run_change_sweeps,
+     ghost.integrity_log, ghost.newnym, ghost.tor_recheck,
+     ghost.secure_delay, ghost.relay_gates, ghost._run_round) = _s5_saved
+check("control: a chain that RAN EVERY PEEL holds no remainder",
+      _s5_seen.get("remainder") == [])
 
 
 

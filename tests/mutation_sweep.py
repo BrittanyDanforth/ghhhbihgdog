@@ -119,7 +119,9 @@ MUTATIONS = [
   ["test_dag_entry"]),
 
  ("the clean-exit message tests the container, not the counts", "GhostSpiral",
-  "        elif _relayed and not (_held_entry or _held_change):",
+  # Re-anchored: the held breakdown gained a third kind (a stopped peel
+  # chain's undistributed remainder), so the condition names three counts.
+  "        elif _relayed and not (_held_entry or _held_change or _held_remainder):",
   "        elif _relayed and not _held:",
   ["test_exit_withdraw"]),
 
@@ -180,9 +182,16 @@ MUTATIONS = [
   "    return [addr_index[a] for a in _addrs[:1] if a in addr_index]",
   ["test_dag_entry", "test_exit_withdraw"]),
 
+ # Re-anchored: the two-way ternary became _held_kind(), which has three
+ # answers now (a peel chain's undistributed remainder is neither ENTRY nor a
+ # distribution change).
  ("held outputs are all reported as ENTRY", "GhostSpiral",
-  '            _held_kinds["entry" if _is_entry else "change"] += 1',
-  '            _held_kinds["entry"] += 1',
+  '        if pair in _entry_set:\n'
+  '            return "entry"\n'
+  '        if pair in _remainder_set:\n'
+  '            return "remainder"\n'
+  '        return "change"',
+  '        return "entry"',
   ["test_exit_withdraw"]),
 
  ("a chunk with no destinations is silently dropped", "GhostSpiral",
@@ -245,10 +254,12 @@ MUTATIONS = [
   "    _entry_funded = sorted(list(_entry_accts)[:1])[:0]",
   ["test_dag_entry", "test_units"]),
 
+ # Re-anchored: stage 2 execution moved out of main() into
+ # resolve_swap_deposits, and ENTRY_ADDRS became the `entry_addrs` parameter.
  ("manual mode prints one --dests for every chunk", "GhostSpiral",
-  '                      + " ".join(scrub_address(_a) for _a in ENTRY_ADDRS)',
-  '                      + scrub_address(ENTRY_ADDRS[0])',
-  ["test_send_gates"]),
+  '                  + " ".join(scrub_address(_a) for _a in entry_addrs)',
+  '                  + scrub_address(entry_addrs[0])',
+  ["test_dag_entry", "test_send_gates"]),
 
  # The exit hold is the LAST thing standing between a swap chunk that landed
  # late and a one-hop sweep to --exit-to from the address the OP_RETURN memo
@@ -257,10 +268,12 @@ MUTATIONS = [
  # reports success.
  ("the exit holds only the chunks that ARRIVED, not the full entry set",
   "GhostSpiral",
+  # Re-anchored: the _stage5_run call grew dag_dst_index/sweep_targets, so
+  # the line this ended on now ends in a comma rather than a bracket.
   "                                 exit_hold=_exit_hold_list(args, addr_index,\n"
-  "                                                           ENTRY_ADDRS))",
+  "                                                           ENTRY_ADDRS),",
   "                                 exit_hold=_exit_hold_list(args, addr_index,\n"
-  "                                                           [_e[0] for _e in ENTRY_SET_FUNDED]))",
+  "                                                           [_e[0] for _e in ENTRY_SET_FUNDED]),",
   ["test_split_partial"]),
 
  # The amounts must follow the ADDRESS. Reverting to the flat concatenation
@@ -313,8 +326,10 @@ MUTATIONS = [
  # 200 of 200 plans, every one of them merging two chunk groups.
  ("the orphan hop pass may re-take a destination another group has",
   "GhostSpiral",
-  "            _free = [d for d in mix_targets if d not in set(_dsts.values())]",
-  "            _free = list(mix_targets)",
+  # Re-anchored: the orphan pool gained the _safe_dsts filter.
+  "            _free = [d for d in mix_targets\n"
+  "                     if d in _safe_dsts and d not in set(_dsts.values())]",
+  "            _free = [d for d in mix_targets if d in _safe_dsts]",
   ["test_dag_entry"]),
 
  # ...and the cross-call check that also covers overlapping slices, which
@@ -443,9 +458,15 @@ MUTATIONS = [
  # failure, and the loop re-runs the leaking gate on every remaining output.
  ("a mid-run Tor leak during the exit is swallowed as a withdrawal failure",
   "GhostSpiral",
-  "            if not _gates_passed:\n                raise",
-  "            if False:\n                raise",
-  ["test_exit_withdraw"]),
+  # Re-anchored: the _gates_passed flag was replaced by RelayGateAbort, so the
+  # thing that must not be swallowed is the re-raise in the exit's own loop.
+  # (Mutation 61 covers the change-sweep loop, which has the same shape.)
+  "            # A distinct exception type rather than the local flag this used to\n"
+  "            # keep: the flag could not travel to the change-sweep loop, which\n"
+  "            # has the same shape and the same catch. See RelayGateAbort.\n"
+  "            raise",
+  "            pass",
+  ["test_exit_withdraw", "test_tor_gates"]),
 
  # _run_change_sweep calls _run_round, which sys.exits on a create/sign/
  # broadcast failure. Without the guard that abort leaves the sweep loop and
@@ -479,9 +500,56 @@ MUTATIONS = [
  # Every fan-out share is quantised onto a 0.0001 XMR grid, so independent
  # draws collide: 81% of plans held a repeat at 0.5 XMR / --wallets 20. The
  # docstring's first line promises "DELIBERATELY UNEQUAL".
+ # time.monotonic() is seconds since BOOT on Linux, so a rate-limiter starting
+ # at 0.0 asks "is this host older than ten minutes?" instead of "have I
+ # reported yet?" -- and suppresses the FIRST "an entry address could not be
+ # read" line on a freshly booted machine. The total is 7 of 10 XMR either way;
+ # that line is the only thing saying the missing 3 was unreadable rather than
+ # absent, and it feeds the arrival gate.
+ ("the first unreadable-entry warning is lost near boot", "GhostSpiral",
+  '    state = {"beat": None, "clock": clock or time.monotonic}',
+  '    state = {"beat": 0.0, "clock": clock or time.monotonic}',
+  ["test_swap_arrival"]),
+
+ # ...and removing the limit outright fixes that case by re-creating the flood
+ # it exists to prevent: one line per 30s poll across a multi-hour wait.
+ ("the unreadable-entry warning is not rate-limited at all", "GhostSpiral",
+  '        if (blind or stale) and (state["beat"] is None\n'
+  '                                 or now - state["beat"] >= UNREADABLE_REPORT_S):',
+  "        if blind or stale:",
+  ["test_swap_arrival"]),
+
+ # A peeling chain that stops part-way leaves EVERYTHING it had left on one
+ # carrier -- each peel consumes its carrier exactly and pays the rest forward.
+ # Driven through the shipped main(), the exit swept 9.62 of 12 XMR from that
+ # carrier to --exit-to, unmixed, and printed "EXIT COMPLETE".
+ ("a stopped peel chain's undistributed remainder is withdrawn to --exit-to",
+  "GhostSpiral",
+  "        if _stuck_carrier:\n"
+  "            _hold.append((int(_stuck_carrier[0]), int(_stuck_carrier[1])))",
+  "        if False:\n"
+  "            _hold.append((int(_stuck_carrier[0]), int(_stuck_carrier[1])))",
+  ["test_peel_pipeline", "test_exit_withdraw"]),
+
+ # ...and the pair it holds has to be the carrier the chain STOPPED on. Naming
+ # the peel that DID run holds an address that is already empty and leaves the
+ # remainder to the exit, which is the same defect wearing a hold.
+ ("the peel remainder hold names the wrong carrier", "GhostSpiral",
+  "            _stuck_carrier = peel_stuck_carrier(_peel_txs, _relayed,\n"
+  "                                                tuple(change_target))",
+  "            _stuck_carrier = peel_stuck_carrier(_peel_txs, _relayed - 1,\n"
+  "                                                tuple(change_target))",
+  ["test_peel_pipeline"]),
+
  ("the fan-out amounts may repeat (the equal-value cluster)", "GhostSpiral",
-  "    if _excess == 0:\n        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]",
-  "    if False:\n        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]",
+  # Re-anchored, and closer to the defect it names: the staircase now RETURNS
+  # directly and the give-back failure refuses with []. The old behaviour --
+  # "a repeat is a weaker failure than an over-budget plan" -- was to hand back
+  # the original draw, repeats and all, which is what this restores.
+  '    integrity_log("stage4", "fanout_refused:indistinct_amounts")\n'
+  "    return []",
+  '    integrity_log("stage4", "fanout_refused:indistinct_amounts")\n'
+  "    return amounts",
   ["test_units"]),
 ]
 
@@ -533,3 +601,16 @@ if __name__ == "__main__":
         r = run(i, *mut)
         tally[r] = tally.get(r, 0) + 1
     print("\n", tally)
+    # SKIP IS NOT A PASS, and neither is a crashed suite -- this file's header
+    # says so twice and then exited 0 anyway, so a sweep that covered 58 of 65
+    # guarantees looked exactly like one that covered all of them. Six anchors
+    # had rotted silently before anyone re-read the tally by hand.
+    _bad = {k: v for k, v in tally.items() if k != "CAUGHT"}
+    if _bad:
+        print(f"\n[!] {sum(_bad.values())} mutation(s) did not produce a "
+              f"verdict: {_bad}.")
+        print("    SKIP means the anchor no longer matches, so that guarantee "
+              "was NOT swept -- re-anchor it against the current source. "
+              "SURVIVED means nothing noticed. NO-RESULT means the suite "
+              "crashed, which proves nothing about its checks.")
+        sys.exit(1)

@@ -1309,6 +1309,58 @@ try:
     check("blind: ...and warns they may be stale",
           any("stale" in _l for _l in _slines))
 
+    # THE FIRST WARNING MUST NOT DEPEND ON HOW LONG THE HOST HAS BEEN UP.
+    #
+    # The rate-limiter started at beat=0.0 and compared time.monotonic()
+    # against it -- and on Linux time.monotonic() is CLOCK_MONOTONIC, seconds
+    # since BOOT. So the first tick asked "is this host older than
+    # UNREADABLE_REPORT_S?" instead of "have I reported yet?", and within ten
+    # minutes of boot the first warning was suppressed outright. The total is
+    # 7 of 10 XMR either way; that line is the ONLY thing saying the missing 3
+    # was unreadable rather than absent, and it feeds the arrival gate, where
+    # "less than expected" reads as a short swap.
+    #
+    # Found because this suite went red on a container four minutes old and
+    # green on the same tree ten minutes later. Every check above ran on a
+    # host that happened to be old enough.
+    for _up in (0.0, 5.0, float(ghost.UNREADABLE_REPORT_S) - 1):
+        _ylines = []
+        ghost.entry_balance_reader(_BlindRPC(_BFULL, dead=[(11, 1)]), _BP,
+                                   echo=_ylines.append, clock=lambda: _up)()
+        check(f"blind: an unreadable address is reported {_up:g}s after boot, "
+              f"not only on a host older than "
+              f"{ghost.UNREADABLE_REPORT_S // 60} min",
+              any("could NOT be read" in _l for _l in _ylines))
+        _zlines = []
+        ghost.entry_balance_reader(_BlindRPC(_BFULL, refresh_ok=False), _BP,
+                                   echo=_zlines.append, clock=lambda: _up)()
+        check(f"blind: ...and so is a stale wallet, {_up:g}s after boot",
+              any("stale" in _l for _l in _zlines))
+
+    # ...and it is still RATE-LIMITED, which is the whole reason the beat
+    # exists: at a 30s poll an unrate-limited line pushes every real event out
+    # of the console buffer. Removing the suppression entirely would fix the
+    # boot case and re-create the flood.
+    _tick = {"t": 1000.0}
+    _rlines = []
+    _reader = ghost.entry_balance_reader(_BlindRPC(_BFULL, dead=[(11, 1)]),
+                                         _BP, echo=_rlines.append,
+                                         clock=lambda: _tick["t"])
+    _reader()
+    _first = len(_rlines)
+    _ticks = int(ghost.UNREADABLE_REPORT_S // 30) - 1     # stay inside the window
+    for _ in range(_ticks):
+        _tick["t"] += 30.0
+        _reader()
+    check("blind: the first tick reports", _first == 1)
+    check(f"blind: ...and the next {_ticks} at 30s do NOT — one line per "
+          f"{ghost.UNREADABLE_REPORT_S // 60} min, not one per poll",
+          len(_rlines) == 1)
+    _tick["t"] += 30.0                                    # now past the window
+    _reader()
+    check("blind: ...and it speaks again once the interval has passed",
+          len(_rlines) == 2)
+
     # The one-shot read is a DECISION, and must fail closed.
     check("blind: the strict read returns normally on a healthy wallet",
           [u for _t, u in ghost.read_entry_balances_strict(
