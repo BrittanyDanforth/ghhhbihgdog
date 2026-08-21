@@ -79,7 +79,7 @@ def drive(fn, *args, payload=None, raises=None, status_ok=True, **kw):
             return _Resp(payload, status_ok)
         _get.seen = None
         gs.requests.get = _get
-        gs.integrity_log = lambda stage, msg, **k: logged.append(msg)
+        gs.integrity_log = lambda stage, msg, *a, **k: logged.append(msg)
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):

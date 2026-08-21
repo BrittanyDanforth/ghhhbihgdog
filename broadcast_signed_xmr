@@ -382,7 +382,7 @@ def build_rpc_pool(args) -> List[str]:
     if len(rpc_pool) > 1:
         print(f"  [!] {len(rpc_pool)} RPC endpoints given; submit_transfer only works "
               f"against the wallet-rpc that created the set. Others will reject it.")
-    integrity_log("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
+    integrity_log_once("broadcast", f"rpc_pool:{len(rpc_pool)}_nodes")
     return rpc_pool
 
 
@@ -516,7 +516,7 @@ def main():
     # broadcast egress is clearnet regardless of what this script reports.
     print("  [!] OPSEC: relay egress is controlled by the wallet-rpc/monerod")
     print("  [!] Tor config (--tx-proxy/--proxy), NOT by this script.")
-    integrity_log("broadcast", "egress_via_walletrpc_daemon_conn")
+    integrity_log_once("broadcast", "egress_via_walletrpc_daemon_conn")
 
     # Actually CHECK that egress instead of only telling the operator to. The
     # transaction leaves the machine via monerod's peer connections, so a
@@ -525,7 +525,7 @@ def main():
     # wallet-rpc); without it we can only repeat the warning.
     if args.rpc_daemon:
         eg = check_daemon_relay_egress(args.rpc_daemon, proxy)
-        integrity_log("broadcast", f"relay_egress:{eg['verdict']}")
+        integrity_log_once("broadcast", f"relay_egress:{eg['verdict']}")
         if eg["verdict"] == "clearnet":
             print(f"  [!] RELAY EGRESS IS CLEARNET: {eg['detail']}")
             if not args.allow_clearnet_relay:
@@ -615,7 +615,7 @@ def main():
     # part of the timing plan -- a reordered manifest must not silently change
     # the sequence the plan was built around.
     items.sort(key=lambda i: i.idx)
-    integrity_log("broadcast", f"blobs_found:{len(items)}")
+    integrity_log_once("broadcast", f"blobs_found:{len(items)}")
 
     manifest_hashes = {i.key: i.sha for i in items if i.sha}
 
@@ -692,7 +692,7 @@ def main():
 
     if any(i.delay for i in items):
         n_delays = sum(1 for i in items if i.delay)
-        integrity_log("broadcast", f"delays_loaded:{delay_source}")
+        integrity_log_once("broadcast", f"delays_loaded:{delay_source}")
         print(f"  [+] TX delays loaded from {delay_source} ({n_delays} entries)")
     else:
         integrity_log("broadcast", "WARNING:no_delays_found")
@@ -712,7 +712,7 @@ def main():
                 print(f"  [!] TAMPERED: {t}")
             sys.exit(f"[!] {len(tampered)} blob(s) failed hash verification! Aborting.")
         n_present = sum(1 for i in items if i.path.exists())
-        integrity_log("broadcast", f"manifest_verified:{n_present}_blobs_ok")
+        integrity_log_once("broadcast", f"manifest_verified:{n_present}_blobs_ok")
         print(f"  [+] Manifest verification: {n_present}/{len(items)} present blobs OK")
 
     absent = [i.key for i in items if not i.path.exists()]
@@ -1013,7 +1013,7 @@ def main():
                   f"- will retry on --resume {progF}")
             _transient("transient")
 
-    integrity_log("broadcast", "done")
+    integrity_log_once("broadcast", "done")
     print(f"\n  [+] Broadcast complete: {success_count} relayed this run, "
           f"{fail_count} failed, {skip_count} skipped "
           f"({len(relayed)}/{len(items)} relayed total, {len(failed_perm)} permanently failed).")

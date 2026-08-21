@@ -40,6 +40,7 @@ does not give you:
 Pure functions and driven fakes: no daemon, no wallet, no network.
 """
 import ast
+import collections
 import contextlib
 import hashlib
 import importlib.machinery
@@ -48,6 +49,7 @@ import io
 import os
 import re
 import secrets as _secretsmod
+import subprocess
 import sys
 import tempfile
 import types
@@ -1154,6 +1156,108 @@ check("thor: ...and that the destinations came from bundles is still recorded",
       "dest_from_bundle" in _tl.read_text())
 check("thor: ...and the chain still verifies",
       gsc.verify_integrity_chain(_tl)[0] is True)
+
+
+
+# ==========================================================================
+# "AT MOST ONCE PER PROCESS" IS NOT ONCE PER RUN, and a round is three
+# processes.
+#
+# integrity_log_once collapses a repeated event because "cardinality survives
+# redaction whenever a loop writes a line per turn". Its set lived in the
+# process, and GhostSpiral spawns a fresh signer twice and a fresh broadcaster
+# once for EVERY round -- so an N-round loop wrote N copies of every line the
+# guard exists to collapse.
+#
+# Measured on a completed run's chain file, between the exit's own
+# withdraw_start and withdraw_done markers, with every digit already redacted:
+#
+#      9  signer     using_account_index:#
+#      9  signer     create_done:#_created:#_failed
+#      8  broadcast  relayed
+#      8  broadcast  done
+#     17  tor        verified_ok
+#
+# That run made exactly nine exit withdrawals -- the number the exit collapses
+# its OWN lines into a set to avoid recording.
+# ==========================================================================
+print()
+print("=== once-per-RUN, across child processes ===")
+
+_REPO_DIR = str(Path(__file__).resolve().parent.parent)
+_PROG = (
+    "import sys, pathlib\n"
+    "sys.path.insert(0, " + repr(_REPO_DIR) + ")\n"
+    "import gs_common as gs\n"
+    "_p = pathlib.Path(sys.argv[1])\n"
+    'gs.integrity_log_once("signer", "using_account_index:7", _p)\n'
+    'gs.integrity_log_once("broadcast", "relayed", _p)\n'
+    'gs.integrity_log("signer", "create_fail:idx=3:Boom", _p)\n'
+)
+
+_od = Path(tempfile.mkdtemp(prefix="chain_once_"))
+_oc, _om = _od / "chain.log", _od / "marker"
+
+
+def _rounds(n, marker):
+    _oc.write_text("")
+    _om.write_text("")
+    for _ in range(n):
+        _e = dict(os.environ)
+        if marker:
+            _e["GS_CHAIN_RUN_ONCE"] = str(_om)
+        else:
+            _e.pop("GS_CHAIN_RUN_ONCE", None)
+        subprocess.run([sys.executable, "-c", _PROG, str(_oc)], check=True,
+                       env=_e, capture_output=True)
+    return collections.Counter(
+        l.split("|")[-1] for l in _oc.read_text().splitlines())
+
+
+_no = _rounds(5, marker=False)
+check("chain-once: WITHOUT the marker, five child rounds leave five copies - "
+      "this is the defect, driven",
+      _no["using_account_index:#"] == 5 and _no["relayed"] == 5)
+_yes = _rounds(5, marker=True)
+check("chain-once: WITH it, five child rounds leave ONE line each",
+      _yes["using_account_index:#"] == 1 and _yes["relayed"] == 1)
+check("chain-once: ...so the round count cannot be read off the chain",
+      sum(v for k, v in _yes.items() if "fail" not in k) == 2)
+check("chain-once: FAILURES still chain every time - counting those gives the "
+      "number of things that went wrong, not the size of the run",
+      _yes["create_fail:idx=#:Boom"] == 5)
+check("chain-once: ...and the chain still verifies",
+      gsc.verify_integrity_chain(_oc)[0] is True)
+
+# THE WIRING. A guard nothing passes the marker to is the same guard.
+_gs_src = (Path(__file__).resolve().parent.parent / "GhostSpiral").read_text()
+check("chain-once: GhostSpiral creates the marker at the start of stage 5",
+      "open_chain_once_marker(args.output)" in _gs_src)
+check("chain-once: ...hands it to every child it spawns",
+      'env["GS_CHAIN_RUN_ONCE"] = _CHAIN_ONCE_FILE[0]' in _gs_src)
+check("chain-once: ...and erases it with the spent plans",
+      '_CHAIN_ONCE_FILE[0] = ""' in _gs_src)
+_sg_src = (Path(__file__).resolve().parent.parent / "airgap_tx_signer").read_text()
+_bc_src = (Path(__file__).resolve().parent.parent / "broadcast_signed_xmr").read_text()
+for _ev in ("using_account_index", "outputs_exported", "create_done",
+            "outputs_imported", "sign_done"):
+    check("chain-once: the signer's " + _ev + " is a once-per-run event",
+          'integrity_log_once("signer", f"' + _ev in _sg_src
+          or 'integrity_log_once("signer", "' + _ev in _sg_src)
+for _ev in ("rpc_pool", "blobs_found", "delays_loaded", "manifest_verified",
+            "egress_via_walletrpc_daemon_conn"):
+    check("chain-once: the broadcaster's " + _ev + " is a once-per-run event",
+          'integrity_log_once("broadcast", f"' + _ev in _bc_src
+          or 'integrity_log_once("broadcast", "' + _ev in _bc_src)
+check("chain-once: and Tor's verified_ok, which fired twice per withdrawal",
+      'integrity_log_once("tor", "verified_ok")' in
+      (Path(__file__).resolve().parent.parent / "gs_common.py").read_text())
+# NON-VACUITY: failures must NOT have been routed through the guard.
+for _bad in ("create_fail", "TAMPER_DETECTED", "DOUBLE_SPEND",
+             "plan_fingerprint_mismatch"):
+    check("chain-once: " + _bad + " still chains every time",
+          'integrity_log_once("signer", f"' + _bad not in _sg_src
+          and 'integrity_log_once("broadcast", f"' + _bad not in _bc_src)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

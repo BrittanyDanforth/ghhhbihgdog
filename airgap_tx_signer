@@ -35,7 +35,7 @@ from decimal import Decimal
 from typing import List
 
 from gs_common import (
-    integrity_log, atomic_write_json, secure_file_perms,
+    integrity_log, integrity_log_once, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     redact_addresses, env_or_argv,
     connect_rpc, validate_proxy, verify_tor, secure_delete_file,
@@ -616,7 +616,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         integrity_log("signer", "bad_account_index")
         sys.exit(f"[!] meta.account_index must be a non-negative int, got "
                  f"{acct_idx!r}.")
-    integrity_log("signer", f"using_account_index:{acct_idx}")
+    integrity_log_once("signer", f"using_account_index:{acct_idx}")
 
     outdir = Path(args.outdir)
     if outdir.is_dir():
@@ -769,7 +769,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         _blob = _exp.get("outputs_data_hex", "")
         if _blob:
             secure_write_text(outdir / OUTPUTS_EXPORT_NAME, _blob)
-            integrity_log("signer", "outputs_exported")
+            integrity_log_once("signer", "outputs_exported")
             print(f"  [+] Exported wallet outputs for offline signing "
                   f"({OUTPUTS_EXPORT_NAME})")
         else:
@@ -796,7 +796,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             _n = len(_accts.get("subaddress_accounts", []) or [])
             if _n:
                 secure_write_text(outdir / ACCOUNTS_COUNT_NAME, str(_n))
-                integrity_log("signer", f"accounts_count:{_n}")
+                integrity_log_once("signer", f"accounts_count:{_n}")
         except Exception as e:                              # noqa: BLE001
             integrity_log("signer", f"accounts_count_fail:{type(e).__name__}")
             print(f"  [!] Could not read the wallet's account count "
@@ -817,7 +817,7 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         "entries": manifest,
     }, manifest_path)
 
-    integrity_log("signer", f"create_done:{created}_created:{failed}_failed")
+    integrity_log_once("signer", f"create_done:{created}_created:{failed}_failed")
     print(f"\n  [+] Phase 1 complete: {created} unsigned TXs created, {failed} failed.")
     if failed:
         print(f"  [!] {failed} TXs failed. Check RPC connection and balances.")
@@ -1049,7 +1049,7 @@ def _ensure_offline_accounts(outdir, wallet_file: str, args) -> None:
                   + "account new\n" * missing + "exit\n")
         after = _offline_account_count(wallet_file, args)
         if after >= needed:
-            integrity_log("signer", f"offline_accounts_topped_up:{after}")
+            integrity_log_once("signer", f"offline_accounts_topped_up:{after}")
             print(f"  [+] Offline wallet now has {after} accounts.")
         else:
             integrity_log("signer", "offline_accounts_topup_short")
@@ -1128,7 +1128,7 @@ def _import_view_outputs(outdir, wallet_file: str, args) -> None:
                 _txt = (_r.stdout or "") + (_r.stderr or "")
                 if "outputs imported" in _txt:
                     n = _txt.split("outputs imported")[0].strip().split()[-1]
-                    integrity_log("signer", "outputs_imported")
+                    integrity_log_once("signer", "outputs_imported")
                     print(f"  [+] Imported {n} wallet outputs into the offline wallet "
                           f"(needed to sign spends of earlier rounds' outputs).")
                 else:
@@ -1393,7 +1393,7 @@ def phase_sign(args, plan: List[dict]):
     final_manifest = signed_dir / "signed_manifest_v1.json"
     atomic_write_json(signed_manifest, final_manifest)
 
-    integrity_log("signer", f"sign_done:{signed_count}_signed")
+    integrity_log_once("signer", f"sign_done:{signed_count}_signed")
     print(f"\n  [+] Phase 2 complete: {signed_count}/{len(entries)} TXs signed.")
     if signed_count < len(entries):
         # Refuse a gapped batch. The original reason given here -- that a gap

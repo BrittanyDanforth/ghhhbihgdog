@@ -4709,9 +4709,24 @@ def announce_distribution_shape(args, n_outputs: int) -> None:
 
     A peel consumes its carrier EXACTLY now and the last one sweeps, so there
     is no change output: in=1 out=2 extra=99, verified end to end through the
-    cold-signing path. 99 rather than 44 because two real destinations need two
-    output pubkeys -- that is the whole of what is left, and it is stated to
-    the operator rather than described as "ordinary".
+    cold-signing path.
+
+    99 AND NOT 44, AND THAT IS IRREDUCIBLE. Measured on current consensus:
+
+        pay ONE subaddress, take change      in=2 out=2 extra= 44
+        pay ONE standard address, take change in=2 out=2 extra= 44
+        pay TWO subaddresses, take change     in=2 out=3 extra=131
+        a peel: TWO subaddresses, no change   in=1 out=2 extra= 99
+
+    An ordinary payment carries one real destination, so monerod needs a single
+    tx pubkey; a peel carries two, so it needs one per output. The output count
+    now matches the ordinary shape and the tx_extra does not, and that is the
+    whole of what is left -- said to the operator rather than described as
+    "ordinary". Removing it would mean a peel with ONE real destination, i.e.
+    letting the forward be monerod's change -- which lands on the spending
+    account's subaddress 0 and rebuilds the repeated-spender hub the rotating
+    carriers exist to remove. monero-wallet-rpc's transfer has no change-address
+    parameter, so there is no third option.
 
     The entry veil's own notice, printed moments earlier, says the transaction
     spending the swap output is "an ordinary 2-output send rather than one an
@@ -6932,28 +6947,16 @@ def main():
         tor_recheck(proxy, "stage5_pre")
 
         _stage5_cleanup(Path(args.output), fanout_file, dag_file, veil_file)
+        # AFTER the cleanup, which erases this directory. See the function.
+        open_chain_once_marker(args.output)
 
         staging_dir = "tx_staging"
-        # ONE SWEEP DESTINATION PER CHANGE LOCATION, and one sweep each.
-        #
-        # A fan-out leaves change in one place, so this is one job. A peel
-        # chain leaves change on every hop's account (see
-        # build_peel_stage_plan) and gets one job per hop -- because the whole
-        # point of splitting the hops across accounts is that each change
-        # output can then be swept ALONE. Collecting them in one sweep would
-        # be an N-input transaction, which is public proof that all N peels
-        # share an owner.
-        #
-        # The destinations are distinct addresses AND distinct ACCOUNTS.
-        #
-        # Distinct addresses alone is not enough, and getting that far and
-        # stopping is how this stays broken one level up. Sweeping N outputs
-        # into one address does not link them today -- stealth addresses make
-        # each arrival a separate one-time key -- but N outputs in one ACCOUNT
-        # can be spent by one transaction, and that transaction's input count
-        # proves they share an owner. These are swept change: they are what
-        # the operator is left holding, so they get the same treatment every
-        # other resting output gets (see create_subs).
+        # ONE SWEEP DESTINATION PER CHANGE LOCATION, and one sweep each --
+        # distinct ADDRESSES and distinct ACCOUNTS, because N outputs in one
+        # account can be spent by one transaction and that transaction's input
+        # count proves they share an owner. A peel chain has no change
+        # locations at all now; a fan-out has one per chunk. See
+        # build_change_sweep_jobs and _run_change_sweeps for the full argument.
         change_sweep_jobs = build_change_sweep_jobs(
             rpc_primary, addr_index, change_accounts)
 
@@ -7157,10 +7160,49 @@ def _wipe_spent_plans(*plan_files):
         if pf and Path(pf).exists() and not secure_delete_file(pf):
             print(f"  [!] Could not securely erase the spent plan {pf}; it holds "
                   f"every hop's destination and amount. Remove it by hand.")
+    # The chain marker goes with them. It holds only redacted event NAMES, so
+    # it is not sensitive in itself -- but it lists which routine events this
+    # run reached, and a file whose existence dates a run is the artifact
+    # _stage5_run already rmdir's the empty staging directory to avoid.
+    _cm = _CHAIN_ONCE_FILE[0]
+    if _cm and Path(_cm).exists():
+        secure_delete_or_warn(Path(_cm), "this run's chain marker")
+    _CHAIN_ONCE_FILE[0] = ""
 
 
 #: Env var carrying the wallet spend-key password to the SIGN child only.
 GS_PW_ENV = "GS_WALLET_PASSWORD"
+
+#: Path of this run's shared "already chained" marker, or "" before it exists.
+#:
+#: A one-element list rather than a plain global so _child_env can read it
+#: without a `global` declaration and the value has exactly one home. Created
+#: by open_chain_once_marker at the start of stage 5 and erased by its caller;
+#: it holds only event NAMES, which are already redacted, and never a value.
+_CHAIN_ONCE_FILE = [""]
+
+
+def open_chain_once_marker(outdir) -> str:
+    """Create this run's shared once-per-run chain marker. Returns its path.
+
+    Children get the path through GS_CHAIN_RUN_ONCE (see _child_env), so
+    integrity_log_once's set spans the RUN rather than each child process.
+    Without it a loop of N rounds writes N copies of every routine line and the
+    count is read off the chain by counting -- see _child_env.
+
+    In the run's own output directory so _stage5_cleanup and paranoia_mode
+    already cover it, and 0600 like everything else this run writes.
+    """
+    try:
+        _p = Path(outdir) / f".chain_once_{secure_hex(6)}"
+        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(_fd)
+        _CHAIN_ONCE_FILE[0] = str(_p)
+        return str(_p)
+    except OSError:
+        # A missing marker costs duplicate chain lines, not a broken run.
+        _CHAIN_ONCE_FILE[0] = ""
+        return ""
 
 
 def _child_env(wallet_password: str = None) -> dict:
@@ -7196,6 +7238,20 @@ def _child_env(wallet_password: str = None) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GS_")}
     if wallet_password is not None:
         env[GS_PW_ENV] = wallet_password
+    # THE ONE GS_ VARIABLE A CHILD IS GIVEN BACK, and it carries no value of
+    # the operator's -- only the path of a marker file listing which ROUTINE
+    # chain events this run has already recorded.
+    #
+    # gs_common.integrity_log_once collapses a repeated event to one line
+    # because "cardinality survives redaction whenever a loop writes a line per
+    # turn". Its set was per PROCESS, and a round spawns three fresh children,
+    # so an N-round loop wrote N copies of every line the guard exists to
+    # collapse. Measured on a completed run: nine `signer|using_account_index:#`
+    # lines between the exit's own withdraw_start and withdraw_done markers,
+    # for a run that made exactly nine withdrawals -- the number the exit
+    # collapses its OWN lines into a set to avoid recording.
+    if _CHAIN_ONCE_FILE[0]:
+        env["GS_CHAIN_RUN_ONCE"] = _CHAIN_ONCE_FILE[0]
     return env
 
 

@@ -968,10 +968,49 @@ def integrity_log_once(stage: str, kind: str, log_path: Path = INTEGRITY_LOG) ->
     Failure events are deliberately NOT routed through this: counting them
     yields the number of things that went wrong, not the size of the run, and
     they are the entries an audit most needs.
+
+    "PER PROCESS" WAS NOT ENOUGH, AND THE COMMENT ABOVE SAYS WHY WITHOUT
+    NOTICING. A GhostSpiral round spawns THREE fresh child processes -- the
+    signer twice and the broadcaster once -- and each one starts with an empty
+    set, so a loop of N rounds writes N copies of every line these guards were
+    added to collapse. Measured on a completed run's chain file: between the
+    exit's own withdraw_start and withdraw_done markers, with every digit in
+    the file already redacted to '#',
+
+        9  signer     using_account_index:#
+        9  signer     create_done:#_created:#_failed
+        8  broadcast  relayed
+        8  broadcast  done
+
+    and that run made exactly 9 exit withdrawals. The count the parent went to
+    the trouble of collapsing into a set was recoverable by counting its
+    children's lines instead.
+
+    GS_CHAIN_RUN_ONCE names a file that makes the set RUN-scoped: the parent
+    creates it, passes it to every child it spawns, and deletes it at the end.
+    The first round chains each kind and the rest do not. A kind that only
+    appears on round seven is still new, so it is still chained -- which is
+    what keeps failures visible.
     """
     key = (stage, kind)
     if key in _CARDINAL_EVENTS_LOGGED:
         return ""
+    _shared = os.environ.get("GS_CHAIN_RUN_ONCE") or ""
+    if _shared:
+        # The chain's own lock serialises this: rounds are sequential and each
+        # spawns one child at a time, so a plain read-then-append is enough,
+        # and a lost race costs one duplicate line rather than a wrong chain.
+        _line = f"{stage}\t{kind}\n"
+        try:
+            with open(_shared, "a+") as _f:
+                _f.seek(0)
+                if _line in _f.read():
+                    return ""
+                _f.write(_line)
+        except OSError:
+            # An unreadable marker file must not silence the chain: a missing
+            # entry is worse than a duplicate one.
+            pass
     _CARDINAL_EVENTS_LOGGED.add(key)
     return integrity_log(stage, kind, log_path)
 
@@ -1352,7 +1391,13 @@ def verify_tor(proxy: Dict[str, str]) -> None:
     if not data.get("IsTor"):
         integrity_log("tor", "LEAK_DETECTED")
         sys.exit("[!] Tor leak detected - traffic NOT exiting via Tor. Aborting.")
-    integrity_log("tor", "verified_ok")
+    # ONCE per run, not once per verification. verify_tor is called at stage 0,
+    # before every round, and inside every broadcast child -- so a run with N
+    # withdrawals wrote N+ identical `tor|verified_ok` lines and the count came
+    # straight off the file. Measured: 17 of them inside one exit bracket.
+    # A FAILURE still chains every time (verify_fail / LEAK_DETECTED above are
+    # not routed through this), which is the half an audit needs.
+    integrity_log_once("tor", "verified_ok")
 
 
 def tor_recheck(proxy: Dict[str, str], stage: str = "recheck") -> None:
