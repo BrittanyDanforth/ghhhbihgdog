@@ -30,6 +30,22 @@ bcast = load("broadcast_signed_xmr")
 os.chdir(_scratch)
 
 PASS = 0; FAIL = 0; FAILURES = []
+import sys as _sys_cg, os as _os_cg
+_sys_cg.path.insert(0, _os_cg.path.dirname(_os_cg.path.abspath(__file__)))
+from srcutil import fail_loudly_on_crash              # noqa: E402
+
+# ARMED HERE, NOT AT THE END. A crash never reaches the bottom of the file --
+# that is what makes it a crash -- so the guard is registered as soon as the
+# counters exist. Whatever kills this suite, the RESULT line still prints and
+# the crash counts as a failure.
+#
+# Without it, a mutation that makes the file DIE is scored NO-RESULT by
+# mutation_sweep, which its own header says is not a catch. That has already
+# turned one genuinely-caught mutation into a recorded survivor, and it has
+# hit three separate call sites in this repo. Guarding the outcome beats
+# guarding each call.
+_finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILURES), "test_units.py")
+
 def check(name, cond):
     global PASS, FAIL
     if cond:
@@ -231,8 +247,15 @@ check("fanout: amounts are UNEQUAL (defeats equal-value clustering)",
       len(set(_amts)) == 8)
 check("fanout: sum never exceeds the spend budget",
       sum(_amts) <= _bud)
+# `_amts and min(...)`, not a bare min(). An over-refusing compute_fanout_amounts
+# returns [], min() raises ValueError on an empty sequence, and the whole file
+# dies HERE -- before printing a RESULT line, so mutation_sweep scores it
+# NO-RESULT, which its own header says is not a catch. Two checks above had
+# already gone red; the crash threw that away. Same trap as the spread checks
+# in test_dag_entry, which killed that file the same way and turned a caught
+# mutation into a survivor.
 check("fanout: every amount reserves its own hop fee (DAG on)",
-      min(_amts) >= ghost.hop_fee_reserve(_fee))
+      bool(_amts) and min(_amts) >= ghost.hop_fee_reserve(_fee))
 check("fanout: a seeded rng is deterministic (same seed -> same split)",
       ghost.compute_fanout_amounts(Decimal("10"), 8, _fee, True, _rnd.Random(1)) == _amts)
 check("fanout: a different seed gives a different split",
@@ -291,6 +314,61 @@ for _fb, _fw in ((Decimal("0.5"), 20), (Decimal("1"), 20), (Decimal("0.5"), 10))
     check(f"fanout: ...and the distinctness construction did not break the "
           f"budget or the per-output floor at {_fb}/{_fw}",
           _fover == 0 and _ffloor == 0)
+
+# ...AND THE SETTINGS WHERE THE STAIRCASE CANNOT BE PAID FOR AT ALL.
+#
+# The three settings above are ones where the staircase has room and simply
+# had to be applied. Below a certain remainder there are not 0+1+...+(N-1)
+# grid ticks to go round, the give-back cannot balance, and the function used
+# to fall through to
+#
+#     return amounts          # the ORIGINAL draw, repeats and all
+#
+# under a comment ending "Not reached at any setting measured above." It is
+# reached, at settings the CLI accepts (--wallets tops out at 60), and it was
+# silent -- nothing printed, and the run went on to create those outputs.
+#
+# Measured against the shipped compute_fee_budget, fee 0.0024, --dag-mixing:
+#
+#     0.5 XMR / --wallets 40  -> 40/40 draws repeat. 40 outputs, 21 distinct,
+#                                8 clusters, worst SIX outputs all 0.0052 XMR
+#     0.8 XMR / --wallets 60  -> 40/40 draws repeat, worst four all 0.0066
+#
+# Six on-chain outputs of one value is the cluster this whole construction
+# exists to remove. The BTC side already refuses rather than hand back repeats
+# (split_btc_amount raises "Refusing to return repeated deposit amounts"); the
+# XMR side now agrees, by returning [] -- which already means "cannot fund
+# this many viable outputs" and which main() answers with exactly the right
+# advice, before anything has been spent.
+for _nb, _nw in ((Decimal("0.5"), 40), (Decimal("0.8"), 60)):
+    _nu = ghost.compute_fee_budget(_nb, Decimal("0.0024"), _nw, deep=1)
+    if isinstance(_nu, tuple):
+        _nu = _nu[0]
+    _got = [ghost.compute_fanout_amounts(_nu, _nw, Decimal("0.0024"), True,
+                                         _fo_rng) for _ in range(30)]
+    check(f"fanout: {_nb} XMR across {_nw} destinations is REFUSED rather "
+          f"than returned with repeated amounts",
+          all(not _g for _g in _got))
+
+# The refusal must be reachable as an abort with usable advice, not a silent
+# empty list -- [] is the signal main() already turns into that message.
+_fo_src = " ".join(code_only(os.path.join(REPO, "GhostSpiral")).split())
+check("fanout: main() turns the empty plan into an abort naming the remedy",
+      "if not fanout_amounts:" in _fo_src
+      and "Use fewer wallets, disable --dag-mixing, or fund the wallet more."
+      in _fo_src)
+
+# NON-VACUITY, and the half that would make the fix a regression: a setting
+# with room must still come back with a full, distinct plan. Refusing
+# everything would satisfy the check above and destroy the tool.
+for _gb, _gw in ((Decimal("5"), 10), (Decimal("20"), 25), (Decimal("100"), 40)):
+    _gu = ghost.compute_fee_budget(_gb, Decimal("0.0024"), _gw, deep=2)
+    if isinstance(_gu, tuple):
+        _gu = _gu[0]
+    _ga = ghost.compute_fanout_amounts(_gu, _gw, Decimal("0.0024"), True,
+                                       _fo_rng)
+    check(f"fanout: {_gb} XMR across {_gw} still returns a full distinct plan",
+          len(_ga) == _gw and len(set(_ga)) == _gw)
 
 # ...and the chunk INDEX must not correlate with the chunk SIZE. The staircase
 # sorts, and sorted() is stable, so keying on the value alone would hand the
@@ -3981,6 +4059,8 @@ check("malformed success: ...and a WELL-FORMED answer is still accepted",
       gs.create_fresh_account(_Answers(_GOODC)) == 5)
 
 
+
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

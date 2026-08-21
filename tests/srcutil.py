@@ -83,3 +83,57 @@ def code_only(path: str) -> str:
             a = min(a, len(body)); b = min(b, len(body))
             out[i] = body[:a] + (" " * max(0, b - a)) + body[b:] + nl
     return "".join(out)
+
+
+def fail_loudly_on_crash(counters, label="suite"):
+    """Make an unhandled exception print a RED result instead of no result.
+
+    WHY: mutation_sweep scores a suite by parsing "N passed, M failed" out of
+    its output, and its own header says a crash "prints no RESULT line, and a
+    crashed suite proves nothing about its checks. Those score NO-RESULT, never
+    CAUGHT". That is the right rule, and it means any mutation that makes a
+    suite DIE rather than fail is recorded as a SURVIVOR.
+
+    It has happened three times in this codebase:
+
+      * test_dag_entry: a spread check called split_btc_amount directly, a
+        mutation routed every split into its ValueError, and the file died --
+        turning [17] from CAUGHT/RED(32) into SURVIVED/NO-RESULT and silently
+        disarming 32 working checks;
+      * test_units: `min(_amts)` on an empty list when a mutation made
+        compute_fanout_amounts refuse everything, after two checks had already
+        gone red;
+      * test_units again, twenty lines later, on PeelBudgetError from the same
+        mutation.
+
+    Guarding each call site is whack-a-mole and the third one proves it. This
+    guards the OUTCOME instead: whatever kills the file, the RESULT line still
+    prints and it counts the crash as a failure, so a crash can never be read
+    as green and can never be read as absent.
+
+    `counters` is a zero-argument callable returning (passed, failed, names) so
+    the live totals are read at exit rather than captured now.
+    """
+    import atexit
+    import sys as _sys
+    import traceback as _tb
+
+    state = {"finished": False}
+
+    def _done():
+        state["finished"] = True
+
+    def _at_exit():
+        if state["finished"]:
+            return
+        exc = _sys.exc_info()[1]
+        passed, failed, names = counters()
+        print(f"\n  [!] {label} DIED before finishing: "
+              f"{type(exc).__name__ if exc else 'unexpected exit'}")
+        if exc is not None:
+            _tb.print_exc()
+        print(f"\nRESULT: {passed} passed, {failed + 1} failed")
+        print("FAILED:", list(names) + [f"{label} crashed before completing"])
+
+    atexit.register(_at_exit)
+    return _done

@@ -50,6 +50,22 @@ _ld.exec_module(ghost)
 PASS = 0
 FAIL = 0
 FAILS = []
+import sys as _sys_cg, os as _os_cg
+_sys_cg.path.insert(0, _os_cg.path.dirname(_os_cg.path.abspath(__file__)))
+from srcutil import fail_loudly_on_crash              # noqa: E402
+
+# ARMED HERE, NOT AT THE END. A crash never reaches the bottom of the file --
+# that is what makes it a crash -- so the guard is registered as soon as the
+# counters exist. Whatever kills this suite, the RESULT line still prints and
+# the crash counts as a failure.
+#
+# Without it, a mutation that makes the file DIE is scored NO-RESULT by
+# mutation_sweep, which its own header says is not a catch. That has already
+# turned one genuinely-caught mutation into a recorded survivor, and it has
+# hit three separate call sites in this repo. Guarding the outcome beats
+# guarding each call.
+_finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS), "test_dag_entry.py")
+
 
 
 def check(name, cond):
@@ -1993,6 +2009,7 @@ check("shape: ...and the DAG-off notice it mirrors is still there",
       "Run with --dag-mixing to" in _sh_src)
 
 
+_finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

@@ -709,13 +709,71 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
         if not _moved:
             break
     # Only when the give-back balanced exactly. Below 0+1+...+(N-1) ticks there
-    # is no distinct assignment and the staircase cannot be paid for; leaving
-    # the original amounts is right there, because the budget guarantees are
-    # what the caller funds against and a repeat is a weaker failure than an
-    # over-budget plan. Not reached at any setting measured above.
+    # is no distinct assignment and the staircase cannot be paid for.
     if _excess == 0:
-        amounts = [min_each + DUST_XMR * Decimal(_v) for _v in _tick]
-    return amounts
+        return [min_each + DUST_XMR * Decimal(_v) for _v in _tick]
+    # THE STAIRCASE COULD NOT BE PAID FOR. What happens next used to be
+    # "leave the original amounts ... a repeat is a weaker failure than an
+    # over-budget plan", with the note "Not reached at any setting measured
+    # above."
+    #
+    # It is reached, and the note was the only thing standing between an
+    # operator and an equal-value cluster on chain. Measured against the
+    # shipped compute_fee_budget at fee 0.0024 with --dag-mixing:
+    #
+    #     0.5 XMR / --wallets 40  -> 40/40 runs repeat; 40 outputs, 21 distinct,
+    #                                8 clusters, worst 6 outputs all 0.0052 XMR
+    #     0.8 XMR / --wallets 60  -> 40/40 runs repeat; worst 4 outputs all
+    #                                0.0066 XMR
+    #
+    # Both are settings the CLI accepts (--wallets tops out at 60), and both
+    # are the ordinary way an operator over-splits a small balance. The
+    # function printed nothing and the run went on to create those outputs.
+    # Six on-chain outputs of identical value is precisely the cluster this
+    # whole staircase exists to remove, and it is worse than no staircase,
+    # because the docstring promises "DELIBERATELY UNEQUAL".
+    #
+    # The BTC side already refuses the same situation rather than return
+    # repeats -- split_btc_amount raises "Refusing to return repeated deposit
+    # amounts" -- so this is the XMR side finally agreeing with it.
+    #
+    # [] IS THE EXISTING SIGNAL, not a new one: it already means "cannot fund
+    # this many viable outputs", and main() answers it with the message this
+    # case needs word for word --
+    #
+    #     Usable balance X XMR too small to fan out across N subaddresses with
+    #     the fee reserve each output needs. Use fewer wallets, disable
+    #     --dag-mixing, or fund the wallet more.
+    #
+    # -- at stage 4, before anything has been spent.
+    #
+    # UNCONDITIONAL, because reaching this line already means the draw had a
+    # duplicate. The first version guarded it with
+    #
+    #     if len(set(amounts)) == len(amounts): return amounts
+    #
+    # on the reasoning that a failed give-back with an already-distinct draw
+    # should not be refused. That case cannot occur, and the guard was dead
+    # code wearing the shape of a safety net:
+    #
+    #   * _order sorts the ticks, so the staircase's `_tick[_i] <= _tick[_prev]`
+    #     can only fire on an EQUAL pair, never an inverted one;
+    #   * a tick is therefore raised only when two original ticks were equal;
+    #   * _excess is the sum of those raises, so _excess > 0 implies at least
+    #     one equal pair;
+    #   * amounts are min_each + tick * DUST_XMR, so equal ticks are equal
+    #     amounts.
+    #
+    # Reaching here means _excess > 0 means the draw repeats. Confirmed by
+    # instrumenting the function over 3186 calls across balance 0.3-100,
+    # --wallets 3-60, --deep 1-6, DAG on and off: 3108 took the staircase, 78
+    # landed here, and NOT ONE arrived with a distinct draw.
+    #
+    # Found because a mutation that deleted the guard survived the whole suite
+    # -- which is what an equivalent mutant looks like, and the honest response
+    # is to delete the code rather than write a test that cannot fail.
+    integrity_log("stage4", "fanout_refused:indistinct_amounts")
+    return []
 
 
 def select_fanout_targets(mix_targets: list, decoy_addrs: set,
