@@ -741,10 +741,13 @@ def _dist(sources, slices, by_addr, peel=False, bal=None, usable=None):
     _bal = bal if bal is not None else _tot * Decimal("50") + Decimal("10")
     _use = usable if usable is not None else _bal * Decimal("0.9")
     with contextlib.redirect_stdout(io.StringIO()):
-        return ghost.build_distribution_plan(
+        _r = ghost.build_distribution_plan(
             _args, None, _ai, sources, [d for sl in slices for d in sl],
             by_addr, slices, Decimal("0.0024"), sources[0][1],
             sum(len(sl) for sl in slices), (0, 0), _secretsmod, _bal, _use)
+        # (plan, change_accounts, mode) -- the 4th element is the amounts the
+        # planner actually used, checked separately below.
+        return _r[:3]
 
 
 _SRC = [("C0", 20, 1), ("C1", 21, 1), ("C2", 22, 1)]
@@ -875,7 +878,7 @@ _pl_err = None
 _pl_plan = _pl_mode = None
 try:
     with contextlib.redirect_stdout(io.StringIO()):
-        _pl_plan, _pl_chg, _pl_mode = ghost.build_distribution_plan(
+        _pl_plan, _pl_chg, _pl_mode, _pl_amts = ghost.build_distribution_plan(
             _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
             _pl_dests, _pl_by, [_pl_dests], Decimal("0.0024"), 20,
             len(_pl_dests), (0, 0), _peel_secmod, Decimal("50"),
@@ -908,7 +911,7 @@ _pl_tight_err = None
 _pl_tight_mode = None
 try:
     with contextlib.redirect_stdout(io.StringIO()):
-        _pt_plan, _pt_chg, _pl_tight_mode = ghost.build_distribution_plan(
+        _pt_plan, _pt_chg, _pl_tight_mode, _pt_amts = ghost.build_distribution_plan(
             _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
             _pl_dests, _pl_by, [_pl_dests], Decimal("0.0024"), 20,
             len(_pl_dests), (0, 0), _peel_secmod,
@@ -923,6 +926,70 @@ check(f"peel planner: the SHRINK path also survives the secrets module "
       f"({_pl_tight_err or 'no error'})", _pl_tight_err is None)
 check("peel planner: ...and it either built or refused, never crashed",
       _pl_tight_mode in ("peel", "refused"))
+
+# THE AMOUNTS THE PLANNER RETURNS MUST BE THE AMOUNTS THE PLAN PAYS.
+#
+# fanout_by_addr is a PARAMETER of build_distribution_plan, and the peel branch
+# rebinds it when fit_peel_distribution shrinks the distribution. That rebind
+# used to stay inside the function: main() went on to hand build_dag_plan the
+# PRE-shrink dict, so the hop planner sized its fundability check from amounts
+# no mix subaddress ever received. It happened to be harmless -- every amount
+# compute_fanout_amounts produces clears min_hop_fundable, so both the stale
+# and the real number answer hop_is_fundable the same way -- but that is the
+# floor being the only question anyone asks, not the dict being right.
+#
+# Checked against the PLAN rather than against the input, so it holds whether
+# or not a shrink happened: every non-final peel names its destination and
+# amount explicitly, and those must be the returned numbers to the piconero.
+def _amounts_agree(plan, by_addr):
+    for _t in plan:
+        for _d in _t.get("destinations", ()):
+            if Decimal(str(_d["amount"])) != Decimal(str(by_addr[_d["address"]])):
+                return False
+    return True
+
+
+check("peel planner: the returned amounts are the ones the plan pays",
+      _pl_plan is not None and _amounts_agree(_pl_plan, _pl_amts))
+
+# AND ON THE SHRINK PATH, which is the only one where the dict changes. Search
+# for a balance that actually shrinks rather than guessing one: the fixture
+# that merely refuses, or merely fits, leaves this unexercised -- which is how
+# the stale dict survived in the first place.
+_shrunk_plan = _shrunk_amts = None
+# Six 1 XMR destinations need 6.018 with the headroom, so anything at or
+# below 6.00 forces the 0.80 fraction. Walked rather than pinned to one
+# number, because the reserve constants are the kind that get retuned.
+for _bal_try in ("6.00", "5.75", "5.50", "5.00", "4.50", "4.00", "3.00"):
+    _buf_sh = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(_buf_sh):
+            _sp, _sc, _sm, _sa = ghost.build_distribution_plan(
+                _pl_args, _PeelRpc(), {"PC0": (20, 1)}, [("PC0", 20, 1)],
+                _pl_dests, dict(_pl_by), [_pl_dests], Decimal("0.0024"), 20,
+                len(_pl_dests), (0, 0), _peel_secmod,
+                Decimal(_bal_try), Decimal(_bal_try) * Decimal("0.98"))
+    except SystemExit:
+        continue
+    if "could not carry the full distribution" in _buf_sh.getvalue():
+        _shrunk_plan, _shrunk_amts = _sp, _sa
+        break
+check("peel planner: a shrinking balance was found, so the path below ran",
+      _shrunk_plan is not None)
+check("peel planner: a SHRUNK distribution returns the shrunk amounts",
+      _shrunk_plan is not None
+      and any(Decimal(str(_shrunk_amts[_d])) != _pl_by[_d] for _d in _pl_dests))
+check("peel planner: ...and they still match what the plan pays",
+      _shrunk_plan is not None and _amounts_agree(_shrunk_plan, _shrunk_amts))
+
+# The call site has to USE the fourth value. A caller that unpacks three and
+# keeps its own dict is the defect back, with the function fixed.
+_bdp_txt = Path(REPO, "GhostSpiral").read_text()
+check("peel planner: main() rebinds fanout_by_addr from the return",
+      "fanout_by_addr) = build_distribution_plan(" in _bdp_txt)
+check("peel planner: ...and build_dag_plan is still handed that same name",
+      "build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr,"
+      in _bdp_txt)
 
 # -- the budget follows the money -----------------------------------------
 _slices, _su, _amts, _bad = ghost.size_distribution(

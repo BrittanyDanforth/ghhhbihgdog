@@ -5921,7 +5921,20 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
                             _delay_window, _secrets, bal,
                             usable) -> tuple:
     """Build the plan that spends the carriers. Returns
-    (fanout_plan, change_accounts, distribution_mode).
+    (fanout_plan, change_accounts, distribution_mode, fanout_by_addr).
+
+    THE AMOUNTS COME BACK OUT, and that is not tidiness. The peel branch below
+    can SHRINK the distribution (fit_peel_distribution), and it rebuilt
+    fanout_by_addr to match -- but fanout_by_addr is a PARAMETER, so the rebind
+    stayed inside this function while main() went on to hand build_dag_plan the
+    pre-shrink dict. The hop planner reads it in exactly one place,
+    hop_is_fundable, and today both the stale and the real amount clear the
+    same floor (compute_fanout_amounts pins every amount at min_hop_fundable
+    when DAG mixing is on), so nothing was misplanned. That is luck, not
+    design: it holds only while the floor is the only thing anyone asks the
+    amounts for, and the next reader who asks for a magnitude gets a number
+    the mix subaddress never received. Returning it removes the trap instead
+    of documenting it.
 
     `bal` and `usable` are REQUIRED, not defaulted. They exist so the peel
     branch can run fit_peel_distribution, and a default of None would let a
@@ -6113,7 +6126,7 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
         # unheld -- and an unheld change output is one the exit sweeps
         # straight to --exit-to.
         change_accounts = [a for _d, a, _i in SPEND_SOURCES]
-    return fanout_plan, change_accounts, distribution_mode
+    return fanout_plan, change_accounts, distribution_mode, fanout_by_addr
 
 
 def establish_entry_set(args, rpc_primary, addr_index, jm_utxos,
@@ -6910,7 +6923,11 @@ def main():
         # Per-destination amount, so each mix subaddress receives its OWN magnitude.
         fanout_by_addr = dict(zip(fanout_dests, fanout_amounts))
 
-        fanout_plan, change_accounts, distribution_mode = build_distribution_plan(
+        # fanout_by_addr COMES BACK. A shrunk peel distribution rebinds it in
+        # there, and the old call discarded that -- build_dag_plan below then
+        # sized its fundability check from amounts no subaddress received.
+        (fanout_plan, change_accounts, distribution_mode,
+         fanout_by_addr) = build_distribution_plan(
             args, rpc_primary, addr_index, SPEND_SOURCES, fanout_dests,
             fanout_by_addr, _dest_slices, fee_xmr, bal_account,
             fanout_count, _delay_window, _secrets, bal, usable)
@@ -6975,7 +6992,7 @@ def main():
             rpc_primary, addr_index, change_accounts)
         # Where the last rounds pay. The exit gates on these having landed
         # before it reads the wallet -- see _stage5_run's landing gate.
-        _dag_tg, _sweep_tg = _landing_targets(addr_index, dag_plan,
+        _dag_ix, _sweep_tg = _landing_targets(addr_index, dag_plan,
                                               change_sweep_jobs)
 
         # HOW LONG THIS WILL TAKE, BEFORE IT STARTS. The delays are the
@@ -7008,7 +7025,7 @@ def main():
                                      addr_index, change_accounts, bal_account),
                                  exit_hold=_exit_hold_list(args, addr_index,
                                                            ENTRY_ADDRS),
-                                 dag_targets=_dag_tg,
+                                 dag_dst_index=_dag_ix,
                                  sweep_targets=_sweep_tg)
 
         report_completion(rpc_primary, incomplete,
@@ -8137,7 +8154,7 @@ def _exit_hold_list(args, addr_index, entry_addr) -> list:
 
 
 def _landing_targets(addr_index, dag_plan, change_sweep_jobs) -> tuple:
-    """(dag_targets, sweep_targets) -- where the last rounds PAY INTO.
+    """(dag_dst_index, sweep_targets) -- where the last rounds PAY INTO.
 
     The exit may not enumerate what it will withdraw until the round that
     funded it has landed (see the landing gate in _stage5_run), and "landed"
@@ -8145,21 +8162,29 @@ def _landing_targets(addr_index, dag_plan, change_sweep_jobs) -> tuple:
     here, in stage 4, where both the plan and addr_index exist -- _stage5_run
     has neither.
 
-    A hop's destination is an address; addr_index turns it into the
-    (account, index) pair a balance poll takes. A change sweep already carries
-    its destination index, but not the ACCOUNT it was minted in, which
-    build_change_sweep_jobs put in addr_index and nowhere else.
+    A MAP rather than a list, because _stage5_run may DROP hops before it runs
+    the round: a peel chain that stopped part-way never funded the later
+    sources, so their sweeps cannot be built. It filters the plan and then has
+    to name the destinations of what SURVIVED, which a positional list cannot
+    answer once entries have been removed. Keyed by the destination address the
+    plan entry already carries.
 
-    Anything the index cannot resolve is dropped rather than guessed: a wrong
-    pair here would make the gate poll an address nobody paid, and the exit
-    would then wait out the full hour before running. Dropping one costs the
-    gate a little coverage, which the straggler pass in the exit backstops.
+    A change sweep carries its destination index but not the ACCOUNT it was
+    minted in, which build_change_sweep_jobs put in addr_index and nowhere
+    else -- so those are resolved here too, and stay a list because nothing
+    filters them afterwards.
+
+    Anything the index cannot resolve is left out rather than guessed: a wrong
+    pair would make the gate poll an address nobody paid, and the exit would
+    then wait out the full hour before running. What is left out costs the gate
+    a little coverage, which the straggler pass in the exit backstops.
     """
-    _dag = []
+    _dag = {}
     for _e in (dag_plan or ()):
-        _pair = addr_index.get(_e.get("dst"))
-        if _pair:
-            _dag.append((int(_pair[0]), int(_pair[1])))
+        _dst = _e.get("dst")
+        _pair = addr_index.get(_dst)
+        if _dst and _pair:
+            _dag[_dst] = (int(_pair[0]), int(_pair[1]))
     _sweep = []
     for _j in (change_sweep_jobs or ()):
         _pair = addr_index.get(_j[2])
@@ -8704,7 +8729,7 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
                 veil_need=None, exit_accounts=None, exit_hold=None,
-                dag_targets=None, sweep_targets=None):
+                dag_dst_index=None, sweep_targets=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -8719,12 +8744,13 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     to None only so the confirmation-gated helper stays callable in isolation;
     the pipeline must pass all four.
 
-    dag_targets/sweep_targets are the (account, index) pairs the DAG round and
-    the change sweeps PAY INTO. They exist for one reason: the exit must not
-    enumerate what it will withdraw until the round that funded it has landed.
-    See the landing gate below -- without it the exit reads the wallet seconds
-    after the last relay, misses whatever the wallet has not scanned yet, and
-    reports a complete exit anyway."""
+    dag_dst_index maps each hop's destination ADDRESS to the (account, index)
+    a balance poll takes, and sweep_targets is the same for the change sweeps.
+    They exist for one reason: the exit must not enumerate what it will
+    withdraw until the round that funded it has landed. See the landing gate
+    below -- without it the exit reads the wallet seconds after the last relay,
+    misses whatever the wallet has not scanned yet, and reports a complete exit
+    anyway."""
     # -- Round 0: veil the entry ------------------------------------------
     # ENTRY holds the one output an analyst is handed for free (the swap memo
     # is public). Sweep it into a fresh carrier FIRST, so the transaction that
@@ -8740,6 +8766,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     # only this function knows which rounds actually ran and how far they got.
     # See the landing gate just before the exit.
     _landed = []
+    # The DISTRIBUTION's destinations that were actually funded, kept apart
+    # from _landed because the DAG round needs them for a second job: they are
+    # the only outputs a hop can be built from, so they decide which hops the
+    # round may still contain when the distribution stopped part-way.
+    _dist_landed = []
     if veil_file:
         print("  [*] === Round 0: entry veil ===")
         newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
@@ -8847,7 +8878,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # a chain that stopped at _relayed funded exactly the first _relayed
         # targets. The rest can never hold anything and waiting on them would
         # be an hour of polling an address nobody paid.
-        _landed += list(fanout_targets or ())[:_relayed]
+        _dist_landed = list(fanout_targets or ())[:_relayed]
+        _landed += _dist_landed
         if _total_peels and _relayed < _total_peels:
             incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
         # Every peel left (carrier reserve - real fee) as change on its OWN
@@ -8905,7 +8937,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
         # One transaction, every target paid. Nothing to trim.
-        _landed += list(fanout_targets or ())
+        _dist_landed = list(fanout_targets or ())
+        _landed += _dist_landed
         # The fan-out could not allocate its input exactly, so ~10% came back
         # as change. Sweep it to a fresh address rather than leaving a tenth of the
         # balance parked, unmixed, on the one output that never moves.
@@ -8927,7 +8960,73 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     if dag_file:
         newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))   # anonymity gate before DAG broadcast round
         secure_delay(5.0, 15.0)
-        if _wait_for_fanout_confirm(args, fanout_targets, proxy):
+        # A HOP CAN ONLY BE BUILT FROM AN OUTPUT THAT EXISTS.
+        #
+        # The gate below used to wait on EVERY distribution target and the
+        # round used every hop in the plan. Both are wrong after a peel chain
+        # that stopped part-way, and they were wrong in a way that cost the
+        # whole round:
+        #
+        #   * the gate polled the carriers the chain never reached. Those
+        #     addresses cannot ever hold anything, so it spent the full
+        #     FANOUT_CONFIRM_TIMEOUT -- an hour -- and then returned False;
+        #   * so the DAG round was skipped ENTIRELY. Every output the chain DID
+        #     fund lost its second mixing round, and the operator was told the
+        #     outputs "did not confirm in time" about outputs that had
+        #     confirmed perfectly.
+        #
+        # Trimming the wait alone would be worse than leaving it: phase_create
+        # exits 1 if ANY transaction in a batch fails to build, and _run_round
+        # turns that into sys.exit -- so the round would have reached monerod,
+        # been told "no unlocked balance" for the unfunded sources, and killed
+        # the run AFTER the peels were on-chain and BEFORE the exit. The plan
+        # has to be filtered to match the wait.
+        #
+        # Dropping a hop whose SOURCE was never funded cannot create the merge
+        # build_dag_plan spends its length preventing. That merge needs an
+        # address to end the round holding TWO outputs, which needs an address
+        # that holds its own output and does not sweep it away. After this
+        # filter an address holds its own output only if the distribution
+        # funded it, and a funded source's hop is exactly the kind this filter
+        # KEEPS -- so the two conditions cannot both be true. An unfunded
+        # destination holds nothing and ends with the one hop it receives.
+        _dag_txs, _dag_meta = [], {}
+        try:
+            _dag_doc = json.loads(Path(dag_file).read_text())
+            _dag_txs = list(_dag_doc.get("txs") or [])
+            _dag_meta = _dag_doc.get("meta", {}) or {}
+        except Exception:                                    # noqa: BLE001
+            _dag_txs, _dag_meta = [], {}
+        _kept = _dag_txs
+        # Only when the distribution really is partial. In fan-out mode one
+        # transaction pays every target, so _dist_landed IS fanout_targets and
+        # this filter would be a no-op that could only introduce a bug; and a
+        # caller that passed no targets at all must not have its plan emptied.
+        if fanout_targets and len(_dist_landed) < len(fanout_targets):
+            _funded_srcs = {(int(a), int(i)) for a, i in _dist_landed}
+            _kept = [_e for _e in _dag_txs
+                     if (int(_e.get("account_index",
+                                    _dag_meta.get("account_index", -1))),
+                         int(_e.get("src_index", -1))) in _funded_srcs]
+            _dropped_hops = len(_dag_txs) - len(_kept)
+            if _dropped_hops:
+                integrity_log("stage5", "dag_hops_dropped_unfunded_source")
+                print(f"  [!] {_dropped_hops} planned hop(s) would have swept a "
+                      f"mix subaddress the distribution never reached, so they "
+                      f"were removed from the round. Building them would have "
+                      f"failed 'no unlocked balance' and taken the whole run "
+                      f"down with the distribution already on-chain.")
+                atomic_write_json({"meta": _dag_meta, "txs": _kept}, Path(dag_file))
+        if not _kept:
+            integrity_log("stage5", "dag_round_skipped:no_funded_source")
+            print("  [!] Skipping the DAG hop round — the distribution funded "
+                  "no output that can source a hop. What it did distribute is "
+                  "on-chain and untouched.")
+            incomplete.append("DAG hop round was SKIPPED (no distribution output "
+                              "survived to source a hop) — the second mixing "
+                              "round did not happen")
+        elif _wait_for_fanout_confirm(args, _dist_landed, proxy,
+                                      what="distribution"):
             print("  [*] === Round 2: DAG hop-mixing ===")
             tor_recheck(proxy, "stage5_dag")
             _run_round(args, dag_file, f"{staging_dir}/dag", "DAG")
@@ -8937,10 +9036,15 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             # that hold nothing until it timed out. The value is on the hop
             # DESTINATIONS, and those are what the exit will withdraw.
             #
+            # From the KEPT entries, not from the plan as it was written: a
+            # destination whose hop was just dropped is never paid, and waiting
+            # on it would put back the hour this filter exists to remove.
+            #
             # Sources that did not hop (unfundable or unassigned -- see
             # build_dag_plan) keep their own output, which unlocked before this
             # round even started, so nothing is lost by dropping them here.
-            _landed = list(dag_targets or ())
+            _ix = dag_dst_index or {}
+            _landed = [_ix[_e["dst"]] for _e in _kept if _e.get("dst") in _ix]
         else:
             integrity_log("stage5", "dag_round_skipped:unconfirmed")
             print("  [!] Skipping the DAG hop round — the distribution outputs "
