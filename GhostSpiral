@@ -3466,13 +3466,13 @@ def build_cli() -> argparse.ArgumentParser:
                      help=f"Multiplier on the DAG adjacency's out-degree "
                           f"(min {MIN_DEEP}). It does NOT add hop rounds: "
                           f"there is one DAG round and every output hops "
-                          f"exactly once whatever this is set to. It DOES "
-                          f"scale the fee reserve linearly, so raising it "
-                          f"distributes less and leaves more as unmixed "
-                          f"change — on a 10 XMR run, --deep 6 holds back "
-                          f"0.43 XMR more than --deep 1 for the same number "
-                          f"of transactions. Raise it for a wider choice of "
-                          f"hop destination, not for more mixing.")
+                          f"exactly once whatever this is set to, and it no "
+                          f"longer costs anything either — the fee reserve is "
+                          f"now one fee per transaction the run will actually "
+                          f"make (compute_fee_budget), so this knob does not "
+                          f"push money out of the mix the way it used to. "
+                          f"Raise it for a wider choice of hop destination, "
+                          f"not for more mixing.")
     cli.add_argument("--rpc-primary", default="http://127.0.0.1:18083",
                      help="Primary monero-wallet-rpc endpoint")
     cli.add_argument("--rpc-alt",
@@ -3996,20 +3996,48 @@ def stage0_preflight(args, proxy) -> tuple:
 
 
 def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
-                       deep: int) -> tuple:
-    """How much of `bal` is actually spendable once every round's fee is held back.
+                       *, peel: bool, dag_mixing: bool, exit_set: bool,
+                       chunks: int = 1) -> tuple:
+    """How much of `bal` is actually spendable once every fee is held back.
 
-    Returns (usable, total_fees, rounds). PURE -- no RPC, no logging, no exit --
-    so the arithmetic that decides whether a spend is affordable can be tested
-    directly instead of only through a live pipeline. The caller decides what an
-    unaffordable result means; this function never aborts, because "the budget
-    does not work out" is a legitimate answer, not an error.
+    Returns (usable, total_fees, transactions). PURE -- no RPC, no logging, no
+    exit -- so the arithmetic that decides whether a spend is affordable can be
+    tested directly instead of only through a live pipeline. The caller decides
+    what an unaffordable result means; this function never aborts, because "the
+    budget does not work out" is a legitimate answer, not an error.
 
-    Every round is one transaction, so the reserve is per-round fee times
-    rounds, with FEE_SAFETY_MARGIN on top: the estimate is taken once at
-    startup and the mempool can move under a multi-hour run. Under-reserving
-    does not fail early or cheaply -- it fails on the LAST hop with "not enough
-    money", after the funds have already been split across subaddresses.
+    THE RESERVE IS ONE FEE PER TRANSACTION THE RUN WILL ACTUALLY MAKE, counted
+    by _runtime_terms -- the same function that produces the wall-clock
+    estimate, and the only count in this file that has been checked against a
+    chain.
+
+    It used to be `wallets * 2 * deep`, and that number is not the transaction
+    count in either direction:
+
+      * UNDER, on the default peel path. A measured --wallets 4 --deep 2 --peel
+        --dag-mixing run relayed 36 transactions and paid 0.072714 XMR in fees.
+        This function reserved 0.05760 -- 26% short of what the run then spent.
+        The docstring said, and still says, that under-reserving "fails on the
+        LAST hop with 'not enough money', after the funds have already been
+        split across subaddresses". The shipped default did it.
+      * OVER, wherever --deep was raised. `deep` multiplies the DAG adjacency's
+        out-degree and adds no transactions at all; the old comment here said
+        so and kept the term anyway as a safety margin. At 40 wallets and
+        --deep 6 that reserved 1.728 XMR against a real cost near 0.5. The
+        excess is not lost, but it is not distributed either: it stays as
+        change, is swept once and reported UNMIXED. Turning the knob up moved
+        the operator's money OUT of the mix.
+
+    So the shape has to be known here, and it is now REQUIRED rather than
+    defaulted: a caller that forgets --peel gets a reserve for a fan-out and
+    the under-reserve back. Keyword-only for the same reason -- these are three
+    booleans in a row and a positional mix-up is silent.
+
+    DECOY_MAX decoys are assumed, because the real count is drawn at random
+    later and this is a reserve. FEE_SAFETY_MARGIN stays on top, via
+    hop_fee_reserve: the estimate is taken once at startup and the mempool can
+    move under a multi-day run. On the measured run that lands at 0.1296 XMR
+    against 0.0727 actually spent -- 1.8x, where the old formula was 0.79x.
     """
     # `deep` INFLATES THIS RESERVE WITHOUT ADDING A SINGLE TRANSACTION, and
     # that is stated rather than quietly corrected.
@@ -4036,13 +4064,50 @@ def compute_fee_budget(bal: Decimal, fee_xmr: Decimal, wallets: int,
     # here. Dropping `deep` would be a 2-to-6x cut in the safety margin
     # justified by arithmetic alone. The cost is made visible to the operator
     # instead (see --deep's help), and the reserve stays conservative.
-    rounds = wallets * 2 * deep
+    class _Shape:
+        pass
+    _Shape.peel = bool(peel)
+    _Shape.dag_mixing = bool(dag_mixing)
+    _Shape.exit_to = ["x"] if exit_set else None
+    _, rounds = _runtime_terms(
+        _Shape, max(1, int(chunks)), max(1, int(wallets)) + DECOY_MAX,
+        Decimal(0), Decimal(0))
     # hop_fee_reserve, not a second copy of `fee_xmr * FEE_SAFETY_MARGIN`.
     # It was written out here as `per_round_fee`, which made this the third
     # place that expression lived AND left main() referencing the local by
     # name -- see the NameError note on the meta dict below.
     total_fees = hop_fee_reserve(fee_xmr) * rounds
     return bal - total_fees, total_fees, rounds
+
+
+def fee_budget_shortfall(bal, total_fees, txs, usable, peel: bool) -> str:
+    """The message for a balance that cannot cover its own fees.
+
+    One function, two call sites: size_and_prune_chunks checks the projected
+    balance and stage 4 re-checks the post-veil one, and they had two different
+    wordings of the same refusal -- both reporting "rounds", a unit that is no
+    longer what compute_fee_budget counts and never was the transaction count.
+
+    Says what the run would actually relay and what to change, because
+    "insufficient" alone leaves the operator choosing between funding the
+    wallet, lowering --wallets and dropping --peel, and those differ by an
+    order of magnitude in effect.
+    """
+    return (f"[!] Balance {bal} XMR insufficient.\n"
+            f"    This shape relays about {txs} transactions -- the entry "
+            f"veil, the distribution, any DAG hops,\n"
+            f"    one change sweep per change location and one withdrawal per "
+            f"funded output -- so it\n"
+            f"    reserves {total_fees} XMR in fees. Usable after fees: "
+            f"{usable} XMR\n"
+            f"\n"
+            f"    NOTHING HAS BEEN SPENT. Fund the wallet more, or use fewer "
+            f"--wallets"
+            + (", or drop --peel:\n"
+               "    a peel chain is one transaction per destination plus a "
+               "change sweep for each, so it\n"
+               "    costs several times a fan-out's fees for the same balance."
+               if peel else "."))
 
 
 def resolve_mix_account(args, rpc_primary, receive_mode: bool,
@@ -6309,13 +6374,14 @@ def size_and_prune_chunks(args, entries: list, unlocked: list,
             sys.exit(f"[!] Balance {bal} XMR left after the entry "
                      f"sweep's fee reserve. Fund the wallet more.")
         usable, total_fees, rounds = compute_fee_budget(
-            bal, fee_xmr, args.wallets, args.deep)
+            bal, fee_xmr, args.wallets,
+            peel=bool(getattr(args, "peel", False)),
+            dag_mixing=bool(getattr(args, "dag_mixing", False)),
+            exit_set=bool(getattr(args, "exit_to", None)),
+            chunks=len(entries))
         if usable <= DUST_XMR:
-            sys.exit(
-                f"[!] Balance {bal} XMR insufficient.\n"
-                f"    Estimated fees: {total_fees} XMR for {rounds} "
-                f"rounds.\n"
-                f"    Usable after fees: {usable} XMR")
+            sys.exit(fee_budget_shortfall(bal, total_fees, rounds, usable,
+                                          getattr(args, "peel", False)))
         _sl, _su, _amts, _bad = size_distribution(
             fanout_dests, unlocked, usable, fee_xmr,
             args.dag_mixing, rng)
@@ -6827,20 +6893,20 @@ def main():
             sys.exit(f"[!] Balance {bal} XMR left after the entry sweep's fee "
                      f"reserve. Fund the wallet more.")
 
-        # Recomputed from the POST-veil balance, and it must agree with what
-        # size_and_prune_chunks used to size the slices -- it does, because
-        # that function returns the pre-veil balance and resolve_entry_veils
-        # subtracts the same reserve exactly once. Kept rather than reused so
-        # the dust guards below run against the balance that actually exists
-        # after the veil plan was built, not the one projected before it.
-        usable, total_fees, rounds = compute_fee_budget(bal, fee_xmr, args.wallets,
-                                                        args.deep)
+        # Recomputed from the POST-veil balance, and it agrees with what
+        # size_and_prune_chunks used: that returns the pre-veil balance and
+        # resolve_entry_veils subtracts the reserve exactly once. Recomputed
+        # rather than reused so the dust guards below run against the balance
+        # that exists after the veil plan, not the one projected before it --
+        # and with THE SAME SHAPE, or the two disagree.
+        usable, total_fees, rounds = compute_fee_budget(
+            bal, fee_xmr, args.wallets, chunks=len(SPEND_SOURCES),
+            peel=bool(getattr(args, "peel", False)),
+            dag_mixing=bool(getattr(args, "dag_mixing", False)),
+            exit_set=bool(getattr(args, "exit_to", None)))
         if usable <= DUST_XMR:
-            sys.exit(
-                f"[!] Balance {bal} XMR insufficient.\n"
-                f"    Estimated fees: {total_fees} XMR for {rounds} rounds.\n"
-                f"    Usable after fees: {usable} XMR"
-            )
+            sys.exit(fee_budget_shortfall(bal, total_fees, rounds, usable,
+                                          getattr(args, "peel", False)))
 
         integrity_log("stage4", "plan_calculated")
 

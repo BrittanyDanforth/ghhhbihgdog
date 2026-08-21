@@ -132,7 +132,8 @@ try:
     mix = [lab.wj("create_address", {"account_index": MIX})["result"]
            for _ in range(N)]
     bal = Decimal(subbal(MIX, E)[1]) / ATOMIC
-    usable, _fees, _rounds = ghost.compute_fee_budget(bal, fee_xmr, N, 2)
+    usable, _fees, _rounds = ghost.compute_fee_budget(bal, fee_xmr, N, peel=True, dag_mixing=False,
+                                                   exit_set=False)
     amounts = ghost.compute_fanout_amounts(usable, N, fee_xmr, False,
                                            random.Random(99))
     hop_fee = fee_xmr * ghost.FEE_SAFETY_MARGIN * ghost.PEEL_CARRIER_RESERVE_MULT

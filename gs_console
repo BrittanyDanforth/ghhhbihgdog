@@ -988,7 +988,7 @@ def _ghost():
     return _GHOST[0]
 
 
-def _run_totals(per_tx_xmr, wallets, deep):
+def _run_totals(per_tx_xmr, wallets, deep, shape=None):
     """What the WHOLE run reserves at each priority, not one transaction.
 
     THE PANEL SHOWED A PER-TRANSACTION FEE while the operator was choosing the
@@ -1020,14 +1020,24 @@ def _run_totals(per_tx_xmr, wallets, deep):
     try:
         g = _ghost()
         from decimal import Decimal as _D
+        # THE SHAPE, because the reserve is now one fee per transaction the run
+        # will actually make and a peel chain makes several times a fan-out's.
+        # Passed explicitly and REQUIRED by the shipped function -- a caller
+        # that forgets --peel would price a fan-out and show a total the run
+        # then exceeds, which is the direction that fails mid-chain.
+        _sh = shape or {}
         totals = []
         rounds = None
         for f in per_tx_xmr:
-            # A nominal balance: total_fees is hop_fee_reserve(fee) * rounds and
-            # does not depend on it. The SHIPPED function computes both, so the
-            # panel and the run cannot disagree about what a round costs.
+            # A nominal balance: total_fees is hop_fee_reserve(fee) x
+            # transactions and does not depend on it. The SHIPPED function
+            # computes both, so the panel and the run cannot disagree.
             _usable, _fees, _rounds = g.compute_fee_budget(
-                _D("1000"), _D(str(f)), w, d)
+                _D("1000"), _D(str(f)), w,
+                peel=bool(_sh.get("peel")),
+                dag_mixing=bool(_sh.get("dag_mixing")),
+                exit_set=bool(_sh.get("exit_to")),
+                chunks=max(1, int(_sh.get("split") or 1)))
             rounds = _rounds
             totals.append(round(float(_fees), 6))
         return rounds, totals
@@ -1060,10 +1070,18 @@ def run_eta(p: dict) -> str:
     try:
         g = _ghost()
         w = max(1, int(p.get("wallets") or 10))
-        # The estimator's mix_outputs is the FUNDED output count, which is
-        # --wallets plus the decoys the run adds (DECOY_MIN..DECOY_MAX). Use
-        # the low end: an estimate that runs long is the safe direction here.
-        outs = w + int(getattr(g, "DECOY_MIN", 2))
+        # The estimator's mix_outputs is the FUNDED output count: --wallets
+        # plus the decoys the run adds, drawn at random in
+        # DECOY_MIN..DECOY_MAX. Use the HIGH end.
+        #
+        # Understating is the dangerous direction here, and it is the same
+        # direction the old estimator failed in. GhostSpiral's own
+        # estimate_runtime docstring: an operator told twenty minutes who then
+        # waits two hours "concludes the run has hung and interrupts it -- and
+        # an interrupt mid-round is the one failure this pipeline has no
+        # automatic recovery from". compute_fee_budget assumes DECOY_MAX for
+        # the same reason, so the two agree about the run's size.
+        outs = w + int(getattr(g, "DECOY_MAX", 7))
         window = g.parse_hop_delay(p.get("hop_delay") or None)
 
         class _A:
@@ -1084,7 +1102,7 @@ def run_eta(p: dict) -> str:
         return ""
 
 
-def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
+def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None, shape=None):
     """Real per-priority fees from the operator's own daemon, or none at all.
 
     THERE IS NO FALLBACK TABLE. This used to answer an unreachable daemon with
@@ -1140,7 +1158,7 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
         fees = est.get("fees")
         if isinstance(fees, list) and fees:
             _per = [round(int(f) * 2000 / 1e12, 6) for f in fees[:4]]
-            _rounds, _totals = _run_totals(_per, wallets, deep)
+            _rounds, _totals = _run_totals(_per, wallets, deep, shape)
             return _flag_fees({"ok": True, "source": "daemon fees[] per priority",
                                "xmr": _per, "rounds": _rounds,
                                "total_xmr": _totals, "nettype": _net})
@@ -1148,7 +1166,7 @@ def live_fees(daemon_url, tor_proxy="", wallets=None, deep=None):
         if base:
             mult = [1, 4, 20, 166]
             _per = [round(int(base) * 2000 * m / 1e12, 6) for m in mult]
-            _rounds, _totals = _run_totals(_per, wallets, deep)
+            _rounds, _totals = _run_totals(_per, wallets, deep, shape)
             return _flag_fees({"ok": True, "source": "daemon base fee x multiplier",
                                "xmr": _per, "rounds": _rounds,
                                "total_xmr": _totals, "nettype": _net})
@@ -1596,7 +1614,8 @@ class H(BaseHTTPRequestHandler):
                 live_fees(c["params"].get("rpc_daemon", "http://127.0.0.1:18081"),
                           c["params"].get("tor_proxy", ""),
                           c["params"].get("wallets"),
-                          c["params"].get("deep"))))
+                          c["params"].get("deep"),
+                          c["params"])))
         if self.path == "/api/preflight":
             c = clean(self._body().get("params"))
             return self._send(200, json.dumps(mandatory_preflight(c["params"])))
@@ -2307,13 +2326,16 @@ async function sync(){
 }
 // Network/OPSEC fields re-trigger the preflight; everything else just re-syncs.
 const PF_FIELDS=new Set(['tor_proxy','rpc_daemon','rpc_primary','allow_clearnet_relay']);
+const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing','exit_to','split','split_recv']);
 $$('input,select').forEach(el=>el.addEventListener('input',()=>{
  if(el.id==='arm') return;
- // The fee panel now reports the TOTAL the run reserves, which depends on
- // --wallets and --deep, so it has to be refetched when either moves. Without
- // this the number is simply stale rather than fixed -- the operator changes
- // depth and still sees the old total, which is the same complaint.
- if(el.id==='wallets'||el.id==='deep') scheduleFees();
+ // The fee panel reports the TOTAL the run reserves, and that reserve is now
+ // one fee per transaction the run will actually make -- so it moves with the
+ // SHAPE (peel, DAG, an exit destination, the chunk count), not just with
+ // --wallets and --deep. Listening to two of them left the panel stale on the
+ // settings that change it most: turning --peel on roughly triples the
+ // transaction count, and the total did not move.
+ if(FEE_FIELDS.has(el.id)) scheduleFees();
  if(PF_FIELDS.has(el.id)) schedulePreflight(); else sync();
 }));
 $('#pfre').addEventListener('click',runPreflight);

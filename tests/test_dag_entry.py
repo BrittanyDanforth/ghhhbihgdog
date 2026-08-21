@@ -2183,30 +2183,50 @@ for _lbl, _plan3 in (("veil", _vp3), ("DAG hop", _dp3), ("fan-out", _fp3)):
 
 
 # ==========================================================================
-# --deep COSTS MONEY AND BUYS NO TRANSACTIONS, and the help now says so.
+# --deep BUYS NO TRANSACTIONS, and it no longer costs anything either.
 #
-# `rounds = wallets * 2 * deep` reads as "one transaction per round", with
+# `rounds = wallets * 2 * deep` read as "one transaction per round", with
 # `deep` sitting in it as though depth meant more hop ROUNDS. It does not:
 # --deep multiplies the DAG adjacency's out-degree, assign_hop_destinations
 # still gives every source exactly ONE destination, and _stage5_run runs
-# exactly one DAG round. So the knob scales the fee reserve linearly while the
-# transaction count stays put, and the difference is not distributed -- it
-# becomes change, swept once, reported UNMIXED.
+# exactly one DAG round. The knob scaled the fee reserve linearly while the
+# transaction count stayed put, and the difference was not distributed -- it
+# became change, swept once, reported UNMIXED.
 #
-# Left conservative on purpose: under-reserving fails on the LAST hop after
-# the funds are already split, and a live chain's real fee cannot be measured
-# from here. Made VISIBLE instead, which is what this pins.
+# That was left standing as a deliberate safety margin, on the argument that a
+# live chain's real fee could not be measured from here. It can now: the
+# reserve is one fee per transaction _runtime_terms counts, and that count
+# reproduces two measured runs exactly. So `deep` is gone from the fee math
+# and the RUN SHAPE is what drives it.
 # ==========================================================================
-print("\n=== --deep is honest about its cost ===")
+print("\n=== the fee reserve follows the shape, not --deep ===")
 
-_u1, _f1, _r1 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.0024"), 12, 1)
-_u6, _f6, _r6 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.0024"), 12, 6)
-check("deep: raising --deep really does hold back more of the balance",
-      _f6 > _f1 * 5)
-check("deep: ...so less is distributed into the mix",
-      _u6 < _u1)
-check("deep: ...and the reserve is linear in it, as the formula says",
-      _r6 == _r1 * 6)
+_ufan, _ffan, _rfan = ghost.compute_fee_budget(
+    Decimal("10"), Decimal("0.0024"), 12,
+    peel=False, dag_mixing=True, exit_set=False)
+_upeel, _fpeel, _rpeel = ghost.compute_fee_budget(
+    Decimal("10"), Decimal("0.0024"), 12,
+    peel=True, dag_mixing=True, exit_set=True)
+check("shape: a peel chain with an exit reserves more than a bare fan-out",
+      _fpeel > _ffan and _rpeel > _rfan)
+check("shape: ...so less of the balance is distributed under --peel",
+      _upeel < _ufan)
+check("shape: the reserve is exactly one hop_fee_reserve per counted "
+      "transaction",
+      _fpeel == ghost.hop_fee_reserve(Decimal("0.0024")) * _rpeel)
+check("shape: --deep cannot change it -- it is not a parameter any more",
+      "deep" not in __import__("inspect").signature(
+          ghost.compute_fee_budget).parameters)
+# THE MEASURED RUN. --wallets 4 --deep 2 --peel --dag-mixing relayed 36
+# transactions and paid 0.072714 XMR; the old formula reserved 0.05760.
+_mu, _mf, _mr = ghost.compute_fee_budget(
+    Decimal("12"), Decimal("0.0024"), 4,
+    peel=True, dag_mixing=True, exit_set=True)
+check(f"shape: the measured peel+DAG run's reserve ({_mf}) now covers the "
+      f"0.072714 XMR it actually spent", _mf > Decimal("0.072714"))
+check("shape: ...and the formula it replaced did not",
+      Decimal("0.0024") * ghost.FEE_SAFETY_MARGIN * 4 * 2 * 2
+      < Decimal("0.072714"))
 
 # The transaction count does NOT move with --deep. Same sources, same targets,
 # one destination each, whatever the adjacency out-degree.
@@ -2239,10 +2259,11 @@ _dh = _dh[:_dh.index("cli.add_argument", 10)]
 _dh = re.sub(r'"\s*\n\s*f?"', "", _dh)
 check("deep: the help no longer calls it a 'depth multiplier' full stop",
       "does NOT add hop rounds" in _dh)
-check("deep: ...and states that it scales the fee reserve",
-      "fee reserve" in _dh)
-check("deep: ...and that the difference becomes unmixed change",
-      "unmixed change" in _dh)
+check("deep: ...and says the fee reserve no longer follows it",
+      "fee reserve" in _dh and "no longer costs anything" in _dh)
+check("deep: ...and no longer claims it pushes money out of the mix, "
+      "because it does not",
+      "unmixed change" not in _dh)
 
 
 

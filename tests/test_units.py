@@ -290,7 +290,7 @@ check("fanout: DAG-off floor is only a dust margin (funds smaller balances)",
 import secrets as _secmod
 _fo_rng = _secmod.SystemRandom()
 for _fb, _fw in ((Decimal("0.5"), 20), (Decimal("1"), 20), (Decimal("0.5"), 10)):
-    _fu = ghost.compute_fee_budget(_fb, Decimal("0.0024"), _fw, deep=2)
+    _fu = ghost.compute_fee_budget(_fb, Decimal("0.0024"), _fw, peel=False, dag_mixing=True, exit_set=False)
     if isinstance(_fu, tuple):
         _fu = _fu[0]
     _fdup = _ffloor = _fover = 0
@@ -340,8 +340,15 @@ for _fb, _fw in ((Decimal("0.5"), 20), (Decimal("1"), 20), (Decimal("0.5"), 10))
 # XMR side now agrees, by returning [] -- which already means "cannot fund
 # this many viable outputs" and which main() answers with exactly the right
 # advice, before anything has been spent.
-for _nb, _nw in ((Decimal("0.5"), 40), (Decimal("0.8"), 60)):
-    _nu = ghost.compute_fee_budget(_nb, Decimal("0.0024"), _nw, deep=1)
+# The balances moved when the fee reserve stopped being `wallets * 2 * deep`
+# and became one fee per transaction the run actually relays: a fan-out shape
+# now reserves LESS, so the old 0.5/40 and 0.8/60 have room and no longer sit
+# in the band. These do -- and the band is entered through the STAIRCASE, not
+# the min_each floor, which is asserted below so the check cannot quietly
+# degrade into "the balance was too small for anything".
+for _nb, _nw in ((Decimal("0.38"), 40), (Decimal("0.56"), 60)):
+    _nu = ghost.compute_fee_budget(_nb, Decimal("0.0024"), _nw, peel=False,
+                                   dag_mixing=True, exit_set=False)
     if isinstance(_nu, tuple):
         _nu = _nu[0]
     _got = [ghost.compute_fanout_amounts(_nu, _nw, Decimal("0.0024"), True,
@@ -349,6 +356,10 @@ for _nb, _nw in ((Decimal("0.5"), 40), (Decimal("0.8"), 60)):
     check(f"fanout: {_nb} XMR across {_nw} destinations is REFUSED rather "
           f"than returned with repeated amounts",
           all(not _g for _g in _got))
+    check(f"fanout: ...and it is the distinctness staircase refusing, not the "
+          f"min_each floor ({_nb}/{_nw})",
+          _nu * ghost.FANOUT_SPEND_FRACTION
+          >= ghost.min_hop_fundable(Decimal("0.0024")) * _nw)
 
 # The refusal must be reachable as an abort with usable advice, not a silent
 # empty list -- [] is the signal main() already turns into that message.
@@ -362,7 +373,7 @@ check("fanout: main() turns the empty plan into an abort naming the remedy",
 # with room must still come back with a full, distinct plan. Refusing
 # everything would satisfy the check above and destroy the tool.
 for _gb, _gw in ((Decimal("5"), 10), (Decimal("20"), 25), (Decimal("100"), 40)):
-    _gu = ghost.compute_fee_budget(_gb, Decimal("0.0024"), _gw, deep=2)
+    _gu = ghost.compute_fee_budget(_gb, Decimal("0.0024"), _gw, peel=False, dag_mixing=True, exit_set=False)
     if isinstance(_gu, tuple):
         _gu = _gu[0]
     _ga = ghost.compute_fanout_amounts(_gu, _gw, Decimal("0.0024"), True,
@@ -374,7 +385,7 @@ for _gb, _gw in ((Decimal("5"), 10), (Decimal("20"), 25), (Decimal("100"), 40)):
 # sorts, and sorted() is stable, so keying on the value alone would hand the
 # lowest index the lowest amount inside every tied group -- an ordering tell,
 # biting hardest at exactly the small-remainder settings where the ties are.
-_fu2 = ghost.compute_fee_budget(Decimal("0.5"), Decimal("0.0024"), 20, deep=2)
+_fu2 = ghost.compute_fee_budget(Decimal("0.5"), Decimal("0.0024"), 20, peel=False, dag_mixing=True, exit_set=False)
 if isinstance(_fu2, tuple):
     _fu2 = _fu2[0]
 _fpairs = _fconc = 0
@@ -505,24 +516,81 @@ os.environ.pop("GS_WALLET_PASSWORD", None)
 
 
 # compute_fee_budget: pure money math, now callable without a pipeline.
-_u, _tf, _r = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10, 2)
-check("budget: rounds = wallets * 2 * deep", _r == 40)
+_u, _tf, _r = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10,
+                                          peel=False, dag_mixing=True,
+                                          exit_set=False)
+# THE RESERVE IS ONE FEE PER TRANSACTION THE RUN WILL MAKE, counted by the same
+# _runtime_terms that produced the wall-clock estimate -- and that count is the
+# only one in this file checked against a chain.
+#
+# It was `wallets * 2 * deep`, which is not the transaction count in either
+# direction. A measured --wallets 4 --deep 2 --peel --dag-mixing run relayed 36
+# transactions and paid 0.072714 XMR; this function reserved 0.05760, 26%
+# short of what the run then spent -- the failure its own docstring describes
+# ("fails on the LAST hop with 'not enough money', after the funds have already
+# been split across subaddresses"). In the other direction, --deep adds no
+# transactions at all, so raising it only pushed money out of the mix.
+_MEANZ = Decimal(0)
+_txs_expected = ghost._runtime_terms(
+    type("S", (), {"peel": False, "dag_mixing": True, "exit_to": None}),
+    1, 10 + ghost.DECOY_MAX, _MEANZ, _MEANZ)[1]
+check("budget: the count is the transactions the run relays, not "
+      "wallets * 2 * deep", _r == _txs_expected and _r != 40)
 check("budget: the fee reserve carries the safety margin",
-      _tf == Decimal("0.001") * ghost.FEE_SAFETY_MARGIN * 40)
+      _tf == Decimal("0.001") * ghost.FEE_SAFETY_MARGIN * _r)
+# The measured run, end to end: the shape that under-reserved must now cover
+# what it actually spent.
+_mu, _mf, _mr = ghost.compute_fee_budget(
+    Decimal("12"), Decimal("0.0024"), 4,
+    peel=True, dag_mixing=True, exit_set=True)
+check(f"budget: the measured peel+DAG run reserves more than the 0.072714 XMR "
+      f"it actually paid (reserves {_mf})", _mf > Decimal("0.072714"))
+check("budget: ...where the old wallets*2*deep formula reserved 0.05760, "
+      "which is less",
+      Decimal("0.0024") * ghost.FEE_SAFETY_MARGIN * 4 * 2 * 2
+      < Decimal("0.072714"))
+# --deep is gone from the signature entirely, so it cannot inflate anything.
+import inspect as _inspect_fb
+check("budget: --deep is not a parameter of the fee reserve any more",
+      "deep" not in _inspect_fb.signature(ghost.compute_fee_budget).parameters)
+# The shape is REQUIRED, so a caller cannot silently price a fan-out for a
+# peel chain -- which is the under-reserve arriving by omission.
+for _kw in ("peel", "dag_mixing", "exit_set"):
+    _args = {"peel": False, "dag_mixing": False, "exit_set": False}
+    _args.pop(_kw)
+    try:
+        ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10, **_args)
+        _req = False
+    except TypeError:
+        _req = True
+    check(f"budget: {_kw} is required, not defaulted", _req)
+check("budget: a peel chain reserves several times a fan-out's fees",
+      ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10,
+                               peel=True, dag_mixing=True, exit_set=True)[1]
+      > ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10,
+                                 peel=False, dag_mixing=False,
+                                 exit_set=True)[1] * 2)
 check("budget: usable is the balance minus the whole reserve",
       _u == Decimal("10") - _tf)
 # The reserve must scale with the work, or a deep run under-reserves and dies
 # on its LAST hop, after the funds are already scattered across subaddresses.
-_u2, _tf2, _r2 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10, 6)
-check("budget: a deeper run reserves strictly more", _tf2 > _tf and _r2 > _r)
-check("budget: usable shrinks as depth grows", _u2 < _u)
+_u2, _tf2, _r2 = ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10,
+                                            peel=True, dag_mixing=True,
+                                            exit_set=True)
+check("budget: a bigger-shaped run reserves strictly more",
+      _tf2 > _tf and _r2 > _r)
+check("budget: usable shrinks as the shape grows", _u2 < _u)
 # It must report an unaffordable plan rather than abort: "cannot afford this"
 # is an answer the caller acts on, not an error.
-_u3, _, _ = ghost.compute_fee_budget(Decimal("0.0001"), Decimal("1"), 10, 2)
+_u3, _, _ = ghost.compute_fee_budget(Decimal("0.0001"), Decimal("1"), 10,
+                                        peel=False, dag_mixing=True,
+                                        exit_set=False)
 check("budget: an unaffordable plan returns a non-positive usable, not an exit",
       _u3 <= 0)
 check("budget: it never returns more than the balance",
-      all(ghost.compute_fee_budget(Decimal(b), Decimal("0.001"), w, d)[0] <= Decimal(b)
+      all(ghost.compute_fee_budget(Decimal(b), Decimal("0.001"), w,
+                                       peel=bool(d % 2), dag_mixing=True,
+                                       exit_set=True)[0] <= Decimal(b)
           for b in ("1", "10", "100") for w in (3, 10, 40) for d in (1, 3, 6)))
 
 
@@ -2683,7 +2751,7 @@ _chg = 0
 for _cb in ("0.5", "1", "2", "3", "5", "10", "20"):
     for _cw in (5, 10, 20, 40):
         _cB = Decimal(_cb)
-        _cu = ghost.compute_fee_budget(_cB, Decimal("0.0024"), _cw, deep=1)
+        _cu = ghost.compute_fee_budget(_cB, Decimal("0.0024"), _cw, peel=False, dag_mixing=True, exit_set=False)
         if isinstance(_cu, tuple):
             _cu = _cu[0]
         if _cu <= 0:
@@ -2775,7 +2843,7 @@ _unf = 0
 _drawn = 0
 for _fb in ("0.2", "0.5", "1", "2", "5", "12"):
     for _fw in (10, 20, 40, 60):
-        _fu = ghost.compute_fee_budget(Decimal(_fb), _ff, _fw, deep=2)
+        _fu = ghost.compute_fee_budget(Decimal(_fb), _ff, _fw, peel=False, dag_mixing=True, exit_set=False)
         if isinstance(_fu, tuple):
             _fu = _fu[0]
         if _fu <= 0:
@@ -2949,7 +3017,7 @@ _pf_bad = _pf_shrunk = _pf_refused = _pf_still = 0
 for _pb in ("0.5", "1", "2", "3", "5", "10"):
     for _pw in (5, 10, 20, 30, 40, 50, 60):
         _pB = Decimal(_pb)
-        _pu = ghost.compute_fee_budget(_pB, Decimal("0.0024"), _pw, deep=1)
+        _pu = ghost.compute_fee_budget(_pB, Decimal("0.0024"), _pw, peel=False, dag_mixing=True, exit_set=False)
         if isinstance(_pu, tuple):
             _pu = _pu[0]
         if _pu <= 0:

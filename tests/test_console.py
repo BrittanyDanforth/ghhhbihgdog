@@ -1090,23 +1090,57 @@ def test_fee_panel_answers_the_setting_the_operator_is_changing():
     l.exec_module(g)
 
     per = [0.0024, 0.0094, 0.038, 0.48]
+    # THE RUN SHAPE, not --deep. The reserve is now one fee per transaction the
+    # run will actually relay, so it moves with --peel, --dag-mixing, an exit
+    # destination and the chunk count -- and NOT with depth, which adds no
+    # transactions. The panel listened only to wallets and deep, so turning
+    # --peel on (roughly triples the transaction count) left the total stale.
+    _SHAPES = [
+        ("bare fan-out",   {"peel": False, "dag_mixing": False}),
+        ("fan-out + DAG",  {"peel": False, "dag_mixing": True}),
+        ("...with an exit", {"peel": False, "dag_mixing": True,
+                             "exit_to": ["x"]}),
+        ("peel + DAG + exit", {"peel": True, "dag_mixing": True,
+                               "exit_to": ["x"]}),
+    ]
     seen = {}
-    for w, d in ((3, 1), (10, 2), (20, 2), (60, 6)):
-        rounds, totals = c._run_totals(per, w, d)
-        seen[(w, d)] = (rounds, totals)
-        check(f"fee panel: {w} wallets/depth {d} produces a round count",
-              rounds and rounds > 0)
-    check("fee panel: the TOTAL changes when wallets/deep change "
+    for w in (3, 20, 60):
+        for label, sh in _SHAPES:
+            rounds, totals = c._run_totals(per, w, 2, sh)
+            seen[(w, label)] = (rounds, totals)
+            check(f"fee panel: {w} wallets, {label} produces a count",
+                  rounds and rounds > 0)
+    check("fee panel: the TOTAL changes when the SHAPE changes "
           "(this is the whole defect)",
-          len({t[1][0] for t in seen.values()}) == len(seen))
-    check("fee panel: more wallets and more depth cost MORE, not less",
-          seen[(3, 1)][1][0] < seen[(20, 2)][1][0] < seen[(60, 6)][1][0])
+          len({seen[(20, lb)][1][0] for lb, _ in
+               [(x[0], x[1]) for x in _SHAPES]}) == len(_SHAPES))
+    check("fee panel: more wallets cost MORE, not less",
+          seen[(3, "peel + DAG + exit")][1][0]
+          < seen[(20, "peel + DAG + exit")][1][0]
+          < seen[(60, "peel + DAG + exit")][1][0])
+    check("fee panel: a peel chain costs more than a fan-out at the same size",
+          seen[(20, "peel + DAG + exit")][1][0]
+          > seen[(20, "fan-out + DAG")][1][0] * 2)
+    check("fee panel: --deep does NOT move it any more",
+          c._run_totals(per, 20, 1, dict(_SHAPES[3][1]))[1]
+          == c._run_totals(per, 20, 6, dict(_SHAPES[3][1]))[1])
     # ...and it agrees with what the pipeline will actually reserve.
     from decimal import Decimal as _D
-    _u, _f, _r = g.compute_fee_budget(_D("1000"), _D("0.0024"), 20, 2)
+    _u, _f, _r = g.compute_fee_budget(_D("1000"), _D("0.0024"), 20, peel=False,
+                              dag_mixing=True, exit_set=False)
     check("fee panel: the total EQUALS the orchestrator's own reserve",
-          abs(seen[(20, 2)][1][0] - float(_f)) < 1e-9
-          and seen[(20, 2)][0] == _r)
+          abs(seen[(20, "fan-out + DAG")][1][0] - float(_f)) < 1e-9
+          and seen[(20, "fan-out + DAG")][0] == _r)
+    # A shape the panel is never told about must price the CHEAPEST run, not a
+    # peel chain -- and the page must therefore actually send the shape.
+    check("fee panel: the endpoint forwards the whole parameter set as the "
+          "shape",
+          'c["params"])))' in open(os.path.join(REPO, "gs_console")).read())
+    check("fee panel: ...and the page refetches when the shape changes, not "
+          "only on wallets/deep",
+          "const FEE_FIELDS=new Set(['wallets','deep','peel','dag_mixing',"
+          "'exit_to','split','split_recv']);" in c.PAGE
+          and "if(FEE_FIELDS.has(el.id)) scheduleFees();" in c.PAGE)
     # Per-tx must stay per-tx: it is the number that legitimately does not move.
     check("fee panel: the per-transaction figure is unchanged by wallets/deep",
           per == [0.0024, 0.0094, 0.038, 0.48])
@@ -1288,6 +1322,15 @@ def test_presets_set_the_hop_delay():
           "$('#hop_delay').value=c.hop_delay||''" in c.PAGE)
 
 
+def _ghost_for_eta():
+    _l = importlib.machinery.SourceFileLoader(
+        "ghost_eta", os.path.join(REPO, "GhostSpiral"))
+    _m = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(_l.name, _l))
+    _l.exec_module(_m)
+    return _m
+
+
 def test_eta_is_computed_by_the_shipped_estimator():
     """The page must state the wall clock, and get it from the pipeline.
 
@@ -1314,6 +1357,20 @@ def test_eta_is_computed_by_the_shipped_estimator():
     check("eta: no exit destination is said to be uncounted",
           "no exit destination" in c.run_eta(
               dict(base, exit_to=[], hop_delay="")))
+    # THE HIGH END OF THE DECOY RANGE, so the estimate cannot come in under the
+    # run. Understating is the direction that gets a live run interrupted, and
+    # it is the direction the previous estimator failed in. The fee reserve
+    # assumes the same count, so the two agree about the run's size.
+    _g_eta = _ghost_for_eta()
+    _n = int(c.run_eta(dict(base, hop_delay="")).split("About ")[1].split()[0])
+    _exp = _g_eta._runtime_terms(
+        type("S", (), {"peel": True, "dag_mixing": True, "exit_to": ["x"]}),
+        1, 10 + _g_eta.DECOY_MAX, 0, 0)[1]
+    check(f"eta: the count assumes DECOY_MAX decoys, like the fee reserve "
+          f"({_n} vs {_exp})", _n == _exp)
+    check("eta: ...and the fee reserve really does assume the same",
+          "DECOY_MAX" in open(os.path.join(REPO, "GhostSpiral")).read()
+          .split("def compute_fee_budget")[1].split("def ")[0])
     check("eta: the endpoint returns it, so the page has something to render",
           '"eta": run_eta(c["params"])' in open(
               os.path.join(REPO, "gs_console")).read())
