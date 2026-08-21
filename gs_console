@@ -2306,6 +2306,18 @@ function collect(){
   split: mode==='receive' ? (+v('split_recv')||1) : (+v('split')||1),
   expect_total_xmr:v('expect_total_xmr'),
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
+  // THE FIELD EXISTED, THE SCHEMA ACCEPTED IT, THE PRESETS SET IT, AND THIS
+  // NEVER SENT IT. --hop-delay was added to SCHEMA so a dashboard run could
+  // express it, then to every preset so the strong ones stopped shipping the
+  // weakest value -- and collect() still did not read the box, so every run
+  // launched from this page went out at GhostSpiral's DEFAULT_HOP_DELAY
+  // whatever the operator or the preset had chosen.
+  //
+  // Caught by the ETA line disagreeing with itself: the "Maximum safe" preset
+  // set the box to 1800-7200 and the estimate underneath still read ~13.2h,
+  // which is the default-delay figure for that shape. The number was right;
+  // the request it was computed from had no delay in it.
+  hop_delay:v('hop_delay'),
   dag_mixing:c('dag_mixing'), peel:c('peel'), joinmarket:c('joinmarket'),
   allow_clearnet_relay:c('allow_clearnet_relay'), tor_proxy:v('tor_proxy'),
   rpc_primary:v('rpc_primary'), rpc_daemon:v('rpc_daemon'),
