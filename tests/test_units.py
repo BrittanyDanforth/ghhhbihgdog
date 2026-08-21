@@ -564,6 +564,30 @@ for _kw in ("peel", "dag_mixing", "exit_set"):
     except TypeError:
         _req = True
     check(f"budget: {_kw} is required, not defaulted", _req)
+# THE REFUSAL IS THE ONLY THING THE OPERATOR GETS at the moment a run stops,
+# and it stopped BEFORE spending -- so it has to say what to change. The two
+# call sites had two different wordings of it, both reporting "rounds", a unit
+# compute_fee_budget no longer counts and never was the transaction count.
+_sf_peel = ghost.fee_budget_shortfall(Decimal("0.3"), Decimal("0.3096"), 86,
+                                      Decimal("-0.0096"), True)
+_sf_fan = ghost.fee_budget_shortfall(Decimal("0.3"), Decimal("0.0396"), 11,
+                                     Decimal("0.2604"), False)
+check("shortfall: it says nothing has been spent",
+      "NOTHING HAS BEEN SPENT" in _sf_peel)
+check("shortfall: it names the transaction count and the reserve",
+      "86 transactions" in _sf_peel and "0.3096" in _sf_peel)
+check("shortfall: it names the remedies",
+      "Fund the wallet more" in _sf_peel and "--wallets" in _sf_peel)
+check("shortfall: ...including dropping --peel, but only when --peel is on",
+      "--peel" in _sf_peel and "--peel" not in _sf_fan)
+check("shortfall: ...and it explains why a peel chain costs more",
+      "one transaction per destination" in _sf_peel)
+check("shortfall: it does not report 'rounds', a unit that no longer exists",
+      "rounds" not in _sf_peel and "rounds" not in _sf_fan)
+_sf_src = " ".join(code_only(os.path.join(REPO, "GhostSpiral")).split())
+check("shortfall: both call sites use the one function",
+      _sf_src.count("sys.exit(fee_budget_shortfall(") == 2)
+
 check("budget: a peel chain reserves several times a fan-out's fees",
       ghost.compute_fee_budget(Decimal("10"), Decimal("0.001"), 10,
                                peel=True, dag_mixing=True, exit_set=True)[1]
