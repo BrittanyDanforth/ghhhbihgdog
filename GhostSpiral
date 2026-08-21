@@ -4275,6 +4275,59 @@ def build_dag_plan(args, fee_xmr, hop_sources_real, fanout_by_addr, dag,
     return dag_plan
 
 
+def announce_distribution_shape(args, n_outputs: int) -> None:
+    """Say that the default distribution leaves ONE distinctive transaction.
+
+    --dag-mixing announces itself when it is OFF ("Run with --dag-mixing to add
+    a second confirmation-gated hop round"). --peel does not, and its absence
+    is the one that shows up on the chain.
+
+    MEASURED, on a completed run of this pipeline against a real chain. Eleven
+    transactions were relayed; ten of them were 1-input, 2-output, 44-byte
+    tx_extra, ~0.0018 XMR fee -- the shape of essentially every ordinary Monero
+    payment. The fan-out was the eleventh:
+
+        height  in  out  extra      fee
+           371   1    2     44   0.001808   <- entry veil
+           409   1    8    291   0.004519   <- the fan-out
+           451   1    2     44   0.001808   <- change sweep
+           491+  1    2     44   0.001808   <- one per exit
+
+    Eight outputs where the chain's overwhelming default is two, a tx_extra six
+    times the length, and a fee two and a half times everything around it. All
+    three are public. It is the transaction an analyst picks out without
+    trying, and --peel is the flag that removes it -- N ordinary 2-output
+    transactions spread over time instead of one that co-creates every output.
+
+    The entry veil's own notice, printed moments earlier, says the transaction
+    spending the swap output is "an ordinary 2-output send rather than one an
+    analyst can pick out by shape". That is true of the veil and it is the only
+    thing it is true of; read alone it suggests shape has been dealt with. The
+    veil moves the distinctive transaction one hop away from ENTRY. It does not
+    make it ordinary.
+
+    A NOTICE, not a default change. Peeling is confirmation-gated per output --
+    its own help says roughly N * 20 minutes -- so making it the default would
+    turn a twenty-minute run into hours for operators who did not ask for that.
+    The operator picks; this makes sure they are picking rather than inheriting.
+    """
+    if getattr(args, "peel", False):
+        return
+    integrity_log("stage4", "distribution_mode:fanout_default")
+    print(f"  [*] Distribution: ONE fan-out transaction creating "
+          f"{n_outputs} outputs at once (the default).")
+    print(f"      That transaction is visibly different from the ~2-output "
+          f"payments around it — its output count, its tx_extra length and "
+          f"its fee are all public, and all three scale with the number of "
+          f"outputs. The entry veil keeps that shape one hop away from the "
+          f"address your swap memo names; it does not make it ordinary.")
+    print(f"      --peel creates the same {n_outputs} outputs in "
+          f"{n_outputs} separate ordinary transactions instead, spread over "
+          f"time. It is much slower — each one is confirmation-gated, so "
+          f"roughly {n_outputs} * 20 min — and it is the stronger choice when "
+          f"time is not the constraint.")
+
+
 def resolve_exit_destinations(args) -> None:
     """Validate every --exit-to address, HERE, before anything happens.
 
@@ -5378,6 +5431,9 @@ def build_distribution_plan(args, rpc_primary, addr_index, SPEND_SOURCES,
     inline in a function nothing executes.
     """
     distribution_mode = "peel" if args.peel else "fanout"
+    # Say what shape the chain will show. Here, where the mode is decided and
+    # the output count is known -- not in main(), which is at its size gate.
+    announce_distribution_shape(args, fanout_count)
     # ONE DISTRIBUTION PER CHUNK, and this is what keeps the invariant.
     #
     # A single distribution spending N carriers would be a CONVERGENCE: the

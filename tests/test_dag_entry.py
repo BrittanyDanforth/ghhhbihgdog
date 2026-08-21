@@ -1931,6 +1931,68 @@ check("deep: ...and that the difference becomes unmixed change",
       "unmixed change" in _dh)
 
 
+
+# ==========================================================================
+# THE ONE TRANSACTION THAT LOOKS DIFFERENT.
+#
+# --dag-mixing announces itself when it is OFF. --peel does not, and its
+# absence is the one that shows up on the chain.
+#
+# Measured on a completed run against a real chain: eleven transactions
+# relayed, ten of them 1-input / 2-output / 44-byte tx_extra / ~0.0018 XMR fee
+# -- the shape of an ordinary Monero payment. The fan-out was the eleventh:
+# 8 outputs, a 291-byte tx_extra, and a 0.0045 XMR fee. All three are public
+# and all three scale with the output count.
+#
+# And the entry veil's notice, printed moments earlier, says the transaction
+# spending the swap output is "an ordinary 2-output send rather than one an
+# analyst can pick out by shape" -- true of the veil, and the only thing it is
+# true of. Read alone it suggests shape has been handled.
+# ==========================================================================
+print("\n=== the distribution says what shape it leaves ===")
+
+_sh_saved = ghost.integrity_log
+ghost.integrity_log = lambda *a, **k: None
+try:
+    def _shape(peel, n):
+        _o = io.StringIO()
+        with contextlib.redirect_stdout(_o):
+            ghost.announce_distribution_shape(
+                types.SimpleNamespace(peel=peel), n)
+        return _o.getvalue()
+
+    _d = _shape(False, 8)
+    check("shape: the default fan-out announces itself",
+          "ONE fan-out transaction creating 8 outputs" in _d)
+    check("shape: ...naming all three public tells, not just the output count",
+          "output count" in _d and "tx_extra" in _d and "fee" in _d)
+    check("shape: ...correcting the veil notice rather than repeating it",
+          "does not make it ordinary" in _d)
+    check("shape: ...and naming the flag that removes it, with its real cost",
+          "--peel" in _d and "8 * 20 min" in _d)
+    check("shape: the count is the run's own, not a fixed example",
+          "25 outputs" in _shape(False, 25))
+
+    # SILENT WHEN PEELING. A notice that fires on the run that already made
+    # the stronger choice is noise, and noise is what gets tuned out.
+    check("shape: --peel says nothing, because there is nothing to warn about",
+          _shape(True, 8) == "")
+finally:
+    ghost.integrity_log = _sh_saved
+
+# It has to be REACHED. Announcing correctly from a function nothing calls is
+# the same as not announcing.
+from srcutil import code_only as _code_only_dg                  # noqa: E402
+_sh_src = " ".join(_code_only_dg(os.path.join(REPO, "GhostSpiral")).split())
+check("shape: build_distribution_plan calls it where the mode is decided",
+      'distribution_mode = "peel" if args.peel else "fanout" '
+      "announce_distribution_shape(args, fanout_count)" in _sh_src)
+# Symmetry with the notice it was modelled on: both must exist, or the pair
+# reads as "DAG matters, peel does not".
+check("shape: ...and the DAG-off notice it mirrors is still there",
+      "Run with --dag-mixing to" in _sh_src)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
