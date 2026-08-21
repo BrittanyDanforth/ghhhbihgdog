@@ -1232,10 +1232,26 @@ finally:
 # ==========================================================================
 print("\n=== a failed change sweep does not strand the rest ===")
 
+# THE TOR GATES ARE STUBBED HERE, AND THEY HAVE TO BE.
+#
+# _run_change_sweep calls relay_gates() before its relay now. In a test process
+# there is no Tor, so the real newnym(required=True) fails and relay_gates
+# raises RelayGateAbort -- which this loop re-raises BY DESIGN, because a live
+# leak must not be retried on every remaining sweep. The effect on this block
+# was that _run_round was never reached at all: 0 of 4 sweeps attempted, the
+# abort out of the function, and all five checks below red.
+#
+# They were red for a reason that has nothing to do with what they assert, so
+# the guarantee they exist for -- a FAILED ROUND does not strand the remaining
+# sweeps or the exit -- went unverified from the commit that added the gates.
+# Stubbing the gates puts the failed-round path back under test; the gate path
+# gets its own checks immediately below, so both live in the file that owns
+# this loop rather than one silently standing in for the other.
 _cs_saved = (ghost._wait_for_change_settled, ghost._change_residue,
              ghost.integrity_log, ghost.secure_delete_or_warn,
              ghost.secure_delete_tree, ghost.atomic_write_json,
-             ghost.connect_rpc, ghost._run_round)
+             ghost.connect_rpc, ghost._run_round, ghost.newnym,
+             ghost.tor_recheck, ghost.secure_delay, ghost.hop_delay)
 try:
     ghost._wait_for_change_settled = lambda *a, **k: (True, 1000)
     ghost._change_residue = lambda *a, **k: 0
@@ -1243,6 +1259,10 @@ try:
     ghost.secure_delete_or_warn = lambda *a, **k: True
     ghost.secure_delete_tree = lambda *a, **k: True
     ghost.atomic_write_json = lambda *a, **k: None
+    ghost.newnym = lambda *a, **k: None
+    ghost.tor_recheck = lambda *a, **k: None
+    ghost.secure_delay = lambda *a, **k: None
+    ghost.hop_delay = lambda *a, **k: 0
     ghost.connect_rpc = lambda *a, **k: types.SimpleNamespace(
         raw_request=lambda m, p=None: {})
     _cs_calls = []
@@ -1283,11 +1303,59 @@ try:
           "UNMIXED" in _buf3.getvalue() and "still there" in _buf3.getvalue())
     check("change sweeps: ...and told the run continues rather than stopping",
           "Continuing with the remaining sweeps" in _buf3.getvalue())
+
+    # THE OTHER HALF, and it must NOT behave like the one above.
+    #
+    # A Tor gate failing is a live deanonymising leak, not a transaction that
+    # would not build. Reported as "FAILED to create, sign or broadcast" it
+    # invites a retry, and this loop would then re-run the same failing gate on
+    # every remaining sweep and hand the run on to the exit. So RelayGateAbort
+    # comes straight out, carrying the gate's own message, while a plain
+    # SystemExit from a round is still caught -- one loop, two outcomes, and
+    # nothing above proves they are told apart.
+    _cs_calls.clear()
+
+    def _cs_gate(args, proxy, stage):
+        raise ghost.RelayGateAbort("[!] Tor leak detected during "
+                                   + str(stage) + " - aborting.")
+
+    _cs_saved_gate = ghost.relay_gates
+    _cs_gate_esc = None
+    _buf4 = io.StringIO()
+    try:
+        ghost.relay_gates = _cs_gate
+        _real_out, sys.stdout = sys.stdout, _buf4
+        try:
+            ghost._run_change_sweeps(
+                _csargs, _jobs, tempfile.mkdtemp(prefix="gs_cs_"),
+                {"http": "x"}, {}, (60, 120))
+        except ghost.RelayGateAbort as _e:
+            _cs_gate_esc = str(_e)
+        except SystemExit as _e:
+            _cs_gate_esc = "PLAIN-SYSTEMEXIT:" + str(_e)
+        finally:
+            sys.stdout = _real_out
+    finally:
+        ghost.relay_gates = _cs_saved_gate
+
+    check("change sweeps: a TOR GATE abort comes out of the loop, unlike a "
+          "failed round",
+          _cs_gate_esc is not None
+          and not _cs_gate_esc.startswith("PLAIN-SYSTEMEXIT:"))
+    check("change sweeps: ...carrying the gate's own words, not the loop's "
+          "generic line",
+          "Tor leak" in (_cs_gate_esc or ""))
+    check("change sweeps: ...and it stops at the FIRST sweep rather than "
+          f"re-running the gate on the rest (attempted {len(_cs_calls)})",
+          len(_cs_calls) == 0)
+    check("change sweeps: ...and is NOT reported as a failed broadcast",
+          "FAILED to create, sign or broadcast" not in _buf4.getvalue())
 finally:
     (ghost._wait_for_change_settled, ghost._change_residue,
      ghost.integrity_log, ghost.secure_delete_or_warn,
      ghost.secure_delete_tree, ghost.atomic_write_json, ghost.connect_rpc,
-     ghost._run_round) = _cs_saved
+     ghost._run_round, ghost.newnym, ghost.tor_recheck, ghost.secure_delay,
+     ghost.hop_delay) = _cs_saved
 
 
 

@@ -1547,8 +1547,31 @@ check("pairs: ...and says nothing when it was not passed",
 check("pairs: --swap-pairs is a real flag",
       "--swap-pairs" in (ghost.build_cli().format_help()))
 _sp_src = " ".join(_code_only_sa(os.path.join(REPO, "GhostSpiral")).split())
-check("pairs: main() fills swap_deposits from the bundle in receive mode",
-      "swap_deposits = _receive_pairs_for(args, ENTRY)" in _sp_src)
+# DRIVEN, not grepped. This was
+#
+#     check(..., "swap_deposits = _receive_pairs_for(args, ENTRY)" in _sp_src)
+#
+# a match on a source line inside main(). The line still exists and still does
+# the same thing, but it moved into resolve_swap_deposits when that block was
+# lifted out of main(), and its local was renamed with the parameter -- so the
+# check went red over a rename while the behaviour was untouched. A textual
+# anchor on a function nothing executes fails for the wrong reasons in one
+# direction and passes for the wrong reasons in the other; the function is
+# callable now, so this calls it.
+_sp_pairs = [{"xmr_dest": "8" + "Q" * 94, "expected_xmr": "2.5"}]
+_sp_saved = (ghost._receive_pairs_for, ghost.integrity_log)
+try:
+    ghost._receive_pairs_for = lambda a, e: list(_sp_pairs)
+    ghost.integrity_log = lambda *a, **k: None
+    with contextlib.redirect_stdout(io.StringIO()):
+        _sp_got = ghost.resolve_swap_deposits(
+            types.SimpleNamespace(btc_amount=None, split=1, tor_proxy=""),
+            {}, [], True, "8" + "Q" * 94, ["8" + "Q" * 94],
+            [("8" + "Q" * 94, 3, 1)])
+finally:
+    (ghost._receive_pairs_for, ghost.integrity_log) = _sp_saved
+check("pairs: receive mode fills swap_deposits from the --swap-pairs bundle",
+      _sp_got == _sp_pairs)
 check("pairs: stage 4 falls back to the quoted sum when no explicit total",
       "else (quoted if quoted > 0 else None)" in _sp_src)
 check("pairs: stage 4 feeds the REAL chunk amounts to the receiver gate, "

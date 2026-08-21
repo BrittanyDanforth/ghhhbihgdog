@@ -402,6 +402,109 @@ check("...and counted, so the caller words its report from a number",
 check("...while the four ordinary outputs still left", _lres[0] == 4)
 
 
+# ...AND IT IS NAMED ONCE, NOT ONCE PER STRAGGLER PASS.
+#
+# A held output is never withdrawn -- that is what holding it means -- so it is
+# STILL FUNDED on every later re-read. The only thing keeping the second pass
+# quiet was the `held` list from the FIRST enumeration, which a late arrival is
+# by definition not in. The case above never reached a second pass (with
+# nothing else late, the loop breaks after one), which is why it passed while
+# the count was wrong.
+#
+# It needs an ordinary late output as well as the held one: that is what keeps
+# the straggler loop alive for the pass that repeats. Measured before the fix:
+# the "arrived on the swap ENTRY address" paragraph printed TWICE and
+# held["entry"] came back 2 -- so the caller's line reads "2 entry addresses"
+# about one address, and sends the operator hunting for a second one that does
+# not exist, on the one report whose whole job is to say where unmixed money is.
+_dclock = Clock()
+_dw = Wallet(_dclock)
+_dw.credit(10, 1, AMT, -(UNLOCK_SECS + 600))
+_dw.credit(11, 1, AMT, -(UNLOCK_SECS + 600))
+_dw.scan()
+
+
+def _two_land(nth):
+    if nth == 0:
+        # ENTRY (held) and an ordinary hop destination, together.
+        _dw.credit(55, 1, AMT, _dclock.t - (UNLOCK_SECS + 60))
+        _dw.credit(12, 1, AMT, _dclock.t - (UNLOCK_SECS + 60))
+
+
+_dbuf = io.StringIO()
+with driven(_dw, _dclock, on_round=_two_land):
+    with contextlib.redirect_stdout(_dbuf):
+        _dres = ghost._run_exit_withdrawals(
+            Args(), [10, 11, 12, 55], Args.exit_to, STAGE, None, META, None,
+            hold=[(55, 1)], entry_pairs=[(55, 1)])
+_dtxt = _dbuf.getvalue()
+check("a late HELD address is counted ONCE across both straggler passes",
+      _dres[3]["entry"] == 1)
+check("...and its paragraph is printed once, not once per pass",
+      _dtxt.count("arrived on the swap ENTRY") == 1)
+check("...while the late ORDINARY output was still withdrawn",
+      _dres[0] == 3 and _dw.true[(12, 1)][0] == 0)
+check("...and the held one still holds its balance",
+      _dw.true[(55, 1)][0] == AMT)
+
+# The suppression must be per ADDRESS, not "one held report per run": two
+# different late-held addresses are two different problems with two different
+# remedies, and collapsing them would hide one.
+_eclock = Clock()
+_ew = Wallet(_eclock)
+_ew.credit(10, 1, AMT, -(UNLOCK_SECS + 600))
+_ew.credit(11, 1, AMT, -(UNLOCK_SECS + 600))
+_ew.scan()
+
+
+def _both_land(nth):
+    if nth == 0:
+        _ew.credit(55, 1, AMT, _eclock.t - (UNLOCK_SECS + 60))   # ENTRY
+        _ew.credit(66, 0, AMT, _eclock.t - (UNLOCK_SECS + 60))   # CHANGE
+        _ew.credit(12, 1, AMT, _eclock.t - (UNLOCK_SECS + 60))   # ordinary
+
+
+_ebuf = io.StringIO()
+with driven(_ew, _eclock, on_round=_both_land):
+    with contextlib.redirect_stdout(_ebuf):
+        _eres = ghost._run_exit_withdrawals(
+            Args(), [10, 11, 12, 55, 66], Args.exit_to, STAGE, None, META,
+            None, hold=[(55, 1), (66, 0)], entry_pairs=[(55, 1)])
+_etxt = _ebuf.getvalue()
+check("two DIFFERENT late-held addresses are both reported",
+      _etxt.count("account 55 / subaddr 1") == 1
+      and _etxt.count("account 66 / subaddr 0") == 1)
+check("...each under its own kind, so the remedy printed matches the address",
+      _eres[3] == {"entry": 1, "change": 1})
+
+# And an address held from the INITIAL snapshot must not gain a second,
+# wrongly-worded report from the re-read: it did not arrive "while this exit
+# was running", it was there before the exit started.
+_fclock2 = Clock()
+_fw2 = Wallet(_fclock2)
+for _a in (10, 11):
+    _fw2.credit(_a, 1, AMT, -(UNLOCK_SECS + 600))
+_fw2.credit(55, 1, AMT, -(UNLOCK_SECS + 600))
+_fw2.scan()
+
+
+def _one_lands(nth):
+    if nth == 0:
+        _fw2.credit(12, 1, AMT, _fclock2.t - (UNLOCK_SECS + 60))
+
+
+_fbuf2 = io.StringIO()
+with driven(_fw2, _fclock2, on_round=_one_lands):
+    with contextlib.redirect_stdout(_fbuf2):
+        _fres2 = ghost._run_exit_withdrawals(
+            Args(), [10, 11, 12, 55], Args.exit_to, STAGE, None, META, None,
+            hold=[(55, 1)], entry_pairs=[(55, 1)])
+_ftxt2 = _fbuf2.getvalue()
+check("an address held from the start is not re-reported as a late arrival",
+      _ftxt2.count("while this exit was running") == 0
+      and _fres2[3]["entry"] == 1)
+
+
 print("\n== the pipeline gates the exit on the last round landing ==")
 
 # _stage5_run must call the wait with the DAG round's DESTINATIONS, and must
