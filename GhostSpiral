@@ -6973,6 +6973,10 @@ def main():
         # build_change_sweep_jobs and _run_change_sweeps for the full argument.
         change_sweep_jobs = build_change_sweep_jobs(
             rpc_primary, addr_index, change_accounts)
+        # Where the last rounds pay. The exit gates on these having landed
+        # before it reads the wallet -- see _stage5_run's landing gate.
+        _dag_tg, _sweep_tg = _landing_targets(addr_index, dag_plan,
+                                              change_sweep_jobs)
 
         # HOW LONG THIS WILL TAKE, BEFORE IT STARTS. The delays are the
         # dominant cost and nothing said so -- see estimate_runtime. An
@@ -7003,7 +7007,9 @@ def main():
                                  exit_accounts=_exit_account_list(
                                      addr_index, change_accounts, bal_account),
                                  exit_hold=_exit_hold_list(args, addr_index,
-                                                           ENTRY_ADDRS))
+                                                           ENTRY_ADDRS),
+                                 dag_targets=_dag_tg,
+                                 sweep_targets=_sweep_tg)
 
         report_completion(rpc_primary, incomplete,
                           [a for a, _ in addr_index.values()] + list(change_accounts),
@@ -7590,14 +7596,19 @@ def _run_round_body(args, plan_file, staging_dir, label):
     return signed_count
 
 
-def _wait_for_fanout_confirm(args, targets, proxy):
-    """Block until the fan-out subaddresses have UNLOCKED balance.
+def _wait_for_fanout_confirm(args, targets, proxy, what="fan-out"):
+    """Block until `targets` have UNLOCKED balance.
 
     The DAG hop round spends outputs the fan-out round just created, and Monero
     outputs are unspendable until they confirm and unlock (~10 blocks). We poll
-    each fan-out target's unlocked balance via wallet-rpc and return True once
-    all of them are unlocked. On timeout we return False so the caller can skip
+    each target's unlocked balance via wallet-rpc and return True once all of
+    them are unlocked. On timeout we return False so the caller can skip
     DAG rather than create hops that would fail for 'no unlocked output'.
+
+    `what` names the outputs in the operator-facing lines, because this is no
+    longer only the fan-out gate: the EXIT uses it too, to refuse to enumerate
+    what it will withdraw until the round that funded it has landed. Saying
+    "fan-out" there would send an operator looking at the wrong round.
     """
     if not targets:
         return False
@@ -7608,7 +7619,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
         print(f"  [!] Could not connect wallet-rpc to await fan-out confirmation: {e}")
         return False
 
-    print(f"  [*] Waiting for {len(targets)} fan-out output(s) to confirm+unlock "
+    print(f"  [*] Waiting for {len(targets)} {what} output(s) to confirm+unlock "
           f"(~10 blocks; up to {FANOUT_CONFIRM_TIMEOUT // 60} min)...")
     waited = 0
     while waited < FANOUT_CONFIRM_TIMEOUT:
@@ -7631,7 +7642,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
                 integrity_log("stage5", f"confirm_poll_err:{type(e).__name__}")
         if unlocked >= len(targets):
             integrity_log("stage5", f"fanout_confirmed:{unlocked}_targets")
-            print(f"  [+] All {unlocked} fan-out output(s) confirmed and unlocked.")
+            print(f"  [+] All {unlocked} {what} output(s) confirmed and unlocked.")
             return True
         print(f"  [*] {unlocked}/{len(targets)} confirmed; waiting {FANOUT_CONFIRM_POLL}s...")
         time.sleep(FANOUT_CONFIRM_POLL)
@@ -7639,7 +7650,7 @@ def _wait_for_fanout_confirm(args, targets, proxy):
 
     integrity_log("stage5", "fanout_confirm_timeout")
     print(f"  [!] Timed out after {FANOUT_CONFIRM_TIMEOUT // 60} min waiting for "
-          f"fan-out to unlock. Skipping DAG hop round (fan-out is already broadcast).")
+          f"the {what} output(s) to unlock.")
     return False
 
 
@@ -8125,6 +8136,38 @@ def _exit_hold_list(args, addr_index, entry_addr) -> list:
     return [addr_index[a] for a in _addrs if a in addr_index]
 
 
+def _landing_targets(addr_index, dag_plan, change_sweep_jobs) -> tuple:
+    """(dag_targets, sweep_targets) -- where the last rounds PAY INTO.
+
+    The exit may not enumerate what it will withdraw until the round that
+    funded it has landed (see the landing gate in _stage5_run), and "landed"
+    can only be checked against the addresses that were paid. Those are known
+    here, in stage 4, where both the plan and addr_index exist -- _stage5_run
+    has neither.
+
+    A hop's destination is an address; addr_index turns it into the
+    (account, index) pair a balance poll takes. A change sweep already carries
+    its destination index, but not the ACCOUNT it was minted in, which
+    build_change_sweep_jobs put in addr_index and nowhere else.
+
+    Anything the index cannot resolve is dropped rather than guessed: a wrong
+    pair here would make the gate poll an address nobody paid, and the exit
+    would then wait out the full hour before running. Dropping one costs the
+    gate a little coverage, which the straggler pass in the exit backstops.
+    """
+    _dag = []
+    for _e in (dag_plan or ()):
+        _pair = addr_index.get(_e.get("dst"))
+        if _pair:
+            _dag.append((int(_pair[0]), int(_pair[1])))
+    _sweep = []
+    for _j in (change_sweep_jobs or ()):
+        _pair = addr_index.get(_j[2])
+        if _pair:
+            _sweep.append((int(_pair[0]), int(_pair[1])))
+    return _dag, _sweep
+
+
 def _funded_subaddresses(rpc, accounts) -> tuple:
     """Every (account, subaddress, atomic_balance) in `accounts` holding money.
 
@@ -8154,6 +8197,40 @@ def _funded_subaddresses(rpc, accounts) -> tuple:
     the caller can report it; nothing here decides what an unreadable account
     means, the same rule the rest of this file follows.
     """
+    # REFRESH FIRST, like every other balance reader in this file.
+    #
+    # _wait_for_fanout_confirm, _wait_for_carrier, _wait_for_change_settled and
+    # _change_residue all open with `refresh`, and the first of them says why:
+    # "without it a wallet-rpc that isn't auto-refreshing never sees the
+    # just-broadcast outputs". This function -- the one that decides what the
+    # exit withdraws AT ALL -- was the only one that did not, and it runs
+    # SECONDS after the last round relayed.
+    #
+    # monero-wallet-rpc only learns about a txpool payment to itself when it
+    # scans the pool, which happens on refresh; its server auto-refreshes on a
+    # 20-second period. commit_tx marks the SOURCE spent immediately, so the
+    # instant a round returns the swept subaddresses read 0 while their
+    # destinations read 0 too -- the value is in the pool and simply invisible.
+    # An output missing from this list is never withdrawn and never mentioned.
+    #
+    # Measured by driving this function and the withdrawal loop against a
+    # wallet modelled on those rules (scan lag uniform 0-20s, submit-to-
+    # enumerate gap uniform 5-15s): the last hop was missed in 146/300 runs at
+    # --wallets 10 and 156/300 at --wallets 20 -- and the caller printed
+    # "EXIT COMPLETE ... Nothing left on this run's accounts" every time.
+    #
+    # The refresh is necessary and NOT sufficient: it closes the scan lag, not
+    # the case where the daemon has not yet handed the pool tx over. The
+    # landing gate in _stage5_run and the straggler pass in the caller cover
+    # that; this is the cheap half.
+    try:
+        rpc.raw_request("refresh", {})
+    except Exception as e:                                   # noqa: BLE001
+        # Not fatal -- a stale read is still a read, and the retries below may
+        # succeed. Logged because everything after it is then a snapshot of
+        # what the wallet knew BEFORE the last round, and that is the exact
+        # condition this call exists to remove.
+        integrity_log("exit", f"enumerate_refresh_failed:{type(e).__name__}")
     found, unreadable = [], []
     for acct in sorted(set(int(a) for a in accounts)):
         bal = None
@@ -8246,8 +8323,11 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         _sweep_cost = Decimal(str((meta or {}).get("fee_per_round") or 0))
     except (TypeError, ValueError, InvalidOperation):        # noqa: BLE001
         _sweep_cost = Decimal(0)
+    # -1, so "no threshold known" filters nothing. Named unconditionally
+    # because the straggler pass at the bottom applies the same floor, and a
+    # name that only exists on one branch would be a NameError on the other.
+    _floor = int(_sweep_cost * Decimal(10 ** 12)) if _sweep_cost > 0 else -1
     if _sweep_cost > 0:
-        _floor = int(_sweep_cost * Decimal(10 ** 12))
         _dust = [t for t in targets if t[2] <= _floor]
         if _dust:
             targets = [t for t in targets if t not in _dust]
@@ -8271,8 +8351,8 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         print(f"      Accounts: {', '.join(str(a) for a in _unreadable)}. "
               f"Check each one and withdraw it yourself; the wallet-rpc was "
               f"probably busy, not broken. This run's exit is NOT complete.")
-    held = [t for t in targets if (t[0], t[1]) in {(int(a), int(i))
-                                                   for a, i in (hold or ())}]
+    _hold_set = {(int(a), int(i)) for a, i in (hold or ())}
+    held = [t for t in targets if (t[0], t[1]) in _hold_set]
     # WHICH KIND, not just how many. The caller's report used to assert ENTRY
     # for any held output, so a run that withheld only a distribution CHANGE
     # sent the operator to look at an address the memo does not name, with the
@@ -8408,22 +8488,29 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
     # how many, or to which account. Every per-output detail is printed to
     # the terminal below, where it reaches the operator and stops.
     _outcomes = set()
-    for n, (acct, sub, amt) in enumerate(targets, 1):
-        if shutdown_requested():
-            _outcomes.add("interrupted")
-            skipped = total - (n - 1)
-            print(f"  [!] EXIT interrupted: {relayed} withdrawn, {skipped} NOT "
-                  f"sent. The remainder is still on this wallet.")
-            break
-        dst = dest_pool[(n - 1) % len(dest_pool)]
-        label = f"exit {n}/{total}"
+    # EVERY (acct, sub) THIS HAS ALREADY TRIED, so the straggler pass below
+    # cannot re-sweep an address the main loop already emptied or already
+    # reported as failed.
+    _attempted = set()
+    _done = 0
+
+    def _withdraw_one(acct, sub, label, dst):
+        """Withdraw ONE subaddress in ONE transaction.
+
+        Extracted from the loop so the straggler pass can reuse it verbatim.
+        A second copy of this body is the last thing this function needs: it
+        carries the settle wait, the Tor gates, the re-raise that distinguishes
+        a leak from a failed round, and the finally that erases the operator's
+        --exit-to destination from disk.
+        """
+        nonlocal relayed, failed, unclean
         # Settle first, for the reason sweep_all makes unavoidable.
         if not _wait_for_change_settled(args, acct, sub, proxy, label)[0]:
             _outcomes.add("unsettled")
             print(f"  [!] {label}: account {acct} / subaddr {sub} did not settle "
                   f"in time, so it was NOT withdrawn. It is safe where it is.")
             failed += 1
-            continue
+            return
         tx = {
             "src": f"exit(acct {acct}/sub {sub})",
             "src_index": sub,
@@ -8434,7 +8521,10 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         }
         path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"
         atomic_write_json({"meta": meta, "txs": [tx]}, path)
-        stage = f"{staging_dir}/exit{n}"
+        # "3/10" -> "3_10". A slash would make the staging path a directory
+        # deeper than intended and put a "/" in the Tor gate's stage name.
+        _tok = label.split()[-1].replace("/", "_")
+        stage = f"{staging_dir}/exit{_tok}"
         # A TOR FAILURE IS NOT A WITHDRAWAL FAILURE, and the except below
         # cannot tell them apart on its own.
         #
@@ -8459,7 +8549,7 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
         _gates_passed = False
         try:
             newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
-            tor_recheck(proxy, f"exit_{n}")
+            tor_recheck(proxy, f"exit_{_tok}")
             _gates_passed = True
             _run_round(args, path, stage, label.capitalize())
             _left = _change_residue(args, acct, sub)
@@ -8501,6 +8591,108 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             _es = Path(stage)
             if _es.is_dir() and not secure_delete_tree(_es):
                 print(f"  [!] Could not securely wipe {stage}; remove it manually.")
+
+    for acct, sub, amt in targets:
+        if shutdown_requested():
+            _outcomes.add("interrupted")
+            skipped = total - _done
+            print(f"  [!] EXIT interrupted: {relayed} withdrawn, {skipped} NOT "
+                  f"sent. The remainder is still on this wallet.")
+            break
+        _done += 1
+        _attempted.add((acct, sub))
+        _withdraw_one(acct, sub, f"exit {_done}/{total}",
+                      dest_pool[(_done - 1) % len(dest_pool)])
+
+    # -- STRAGGLERS: read the wallet again, because the first read was a
+    #    snapshot and this loop has been running for hours.
+    #
+    # Two things put value on an account after the enumeration at the top:
+    #
+    #   * an output the wallet had not scanned yet when the exit started. The
+    #     landing gate in _stage5_run closes most of that window, but the gate
+    #     can time out, and a --no-exit-to caller does not run it at all;
+    #   * an output that arrived DURING this loop -- a late swap chunk, or a
+    #     hop whose confirmation landed while an earlier withdrawal was
+    #     serving its --hop-delay, which can be hours.
+    #
+    # Without this the run's last word on those was "EXIT COMPLETE ... Nothing
+    # left on this run's accounts", asserted from a snapshot taken before they
+    # existed. Re-reading costs one RPC per account and turns a false claim
+    # into either a withdrawal or a named residue.
+    #
+    # Bounded, and _attempted makes it monotone: nothing already tried is
+    # retried, so each pass strictly shrinks what is left to find. Two passes
+    # rather than "until dry" because an address that keeps being funded is a
+    # live incoming stream, not a straggler, and this must terminate.
+    for _pass in range(2):
+        if shutdown_requested() or not dest_pool:
+            break
+        _late, _late_unreadable = _funded_subaddresses(
+            connect_rpc(args.rpc_primary,
+                        proxy_url=getattr(args, "tor_proxy", "")),
+            accounts)
+        # AN ACCOUNT THIS PASS COULD NOT READ IS NOT A CLEAN EXIT EITHER, and
+        # the same rule the initial enumeration follows applies here: it may
+        # hold anything. Only accounts the FIRST read could see are counted --
+        # one already in _unreadable is already in `failed`, and counting it
+        # twice would report more failures than there are accounts.
+        _new_unreadable = [a for a in _late_unreadable if a not in _unreadable]
+        if _new_unreadable:
+            _outcomes.add("recheck_unreadable")
+            failed += len(_new_unreadable)
+            print(f"  [!] EXIT: {len(_new_unreadable)} account(s) could not be "
+                  f"re-read after the withdrawals "
+                  f"({', '.join(str(a) for a in _new_unreadable)}), so this "
+                  f"exit cannot be called complete. Check them yourself.")
+        # A HELD ADDRESS THAT BECAME FUNDED DURING THE EXIT STILL HAS TO BE
+        # NAMED. This is not a corner case -- it is the case _exit_hold_list is
+        # written for: "a swap chunk that settled late". If it settles while
+        # the withdrawals above are serving their --hop-delay, the initial
+        # enumeration never saw it, so the block that prints where held money
+        # is and what to do with it never ran for it. Filtering it out here
+        # without a word would leave the operator with an unmixed balance on an
+        # address a public ThorChain memo names, and nothing anywhere saying so.
+        _late_held = [t for t in _late
+                      if (t[0], t[1]) in _hold_set
+                      and (t[0], t[1]) not in {(h[0], h[1]) for h in held}]
+        for _la, _li, _lamt in _late_held:
+            _is_entry = (_la, _li) in {(int(_a), int(_i))
+                                       for _a, _i in (entry_pairs or ())}
+            _held_kinds["entry" if _is_entry else "change"] += 1
+            print(f"  [!] EXIT: {Decimal(_lamt) / Decimal(10 ** 12)} XMR "
+                  f"arrived on "
+                  f"{'the swap ENTRY' if _is_entry else 'a distribution CHANGE'}"
+                  f" address (account {_la} / subaddr {_li}) while this exit "
+                  f"was running, and was NOT withdrawn — for the same reason "
+                  f"the held outputs above were not. It is safe where it is; "
+                  f"mix it with a fresh receive wallet as described above.")
+        if _late_held:
+            integrity_log("exit", "withheld_unmixed")
+        _late = [t for t in _late
+                 if (t[0], t[1]) not in _attempted
+                 and (t[0], t[1]) not in _hold_set
+                 and t[2] > _floor]
+        if not _late:
+            break
+        _outcomes.add("late_outputs")
+        integrity_log("exit", "late_outputs_found")
+        print(f"  [!] EXIT: {len(_late)} output(s) are funded now that were "
+              f"not when this exit started — either the wallet had not scanned "
+              f"them yet, or they arrived while the withdrawals above were "
+              f"serving their delays. Withdrawing them too rather than "
+              f"reporting a clean exit over them.")
+        total += len(_late)
+        for acct, sub, amt in _late:
+            if shutdown_requested():
+                _outcomes.add("interrupted")
+                skipped += 1
+                continue
+            _done += 1
+            _attempted.add((acct, sub))
+            _withdraw_one(acct, sub, f"exit {_done}/{total}",
+                          dest_pool[(_done - 1) % len(dest_pool)])
+
     integrity_log("exit", "withdraw_done:" +
                   (",".join(sorted(_outcomes)) or "nothing_attempted"))
     return (relayed, failed, skipped, dict(_held_kinds), unclean)
@@ -8511,7 +8703,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                 change_target=(0, 0), change_sweep_jobs=None,
                 change_accounts=None,
                 delay_window=None, veil_file=None, veil_target=None,
-                veil_need=None, exit_accounts=None, exit_hold=None):
+                veil_need=None, exit_accounts=None, exit_hold=None,
+                dag_targets=None, sweep_targets=None):
     """Execute the create -> sign -> broadcast pipeline as confirmation-gated
     rounds: the distribution (a one-shot fan-out OR a peeling chain), then
     (optionally) the DAG hop round once the mix outputs have unlocked on-chain,
@@ -8524,7 +8717,14 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     first peel spent a carrier that had never been funded ("not enough
     money"). No test caught it because nothing executes main(). They default
     to None only so the confirmation-gated helper stays callable in isolation;
-    the pipeline must pass all four."""
+    the pipeline must pass all four.
+
+    dag_targets/sweep_targets are the (account, index) pairs the DAG round and
+    the change sweeps PAY INTO. They exist for one reason: the exit must not
+    enumerate what it will withdraw until the round that funded it has landed.
+    See the landing gate below -- without it the exit reads the wallet seconds
+    after the last relay, misses whatever the wallet has not scanned yet, and
+    reports a complete exit anyway."""
     # -- Round 0: veil the entry ------------------------------------------
     # ENTRY holds the one output an analyst is handed for free (the swap memo
     # is public). Sweep it into a fresh carrier FIRST, so the transaction that
@@ -8536,6 +8736,10 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     # -- it spends the carrier -- so the wait is not optional politeness.
     incomplete = []
     withheld = []
+    # WHAT THE EXIT MUST WAIT FOR. Accumulated as each round relays, because
+    # only this function knows which rounds actually ran and how far they got.
+    # See the landing gate just before the exit.
+    _landed = []
     if veil_file:
         print("  [*] === Round 0: entry veil ===")
         newnym(required=True, proxy_url=getattr(args, "tor_proxy", ""))
@@ -8639,6 +8843,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         except Exception:
             _total_peels = 0
         _relayed = _run_peel_chain(args, fanout_file, staging_dir, proxy, change_target)
+        # Peel i pays fanout_dests[i] (build_peel_plan walks them in order), so
+        # a chain that stopped at _relayed funded exactly the first _relayed
+        # targets. The rest can never hold anything and waiting on them would
+        # be an hour of polling an address nobody paid.
+        _landed += list(fanout_targets or ())[:_relayed]
         if _total_peels and _relayed < _total_peels:
             incomplete.append(f"peeling chain relayed only {_relayed}/{_total_peels} peels")
         # Every peel left (carrier reserve - real fee) as change on its OWN
@@ -8682,6 +8891,11 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                       f"empty address.")
             _missed = _run_change_sweeps(args, _runnable, staging_dir,
                                          proxy, _cs_meta, delay_window)
+            # Only when every sweep relayed. A sweep that failed left its fresh
+            # destination unfunded, and the landing gate would poll it for the
+            # full hour before giving up on money that was never sent.
+            if not _missed:
+                _landed += list(sweep_targets or ())[:len(_runnable)]
             if _missed:
                 incomplete.append(
                     f"{_missed} of {len(_runnable)} peel change output(s) "
@@ -8690,6 +8904,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
     else:
         print("  [*] === Round 1: Fan-out distribution ===")
         _run_round(args, fanout_file, f"{staging_dir}/fanout", "Fan-out")
+        # One transaction, every target paid. Nothing to trim.
+        _landed += list(fanout_targets or ())
         # The fan-out could not allocate its input exactly, so ~10% came back
         # as change. Sweep it to a fresh address rather than leaving a tenth of the
         # balance parked, unmixed, on the one output that never moves.
@@ -8699,8 +8915,10 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
                     _cs_meta = json.load(_mf).get("meta", {})
             except Exception:                                # noqa: BLE001
                 _cs_meta = {}
-            if _run_change_sweeps(args, change_sweep_jobs, staging_dir,
-                                  proxy, _cs_meta, delay_window):
+            if not _run_change_sweeps(args, change_sweep_jobs, staging_dir,
+                                      proxy, _cs_meta, delay_window):
+                _landed += list(sweep_targets or ())
+            else:
                 incomplete.append("the fan-out's change was NOT swept to a fresh address "
                                   "— roughly a tenth of the balance is unmixed on "
                                   "the change address")
@@ -8713,14 +8931,70 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
             print("  [*] === Round 2: DAG hop-mixing ===")
             tor_recheck(proxy, "stage5_dag")
             _run_round(args, dag_file, f"{staging_dir}/dag", "DAG")
+            # EVERY HOP SOURCE IS NOW EMPTY. A hop is a sweep_all, so the
+            # distribution targets this list held have paid their whole balance
+            # onward -- keeping them would make the landing gate poll addresses
+            # that hold nothing until it timed out. The value is on the hop
+            # DESTINATIONS, and those are what the exit will withdraw.
+            #
+            # Sources that did not hop (unfundable or unassigned -- see
+            # build_dag_plan) keep their own output, which unlocked before this
+            # round even started, so nothing is lost by dropping them here.
+            _landed = list(dag_targets or ())
         else:
             integrity_log("stage5", "dag_round_skipped:unconfirmed")
+            print("  [!] Skipping the DAG hop round — the distribution outputs "
+                  "did not all unlock in time. The distribution is already "
+                  "broadcast; only the second mixing round is lost.")
             incomplete.append("DAG hop round was SKIPPED (the distribution outputs "
                               "did not confirm in time) — the second mixing round "
                               "did not happen")
 
     newnym(proxy_url=getattr(args, "tor_proxy", ""))
     secure_delay(5.0, 15.0)
+
+    # -- THE LANDING GATE. The exit must not read a wallet that is still moving.
+    #
+    # _run_exit_withdrawals enumerates the funded subaddresses ONCE and
+    # withdraws exactly what that snapshot contained. Until this gate existed
+    # the snapshot was taken seconds after the last round relayed, and
+    # monero-wallet-rpc does not know about a txpool payment to itself until it
+    # scans the pool -- which its server does on a 20-second period. Meanwhile
+    # commit_tx marks the SOURCE spent the instant the round returns. So for a
+    # window of up to 20 seconds the money is in neither place as far as the
+    # wallet is concerned, and an output missing from that snapshot is never
+    # withdrawn and never mentioned.
+    #
+    # Measured by driving the shipped enumeration and withdrawal loop against a
+    # wallet modelled on those rules -- scan lag uniform 0-20s, submit-to-
+    # enumerate gap uniform 5-15s, ten hop destinations of 0.3 XMR:
+    #
+    #     last hop not yet scanned    9/10 withdrawn, 0.3 XMR left behind
+    #     last two not yet scanned    8/10 withdrawn, 0.6 XMR left behind
+    #     none scanned yet            0/10 withdrawn, 3.0 XMR left behind
+    #
+    # and the caller printed "EXIT COMPLETE ... Nothing left on this run's
+    # accounts" in the first two and NOTHING AT ALL in the third. Across 300
+    # runs the last hop was stranded in 146 (--wallets 10) and 156
+    # (--wallets 20) of them.
+    #
+    # The pipeline already owns the right primitive -- it is the same gate that
+    # stops the DAG round being created before the distribution unlocks. It was
+    # simply never applied to the step that moves the money OUT, which is the
+    # one place where being early costs the whole point of the run.
+    #
+    # Waiting for UNLOCKED, not merely visible: sweep_all can only spend
+    # unlocked outputs, so an output that is merely in the pool would be
+    # enumerated and then swept for nothing.
+    if getattr(args, "exit_to", None) and _landed:
+        if not _wait_for_fanout_confirm(args, _landed, proxy,
+                                        what="last round's"):
+            integrity_log("stage5", "exit_landing_timeout")
+            print("  [!] Not every output from the last round unlocked within "
+                  f"{FANOUT_CONFIRM_TIMEOUT // 60} min. The exit runs anyway on "
+                  "what IS visible, and reports whatever it could not take — "
+                  "but read its lines carefully: value may be left on this "
+                  "wallet.")
 
     # -- Stage 5d: THE EXIT. This is the step that moves value off this wallet.
     #
@@ -8850,7 +9124,8 @@ def _stage5_run(args, fanout_file, dag_file, fanout_targets, staging_dir,
         # type changed. Count, never test the container.
         elif _relayed and not (_held_entry or _held_change):
             print(f"  [+] EXIT COMPLETE: {_relayed} output(s) withdrawn, each in "
-                  f"its own transaction. Nothing left on this run's accounts.")
+                  f"its own transaction. The wallet was re-read afterwards and "
+                  f"nothing further is funded on this run's accounts.")
     else:
         integrity_log("exit", "no_exit_to:not_withdrawn")
         print("  [*] Stage 5d: NO EXIT PERFORMED — --exit-to was not given, so "
