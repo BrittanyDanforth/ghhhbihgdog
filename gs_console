@@ -229,6 +229,31 @@ SCHEMA = {
 #: much a single request can make this compose.
 MAX_EXIT_DESTS = 16
 
+#: Where the quote bundle lives when the operator leaves the field blank.
+#:
+#: THREE ACTIONS READ THIS FIELD AND ONLY TWO DEFAULTED IT. swap_quote writes
+#: the quotes to thor_pairs.json when the box is empty, watch_receive waits
+#: against thor_pairs.json when the box is empty -- and pipeline_argv passed
+#: --swap-pairs only when the box was NOT empty. So the default dashboard
+#: receive flow (click all three, type nothing) produced a quote file, waited
+#: on it, and then ran the mix with NO target at all: GhostSpiral's receiver
+#: branch reads `args.expect_total_xmr is None` as "nothing to check", prints
+#: "this run does NOT wait", and plans against whatever happens to be on ENTRY
+#: at that instant. Paid by four swaps, it starts mixing on the first one to
+#: land and the other three arrive on an address the run has finished with --
+#: unmixed, on the address the swap memo names in public.
+#:
+#: That is the exact failure the expect_total_xmr SCHEMA entry was added to
+#: prevent. Adding the field made the gate REACHABLE; it did not arm it, and
+#: the page reported no problem, because as far as pipeline_argv was concerned
+#: nothing was missing.
+#:
+#: A constant, because a default that lives in three string literals is how
+#: two of them agreed and the third did not. Passing it when the file is absent
+#: costs nothing: _receive_pairs_for is explicitly "NEVER FATAL" -- it warns and
+#: leaves the run exactly as it was.
+DEFAULT_PAIRS_FILE = "thor_pairs.json"
+
 
 def clean(params: dict) -> dict:
     """Validate every parameter against SCHEMA. Unknown keys are dropped."""
@@ -314,8 +339,10 @@ def pipeline_argv(p: dict) -> tuple[list, list]:
         # gate tightens to 0.95 XMR with the breakdown and only reaches 0.90
         # without it, and at 0.90 the 0.05 swap can be missing entirely while
         # the run starts mixing.
-        if p.get("pairs_file"):
-            a += ["--swap-pairs", p["pairs_file"]]
+        # DEFAULTED, like the two actions above. See DEFAULT_PAIRS_FILE: this
+        # was the one of the three that did not, which left the standard GUI
+        # receive flow running with no arrival gate at all.
+        a += ["--swap-pairs", p.get("pairs_file") or DEFAULT_PAIRS_FILE]
     else:
         if not p.get("btc_entry"):
             why.append("Send mode needs a BTC entry address (bech32).")
@@ -429,7 +456,7 @@ ACTIONS = {
                         "build": lambda p: [PY, "thor_swap_preparer",
                                             "--dest-from-receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", ""),
-                                            "--outfile", p.get("pairs_file") or "thor_pairs.json"]},
+                                            "--outfile", p.get("pairs_file") or DEFAULT_PAIRS_FILE]},
     # watches YOUR OWN wallet-rpc until the payment lands. Reads only — it
     # never spends, so it stays a `safe` action even though it is the step
     # that decides a mix is about to happen.
@@ -438,7 +465,7 @@ ACTIONS = {
                         "build": lambda p: [PY, "receive_watch",
                                             "--receive-wallet", p.get("receive_wallet", ""),
                                             "--tor-proxy", p.get("tor_proxy", "")]
-                                           + ["--pairs", p.get("pairs_file") or "thor_pairs.json"]},
+                                           + ["--pairs", p.get("pairs_file") or DEFAULT_PAIRS_FILE]},
     # NOT "--any" when the field is blank. The swap_quote action two entries
     # above defaults the SAME blank field to "thor_pairs.json" and writes the
     # quote there -- so the GUI's default flow produced a quote file and then
@@ -1045,6 +1072,58 @@ def _run_totals(per_tx_xmr, wallets, deep, shape=None):
         return None, None
 
 
+def run_notes(p: dict) -> list:
+    """Non-blocking advisories about what THIS run will and will not do.
+
+    pipeline_argv's `problems` stop a spend, so it can only carry things that
+    are wrong. It cannot carry "this is legal and probably not what you meant",
+    and the page therefore had no way to say the most consequential of those:
+    that a receive run with no target does not wait.
+
+    GhostSpiral supports a targetless receive run -- it prints "this run does
+    NOT wait" and plans against whatever is on ENTRY -- so refusing it here
+    would be wrong. Saying nothing was worse: the page showed an empty problem
+    list, which reads as "everything is set".
+    """
+    notes = []
+    if p.get("mode") == "receive":
+        if not p.get("expect_total_xmr"):
+            _pf = p.get("pairs_file") or DEFAULT_PAIRS_FILE
+            _have = False
+            try:
+                _have = os.path.isfile(os.path.join(REPO, _pf))
+            except Exception:                                # noqa: BLE001
+                _have = False
+            if _have:
+                notes.append(
+                    f"The arrival target comes from {_pf}: the run sums the "
+                    f"swaps routed to this receive address and waits for all "
+                    f"of them. Set 'Expected total XMR' only to override that.")
+            else:
+                notes.append(
+                    f"NO ARRIVAL TARGET. {_pf} is not in the repo directory "
+                    f"and 'Expected total XMR' is empty, so this run will NOT "
+                    f"WAIT — it mixes whatever is on the receive address the "
+                    f"moment it starts. Paid by more than one swap, the later "
+                    f"ones land on an address the run has already finished "
+                    f"with, unmixed, on the address the swap memo names in "
+                    f"public. Run 'Get the BTC deposit address' first, or type "
+                    f"the total you are expecting.")
+    if p.get("exit_to"):
+        _n = len(p["exit_to"])
+        if _n == 1:
+            notes.append(
+                "ONE exit destination: every withdrawal arrives at the same "
+                "address, so whoever watches it sees them as one group. "
+                "Repeat the address box for more.")
+    else:
+        notes.append(
+            "No exit destination, so nothing is withdrawn: the mixed funds "
+            "stay spread across this wallet's accounts and the run says which "
+            "ones at the end.")
+    return notes
+
+
 def run_eta(p: dict) -> str:
     """How long THIS run will take, from the shipped estimator. "" if unknown.
 
@@ -1607,6 +1686,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "argv": argv, "pretty": " ".join(shlex.quote(x) for x in argv),
                 "problems": c["errors"] + why,
+                "notes": run_notes(c["params"]),
                 "eta": run_eta(c["params"])}))
         if self.path == "/api/fees":
             c = clean(self._body().get("params"))
@@ -1795,6 +1875,8 @@ text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;ba
 pre.prev{margin:0;background:var(--term);color:var(--ti);padding:11px 13px;border-radius:8px;
 font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto}
 .probs{margin:9px 0 0;padding:0;list-style:none}
+.notes{list-style:none;padding:8px 10px;margin:8px 0 0 0;border-left:3px solid var(--mut);color:var(--mut);font-size:12px;line-height:1.5}
+.notes li{margin:3px 0}
 .probs li{font-size:12px;color:var(--err);background:var(--errs);padding:6px 9px;border-radius:6px;margin-bottom:4px}
 .pfbox{margin-top:11px;border:1px solid var(--line);border-radius:9px;overflow:hidden;font-size:12px}
 .pfhead{padding:8px 11px;font-weight:600;font-size:12px}
@@ -2047,6 +2129,11 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
     <div class="subhead"><span>Command that will run</span><span class="mut-s">composed on the server</span></div>
     <pre class="prev" id="prev">…</pre>
     <ul class="probs" id="probs"></ul>
+    <!-- NON-BLOCKING advisories: things that are legal and probably not what
+         the operator meant. `probs` stops the run, so it could never carry
+         "this receive run has no arrival target and will not wait" -- and an
+         empty problem list reads as "everything is set". See run_notes. -->
+    <ul class="notes" id="notes"></ul>
     <div class="arm" id="armbox" style="display:none">
       <p><strong>This moves funds.</strong> It signs and broadcasts real transactions. The OPSEC
       preflight (step 4) must pass — it is re-verified on the server when you run, so it cannot be
@@ -2317,6 +2404,7 @@ async function sync(){
  // delay dropdown used to carry hand-written run lengths that were out by 20x
  // because --hop-delay is per TRANSACTION -- see run_eta.
  if($('#eta')) $('#eta').textContent=r.eta||'';
+ if($('#notes')) $('#notes').innerHTML=(r.notes||[]).map(n=>`<li>${esc(n)}</li>`).join('');
  const ok=!r.problems.length;
  $('#armbox').style.display=ok?'':'none';
  const btn=document.querySelector('.act[data-id="run_pipeline"]');

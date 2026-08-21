@@ -1331,6 +1331,89 @@ def _ghost_for_eta():
     return _m
 
 
+def test_the_receive_flow_arms_its_own_arrival_gate():
+    """Three actions read pairs_file. Only two defaulted it.
+
+    swap_quote WRITES the quotes to thor_pairs.json when the box is empty and
+    watch_receive WAITS against thor_pairs.json when the box is empty --
+    pipeline_argv passed --swap-pairs only when the box was NOT empty. So the
+    standard dashboard receive flow (click all three, type nothing) produced a
+    quote file, waited on it, and then ran the mix with no target at all:
+    GhostSpiral's receiver branch reads `args.expect_total_xmr is None` as
+    "nothing to check", prints "this run does NOT wait", and plans against
+    whatever is on ENTRY at that instant. Paid by four swaps it starts mixing
+    on the first, and the other three land on an address the run has finished
+    with -- unmixed, on the address the swap memo names in public.
+
+    Adding expect_total_xmr to SCHEMA made that gate reachable. It did not arm
+    it, and the page reported no problem, because nothing was missing as far as
+    pipeline_argv was concerned.
+    """
+    c = load_console()
+    base = {"mode": "receive", "receive_wallet": "w.json",
+            "tor_proxy": "socks5h://127.0.0.1:9050", "wallets": 10, "deep": 2}
+    a, why = c.pipeline_argv(c.clean(base)["params"])
+    check("receive: the blank bundle field still reaches the run",
+          "--swap-pairs" in a
+          and a[a.index("--swap-pairs") + 1] == c.DEFAULT_PAIRS_FILE)
+    check("receive: ...and it is the SAME default the quote and watch steps "
+          "use",
+          c.ACTIONS["swap_quote"]["build"](c.clean(base)["params"])[-1]
+          == c.DEFAULT_PAIRS_FILE
+          and c.DEFAULT_PAIRS_FILE
+          in c.ACTIONS["watch_receive"]["build"](c.clean(base)["params"]))
+    check("receive: an explicit bundle still wins over the default",
+          c.pipeline_argv(c.clean(dict(base, pairs_file="other.json"))
+                          ["params"])[0][
+              c.pipeline_argv(c.clean(dict(base, pairs_file="other.json"))
+                              ["params"])[0].index("--swap-pairs") + 1]
+          == "other.json")
+    # SEND mode must not get it: GhostSpiral prints "--swap-pairs is ignored in
+    # SEND mode" and logs swap_pairs_ignored_send_mode.
+    _snd = {"mode": "send", "btc_entry": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            "btc_amount": "0.05", "tor_proxy": "socks5h://127.0.0.1:9050"}
+    check("receive: send mode is not given a bundle it would only ignore",
+          "--swap-pairs" not in c.pipeline_argv(c.clean(_snd)["params"])[0])
+    # A missing bundle must stay non-fatal, or defaulting it would break every
+    # run that legitimately has no quotes.
+    g = _ghost_for_eta()
+    _rp = g._receive_pairs_for.__doc__ or ""
+    check("receive: ...and passing a bundle that is not there is NEVER FATAL",
+          "NEVER FATAL" in _rp)
+
+    # THE ADVISORY. A targetless receive run is legal, so it cannot be a
+    # `problem` (those stop the spend) -- but an empty problem list reads as
+    # "everything is set", which is how this stayed invisible.
+    import os as _os
+    _pf = _os.path.join(REPO, c.DEFAULT_PAIRS_FILE)
+    _had = _os.path.exists(_pf)
+    if not _had:
+        _notes = c.run_notes(c.clean(base)["params"])
+        check("receive: with no bundle and no total, the page SAYS the run "
+              "will not wait",
+              any("NOT WAIT" in n for n in _notes))
+        check("receive: ...and says what to do about it",
+              any("Get the BTC deposit address" in n for n in _notes))
+    _notes2 = c.run_notes(c.clean(dict(base, expect_total_xmr="1.5"))["params"])
+    check("receive: a typed total silences the no-target advisory",
+          not any("NOT WAIT" in n for n in _notes2))
+    check("receive: the advisory never blocks the run",
+          not c.pipeline_argv(c.clean(base)["params"])[1])
+    check("receive: the endpoint returns the notes and the page renders them",
+          '"notes": run_notes(c["params"])' in open(
+              _os.path.join(REPO, "gs_console")).read()
+          and "$('#notes').innerHTML" in c.PAGE and 'id="notes"' in c.PAGE)
+    # ...and the single-exit advisory, which the exit itself also warns about
+    # far later, when it is too late to add a destination.
+    _one = c.run_notes(c.clean(dict(base, exit_to=["4" + "1" * 94]))["params"])
+    check("receive: one exit destination is called out here too",
+          any("ONE exit destination" in n for n in _one))
+    check("receive: ...and no exit destination is called out as withdrawing "
+          "nothing",
+          any("nothing is withdrawn" in n for n in c.run_notes(
+              c.clean(base)["params"])))
+
+
 def test_eta_is_computed_by_the_shipped_estimator():
     """The page must state the wall clock, and get it from the pipeline.
 
@@ -1575,9 +1658,18 @@ def test_console_can_express_the_expected_total():
     ns = g.build_cli().parse_args(a[2:])
     check("expected total: ...and GhostSpiral's parser takes it",
           ns.swap_pairs == "thor_pairs.json")
+    # A BLANK FIELD NOW MEANS THE DEFAULT BUNDLE, not "no flag". This used to
+    # assert the opposite, and that was the defect: swap_quote writes to
+    # thor_pairs.json when the box is empty and watch_receive reads it, so
+    # only the pipeline ignored the file the flow had just produced -- and ran
+    # with no arrival gate. See test_the_receive_flow_arms_its_own_arrival_gate.
     a, _ = argv_for()
-    check("expected total: ...and no bundle means no flag, unchanged",
-          "--swap-pairs" not in a)
+    check("expected total: a blank bundle field falls back to the SAME file "
+          "the quote and watch steps use",
+          "--swap-pairs" in a
+          and a[a.index("--swap-pairs") + 1] == c.DEFAULT_PAIRS_FILE)
+    check("expected total: ...and send mode still gets no bundle",
+          "--swap-pairs" not in argv_for(mode="send")[0])
 
 
 def test_daemon_chain_is_reported_not_assumed():
