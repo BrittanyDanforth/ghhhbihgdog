@@ -4,9 +4,15 @@ This is the hardware/network layout for running GhostSpiral **without**
 leaving the spend key on a box that stays online, and **without** the
 home ISP seeing Tor guards.
 
-The Telegram doorbell is a **pager**. It is not in this repo yet. Until
-it exists, you sit at the ThinkPad and use `gs_console` the same way.
-The split below still applies.
+The Telegram **pager** — the phone-to-Pi trigger — is
+not in this repo yet, and deliberately so (§8).
+The **wake channel** between the Pi and
+the ThinkPad *is* shipped: `gs_wake_keys`, `gs_doorbell` and
+`gs_wake_agent`. So the vault can sit powered off for weeks and be woken
+for one job at a time. Until you build a trigger you poke the Pi by hand
+over SSH; until you set the wake channel up at all, you sit at the
+ThinkPad and use `gs_console` the same way. The split below still
+applies.
 
 ```
  phone (throwaway Telegram)
@@ -154,8 +160,15 @@ Debian or whatever you already run. Disk encrypted.
   speaks to the home ISP.
 - Run **its own** Tor on the ThinkPad (`127.0.0.1:9050`). Do not use
   the Pi as a Tor proxy — a pwned Pi would sit on the path.
+  `gs_wake_agent` takes its proxy from its **own keyfile**, never from
+  the wake note, so a pwned Pi cannot supply one. That is checked by
+  `tests/test_opsec_doc.py`, not merely promised here.
   Cost: when a job is running, Mullvad sees two Tor clients in one
   tunnel. The ISP still only sees Mullvad.
+- The Pi is still your default route, and it now also knows **which job
+  it dispatched and roughly when**. Running your own Tor means the Pi
+  cannot read or redirect the circuit; it does not make the Pi blind to
+  timing and volume.
 
 **Wallet — accounts, not just subaddresses**
 
@@ -569,18 +582,51 @@ If you will not accept “laptop theft = they can watch incoming,”
 there is no doorbell. Stop here and use the console by hand.
 
 
-## 5. Job cycle (when the bot exists)
+## 5. Job cycle
+
+Steps 1–2 are still procedure (no trigger is shipped). Step 3 onward is
+`gs_doorbell` and `gs_wake_agent`.
 
 1. Phone: `/recv` then `/depo 0.05` to the throwaway account.
 2. Pi checks Tor, allowlisted chat id, rate limit.
-3. Pi WOL + signed job file on the LAN.
-4. ThinkPad boots, waits a **random 5–20 min** (breaks the obvious
-   Telegram→power-spike→Thor clock), brings up Tor, runs the same
-   actions as the console: `create_receive_wallet`, `thor_swap_preparer`.
+3. `gs_doorbell wake` binds its LAN socket **first**, waits a random
+   0–15 min, then sends the magic packet and holds one job for 10 min.
+   It hands that job over **at most once**, sealed to a public key the
+   booting ThinkPad mints for that boot alone.
+4. ThinkPad boots. `gs_wake_agent` checks it can do the job **before**
+   asking for one — deadman armed, no removable disk attached, disk and
+   RAM fine, its own Tor up — so a boot that cannot work does not burn
+   the poke. Then it waits a **random 5–20 min** and runs
+   `create_receive_wallet` and `thor_swap_preparer` as one job.
+
+   Which jitter breaks which link, stated honestly: the Pi's pre-WOL
+   delay decorrelates *poke → power spike*; the ThinkPad's 5–20 min
+   decorrelates *boot → ThorChain*. **Nothing** decorrelates *boot →
+   a second Tor client appearing in the Mullvad tunnel*. The ThinkPad's
+   jitter is the floor because a pwned Pi can zero its own.
 5. Slip stays on the ThinkPad (`0600`). Telegram gets `depo ready · slip A3F1`.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
-7. ThinkPad `receive_watch` until landed **or** a few hours, then
-   `landed` / timeout, then **shutdown**.
+7. ThinkPad `receive_watch` until landed **or 2 h** (`--timeout-min 110`,
+   inside a 7200 s budget — the doc and the code say the same number),
+   then **power off**. Power-off is three independent root-owned paths:
+   the agent's own `finally`, `OnFailure=` on its unit, and a deadman
+   timer armed at boot that does not depend on the agent being alive.
+   The only two things that stop it are an inhibit file and a live
+   GhostSpiral run lock — both mean a person is at the machine. The
+   inhibit file has a name and a place, and it is no use to you unless
+   you know both, so: it is `.gs_wake_inhibit` **in the artifact
+   directory the keyfile names**, not in your home directory.
+
+   ```bash
+   touch /var/lib/ghostspiral/.gs_wake_inhibit    # sitting down at the vault
+   rm    /var/lib/ghostspiral/.gs_wake_inhibit    # done; it can wake again
+   ```
+
+   While it exists, a woken boot refuses the job, does **not** power off,
+   and disarms the deadman so nothing takes the machine down under you.
+   Leave it there and the vault is simply not wakeable — which is the
+   correct trade for the hour you are using it, and the wrong one to
+   forget about for a week.
 8. Idle weeks: ThinkPad is off. Only the Pi hums.
 
 Until the bot exists: skip 1–3. You are at the ThinkPad. Same files,
@@ -594,15 +640,15 @@ same “memo never leaves the machine except to the sender.”
 | ISP “this house runs Tor” | **Yes** — they see Mullvad |
 | Hotspot / SIM / towers | **Yes** — no cellular |
 | VPS host images a wallet | **Yes** — no wallet on Mullvad |
-| Door kick, Pi only | **Yes** — rotate the bot token |
+| Door kick, Pi only | **Partly** — the Pi holds a long-term X25519 secret plus your MAC and LAN address. Recovery is a two-box re-key (`gs_wake_keys`), not a token rotation. Wake traffic recorded off the switch stays sealed: each job note is boxed to a key the vault minted for that boot |
 | Door kick, they take the ThinkPad | **Partly** — view-only if auto-unlock; spend USB elsewhere |
 | Spend USB left in the laptop | **No** — you blew the split |
-| Stolen Telegram / bot token | **Partly** — they can wake and spam quotes, not spend |
-| Roommate sends WOL | **Yes** if jobs need a signed Pi note |
+| Stolen Telegram / bot token | **Partly** — they can wake and spam quotes, not spend, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses minting jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. What they still get is your vault powering on when they say |
+| Roommate sends WOL | **Yes** for job execution — no authenticated note, no job, boot-sit-shutdown. **No** for the side effects: they still chose when your vault powers on and auto-unlocks, and a no-job boot dwells a random 1–3 min before powering off, so it does not die the instant it learns there is nothing to do. That removes the boot-and-die tell; it does **not** make a no-job boot look like a job boot, which waits 5–20 min of jitter before it starts anything |
 | WOL from the internet | **Yes** if UDP 9 is not forwarded |
 | Power cut | **Yes** if BIOS stays Off |
 | Tor / Mullvad down | **Yes** — fail closed, no clearnet “backup” |
-| SD card dies | **Yes** — spare image; Telegram goes quiet |
+| SD card dies | **Yes** — spare image, then re-key both boxes. There is no counter to go backwards: freshness is a per-boot challenge, so a restored Pi is not locked out |
 | Telegram + Mullvad + Thor lined up on the clock | **Not really** — jitter helps, does not erase |
 | BTC from a named exchange | **No** |
 | Real-name Telegram | **No** |
@@ -621,6 +667,21 @@ same “memo never leaves the machine except to the sender.”
 - [ ] Throwaway Telegram, not the account with your face
 - [ ] A test `/depo` (or a hand-run quote) writes the slip **only**
       on the ThinkPad; chat has no memo
+- [ ] `gs_wake_keys` printed the SAME pair fingerprint on both boxes
+- [ ] The Pi keyfile is `0400` and the ThinkPad's is too; the Pi's copy
+      was `shred -u`'d from the ThinkPad after the pair was confirmed
+- [ ] `gs-wake-deadman.timer` is **active** — the agent refuses to run a
+      job on a box that cannot turn itself off
+- [ ] `sleep.target suspend.target hibernate.target hybrid-sleep.target`
+      are **masked**: suspend leaves the LUKS key in RAM in a closet
+- [ ] Spend USB **out** before any wake; the agent refuses if it sees a
+      removable block device
+- [ ] The doorbell's port is **not** forwarded, and it binds the LAN
+      address only — never `0.0.0.0`, never `wg0`
+- [ ] **UNMEASURED, test it yourself:** that this NIC honours the magic
+      packet at all, and that WOL still works after a `paranoia_mode`
+      MAC spoof. Whether a randomised MAC is the address the NIC's WOL
+      engine matches is chip-dependent, so this repo does not claim it
 
 
 ## 8. What this repo actually runs today
@@ -640,6 +701,79 @@ Receive path (no mix):
 Mix is `run_pipeline` / GhostSpiral and needs the spend USB. Do not
 point a pager at it.
 
-The Pi doorbell + signed job file are **operator procedure**, not a
-shipped binary. Do not “just run a Telegram bot” that prints the memo
-— that throws away the only reason to have a Pi.
+The Pi doorbell + signed note **are shipped now**:
+
+```bash
+# once, at the ThinkPad, with physical access
+python3 gs_wake_keys --thinkpad-mac aa:bb:cc:dd:ee:ff \
+        --doorbell-host 192.168.1.9 --amount-ladder 0.01 0.02 0.05
+
+# on the Pi, one process per poke — the job goes in on STDIN, never argv
+echo '{"job":"receive_and_quote","amount_slot":2}' | \
+    python3 gs_doorbell wake --key /etc/gs_wake_pi.key
+
+# on the ThinkPad, as a systemd oneshot at boot (see systemd/ in this repo)
+python3 gs_wake_agent --key /etc/gs_wake_thinkpad.key
+```
+
+Install the units from `systemd/` **as shipped**, and leave
+`WorkingDirectory=` and `Environment=HOME=` alone. `paranoia_mode`
+sweeps four fixed roots — cwd, `$HOME`, `$HOME/ghostspiral`,
+`$HOME/GhostSpiral` — and systemd starts a unit with cwd `/` and
+`HOME=/root`, so without those two lines the woken job's bundles and
+slips sit somewhere the wipe never looks. The agent checks this itself
+and refuses the boot (`outside_wipe_roots`) rather than writing them
+there, which is the right answer and not a working vault.
+
+For the same reason, wipe the wake artifacts from **that** directory:
+
+```bash
+cd /var/lib/ghostspiral && python3 /opt/ghostspiral/paranoia_mode
+```
+
+A `paranoia_mode` run started from your home directory will not see
+them.
+
+It will **not** touch `/etc/gs_wake_thinkpad.key`, because `/etc` is not
+one of the four roots — measured, not assumed. That is the right answer
+for a routine wipe: the vault stays pairable and the doorbell keeps
+working. It is the wrong answer if you are wiping because you expect the
+door to come in, and `paranoia_mode` cannot tell those two apart. In
+that case destroy the pairing yourself, and re-key both boxes afterwards:
+
+```bash
+shred -u /etc/gs_wake_thinkpad.key
+```
+
+If you instead keep the keyfile inside a swept root, `paranoia_mode`
+destroys it on every wipe and says so ("DESTROYED the WAKE PAIRING"),
+and recovery is a two-box re-key with `gs_wake_keys` — not a token
+rotation.
+
+What is still **not** shipped is the trigger INTO the Pi. Do not “just
+run a Telegram bot” that prints the memo — that throws away the only
+reason to have a Pi. The only acceptable remote trigger is inbound over
+Tor to a Pi onion service: no port forward, and no WAN path to WOL.
+
+The wake channel can ask for three jobs and no others — `receive_new`,
+`receive_and_quote`, `watch`. There is deliberately no job that takes an
+XMR destination: a doorbell that can name one turns “they can wake and
+spam quotes, not spend” into “you read a valid memo off your own vault,
+send real BTC, and ThorChain delivers to the attacker.” Every parameter
+is a bounded integer or a 4-hex handle; the amount is an INDEX into a
+ladder that lives on the ThinkPad, so the Pi never sends a number and
+never a flag, a path or a proxy. The ThinkPad composes every argument
+itself.
+
+`watch` takes only a handle that came from `receive_and_quote`. A handle
+from `receive_new` is refused, for two reasons: `--count N` mints N
+bundles and the handle cannot name one of them without picking
+arbitrarily, and a receive bundle carries no quoted amount, so the only
+way to watch it would be `--any` — which stops on **any** balance, so a
+piconero of dust from anyone holding the address would page you that
+your money had landed.
+
+Pi-side artifacts are **not** covered by `paranoia_mode`: it sweeps the
+host it runs on, and nothing in this repo runs on the Pi except
+`gs_doorbell`. The doorbell persists nothing — its only file is the
+keyfile.

@@ -4,6 +4,16 @@ requests>=2.28
 # speak SOCKS on its own, so the whole toolchain refuses to run. It was missing
 # from this list, which meant a clean install could not use Tor at all.
 PySocks>=1.7.1
+# REQUIRED for the Pi doorbell and the wake agent. gs_wake_proto boxes every
+# wake message with libsodium crypto_box (X25519 + XSalsa20-Poly1305). Measured
+# against PyNaCl 1.6.2: Box.encrypt() draws its own 24-byte nonce and returns
+# nonce+ciphertext+MAC, 40 bytes of overhead, and sodium_pad puts every record
+# on exactly one 256-byte block so the job cannot be read off the wire by
+# length. There is NO unauthenticated wake mode and no degraded mode -- unlike
+# --gpg-recipient, where a meaningful unencrypted state exists, "an
+# unauthenticated wake note" is a magic packet with extra steps. Without this
+# the doorbell refuses to start.
+PyNaCl>=1.5
 tenacity>=8.0
 stem>=1.8
 monero>=0.8

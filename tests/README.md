@@ -66,6 +66,54 @@ python3 tests/test_opsec_doc.py     # OPSEC_SETUP.md's promises about this code,
 python3 tests/test_console.py       # gs_console: wallet-password scope, no
                                     #   invented fee numbers, preflight egress
                                     #   rule, HTTP gates over a real socket
+python3 tests/test_wake_protocol.py # THE WAKE WIRE FORMAT: the Pi->vault job
+                                    #   note. The first design boxed both
+                                    #   directions with ONE crypto_box, so the
+                                    #   vault's own request replayed back at it
+                                    #   decrypted, authenticated AND echoed the
+                                    #   challenge it had just generated. Now:
+                                    #   M2 is sealed to a per-boot ephemeral,
+                                    #   M1/M3 are separated by a domain tag,
+                                    #   and every record is padded to exactly
+                                    #   296 bytes so the job cannot be read off
+                                    #   the wire by length (76/91/100 before)
+python3 tests/test_wake_agent.py    # THE VAULT AGENT: a TABLE asserting the
+                                    #   machine powers off on every refusal.
+                                    #   Fail-closed elsewhere means sys.exit;
+                                    #   here it means the box turns off, and
+                                    #   the ordinary house style would have
+                                    #   left the vault running on the LAN with
+                                    #   the disk unlocked. Plus the argv canary
+                                    #   (nothing from a note becomes a flag,
+                                    #   a path, a URL or a proxy), the handle
+                                    #   rules (one handle names ONE watchable
+                                    #   address or none, and a watch with no
+                                    #   quote is refused rather than passing
+                                    #   the literal string "None" to --pairs),
+                                    #   and the shipped systemd units read as
+                                    #   FILES: two of the three power-off paths
+                                    #   ARE those files, and their numbers
+                                    #   drift apart from this module silently
+python3 tests/test_wake_doorbell.py # THE DOORBELL over a real socket: one job,
+                                    #   handed over at most once, windows on
+                                    #   the Pi's own clock, and the Pi writes
+                                    #   NOTHING to disk. Also that report()
+                                    #   PRINTS the event meaning "a second
+                                    #   authenticated boot took your job" --
+                                    #   it was collected and read by nothing
+python3 tests/test_wake_endtoend.py # THE WHOLE WAKE CHANNEL, END TO END: the
+                                    #   keyfiles are minted by running
+                                    #   gs_wake_keys as a SUBPROCESS, the
+                                    #   doorbell binds a real socket in a
+                                    #   thread, and the agent posts to it with
+                                    #   its own urllib. Every other wake suite
+                                    #   tests one side against a stand-in for
+                                    #   the other, so both can be green while
+                                    #   the halves do not fit — a swapped key
+                                    #   direction, a URL built wrong, a status
+                                    #   code one side never emits. Only the
+                                    #   edges are stubbed: the magic packet,
+                                    #   the child tools, the probes, the sleeps
 python3 tests/test_peel_pipeline.py # THE PEEL CHAIN, THE DAG ROUND AND THE
                                     #   EXIT, driven through the REAL main()
                                     #   against a wallet that MOVES MONEY.
@@ -144,6 +192,26 @@ python3 -m venv --system-site-packages .venv
 .venv/bin/pip install monero
 .venv/bin/python tests/real_phase_create_testnet.py
 ```
+
+### What the wake channel does NOT verify
+
+Everything about the wake path is driven offline: no Pi, no real magic packet,
+no real power-off. Two things are less stubbed than that sounds. The pairing
+tool is run as a real subprocess, because a keyfile written wrong is discovered
+at 3am on a box that will not wake. And `test_wake_endtoend.py` puts the real
+doorbell and the real agent on opposite ends of a real socket, because a suite
+per side can be green while the two sides do not fit.
+
+Four things are **claimed by nobody** and must be checked by hand on the
+actual hardware (they are in OPSEC_SETUP.md §7 as checklist items):
+
+- that this NIC honours the magic packet at all;
+- that Wake-on-LAN still works after `paranoia_mode`'s MAC spoof — whether a
+  randomised MAC is the address the NIC's WOL engine matches is chip-dependent,
+  so this repo does not claim it either way;
+- BIOS: WOL enabled, power-loss stay-off;
+- that `poweroff` actually cuts power rather than dropping to a halt state that
+  leaves the LUKS key in RAM.
 
 ### Committing an artifact is an OPSEC failure, so it is machine-checked
 

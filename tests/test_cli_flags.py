@@ -7,7 +7,12 @@ import os, subprocess, sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
            "create_receive_wallet", "exit_strategy_simulator",
-           "paranoia_mode", "thor_swap_preparer"]
+           "paranoia_mode", "thor_swap_preparer",
+           # The wake channel. Listing them here is what forces the lazy
+           # PyNaCl import: a top-level `import nacl` would make --help red on
+           # a clean install, and --help is how an operator finds out what a
+           # program wants before they have installed anything.
+           "gs_wake_keys", "gs_doorbell", "gs_wake_agent"]
 PROXY = "socks5h://127.0.0.1:9050"
 
 PASS = 0; FAIL = 0; FAILS = []

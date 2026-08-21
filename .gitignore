@@ -68,3 +68,12 @@ tx_staging/
 # Wallet output-set export written by airgap_tx_signer phase_create so the
 # offline wallet can sign spends of earlier rounds. Maps the wallet holdings.
 outputs_export.hex
+
+# The Pi/vault wake channel. The .key files hold an X25519 SECRET each; the
+# state file is the job ledger; the handles file maps a handle to the bundle
+# and slip it names. Suffixed patterns, NOT "gs_wake_*" -- that would shadow
+# the tracked scripts gs_wake_keys, gs_wake_agent and gs_wake_proto.py.
+gs_wake_*.key
+gs_wake_state.json
+gs_wake_handles.json
+.gs_wake_inhibit

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""gs_wake_keys - pair a Pi doorbell with a ThinkPad vault, once, by hand.
+
+Writes TWO files and puts a secret in each. Neither file ever contains both
+secrets, so copying one to the wrong box cannot hand over the other side's
+identity:
+
+    <out>/gs_wake_thinkpad.key   ThinkPad secret + Pi public   -> stays here
+    <out>/gs_wake_pi.key         Pi secret + ThinkPad public   -> goes to the Pi
+
+Run this ON THE THINKPAD, with physical access, once. Carry the Pi file over on
+the same removable medium you use for nothing else, and delete it from here
+afterwards -- this tool prints the exact command and will not do it for you,
+because a tool that deletes the only copy of a key before you have confirmed
+the other end works is a tool that bricks the doorbell.
+
+WHY ASYMMETRIC, WHEN THE DOC SAID "shared key"
+OPSEC_SETUP.md §3 says the ThinkPad "only runs a job after a signed note from
+the Pi (shared key on the Pi and the ThinkPad)". A shared symmetric key means a
+seized Pi SD card yields the ThinkPad's identity as well as the Pi's -- the
+attacker can then impersonate EITHER side. Two keypairs cost nothing and mean
+the Pi holds only its own secret. §6's "Door kick, Pi only" row is rewritten to
+say what recovery actually is: a two-box re-key, not a token rotation.
+
+WHAT THIS TOOL REFUSES
+  * to overwrite an existing keyfile -- silently replacing a keypair breaks the
+    other box in a way that presents as "the doorbell stopped working", which
+    is byte-identical to a dead switch, a BIOS reset and a hostile WOL
+  * to write anywhere group- or world-readable
+  * to accept an amount ladder longer than the wire format's slot range
+  * to run at all without PyNaCl
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gs_common import (                                      # noqa: E402
+    atomic_write_json, integrity_log, install_signal_handlers, secure_mkdir,
+)
+import gs_wake_proto as proto                                # noqa: E402
+
+MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
+#: amount_slot is validated as int 0..7 on the wire, so a ladder longer than
+#: that has entries no note can ever select. Refuse rather than carry them.
+MAX_LADDER = 8
+
+THINKPAD_FILE = "gs_wake_thinkpad.key"
+PI_FILE = "gs_wake_pi.key"
+
+
+def _pair_fingerprint(pub_a: bytes, pub_b: bytes) -> str:
+    """A short, PUBLIC value both boxes can print to prove they are paired.
+
+    Over the SORTED pair, so both sides compute the same string without either
+    needing to know which of them is 'first'. Public keys only -- a fingerprint
+    an operator reads aloud must not be derived from a secret.
+    """
+    lo, hi = sorted((pub_a, pub_b))
+    return hashlib.sha256(b"GSWAKE-pair-v1" + lo + hi).hexdigest()[:16].upper()
+
+
+def _refuse_existing(path: Path) -> None:
+    if path.exists():
+        sys.exit(
+            f"[!] {path} already exists.\n"
+            f"    Refusing to overwrite it: the other box holds the matching\n"
+            f"    half, and replacing this one silently breaks the pair in a way\n"
+            f"    that looks exactly like a dead switch or a hostile WOL.\n"
+            f"    Move it aside deliberately if you really are re-keying, and\n"
+            f"    re-key BOTH boxes in the same sitting.")
+
+
+def _write_key(path: Path, obj: dict) -> None:
+    # 0400. The agent runs unattended and only ever reads this; a writable
+    # keyfile is a keyfile something can rewrite between boots.
+    atomic_write_json(obj, path, perms=0o400)
+    st = os.stat(path)
+    if st.st_mode & 0o077:                                   # pragma: no cover
+        sys.exit(f"[!] {path} ended up group/world accessible; refusing to "
+                 f"leave a wake secret readable. Check your umask and the "
+                 f"filesystem.")
+
+
+def build_cli() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Pair a Pi doorbell with a ThinkPad vault (run once, on "
+                    "the ThinkPad).")
+    ap.add_argument("--out", default=".",
+                    help="directory for the two keyfiles (default: cwd)")
+    ap.add_argument("--thinkpad-mac", required=True,
+                    help="the ThinkPad NIC the Pi will send the magic packet "
+                         "to, aa:bb:cc:dd:ee:ff")
+    ap.add_argument("--doorbell-host", required=True,
+                    help="the Pi's LAN address the ThinkPad will fetch from")
+    ap.add_argument("--doorbell-port", type=int, default=8770)
+    ap.add_argument("--wol-broadcast", default="255.255.255.255",
+                    help="broadcast address for the magic packet")
+    ap.add_argument("--wol-port", type=int, default=9)
+    ap.add_argument("--tor-proxy", default="socks5h://127.0.0.1:9050",
+                    help="the ThinkPad's OWN Tor. OPSEC_SETUP.md §4: do not "
+                         "point this at the Pi — a pwned Pi would sit on the "
+                         "path.")
+    ap.add_argument("--rpc", default="http://127.0.0.1:18083",
+                    help="the ThinkPad's wallet-rpc")
+    ap.add_argument("--artifact-dir", default="/var/lib/ghostspiral",
+                    help="ABSOLUTE path where the woken jobs write bundles and "
+                         "slips. Must match ReadWritePaths= in "
+                         "systemd/gs-wake-agent.service.")
+    ap.add_argument("--amount-ladder", nargs="*", default=[],
+                    metavar="BTC",
+                    help=f"up to {MAX_LADDER} BTC amounts a wake may select by "
+                         f"INDEX. The Pi never sends a number — it sends a slot.")
+    ap.add_argument("--account-ceiling", type=int, default=45,
+                    help="refuse minting jobs once the wallet holds this many "
+                         "accounts (OPSEC_SETUP.md §4: the offline signing "
+                         "wallet derives subaddresses for a bounded number)")
+    return ap
+
+
+def main():
+    install_signal_handlers()
+    args = build_cli().parse_args()
+
+    # Fail on the dependency BEFORE creating a directory or printing anything
+    # that implies success.
+    try:
+        proto.require_nacl()
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+    import nacl.public
+
+    if not MAC_RE.match(args.thinkpad_mac):
+        sys.exit(f"[!] --thinkpad-mac {args.thinkpad_mac!r} is not a MAC "
+                 f"address (aa:bb:cc:dd:ee:ff). The magic packet is built from "
+                 f"these six bytes; a wrong one wakes nothing and reports "
+                 f"nothing.")
+    if len(args.amount_ladder) > MAX_LADDER:
+        sys.exit(f"[!] --amount-ladder has {len(args.amount_ladder)} entries; "
+                 f"the wire format carries a slot index 0..{MAX_LADDER - 1}, so "
+                 f"anything past {MAX_LADDER} could never be selected. Refusing "
+                 f"to write a ladder with unreachable rungs.")
+    for a in args.amount_ladder:
+        # Shape only. The value is handed to thor_swap_preparer, which does the
+        # real Decimal validation -- this refuses the obviously-wrong so the
+        # operator finds out now rather than at 3am on a woken box.
+        #
+        # Decimal, not float, even for a shape check. The regex already blocks
+        # "inf" and "1e9", so float() could not have been fed one here -- but
+        # tests/test_signer_schema.py records what a float on a money path cost
+        # this repo once, and there is no reason to leave a second one lying
+        # around for the next person to copy.
+        if not re.match(r"^\d+(\.\d+)?$", a) or Decimal(a) <= 0:
+            sys.exit(f"[!] --amount-ladder entry {a!r} is not a positive "
+                     f"decimal BTC amount.")
+    if args.account_ceiling < 1:
+        sys.exit("[!] --account-ceiling must be at least 1.")
+    # THE OPERATOR FINDS OUT NOW, NOT AT 3AM. Everything below is written into
+    # a keyfile and only checked when the doorbell next tries to start -- which
+    # is the moment they actually need it to work.
+    host = str(args.doorbell_host).strip()
+    if not host or host in ("0.0.0.0", "::", "*"):
+        sys.exit(f"[!] --doorbell-host {args.doorbell_host!r} is an "
+                 f"all-interfaces address. The Pi must bind ONE LAN address: "
+                 f"binding everything puts the doorbell on the VPN tunnel as "
+                 f"well as the switch. gs_doorbell refuses this at startup, "
+                 f"so a keyfile carrying it is a pairing that never works.")
+    if re.search(r"[\s/:@?#\[\]]", host):
+        # It is pasted straight into http://<host>:<port>. A stray path or a
+        # second colon there produces a URL that resolves somewhere else.
+        sys.exit(f"[!] --doorbell-host {args.doorbell_host!r} must be a bare "
+                 f"hostname or IPv4 address; it goes into the URL the vault "
+                 f"fetches from.")
+    for name, port in (("--doorbell-port", args.doorbell_port),
+                       ("--wol-port", args.wol_port)):
+        if not (1 <= int(port) <= 65535):
+            sys.exit(f"[!] {name} {port} is not a port. Port 0 in particular "
+                     f"would have the Pi bind a random port while the vault "
+                     f"was told to fetch from ':0'.")
+    # A RELATIVE ARTIFACT DIR IS RESOLVED BY THE AGENT, NOT BY YOU. The agent
+    # runs from systemd, whose working directory is "/", so the old default of
+    # "." meant every woken job wrote to the root filesystem -- which
+    # gs-wake-agent.service mounts read-only (ProtectSystem=strict), so the
+    # first boot after pairing refused with "outside_wipe_roots" and the
+    # operator had a keyfile that looked right and a vault that would not work.
+    if not os.path.isabs(args.artifact_dir):
+        sys.exit(f"[!] --artifact-dir {args.artifact_dir!r} is relative. The "
+                 f"agent runs under systemd, where the working directory is "
+                 f"'/', so a relative path resolves somewhere you did not "
+                 f"choose. Give an absolute path, and make it the one "
+                 f"ReadWritePaths= names in "
+                 f"systemd/gs-wake-agent.service (/var/lib/ghostspiral).")
+
+    outdir = Path(args.out)
+    secure_mkdir(outdir)
+    tp_path, pi_path = outdir / THINKPAD_FILE, outdir / PI_FILE
+    _refuse_existing(tp_path)
+    _refuse_existing(pi_path)
+
+    tp_sk = nacl.public.PrivateKey.generate()
+    pi_sk = nacl.public.PrivateKey.generate()
+    tp_pub = tp_sk.public_key.encode()
+    pi_pub = pi_sk.public_key.encode()
+    fp = _pair_fingerprint(tp_pub, pi_pub)
+
+    # BOTH FILES OR NEITHER. If the second write fails -- a full disk, a
+    # read-only --out on a USB stick -- the first one is already on disk, and
+    # re-running then hits _refuse_existing and tells the operator to re-key
+    # both boxes when in fact nothing was ever paired. Undo it and say so.
+    _written = []
+
+    def _write_pair(path, obj):
+        try:
+            _write_key(path, obj)
+        except BaseException:
+            for done in _written:
+                try:
+                    done.unlink()
+                except OSError:
+                    print(f"  [!] Could NOT remove the half-written {done}. "
+                          f"Delete it by hand before pairing again: it holds "
+                          f"a secret and it is not paired with anything.")
+            raise
+        _written.append(path)
+
+    _write_pair(tp_path, {
+        "schema": "gs_wake_v1",
+        "version": proto.WIRE_VERSION,
+        "role": "thinkpad",
+        "secret": tp_sk.encode().hex(),
+        "peer_public": pi_pub.hex(),
+        "pair_fingerprint": fp,
+        "doorbell_url": f"http://{args.doorbell_host}:{args.doorbell_port}",
+        "tor_proxy": args.tor_proxy,
+        "rpc_primary": args.rpc,
+        "artifact_dir": args.artifact_dir,
+        "amount_ladder": list(args.amount_ladder),
+        "account_ceiling": int(args.account_ceiling),
+    })
+    _write_pair(pi_path, {
+        "schema": "gs_wake_v1",
+        "version": proto.WIRE_VERSION,
+        "role": "pi",
+        "secret": pi_sk.encode().hex(),
+        "peer_public": tp_pub.hex(),
+        "pair_fingerprint": fp,
+        "listen_host": args.doorbell_host,
+        "listen_port": int(args.doorbell_port),
+        "target_mac": args.thinkpad_mac.lower().replace("-", ":"),
+        "wol_broadcast": args.wol_broadcast,
+        "wol_port": int(args.wol_port),
+    })
+
+    # The fingerprint is public and the paths are local. No key material and no
+    # MAC reaches the persistent chain: chain_safe collapses digits to '#' but
+    # has no MAC rule, so 'a4:c3:f0:1b' would survive as 'a#:c#:f#:#b' -- with
+    # the digit positions known, that is a handful of candidates. spoof_mac
+    # already settled this: record THAT it happened, never the address.
+    integrity_log("wake", f"keypair_minted:{fp}")
+
+    print(f"  [+] Wake pair {fp} minted.")
+    print(f"      ThinkPad : {tp_path}   (0400, stays on this machine)")
+    print(f"      Pi       : {pi_path}   (0400, carry to the Pi)")
+    print()
+    print("  Next, in this order:")
+    print(f"    1. Copy {pi_path.name} to the Pi at /etc/gs_wake_pi.key, "
+          f"chown root:root, chmod 0400.")
+    print(f"    2. Confirm BOTH boxes print pair {fp} before you rely on it.")
+    # `shred -u`, not a paranoia_mode flag. An earlier draft of this line said
+    # `python3 paranoia_mode --shred <path>`; paranoia_mode has no --shred, so
+    # the one instruction the operator is given for deleting a live secret
+    # would have failed with a usage error. A full `python3 paranoia_mode` run
+    # does remove it (gs_wake_*.key is in GS_ARTIFACT_FILE_PATTERNS), but
+    # telling someone to run the whole wipe to delete one file is its own bad
+    # advice -- it would take the ThinkPad keyfile with it.
+    print(f"    3. Then, and only then, securely delete {pi_path} from here:")
+    print(f"         shred -u {pi_path}")
+    print()
+    print("  [!] Neither file is encrypted at rest. Encrypting them with a "
+          "passphrase")
+    print("      would mean typing it at every unattended boot, which is the "
+          "one thing")
+    print("      a doorbell cannot do — the same trade OPSEC_SETUP.md §4 "
+          "records for LUKS.")
+    print("      Full-disk encryption on both boxes is what protects these; "
+          "0400 is not.")
+    print("  [!] The Pi deliberately holds this ThinkPad's MAC and LAN "
+          "address. That is")
+    print("      the doorbell's whole job. It holds no key, no memo and no "
+          "address of yours.")
+
+
+if __name__ == "__main__":
+    main()

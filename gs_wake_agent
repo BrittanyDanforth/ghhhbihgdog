@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+"""gs_wake_agent - the vault half. Boot, ask, do ONE job, power off.
+
+Runs on the ThinkPad as a systemd oneshot at boot. It is the reason the vault
+can be OFF for weeks: OPSEC_SETUP.md §5 step 8, "Idle weeks: ThinkPad is off.
+Only the Pi hums."
+
+    gs_wake_agent --key /etc/gs_wake_thinkpad.key
+
+THE SHAPE OF THIS FILE IS THE POINT
+`run_once()` returns a reason code and NEVER exits. `main()` wraps it in a
+try/finally that calls `power_off()`. That is not tidiness, it is the whole
+feature:
+
+    fail-closed everywhere else in this repo means sys.exit()
+    fail-closed HERE means the machine turns off
+
+gs_common.verify_tor, tor_recheck, validate_proxy and newnym(required=True) all
+abort with sys.exit. If this agent were written the ordinary house way, a Tor
+failure would exit the process, systemd would mark the unit failed, and the
+vault would sit powered on, on the LAN, with the disk auto-unlocked, until
+somebody walked over. That is strictly worse than the row OPSEC_SETUP.md §6
+scores for "they take the ThinkPad", and it happens on the four most ordinary
+paths there are: no job pending, Tor not up yet, cable out, Pi rebooting.
+
+`finally` runs on SystemExit too, so gs_common's aborts are covered without
+touching gs_common.
+
+POWER-OFF IS THREE INDEPENDENT ROOT-OWNED PATHS, and this file is only one:
+  1. this agent's `finally`;
+  2. `OnFailure=gs-wake-poweroff.service` on the unit, for a crash;
+  3. `gs-wake-deadman.timer`, armed at boot by the same target that starts the
+     agent and independent of it, for a SIGKILL or a hang.
+None is conditional on the job succeeding. See systemd/ in this repo.
+
+A BOOT THAT CANNOT DO THE JOB MUST NOT CONSUME THE JOB.
+Every precondition is checked BEFORE M1 goes out. If Tor is down, if the spend
+USB is in, if the disk is full, if the deadman is not armed -- the agent powers
+off without ever asking, and the job is still pending at the Pi for the next
+boot. Asking first and failing second would silently burn the operator's poke.
+
+WHAT A JOB MAY BE
+Whatever `gs_wake_proto.JOBS` says, and nothing else. The Pi sends a job id and
+a closed set of typed scalars; this file composes 100% of the argv itself from
+that table plus its own keyfile. No value from the note ever becomes a flag
+name, a path, a URL or a proxy. See gs_wake_proto for the attack that rule
+exists for.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import random
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gs_common import (                                      # noqa: E402
+    ResourceCheckUnavailable, atomic_write_json, integrity_log,
+    install_signal_handlers, resource_check, wipe_covers,
+)
+import gs_wake_proto as proto                                # noqa: E402
+
+#: Mandatory, agent-side, and the Pi cannot influence it. OPSEC_SETUP.md §5
+#: step 4: "waits a random 5-20 min (breaks the obvious Telegram -> power-spike
+#: -> Thor clock)". The Pi adds its own pre-WOL delay, but that one is
+#: best-effort: a pwned Pi can zero it, which is exactly why this floor exists
+#: on the box the Pi does not control.
+JITTER_LO_S, JITTER_HI_S = 300, 1200
+#: How long the Pi has to answer, measured with THIS machine's monotonic clock.
+#: One machine, one clock -- correct on a ThinkPad with a flat CMOS battery,
+#: where a wall-clock comparison against the Pi's timestamp is not.
+M1_M2_WINDOW_S = 120
+#: SIGTERM the job's process group, wait, then SIGKILL. SIGTERM first because
+#: every tool here installs a handler and its finally blocks are what erase the
+#: plans and the wallet-password scratch file.
+JOB_TERM_GRACE_S = 20
+#: A no-job boot sits for a random spell so its uptime is not trivially
+#: separable from a real one. It does not hide a two-hour watch, and nothing
+#: claims it does.
+NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S = 60, 180
+
+STATE_FILE = "gs_wake_state.json"
+HANDLES_FILE = "gs_wake_handles.json"
+INHIBIT_FILE = ".gs_wake_inhibit"
+DEADMAN_UNIT = "gs-wake-deadman.timer"
+
+
+class Refused(Exception):
+    """A reason not to run. Carries the operator-facing text."""
+
+    def __init__(self, code: str, msg: str, power: bool = True):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+        #: False only for the two cases where a human is demonstrably present.
+        self.power = power
+
+
+# ---------------------------------------------------------------------------
+#  Injectable process boundaries. Tests replace these MODULE ATTRIBUTES; that
+#  only works because everything below calls through the module, so no
+#  `from time import sleep` anywhere in this file.
+# ---------------------------------------------------------------------------
+def power_off(dry_run: bool = False) -> bool:
+    """Turn this machine off. Returns True if the command was accepted.
+
+    NEVER print "powering off" before checking. An unchecked call that failed
+    while the message said it succeeded is this repo's most-repeated defect,
+    and here it would leave the vault running while the operator believed it
+    was down.
+    """
+    if dry_run:
+        print("  [*] --dry-run: NOT powering off. In a real wake this is where "
+              "the machine goes down.")
+        return False
+    # --no-block. This process IS gs-wake-agent.service, and systemd's
+    # shutdown transaction stops that unit -- so a BLOCKING `systemctl
+    # poweroff` waits for a transaction that is waiting for this process,
+    # until the SIGTERM lands in the middle of the call. Queue it and return.
+    # "Accepted", which is what this function's contract already says, is the
+    # honest reading either way; --no-block is the one that does not hang.
+    for cmd in (["systemctl", "--no-block", "poweroff"], ["poweroff"]):
+        try:
+            r = subprocess.run(cmd, timeout=60)
+            if r.returncode == 0:
+                return True
+        except Exception:                                    # noqa: BLE001
+            continue
+    # Deliberately not "Powering off." -- say what is true.
+    print("  [!] COULD NOT POWER OFF: this machine is still ON. The deadman "
+          "timer should take it down; if it does not, shut it down by hand.")
+    integrity_log("wake", "poweroff_failed")
+    return False
+
+
+def unit_is_active(unit: str) -> bool:
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                           timeout=30)
+        return r.returncode == 0
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def disarm_deadman() -> None:
+    try:
+        subprocess.run(["systemctl", "stop", DEADMAN_UNIT], timeout=30)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def removable_devices() -> list:
+    """Block devices the kernel marks removable.
+
+    OPSEC_SETUP.md §4: "Spend USB left in the laptop -> No -- you blew the
+    split." A woken box must not be a box with custody on it. Read from
+    /sys/block, which is the kernel's own answer -- not from udisks policy,
+    which is not reliably introspectable from here, so this never claims
+    "removable media cannot be mounted".
+    """
+    out = []
+    for p in glob.glob("/sys/block/*/removable"):
+        try:
+            if Path(p).read_text().strip() != "1":
+                continue
+        except OSError:
+            continue
+        # AN EMPTY SLOT IS NOT A DEVICE. A built-in SD reader with no card in
+        # it publishes removable=1 permanently, so the first version refused
+        # EVERY boot on any ThinkPad that has one -- a check that fails closed
+        # so hard the feature never runs is a broken feature, not a strict one.
+        # `size` is in 512-byte sectors and reads 0 when there is no medium.
+        # An unreadable size still counts as present: this errs toward
+        # refusing, which is the right direction when custody is the question.
+        try:
+            if (Path(p).parent / "size").read_text().strip() == "0":
+                continue
+        except OSError:
+            pass
+        out.append(Path(p).parent.name)
+    return out
+
+
+def tor_bootstrapped(proxy_url: str) -> bool:
+    """Is THIS machine's own Tor up?
+
+    Checked before M1 so a Tor-down boot never consumes the job. This is a
+    local liveness probe, not an exit test: the full verify_tor() runs after
+    the jitter, and doing a real exit request here would put boot-time Tor
+    traffic on the wire at exactly the moment the jitter exists to decorrelate.
+    """
+    m = re.match(r"^socks5h?://(?:[^@]*@)?([^:/]+):(\d+)", proxy_url or "")
+    if not m:
+        return False
+    import socket
+    try:
+        with socket.create_connection((m.group(1), int(m.group(2))), timeout=10):
+            return True
+    except OSError:
+        return False
+
+
+def post_record(url: str, path: str, record: bytes, timeout: int = 30) -> tuple:
+    """POST one record to the doorbell. Returns (status, body).
+
+    urllib, not requests: this runs before the job and a hard dependency here
+    would be one more thing that can fail between boot and power-off.
+    """
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(url.rstrip("/") + path, data=record,
+                                 method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("Content-Length", str(len(record)))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except Exception:                                        # noqa: BLE001
+        return 0, b""
+
+
+# ---------------------------------------------------------------------------
+#  Keyfile and local state
+# ---------------------------------------------------------------------------
+def load_key(path: Path) -> dict:
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise Refused(
+            "no_keyfile",
+            f"no wake keyfile at {path} ({e.strerror}). This machine is not "
+            f"paired with a doorbell, so it cannot tell a real job from a "
+            f"magic packet anyone on the switch can send. If you just ran "
+            f"paranoia_mode, it wiped the pairing: re-run gs_wake_keys with "
+            f"physical access.") from e
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise Refused("keyfile_perms",
+                      f"{path} is group- or world-accessible (mode "
+                      f"{stat.S_IMODE(st.st_mode):04o}); chmod 0400 it.")
+    try:
+        k = json.loads(Path(path).read_text())
+    except Exception as e:                                   # noqa: BLE001
+        raise Refused("keyfile_unreadable",
+                      f"{path} is not readable JSON ({type(e).__name__})") from e
+    if k.get("schema") != "gs_wake_v1" or k.get("version") != proto.WIRE_VERSION:
+        raise Refused("keyfile_schema",
+                      f"{path} is not a gs_wake_v1 key for wire version "
+                      f"{proto.WIRE_VERSION}")
+    if k.get("role") != "thinkpad":
+        raise Refused("keyfile_role",
+                      f"{path} is the {k.get('role')!r} keyfile. The Pi's file "
+                      f"holds the DOORBELL's secret; this machine needs its "
+                      f"own.")
+    return k
+
+
+def load_state(dirpath: Path) -> dict:
+    p = dirpath / STATE_FILE
+    try:
+        d = json.loads(p.read_text())
+        if not isinstance(d, dict):
+            raise ValueError("not an object")
+        d.setdefault("jobs", [])
+        d.setdefault("wakes", [])
+        return d
+    except Exception as e:                                   # noqa: BLE001
+        # A missing or corrupt ledger is not fatal, and it must not be: this
+        # file lives where paranoia_mode wipes. Carry on with the Pi's copy,
+        # which is the one that does not live on a wipeable disk.
+        #
+        # SAY IT, though. This comment claimed "say honestly what is lost" for
+        # a whole draft while the code returned in silence -- a comment
+        # describing a behaviour that was not there, which is the defect this
+        # repo names most often. A missing file is the normal first boot and
+        # says nothing; a file that EXISTS and will not parse is a fact the
+        # operator needs, because the replay and wake-budget backstops both
+        # start over from it.
+        if p.exists():
+            print(f"  [!] {p} exists but does not parse ({type(e).__name__}). "
+                  f"Starting a NEW ledger: the local replay guard and the "
+                  f"24 h wake budget both begin again from zero this boot. "
+                  f"The doorbell's one-job-per-process rule still holds.")
+            integrity_log("wake", "ledger_unreadable")
+        return {"jobs": [], "wakes": []}
+
+
+def save_state(dirpath: Path, state: dict) -> None:
+    atomic_write_json(state, dirpath / STATE_FILE, perms=0o600)
+
+
+# ---------------------------------------------------------------------------
+#  Preflight: everything that must be true BEFORE the job is consumed
+# ---------------------------------------------------------------------------
+def preflight(key: dict, artifact_dir: Path, dry_run: bool,
+              probes: dict = None) -> None:
+    p = probes or {}
+    _unit_active = p.get("unit_is_active", unit_is_active)
+    _removable = p.get("removable_devices", removable_devices)
+    _resources = p.get("resource_check", resource_check)
+    _tor = p.get("tor_bootstrapped", tor_bootstrapped)
+    _covers = p.get("wipe_covers", wipe_covers)
+
+    # A human is present: an operator boot, or a mix already running. Refuse
+    # the job and DISARM the deadman -- powering the box off under someone who
+    # is using it is the one failure this feature must not introduce.
+    inhibit = artifact_dir / INHIBIT_FILE
+    if inhibit.exists():
+        raise Refused("inhibited",
+                      f"{inhibit} exists, so a person is using this machine. "
+                      f"Not running a job and NOT powering off. Remove the "
+                      f"file when you are done.", power=False)
+    lock = artifact_dir / ".ghostspiral.lock"
+    if lock.exists() and _lock_is_held(lock):
+        raise Refused("mix_running",
+                      "a GhostSpiral run holds the lock on this machine. Not "
+                      "running a job and NOT powering off — a mix mid-flight "
+                      "is the one thing here with no automatic recovery.",
+                      power=False)
+
+    if not dry_run and not _unit_active(DEADMAN_UNIT):
+        # Doing a job on a box that cannot turn itself off is strictly worse
+        # than refusing: it is the always-on vault this feature exists to end.
+        raise Refused("no_deadman",
+                      f"{DEADMAN_UNIT} is not active, so nothing would turn "
+                      f"this machine off if the agent died. Refusing to start "
+                      f"a job. Install the units in systemd/ from this repo.")
+
+    rem = _removable()
+    if rem:
+        raise Refused("removable_media",
+                      f"removable device(s) attached ({', '.join(rem)}). "
+                      f"OPSEC_SETUP.md §4: the spend USB must not be in a "
+                      f"machine a pager can wake. Refusing.")
+
+    # resource_check, NOT require_resources. The latter returns None and
+    # aborts by sys.exit, so `if not require_resources(...)` would have been
+    # False-y on every healthy boot and refused every job -- caught by running
+    # it. It also CONTINUES when psutil is missing, which is right for an
+    # attended run and wrong here: nobody is watching, so a check that could
+    # not be performed is not a check that passed.
+    try:
+        ok = _resources(2.0, 90.0)
+    except ResourceCheckUnavailable:
+        raise Refused("no_sentinel",
+                      "psutil is not installed, so free disk and RAM were NOT "
+                      "checked. An attended run may continue past this; an "
+                      "unattended one must not — a job that fills the disk "
+                      "leaves half-written artifacts nobody is watching for.")
+    except Exception as e:                                   # noqa: BLE001
+        raise Refused("sentinel_error",
+                      f"the resource sentinel failed ({type(e).__name__}).")
+    if not ok:
+        raise Refused("resources",
+                      "this machine is short of disk or memory. Refusing.")
+
+    if not _covers(artifact_dir):
+        raise Refused("outside_wipe_roots",
+                      f"{artifact_dir} is outside every directory "
+                      f"paranoia_mode searches, so the bundles and slips this "
+                      f"job writes would never be erased. Refusing.")
+
+    if not _tor(key.get("tor_proxy", "")):
+        raise Refused("tor_down",
+                      f"this machine's own Tor is not answering on "
+                      f"{key.get('tor_proxy')}. Refusing BEFORE asking for the "
+                      f"job, so the job is still waiting at the doorbell for "
+                      f"the next boot.")
+
+
+def _lock_is_held(path: Path) -> bool:
+    """True if something holds the run lock right now.
+
+    flock, so the kernel answers -- a stale lock file from a killed run is not
+    a held lock, and a box that refuses forever because of a leftover file is a
+    box that never wakes again.
+    """
+    import fcntl
+    try:
+        fh = open(path, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+# ---------------------------------------------------------------------------
+#  argv composition. Nothing from the note becomes a flag.
+# ---------------------------------------------------------------------------
+def _tool(name: str) -> str:
+    return str(Path(__file__).resolve().parent / name)
+
+
+def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
+               bundle: str = None, slip: str = None, handle: str = None) -> list:
+    """(argv, env_extra) pairs for one job, composed ENTIRELY from the fixed
+    template plus this machine's own keyfile.
+
+    The only things that come from the note are: an int already range-checked
+    against a closed schema, and a handle already matched against
+    ^[0-9A-F]{4}$. Neither is ever a flag name, a path, a URL or a proxy.
+    """
+    proxy = key["tor_proxy"]
+    rpc = key["rpc_primary"]
+    if job == "receive_new":
+        return [[sys.executable, _tool("create_receive_wallet"),
+                 "--tor-proxy", proxy, "--rpc", rpc,
+                 "--count", str(int(params["count"])),
+                 "--output-dir", str(artifact_dir)]]
+    if job == "receive_and_quote":
+        ladder = key.get("amount_ladder") or []
+        slot = int(params["amount_slot"])
+        if slot >= len(ladder):
+            raise Refused("empty_slot",
+                          f"the note asked for amount slot {slot} and this "
+                          f"machine's ladder has {len(ladder)} rung(s). The "
+                          f"ladder lives here, not on the doorbell — add the "
+                          f"amount with physical access if you meant it.")
+        return [
+            [sys.executable, _tool("create_receive_wallet"),
+             "--tor-proxy", proxy, "--rpc", rpc,
+             "--count", "1", "--output-dir", str(artifact_dir)],
+            # The amount rides in the ENVIRONMENT. /proc/<pid>/cmdline is 0444
+            # and gs_common.env_or_argv's docstring records what argv already
+            # cost this repo three times.
+            [sys.executable, _tool("thor_swap_preparer"),
+             "--tor-proxy", proxy,
+             "--dest-from-receive-wallet", str(bundle),
+             "--outfile", str(artifact_dir / f"thor_pairs_{handle}.json")],
+        ]
+    if job == "watch":
+        return [[sys.executable, _tool("receive_watch"),
+                 "--tor-proxy", proxy, "--rpc", rpc,
+                 "--receive-wallet", str(bundle),
+                 "--pairs", str(slip),
+                 # Inside the 7200 s budget, and the same number OPSEC_SETUP.md
+                 # §5 step 7 states. --choice is omitted deliberately: with
+                 # stdin closed the prompt cannot fire, and omitting the flag
+                 # is the only value under which the tool cannot print a mix
+                 # command.
+                 "--timeout-min", "110"]]
+    raise Refused("unknown_job", "no argv template for this job")
+
+
+def run_child(argv: list, env_extra: dict, budget_s: int,
+              runner=None) -> tuple:
+    """Run one child under a watchdog. Returns (rc, killed_hard)."""
+    if runner is not None:
+        return runner(argv, env_extra, budget_s)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env.update(env_extra or {})
+    # start_new_session so the watchdog can signal the whole GROUP: a tool that
+    # spawns monero-wallet-cli must not leave it behind.
+    p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    try:
+        return p.wait(timeout=budget_s), False
+    except subprocess.TimeoutExpired:
+        import signal
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except Exception:                                    # noqa: BLE001
+            p.terminate()
+        try:
+            return p.wait(timeout=JOB_TERM_GRACE_S), False
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except Exception:                                # noqa: BLE001
+                p.kill()
+            p.wait(timeout=30)
+            return -9, True
+
+
+# ---------------------------------------------------------------------------
+#  One wake
+# ---------------------------------------------------------------------------
+def run_once(args, deps: dict = None) -> tuple:
+    """Do at most one job. Returns (code, status, handle).
+
+    NEVER calls sys.exit itself: main() owns the exit code because main() owns
+    the finally that powers the machine off. It can still PROPAGATE a
+    SystemExit raised by gs_common's own fail-closed aborts (verify_tor), and
+    that is fine -- main()'s finally catches every path, and past collection
+    such an abort is reported to the doorbell as a refusal like any other.
+
+    `status` is what the doorbell is told, and it is deliberately coarse:
+    done / refused / failed. The REASON stays on this machine. A doorbell that
+    learns why a job was refused learns something about this wallet.
+    """
+    d = deps or {}
+    _post = d.get("post_record", post_record)
+    _sleep = d.get("sleep", time.sleep)
+    _clock = d.get("clock", time.monotonic)
+    _rng = d.get("rng", random.SystemRandom())
+    _child = d.get("run_child", None)
+    _verify_tor = d.get("verify_tor", None)
+    _accounts = d.get("account_count", None)
+
+    proto.require_nacl()
+    import nacl.public
+
+    key = load_key(Path(args.key))
+    artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    preflight(key, artifact_dir, args.dry_run, probes=d)
+
+    tp_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
+    pi_pk = nacl.public.PublicKey(bytes.fromhex(key["peer_public"]))
+
+    # PER-BOOT EPHEMERAL. M2 is boxed to this, never to the static key, so a
+    # door kick that yields the Pi's long-term secret does not decrypt months
+    # of M2s recorded off the switch -- and a replayed M1 cannot open at the M2
+    # reader at all. Generated here, never written down, gone when this process
+    # ends and the machine powers off minutes later.
+    eph = nacl.public.PrivateKey.generate()
+    challenge = proto.new_challenge()
+
+    m1 = proto.seal(tp_sk, pi_pk, proto.TAG_M1,
+                    {"eph_pk": eph.public_key.encode().hex(),
+                     "challenge": challenge.hex()})
+    sent_at = _clock()
+    status, m2 = _post(key["doorbell_url"], "/wake", m1)
+    # UNREACHABLE AND NO-JOB ARE DIFFERENT FACTS WITH DIFFERENT ACTIONS, and
+    # the first version collapsed them: post_record returns (0, b"") when the
+    # request never completed, and `if status == 204 or not m2` caught that
+    # first -- so a dead Pi, a pulled cable or a wrong LAN address all reported
+    # "the doorbell has no job for this boot", i.e. "somebody sent a stray
+    # magic packet". The operator checks the switch for an intruder while the
+    # actual fault is their own network. Caught by driving it.
+    if status == 0:
+        raise Refused("doorbell_unreachable",
+                      "could not reach the doorbell at all. The Pi may be "
+                      "down, the cable out, or the address wrong. Nothing was "
+                      "handed over, so the job is still waiting.")
+    if status == 204 or not m2:
+        # DWELL BEFORE DYING. A boot that powers off the instant it is told
+        # "nothing for you" has an uptime of a few seconds, and that shape is
+        # itself a statement: whoever sent that packet did not have a note for
+        # this machine. Sitting a random 1-3 min removes the instant
+        # boot-and-die tell. It does NOT make this look like a job boot -- a
+        # real job waits 5-20 min of jitter before it starts anything -- and
+        # neither this comment nor the table in OPSEC_SETUP.md claims it does.
+        # Skipped under --dry-run: that is run by hand, and three minutes of
+        # silence in front of an operator reads as a hang, not as opsec.
+        #
+        # This block is the fix for a defect in the first version of this
+        # file: NO_JOB_DWELL_LO_S/HI_S were declared, documented in the doc's
+        # threat table, and never called. Dead constants that look like a
+        # feature are worse than no feature, because the operator plans around
+        # them.
+        if not args.dry_run:
+            _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))
+        raise Refused("no_job",
+                      "the doorbell answered, and it has no job for this boot. "
+                      "That is what a magic packet from anyone on the switch "
+                      "looks like: boot, sit, shut down.")
+    if status != 200:
+        raise Refused("doorbell_unreachable",
+                      f"the doorbell answered {status}, which is not an "
+                      f"answer this protocol has. Nothing was handed over.")
+
+    body = proto.open_record(eph, pi_pk, m2, proto.TAG_M2)
+
+    # ONE JOB PER BOOT is a property of the process, not of a flag: run_once is
+    # called exactly once from main(), there is no loop, and the ephemeral and
+    # the challenge are locals that die with it. An earlier draft set the
+    # challenge to None here and checked it on the next line -- a guard that
+    # could never fire, wearing a safety net's clothes. This repo has a name
+    # for that ("a comment claiming a gate where there is none") and deletes
+    # them rather than testing them.
+    got = proto.challenge_of(body)
+    if not _ct_eq(got, challenge):
+        raise Refused("challenge_mismatch",
+                      "the doorbell's answer does not echo this boot's "
+                      "challenge.")
+    # VALIDATE BEFORE THE WINDOW CHECK, so a slow answer still knows its
+    # job_id and can be REPORTED. Order is safe: the body is already
+    # authenticated and already bound to this boot's challenge, and
+    # validate_job only reads a closed, typed schema out of it.
+    job_id, job, params = proto.validate_job(body)
+
+    elapsed = _clock() - sent_at
+    if elapsed > M1_M2_WINDOW_S:
+        # NEVER the word "expired". The job is current; what is out of bounds
+        # is the round trip, and saying so is the difference between an
+        # operator checking the network and an operator checking a clock.
+        raise _reported(key, d, job_id, challenge, Refused(
+            "slow_answer",
+            f"the doorbell answered {int(elapsed)} s after the "
+            f"challenge; the window is {M1_M2_WINDOW_S} s."))
+
+    # ONCE THE JOB IS OFF THE DOORBELL, THE DOORBELL IS OWED AN ANSWER.
+    # Only the post-dispatch refusal reported back, so every refusal between
+    # collection and dispatch -- a replayed job_id, the 24 h wake budget, the
+    # account ceiling, an empty ladder slot, an unwatchable handle, a Tor
+    # check that aborts -- left the Pi to time out and tell the operator
+    # "collected but never reported back ... this job may already be done.
+    # CHECK THE VAULT." Nothing had run. That is the defect this repo names
+    # most often, wearing a network timeout as a disguise.
+    #
+    # SystemExit is in the handler because gs_common's verify_tor aborts that
+    # way; an abort is still a refusal the doorbell can be told about, and
+    # main()'s finally still powers the machine off after it.
+    try:
+        return _run_validated(d, key, artifact_dir, state_deps=(
+            job_id, job, params, challenge, _sleep, _rng, _verify_tor,
+            _accounts, _child))
+    except (Refused, SystemExit) as e:
+        report_back(key, job_id, challenge.hex(), "refused", "",
+                    poster=d.get("post_record"))
+        raise e
+
+
+def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
+    """Everything after the job is validated. Its refusals all report back."""
+    # _post is deliberately NOT threaded through: everything in here that
+    # talks to the doorbell goes via report_back(poster=d.get("post_record")),
+    # so a second handle on the same channel would be a second thing to keep
+    # in step. The M1 POST is run_once's, and it is already done by here.
+    (job_id, job, params, challenge, _sleep, _rng, _verify_tor,
+     _accounts, _child) = state_deps
+
+    state = load_state(artifact_dir)
+    if job_id in {j.get("id") for j in state["jobs"]}:
+        prev = next(j for j in state["jobs"] if j.get("id") == job_id)
+        raise Refused("job_replayed",
+                      f"this machine already started job {job_id[:8]} at "
+                      f"{prev.get('at')}. It may or may not have finished — "
+                      f"check {artifact_dir} before poking again.")
+
+    # A 24 h wake budget. A wipe resets it, and the account ceiling below is
+    # the half that cannot be reset from this disk.
+    now_wall = int(time.time())
+    recent = [w for w in state["wakes"] if now_wall - int(w) < 86400]
+    if len(recent) >= int(key.get("daily_wake_budget", 12)):
+        raise Refused("wake_budget",
+                      f"{len(recent)} wakes in the last 24 h, which is the "
+                      f"budget. Refusing.")
+
+    if job in ("receive_new", "receive_and_quote"):
+        ceiling = int(key.get("account_ceiling", 45))
+        n = _account_count(key, _accounts)
+        if n is None:
+            raise Refused("account_count_unreadable",
+                          "could not read how many accounts this wallet "
+                          "holds, so the ceiling that stops a doorbell "
+                          "minting past the offline wallet's lookahead cannot "
+                          "be enforced. Refusing.")
+        if n >= ceiling:
+            raise Refused("account_ceiling",
+                          f"this wallet holds {n} accounts and the ceiling is "
+                          f"{ceiling}. OPSEC_SETUP.md §4: the offline signing "
+                          f"wallet derives subaddresses for a bounded number. "
+                          f"Refusing to mint more from a pager.")
+
+    # WRITE THE LEDGER BEFORE DISPATCH. If power is lost mid-job, the next boot
+    # must refuse this job_id rather than run it twice -- a second slip would
+    # overwrite the first, and if BTC was already sent against the first, the
+    # only record of what was paid is gone.
+    state["jobs"] = (state["jobs"] + [{"id": job_id, "job": job,
+                                       "at": now_wall}])[-200:]
+    # `recent` already dropped everything older than 24 h, so this is the
+    # window plus this wake -- not an append to the unpruned list.
+    state["wakes"] = recent + [now_wall]
+    save_state(artifact_dir, state)
+    integrity_log("wake", f"job_accepted:{job}")
+
+    # JITTER. After the note is validated and the ledger is written, before any
+    # network work the job does. OPSEC_SETUP.md §5 step 4.
+    delay = _rng.randint(JITTER_LO_S, JITTER_HI_S)
+    print(f"  [*] Job {job} accepted. Waiting {delay // 60} min before "
+          f"starting, so the boot and the swap are not the same moment.")
+    _sleep(delay)
+
+    # The FULL Tor check now, with an exit request. Its sys.exit is caught by
+    # main()'s finally, which powers off.
+    if _verify_tor is not None:
+        _verify_tor()
+    else:
+        from gs_common import validate_proxy, verify_tor as _vt
+        _vt(validate_proxy(key["tor_proxy"]))
+
+    handle = proto.new_handle()
+    # EVERYTHING PAST THE LEDGER REPORTS BACK, including a refusal. An earlier
+    # draft returned without ever sending M3, so report_back was dead code and
+    # the doorbell reported "collected_no_result" after every successful job --
+    # sending the operator to check a vault that had already finished and
+    # powered off. Refusals report too: "refused" with no handle and no reason,
+    # because a doorbell that learns WHY a job was refused learns something
+    # about this wallet.
+    # A refusal raised in here is reported by run_once's handler, which now
+    # covers this and every other refusal past collection alike -- rather than
+    # this one path having its own copy and the rest having none.
+    code, status, handle = _dispatch(job, params, key, artifact_dir,
+                                     handle, _child, job_id)
+    report_back(key, job_id, challenge.hex(), status, handle,
+                poster=d.get("post_record"))
+    return code, status, handle
+
+
+def _reported(key, d, job_id, challenge, exc):
+    """Tell the doorbell 'refused', then hand back the exception to raise."""
+    report_back(key, job_id, challenge.hex(), "refused", "",
+                poster=d.get("post_record"))
+    return exc
+
+
+def _ct_eq(a: bytes, b: bytes) -> bool:
+    import hmac
+    return hmac.compare_digest(a, b)
+
+
+def _account_count(key: dict, injected=None):
+    if injected is not None:
+        return injected()
+    try:
+        from gs_common import connect_rpc
+        rpc = connect_rpc(key["rpc_primary"], proxy_url=key.get("tor_proxy", ""))
+        r = rpc.raw_request("get_accounts", {}) or {}
+        return len(r.get("subaddress_accounts") or [])
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
+    """Run the job's tools in order. Returns (code, status, handle)."""
+    budget = proto.JOBS[job]["budget_s"]
+    handles = _load_handles(artifact_dir)
+
+    # A HANDLE IS FOUR HEX CHARACTERS, SO COLLISIONS ARE NOT A CURIOSITY.
+    # 65536 values: at ~300 recorded handles a repeat is more likely than not,
+    # and this dict is keyed on the handle, so a repeat SILENTLY OVERWRITES
+    # the record it lands on -- after which a `watch` on the older label
+    # watches the newer job's address. Redraw instead.
+    #
+    # Four characters stays. The operator reads it aloud off a terminal;
+    # widening it to fix a bookkeeping problem would be paying in the wrong
+    # currency, and the fix costs nothing here.
+    for _ in range(64):
+        if handle not in handles:
+            break
+        handle = proto.new_handle()
+    else:
+        raise Refused("handle_space",
+                      "could not draw an unused handle in 64 tries, which "
+                      "means this machine is holding most of the 65536 there "
+                      "are. Run paranoia_mode: the handles file is one of the "
+                      "things it wipes.")
+
+    bundle = slip = None
+    if job == "watch":
+        rec = handles.get(params["handle"])
+        if not rec:
+            raise Refused("unknown_handle",
+                          f"no bundle on this machine for handle "
+                          f"{params['handle']}.")
+        bundle, slip = rec.get("bundle"), rec.get("slip")
+        # ONE HANDLE, ONE ADDRESS. `receive_new --count 4` writes four
+        # wallet_<random>.json files and the handle cannot name one of them
+        # without picking arbitrarily, so it names none and this refuses.
+        if not bundle:
+            raise Refused(
+                "handle_not_watchable",
+                f"handle {params['handle']} covers "
+                f"{rec.get('minted', 'several')} receive bundles, so it does "
+                f"not name ONE address to watch. Watch the address you mean "
+                f"from this machine, or quote it with receive_and_quote.")
+        # A WATCH WITH NO QUOTE IS NOT A WATCH. The first version passed
+        # str(slip) here, so a handle minted by receive_new -- which never
+        # writes a slip -- reached receive_watch as the literal path "None".
+        # load_pairs then exited on a missing file and the doorbell was told
+        # "failed", which is true and useless: a wake and a boot spent to
+        # learn that a string was not a filename.
+        #
+        # There is no --any fallback here, deliberately. --any stops on ANY
+        # balance, so one piconero of dust from anyone who has the address
+        # would report "done" to the doorbell -- telling the operator over the
+        # pager that their money landed when what landed was a probe.
+        if not slip:
+            raise Refused(
+                "no_quote",
+                f"handle {params['handle']} names a receive bundle with no "
+                f"swap quote, so there is no expected amount to watch for. "
+                f"Only a receive_and_quote handle can be watched.")
+
+    steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
+                       slip=slip, handle=handle)
+
+    before = set(glob.glob(str(artifact_dir / "wallet_*.json")))
+    for i, argv in enumerate(steps):
+        env_extra = {}
+        if job == "receive_and_quote" and i == 1:
+            # Identify the new bundle by a DIRECTORY DIFF, not by parsing
+            # stdout: a tool's human-facing output is not an interface, and a
+            # wrong bundle here would quote a swap to the wrong address.
+            new = sorted(set(glob.glob(str(artifact_dir / "wallet_*.json")))
+                         - before)
+            if len(new) != 1:
+                raise Refused("bundle_ambiguous",
+                              f"expected exactly one new receive bundle, found "
+                              f"{len(new)}. Refusing to quote a swap without "
+                              f"knowing which address it pays.")
+            argv[argv.index("--dest-from-receive-wallet") + 1] = new[0]
+            env_extra["GS_SWAP_AMOUNTS"] = str(
+                key["amount_ladder"][int(params["amount_slot"])])
+            handles[handle] = {"bundle": new[0], "minted": 1,
+                               "slip": str(artifact_dir /
+                                           f"thor_pairs_{handle}.json")}
+        rc, hard = run_child(argv, env_extra, budget, runner=runner)
+        if rc != 0:
+            if hard:
+                print(f"  [!] Step {i + 1} had to be SIGKILLed after its "
+                      f"budget. Its cleanup did NOT run — run paranoia_mode.")
+            integrity_log("wake", f"job_failed:{job}")
+            # NEVER RECORD A SLIP THAT WAS NOT WRITTEN. The handle is recorded
+            # before the quote step runs, because the argv needs the path. If
+            # that step then failed, the bundle exists and the slip does not,
+            # and leaving the path in would make a later `watch` die inside
+            # receive_watch on a missing file instead of refusing here with a
+            # reason the operator can act on.
+            rec = handles.get(handle)
+            if rec and rec.get("slip") and not Path(rec["slip"]).exists():
+                rec["slip"] = None
+            _save_handles(artifact_dir, handles)
+            return "job_failed", "failed", handle
+
+    if job == "receive_new":
+        new = sorted(set(glob.glob(str(artifact_dir / "wallet_*.json"))) - before)
+        if new:
+            # `bundle` only when there is exactly ONE, because --count N writes
+            # N files named wallet_<random>.json and new[0] is whichever of
+            # them sorts first -- an address the operator could not have
+            # predicted. `minted` is what the refusal above quotes back.
+            handles[handle] = {"bundle": new[0] if len(new) == 1 else None,
+                               "minted": len(new), "slip": None}
+    _save_handles(artifact_dir, handles)
+    integrity_log("wake", f"job_done:{job}")
+    return "done", "done", handle
+
+
+def _load_handles(d: Path) -> dict:
+    try:
+        v = json.loads((d / HANDLES_FILE).read_text())
+        return v if isinstance(v, dict) else {}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+#: Bound on the handles file. Insertion order is preserved by dict, so this
+#: keeps the most recent. Nothing pruned this before and it only ever grew --
+#: 12 wakes a day for a month is ~360 entries, so 1000 is far past any real
+#: between-wipe usage, and an entry that does fall off gives `unknown_handle`,
+#: which is a refusal the operator can read, not a silently wrong address.
+MAX_HANDLES = 1000
+
+
+def _save_handles(d: Path, h: dict) -> None:
+    if len(h) > MAX_HANDLES:
+        h = dict(list(h.items())[-MAX_HANDLES:])
+    atomic_write_json(h, d / HANDLES_FILE, perms=0o600)
+
+
+# ---------------------------------------------------------------------------
+def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
+                handle: str, poster=None) -> None:
+    """Tell the doorbell only: done / refused / failed, and a 4-hex label.
+
+    NEVER the reason, never an address, never the memo, never an amount. The
+    slip stays here; the doorbell learns a label it can read back to a human.
+    """
+    try:
+        import nacl.public
+        tp_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
+        pi_pk = nacl.public.PublicKey(bytes.fromhex(key["peer_public"]))
+        m3 = proto.seal(tp_sk, pi_pk, proto.TAG_M3,
+                        {"job_id": job_id, "challenge": challenge_hex,
+                         "status": status,
+                         "handle": handle if status == "done" else ""})
+        (poster or post_record)(key["doorbell_url"], "/result", m3)
+    except Exception:                                        # noqa: BLE001
+        # An undeliverable result is not a failure of the job. The job either
+        # happened or did not, and the record of it is here.
+        integrity_log("wake", "result_undeliverable")
+
+
+def build_cli() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Collect one job from the doorbell, run it, power off.")
+    ap.add_argument("--key", required=True, help="the ThinkPad keyfile (0400)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="do everything except run a job and power off. Use "
+                         "this once, by hand, to confirm the pairing before "
+                         "you rely on the machine turning itself off.")
+    return ap
+
+
+def main(argv=None) -> int:
+    install_signal_handlers()
+    args = build_cli().parse_args(argv)
+    code = "unknown"
+    try:
+        try:
+            code, _status, _handle = run_once(args)
+            print(f"  [+] Wake finished: {code}.")
+            return 0
+        except Refused as e:
+            code = e.code
+            print(f"  [!] Wake refused ({e.code}): {e.msg}")
+            integrity_log("wake", f"refused:{e.code}")
+            if not e.power:
+                # The two cases where a human is demonstrably present. Disarm
+                # the deadman so the machine they are using does not go down
+                # under them.
+                disarm_deadman()
+                return 0
+            return 1
+        except proto.WakeError as e:
+            code = "bad_note"
+            print(f"  [!] Wake refused: {e}")
+            integrity_log("wake", "refused:bad_note")
+            return 1
+    finally:
+        # EVERY path, including SystemExit from gs_common's own fail-closed
+        # aborts, and including an unhandled exception.
+        if code not in ("inhibited", "mix_running"):
+            power_off(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

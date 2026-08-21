@@ -1,0 +1,19 @@
+# ARMED AT BOOT, INDEPENDENT OF THE AGENT. This is the path that survives the
+# agent being SIGKILLed, wedged, or never starting at all.
+#
+# 9300s = 1200 (max jitter) + 300 (Tor allowance) + 7200 (the largest job's
+# budget) + 600 (slack). Sized for the LARGEST job because it is armed before
+# any job is known. The stated cost: a boot whose agent DIED on a short job
+# sits up to ~2h35m instead of ~20 min. The agent's own per-job budget bounds
+# the normal case; generous-but-bounded is the right shape for a backstop that
+# only runs when the thing that should have bounded it is dead.
+[Unit]
+Description=GhostSpiral wake deadman (power off even if the agent dies)
+
+[Timer]
+OnActiveSec=9300
+AccuracySec=30s
+Unit=gs-wake-poweroff.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""THE DOORBELL, over a real socket.
+
+gs_doorbell runs on the Raspberry Pi that OPSEC_SETUP.md §3 defines by what it
+must never hold. Two things are being tested and they are different:
+
+  1. the STATE MACHINE -- one job, at most once, windows on the Pi's own clock;
+  2. the BIND -- driven through ThreadingHTTPServer + http.client on
+     127.0.0.1, exactly as tests/test_console.py does. A handler called
+     directly proves the parse, not the bind, and the bind is half the
+     guarantee.
+
+The Pi's clock is injected, so window expiry is asserted without waiting ten
+minutes for it.
+"""
+import contextlib
+import http.client
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import socket
+import sys
+import tempfile
+import threading
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+PASS = 0
+FAIL = 0
+FAILS = []
+
+
+def check(name, cond):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  ok  ", name)
+    else:
+        FAIL += 1
+        FAILS.append(name)
+        print("  FAIL:", name)
+
+
+import gs_wake_proto as P                                    # noqa: E402
+from srcutil import code_only, fail_loudly_on_crash          # noqa: E402
+
+_finished = fail_loudly_on_crash(lambda: (PASS, FAIL, FAILS),
+                                 "test_wake_doorbell.py")
+
+
+def load(name):
+    ld = importlib.machinery.SourceFileLoader(name, os.path.join(REPO, name))
+    sp = importlib.util.spec_from_loader(ld.name, ld)
+    m = importlib.util.module_from_spec(sp)
+    ld.exec_module(m)
+    return m
+
+
+DB = load("gs_doorbell")
+import nacl.public as NP                                     # noqa: E402
+
+TP = NP.PrivateKey.generate()
+PI = NP.PrivateKey.generate()
+KEY = {"schema": "gs_wake_v1", "version": 1, "role": "pi",
+       "secret": PI.encode().hex(), "peer_public": TP.public_key.encode().hex(),
+       "listen_host": "127.0.0.1", "listen_port": 0,
+       "target_mac": "aa:bb:cc:dd:ee:ff", "wol_broadcast": "255.255.255.255",
+       "wol_port": 9}
+
+
+class Bell:
+    """A doorbell on a real ephemeral port, with an injected clock."""
+
+    def __init__(self, job="receive_and_quote", params=None, t=1000.0):
+        self.t = [t]
+        self.pending = DB.Pending(KEY, job, params or {"amount_slot": 1},
+                                  clock=lambda: self.t[0])
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        self.port = s.getsockname()[1]
+        s.close()
+        self.srv = ThreadingHTTPServer(("127.0.0.1", self.port),
+                                       DB.make_handler(self.pending))
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def post(self, path, body):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        c.request("POST", path, body=body,
+                  headers={"Content-Length": str(len(body))})
+        r = c.getresponse()
+        d = r.read()
+        c.close()
+        return r.status, d
+
+    def get(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        c.request("GET", path)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def m1_for(eph, chal):
+    return P.seal(TP, PI.public_key, P.TAG_M1,
+                  {"eph_pk": eph.public_key.encode().hex(),
+                   "challenge": chal.hex()})
+
+
+print("== the Pi holds nothing, enforced by the import list ==")
+src = code_only(os.path.join(REPO, "gs_doorbell"))
+import ast                                                   # noqa: E402
+mods = set()
+for n in ast.walk(ast.parse(open(os.path.join(REPO, "gs_doorbell")).read())):
+    if isinstance(n, ast.Import):
+        mods.update(a.name.split(".")[0] for a in n.names)
+    elif isinstance(n, ast.ImportFrom) and n.module:
+        mods.add(n.module.split(".")[0])
+for bad in ("gs_common", "monero", "stem", "psutil", "requests", "tenacity"):
+    check(f"the doorbell does not import {bad}", bad not in mods)
+for word in ("wallet_", "thor_pairs", "view_key", "spend_key", "mnemonic",
+             "seed"):
+    # code_only, so the header paragraph that NAMES these as forbidden does not
+    # satisfy the check -- six checks in this repo already went red for
+    # matching a string that lived only in a comment.
+    check(f"...and its CODE never mentions {word}", word not in src)
+def _refuses_bind(host):
+    d = Path(tempfile.mkdtemp())
+    p = d / "k.key"
+    p.write_text(json.dumps({**KEY, "listen_host": host}))
+    os.chmod(p, 0o400)
+    try:
+        DB.load_key(p)
+        return False
+    except DB.Doorbell:
+        return True
+
+
+for _h in ("0.0.0.0", "::", ""):
+    check(f"it refuses a keyfile that asks it to bind {_h!r} — that would put "
+          f"the doorbell on the Mullvad tunnel as well as the LAN",
+          _refuses_bind(_h))
+
+
+print("\n== the keyfile ==")
+_d = Path(tempfile.mkdtemp())
+
+
+def _keyfile(obj, mode=0o400, name="k.key"):
+    p = _d / name
+    p.write_text(json.dumps(obj))
+    os.chmod(p, mode)
+    return p
+
+
+for obj, mode, why in (
+        ({**KEY, "role": "thinkpad"}, 0o400,
+         "the VAULT's keyfile (it holds the vault's secret)"),
+        (KEY, 0o644, "a world-readable keyfile"),
+        ({**KEY, "schema": "nope"}, 0o400, "a foreign schema"),
+        ({**KEY, "version": 99}, 0o400, "a future wire version"),
+        ({**KEY, "target_mac": "nope"}, 0o400, "an unusable MAC")):
+    p = _keyfile(obj, mode, name=f"k{abs(hash(why)) % 9999}.key")
+    try:
+        DB.load_key(p)
+        check(f"refuses {why}", False)
+    except DB.Doorbell:
+        check(f"refuses {why}", True)
+check("accepts its own keyfile", DB.load_key(_keyfile(KEY, name="ok.key")))
+
+
+print("\n== the job comes in on stdin, never on argv ==")
+help_text = DB.build_cli().format_help()
+for flag in ("--job", "--amount", "--count", "--handle", "--param"):
+    check(f"there is no {flag} flag — a job on argv lands in "
+          f"/proc/<pid>/cmdline, which is mode 0444",
+          flag not in help_text)
+for raw, why in (('{"job":"receive_and_quote","amount_slot":2}', None),
+                 ('{"job":"run_pipeline"}', "a spending job"),
+                 ('{"job":"GhostSpiral"}', "the mix itself"),
+                 ('{"job":"receive_new","count":9}', "an out-of-range count"),
+                 ('{"job":"receive_new","count":1,"outfile":"/srv/x"}',
+                  "a smuggled extra key"),
+                 ('{"job":"receive_new"}', "a missing key"),
+                 ('{"job":"receive_new","count":"--tor-proxy"}',
+                  "a flag-shaped value"),
+                 ('not json', "malformed input"),
+                 ('', "empty input")):
+    try:
+        job, params = DB.read_job_from_stdin(io.StringIO(raw))
+        check("a well-formed job is accepted" if why is None
+              else f"refuses {why}", why is None)
+    except (DB.Doorbell, P.WakeError):
+        check(f"refuses {why}", why is not None)
+
+
+print("\n== one job, handed over at most once ==")
+b = Bell()
+eph, chal = NP.PrivateKey.generate(), P.new_challenge()
+st, m2 = b.post("/wake", m1_for(eph, chal))
+check("an authenticated M1 gets the job", st == 200 and len(m2) == P.RECORD_LEN)
+body = P.open_record(eph, PI.public_key, m2, P.TAG_M2)
+check("...the M2 echoes this boot's challenge", body["challenge"] == chal.hex())
+check("...and names the job the operator asked for",
+      body["job"] == "receive_and_quote" and body["amount_slot"] == 1)
+
+st2, m2b = b.post("/wake", m1_for(eph, chal))
+check("REPLAYING the same M1 returns the SAME M2 and consumes nothing — a "
+      "genuine retry and a LAN replay are the same request",
+      st2 == 200 and m2b == m2)
+
+eph2 = NP.PrivateKey.generate()
+st3, _ = b.post("/wake", m1_for(eph2, P.new_challenge()))
+check("a DIFFERENT authenticated boot gets nothing — queue depth is one",
+      st3 == 204)
+
+forged = P.seal(NP.PrivateKey.generate(), PI.public_key, P.TAG_M1,
+                {"eph_pk": eph.public_key.encode().hex(),
+                 "challenge": chal.hex()})
+check("an M1 from an unknown key gets 204, not an error page",
+      b.post("/wake", forged)[0] == 204)
+check("a wrong-length body is refused before the AEAD",
+      b.post("/wake", b"x" * 10)[0] == 400)
+check("GET is refused — nothing this program knows goes in a URL",
+      b.get("/wake") == 405)
+check("an unknown path is refused", b.post("/nope", b"x" * P.RECORD_LEN)[0] == 404)
+
+
+print("\n== the result ==")
+def m3(status, handle, job_id=None, chall=None):
+    return P.seal(TP, PI.public_key, P.TAG_M3,
+                  {"job_id": job_id or b.pending.job_id,
+                   "challenge": (chall or chal).hex(),
+                   "status": status, "handle": handle})
+
+
+check("a 60-character 'handle' is refused — the doorbell may learn a label, "
+      "never an address",
+      b.post("/result", m3("done", "A" * 60))[0] == 204
+      and b.pending.result is None)
+check("a lowercase handle is refused", b.post("/result", m3("done", "a3f1"))[0] == 204)
+check("a done with NO handle is refused — the operator would be told it "
+      "worked and given nothing to look up",
+      b.post("/result", m3("done", ""))[0] == 204 and b.pending.result is None)
+check("a result for a different job is refused",
+      b.post("/result", m3("done", "BEEF", job_id=P.new_job_id()))[0] == 204)
+check("a well-formed result is accepted",
+      b.post("/result", m3("done", "A3F1"))[0] == 200
+      and b.pending.result == {"status": "done", "handle": "A3F1"})
+check("a SECOND result is refused — the outcome the operator sees must not "
+      "depend on which note arrived last",
+      b.post("/result", m3("failed", ""))[0] == 204
+      and b.pending.result["status"] == "done")
+check("the doorbell's outcome is what it was told", b.pending.outcome() == "done")
+b.close()
+
+b2 = Bell()
+check("a failed/refused result may carry no handle, because there is nothing "
+      "to name",
+      b2.post("/wake", m1_for(eph, chal))[0] == 200
+      and b2.post("/result", P.seal(TP, PI.public_key, P.TAG_M3,
+                                    {"job_id": b2.pending.job_id,
+                                     "challenge": chal.hex(),
+                                     "status": "failed",
+                                     "handle": ""}))[0] == 200)
+check("...and reports as failed", b2.pending.outcome() == "failed")
+b2.close()
+
+
+print("\n== windows, on the Pi's own monotonic clock ==")
+b3 = Bell()
+check("before collection the job is not finished", not b3.pending.finished())
+b3.t[0] += DB.FETCH_WINDOW_S + 1
+check("an uncollected job expires after the fetch window",
+      b3.pending.finished() and b3.pending.outcome() == "expired_uncollected")
+check("...and a late M1 gets nothing",
+      b3.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge()))[0]
+      == 204)
+b3.close()
+
+b4 = Bell()
+b4.post("/wake", m1_for(eph, chal))
+check("a collected job is not finished while its budget runs",
+      not b4.pending.finished())
+b4.t[0] += P.JOBS["receive_and_quote"]["budget_s"] + 1
+check("a collected job with no result reports collected_no_result — the "
+      "operator is told to CHECK THE VAULT before poking again",
+      b4.pending.finished() and b4.pending.outcome() == "collected_no_result")
+b4.close()
+
+
+print("\n== Wake-on-LAN ==")
+seen = {}
+
+
+class FakeSock:
+    def setsockopt(self, *a):
+        seen["broadcast"] = a
+
+    def sendto(self, pkt, addr):
+        seen["pkt"], seen["addr"] = pkt, addr
+        return len(pkt)
+
+    def close(self):
+        pass
+
+
+n = DB.send_wol("aa:bb:cc:dd:ee:ff", "192.168.1.255", 9,
+                sock_factory=lambda: FakeSock())
+check("the magic packet is 102 bytes", n == 102 and len(seen["pkt"]) == 102)
+check("...six 0xFF then the MAC sixteen times",
+      seen["pkt"][:6] == b"\xff" * 6
+      and seen["pkt"][6:] == bytes.fromhex("aabbccddeeff") * 16)
+check("...to the configured broadcast and port",
+      seen["addr"] == ("192.168.1.255", 9))
+check("...with SO_BROADCAST set", seen.get("broadcast") is not None)
+for bad in ("nope", "aa:bb:cc:dd:ee", "", "aa:bb:cc:dd:ee:ff:00"):
+    try:
+        DB.send_wol(bad, "1.2.3.4", 9, sock_factory=lambda: FakeSock())
+        check(f"a malformed MAC ({bad!r}) refuses rather than sends", False)
+    except DB.Doorbell:
+        check(f"a malformed MAC ({bad!r}) refuses rather than sends", True)
+
+
+print("\n== the socket is bound BEFORE the magic packet goes out ==")
+order = []
+
+
+class Args:
+    no_jitter = True
+
+
+def _boom(addr, handler):
+    order.append("bind")
+    raise OSError(98, "Address already in use")
+
+
+try:
+    DB.run_wake(Args(), KEY, "receive_new", {"count": 1},
+                server_factory=_boom,
+                sock_factory=lambda: (order.append("wol"), FakeSock())[1])
+    check("a doorbell that cannot listen refuses", False)
+except DB.Doorbell as e:
+    check("a doorbell that cannot listen refuses", "NOT sending" in str(e))
+check("...and NO magic packet was sent — never wake a machine you have not "
+      "proven you can answer", order == ["bind"])
+
+
+print("\n== the doorbell persists nothing ==")
+scratch = Path(tempfile.mkdtemp())
+cwd = os.getcwd()
+os.chdir(scratch)
+try:
+    before = sorted(os.listdir("."))
+    b5 = Bell()
+    b5.post("/wake", m1_for(eph, chal))
+    b5.post("/result", P.seal(TP, PI.public_key, P.TAG_M3,
+                              {"job_id": b5.pending.job_id,
+                               "challenge": chal.hex(),
+                               "status": "done", "handle": "BEEF"}))
+    b5.close()
+    after = sorted(os.listdir("."))
+finally:
+    os.chdir(cwd)
+check("a full cycle writes NOTHING to disk — the pending job, the response "
+      "cache and the timers are process memory", before == after == [])
+check("...and there is no persistent state file to go stale",
+      not any("state" in n for n in after))
+
+
+print("\n== the operator is TOLD when a second boot took the job ==")
+# `events` was collected by every path in this file and read by NOTHING -- the
+# same defect as a constant that is declared, documented and never called, and
+# worse here: the one event meaning "your job did not go where you think" was
+# among the ones being dropped on the floor.
+er = Bell()
+ereph, echal = NP.PrivateKey.generate(), P.new_challenge()
+er.post("/wake", m1_for(ereph, echal))
+er.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge()))
+er.close()
+check("a second authenticated ephemeral is RECORDED, not just refused",
+      er.pending.events.count("m1_second_ephemeral") == 1)
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    DB.report(er.pending)
+_txt = _buf.getvalue()
+check("...and report() prints it, so a replay on the switch is not silent",
+      "different boot" in _txt and "CHECK THE VAULT" in _txt)
+check("...and says the vault's own ledger stops it running twice, rather than "
+      "leaving the operator to guess",
+      "repeated job id" in _txt)
+
+# A malformed /result is NOT called hostile: any host on the LAN can post 296
+# bytes of noise and land in that count.
+er2 = Bell()
+er2.post("/result", b"\x00" * P.RECORD_LEN)
+er2.close()
+_buf2 = io.StringIO()
+with contextlib.redirect_stdout(_buf2):
+    DB.report(er2.pending)
+check("a junk /result is counted and reported without being called an attack",
+      "did not authenticate" in _buf2.getvalue()
+      and "hostile" not in _buf2.getvalue().lower())
+
+# "did not authenticate" and "authenticated, then refused" are DIFFERENT
+# FACTS and they used to share one line. A duplicate M3 can only come from
+# something holding the vault's key; reporting it as LAN noise sends the
+# operator to look at the switch instead of at the vault.
+er3 = Bell()
+er3eph, er3ch = NP.PrivateKey.generate(), P.new_challenge()
+er3.post("/wake", m1_for(er3eph, er3ch))
+_good = P.seal(TP, PI.public_key, P.TAG_M3,
+               {"job_id": er3.pending.job_id, "challenge": er3ch.hex(),
+                "status": "done", "handle": "BEEF"})
+_st_a = er3.post("/result", _good)[0]
+_st_b = er3.post("/result", _good)[0]
+_st_c = er3.post("/result", b"\x00" * P.RECORD_LEN)[0]
+er3.close()
+check("a duplicate result is refused, and recorded as REFUSED rather than as "
+      "a record that did not authenticate",
+      er3.pending.events.count("result_refused") == 1
+      and er3.pending.events.count("result_bad") == 1)
+check("...and the wire cannot tell the two apart: every refusal is 204, so a "
+      "prober learns nothing from which one it hit",
+      _st_a == 200 and _st_b == 204 and _st_c == 204)
+_buf4 = io.StringIO()
+with contextlib.redirect_stdout(_buf4):
+    DB.report(er3.pending)
+_t4 = _buf4.getvalue()
+check("...and report() says the vault contradicted itself, NOT that a "
+      "stranger on the switch posted noise",
+      "authenticated and were then refused" in _t4
+      and "CHECK THE VAULT" in _t4)
+
+_buf3 = io.StringIO()
+q = Bell()
+q.close()
+with contextlib.redirect_stdout(_buf3):
+    DB.report(q.pending)
+check("...and a clean cycle prints NO event line at all",
+      "different boot" not in _buf3.getvalue()
+      and "did not authenticate" not in _buf3.getvalue())
+
+
+print("\n== the doorbell is quiet ==")
+check("log_message is overridden to a no-op, so every wake is not timestamped "
+      "into the Pi's journal with the vault's address",
+      "def log_message" in src and "return" in src)
+
+
+_finished()
+print(f"\nRESULT: {PASS} passed, {FAIL} failed")
+if FAILS:
+    print("FAILED:", FAILS)
+    sys.exit(1)
+print("ALL GREEN")

@@ -3456,7 +3456,9 @@ if _pf_api is not None:
     for _tool_f in ("GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
                     "create_receive_wallet", "exit_strategy_simulator",
                     "gs_common.py", "gs_console", "paranoia_mode",
-                    "receive_watch", "thor_swap_preparer"):
+                    "receive_watch", "thor_swap_preparer",
+                    "gs_wake_proto.py", "gs_wake_keys", "gs_doorbell",
+                    "gs_wake_agent"):
         _errbuf, _outbuf = _pf_io.StringIO(), _pf_io.StringIO()
         _pf_api.checkPath(os.path.join(REPO, _tool_f),
                           _pf_rep.Reporter(_outbuf, _errbuf))

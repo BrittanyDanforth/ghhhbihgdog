@@ -1,0 +1,20 @@
+# The Pi side is NOT a daemon and this file is an EXAMPLE, not an install.
+#
+# gs_doorbell is one process per poke: it binds, wakes, hands over one job,
+# hears back and exits. There is deliberately no always-listening service --
+# that would just move the 24/7 socket from the vault to the doorbell, which is
+# the thing this whole feature exists to stop.
+#
+# The trigger INTO the Pi (phone, onion service, whatever) is out of scope, as
+# OPSEC_SETUP.md §8 says. Do NOT wire a Telegram bot that prints the memo.
+#
+# If you wrap a trigger, it must run AFTER the tunnel, and fail with it:
+[Unit]
+Description=EXAMPLE ONLY - a wrapper that pokes gs_doorbell
+After=wg-quick@wg0.service tor.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+# The job goes in on STDIN, never on argv: /proc/<pid>/cmdline is mode 0444.
+ExecStart=/bin/sh -c 'echo "{\"job\":\"receive_and_quote\",\"amount_slot\":2}" | /usr/bin/python3 /opt/ghostspiral/gs_doorbell wake --key /etc/gs_wake_pi.key'
