@@ -273,4 +273,76 @@ ck("control: a stable fee is the ordinary case and consumes exactly",
    sum(int(d["amount"]) for d in _rm.builds[-1]["destinations"]) + 2632800000
    == _rm.unlocked)
 
+# ===========================================================================
+# --phase create ERASES --outdir, UNRECOVERABLY, WITH NO CONFIRMATION.
+#
+# secure_delete_tree overwrites every file before unlinking it -- that is the
+# point of using it rather than rmtree, because a previous attempt's
+# signed/tx_*.signed is a RELAYABLE transaction. But it ran on whatever
+# --outdir named, so a typo, a stale path, or `--outdir ~/Documents` destroyed
+# every file in that directory beyond recovery. It is reachable in ordinary
+# use: it sits AFTER the Tor and RPC checks succeed, which on the online
+# machine that runs --phase create is the normal case, and there is no
+# confirmation prompt anywhere in this tool.
+#
+# The re-run into our own staging directory has to stay frictionless, so the
+# test is "does this hold anything we did not put there".
+# ===========================================================================
+import tempfile as _tf, pathlib as _pl
+
+
+def _mkdir_with(names):
+    d = _tf.mkdtemp(prefix="stgtest_")
+    for n in names:
+        q = _pl.Path(d) / n
+        if n.endswith("/"):
+            q.mkdir()
+        else:
+            q.write_text("x")
+    return d
+
+
+ck("a staging dir this tool created is still wipeable, so re-running "
+   "--phase create is not made painful",
+   a._staging_strays(_mkdir_with(
+       ["tx_0.unsigned", "tx_1.unsigned", "tx_11.unsigned",
+        "unsigned_manifest.json", "outputs_export.hex",
+        "accounts_count.txt", "signed/"])) == [])
+ck("...and so is an empty directory, which is what a fresh --outdir is",
+   a._staging_strays(_mkdir_with([])) == [])
+for _junk in ("tax_return.pdf", "wallet.keys", "photos/", ".ssh/"):
+    ck(f"a directory holding {_junk} is refused, not erased",
+       a._staging_strays(_mkdir_with([_junk])) == [_junk.rstrip("/")])
+ck("ONE stray among our own files is still a refusal — the dangerous case is "
+   "a directory that looks half like ours",
+   a._staging_strays(_mkdir_with(["notes.txt", "tx_0.unsigned"])) == ["notes.txt"])
+for _near in ("tx_.unsigned", "tx_1.unsigned.bak", "tx_01.unsignedX",
+              "Signed/", "unsigned_manifest.json.tmp"):
+    ck(f"near-miss {_near} does not pass as one of ours",
+       a._staging_strays(_mkdir_with([_near])) == [_near.rstrip("/")])
+ck("an unreadable directory counts as a stray, because guessing wrong here "
+   "erases somebody's files",
+   a._staging_strays("/proc/1/root/nope") != [])
+_src = open(os.path.join(REPO, "airgap_tx_signer")).read()
+# THE CALL SITE, not the substring. `_staging_strays(outdir)` also occurs in
+# `def _staging_strays(outdir) -> list:`, so checking for the bare substring
+# matched the DEFINITION and passed with the call deleted -- the mutation sweep
+# reported SURVIVED on exactly that, which is what it is for.
+def _pos(hay, needle):
+    """Index or -1. str.index RAISES, and a test that dies scores NO-RESULT in
+    the mutation sweep -- which proves nothing about the check. Fail with our
+    own words instead."""
+    return hay.find(needle)
+
+
+_CALL = "_ours = _staging_strays(outdir)"
+ck("the guard is actually wired in front of the wipe, not merely defined",
+   _pos(_src, _CALL) >= 0
+   and _pos(_src, _CALL) < _pos(_src, "secure_delete_tree(outdir)"))
+ck("...and its refusal is reachable, i.e. the result is actually branched on",
+   _pos(_src, "if _ours:") >= 0
+   and _pos(_src, _CALL) < _pos(_src, "if _ours:"))
+ck("...and the refusal says the erase is unrecoverable",
+   "cannot be recovered" in _src)
+
 print(f"\n{P} passed, {F} failed"); sys.exit(1 if F else 0)

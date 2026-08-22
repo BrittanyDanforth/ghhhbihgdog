@@ -1025,6 +1025,77 @@ check("a tty means a human is watching and there is no journal in the path, "
 check("...and isatty is guarded, because a closed stdout must not abort a "
       "wake", "_watched = False" in _agent_src)
 
+# ===========================================================================
+# THE HARDENING MADE THE DEPENDENCIES INVISIBLE, AND THE SILENCE HID IT.
+#
+# ProtectHome=yes makes /home, /root and /run/user inaccessible to this unit.
+# Python derives its per-user site directory from $HOME, so a
+# `pip install --user` dependency set cannot be imported here -- and on
+# Debian 12 / Raspberry Pi OS a plain `pip install` is refused (PEP 668),
+# which pushes operators to exactly that install. Measured on a live box, the
+# normal outcome is a MIXED install:
+#
+#   requests -> /root/.local/lib/python3.11/site-packages   (invisible here)
+#   monero   -> /usr/local/lib/python3.11/dist-packages     (fine)
+#
+# gs_common imports requests at MODULE scope, so this fails before any of this
+# toolchain's code runs; StandardError=null discards the traceback; and
+# OnFailure=gs-wake-poweroff.service then powers the machine down. The vault
+# boots, dies, powers off, and nothing anywhere says why.
+# ===========================================================================
+print("\n== a missing dependency must not become a silent poweroff ==")
+check("the unit checks its dependencies BEFORE the agent runs",
+      "ExecStartPre=" in _agent_u)
+_pre = [l for l in _agent_u.splitlines() if l.startswith("ExecStartPre=")]
+check("...and there is exactly one such check", len(_pre) == 1)
+_preline = _pre[0] if _pre else ""
+# EXACTLY THE HARD SET. A pre-check stricter than the code would itself be the
+# thing that stops the vault working.
+for _hard in ("requests", "tenacity", "nacl", "socks", "psutil", "monero"):
+    check(f"the pre-check covers {_hard}, which the wake path hard-requires",
+          _hard in _preline)
+for _soft in ("stem", "gnupg", "yaml"):
+    check(f"...and NOT {_soft}, which is guarded or unused on the wake path",
+          _soft not in _preline)
+check("the failure is written somewhere durable, not to the null stderr "
+      "this unit sets",
+      "gs_wake_job.log" in _preline)
+check("...and it exits non-zero, so systemd does not start the agent anyway",
+      "exit 1" in _preline)
+# NON-VACUITY: the hard set must match what the code actually imports.
+check("requests really is a module-scope import in gs_common, which is why a "
+      "missing one cannot be caught in Python",
+      any(l.strip() == "import requests"
+          for l in open(os.path.join(REPO, "gs_common.py")).read().splitlines()))
+check("psutil really does refuse the wake when absent",
+      "no_sentinel" in open(os.path.join(REPO, "gs_wake_agent")).read())
+check("the unit says how to install them so this does not recur",
+      "break-system-packages" in _agent_u or "venv" in _agent_u)
+
+# ===========================================================================
+# THE REFUSAL TOLD A CORRECT INSTALL IT WAS BROKEN.
+#
+# wipe_covers resolves against cwd and $HOME. The unit sets both; an operator's
+# shell does not. So `gs_wake_agent --key ... --dry-run` -- the command
+# gs_wake_keys prints as "confirm the pairing works before you rely on it" --
+# refused on the SHIPPED DEFAULT artifact dir, at the exact moment the operator
+# was told to check that pairing had worked.
+# ===========================================================================
+print("\n== outside_wipe_roots must say which of its two causes this is ==")
+_agent_src = open(os.path.join(REPO, "gs_wake_agent")).read()
+check("the refusal names the by-hand case rather than only the misconfigured "
+      "one", "BY HAND" in _agent_src)
+check("...and gives the cd + HOME that reproduces the unit's environment",
+      "cd {artifact_dir} && HOME={artifact_dir}" in _agent_src)
+check("...and still names the systemd fix for a genuinely misplaced dir",
+      "WorkingDirectory=" in _agent_src and "Environment=HOME=" in _agent_src)
+_keys_src = open(os.path.join(REPO, "gs_wake_keys")).read()
+check("the pairing tool's own 'next step' command is conditional on whether "
+      "the chosen artifact dir is reachable from a shell",
+      "if not wipe_covers(_ad):" in _keys_src)
+check("...and prints the working form when it is not",
+      "HOME={_ad}" in _keys_src)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

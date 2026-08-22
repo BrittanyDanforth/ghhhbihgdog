@@ -74,7 +74,12 @@ import gs_wake_proto as proto                                # noqa: E402
 #: -> Thor clock)". The Pi adds its own pre-WOL delay, but that one is
 #: best-effort: a pwned Pi can zero it, which is exactly why this floor exists
 #: on the box the Pi does not control.
-JITTER_LO_S, JITTER_HI_S = 300, 1200
+#: FROM gs_wake_proto, so the Pi and the vault cannot disagree about it. They
+#: did: the doorbell sized its result window on budget_s alone, as though this
+#: sleep -- which happens BEFORE the job starts -- did not exist, so every job
+#: could report into a socket the Pi had already closed. See
+#: proto.result_budget_s.
+JITTER_LO_S, JITTER_HI_S = proto.VAULT_JITTER_LO_S, proto.VAULT_JITTER_HI_S
 #: How long the Pi has to answer, measured with THIS machine's monotonic clock.
 #: One machine, one clock -- correct on a ThinkPad with a flat CMOS battery,
 #: where a wall-clock comparison against the Pi's timestamp is not.
@@ -380,10 +385,31 @@ def preflight(key: dict, artifact_dir: Path, dry_run: bool,
                       "this machine is short of disk or memory. Refusing.")
 
     if not _covers(artifact_dir):
+        # SAY WHICH OF THE TWO THIS IS. wipe_covers resolves against cwd and
+        # $HOME, and the systemd unit sets both to the artifact directory on
+        # purpose (gs-wake-agent.service:41-42). So this refusal has two very
+        # different causes and only one of them is a misconfiguration:
+        #
+        #   * run by hand from an ordinary shell -> cwd and $HOME are the
+        #     operator's, the sweep is anchored somewhere else, and this fires
+        #     on a CORRECT install. It fired on the shipped default, on the
+        #     command gs_wake_keys prints as "confirm the pairing works".
+        #   * run by systemd with the unit as shipped -> genuinely misplaced.
+        #
+        # Telling an operator their install is broken when it is not is its
+        # own defect, so name the by-hand case explicitly.
         raise Refused("outside_wipe_roots",
                       f"{artifact_dir} is outside every directory "
                       f"paranoia_mode searches, so the bundles and slips this "
-                      f"job writes would never be erased. Refusing.")
+                      f"job writes would never be erased. Refusing.\n"
+                      f"      paranoia_mode's sweep is anchored on cwd and "
+                      f"$HOME. If you are running this BY HAND to check a "
+                      f"pairing, run it the way the unit does:\n"
+                      f"          cd {artifact_dir} && HOME={artifact_dir} "
+                      f"python3 gs_wake_agent --key ... --dry-run\n"
+                      f"      If systemd runs it, set WorkingDirectory= and "
+                      f"Environment=HOME= to {artifact_dir} in "
+                      f"gs-wake-agent.service.")
 
     if not _tor(key.get("tor_proxy", "")):
         raise Refused("tor_down",

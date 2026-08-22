@@ -63,6 +63,47 @@ TimeoutStartSec=9000
 # does not name the job, the amount or any address.
 StandardOutput=null
 StandardError=null
+
+# DEPENDENCIES MUST BE SYSTEM-WIDE OR IN A VENV. NEVER `pip install --user`.
+#
+# ProtectHome=yes below makes /home, /root and /run/user inaccessible to this
+# unit. Python derives its per-user site directory from $HOME, so a
+# `pip install --user` dependency set is INVISIBLE here -- and on Debian 12 /
+# Raspberry Pi OS a plain `pip install` is refused (PEP 668,
+# "externally-managed-environment"), which pushes people to exactly the
+# --user install that cannot work. Measured on a live box, a mixed install is
+# the normal outcome:
+#
+#   requests -> /root/.local/lib/python3.11/site-packages   (INVISIBLE here)
+#   monero   -> /usr/local/lib/python3.11/dist-packages     (fine)
+#
+# Install one of these ways instead:
+#   sudo apt install python3-requests python3-nacl python3-psutil ...
+#   sudo pip install --break-system-packages -r requirements.txt
+#   python3 -m venv /opt/ghostspiral/venv && /opt/ghostspiral/venv/bin/pip \
+#       install -r requirements.txt      # then point ExecStart at that python
+#
+# EXACTLY THE HARD SET, so this cannot refuse a boot the agent would have
+# handled. Checked against the code rather than against requirements.txt:
+#   requests, tenacity  gs_common imports both at MODULE scope (line 28-29)
+#   nacl                gs_wake_proto boxes every record; no unauthenticated mode
+#   socks               socks5h:// Tor proxying, and the agent verifies Tor
+#   psutil              absent -> resource_check raises and the agent refuses
+#                       "no_sentinel" (gs_wake_agent:374)
+#   monero              create_receive_wallet, which every job runs
+# stem, gnupg and yaml are deliberately NOT here: they are guarded or unused on
+# the wake path, and a pre-check stricter than the code would itself be the
+# thing that stops the vault working.
+#
+# WHY THIS IS WORTH A PRE-CHECK RATHER THAN A COMMENT. Without it the failure
+# is invisible AND destructive: gs_common imports requests at module scope, so
+# a missing dependency raises ModuleNotFoundError before any of this
+# toolchain's own code runs; StandardError=null above discards the traceback;
+# and OnFailure=gs-wake-poweroff.service then powers the machine down. The
+# operator pokes the doorbell, the vault boots, powers off, and NOTHING
+# anywhere says why. This writes the reason into the same 0600 job log the
+# agent already uses, which paranoia_mode wipes with the rest of the run.
+ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, socks, psutil, monero" 2>>/var/lib/ghostspiral/gs_wake_job.log || { echo "gs-wake-agent: a Python dependency is missing or not visible under ProtectHome=yes -- see requirements.txt and the install note in this unit" >>/var/lib/ghostspiral/gs_wake_job.log; exit 1; }'
 ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_wake_agent --key /etc/gs_wake_thinkpad.key
 
 # §4: "the auto-job user must NOT be allowed to mount removable disks." These

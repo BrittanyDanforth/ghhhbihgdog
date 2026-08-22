@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
     atomic_write_json, integrity_log, install_signal_handlers, secure_mkdir,
+    wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
 
@@ -516,7 +517,32 @@ def do_pair(args) -> int:
     print("      is the one that leaves the building in a pocket.")
     print()
     print("  Next: confirm the pairing works before you rely on it --")
-    print(f"      python3 gs_wake_agent --key {tp_path} --dry-run")
+    # THE CONFIRMATION HAS TO ACTUALLY RUN, and the bare command did not.
+    #
+    # wipe_covers() resolves against cwd and $HOME. The systemd unit sets BOTH
+    # to the artifact directory on purpose (gs-wake-agent.service:41-42, whose
+    # own comment says "wipe_covers(/var/lib/ghostspiral) = True"), so a real
+    # wake is fine. An operator running this line from their own shell has
+    # neither, so the agent refuses outside_wipe_roots -- on the SHIPPED
+    # DEFAULT, at the exact moment they were told to check that pairing
+    # worked. Measured: covered=False by hand, covered=True under the unit.
+    #
+    # So print the command that reproduces what systemd does. A verification
+    # step that fails on a correct install teaches the operator to distrust a
+    # system that is working, which is worse than not offering one.
+    _ad = args.artifact_dir
+    if not wipe_covers(_ad):
+        print(f"      cd {_ad} && HOME={_ad} \\")
+        print(f"          python3 {os.path.abspath(__file__).rsplit('/', 1)[0]}"
+              f"/gs_wake_agent --key {tp_path} --dry-run")
+        print()
+        print(f"      (cd + HOME are what the systemd unit sets -- see")
+        print(f"      WorkingDirectory= and Environment=HOME= in")
+        print(f"      systemd/gs-wake-agent.service. Without them the agent")
+        print(f"      refuses, because paranoia_mode's sweep is anchored on")
+        print(f"      cwd and $HOME and would never reach {_ad}.)")
+    else:
+        print(f"      python3 gs_wake_agent --key {tp_path} --dry-run")
     return 0
 
 
