@@ -353,7 +353,7 @@ def _announce(args) -> None:
     print(f"  [*] Waiting up to {proto.PAIR_TIMEOUT_S // 60} min...")
 
 
-def _one_attempt(conn, peer, my_pub, args) -> dict:
+def _one_attempt(conn, peer, sk, my_pub, args) -> dict:
     """Run the responder against one connection. Raises on any failure."""
     src_ip = conn.getsockname()[0]
     iface, mac, brd = local_link(src_ip)
@@ -377,7 +377,8 @@ def _one_attempt(conn, peer, my_pub, args) -> dict:
     # is the shape of a message that has stopped describing reality.
     where = f"on {iface} " if iface and iface != "(given)" else ""
     print(f"  [*] This machine will be woken {where}({mac}), broadcast {brd}.")
-    return proto.pair_responder(conn, my_pub, {"mac": mac, "broadcast": brd},
+    return proto.pair_responder(conn, sk, my_pub,
+                                {"mac": mac, "broadcast": brd},
                                 ask_match, print)
 
 
@@ -412,7 +413,7 @@ def do_pair(args) -> int:
                          "Check the cable, the address, and that both boxes "
                          "are on the same switch.")
             try:
-                agreed = _one_attempt(conn, peer, my_pub, args)
+                agreed = _one_attempt(conn, peer, sk, my_pub, args)
             except proto.PairAborted as e:
                 # A PERSON decided. Not a fault, and not something to sit
                 # through: retrying would ask them again until they got it

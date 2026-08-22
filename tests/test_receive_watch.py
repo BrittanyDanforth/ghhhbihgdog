@@ -145,6 +145,36 @@ _ptext0 = "\n".join(_pr0)
 check("main() warns when the target was built from only some of the pairs",
       "contribute NOTHING to the target" in _ptext0)
 
+# THE ARRIVAL GATE MUST KNOW HOW MANY SWAPS THERE ARE, and main() had that
+# number and threw it away. `chunks` fell back to 1 whenever the per-chunk
+# breakdown was empty -- which is exactly what --expect-xmr does, by design.
+# With chunks=1 the second term of the floor collapses to a piconero and the
+# slippage tolerance stands alone.
+#
+# Driven through the REAL gs_common.swap_arrival_floor rather than asserted
+# about, because the claim is arithmetic.
+from gs_common import swap_arrival_floor as _saf                # noqa: E402
+_tot, _tol = Decimal("12"), Decimal("0.10")
+_f_old, _ = _saf(_tot, _tol, [], 1)
+_f_new, _tightened = _saf(_tot, _tol, [], 12)
+check("with chunks=1 the gate opens at 11.0 XMR of a 12 XMR target — a whole "
+      "1 XMR swap absent and the tool reports PAID",
+      Decimal("11.0") >= _f_old)
+check("...and with the real swap count it does not",
+      Decimal("11.0") < _f_new and _tightened)
+# The call site must supply that count. AST, not a substring: the call is
+# wrapped across lines and a literal search is how this kind of check goes red
+# for the wrong reason.
+_calls = [n for n in _ast0.walk(_m0)
+          if isinstance(n, _ast0.Call) and isinstance(n.func, _ast0.Name)
+          and n.func.id == "swap_arrival_floor"]
+check("main() calls swap_arrival_floor exactly once", len(_calls) == 1)
+_chunkarg = _ast0.unparse(_calls[0].args[3]) if _calls else ""
+check("...and the chunk count falls back to the number of SWAP PAIRS routed "
+      "to this address before it falls back to 1"
+      + (f" (got {_chunkarg!r})" if _calls else ""),
+      "matched" in _chunkarg and _chunkarg.rstrip().endswith("or 1"))
+
 # A shortfall INSIDE --tolerance is still a shortfall and must be named. The
 # aggregator knows the default is 10%; skimming just inside it was reported as
 # an unqualified success.

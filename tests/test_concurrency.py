@@ -316,6 +316,77 @@ check("the shared lab takes its ports from the caller",
       "def __init__(self, base, daemon_port, wallet_port)" in _lab_src)
 
 
+# ===========================================================================
+# A SIGNAL HANDLER MAY NOT TAKE THE CHAIN LOCK.
+#
+# _shutdown_handler called integrity_log, which takes an exclusive flock on
+# integrity_chain.log.lock for its whole read-modify-write and opens a FRESH
+# descriptor every call. flock conflicts are per open file description, not per
+# process -- so a second LOCK_EX from inside a handler that interrupted the
+# first blocks on a lock only the interrupted code can release, and it cannot,
+# because the handler is sitting on top of it.
+#
+# Reproduced rather than reasoned about: the original hung until `timeout`
+# killed it. And the cost is worse than a hang -- every tool here logs at
+# startup and receive_watch logs once per failed poll for up to 24 hours, so
+# the window is hit in ordinary use, and an operator whose Ctrl-C does nothing
+# reaches for kill -9. SIGKILL runs no finally block, so .gs_pw_* (the
+# plaintext wallet password) stays on disk. A deadlock here turns an interrupt
+# into a secret left behind.
+def _run_bounded(argv, secs):
+    """A TIMEOUT IS THE FAILURE BEING TESTED, not an error in the harness.
+
+    Letting TimeoutExpired escape crashes the suite, and a crashed suite prints
+    no RESULT line -- which the mutation sweep scores as NO-RESULT, i.e. proves
+    nothing. The deadlock this section exists for makes the child hang forever,
+    so it has to come back as a failed check.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=secs)
+    except subprocess.TimeoutExpired:
+        return types_ns(returncode=-1, stdout="", stderr="TIMED OUT")
+
+
+class types_ns:                                              # noqa: N801
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+_dl = _run_bounded(
+    [sys.executable, "-c", r"""
+import sys, os, signal, threading, time, fcntl, tempfile
+sys.path.insert(0, %r)
+os.chdir(tempfile.mkdtemp())
+import gs_common as g
+fd = os.open(str(g.INTEGRITY_LOG) + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+signal.signal(signal.SIGINT, g._shutdown_handler)
+threading.Thread(target=lambda: (time.sleep(0.4),
+                                 os.kill(os.getpid(), signal.SIGINT)),
+                 daemon=True).start()
+time.sleep(2)
+fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+g.integrity_log("recv", "ordinary")
+ok = g.verify_integrity_chain(g.INTEGRITY_LOG)[0]
+n = len(open(str(g.INTEGRITY_LOG)).read().splitlines())
+print("SURVIVED", g.shutdown_requested(), ok, n)
+""" % REPO], 60)
+check("SIGINT delivered while the chain lock is held does NOT deadlock the "
+      "process", "SURVIVED" in _dl.stdout)
+check("...the shutdown flag is still set, so the run still winds down",
+      "SURVIVED True" in _dl.stdout)
+check("...the signal is not lost: the next ordinary entry writes it too",
+      _dl.stdout.strip().endswith("True True 2"))
+check("...and the chain still verifies, so the deferred line is chained in "
+      "order rather than appended past the head",
+      "True True" in _dl.stdout)
+_gs = open(os.path.join(REPO, "gs_common.py")).read()
+check("the handler itself calls nothing that can block",
+      "_PENDING_CHAIN.append" in _gs
+      and "integrity_log(\"signal\"" not in _gs)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

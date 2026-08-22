@@ -129,6 +129,12 @@ TAG_LEN = 16
 TAG_M1 = b"GSWAKE-v1-M1".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "I am awake"
 TAG_M2 = b"GSWAKE-v1-M2".ljust(TAG_LEN, b"\0")   # Pi -> ThinkPad   "do this job"
 TAG_M3 = b"GSWAKE-v1-M3".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "it is done"
+#: The pairing ceremony's LAST exchange, after both operators confirmed the
+#: code. Two tags, not one, for the same reason M1 and M3 have two: both are
+#: sealed under the same static-static key, so only a domain tag stops one
+#: being replayed as the other.
+TAG_PC = b"GSWAKE-v2-PC".ljust(TAG_LEN, b"\0")   # Pi -> ThinkPad   "my address"
+TAG_PV = b"GSWAKE-v2-PV".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "my MAC"
 
 #: One 256-byte block. See the header for why every record is the same size.
 PAD_BLOCK = 256
@@ -142,6 +148,18 @@ MAX_INNER = PAD_BLOCK - 1
 
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
+#: The doorbell's per-window nonce. SIXTEEN, not thirty-two, and the reason is
+#: arithmetic rather than taste: M1 already carries a 32-byte ephemeral public
+#: key and a 32-byte challenge, each 64 hex characters, and at 32 bytes this
+#: took the inner record to 248 of the 255 that fit in one padded block. seal()
+#: refuses a longer one rather than emitting a visibly different 512-byte
+#: record -- correct, but it means the next field anybody adds fails on a woken
+#: box in the field. 16 bytes leaves real headroom.
+#:
+#: Nothing is lost. This value is not a key and does not need to resist search:
+#: forging an M1 needs the vault's static secret, so the nonce only has to be
+#: FRESH. 128 bits of it, from the same getrandom() as everything else here.
+WINDOW_BYTES = 16
 #: The handle the operator reads off the terminal and the doorbell may learn.
 #: FOUR hex characters, uppercase, and RANDOM -- never derived from the slip,
 #: the address or the memo. A derived handle would let a seized Pi confirm or
@@ -278,7 +296,7 @@ def seal(sender_secret, recipient_public, tag: bytes, body: dict) -> bytes:
     No nonce parameter, deliberately -- see the header.
     """
     public, bindings = _nacl()
-    if tag not in (TAG_M1, TAG_M2, TAG_M3):
+    if tag not in (TAG_M1, TAG_M2, TAG_M3, TAG_PC, TAG_PV):
         raise WakeError("refusing to seal a record with an unknown tag")
     # sort_keys so the same body always produces the same inner length; the
     # padding makes the WIRE length constant regardless, but a deterministic
@@ -381,6 +399,15 @@ def challenge_of(body: dict) -> bytes:
 
 def eph_pk_of(body: dict) -> bytes:
     return _hexfield(body, "eph_pk", 32)
+
+
+def new_window() -> bytes:
+    return secrets.token_bytes(WINDOW_BYTES)
+
+
+def window_of(body: dict) -> bytes:
+    """The doorbell's per-window nonce, echoed back in M1. See Pending.window."""
+    return _hexfield(body, "window", WINDOW_BYTES)
 
 
 def job_id_of(body: dict) -> str:
@@ -831,8 +858,7 @@ def _pair_info(body: dict) -> dict:
     return out
 
 
-def _pair_finish(sock, my_pub: bytes, peer_pub: bytes, peer_info: dict,
-                 ask, out) -> dict:
+def _pair_finish(sock, my_pub: bytes, peer_pub: bytes, ask, out) -> dict:
     """Show the code, ask the human, exchange answers, and only then agree.
 
     BOTH SIDES MUST SAY YES. Each box sends its own answer and reads the
@@ -863,11 +889,70 @@ def _pair_finish(sock, my_pub: bytes, peer_pub: bytes, peer_info: dict,
             "differed, something on your network answered instead of the box "
             "you meant -- unplug the switch from anything you do not own and "
             "try again.")
-    out("  [+] Codes matched on both boxes. Writing the keyfiles.")
-    return {"peer_public": peer_pub.hex(), "peer_info": peer_info, "sas": sas}
+    out("  [+] Codes matched on both boxes.")
+    return {"peer_public": peer_pub.hex(), "sas": sas}
 
 
-def pair_initiator(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
+def _pair_read_record(sock) -> bytes:
+    """Exactly RECORD_LEN bytes, under the same whole-message deadline."""
+    deadline = time.monotonic() + PAIR_MSG_S
+    buf = b""
+    while len(buf) < RECORD_LEN:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise WakeError("the other box did not finish sending its "
+                            "configuration. Nothing was written here.")
+        try:
+            sock.settimeout(min(left, 5.0))
+            chunk = sock.recv(RECORD_LEN - len(buf))
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                raise WakeError("the other box did not finish sending its "
+                                "configuration. Nothing was written "
+                                "here.") from e
+            raise WakeError(f"the pairing connection failed while reading the "
+                            f"configuration ({type(e).__name__}).") from e
+        if not chunk:
+            raise WakeError("the other box closed the connection before "
+                            "sending its configuration")
+        buf += chunk
+    return buf
+
+
+def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
+                 send_tag: bytes, recv_tag: bytes, first: bool) -> dict:
+    """Swap configuration AFTER both operators confirmed, and only sealed.
+
+    THIS USED TO RIDE IN THE PLAINTEXT `reveal`, which the vault sends to
+    whoever connects, on a socket bound to every interface, before anybody has
+    authenticated anything. So any host on the switch could open the pairing
+    port during the ceremony and be handed the vault's MAC ADDRESS and its
+    broadcast address -- the exact value the sealed keyfile exists to keep off
+    a stolen SD card, given away over the LAN by the tool that seals it. A key
+    can be rotated in one sitting; a NIC cannot.
+
+    Now nothing but a public key crosses before the two operators have compared
+    the code, and the configuration crosses after, boxed to the key that
+    comparison authenticated. It reuses seal/open_record, so it is the same 296
+    bytes as every other record on this wire and carries a domain tag.
+
+    `first` decides who speaks: one side sends then reads, the other reads then
+    sends, or they deadlock.
+    """
+    public, _b = _nacl()
+    peer_pub = public.PublicKey(peer_pub_raw)
+    rec = seal(my_sk, peer_pub, send_tag, {"info": my_info})
+    if first:
+        sock.sendall(rec)
+        got = _pair_read_record(sock)
+    else:
+        got = _pair_read_record(sock)
+        sock.sendall(rec)
+    return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
+
+
+def pair_initiator(sock, my_sk, my_pub: bytes, my_info: dict, ask,
+                   out) -> dict:
     """The side that connects (the Pi). COMMITS FIRST -- see pair_sas."""
     # No blanket settimeout here: _pair_recv sets its own per-read timeout
     # under a per-message deadline. A blanket one here silently overrode the
@@ -877,36 +962,28 @@ def pair_initiator(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
     _pair_send(sock, {"t": "commit", "v": PAIR_PROTO,
                       "c": pair_commitment(my_pub).hex()})
     body = _pair_step(sock, "reveal")
-    try:
-        peer_pub = _pair_pub(body)
-        peer_info = _pair_info(body)
-    except WakeError:
-        _pair_abort(sock, "info")
-        raise
+    peer_pub = _pair_pub(body)
     if peer_pub == my_pub:
         # Both boxes drew the same key: either the same box is talking to
         # itself, or something is reflecting the exchange.
         _pair_abort(sock, "self_key")
         raise WakeError("the other box offered THIS box's own public key")
-    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex(),
-                      "info": my_info})
-    return _pair_finish(sock, my_pub, peer_pub, peer_info, ask, out)
+    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex()})
+    agreed = _pair_finish(sock, my_pub, peer_pub, ask, out)
+    agreed["peer_info"] = _pair_config(sock, my_sk, peer_pub, my_info,
+                                       TAG_PC, TAG_PV, first=True)
+    return agreed
 
 
-def pair_responder(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
+def pair_responder(sock, my_sk, my_pub: bytes, my_info: dict, ask,
+                   out) -> dict:
     """The side that listens (the vault). Reveals only after the commitment."""
     sock.settimeout(PAIR_MSG_S)
     body = _pair_step(sock, "commit")
     commitment = _hexfield(body, "c", 32)
-    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex(),
-                      "info": my_info})
+    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex()})
     body = _pair_step(sock, "reveal")
-    try:
-        peer_pub = _pair_pub(body)
-        peer_info = _pair_info(body)
-    except WakeError:
-        _pair_abort(sock, "info")
-        raise
+    peer_pub = _pair_pub(body)
     if peer_pub == my_pub:
         _pair_abort(sock, "self_key")
         raise WakeError("the other box offered THIS box's own public key")
@@ -920,7 +997,10 @@ def pair_responder(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
             "the other box revealed a key that does not match what it "
             "committed to. That is what an attempt to fix the comparison code "
             "looks like. Refusing, and nothing was written.")
-    return _pair_finish(sock, my_pub, peer_pub, peer_info, ask, out)
+    agreed = _pair_finish(sock, my_pub, peer_pub, ask, out)
+    agreed["peer_info"] = _pair_config(sock, my_sk, peer_pub, my_info,
+                                       TAG_PV, TAG_PC, first=False)
+    return agreed
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ from gs_common import (
     safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json,
     validate_proxy, install_signal_handlers, shutdown_requested,
-    scrub_address, bech32_checksum_ok, secure_mkdir,
+    scrub_address, chain_safe, bech32_checksum_ok, secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_or_warn,
     integrity_log_once,
     secure_delete_tree,
@@ -3254,9 +3254,21 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
         # optparse exits 2 on an unknown option, and tumbler.py exits on a
         # destination that fails validate_address. Both used to be produced by
         # this function's own argv rather than by anything the operator did.
-        sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode}). Its "
-                 f"stderr is above; a usage/option error means the tumbler "
-                 f"CLI has moved on from what this call expects.")
+        # PRINT IT, DO NOT POINT AT IT. This said "its stderr is above" while
+        # the call three hundred lines up passes capture_output=True, which
+        # sets stdout and stderr to PIPE -- so nothing was above, and the
+        # operator was told to read something that did not exist. That leaves
+        # them with an exit code and no way to tell a moved CLI flag from a
+        # wallet that would not open.
+        #
+        # chain_safe rather than raw: the tumbler echoes destination addresses
+        # in its own errors, and this line reaches a terminal.
+        _jm_err = chain_safe((e.stderr or e.stdout or "").strip())[-800:]
+        sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode}).\n"
+                 f"    Its output was captured, so here it is:\n"
+                 f"    {_jm_err or '(the tumbler printed nothing)'}\n"
+                 f"    A usage/option error means the tumbler CLI has moved on "
+                 f"from what this call expects.")
 
 
 def _receive_pairs_for(args, entry_addr: str) -> list:
@@ -7422,9 +7434,16 @@ def _report_surviving_plans() -> None:
     if not left:
         return
     try:
+        # NOT "--exit-to". The three plans registered here are the fan-out,
+        # the entry veil and the DAG round; their destinations are mix
+        # subaddresses and carriers, never the withdrawal address. The exit
+        # plan is written later, is erased in its own `finally`, and warns by
+        # name if that erase fails. Naming --exit-to here was a sentence that
+        # made an operator look for the wrong thing in the right files -- and
+        # made the real disclosure sound smaller than it is.
         print(f"\n  [!] {len(left)} unsigned plan file(s) are STILL ON DISK. "
-              f"Each holds every hop's source, destination and amount in "
-              f"plaintext — including your --exit-to destination:")
+              f"Each holds every hop's source, destination, amount and "
+              f"account index in plaintext — the mix graph of this run:")
         for _p in left:
             print(f"        {Path(_p).resolve()}")
         print("      They were kept on purpose: this run did not complete, and "
@@ -8360,7 +8379,27 @@ def _run_change_sweep(args, account, change_index, dest_addr, dest_index,
         "sweep": True,
         "delay": hop_delay(delay_window),
     }
-    path = Path(staging_dir).parent / f"unsigned_changesweep_{secure_hex(6)}.json"
+    # THE OPERATOR'S --output DIRECTORY, NOT THE CURRENT ONE. This was
+    # `Path(staging_dir).parent`, and staging_dir is the bare string
+    # "tx_staging", so its parent is "." -- the shell's working directory.
+    # Every other plan this run writes goes to args.output, which secure_mkdir
+    # creates 0700 and which _stage5_cleanup erases; these two did not.
+    #
+    # These are the two worst plans to misplace. The exit plan names the
+    # operator's FINAL destination -- the one address the whole pipeline exists
+    # to keep unlinked from the public ThorChain memo -- and the change-sweep
+    # plan names where each carrier's change goes. atomic_write_json writes
+    # 0600, so the CONTENTS were not readable by other accounts; the filenames
+    # were, and "unsigned_exit_*.json" in a directory dates a withdrawal.
+    # Worse, they sat outside the directory the cleanup erases, so a run that
+    # tidied up after itself left exactly these behind.
+    # ENSURED, not assumed. A real run created it in stage 4, but crashing
+    # HERE -- after the mix has run and the gates have passed, one step before
+    # the money moves -- is the worst place in the pipeline to discover a
+    # missing directory.
+    _outdir = Path(args.output)
+    secure_mkdir(_outdir, narrow_existing=False)
+    path = _outdir / f"unsigned_changesweep_{secure_hex(6)}.json"
     atomic_write_json({"meta": meta, "txs": [sweep_tx]}, path)
     stage = f"{staging_dir}/changesweep{seq}" if seq else f"{staging_dir}/changesweep"
     try:
@@ -8940,7 +8979,11 @@ def _run_exit_withdrawals(args, accounts, dests, staging_dir, proxy, meta,
             "sweep": True,
             "delay": hop_delay(delay_window),
         }
-        path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"
+        # See _run_change_sweep for why this is args.output and not
+        # Path(staging_dir).parent, which resolved to the shell's cwd.
+        _outdir = Path(args.output)
+        secure_mkdir(_outdir, narrow_existing=False)
+        path = _outdir / f"unsigned_exit_{secure_hex(6)}.json"
         atomic_write_json({"meta": meta, "txs": [tx]}, path)
         # "3/10" -> "3_10". A slash would make the staging path a directory
         # deeper than intended and put a "/" in the Tor gate's stage name.

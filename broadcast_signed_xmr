@@ -9,7 +9,11 @@ OPSEC hardening:
     re-verified immediately before EVERY submit (a local RPC on the usual
     loopback daemon), so a monerod that picks up clearnet peers mid-batch is
     caught before the next transaction rather than up to a timer-interval
-    later. The Tor exit check is an external request, so it stays on a
+    later -- WHEN --rpc-daemon IS SET, AND ONLY THEN. EgressGate.check returns
+    immediately if it has no daemon URL, and --rpc-daemon has no default. So
+    without it this paragraph described a check that never ran, and the run
+    said nothing about the difference. It does now: the gate says so once, at
+    startup, rather than leaving the header to be believed. The Tor exit check is an external request, so it stays on a
     ~5-minute timer and is forced before any transaction that had a planned
     delay -- the delay is what makes the previous sample stale
   - NEWNYM circuit rotation between every TX broadcast
@@ -252,6 +256,11 @@ class EgressGate:
     out -- the exact "verified, then assumed" pattern the check exists to close.
     """
 
+    #: Once per process. This warning is about a MISSING flag, so it is the
+    #: same on every submit; printing it per transaction would train the
+    #: operator to scroll past it.
+    _warned_no_daemon = False
+
     def __init__(self, args, proxy, progF, relayed: set):
         self.args = args
         self.proxy = proxy
@@ -291,6 +300,22 @@ class EgressGate:
             tor_recheck(self.proxy, tag)
             self.last_tor_check = time.time()
         if not self.args.rpc_daemon:
+            # SAY IT ONCE, RATHER THAN LEAVE THE HEADER TO BE BELIEVED. This
+            # module's own header promises the daemon's relay egress is
+            # "re-verified immediately before EVERY submit". Without
+            # --rpc-daemon -- which has no default -- this returns here and
+            # that check never runs at all, on any submit, and nothing said so.
+            # An operator who read the header has a guarantee they do not have.
+            if not EgressGate._warned_no_daemon:
+                EgressGate._warned_no_daemon = True
+                print("  [!] No --rpc-daemon, so the daemon's RELAY EGRESS is "
+                      "NOT checked before submits.")
+                print("      The Tor exit check above still runs. What is not "
+                      "running is the one that asks")
+                print("      whether your monerod would hand this transaction "
+                      "to raw-IP peers. Pass")
+                print("      --rpc-daemon http://127.0.0.1:18081 to get it.")
+                integrity_log("broadcast", "egress_gate_no_daemon")
             return
         _eg = check_daemon_relay_egress(self.args.rpc_daemon, self.proxy)
         if _eg["verdict"] != "clearnet":

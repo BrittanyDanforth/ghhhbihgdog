@@ -110,6 +110,8 @@ def deps_for(d, bell, **over):
 
     def post(url, path, rec, timeout=30):
         posted.append((path, rec))
+        if path == "/window":
+            return 200, bell.window
         if path == "/wake":
             try:
                 return 200, bell.on_m1(rec)
@@ -138,6 +140,22 @@ def deps_for(d, bell, **over):
     base["_posted"] = posted
     base["_ran"] = ran
     return base
+
+
+def stub_post(bell, on_wake=(204, b""), on_result=(200, b"")):
+    """A doorbell stub that answers /window HONESTLY and /wake as told.
+
+    Every one of these used to be a bare lambda returning one tuple for every
+    path. When M1 gained a window binding, /window started getting that same
+    answer -- so a test meaning "the doorbell has no job" became "the doorbell
+    is broken", and six checks changed what they were testing without changing
+    a line. The window is not the thing under test in any of them.
+    """
+    def post(url, path, rec, timeout=30):
+        if path == "/window":
+            return 200, bell.window
+        return on_result if path == "/result" else on_wake
+    return post
 
 
 def run(kf, deps, dry_run=False):
@@ -246,7 +264,7 @@ check("refuses when the resource sentinel could not RUN at all — an "
 # ===========================================================================
 print("\n== the note itself ==")
 d6, kf6, _k, bell6 = new_env()
-dp6 = deps_for(d6, bell6, post_record=lambda u, p, r, timeout=30: (204, b""))
+dp6 = deps_for(d6, bell6, post_record=stub_post(bell6))
 out6, err6, _t = run(kf6, dp6)
 check("no job pending -> refused, and that is what a hostile magic packet "
       "looks like: boot, sit, shut down",
@@ -266,7 +284,7 @@ def _draw6(a, b):
 
 
 dp6b = deps_for(d6b, bell6b,
-                post_record=lambda u, p, r, timeout=30: (204, b""),
+                post_record=stub_post(bell6b),
                 sleep=slept6.append,
                 rng=types.SimpleNamespace(randint=_draw6))
 out6b, err6b, _t = run(kf6b, dp6b)
@@ -285,7 +303,7 @@ check("...and that is the ONLY wait on a no-job boot: it never reaches the "
 d6c, kf6c, _k, bell6c = new_env()
 slept6c = []
 dp6c = deps_for(d6c, bell6c,
-                post_record=lambda u, p, r, timeout=30: (204, b""),
+                post_record=stub_post(bell6c),
                 sleep=slept6c.append)
 out6c, err6c, _t = run(kf6c, dp6c, dry_run=True)
 check("...and --dry-run skips the dwell",
@@ -303,6 +321,8 @@ d8, kf8, _k, bell8 = new_env()
 
 
 def _reflect(url, path, rec, timeout=30):
+    if path == "/window":
+        return 200, bell8.window
     if path == "/wake":
         return 200, rec          # hand the vault back its own M1
     return 200, b""
@@ -316,6 +336,8 @@ d9, kf9, _k, bell9 = new_env()
 
 
 def _static_m2(url, path, rec, timeout=30):
+    if path == "/window":
+        return 200, bell9.window
     if path == "/wake":
         body = P.open_record(PI, TP.public_key, rec, P.TAG_M1)
         return 200, P.seal(PI, TP.public_key, P.TAG_M2,
@@ -335,6 +357,8 @@ d10, kf10, _k, bell10 = new_env()
 
 
 def _wrong_chal(url, path, rec, timeout=30):
+    if path == "/window":
+        return 200, bell10.window
     if path == "/wake":
         body = P.open_record(PI, TP.public_key, rec, P.TAG_M1)
         eph = NP.PublicKey(bytes.fromhex(body["eph_pk"]))
@@ -693,6 +717,46 @@ finally:
     os.chdir(_cwd0)
     if _home0 is not None:
         os.environ["HOME"] = _home0
+
+# THE WORST LEAK THIS FEATURE HAS HAD, and it was in a file nobody read as
+# code. A systemd unit with no StandardOutput= journals everything its children
+# print, and the children are thor_swap_preparer -- which prints the BTC
+# deposit address and the THORCHAIN MEMO. The memo names the destination XMR
+# address in plain text. So the one string this toolchain exists to keep off
+# durable storage was going into /var/log/journal: persistent, root-owned,
+# rotated rather than erased, and outside everything paranoia_mode sweeps.
+check("the agent unit sends its own output NOWHERE, so a woken job's children "
+      "cannot journal the swap memo",
+      _val(_agent_u, "StandardOutput") == "null"
+      and _val(_agent_u, "StandardError") == "null")
+check("...and the doorbell's example unit does the same on the Pi",
+      _val(_unit("gs-doorbell.service.example"), "StandardOutput") == "null")
+
+# The unit is half of it. The other half is that the child does not inherit
+# this process's stdout at all -- driven, not read.
+_jl = Path(tempfile.mkdtemp(prefix="wakejob_"))
+_rc, _hard = A.run_child(
+    [sys.executable, "-c",
+     "import sys;print('MEMO=4AAAA...');print('boom', file=sys.stderr)"],
+    {}, 30, log_path=_jl / A.JOB_LOG)
+_logged = (_jl / A.JOB_LOG).read_text()
+check("a child's stdout AND stderr go to the job log, not to this process",
+      _rc == 0 and "MEMO=4AAAA" in _logged and "boom" in _logged)
+check("...and that log is 0600 from the moment it exists, not chmod'ed after "
+      "a memo has already been written into it",
+      oct(os.stat(_jl / A.JOB_LOG).st_mode)[-3:] == "600")
+check("...and it is named in BOTH paranoia_mode's wipe list and .gitignore, "
+      "because a diagnostic that survives the wipe is the leak again",
+      A.JOB_LOG in open(os.path.join(REPO, "paranoia_mode")).read()
+      and A.JOB_LOG in open(os.path.join(REPO, ".gitignore")).read())
+_captured = io.StringIO()
+with contextlib.redirect_stdout(_captured):
+    A.run_child([sys.executable, "-c", "print('SHOULD NOT APPEAR')"], {}, 30,
+                log_path=_jl / A.JOB_LOG)
+check("...and with no log path the child's output is discarded rather than "
+      "inherited",
+      "SHOULD NOT APPEAR" not in _captured.getvalue())
+
 
 # OPSEC_SETUP.md §8 states this as a measured fact, so measure it. If /etc ever
 # becomes a sweep root, the doc's "destroy the pairing yourself" instruction

@@ -551,6 +551,22 @@ def test_http_gates():
         check("no token is rejected", st == 401)
         st, _ = s.req("GET", "/", headers=s.auth())
         check("a valid token loads the page", st == 200)
+        # A NON-ASCII TOKEN USED TO KILL THE REQUEST THREAD, BEFORE
+        # AUTHENTICATION. hmac.compare_digest raises TypeError on non-ASCII str
+        # operands, and this one comes straight off the wire -- so any
+        # unauthenticated local process could kill a handler thread at will and
+        # fill the operator's terminal with tracebacks during a run.
+        # Reproduced against the running server: "curl: (52) Empty reply from
+        # server" and a TypeError out of do_GET.
+        st, _ = s.req("GET", "/", headers={"X-GS-Token": "\u00e9abc"})
+        check("a non-ASCII token is REJECTED, not a crashed request thread",
+              st == 401)
+        # No astral-character case: http.client encodes headers as latin-1 and
+        # refuses to send one, so a normal client cannot produce it. The
+        # latin-1 range above is what actually reaches the server, and it is
+        # what reproduced the crash.
+        st, _ = s.req("GET", "/", headers=s.auth())
+        check("...and the server is still serving afterwards", st == 200)
         st, _ = s.req("GET", "/", headers={**s.auth(), "Host": "evil.example.com"})
         check("a spoofed Host is rejected (DNS rebinding)", st == 403)
         st, _ = s.req("GET", "/", headers={**s.auth(), "Origin": "http://evil.example.com"})
@@ -734,6 +750,47 @@ def test_receive_is_btc_to_monero():
           "--amounts" not in argv and "0.05" not in argv)
     check("the swap amount is handed over in the environment instead",
           c.secret_env({"swap_btc": "0.05"}).get("GS_SWAP_AMOUNTS") == "0.05")
+
+    # A SEND RUN MUST NOT INHERIT THE LAST RECEIVE RUN'S ARRIVAL TARGET.
+    #
+    # secret_env sends expect_total_xmr in BOTH modes, deliberately: in send
+    # mode it is the fallback for an unreadable quote, and there is a check for
+    # that further down this file. The INPUT, though, lived only inside
+    # #recv-fields -- which is HIDDEN in send mode, not removed -- so the
+    # browser kept the operator's last receive value in the DOM and collect()
+    # sent it with every send run, where it becomes GS_EXPECT_TOTAL_XMR: the
+    # swap arrival gate. A stale target lower than the real total opens that
+    # gate with a swap still in flight and the run starts mixing, and nothing
+    # on the page in send mode displayed the number.
+    #
+    # The fix is not to stop sending it -- that would remove a capability the
+    # code has and the suite pins. It is that each mode reads its OWN visible
+    # box, the rule `split` already followed.
+    _js = open(os.path.join(REPO, "gs_console")).read()
+    check("send mode has its own VISIBLE total-expected input, outside the "
+          "receive-only block",
+          'id="expect_total_xmr_send"' in _js
+          and _js.index('id="expect_total_xmr_send"')
+          < _js.index('id="recv-fields"'))
+    check("...and collect() reads whichever box the operator can actually see, "
+          "never the hidden one",
+          "mode==='receive' ? v('expect_total_xmr')" in _js
+          and "v('expect_total_xmr_send')" in _js)
+    check("...so the receive-only input is not the source in send mode",
+          "expect_total_xmr:v('expect_total_xmr')" not in _js.replace(" ", ""))
+
+    # swap_btc, pairs_file and receive_wallet ARE sent in both modes, and that
+    # is harmless rather than an oversight: ACTION_SECRETS scopes
+    # GS_SWAP_AMOUNTS to the swap_quote action, and a send run is run_pipeline,
+    # which never receives it. Pinned so nobody "fixes" the scoping away.
+    check("GS_SWAP_AMOUNTS is scoped to swap_quote only, so a stale receive "
+          "value cannot reach a send run whatever the page sends",
+          "GS_SWAP_AMOUNTS" in c.ACTION_SECRETS["swap_quote"]
+          and "GS_SWAP_AMOUNTS" not in c.ACTION_SECRETS["run_pipeline"])
+    check("...while the arrival target IS scoped to the pipeline, which is why "
+          "the visible-input rule above is the thing that protects it",
+          "GS_EXPECT_TOTAL_XMR" in c.ACTION_SECRETS["run_pipeline"])
+
     # The destination must come from the verified bundle, never a retyped
     # 95-char address -- a typo there is irreversible.
     check("the XMR destination is taken from the receive bundle, not retyped",
@@ -1752,8 +1809,14 @@ def test_console_can_express_the_expected_total():
     _page = getattr(c, "PAGE", "")
     check("expected total: the receive step actually offers the input",
           'id="expect_total_xmr"' in _page)
-    check("expected total: ...and the page collects it into the request",
-          "expect_total_xmr:v('expect_total_xmr')" in _page)
+    check("expected total: ...and send mode offers one too, because secret_env "
+          "sends the value in both modes and an input that exists in only one "
+          "of them means the other reads a hidden box",
+          'id="expect_total_xmr_send"' in _page)
+    check("expected total: ...and the page collects it from whichever box the "
+          "operator can actually see",
+          "mode==='receive' ? v('expect_total_xmr')" in _page
+          and "v('expect_total_xmr_send')" in _page)
     # The send form's "Split into" input lives inside #send-fields, which is
     # HIDDEN in receive mode rather than removed -- so it is still in the DOM
     # and still reads 1. A receive-side count therefore needs its own field,
@@ -1810,6 +1873,41 @@ def test_daemon_chain_is_reported_not_assumed():
     check("chain: an unreachable daemon reports it as unknown, not a guess",
           _gc.check_daemon_relay_egress("http://127.0.0.1:1", None)["nettype"]
           == "unknown")
+
+
+def test_job_timeout_flag_actually_does_something():
+    """--job-timeout was inert for every job the page can start.
+
+    start() is called with timeout_s=job_timeout_for(params) from the HTTP
+    handler, and job_timeout_for returned max(JOB_TIMEOUT_FLOOR_S, ...) -- a
+    floor that never consulted JOB_TIMEOUT_S. Measured with --job-timeout 60:
+    job_timeout_for({}) -> 694800, effective 694800. The flag's own help says
+    "kill a job after this long".
+    """
+    c = load_console()
+    _saved = (c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S)
+    try:
+        c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S = False, 60
+        _big = c.job_timeout_for({"wallets": 60, "hop_delay": "86400-259200"})
+        check("unset: the per-job estimate still scales with wallets x delay, "
+              "which is the reason job_timeout_for exists",
+              _big > c.JOB_TIMEOUT_FLOOR_S)
+        check("unset: and the default job still gets the floor",
+              c.job_timeout_for({}) >= c.JOB_TIMEOUT_FLOOR_S)
+        c.JOB_TIMEOUT_EXPLICIT = True
+        check("set: --job-timeout 60 actually bounds a default job",
+              c.job_timeout_for({}) == 60)
+        check("set: ...and the biggest job too, which is the one an operator "
+              "would be trying to bound", c.job_timeout_for(
+                  {"wallets": 60, "hop_delay": "86400-259200"}) == 60)
+    finally:
+        c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S = _saved
+    _src = open(os.path.join(REPO, "gs_console")).read()
+    check("the flag defaults to None, so 'not given' is distinguishable from "
+          "'given the default'",
+          'ap.add_argument("--job-timeout", type=int, default=None' in _src)
+    check("...and setting it says so, because it now overrides an estimate "
+          "the operator cannot see", "applies to EVERY job" in _src)
 
 
 def test_fee_panel_says_which_chain_the_daemon_is_on():

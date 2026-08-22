@@ -1467,7 +1467,11 @@ def _drive_change_sweep(residue, settle=True):
         ghost.hop_delay = lambda *a, **k: 0
         buf = _io.StringIO()
         _a = types.SimpleNamespace(rpc_primary="http://127.0.0.1:18083",
-                                   tor_proxy="socks5h://127.0.0.1:9050")
+                                   tor_proxy="socks5h://127.0.0.1:9050",
+                                   # The change-sweep plan names where each
+                                   # carrier's change goes; it is written to
+                                   # args.output now, not to the shell's cwd.
+                                   output=stg)
         with _ctx.redirect_stdout(buf):
             ok = ghost._run_change_sweep(_a, 4, 0, "DEST", 1, stg, None, {},
                                          delay_window=(0, 0))
@@ -4107,7 +4111,9 @@ try:
     ghost.atomic_write_json = lambda payload, path: _built.update(payload)
     with _ctx.redirect_stdout(_io.StringIO()):
         _ok_cs = ghost._run_change_sweep(
-            _VA(rpc_primary="http://127.0.0.1:1", tor_proxy=None),
+            _VA(rpc_primary="http://127.0.0.1:1", tor_proxy=None,
+                # The plan goes to args.output, not to the shell's cwd.
+                output=_tf.mkdtemp(prefix="gs_cs_units_")),
             5, 0, "DEST_ADDR", 9, "stg", None, {"account_index": 5},
             label="change sweep 1/3", seq=1, delay_window=(600, 601))
     _tx = (_built.get("txs") or [{}])[0]
@@ -4472,6 +4478,46 @@ for _lbl, _resp in (("{}", {}), ("None", None), ("[]", []),
 check("malformed success: ...and a WELL-FORMED answer is still accepted",
       gs.create_fresh_account(_Answers(_GOODC)) == 5)
 
+
+# ===========================================================================
+# A DOT IN A DIRECTORY NAME IS NOT A FILE EXTENSION.
+#
+# wipe_covers read `if res.is_file() or res.suffix: res = res.parent`, so any
+# path whose last component contained a dot was treated as a FILE and replaced
+# by its parent -- and directories with dots in them are ordinary. Measured
+# with HOME and cwd pointed at a scratch root:
+#
+#   $HOME/gs/run.2026  -> checked $HOME/gs   -> "covered"      (it is not)
+#   $HOME/a/b          -> checked $HOME/a/b  -> not covered    (correct)
+#
+# Every tool that asks this question tells the operator "your artifacts will be
+# erased" on the strength of the answer, so a wrong True is a promise the wipe
+# does not keep.
+import tempfile as _tfw, pathlib as _plw                      # noqa: E402
+_hw = _tfw.mkdtemp(prefix="gs_cover_")
+_savedhome = os.environ.get("HOME")
+_savedcwd = os.getcwd()
+try:
+    os.environ["HOME"] = _hw
+    os.chdir(_hw)
+    for _rel in ("gs/run.2026", "a/b", "gs", "deep/deeper/x"):
+        _plw.Path(_hw, _rel).mkdir(parents=True, exist_ok=True)
+    check("a DIRECTORY two levels down with a dot in its name is NOT reported "
+          "as covered -- the sweep only globs depth 0 and 1",
+          not _gsc.wipe_covers(os.path.join(_hw, "gs", "run.2026")))
+    check("...the same directory without a dot was already correct",
+          not _gsc.wipe_covers(os.path.join(_hw, "a", "b")))
+    check("...and a depth-1 directory still IS covered",
+          _gsc.wipe_covers(os.path.join(_hw, "gs")))
+    check("a FILE path is still resolved to its directory, which is the whole "
+          "reason the shortcut existed",
+          _gsc.wipe_covers(os.path.join(_hw, "gs", "plan.json")))
+    check("...including one that does not exist yet",
+          _gsc.wipe_covers(os.path.join(_hw, "notyet.json")))
+finally:
+    os.chdir(_savedcwd)
+    if _savedhome is not None:
+        os.environ["HOME"] = _savedhome
 
 
 _finished()

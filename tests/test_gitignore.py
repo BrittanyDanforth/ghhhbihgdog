@@ -111,6 +111,37 @@ tracked = subprocess.run(["git", "ls-files"], cwd=REPO,
 shadowed = [f for f in tracked if is_ignored(f)]
 check(f"no tracked file is shadowed by .gitignore (found: {shadowed})", not shadowed)
 
+
+# ===========================================================================
+# NO TRACKED FILE MAY BE ON THE WIPE LIST.
+#
+# The two lists are kept in lockstep in one direction already: anything worth
+# secure-deleting is worth gitignoring. This is the other direction, and it was
+# missing. "renamethis1" sat on GS_ARTIFACT_FILE_PATTERNS and is a committed
+# file, so a real wipe shredded it and left git reporting a deletion -- the
+# wipe tool dirtying the working tree of the repository it lives in, for no
+# gain, because a file that is already published is not unpublished by deleting
+# the local copy.
+import fnmatch as _fn                                        # noqa: E402
+import subprocess as _sp2                                    # noqa: E402
+
+_tracked = _sp2.run(["git", "ls-files"], capture_output=True, text=True,
+                    cwd=REPO).stdout.split()
+check("git ls-files returned something, so this check is not passing "
+      "vacuously outside a checkout", len(_tracked) > 10)
+_clash = []
+for _t in _tracked:
+    _base = os.path.basename(_t)
+    for _pat in list(para.GS_ARTIFACT_FILE_PATTERNS):
+        if _fn.fnmatch(_base, _pat):
+            _clash.append(f"{_t} matches wipe pattern {_pat!r}")
+    for _pat in list(para.GS_ARTIFACT_DIR_PATTERNS):
+        if _fn.fnmatch(_base, _pat):
+            _clash.append(f"{_t} matches wipe DIR pattern {_pat!r}")
+check("no file tracked by git matches a paranoia_mode wipe pattern"
+      + ("" if not _clash else " -- " + "; ".join(_clash[:4])),
+      not _clash)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

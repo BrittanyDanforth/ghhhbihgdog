@@ -579,6 +579,148 @@ MUTATIONS = [
   "        handle = proto.new_handle()",
   ["test_wake_agent"]),
 
+ # The integrity chain redacts addresses; a MAC had no rule at all and bech32
+ # fell through to the digit rule, which left most of the address in order.
+ ("the chain redactor passes MAC addresses through", "gs_common.py",
+  '        out = _CHAIN_MAC_RE.sub("<mac>", out)',
+  "        pass",
+  ["test_chain_redaction"]),
+ ("the chain redactor passes bech32 BTC addresses through", "gs_common.py",
+  '        out = _CHAIN_BECH32_RE.sub("<addr>", out)',
+  "        pass",
+  ["test_chain_redaction"]),
+
+ # The dedupe marker is a second copy of every chain payload, keyed on the RAW
+ # value and written to disk beside the plans.
+ ("the dedupe marker stores the unredacted payload", "gs_common.py",
+  '        _line = f"{chain_safe(stage)}\\t{chain_safe(kind)}\\n"',
+  '        _line = f"{stage}\\t{kind}\\n"',
+  ["test_chain_redaction"]),
+
+ # A path whose last component contains a dot was treated as a FILE and
+ # replaced by its parent, so a directory two levels down reported "covered".
+ ("wipe_covers calls a dotted directory covered", "gs_common.py",
+  "        if res.is_file():\n"
+  "            res = res.parent\n"
+  "        elif not res.exists() and res.suffix:\n"
+  "            res = res.parent",
+  "        if res.is_file() or res.suffix:\n            res = res.parent",
+  ["test_units"]),
+
+ # compare_digest raises TypeError on non-ASCII str, and this one comes off the
+ # wire -- so any local process could kill a handler thread before auth.
+ ("a non-ASCII token crashes the console's request thread", "gs_console",
+  "        try:\n"
+  '            got = t.encode("utf-8", "surrogatepass")\n'
+  '            want = TOKEN.encode("utf-8", "surrogatepass")\n'
+  "        except (UnicodeError, AttributeError):\n"
+  "            return False\n"
+  "        return hmac.compare_digest(got, want)",
+  "        return hmac.compare_digest(t, TOKEN)",
+  ["test_console"]),
+
+ # --job-timeout was inert for every job the page can start.
+ ("--job-timeout does nothing for a job started from the page", "gs_console",
+  "    if JOB_TIMEOUT_EXPLICIT:\n        return JOB_TIMEOUT_S",
+  "    if False:\n        return JOB_TIMEOUT_S",
+  ["test_console"]),
+
+ # The exit plan names the operator's FINAL destination and was written to the
+ # shell's cwd rather than the 0700 --output directory.
+ ("the exit plan is written to the working directory", "GhostSpiral",
+  '        path = _outdir / f"unsigned_exit_{secure_hex(6)}.json"',
+  '        path = Path(staging_dir).parent / f"unsigned_exit_{secure_hex(6)}.json"',
+  ["test_exit_withdraw"]),
+
+ # The header promises the daemon egress check runs before EVERY submit; with
+ # no --rpc-daemon it runs on none of them.
+ ("the egress gate is silent about not running", "broadcast_signed_xmr",
+  "            if not EgressGate._warned_no_daemon:",
+  "            if False:",
+  ["test_broadcast"]),
+
+ # THE WORST LEAK THIS FEATURE HAS HAD. A systemd unit with no StandardOutput=
+ # journals everything its children print, and the children print the ThorChain
+ # memo -- which names the destination XMR address in plain text -- into
+ # /var/log/journal, outside everything paranoia_mode sweeps.
+ ("the woken job's output goes to the systemd journal",
+  "systemd/gs-wake-agent.service",
+  "StandardOutput=null\nStandardError=null\n",
+  "",
+  ["test_wake_agent"]),
+
+ # The other half: the child must not inherit this process's stdout either.
+ ("a woken job's child inherits the agent's stdout", "gs_wake_agent",
+  "                             stdout=sink or subprocess.DEVNULL,\n"
+  "                             stderr=subprocess.STDOUT,\n",
+  "",
+  ["test_wake_agent"]),
+
+ # flock conflicts are per open file description, not per process, so a handler
+ # that takes the chain lock blocks on a lock only the code it interrupted can
+ # release. The process then cannot be interrupted at all, the operator reaches
+ # for kill -9, and SIGKILL runs no finally -- leaving .gs_pw_* on disk.
+ ("a signal handler takes the integrity-chain lock and deadlocks",
+  "gs_common.py",
+  '    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={signum}"))',
+  '    integrity_log("signal", f"shutdown_requested_sig={signum}")',
+  ["test_concurrency"]),
+
+ # The arrival gate decides the money has landed. With chunks=1 the floor is
+ # just the slippage tolerance, so a whole swap can be missing.
+ ("the swap arrival gate forgets how many swaps there are", "receive_watch",
+  "        len(_chunk_amounts) or len(matched) or 1)",
+  "        len(_chunk_amounts) or 1)",
+  ["test_receive_watch"]),
+
+ # monero-python dumps whole JSON-RPC responses to stderr on any error, past
+ # every redactor in this repository, because logging.lastResort is a stderr
+ # handler and "no handler configured" is not "no output".
+ ("a dependency's logger writes unredacted RPC responses to stderr",
+  "gs_common.py",
+  "\n\n_silence_third_party_logging()\n",
+  "\n\npass  # mutated\n",
+  ["test_env_leaks"]),
+
+ # Under `sudo paranoia_mode` -- which the tool's own failure text recommends --
+ # os.getuid() is root, and the "uid-scoped" sweep becomes a blanket sweep of
+ # every root-owned entry in /tmp: systemd-private-*, .X11-unix, running units.
+ ("the temp sweep deletes root's /tmp when run under sudo", "paranoia_mode",
+  '        if uid == 0 and os.environ.get("SUDO_UID"):\n'
+  '            uid = int(os.environ["SUDO_UID"])',
+  "        pass",
+  ["test_shmwipe"]),
+
+ # HISTFILE is a shell VARIABLE, never exported, so the environment lookup was
+ # dead in exactly the case its own docstring names -- and that file can hold a
+ # --wallet-password verbatim.
+ ("a relocated shell history is missed by the wipe", "paranoia_mode",
+  # A SYNTAX-BREAKING mutation would score NO-RESULT, which proves nothing --
+  # so this kills the feature while leaving the file valid: the pattern simply
+  # never matches an assignment anybody writes.
+  '        for hit in re.finditer(r"^\\s*(?:export\\s+)?HISTFILE=(\\S+)\\s*$",',
+  '        for hit in re.finditer(r"^\\s*(?:export\\s+)?NEVERMATCHES=(\\S+)\\s*$",',
+  ["test_shmwipe"]),
+
+ # Everything below the summary's completion line used to sit under
+ # `elif not bad:`, so a run with one failed phase printed none of it -- and a
+ # non-root run always fails the MAC spoof.
+ ("the wallet caveat is unreachable on a run that had failures",
+  "paranoia_mode",
+  "    if not args.dry_run:\n"
+  "        # THE BIGGEST THING THIS TOOL DOES NOT DO, said out loud.",
+  "    if not args.dry_run and not bad:\n"
+  "        # THE BIGGEST THING THIS TOOL DOES NOT DO, said out loud.",
+  ["test_gapfixes"]),
+
+ # #recv-fields is hidden in send mode, not removed, so the browser kept the
+ # last receive value and it became the swap arrival gate for a send run.
+ ("a send run reads its arrival target from a hidden input", "gs_console",
+  "  expect_total_xmr: mode==='receive' ? v('expect_total_xmr')\n"
+  "                                     : v('expect_total_xmr_send'),",
+  "  expect_total_xmr:v('expect_total_xmr'),",
+  ["test_console"]),
+
  # THE ONE THING THE SHORT PAIRING CODE DEPENDS ON. Without the commitment
  # check the initiator picks its key after seeing the responder's, so a man in
  # the middle grinds keypairs until the two codes agree -- about 2^20 X25519
@@ -801,23 +943,46 @@ def run(idx, name, fname, find, repl, suites):
         print(f"[{idx:2d}] BROKEN {name}: replacement not found on disk")
         shutil.rmtree(tmp, ignore_errors=True)
         return "BROKEN"
-    caught, verdicts = False, []
+    caught, verdicts, crashed = False, [], False
     for suite in suites:
-        p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
-                           capture_output=True, text=True, timeout=900)
-        out = p.stdout + p.stderr
+        try:
+            p = subprocess.run([sys.executable, f"tests/{suite}.py"], cwd=dst,
+                               capture_output=True, text=True, timeout=900)
+            out = p.stdout + p.stderr
+        except subprocess.TimeoutExpired:
+            # A HUNG SUITE IS NOT A CATCH EITHER, and letting the exception
+            # escape would abandon the whole sweep at whichever mutation
+            # happened to hang.
+            out = ""
+            verdicts.append(f"{suite}=TIMEOUT")
+            crashed = True
+            continue
         m = re.findall(r"(\d+) passed, (\d+) failed", out)
         if not m:
             verdicts.append(f"{suite}=NO-RESULT")
+            crashed = True
             continue
         failed = int(m[-1][1])
         verdicts.append(f"{suite}={'RED' if failed else 'green'}({failed})")
         if failed:
             caught = True
     shutil.rmtree(tmp, ignore_errors=True)
-    tag = "CAUGHT" if caught else "*** SURVIVED ***"
-    print(f"[{idx:2d}] {tag:16s} {name}\n       {'  '.join(verdicts)}")
-    return "CAUGHT" if caught else "SURVIVED"
+    # A CRASHED SUITE IS NOT A SURVIVOR, AND SAYING SO MATTERS. This reported
+    # "*** SURVIVED ***" for a suite that never ran -- a mutation that made the
+    # source syntactically invalid, so the test file died on import and printed
+    # no RESULT line. Both outcomes fail the sweep, so the tally was not wrong,
+    # but the WORD was: SURVIVED means "the tests ran and noticed nothing",
+    # which sends you to write a test that already exists. NO-RESULT means "the
+    # tests could not run", which sends you to fix the mutation. This file's own
+    # header has drawn that distinction from the start and the code did not.
+    if crashed and not caught:
+        tag, verdict = "*** NO-RESULT ***", "NO-RESULT"
+    elif caught:
+        tag, verdict = "CAUGHT", "CAUGHT"
+    else:
+        tag, verdict = "*** SURVIVED ***", "SURVIVED"
+    print(f"[{idx:2d}] {tag:17s} {name}\n       {'  '.join(verdicts)}")
+    return verdict
 
 
 if __name__ == "__main__":
