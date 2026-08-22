@@ -579,6 +579,46 @@ MUTATIONS = [
   "        handle = proto.new_handle()",
   ["test_wake_agent"]),
 
+ # THE ONE THING THE SHORT PAIRING CODE DEPENDS ON. Without the commitment
+ # check the initiator picks its key after seeing the responder's, so a man in
+ # the middle grinds keypairs until the two codes agree -- about 2^20 X25519
+ # keygens for 40 bits, i.e. seconds -- and the operator compares two identical
+ # strings while somebody sits between them.
+ ("the pairing commitment is not checked, so the code can be ground to match",
+  "gs_wake_proto.py",
+  "    if not hmac.compare_digest(pair_commitment(peer_pub), commitment):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # The SD card is the one that leaves the building in a pocket, and 0400 means
+ # nothing to somebody reading it on their own machine.
+ ("the Pi accepts an UNSEALED keyfile", "gs_doorbell",
+  "    if not proto.keyfile_is_sealed(container):",
+  "    if False:",
+  ["test_wake_doorbell"]),
+
+ # Both numbers come off a disk an attacker may have written to, and memlimit
+ # is an allocation: a keyfile can otherwise OOM the box that reads it.
+ ("Argon2 parameters off the disk are used unchecked", "gs_wake_proto.py",
+  "    if (isinstance(mem, bool) or not isinstance(mem, int)\n"
+  "            or not 2**23 <= mem <= 2**30):",
+  "    if False:",
+  ["test_wake_protocol"]),
+
+ # A port scanner, a monitoring probe or a half-open connection must not
+ # consume the ceremony and leave the real Pi with 'connection refused'.
+ ("one stray connection consumes the pairing ceremony", "gs_wake_keys",
+  "            except (proto.WakeError, OSError) as e:",
+  "            except (proto.PairAborted,) as e:",
+  ["test_wake_endtoend"]),
+
+ # A regex that counts digits is not a check that the number is a byte. The
+ # value goes into the Pi's keyfile and then into sendto().
+ ("999.1.1.1 is accepted as a broadcast address", "gs_wake_keys",
+  '    return all(0 <= int(p) <= 255 for p in v.split("."))',
+  "    return True",
+  ["test_wake_endtoend"]),
+
  # A built-in SD reader with no card publishes removable=1 forever, so without
  # the size check the vault refuses EVERY boot: a feature that never runs.
  ("an empty card slot counts as attached media", "gs_wake_agent",
@@ -604,7 +644,7 @@ MUTATIONS = [
  ("a relative artifact dir is written into the keyfile", "gs_wake_keys",
   "    if not os.path.isabs(args.artifact_dir):",
   "    if False:",
-  ["test_wake_protocol"]),
+  ["test_wake_endtoend"]),
 
  # The dwell shipped as two dead constants and a doc claim for a whole draft.
  # An anchor here is the standing guard against it going dead again.

@@ -92,7 +92,10 @@ def new_env(job="receive_and_quote", params=None, ladder=("0.01", "0.05")):
            "artifact_dir": str(d), "amount_ladder": list(ladder),
            "account_ceiling": 45}
     kf = d / "tp.key"
-    kf.write_text(json.dumps(key))
+    # THE REAL CONTAINER, not a hand-built dict. A fixture that writes a shape
+    # the shipped loader no longer accepts is a fixture that tests a format
+    # nothing uses -- which is how a suite stays green through a format change.
+    kf.write_text(json.dumps(P.lock_keyfile(key, b"", role="thinkpad")))
     os.chmod(kf, 0o400)
     bell = DB.Pending({"secret": PI.encode().hex(),
                        "peer_public": TP.public_key.encode().hex()},
@@ -537,10 +540,10 @@ check("...and the message never says 'expired': the job is current, the round "
 
 # The 24 h wake budget, on the far side of the same boundary.
 dr2, kfr2, keyr2, bellr2 = new_env()
-_kf2 = json.loads(kfr2.read_text())
+_kf2 = P.unlock_keyfile(json.loads(kfr2.read_text()))
 _kf2["daily_wake_budget"] = 1
 os.chmod(kfr2, 0o600)
-kfr2.write_text(json.dumps(_kf2))
+kfr2.write_text(json.dumps(P.lock_keyfile(_kf2, b"", role="thinkpad")))
 os.chmod(kfr2, 0o400)
 (dr2 / A.STATE_FILE).write_text(json.dumps(
     {"jobs": [], "wakes": [int(time.time())]}))

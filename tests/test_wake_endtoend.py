@@ -74,6 +74,10 @@ def load(name):
 A = load("gs_wake_agent")
 DB = load("gs_doorbell")
 
+#: interactive, not moderate: this suite pairs several times and moderate
+#: would add minutes. The container is identical either way.
+PW = b"end to end pairing passphrase"
+
 
 def free_port():
     s = socket.socket()
@@ -99,21 +103,80 @@ class FakeWOL:
         pass
 
 
-def mint_pair(port, artifact_dir):
-    """Run the REAL pairing tool and return (dir, thinkpad_key, pi_key)."""
+def free_port_pair():
+    return free_port()
+
+
+def mint_pair(port, artifact_dir, kdf="interactive"):
+    """Run the REAL two-box ceremony and return (dir, tp_payload, pi_payload).
+
+    NOT a hand-built pair of dicts, and not one tool writing both files: the
+    vault half runs as a real subprocess of gs_wake_keys, the Pi half runs
+    gs_doorbell's own do_pair, and they talk over a real TCP socket. That is
+    the only way to test the property the ceremony exists for -- that NO SECRET
+    EVER CROSSES -- because a fixture that fabricates two keyfiles proves
+    nothing about what moved between them.
+
+    --mac / --broadcast are passed because the ceremony runs here on loopback,
+    which has no usable hardware address. That is a supported path (the tool
+    refuses rather than guessing when detection fails); the DETECTION itself is
+    driven separately against this host's real interface below.
+    """
     d = tempfile.mkdtemp(prefix="wake_e2e_")
-    r = subprocess.run(
-        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "--out", d,
-         "--thinkpad-mac", "AA:BB:CC:DD:EE:FF",
-         "--doorbell-host", "127.0.0.1", "--doorbell-port", str(port),
+    pport = free_port()
+    v = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+         "--out", d, "--bind", "127.0.0.1", "--pair-port", str(pport),
+         "--mac", "aa:bb:cc:dd:ee:ff", "--broadcast", "255.255.255.255",
          "--artifact-dir", str(artifact_dir),
          "--amount-ladder", "0.01", "0.02", "0.05"],
-        capture_output=True, text=True, cwd=d)
-    if r.returncode != 0:
-        raise AssertionError(f"pairing failed: {r.stdout}{r.stderr}")
-    tp = json.loads(open(os.path.join(d, "gs_wake_thinkpad.key")).read())
-    pi = json.loads(open(os.path.join(d, "gs_wake_pi.key")).read())
-    return d, tp, pi
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, cwd=d)
+    # Wait for the listener rather than sleeping a guess: a fixed sleep here
+    # is a flaky suite on a loaded machine.
+    for _ in range(400):
+        try:
+            probe = socket.create_connection(("127.0.0.1", pport), timeout=0.2)
+            probe.close()
+            break
+        except OSError:
+            time.sleep(0.05)
+
+    seen = {}
+    pi_args = types.SimpleNamespace(
+        vault="127.0.0.1", pair_port=pport,
+        key=os.path.join(d, "gs_wake_pi.key"), port=port, kdf=kdf)
+    out = {}
+
+    def pi_side():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                out["rc"] = DB.do_pair(
+                    pi_args, ask=lambda sas: (seen.setdefault("pi", sas), True)[1],
+                    getpass_fn=lambda prompt: PW.decode())
+        except BaseException as e:                           # noqa: BLE001
+            out["rc"] = e
+
+    t = threading.Thread(target=pi_side, daemon=True)
+    t.start()
+    try:
+        vout, _ = v.communicate(input="yes\n", timeout=180)
+    except subprocess.TimeoutExpired:
+        v.kill()
+        vout, _ = v.communicate()
+    t.join(120)
+    out["vault_stdout"] = vout
+    out["pi_sas"] = seen.get("pi")
+    tp_path = os.path.join(d, "gs_wake_thinkpad.key")
+    pi_path = os.path.join(d, "gs_wake_pi.key")
+    out["tp_container"] = (json.loads(open(tp_path).read())
+                           if os.path.exists(tp_path) else None)
+    out["pi_container"] = (json.loads(open(pi_path).read())
+                           if os.path.exists(pi_path) else None)
+    tp = P.unlock_keyfile(out["tp_container"]) if out["tp_container"] else None
+    pi = P.unlock_keyfile(out["pi_container"], PW) if out["pi_container"] else None
+    out["dir"] = d
+    return d, tp, pi, out
 
 
 def agent_deps(bay, ran, **over):
@@ -134,10 +197,12 @@ def agent_deps(bay, ran, **over):
     return base
 
 
-def cycle(job, params, bay):
+def cycle(job, params, bay, info_out=None):
     """One full poke: doorbell in a thread, agent against it over HTTP."""
     port = free_port()
-    kd, tp, pi = mint_pair(port, bay)
+    kd, tp, pi, _info = mint_pair(port, bay)
+    if info_out is not None:
+        info_out.update(_info)
     FakeWOL.sent = []
     pending = {}
 
@@ -176,8 +241,33 @@ os.chdir(_bay)
 
 try:
     print("== receive_and_quote, both halves, real HTTP ==")
+    _cinfo = {}
     p1, out1, err1, ran1, text1 = cycle("receive_and_quote",
-                                        {"amount_slot": 2}, _bay)
+                                        {"amount_slot": 2}, _bay,
+                                        info_out=_cinfo)
+    check("the two boxes showed the SAME pairing code, and it is the one the "
+          "operator compares",
+          _cinfo.get("pi_sas") and _cinfo["pi_sas"] in _cinfo["vault_stdout"])
+    check("...and NO SECRET crossed: neither box's private key appears in "
+          "anything the other one wrote",
+          _cinfo["tp_container"]["plain"]["secret"]
+          not in json.dumps(_cinfo["pi_container"]))
+    check("the Pi's keyfile on the SD card is SEALED and gives up nothing but "
+          "KDF parameters",
+          P.keyfile_is_sealed(_cinfo["pi_container"])
+          and all(v not in json.dumps(_cinfo["pi_container"]) for v in
+                  ("aa:bb:cc:dd:ee:ff", "255.255.255.255",
+                   _cinfo["tp_container"]["plain"]["peer_public"])))
+    check("the vault's keyfile is NOT sealed, says so in the file, and the "
+          "tool said so out loud rather than letting it be discovered",
+          not P.keyfile_is_sealed(_cinfo["tp_container"])
+          and _cinfo["tp_container"]["kdf"] == "none"
+          and "NOT encrypted" in _cinfo["vault_stdout"])
+    check("...and the vault learned the MAC it must wake, without anyone "
+          "typing it into the Pi",
+          _cinfo["pi_container"] is not None
+          and DB.load_key(Path(_cinfo["dir"]) / "gs_wake_pi.key",
+                          PW)["target_mac"] == "aa:bb:cc:dd:ee:ff")
     check("the agent finished the job", err1 is None and out1
           and out1[0] == "done" and out1[1] == "done")
     check("...and the DOORBELL heard it, sealed by the agent's own key",
@@ -208,6 +298,65 @@ try:
           and ran1[1][0][ran1[1][0].index("--dest-from-receive-wallet") + 1]
           .startswith(str(_bay)))
 
+    print("\n== the ceremony survives whatever else is on the switch ==")
+    # FOUND BY DRIVING IT. A two-line readiness probe in this very file
+    # connected to the pairing port and closed; the vault accepted it as "the
+    # Pi", gave up, and the real Pi then got 'connection refused' from a box
+    # that had already finished pairing with nothing. On a real LAN that is a
+    # port scanner, a monitoring agent, or anyone who wants the ceremony to
+    # fail. The vault now keeps listening through connections that never speak
+    # the protocol.
+    _sd = tempfile.mkdtemp(prefix="wake_stray_")
+    _sp = free_port()
+    _sv = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+         "--out", _sd, "--bind", "127.0.0.1", "--pair-port", str(_sp),
+         "--mac", "aa:bb:cc:dd:ee:ff", "--broadcast", "255.255.255.255"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, cwd=_sd)
+    for _ in range(400):
+        try:
+            _junk = socket.create_connection(("127.0.0.1", _sp), timeout=0.2)
+            break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        _junk = None
+    if _junk is not None:
+        _junk.close()                       # connect and vanish: a port scan
+        _junk2 = socket.create_connection(("127.0.0.1", _sp), timeout=2)
+        _junk2.sendall(b"GET / HTTP/1.0\r\n\r\n")   # and now noise
+        _junk2.close()
+    _sargs = types.SimpleNamespace(vault="127.0.0.1", pair_port=_sp,
+                                   key=os.path.join(_sd, "gs_wake_pi.key"),
+                                   port=0, kdf="interactive")
+    _sout = {}
+
+    def _spi():
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _sout["rc"] = DB.do_pair(_sargs, ask=lambda x: True,
+                                         getpass_fn=lambda p: PW.decode())
+        except BaseException as e:                           # noqa: BLE001
+            _sout["rc"] = e
+
+    _st = threading.Thread(target=_spi, daemon=True)
+    _st.start()
+    try:
+        _svout, _ = _sv.communicate(input="yes\n", timeout=180)
+    except subprocess.TimeoutExpired:
+        _sv.kill()
+        _svout, _ = _sv.communicate()
+    _st.join(120)
+    check("two stray connections do NOT consume the ceremony: the real Pi "
+          "still pairs afterwards",
+          _sout.get("rc") == 0
+          and os.path.exists(os.path.join(_sd, "gs_wake_thinkpad.key")))
+    check("...and the operator is TOLD each one happened, rather than just "
+          "seeing a slow pairing",
+          _svout.count("That was not the Pi") >= 2)
+
+
     print("\n== the doorbell's queue depth is one, over the wire ==")
     # The first boot's M3 is DROPPED on the floor here, deliberately, for two
     # reasons at once: it keeps the doorbell listening (a result ends its
@@ -217,7 +366,7 @@ try:
     # over real HTTP. The Pi's clock is injected so the thread can be released
     # on demand instead of sitting out the job budget.
     port2 = free_port()
-    kd2, tp2, pi2 = mint_pair(port2, _bay)
+    kd2, tp2, pi2, _i2 = mint_pair(port2, _bay)
     FakeWOL.sent = []
     hold = {}
     _clk = [0.0]
@@ -284,6 +433,99 @@ try:
           "4-hex handle: no address, no memo, no amount",
           "0.05" not in _rt and "wallet_" not in _rt
           and "thor_pairs" not in _rt and out1[2] in _rt)
+    print("\n== the pairing tool refuses before it opens a socket ==")
+    # These used to be checked in test_wake_protocol against the OLD gs_wake_keys
+    # CLI. That CLI is gone and the checks went with it, leaving a mutation
+    # anchor pointing at a guarantee nothing tested any more -- the sweep would
+    # have reported it as a survivor, which is the sweep doing its job and this
+    # file having stopped doing its own.
+    def _keys_cli(*extra):
+        d = tempfile.mkdtemp(prefix="wake_val_")
+        try:
+            return subprocess.run(
+                [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+                 "--out", d, "--bind", "127.0.0.1",
+                 "--pair-port", str(free_port()), *extra],
+                capture_output=True, text=True, timeout=60, cwd=d, input="")
+        except subprocess.TimeoutExpired:
+            # A TOOL THAT HANGS ON A BAD FLAG HAS NOT REFUSED IT. Reported as
+            # a failed check, not as a crashed suite: this is exactly how
+            # --broadcast 999.1.1.1 was found (the regex counted digits and
+            # never asked whether 999 was a byte, so the tool went on to bind
+            # and wait 5 minutes).
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    for _extra, _why, _needle in (
+            (("--artifact-dir", "bay"),
+             "a RELATIVE artifact dir: the agent runs under systemd, whose "
+             "working directory is '/', and that is mounted read-only",
+             "relative"),
+            (("--amount-ladder", "0.01", "0", "0.05"),
+             "a zero rung on the amount ladder", "positive"),
+            (("--amount-ladder", *(["0.01"] * 9)),
+             "a ladder longer than the wire's slot range, whose extra rungs "
+             "no note could ever select", "never be selected"),
+            (("--account-ceiling", "0"), "a zero account ceiling", "at least"),
+            (("--daily-wake-budget", "0"), "a zero wake budget", "between"),
+            (("--mac", "not-a-mac"), "a MAC that is not a MAC", "MAC address"),
+            (("--broadcast", "999.1.1.1"),
+             "a broadcast address that is not an address", "IPv4"),
+            (("--pair-port", "0"), "port 0 for the ceremony", "not a port")):
+        _r = _keys_cli(*_extra)
+        check(f"refuses {_why}",
+              _r.returncode != 0 and _needle in (_r.stdout + _r.stderr))
+
+    # And it refuses BEFORE binding, so a bad flag never leaves a socket open.
+    _r = _keys_cli("--artifact-dir", "bay")
+    check("...and says nothing about waiting, because it never got as far as "
+          "opening the pairing socket",
+          "Waiting up to" not in _r.stdout + _r.stderr)
+
+    _d0 = tempfile.mkdtemp(prefix="wake_exist_")
+    open(os.path.join(_d0, "gs_wake_thinkpad.key"), "w").write("{}")
+    _r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "gs_wake_keys"), "pair",
+         "--out", _d0, "--bind", "127.0.0.1", "--pair-port", str(free_port())],
+        capture_output=True, text=True, timeout=60, cwd=_d0, input="")
+    check("refuses to overwrite an existing keyfile: the Pi holds the "
+          "matching half, and replacing this one silently breaks the pair in "
+          "a way that looks exactly like a dead switch",
+          _r.returncode != 0 and "already exists" in _r.stdout + _r.stderr)
+
+
+    print("\n== the MAC is detected, never typed ==")
+    # --thinkpad-mac used to be a REQUIRED flag, and a typo in it produced a
+    # setup that paired perfectly, reported success on both boxes, and then
+    # woke nothing forever. A magic packet is not acknowledged, so no layer of
+    # this system could ever have told the operator.
+    _keys = load("gs_wake_keys")
+    _u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _u.settimeout(1)
+    try:
+        _u.connect(("192.0.2.1", 9))
+        _src = _u.getsockname()[0]
+    except OSError:
+        _src = ""
+    finally:
+        _u.close()
+    _iface, _mac, _brd = _keys.local_link(_src) if _src else (None, None, None)
+    if _src and _src != "127.0.0.1":
+        check(f"the interface holding this host's own address ({_src}) is "
+              f"found, with a usable MAC and broadcast",
+              bool(_iface) and bool(_keys.MAC_RE.match(_mac or ""))
+              and _mac != "00:00:00:00:00:00"
+              and bool(_keys.IPV4_RE.match(_brd or "")))
+    else:
+        # No route off this host. The tool must say so, not invent a MAC.
+        check("with no route off this host, detection returns nothing rather "
+              "than guessing", (_iface, _mac, _brd) == (None, None, None))
+    check("loopback is never offered as the interface to wake: it has no "
+          "hardware address and a magic packet there reaches nothing",
+          _keys.local_link("127.0.0.1") == (None, None, None))
+    check("an address no interface holds returns nothing",
+          _keys.local_link("203.0.113.77") == (None, None, None))
+
+
 finally:
     os.chdir(_cwd0)
 

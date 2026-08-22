@@ -248,14 +248,29 @@ def load_key(path: Path) -> dict:
                       f"{path} is group- or world-accessible (mode "
                       f"{stat.S_IMODE(st.st_mode):04o}); chmod 0400 it.")
     try:
-        k = json.loads(Path(path).read_text())
+        container = json.loads(Path(path).read_text())
     except Exception as e:                                   # noqa: BLE001
         raise Refused("keyfile_unreadable",
                       f"{path} is not readable JSON ({type(e).__name__})") from e
-    if k.get("schema") != "gs_wake_v1" or k.get("version") != proto.WIRE_VERSION:
-        raise Refused("keyfile_schema",
-                      f"{path} is not a gs_wake_v1 key for wire version "
-                      f"{proto.WIRE_VERSION}")
+    # THIS ONE IS NOT SEALED, AND THE FILE SAYS SO RATHER THAN THIS CODE
+    # ASSUMING IT. gs_wake_agent runs at boot with nobody here, on a disk that
+    # unlocks itself so that it can: a passphrase this machine stores in order
+    # to type it to itself is not a passphrase. See gs_wake_keys' docstring for
+    # exactly what that costs, which is bounded and is not nothing.
+    #
+    # A SEALED file reaching here is a real mix-up worth naming: it is the Pi's,
+    # and the Pi's file must never be on this box.
+    if proto.keyfile_is_sealed(container):
+        raise Refused(
+            "keyfile_sealed",
+            f"{path} is passphrase-sealed, which this machine's keyfile is "
+            f"never allowed to be -- nobody is here at boot to type one. That "
+            f"makes this the PI's keyfile, and it must not be on this box. Get "
+            f"it off, then re-pair with `gs_wake_keys pair`.")
+    try:
+        k = proto.unlock_keyfile(container)
+    except proto.WakeError as e:
+        raise Refused("keyfile_schema", str(e)) from e
     if k.get("role") != "thinkpad":
         raise Refused("keyfile_role",
                       f"{path} is the {k.get('role')!r} keyfile. The Pi's file "

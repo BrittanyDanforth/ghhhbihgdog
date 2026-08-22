@@ -116,6 +116,7 @@ import hmac
 import json
 import re
 import secrets
+import time
 
 #: Wire version. A peer that does not recognise a tag REFUSES. There is no
 #: negotiation and no "try v1 if v2 fails" -- a downgrade path is a way to be
@@ -153,6 +154,23 @@ _HEX_RE = re.compile(r"^[0-9a-f]+$")
 class WakeError(Exception):
     """A record was refused. The message is operator-facing and must never
     echo attacker-supplied bytes back into a log or a terminal."""
+
+
+class PairAborted(WakeError):
+    """A HUMAN decided not to pair. Distinct from every other pairing failure.
+
+    The vault keeps listening through connections that fail before anyone was
+    asked anything -- a port scanner, a monitoring probe, a half-open TCP
+    connection, an attacker sending noise -- because otherwise the first stray
+    packet on the LAN consumes the ceremony and the operator has to start over
+    without being told why. Found by driving it: a two-line readiness probe in
+    a test connected, closed, and the real Pi then got 'connection refused'
+    from a vault that had already 'paired' with nothing.
+
+    It must NOT keep listening once a person has answered no. That is a
+    decision, not a fault, and retrying past it would ask them again until they
+    got it wrong.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +385,542 @@ def eph_pk_of(body: dict) -> bytes:
 
 def job_id_of(body: dict) -> str:
     return _hexfield(body, "job_id", JOB_ID_BYTES).hex()
+
+
+# ---------------------------------------------------------------------------
+#  THE KEYFILE CONTAINER, AND WHY IT EXISTS
+# ---------------------------------------------------------------------------
+# KERCKHOFFS, TAKEN LITERALLY. This repository is public. An adversary has read
+# every line of it: they know the file names, the ports, the record size, the
+# job vocabulary, the systemd units, the wipe patterns and this comment. The
+# ONLY thing that may be secret is key material. So the question is not "would
+# anyone think to look at /etc/gs_wake_pi.key" -- they would, they read it
+# here -- but "what do they get when they do".
+#
+# WHAT THEY GOT BEFORE. The v1 keyfile was plaintext JSON at mode 0400. A
+# Raspberry Pi's SD card is not encrypted in any realistic build: pull it out,
+# mount it on any laptop, and 0400 means nothing because you are root on the
+# machine doing the reading. That handed over, in one file:
+#
+#     the Pi's long-term X25519 SECRET    -> forge job notes to the vault
+#     the vault's public key              -> recognise its traffic anywhere
+#     target_mac                          -> the vault's NIC, a hardware
+#                                            identifier that ties that laptop
+#                                            to this setup for the rest of its
+#                                            life
+#     listen_host / wol_broadcast         -> the LAN layout
+#     pair_fingerprint                    -> a stable identifier for the pair
+#
+# The MAC is arguably worse than the key. A key can be rotated in one sitting;
+# a NIC cannot, and it is the one value that survives reinstalling both boxes.
+#
+# So the Pi's keyfile is now a sealed container: Argon2id over a passphrase,
+# then XSalsa20-Poly1305 over the whole payload. An imaged SD card yields the
+# KDF parameters and a salt, which are not secrets, and nothing else.
+#
+# THE FILE SAYS WHAT IT IS. "kdf": "none" is a real, supported value and it
+# stores the payload as plain JSON under "plain" rather than as unencrypted
+# bytes dressed up as a ciphertext. A file that LOOKS encrypted and is not is
+# worse than one that says so, because the operator plans around the look.
+# gs_wake_agent's keyfile uses it deliberately -- see load_key there for why an
+# unattended boot cannot do better, stated rather than papered over.
+
+#: The keyfile format. Versioned SEPARATELY from WIRE_VERSION: the messages on
+#: the wire did not change when the file format did, and one number covering
+#: two things that change for different reasons is a number that lies about one
+#: of them.
+KEYFILE_SCHEMA = "gs_wake_v2"
+
+#: Argon2id profiles, by name, recorded IN the file. A file derived under one
+#: profile must always be derived under that profile, so the reader takes the
+#: parameters from the file rather than from this table -- the table only says
+#: what a NEW file gets. Values are libsodium's own.
+#:
+#: MODERATE (3 passes, 256 MiB) is the default and is chosen for the hardware
+#: this actually runs on. Measured with PyNaCl 1.6.2: 2.15 s on the machine
+#: this was written on. A Pi 3B+ is markedly slower and has 1 GB of RAM total
+#: with Tor already resident, so 256 MiB is a real allocation there -- which is
+#: why `pair` MEASURES the derivation on the box doing it and prints the number,
+#: instead of this comment guessing at hardware it has never run on.
+#:
+#: SENSITIVE (1 GiB) is deliberately absent: it cannot allocate on a 1 GB Pi,
+#: and a profile that OOM-kills the doorbell is not a stronger profile.
+KDF_PROFILES = {
+    "moderate": (3, 268435456),
+    "interactive": (2, 67108864),
+}
+DEFAULT_KDF = "moderate"
+
+#: Crockford's alphabet: no I, L, O or U, so there is no 1/l, 0/O or
+#: rhymes-with-you confusion when a human reads one code off a Pi's console and
+#: compares it to a laptop screen. That comparison is the entire security of
+#: the pairing, so the character set is a security parameter.
+_B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+SAS_BYTES = 5                                    # 40 bits -> exactly 8 chars
+
+
+def _b32(raw: bytes) -> str:
+    n = int.from_bytes(raw, "big")
+    out = []
+    for _ in range(len(raw) * 8 // 5):
+        out.append(_B32[n & 31])
+        n >>= 5
+    return "".join(reversed(out))
+
+
+def pair_commitment(public_key: bytes) -> bytes:
+    """SHA-256 over a domain tag and one public key. See pair_sas."""
+    import hashlib
+    if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != 32:
+        raise WakeError("commitment takes a 32-byte X25519 public key")
+    return hashlib.sha256(b"GSWAKE-commit-v2" + bytes(public_key)).digest()
+
+
+def pair_sas(pub_a: bytes, pub_b: bytes) -> str:
+    """The code the operator compares on both screens. 40 bits, 8 characters.
+
+    WHY 40 BITS IS ENOUGH HERE, AND WOULD NOT BE ON ITS OWN.
+
+    A man in the middle on the LAN runs two pairings at once: one with the Pi
+    using a key he made up, one with the vault using another. He wins if the
+    two codes come out the same, and he can pick both of his keys -- so with
+    a bare short code he grinds keypairs until they collide, which for 40 bits
+    is a birthday search of about 2^20 X25519 keygens. Seconds. The short code
+    would be theatre.
+
+    So the exchange COMMITS FIRST. The initiator sends SHA-256 of its public
+    key before it has seen the responder's; the responder then reveals; the
+    initiator reveals and the responder checks the commitment. Neither party --
+    and therefore neither half of a man in the middle -- ever chooses a key
+    while knowing the other side's. Grinding has nothing to grind against, and
+    the attack collapses to guessing one code, once, at 1 in 2^40, with a
+    failure that the operator sees. This is the ZRTP construction and it is
+    used here for the same reason: it lets the thing a human must compare be
+    short enough that they actually compare it.
+
+    Sorted, so both boxes print the same string without either needing to know
+    which of them is 'first'. Public keys only: a code read aloud must never be
+    derived from a secret.
+    """
+    import hashlib
+    lo, hi = sorted((bytes(pub_a), bytes(pub_b)))
+    raw = hashlib.sha256(b"GSWAKE-sas-v2" + lo + hi).digest()[:SAS_BYTES]
+    s = _b32(raw)
+    return f"{s[:4]}-{s[4:]}"
+
+
+def lock_keyfile(payload: dict, passphrase: bytes, kdf: str = DEFAULT_KDF,
+                 role: str = "") -> dict:
+    """Wrap a keyfile payload in a sealed container.
+
+    passphrase=b"" means kdf="none": the payload is stored as plain JSON and
+    the file SAYS so. That is not an oversight, it is the only honest way to
+    represent a file that an unattended process must be able to read.
+    """
+    public, bindings = _nacl()
+    import nacl.pwhash
+    import nacl.secret
+    import nacl.utils
+    if not isinstance(payload, dict):
+        raise WakeError("keyfile payload must be an object")
+    head = {"schema": KEYFILE_SCHEMA, "version": WIRE_VERSION, "role": role}
+    if not passphrase:
+        head["kdf"] = "none"
+        head["plain"] = payload
+        return head
+    if kdf not in KDF_PROFILES:
+        raise WakeError(f"unknown KDF profile {kdf!r}")
+    ops, mem = KDF_PROFILES[kdf]
+    salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+    try:
+        key = nacl.pwhash.argon2id.kdf(nacl.secret.SecretBox.KEY_SIZE,
+                                       passphrase, salt,
+                                       opslimit=ops, memlimit=mem)
+    except Exception as e:                                   # noqa: BLE001
+        # NEVER quietly drop to a cheaper profile. A keyfile that is weaker
+        # than the operator asked for, without saying so, is the exact defect
+        # this whole file is written against.
+        raise WakeError(
+            f"could not derive the keyfile key with the {kdf!r} profile "
+            f"({type(e).__name__}: {e}). That profile needs "
+            f"{mem // 2**20} MiB of RAM. Free some, or pair with "
+            f"--kdf interactive, which uses "
+            f"{KDF_PROFILES['interactive'][1] // 2**20} MiB and is recorded in "
+            f"the file so you can always see which one you chose.") from e
+    box = nacl.secret.SecretBox(key)
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    sealed = bytes(box.encrypt(raw))
+    head.update({"kdf": "argon2id", "profile": kdf, "ops": ops, "mem": mem,
+                 "salt": salt.hex(), "box": sealed.hex()})
+    return head
+
+
+def keyfile_is_sealed(container: dict) -> bool:
+    return isinstance(container, dict) and container.get("kdf") == "argon2id"
+
+
+def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
+    """Return the payload, or raise WakeError. The ONLY keyfile read path."""
+    public, bindings = _nacl()
+    import nacl.pwhash
+    import nacl.secret
+    if not isinstance(container, dict):
+        raise WakeError("keyfile is not a JSON object")
+    if container.get("schema") != KEYFILE_SCHEMA:
+        raise WakeError(
+            f"keyfile is {container.get('schema')!r}, not {KEYFILE_SCHEMA}. "
+            f"The v1 format was plaintext on disk and is not read any more: "
+            f"pair the two boxes again, which generates a fresh key on each "
+            f"of them and carries no secret between machines.")
+    if container.get("version") != WIRE_VERSION:
+        raise WakeError(f"keyfile is for wire version "
+                        f"{container.get('version')!r}, not {WIRE_VERSION}")
+    kdf = container.get("kdf")
+    if kdf == "none":
+        payload = container.get("plain")
+        if not isinstance(payload, dict):
+            raise WakeError("keyfile says kdf=none but carries no payload")
+        return payload
+    if kdf != "argon2id":
+        raise WakeError(f"keyfile names an unknown KDF {kdf!r}")
+    if not passphrase:
+        raise WakeError("this keyfile is passphrase-protected and no "
+                        "passphrase was supplied")
+    ops, mem = container.get("ops"), container.get("mem")
+    # Read the parameters FROM THE FILE, never from KDF_PROFILES: a file
+    # written under one profile must always be derived under that one, or
+    # changing the table's defaults would silently brick every existing file.
+    # Bound them anyway -- these numbers come off a disk an attacker may have
+    # written to, and memlimit is an allocation.
+    # isinstance(True, int) is True, so `"ops": true` would sail through an
+    # isinstance check and be used as ops=1 -- below the floor of BOTH profiles,
+    # silently. _int_range in the job schema already refuses bools for exactly
+    # this reason; a second place in the same file that does not is the kind of
+    # inconsistency that gets copied rather than noticed.
+    if isinstance(ops, bool) or not isinstance(ops, int) or not 1 <= ops <= 16:
+        raise WakeError("keyfile carries an out-of-range Argon2 opslimit")
+    if (isinstance(mem, bool) or not isinstance(mem, int)
+            or not 2**23 <= mem <= 2**30):
+        # 8 MiB .. 1 GiB. Below the floor is a weakened file; above the ceiling
+        # is a keyfile that OOM-kills the doorbell when it is read, which is a
+        # denial of service written into a file.
+        raise WakeError("keyfile carries an out-of-range Argon2 memlimit")
+    try:
+        salt = bytes.fromhex(container["salt"])
+        sealed = bytes.fromhex(container["box"])
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError("keyfile salt or body is not hex") from e
+    if len(salt) != nacl.pwhash.argon2id.SALTBYTES:
+        raise WakeError("keyfile salt is the wrong length")
+    try:
+        key = nacl.pwhash.argon2id.kdf(nacl.secret.SecretBox.KEY_SIZE,
+                                       passphrase, salt,
+                                       opslimit=ops, memlimit=mem)
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError(f"could not derive the keyfile key "
+                        f"({type(e).__name__}). This profile needs "
+                        f"{mem // 2**20} MiB of RAM.") from e
+    try:
+        raw = nacl.secret.SecretBox(key).decrypt(sealed)
+    except Exception as e:                                   # noqa: BLE001
+        # ONE MESSAGE for a wrong passphrase and for a tampered file. They are
+        # not distinguishable here -- Poly1305 fails the same way for both --
+        # and pretending to tell them apart would be inventing a fact.
+        raise WakeError(
+            "the keyfile did not open: the passphrase is wrong, or the file "
+            "has been altered. There is no way to tell which from here.") from e
+    payload = parse_body(raw)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+#  FIRST-START PAIRING. EACH BOX MAKES ITS OWN KEY; ONLY PUBLIC KEYS MOVE.
+# ---------------------------------------------------------------------------
+# WHAT THIS REPLACES. v1 minted BOTH keypairs on the ThinkPad and told the
+# operator to carry the Pi's SECRET across on a USB stick and then remember to
+# shred it. Three copies of a secret existed at once -- the ThinkPad's disk,
+# the stick, the Pi -- and two of them were the operator's job to destroy. The
+# instruction was correct and nobody follows instructions at 2am.
+#
+# Now each box generates its own keypair, in place, and the only thing that
+# crosses the LAN is a PUBLIC key. There is no step at which a secret exists
+# anywhere except on the machine that will use it, so there is no step for the
+# operator to get wrong.
+#
+# THE MAN IN THE MIDDLE, HANDLED HONESTLY. Two boxes that have never met cannot
+# tell each other apart from an attacker on the same switch: whoever answers
+# first is who you paired with. Nothing in software fixes that. What software
+# CAN do is make the attack visible, and that is what the code below does --
+# both boxes derive one short string from both public keys and show it, and a
+# human compares them. An attacker in the middle held two different pairings,
+# so the two strings differ and the operator sees it.
+#
+# That check is the entire security of this exchange. If the operator does not
+# actually look at both screens, this is unauthenticated key agreement and the
+# code says so where they will read it.
+#
+# See pair_sas for why the commitment step is what lets the string be short.
+
+PAIR_PROTO = 2
+PAIR_MAX_LINE = 8192
+#: The ceremony runs once, with a human at both ends. Generous, but bounded:
+#: a pairing socket that waits forever is a socket someone can leave open.
+PAIR_TIMEOUT_S = 300
+#: How long a peer gets to send one MACHINE message. A real peer sends
+#: immediately; this bound exists because the reads below are byte-at-a-time
+#: and a socket timeout is PER READ, not for the message. Without it a peer
+#: that sends one byte every 299 seconds holds the ceremony open for the better
+#: part of a month while every individual recv() comes in comfortably inside
+#: its timeout. Slowloris, on a socket a human is standing in front of.
+PAIR_MSG_S = 30
+
+
+def _pair_send(sock, obj: dict) -> None:
+    """Send one line. A dead peer becomes a WakeError, never a BrokenPipeError.
+
+    AND IT TRIES TO FIND OUT WHY FIRST. Driven over a real socket: when the
+    vault refused a bad commitment it sent its abort and closed, and the Pi --
+    already past its own reveal -- hit the closed socket on the NEXT send and
+    reported "[Errno 32] Broken pipe". The operator standing at the Pi was
+    shown a plumbing error for a detected attack. A socket closed by the peer
+    still delivers whatever it sent before the FIN, so on a failed send this
+    reads once more and surfaces the abort that is sitting there.
+    """
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    if len(raw) > PAIR_MAX_LINE:
+        raise WakeError("pairing message is too long to send")
+    try:
+        sock.sendall(raw)
+    except OSError as e:
+        try:
+            _pair_step(sock, "__none__")          # raises on an abort
+        except WakeError:
+            raise
+        except Exception:                                    # noqa: BLE001
+            pass
+        raise WakeError(
+            "the other box closed the connection mid-pairing and did not say "
+            "why. Nothing was written here.") from e
+
+
+def _pair_recv(sock, budget_s: float = PAIR_MSG_S) -> dict:
+    """One newline-delimited JSON object, under a hard cap and a hard deadline.
+
+    Read byte-at-a-time up to the cap rather than buffering: this runs exactly
+    three times per pairing, so the cost does not matter, and it means a peer
+    cannot make this allocate by sending a long line.
+
+    THE DEADLINE IS FOR THE WHOLE MESSAGE, not for each read. A socket timeout
+    bounds one recv(); with reads this small a peer that dribbles one byte per
+    timeout-minus-a-second holds the socket for as long as it likes and every
+    single read looks healthy. Bounded here instead.
+
+    budget_s is short for the machine steps and long for the one a human is
+    deciding -- the confirm exchange happens while somebody compares two
+    screens, and hurrying that is how they stop comparing.
+    """
+    deadline = time.monotonic() + budget_s
+    buf = bytearray()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise WakeError(
+                f"the other box did not finish sending within {int(budget_s)} "
+                f"s. Nothing was written here.")
+        try:
+            sock.settimeout(min(left, 5.0))
+            b = sock.recv(1)
+        except OSError as e:
+            # WHICH IT WAS MATTERS. A read that timed out because the whole
+            # message ran out of time is a peer dribbling bytes; a read that
+            # failed for another reason is a broken connection. Saying
+            # "connection failed" for the first sends the operator to check a
+            # cable that is fine.
+            if time.monotonic() >= deadline:
+                raise WakeError(
+                    f"the other box did not finish sending within "
+                    f"{int(budget_s)} s. Nothing was written here.") from e
+            raise WakeError(f"the pairing connection failed while reading "
+                            f"({type(e).__name__}). Nothing was written "
+                            f"here.") from e
+        if not b:
+            raise WakeError("the other box closed the connection mid-pairing")
+        if b == b"\n":
+            break
+        buf += b
+        if len(buf) > PAIR_MAX_LINE:
+            raise WakeError("pairing message exceeded the size limit")
+    return parse_body(bytes(buf))
+
+
+#: WHY THE OTHER BOX GAVE UP, AS A CODE FROM A CLOSED SET. The peer's reason
+#: is attacker-controlled text and must never be printed; a code is looked up
+#: in THIS table and this box's own words are shown. Without any abort message
+#: at all the operator standing at the other screen sees only "closed the
+#: connection" and has to guess -- which is how a person decides to just try
+#: again on a network that has something on it.
+PAIR_ABORT = {
+    "declined": "the other box's operator answered no to the code comparison.",
+    "commitment": "the other box says the key it received did not match what "
+                  "was committed to. Something on the network is trying to "
+                  "make the two codes agree.",
+    "protocol": "the other box did not understand this pairing protocol. Are "
+                "both boxes running the same version of this repository?",
+    "self_key": "the other box says it was offered its own public key back.",
+    "info": "the other box refused the address or MAC this one sent.",
+}
+
+
+def _pair_abort(sock, code: str) -> None:
+    """Best effort. A peer that has already gone is not an error here."""
+    try:
+        _pair_send(sock, {"t": "abort", "v": PAIR_PROTO, "code": code})
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _pair_step(sock, expect: str, budget_s: float = PAIR_MSG_S) -> dict:
+    """Receive one message, turning a peer abort into a local explanation."""
+    body = _pair_recv(sock, budget_s)
+    if body.get("t") == "abort":
+        code = body.get("code")
+        why = PAIR_ABORT.get(code if isinstance(code, str) else "",
+                             "the other box gave up without saying why.")
+        exc = PairAborted if code == "declined" else WakeError
+        raise exc(f"pairing abandoned: {why} Nothing was written here.")
+    if body.get("t") != expect or body.get("v") != PAIR_PROTO:
+        raise WakeError("the other box is not speaking this pairing protocol")
+    return body
+
+
+def _pair_pub(body: dict) -> bytes:
+    return _hexfield(body, "pub", 32)
+
+
+def _pair_info(body: dict) -> dict:
+    """The peer's non-secret configuration, shape-checked.
+
+    EVERY VALUE HERE COMES OFF THE LAN and is written into a keyfile that then
+    composes a command line and a UDP packet, so each one is validated against
+    what it will be used for. An unvalidated 'host' here becomes the URL the
+    vault fetches from for as long as the pairing lasts.
+    """
+    info = body.get("info")
+    if not isinstance(info, dict):
+        raise WakeError("pairing message carries no info object")
+    out = {}
+    for k, v in sorted(info.items()):
+        if k not in ("host", "port", "mac", "broadcast"):
+            raise WakeError("pairing info carries an unexpected field")
+        if k == "port":
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65535:
+                raise WakeError("pairing info carries a bad port")
+        elif k == "mac":
+            if not isinstance(v, str) or not re.match(
+                    r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", v):
+                raise WakeError("pairing info carries a bad MAC")
+        else:
+            # Dotted-quad only. It is pasted into a URL and into sendto(), and
+            # a hostname here would mean a DNS lookup on a box whose whole
+            # point is that it does not make unexpected lookups.
+            if not isinstance(v, str) or not re.match(
+                    r"^(\d{1,3}\.){3}\d{1,3}$", v) or any(
+                    int(p) > 255 for p in v.split(".")):
+                raise WakeError("pairing info carries a bad IPv4 address")
+        out[k] = v
+    return out
+
+
+def _pair_finish(sock, my_pub: bytes, peer_pub: bytes, peer_info: dict,
+                 ask, out) -> dict:
+    """Show the code, ask the human, exchange answers, and only then agree.
+
+    BOTH SIDES MUST SAY YES. Each box sends its own answer and reads the
+    other's, and writes nothing unless both are yes -- so answering 'n' on
+    either screen aborts the pairing on BOTH boxes rather than leaving one of
+    them holding a keyfile for a peer that never wrote one.
+    """
+    sas = pair_sas(my_pub, peer_pub)
+    mine = bool(ask(sas))
+    if not mine:
+        _pair_abort(sock, "declined")
+        raise PairAborted(
+            "pairing abandoned: you did not confirm the code. NOTHING was "
+            "written on either box. If the two codes really differed, "
+            "something on your network answered instead of the box you meant "
+            "-- unplug the switch from anything you do not own and try again.")
+    _pair_send(sock, {"t": "confirm", "v": PAIR_PROTO, "ok": True})
+    # THE LONG ONE. Somebody is reading two screens; the other box does not
+    # answer until they have. Every other step gets PAIR_MSG_S.
+    ans = _pair_step(sock, "confirm", PAIR_TIMEOUT_S)
+    theirs = ans.get("ok")
+    if theirs is not True and theirs is not False:
+        raise WakeError("the other box sent an answer that is not yes or no")
+    if not theirs:
+        raise PairAborted(
+            "pairing abandoned: the other box's operator did not confirm the "
+            "code. NOTHING was written on either box. If the two codes really "
+            "differed, something on your network answered instead of the box "
+            "you meant -- unplug the switch from anything you do not own and "
+            "try again.")
+    out("  [+] Codes matched on both boxes. Writing the keyfiles.")
+    return {"peer_public": peer_pub.hex(), "peer_info": peer_info, "sas": sas}
+
+
+def pair_initiator(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
+    """The side that connects (the Pi). COMMITS FIRST -- see pair_sas."""
+    # No blanket settimeout here: _pair_recv sets its own per-read timeout
+    # under a per-message deadline. A blanket one here silently overrode the
+    # shorter greeting timeout the caller had just set, which is how a
+    # deliberate 30-second bound became a 300-second one.
+    sock.settimeout(PAIR_MSG_S)
+    _pair_send(sock, {"t": "commit", "v": PAIR_PROTO,
+                      "c": pair_commitment(my_pub).hex()})
+    body = _pair_step(sock, "reveal")
+    try:
+        peer_pub = _pair_pub(body)
+        peer_info = _pair_info(body)
+    except WakeError:
+        _pair_abort(sock, "info")
+        raise
+    if peer_pub == my_pub:
+        # Both boxes drew the same key: either the same box is talking to
+        # itself, or something is reflecting the exchange.
+        _pair_abort(sock, "self_key")
+        raise WakeError("the other box offered THIS box's own public key")
+    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex(),
+                      "info": my_info})
+    return _pair_finish(sock, my_pub, peer_pub, peer_info, ask, out)
+
+
+def pair_responder(sock, my_pub: bytes, my_info: dict, ask, out) -> dict:
+    """The side that listens (the vault). Reveals only after the commitment."""
+    sock.settimeout(PAIR_MSG_S)
+    body = _pair_step(sock, "commit")
+    commitment = _hexfield(body, "c", 32)
+    _pair_send(sock, {"t": "reveal", "v": PAIR_PROTO, "pub": my_pub.hex(),
+                      "info": my_info})
+    body = _pair_step(sock, "reveal")
+    try:
+        peer_pub = _pair_pub(body)
+        peer_info = _pair_info(body)
+    except WakeError:
+        _pair_abort(sock, "info")
+        raise
+    if peer_pub == my_pub:
+        _pair_abort(sock, "self_key")
+        raise WakeError("the other box offered THIS box's own public key")
+    # THE CHECK THE SHORT CODE DEPENDS ON. Without it the initiator could pick
+    # its key after seeing this one, grind a few million candidates and match
+    # any 40-bit code it liked -- and the operator would compare two identical
+    # strings while an attacker sat between them.
+    if not hmac.compare_digest(pair_commitment(peer_pub), commitment):
+        _pair_abort(sock, "commitment")
+        raise WakeError(
+            "the other box revealed a key that does not match what it "
+            "committed to. That is what an attempt to fix the comparison code "
+            "looks like. Refusing, and nothing was written.")
+    return _pair_finish(sock, my_pub, peer_pub, peer_info, ask, out)
 
 
 # ---------------------------------------------------------------------------

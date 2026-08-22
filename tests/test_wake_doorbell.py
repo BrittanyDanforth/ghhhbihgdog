@@ -67,11 +67,19 @@ import nacl.public as NP                                     # noqa: E402
 
 TP = NP.PrivateKey.generate()
 PI = NP.PrivateKey.generate()
-KEY = {"schema": "gs_wake_v1", "version": 1, "role": "pi",
+#: The PAYLOAD. What lands on the SD card is the sealed container around it;
+#: Pending() and run_wake() are handed the payload, because that is what
+#: load_key returns after it opens the file.
+KEY = {"role": "pi",
        "secret": PI.encode().hex(), "peer_public": TP.public_key.encode().hex(),
        "listen_host": "127.0.0.1", "listen_port": 0,
        "target_mac": "aa:bb:cc:dd:ee:ff", "wol_broadcast": "255.255.255.255",
        "wol_port": 9}
+#: Cheap on purpose: this suite opens keyfiles many times and 'moderate' would
+#: add minutes. The PROFILE is what is being varied, not the container, and the
+#: container is identical either way.
+PW = b"pairing test passphrase"
+KDF = "interactive"
 
 
 class Bell:
@@ -156,27 +164,63 @@ print("\n== the keyfile ==")
 _d = Path(tempfile.mkdtemp())
 
 
-def _keyfile(obj, mode=0o400, name="k.key"):
+def _keyfile(obj, mode=0o400, name="k.key", seal=True, mangle=None):
+    """Write a REAL container around a payload. Never a hand-built shape."""
+    c = (P.lock_keyfile(obj, PW, kdf=KDF, role=obj.get("role", "pi"))
+         if seal else P.lock_keyfile(obj, b"", role=obj.get("role", "pi")))
+    if mangle:
+        c = mangle(dict(c))
     p = _d / name
-    p.write_text(json.dumps(obj))
+    p.write_text(json.dumps(c))
     os.chmod(p, mode)
     return p
 
 
-for obj, mode, why in (
-        ({**KEY, "role": "thinkpad"}, 0o400,
+def _bad(**over):
+    def f(c):
+        c.update(over)
+        return c
+    return f
+
+
+for kw, why in (
+        (dict(obj={**KEY, "role": "thinkpad"}),
          "the VAULT's keyfile (it holds the vault's secret)"),
-        (KEY, 0o644, "a world-readable keyfile"),
-        ({**KEY, "schema": "nope"}, 0o400, "a foreign schema"),
-        ({**KEY, "version": 99}, 0o400, "a future wire version"),
-        ({**KEY, "target_mac": "nope"}, 0o400, "an unusable MAC")):
-    p = _keyfile(obj, mode, name=f"k{abs(hash(why)) % 9999}.key")
+        (dict(obj=KEY, mode=0o644), "a world-readable keyfile"),
+        (dict(obj=KEY, mangle=_bad(schema="nope")), "a foreign schema"),
+        (dict(obj=KEY, mangle=_bad(version=99)), "a future wire version"),
+        (dict(obj={**KEY, "target_mac": "nope"}), "an unusable MAC"),
+        (dict(obj=KEY, seal=False),
+         "an UNSEALED Pi keyfile — the SD card is the one that leaves the "
+         "building, and 0400 means nothing to someone reading the card"),
+        (dict(obj=KEY, mangle=_bad(ops=99)),
+         "an out-of-range Argon2 opslimit off a disk an attacker may have "
+         "written to"),
+        (dict(obj=KEY, mangle=_bad(mem=2**40)),
+         "an Argon2 memlimit that would OOM the doorbell when the file is "
+         "read — a denial of service written into a keyfile")):
+    kw.setdefault("mode", 0o400)
+    p = _keyfile(name=f"k{abs(hash(why)) % 9999}.key", **kw)
     try:
-        DB.load_key(p)
+        DB.load_key(p, PW)
         check(f"refuses {why}", False)
     except DB.Doorbell:
         check(f"refuses {why}", True)
-check("accepts its own keyfile", DB.load_key(_keyfile(KEY, name="ok.key")))
+check("accepts its own keyfile", DB.load_key(_keyfile(KEY, name="ok.key"), PW))
+try:
+    DB.load_key(_keyfile(KEY, name="wrongpw.key"), b"not the passphrase")
+    check("refuses a wrong passphrase", False)
+except DB.Doorbell as e:
+    check("refuses a wrong passphrase", "did not open" in str(e))
+_sealed = json.loads((_d / "ok.key").read_text())
+check("...and NOTHING sensitive is outside the sealed box: not the secret, "
+      "not the vault's MAC, not the LAN address",
+      all(v not in json.dumps(_sealed) for v in
+          (KEY["secret"], KEY["target_mac"], KEY["peer_public"])))
+check("...while the KDF parameters ARE outside, because they are not secrets "
+      "and the file has to be openable without guessing them",
+      _sealed["kdf"] == "argon2id" and isinstance(_sealed["ops"], int)
+      and isinstance(_sealed["mem"], int) and len(_sealed["salt"]) == 32)
 
 
 print("\n== the job comes in on stdin, never on argv ==")
