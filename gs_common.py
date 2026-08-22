@@ -255,8 +255,27 @@ _CHAIN_DIGITS_RE = re.compile(r"\d+")
 #:
 #: Stripping the digits out leaves 14 of them, which is still unique. The whole
 #: fragment goes.
+#: ALPHANUMERIC, NOT BASE58. This rule recognises what scrub_address
+#: PRODUCES, and scrub_address is applied to BTC addresses too -- but base58
+#: excludes 0, O, I and l, and bech32's alphabet contains 0 and l, so a
+#: fragment with either in one half fell through to the digit rule:
+#:
+#:     scrub_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+#:       -> bc1qar0s...zzwf5mdq
+#:     chain_safe("entry=bc1qar0s...zzwf5mdq")
+#:       -> entry=bc#qar#s...zzwf#mdq        <- 13 of 16 characters, in order
+#:
+#: which is the exact output this file quotes as the BUG in the bare-bech32
+#: case. Measured over 2000 random bc1q addresses, 792 (39.6%) escaped, so
+#: coverage was address-dependent rather than rule-based. The '...' between two
+#: runs is what makes this form recognisable; the alphabet never was.
+#:
+#: Widening costs nothing that was not already paid: 'waiting...done' collapsed
+#: to <addr> under the base58 class too ('w','a','i','t','d','o','n','e' are
+#: all base58). The literal '...' is the discriminator, and a chain payload is
+#: a fixed event vocabulary, not prose.
 _CHAIN_ADDR_RE = re.compile(
-    r"[1-9A-HJ-NP-Za-km-z]{4,}\.\.\.[1-9A-HJ-NP-Za-km-z]{4,}")
+    r"[0-9A-Za-z]{4,}\.\.\.[0-9A-Za-z]{4,}")
 
 #: A bare run of base58, for the addresses that arrive WITHOUT the scrub form.
 #:
@@ -379,8 +398,31 @@ def _b58_run_is_addressy(run: str) -> bool:
 
 #: Any of the usual separators, upper or lower case. Anchored on non-hex
 #: boundaries so an ordinary hex string is not mistaken for one.
+#: FOUR NOTATIONS, NOT ONE. The colon/hyphen form was the only one covered,
+#: and measured on the shipped function the other three walked straight
+#: through -- two of them with no digits in them at all, so the digit rule
+#: never fired either:
+#:
+#:     mac=dead.beef.cafe    ->  mac=dead.beef.cafe   (Cisco, untouched)
+#:     mac=deadbeefcafe      ->  mac=deadbeefcafe     (bare, untouched)
+#:     0xde:ad:be:ef:ca:fe   ->  #xde:ad:be:ef:ca:fe  (MAC intact)
+#:     01:de:ad:be:ef:ca:fe  ->  <mac>:fe             (7 octets, one survives)
+#:
+#: paranoia_mode's own rand_mac() emits the colon form, so none of these is a
+#: live leak today -- but this redactor is documented as the backstop for a
+#: call site "added later", and `ip link` output, a Windows-style string or a
+#: Cisco-style one is exactly how such a value would arrive. A backstop that
+#: only catches the notation the current caller happens to use is not one.
+#:
+#: {5,} rather than {5} so a longer run is eaten whole instead of leaving its
+#: tail behind; the optional 0x covers the prefixed form the lookbehind would
+#: otherwise refuse to start on.
 _CHAIN_MAC_RE = re.compile(
-    r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z])")
+    r"(?<![0-9A-Za-z])(?:0[xX])?(?:"
+    r"(?:[0-9A-Fa-f]{2}[:-]){5,}[0-9A-Fa-f]{2}"
+    r"|(?:[0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}"
+    r"|[0-9A-Fa-f]{12}"
+    r")(?![0-9A-Za-z])")
 #: bech32 / bech32m, mainnet and testnet, segwit v0 and v1. The data part is
 #: the bech32 charset (no 1, b, i or o), 6+ characters, and in practice 25-87.
 _CHAIN_BECH32_RE = re.compile(
@@ -388,7 +430,7 @@ _CHAIN_BECH32_RE = re.compile(
     re.I)
 
 
-def chain_safe(msg: str) -> str:
+def chain_safe(msg: str, keep_digits: bool = False) -> str:
     """Strip every number out of a chain payload, keeping the event.
 
     `withdrawn:4/1` becomes `withdrawn:#/#`; `fanout_plan:1_tx:9_dests` becomes
@@ -501,9 +543,43 @@ def chain_safe(msg: str) -> str:
         out = _CHAIN_B58_RUN_RE.sub(
             lambda m: "<addr>" if _b58_run_is_addressy(m.group(0)) else m.group(0),
             out)
-        return _CHAIN_DIGITS_RE.sub("#", out)
+        # keep_digits is for TERMINAL lines, never for the chain. See
+        # terminal_safe: on a line the operator is reading right now, the
+        # numbers ARE the diagnosis, and the docstring's justification for
+        # stripping them ("every quantity worth having is already printed to
+        # the terminal at the moment it is computed") is false when this IS
+        # that terminal line. integrity_log never passes it.
+        return out if keep_digits else _CHAIN_DIGITS_RE.sub("#", out)
     except Exception:                                        # noqa: BLE001
         return "REDACTED"
+
+
+def terminal_safe(msg: str) -> str:
+    """Redact identifiers but KEEP the numbers, for operator-facing failures.
+
+    chain_safe strips every digit, which is right for a durable chain payload
+    and wrong for a line printed once to a terminal that the operator is
+    reading to find out what went wrong. Measured on real messages:
+
+        Method 'transfer' failed with RPC Error of code -37, message: not
+        enough money
+          chain_safe   -> ...RPC Error of code -#...
+          terminal_safe-> ...RPC Error of code -37...
+
+        HTTPConnectionPool(host='127.0.0.1', port=18083): Max retries exceeded
+          chain_safe   -> HTTPConnectionPool(host='#.#.#.#', port=#): ...
+          terminal_safe-> HTTPConnectionPool(host='127.0.0.1', port=18083): ...
+
+    The monero-wallet-rpc error CODE is the primary diagnostic (-37 not enough
+    money, -16 tx too big, -4 bad address, -9 daemon busy); collapsed to `-#`
+    they are all the same message. With --rpc and --rpc-alt configured, the
+    port is how the operator tells which endpoint refused.
+
+    Addresses, MACs, bech32 and paths are still removed -- everything
+    chain_safe removes EXCEPT the digit rule -- so this is not a way to print
+    a destination. It is not for anything that reaches disk.
+    """
+    return chain_safe(msg, keep_digits=True)
 
 
 def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
@@ -560,14 +636,32 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             except IndexError:                               # pragma: no cover
                 break
         h = None
-        for _stage, _msg in pending + [(stage, msg)]:
-            # REDACTED HERE, at the one place every tool passes through, so a
-            # call site added later cannot reintroduce the leak by being
-            # written the obvious way. See chain_safe.
-            line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg)}"
-            h = hashlib.sha256((prev + line).encode()).hexdigest()
-            _append_chain_line(log_path, h, line)
-            prev = h
+        # POPPED IS NOT WRITTEN. The drain above took the deferred entries out
+        # of the global; if a write below raises (ENOSPC, EROFS, the artifact
+        # dir pulled out from under us) they are gone from memory AND absent
+        # from disk, and one failed write drops EVERY queued signal line rather
+        # than just the current one. Count what actually landed and put the
+        # remainder back, so the next call retries it. The disclosed loss
+        # window is "the process exits with no further call"; this keeps "a
+        # later call is made and fails" from silently becoming a second one.
+        _written = 0
+        try:
+            for _stage, _msg in pending + [(stage, msg)]:
+                # REDACTED HERE, at the one place every tool passes through, so
+                # a call site added later cannot reintroduce the leak by being
+                # written the obvious way. See chain_safe.
+                line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg)}"
+                h = hashlib.sha256((prev + line).encode()).hexdigest()
+                _append_chain_line(log_path, h, line)
+                prev = h
+                _written += 1
+        except BaseException:
+            # pending[_written:] is what was drained and never written. The
+            # caller's own (stage, msg) is the LAST element and is not a
+            # deferred entry, so a failure on it restores nothing.
+            if _written < len(pending):
+                _PENDING_CHAIN[:0] = pending[_written:]
+            raise
     finally:
         if lock_fd is not None:
             try:

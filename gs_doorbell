@@ -297,9 +297,27 @@ class Pending:
         body = proto.open_record(pi_sk, tp_pk, record, proto.TAG_M1)
         eph = proto.eph_pk_of(body)
         chal = proto.challenge_of(body)
+        # A MISSING window FIELD IS AN OLD BUILD, NOT A STRANGER.
+        #
+        # window_of raises WakeError when the field is absent, and that raise
+        # used to happen BEFORE any events.append, so do_POST answered 204 with
+        # nothing recorded and the agent printed its no-job line: "that is what
+        # a magic packet from anyone on the switch looks like". A half-upgraded
+        # pair therefore booted the vault, powered it off, and sent the
+        # operator hunting for an intruder on their own LAN. The per-window
+        # nonce was added without bumping PAIR_PROTO, so this is OUR wire
+        # break, and it has to name itself.
+        try:
+            _window = proto.window_of(body)
+        except proto.WakeError:
+            self.events.append("m1_no_window_field")
+            raise Doorbell(
+                "that note has no wake window in it, which means the box that "
+                "sent it is running a build older than the per-window nonce "
+                "-- update BOTH boxes and pair again")
         # compare_digest, and BEFORE the cache: a record for another window is
         # not a retry of anything, it is a record from another window.
-        if not hmac.compare_digest(proto.window_of(body), self.window):
+        if not hmac.compare_digest(_window, self.window):
             self.events.append("m1_stale_window")
             raise Doorbell("that note was written for a different wake window")
         cached = self._issued.get((eph, chal))
@@ -388,6 +406,36 @@ def make_handler(pending: Pending):
 
         def version_string(self):
             return ""
+
+        def send_error(self, code, message=None, explain=None):
+            """The SAME minimal reply as _reply, for the paths we do not own.
+
+            _reply covers the four responses this handler writes itself, but
+            anything BaseHTTPRequestHandler rejects before dispatch -- an
+            unsupported method, a too-long request line, a bad HTTP version --
+            goes through send_error -> send_response, which emits Server: AND
+            Date: anyway. Measured against the running handler:
+
+                PUT /wake HTTP/1.1  -> 501, Server: , Date: Sat, 22 Aug 2026 ...
+                GET /<70000 a's>    -> 414, Server: , Date: Sat, 22 Aug 2026 ...
+
+            So the wall clock the comment in _reply says was closed was still
+            one malformed request away. Two smaller costs went with it: the
+            stock HTML error page ('<title>Error response</title>',
+            'Bad request syntax or unsupported method') fingerprints
+            http.server as well as the banner did, and an EMPTY 'Server: ' is
+            more distinctive than the stock one -- it marks the box as
+            deliberately stripped. send_response_only emits neither header at
+            all, and no body, which is what a box holding nothing should say.
+            """
+            try:
+                self.send_response_only(code, message)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+            except Exception:                                # noqa: BLE001
+                pass
+            self.close_connection = True
 
         def log_message(self, fmt, *a):                      # noqa: A003
             # SILENT, deliberately. The default writes every request to stderr,

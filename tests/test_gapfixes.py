@@ -701,6 +701,53 @@ def test_summary_lists_outstanding_operator_actions():
           and "SCRUBBED.append(key)" in src)
 
 
+def test_dry_run_that_errored_says_so_instead_of_exiting_1_in_silence():
+    """A preview that failed printed a SUCCESS line and exited 1 with no reason.
+
+    `if bad: sys.exit(1)` at the end of main() was lifted out of the `else:`
+    arm along with the wallet caveat, but it is not guarded by dry_run -- and
+    the failure DETAIL (`- name: N failure(s)`) stayed inside that `else:`,
+    which a dry run never reaches. So any phase that errors while only looking
+    (an unreadable --search-dir, an unreadable $HOME, an OSError in any of the
+    thirteen run_phase calls) produced:
+
+        [+] paranoia_mode DRY RUN complete -- nothing was changed.
+        exit 1
+
+    A wrapper or CI gate on `paranoia_mode --dry-run` flips to red with nothing
+    on screen explaining why. The exit code is right -- a preview that could
+    not read what it is previewing has not previewed it -- the silence was not.
+    """
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "paranoia_mode"), "--dry-run",
+         "--iface", "lo", "--search-dir", "/proc/1/root"],
+        capture_output=True, text=True, timeout=300)
+    out = r.stdout + r.stderr
+    check("a dry run that errored still exits non-zero", r.returncode != 0)
+    check("...and NAMES the phase that failed, rather than exiting in silence",
+          "GhostSpiral artifacts" in out and "failure(s)" in out)
+    # AND, not OR. With `or`, a mutation that removed the "PREVIEW ITSELF"
+    # line still passed on the word INCOMPLETE in the NEXT print, and the
+    # sweep reported SURVIVED. Both halves of the sentence are the point.
+    check("...and says the preview itself is incomplete, so the operator does "
+          "not read the list above as the whole story",
+          "PREVIEW ITSELF" in out and "INCOMPLETE" in out)
+    check("...while still making clear nothing was changed",
+          "nothing was changed" in out)
+
+
+def test_a_clean_dry_run_is_still_quiet_and_zero():
+    """NON-VACUITY for the check above: the new branch must not always fire."""
+    d = tempfile.mkdtemp(prefix="paraok_")
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "paranoia_mode"), "--dry-run",
+         "--iface", "lo", "--search-dir", d],
+        capture_output=True, text=True, timeout=300)
+    out = r.stdout + r.stderr
+    check("a dry run with a readable search dir does not claim the preview "
+          "failed", "PREVIEW ITSELF" not in out)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

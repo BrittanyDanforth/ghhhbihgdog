@@ -1380,6 +1380,116 @@ check("...and still says what they DO hold",
       "mix graph" in _rep and "account index" in _rep)
 
 
+# ===========================================================================
+# A scrub_address FRAGMENT OF A BECH32 ADDRESS ESCAPED THE FRAGMENT RULE.
+#
+# _CHAIN_ADDR_RE recognises what scrub_address PRODUCES, and scrub_address is
+# applied to BTC addresses too -- but its class was base58, which excludes
+# 0, O, I and l, and bech32's alphabet contains 0 and l. Measured before:
+#
+#   scrub_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+#     -> bc1qar0s...zzwf5mdq
+#   chain_safe("entry=bc1qar0s...zzwf5mdq")
+#     -> entry=bc#qar#s...zzwf#mdq        <- 13 of 16 characters, in order
+#
+# which is the exact shape this file calls the bug in the bare-bech32 case.
+# 792 of 2000 random bc1q addresses escaped, so coverage was address-dependent.
+# ===========================================================================
+_BC_FRAG = gsc.scrub_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+check("bech32: the scrub fragment is redacted whole",
+      gsc.chain_safe("entry=" + _BC_FRAG) == "entry=<addr>")
+check("bech32: ...and no run of it survives in order",
+      "qar" not in gsc.chain_safe("entry=" + _BC_FRAG)
+      and "zzwf" not in gsc.chain_safe("entry=" + _BC_FRAG))
+_CH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_esc = [a for a in
+        ["bc1q" + "".join(_CH32[(i * 7 + j * 13) % 32] for j in range(38))
+         for i in range(200)]
+        if "<addr>" not in gsc.chain_safe("e=" + gsc.scrub_address(a))]
+check("bech32: NOT ONE of 200 generated addresses escapes as a fragment",
+      _esc == [])
+check("base58 fragments still redacted (no regression)",
+      gsc.chain_safe("entry=" + gsc.scrub_address(
+          "4AdUndZSTcE4t8FqYpFRTNAj" + "9kQjMdKr" * 9)) == "entry=<addr>")
+
+# ===========================================================================
+# chain_safe STRIPS EVERY DIGIT, AND ON A TERMINAL LINE THE DIGITS ARE THE
+# DIAGNOSIS. terminal_safe is the same redaction WITHOUT that last rule.
+#
+# The signer's "TX N failed" line and GhostSpiral's JoinMarket failure are the
+# lines an operator reads to find out what went wrong. chain_safe turned the
+# monero-wallet-rpc error CODE -- -37 not enough money, -16 too big, -4 bad
+# address, -9 daemon busy -- into `-#`, i.e. all the same message.
+# ===========================================================================
+_RPC = "Method 'transfer' failed with RPC Error of code -37, message: not enough money"
+check("terminal_safe keeps the RPC error code",
+      "-37" in gsc.terminal_safe(_RPC))
+check("...and chain_safe still does NOT (the chain is unchanged)",
+      "-37" not in gsc.chain_safe(_RPC) and "-#" in gsc.chain_safe(_RPC))
+check("terminal_safe keeps the port that says WHICH endpoint refused",
+      "18083" in gsc.terminal_safe(
+          "HTTPConnectionPool(host='127.0.0.1', port=18083): Max retries"))
+_LONGADDR = "4AdUndZSTcE4t8FqYpFRTNAj" + "9kQjMdKr" * 9
+check("terminal_safe STILL removes a full address",
+      _LONGADDR not in gsc.terminal_safe(f"dest {_LONGADDR} invalid")
+      and "<addr>" in gsc.terminal_safe(f"dest {_LONGADDR} invalid"))
+check("terminal_safe STILL removes a MAC",
+      "de:ad:be:ef:ca:fe" not in gsc.terminal_safe("nic de:ad:be:ef:ca:fe up"))
+check("terminal_safe STILL removes bech32",
+      "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" not in gsc.terminal_safe(
+          "e=bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"))
+check("terminal_safe STILL flattens newlines (one chain line, one entry)",
+      "\n" not in gsc.terminal_safe("two\nlines"))
+check("terminal_safe never raises",
+      gsc.terminal_safe(None) is not None)
+# NON-VACUITY: the two terminal call sites must actually use it.
+check("the signer's TX-failed line uses terminal_safe, not chain_safe",
+      "terminal_safe(str(e))" in _sg_src and "chain_safe(str(e))" not in _sg_src)
+check("GhostSpiral's JoinMarket failure uses terminal_safe",
+      "terminal_safe((e.stderr" in _gs_src)
+check("integrity_log still uses the digit-stripping form",
+      "keep_digits" not in (Path(__file__).resolve().parent.parent
+                            / "gs_common.py").read_text().split(
+          "def integrity_log(")[1][:2000])
+
+
+# ===========================================================================
+# A MAC HAS FOUR COMMON NOTATIONS AND ONLY ONE WAS COVERED.
+#
+# Measured on the shipped function before this -- note two of them contain no
+# digits at all, so the digit rule never fired on them either:
+#
+#     mac=dead.beef.cafe    ->  mac=dead.beef.cafe   (Cisco, untouched)
+#     mac=deadbeefcafe      ->  mac=deadbeefcafe     (bare, untouched)
+#     0xde:ad:be:ef:ca:fe   ->  #xde:ad:be:ef:ca:fe  (MAC intact)
+#     01:de:ad:be:ef:ca:fe  ->  <mac>:fe             (7 octets, one survives)
+#
+# rand_mac() emits the colon form, so none was a live leak -- but this
+# redactor is documented as the backstop for a call site "added later", and
+# `ip link` output or a Windows/Cisco-style string is how one would arrive.
+# ===========================================================================
+for _m, _label in [("dead.beef.cafe", "Cisco dotted-triplet"),
+                   ("deadbeefcafe", "bare, no delimiter"),
+                   ("0xde:ad:be:ef:ca:fe", "0x-prefixed"),
+                   ("de:ad:be:ef:ca:fe", "colon (the one that worked)"),
+                   ("DE-AD-BE-EF-CA-FE", "hyphen, uppercase")]:
+    _got = gsc.chain_safe("mac=" + _m)
+    check(f"chain_safe redacts a MAC in {_label} form",
+          "<mac>" in _got and _m.lower() not in _got.lower())
+check("a run LONGER than six octets is eaten whole, not left with a tail",
+      gsc.chain_safe("01:de:ad:be:ef:ca:fe") == "<mac>")
+# NON-VACUITY: the widened rule must not start eating ordinary payloads.
+check("a 64-char hex hash is NOT mistaken for a MAC",
+      "a" * 64 in gsc.chain_safe("hash=" + "a" * 64))
+check("the chain's own worked example is unchanged",
+      gsc.chain_safe("withdrawn:4/1") == "withdrawn:#/#")
+check("...and so is the account/subaddress payload",
+      gsc.chain_safe("spend_source_ok:acct=3:idx=1")
+      == "spend_source_ok:acct=#:idx=#")
+check("a clock time is still handled by the digit rule, not the MAC rule",
+      "<mac>" not in gsc.chain_safe("time 12:34:56"))
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)

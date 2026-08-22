@@ -1248,6 +1248,24 @@ def main():
     if args.dry_run:
         print("  [+] paranoia_mode DRY RUN complete — nothing was changed. "
               "Re-run without --dry-run to act.")
+        # A DRY RUN THAT ERRORED STILL HAS TO SAY SO. `if bad: sys.exit(1)` at
+        # the end of main() is not guarded by dry_run, and the failure detail
+        # below lives in the `else:` arm a dry run never reaches -- so a
+        # preview whose search dir was unreadable printed this success line and
+        # exited 1 with no reason on screen. The exit code is right (a preview
+        # that could not read what it is previewing has not previewed it); the
+        # silence was not.
+        if bad:
+            print()
+            print("  [!] ...but the PREVIEW ITSELF did not complete cleanly. "
+                  "These phases errored")
+            print("      while only looking, so the list above is INCOMPLETE — "
+                  "a real run has")
+            print("      more to do than this preview showed:")
+            for name, n in bad.items():
+                print(f"      - {name}: {n} failure(s)")
+            print(f"  [!] {total} item(s)/phase(s) did not complete. Many "
+                  f"phases need root (sudo).")
     elif not bad:
         print("  [+] paranoia_mode complete — every phase reported success.")
         print("  [i] Best-effort caveats still apply: swap-device bytes and freed")

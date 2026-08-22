@@ -956,6 +956,75 @@ check("...and the only tools it can spawn are the three in JOBS",
       == {"create_receive_wallet", "thor_swap_preparer", "receive_watch"})
 
 
+# ===========================================================================
+# SILENCING THE UNIT SILENCED THE AGENT'S OWN REASONS TOO.
+#
+# StandardOutput=null/StandardError=null had to go on the unit -- the children
+# print the ThorChain memo and systemd would journal it onto the SD card. But
+# the agent's OWN refusal reasons and every uncaught traceback went out the
+# same pipe. With OnFailure=gs-wake-poweroff.service, a vault that refuses for
+# no_keyfile / keyfile_perms / outside_wipe_roots now boots, powers itself off,
+# and leaves NOTHING saying why: only the terse code reached the chain, and
+# the journal copy that used to carry the reason is gone.
+# ===========================================================================
+_al = Path(tempfile.mkdtemp(prefix="agentlog_"))
+_saved_log = A._AGENT_LOG[0]
+try:
+    A._AGENT_LOG[0] = _al / A.JOB_LOG
+    _cap = io.StringIO()
+    with contextlib.redirect_stdout(_cap):
+        A.agent_say("  [!] Wake refused (no_keyfile): there is no keyfile")
+    _on_disk = (_al / A.JOB_LOG).read_text()
+    check("a refusal reason is written where StandardOutput=null cannot "
+          "reach it", "no_keyfile" in _on_disk)
+    check("...and still printed, for the operator running it by hand",
+          "no_keyfile" in _cap.getvalue())
+    check("...into the same 0600 file the children's output uses, so it is "
+          "wiped with the artifacts and nowhere else",
+          oct(os.stat(_al / A.JOB_LOG).st_mode)[-3:] == "600")
+    A._AGENT_LOG[0] = None
+    _cap2 = io.StringIO()
+    with contextlib.redirect_stdout(_cap2):
+        A.agent_say("before the artifact dir is known")
+    check("before the artifact dir is known it only prints -- it does not "
+          "invent a path from an untrusted keyfile",
+          "before the artifact dir" in _cap2.getvalue())
+    A._AGENT_LOG[0] = Path("/proc/nonexistent-dir-xyz") / "x.log"
+    A.agent_say("unwritable")                       # must not raise
+    check("agent_say never raises, so logging cannot become the thing that "
+          "aborts a wake", True)
+finally:
+    A._AGENT_LOG[0] = _saved_log
+
+_agent_src = open(os.path.join(REPO, "gs_wake_agent")).read()
+check("the refusal paths actually use it, or the helper is decoration",
+      "agent_say(f\"  [!] Wake refused (" in _agent_src
+      and "agent_say(f\"  [!] Wake refused: {e}\")" in _agent_src)
+check("an unhandled exception is recorded and RE-RAISED, so the finally still "
+      "powers off exactly as before",
+      "unhandled \"" in _agent_src
+      and "traceback.format_exc()" in _agent_src
+      and _agent_src.split("agent_say(traceback.format_exc())")[1][:300]
+          .count("raise") == 1)
+check("_AGENT_LOG is pointed at the artifact dir, not at a fixed path",
+      "_AGENT_LOG[0] = artifact_dir / JOB_LOG" in _agent_src)
+
+# ===========================================================================
+# ...AND THE DIVERSION SWALLOWED THE BY-HAND RUN, WHICH THE UNIT ITSELF
+# OFFERS AS THE MITIGATION: "run the agent by hand with --dry-run and you
+# still see everything on your terminal". run_child diverted unconditionally,
+# so that was false -- and JOB_LOG was printed nowhere, so an operator had no
+# way to find what they were no longer being shown.
+# ===========================================================================
+check("where the child's output went is announced, not left to be guessed",
+      "output -> {_jl}" in _agent_src)
+check("a tty means a human is watching and there is no journal in the path, "
+      "so the output is NOT diverted",
+      "sys.stdout.isatty()" in _agent_src
+      and "log_path=None if _watched else _jl" in _agent_src)
+check("...and isatty is guarded, because a closed stdout must not abort a "
+      "wake", "_watched = False" in _agent_src)
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

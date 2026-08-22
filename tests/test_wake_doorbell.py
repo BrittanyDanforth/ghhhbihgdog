@@ -619,6 +619,85 @@ check("log_message is overridden to a no-op, so every wake is not timestamped "
       "def log_message" in src and "return" in src)
 
 
+# ===========================================================================
+# THE BANNER SUPPRESSION ONLY COVERED THE PATHS THIS HANDLER WRITES ITSELF.
+#
+# _reply uses send_response_only, which emits neither Server: nor Date:. But
+# anything BaseHTTPRequestHandler rejects BEFORE dispatch -- an unsupported
+# method, an over-long request line -- goes through send_error -> send_response
+# and got both anyway, plus the stock HTML error page that fingerprints
+# http.server as well as the banner did. Measured against the running handler:
+#
+#   PUT /wake HTTP/1.1  -> 501, Server: , Date: Sat, 22 Aug 2026 05:15:38 GMT
+#
+# The Pi is the only box here with a correct clock, which is what makes it
+# worth correlating against a Tor circuit or a Bitcoin timestamp.
+# ===========================================================================
+_bb = Bell()
+try:
+    def _raw(req: bytes) -> str:
+        c = socket.create_connection(("127.0.0.1", _bb.port), 10)
+        c.sendall(req)
+        out = b""
+        try:
+            while True:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                out += chunk
+        except OSError:
+            pass
+        c.close()
+        return out.decode("latin1")
+
+    for _name, _req in [
+            ("an unsupported method", b"PUT /wake HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ("an over-long request line",
+             b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\nHost: x\r\n\r\n")]:
+        _resp = _raw(_req)
+        _head = _resp.split("\r\n\r\n")[0]
+        check(f"{_name} does not leak the Pi's wall clock",
+              "Date:" not in _head)
+        check(f"{_name} does not leak a Server banner at all",
+              "Server:" not in _head)
+        check(f"{_name} does not return the stock http.server error page",
+              "<title>" not in _resp and "Error response" not in _resp)
+finally:
+    _bb.close()
+check("the error path is overridden in the handler, not left to the default",
+      "def send_error" in open(os.path.join(REPO, "gs_doorbell")).read())
+
+# ===========================================================================
+# AN M1 WITH NO window FIELD IS AN OLD BUILD, NOT AN INTRUDER.
+#
+# window_of raises before events.append, so do_POST answered 204 with nothing
+# recorded, and the agent printed its no-job line: "that is what a magic packet
+# from anyone on the switch looks like". A half-upgraded pair therefore booted
+# the vault, powered it off, and sent the operator hunting for an intruder on
+# their own LAN. The per-window nonce went in without bumping PAIR_PROTO, so
+# this is OUR wire break and it has to name itself.
+# ===========================================================================
+_wb = Bell()
+try:
+    import nacl.public as _NPUB
+    _tp_sk = _NPUB.PrivateKey(bytes.fromhex(KEY["secret"]))
+    _pi_pk = _NPUB.PublicKey(bytes.fromhex(KEY["peer_public"]))
+    _eph = _NPUB.PrivateKey.generate()
+    # An old build's M1: every field the current one has EXCEPT window.
+    _old_m1 = P.seal(_tp_sk, _pi_pk, P.TAG_M1, {
+        "eph_pk": _eph.public_key.encode().hex(),
+        "challenge": os.urandom(P.CHALLENGE_BYTES).hex(),
+    })
+    _st, _ = _wb.post("/wake", _old_m1)
+    check("an M1 with no window field is still answered 204 (nothing leaks)",
+          _st == 204)
+    check("...but it is RECORDED as a version mismatch, not silence",
+          "m1_no_window_field" in _wb.pending.events)
+    check("...and NOT as a stranger's magic packet",
+          "m1_stale_window" not in _wb.pending.events)
+finally:
+    _wb.close()
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

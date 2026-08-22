@@ -35,7 +35,7 @@ from decimal import Decimal
 from typing import List
 
 from gs_common import (
-    chain_safe,
+    terminal_safe,
     integrity_log, integrity_log_once, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     redact_addresses, env_or_argv,
@@ -755,13 +755,20 @@ def phase_create(args, plan: List[dict], meta: dict = None):
             # goes through scrub_address; this one did not, and it is the line
             # that fires when something goes wrong, i.e. the one an operator
             # copies into a note or a screenshot.
-            # chain_safe, NOT scrub_address: scrub_address elides the middle
-            # of a string it treats as one address, so on a sentence it returns
-            # "Method t... invalid" and the diagnostic is gone. chain_safe
+            # terminal_safe, NOT scrub_address: scrub_address elides the
+            # middle of a string it treats as one address, so on a sentence it
+            # returns "Method t... invalid" and the diagnostic is gone. This
             # redacts addresses IN PROSE and leaves the words -- measured:
             #   "...destination 44AFFq5kSi... is invalid"
             #     -> "Method transfer failed: destination <addr> is invalid"
-            print(f"  [!] TX {idx} failed: {chain_safe(str(e))[:160]}")
+            #
+            # terminal_safe, NOT chain_safe: chain_safe also strips every
+            # DIGIT, and the monero-wallet-rpc error code is the whole
+            # diagnosis on this line -- -37 not enough money, -16 tx too big,
+            # -4 bad address, -9 daemon busy all print as `-#`. This line is
+            # the terminal, so chain_safe's "the number is already on the
+            # terminal" justification does not apply to it.
+            print(f"  [!] TX {idx} failed: {terminal_safe(str(e))[:160]}")
             failed += 1
 
     # ---- Output export for MULTI-ROUND cold signing -----------------------

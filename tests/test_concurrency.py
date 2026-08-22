@@ -387,6 +387,54 @@ check("the handler itself calls nothing that can block",
       and "integrity_log(\"signal\"" not in _gs)
 
 
+# ===========================================================================
+# POPPED IS NOT WRITTEN.
+#
+# The deferred-line drain took every queued entry OUT of _PENDING_CHAIN and
+# only then started writing. A write that raised (ENOSPC, EROFS, the artifact
+# directory pulled out from under the process) lost them from memory AND left
+# them absent from disk -- and it amplified: ONE failed write dropped EVERY
+# queued signal line, not just the current one. The disclosed loss window is
+# "the process exits with no further call"; this was a second, undisclosed one
+# ("a later call is made and fails") introduced by the deadlock fix itself.
+# ===========================================================================
+_pl = _run_bounded(
+    [sys.executable, "-c", r"""
+import sys, os, tempfile
+sys.path.insert(0, %r)
+os.chdir(tempfile.mkdtemp())
+import gs_common as g
+g._PENDING_CHAIN.append(("signal", "shutdown_requested_sig=2"))
+g._PENDING_CHAIN.append(("signal", "shutdown_requested_sig=15"))
+_real = g._append_chain_line
+def boom(*a, **k):
+    raise OSError(28, "No space left on device")
+g._append_chain_line = boom
+try:
+    g.integrity_log("recv", "ordinary")
+except OSError:
+    pass
+kept = len(g._PENDING_CHAIN)
+g._append_chain_line = _real
+g.integrity_log("recv", "ordinary")
+n = len(open(str(g.INTEGRITY_LOG)).read().splitlines())
+ok = g.verify_integrity_chain(g.INTEGRITY_LOG)[0]
+print("RESTORED", kept, n, ok)
+""" % REPO], 60)
+check("a FAILED chain write puts the deferred lines back rather than "
+      "dropping them",
+      _pl.stdout.strip().split()[1:2] == ["2"])
+check("...and the next successful call writes all of them, chained and "
+      "verifying",
+      _pl.stdout.strip().endswith("3 True"))
+check("one failed write does not amplify into losing every queued line",
+      "RESTORED 2" in _pl.stdout)
+check("the restore is in the source, guarded so a failure on the caller's "
+      "OWN line restores nothing",
+      "_PENDING_CHAIN[:0] = pending[_written:]" in _gs
+      and "if _written < len(pending)" in _gs)
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES); sys.exit(1)

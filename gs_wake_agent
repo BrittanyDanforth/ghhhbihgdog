@@ -58,13 +58,14 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gs_common import (                                      # noqa: E402
     ResourceCheckUnavailable, atomic_write_json, integrity_log,
-    install_signal_handlers, resource_check, wipe_covers,
+    install_signal_handlers, resource_check, terminal_safe, wipe_covers,
 )
 import gs_wake_proto as proto                                # noqa: E402
 
@@ -476,6 +477,38 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
 #: directory, so paranoia_mode wipes it with the rest of the run.
 JOB_LOG = "gs_wake_job.log"
 
+#: Filled in by run_once once the keyfile names the artifact directory.
+_AGENT_LOG: list = [None]
+
+
+def agent_say(msg: str) -> None:
+    """Print, AND append to the 0600 job log once we know where it is.
+
+    THE UNIT SILENCES stdout AND stderr, and it has to: the children print the
+    BTC deposit address and the ThorChain memo, and systemd would journal them
+    onto the SD card. But the agent's OWN refusal reasons and tracebacks went
+    out the same pipe, so silencing it took those too -- and with
+    OnFailure=gs-wake-poweroff.service, a vault that refuses for no_keyfile,
+    keyfile_perms or outside_wipe_roots now boots, powers itself off, and
+    leaves NOTHING behind saying why. Only the terse code reached the chain.
+
+    So the reason goes where the children's output already goes: the artifact
+    directory, 0600, gitignored, on paranoia_mode's wipe list. Diagnostics
+    survive exactly as long as the artifacts do, and no longer.
+
+    Never raises: a logging call must not become the thing that aborts a wake.
+    """
+    print(msg)
+    _p = _AGENT_LOG[0]
+    if _p is None:
+        return
+    try:
+        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(_fd, "a") as _fh:
+            _fh.write(msg.rstrip("\n") + "\n")
+    except Exception:                                        # noqa: BLE001
+        pass
+
 
 def run_child(argv: list, env_extra: dict, budget_s: int,
               runner=None, log_path: Path = None) -> tuple:
@@ -570,6 +603,11 @@ def run_once(args, deps: dict = None) -> tuple:
     key = load_key(Path(args.key))
     artifact_dir = Path(key.get("artifact_dir") or ".").resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    # From here on agent_say() has somewhere durable to write. Anything refused
+    # BEFORE this line (a missing or world-readable keyfile) is still terminal
+    # only -- there is no trusted directory to write to yet, and inventing one
+    # from an untrusted keyfile is how you get a log outside the wipe roots.
+    _AGENT_LOG[0] = artifact_dir / JOB_LOG
 
     preflight(key, artifact_dir, args.dry_run, probes=d)
 
@@ -888,8 +926,32 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
             handles[handle] = {"bundle": new[0], "minted": 1,
                                "slip": str(artifact_dir /
                                            f"thor_pairs_{handle}.json")}
+        # WHO IS WATCHING DECIDES WHERE THE OUTPUT GOES.
+        #
+        # The diversion exists because systemd journals whatever the children
+        # print, and thor_swap_preparer prints the ThorChain memo. That is true
+        # of the UNATTENDED path only. Diverting unconditionally also swallowed
+        # the by-hand and --dry-run runs -- so the unit's own mitigation ("run
+        # the agent by hand with --dry-run and you still see everything on your
+        # terminal") was false, and JOB_LOG was named nowhere on screen, so an
+        # operator had no way to find what they were no longer being shown.
+        #
+        # A tty means a human is present and there is no journal in the path;
+        # anything else (systemd, a pipe, a redirect) gets the 0600 file.
+        _jl = artifact_dir / JOB_LOG
+        _watched = False
+        try:
+            _watched = sys.stdout.isatty()
+        except Exception:                                    # noqa: BLE001
+            _watched = False
+        if _watched:
+            agent_say(f"  [i] Step {i + 1} output follows on this terminal "
+                      f"(no journal in the path when a human is watching).")
+        else:
+            agent_say(f"  [i] Step {i + 1} output -> {_jl} (0600, wiped with "
+                      f"the artifacts).")
         rc, hard = run_child(argv, env_extra, budget, runner=runner,
-                             log_path=artifact_dir / JOB_LOG)
+                             log_path=None if _watched else _jl)
         if rc != 0:
             if hard:
                 print(f"  [!] Step {i + 1} had to be SIGKILLed after its "
@@ -984,11 +1046,11 @@ def main(argv=None) -> int:
     try:
         try:
             code, _status, _handle = run_once(args)
-            print(f"  [+] Wake finished: {code}.")
+            agent_say(f"  [+] Wake finished: {code}.")
             return 0
         except Refused as e:
             code = e.code
-            print(f"  [!] Wake refused ({e.code}): {e.msg}")
+            agent_say(f"  [!] Wake refused ({e.code}): {e.msg}")
             integrity_log("wake", f"refused:{e.code}")
             if not e.power:
                 # The two cases where a human is demonstrably present. Disarm
@@ -999,9 +1061,24 @@ def main(argv=None) -> int:
             return 1
         except proto.WakeError as e:
             code = "bad_note"
-            print(f"  [!] Wake refused: {e}")
+            agent_say(f"  [!] Wake refused: {e}")
             integrity_log("wake", "refused:bad_note")
             return 1
+        except Exception as e:                               # noqa: BLE001
+            # NOT a catch-and-continue: it re-raises, so the finally below
+            # still powers off exactly as it did when this was unhandled. The
+            # only thing that changes is that the reason is written down --
+            # under StandardOutput=null an unhandled traceback went to a null
+            # stderr and the machine powered off silently.
+            code = "crash"
+            agent_say(f"  [!] Wake FAILED, unhandled "
+                      f"{type(e).__name__}: {terminal_safe(str(e))}")
+            agent_say(traceback.format_exc())
+            try:
+                integrity_log("wake", "crash")
+            except Exception:                                # noqa: BLE001
+                pass
+            raise
     finally:
         # EVERY path, including SystemExit from gs_common's own fail-closed
         # aborts, and including an unhandled exception.
