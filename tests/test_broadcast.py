@@ -477,6 +477,77 @@ def test_egress_gate_says_when_it_is_not_running():
           "AND ONLY THEN" in open(os.path.join(REPO, "broadcast_signed_xmr")).read())
 
 
+def test_every_retry_submit_is_gated_not_just_the_first():
+    """The gate ran ONCE per transaction, above the retry loop.
+
+    A transaction gets --rebroadcast attempts (default 5) across --timeout-min
+    minutes (default 30), and every attempt after the first re-submitted on an
+    egress sample taken before the first -- across a newnym() and a 5-15 s
+    delay, which is exactly when egress state changes. The gate's own docstring
+    calls that the "verified, then assumed" pattern it exists to close.
+    """
+    h = Harness(n=1)
+    calls = []
+    h.egress = lambda: (calls.append(1) or {"verdict": "tor", "detail": "stub"})
+    tries = []
+
+    def _resp(payload):
+        tries.append(1)
+        if len(tries) < 3:
+            return {"error": {"message": "timeout"}}      # transient -> retry
+        return {"result": {"tx_hash_list": ["a" * 64]}}
+
+    h.responder = _resp
+    code, _out = h.run(extra=("--rebroadcast", "3",
+                              "--rpc-daemon", "http://127.0.0.1:18081"))
+    check("control: the TX took three submit attempts", len(tries) == 3)
+    check("control: and it eventually relayed", code == 0)
+    check("the daemon relay-egress check runs before EVERY submit, not only "
+          f"the first (got {len(calls)} for {len(tries)} submits)",
+          len(calls) >= len(tries))
+
+
+def test_egress_degrading_between_retries_stops_the_batch():
+    """NON-VACUITY for the above: the extra checks must actually be load-bearing.
+
+    If egress goes clearnet while a transaction is being retried, the retry
+    must not go out. Before the fix nothing looked again, so it did.
+    """
+    h = Harness(n=1)
+    seq = []
+
+    def _eg():
+        seq.append(1)
+        # Call 1 is the STARTUP sample, call 2 is the gate before the first
+        # submit; both must pass or nothing is ever sent. Degrade from call 3,
+        # which is the gate in front of the RETRY -- the submit that used to go
+        # out unchecked.
+        return ({"verdict": "tor", "detail": "stub"} if len(seq) <= 2
+                else {"verdict": "clearnet", "detail": "raw-IP peer"})
+
+    h.egress = _eg
+    tries = []
+
+    def _resp(payload):
+        tries.append(1)
+        return {"error": {"message": "timeout"}}          # always transient
+
+    h.responder = _resp
+    code, out = h.run(extra=("--rebroadcast", "3",
+                             "--rpc-daemon", "http://127.0.0.1:18081"))
+    check("a batch whose egress degrades mid-retry does not keep submitting "
+          f"(submits={len(tries)}, expected exactly the first)",
+          len(tries) == 1)
+    # h.out is the CAPTURED STDOUT; `out` is the SystemExit message. The
+    # warning and the exit reason are two different strings in two different
+    # places, and the operator sees both.
+    check("...and it says so rather than failing quietly",
+          "CLEARNET" in h.out.upper())
+    check("...and the exit reason names what would have leaked",
+          "raw-IP peers" in out)
+    check("...and exits non-zero", code != 0)
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

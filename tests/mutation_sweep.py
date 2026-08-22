@@ -1092,6 +1092,41 @@ MUTATIONS = [
   "        _ours = []",
   ["test_signer_schema"]),
 
+ # `$` also matches before a trailing newline. Thirteen shipped validators
+ # anchored that way; 10 of 10 measured accepted "<good>\\n". The guard is
+ # STRUCTURAL -- it walks the source -- so reverting any single one is caught.
+ ("a validator goes back to anchoring with $ instead of \\Z", "gs_console",
+  'PATH_RE = re.compile(r"^[A-Za-z0-9._/\\-]{1,200}\\Z")',
+  'PATH_RE = re.compile(r"^[A-Za-z0-9._/\\-]{1,200}$")',
+  ["test_units"]),
+
+ # The egress gate ran once per TX, above the retry loop. Every attempt after
+ # the first re-submitted on a sample taken before the first -- across a
+ # newnym() and a 5-15 s delay, which is exactly when egress changes.
+ ("only the first submit of a TX is egress-gated", "broadcast_signed_xmr",
+  '                _egress_gate(f"broadcast_tx_{real_idx}_retry", force=False)',
+  "                pass",
+  ["test_broadcast"]),
+
+ # "Will this be wiped?" needs the NAME as well as the location. Asking
+ # wipe_covers said True for ~/gs/my_notes.json, which no pattern matches and
+ # the sweep never touches -- and that file holds every deposit address and
+ # every memo, so no warning was printed for the worst possible artifact.
+ ("the slip warning goes back to asking the location only",
+  "thor_swap_preparer",
+  "    if not wipe_will_erase(_out):",
+  "    if not wipe_covers(_out):",
+  ["test_gitignore"]),
+
+ # The memo was re-validated before the sender instructions were re-printed;
+ # the DEPOSIT ADDRESS was not. A tampered address sends the BTC where
+ # ThorChain never sees it, and the memo check cannot fire because the memo
+ # can stay honest. Same file, same argument, applied to one field only.
+ ("the BTC deposit address is handed over unchecked", "receive_watch",
+  "    _baddr = [i for i, p in enumerate(matched)",
+  "    _baddr = [] and [i for i, p in enumerate(matched)",
+  ["test_receive_watch"]),
+
  # ---- fixes that shipped in 9da2e24 with NO anchor at all --------------
  # Reverting either of these left all 33 suites green, so nothing stopped a
  # later edit from quietly undoing them.

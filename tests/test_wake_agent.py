@@ -68,6 +68,8 @@ def load(name):
 
 
 A = load("gs_wake_agent")
+# The wipe patterns live in gs_common now; paranoia_mode re-exports them.
+import gs_common as _gsc_pat
 DB = load("gs_doorbell")
 import nacl.public as NP                                     # noqa: E402
 
@@ -747,7 +749,7 @@ check("...and that log is 0600 from the moment it exists, not chmod'ed after "
       oct(os.stat(_jl / A.JOB_LOG).st_mode)[-3:] == "600")
 check("...and it is named in BOTH paranoia_mode's wipe list and .gitignore, "
       "because a diagnostic that survives the wipe is the leak again",
-      A.JOB_LOG in open(os.path.join(REPO, "paranoia_mode")).read()
+      A.JOB_LOG in _gsc_pat.GS_ARTIFACT_FILE_PATTERNS
       and A.JOB_LOG in open(os.path.join(REPO, ".gitignore")).read())
 _captured = io.StringIO()
 with contextlib.redirect_stdout(_captured):

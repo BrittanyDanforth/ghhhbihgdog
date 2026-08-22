@@ -926,6 +926,9 @@ for _bad in ({}, None):
 # ---------------------------------------------------------------------------
 _exit_src = open(os.path.join(REPO, "exit_strategy_simulator")).read()
 _par_src = open(os.path.join(REPO, "paranoia_mode")).read()
+# The wipe patterns live in gs_common now (one owner for the sweep and for
+# wipe_will_erase); paranoia_mode re-exports them under the original names.
+_para_mod = load("paranoia_mode")
 _gs_a = open(os.path.join(REPO, "GhostSpiral")).read()
 _crw_a = open(os.path.join(REPO, "create_receive_wallet")).read()
 _bc_a = open(os.path.join(REPO, "broadcast_signed_xmr")).read()
@@ -1217,9 +1220,15 @@ check("paranoia: it points at the real mitigation instead of implying none",
 check("paranoia: it still does NOT delete wallet keys (that is the money)",
       "*.keys" not in _par_src)
 # And the artifacts it DOES claim must really be covered.
+# THE LIST, not the source text. These patterns moved to gs_common so the
+# sweep and gs_common.wipe_will_erase cannot disagree about them, and a grep
+# over paranoia_mode's source stopped seeing them -- while the patterns were
+# still there and still working. Asserting on the real list is what was meant,
+# and it survives the next move too.
 for _pat in ("exitplan_*.json", "monero-wallet-rpc.log", "outputs_export.hex",
              "integrity_chain.log"):
-    check(f"paranoia: {_pat} is in the wipe patterns", _pat in _par_src)
+    check(f"paranoia: {_pat} is in the wipe patterns",
+          _pat in _para_mod.GS_ARTIFACT_FILE_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -4586,6 +4595,45 @@ check("...naming the reason: the chain is unkeyed",
       "unkeyed" in _vic.lower())
 check("...so it no longer claims a bare 'detects tampering'",
       "tamper-EVIDENCE until" in _vic or "is not tamper" in _vic.lower())
+
+
+# ===========================================================================
+# `$` IS NOT END-OF-STRING, AND THIS TOOLCHAIN HAD THIRTEEN OF THEM.
+#
+# In Python `$` also matches just before a trailing newline. Measured across
+# the shipped validators before this: 10 of 10 accepted "<good value>\n", and
+# 0 of 10 accepted a mid-string injection -- so the bounded consequence is a
+# value that passes validation carrying a newline it should not have, then
+# fails confusingly somewhere downstream (a path that will not open, a URL
+# urllib rejects with "control characters", an address that will not connect)
+# or is stored that way.
+#
+# STRUCTURAL, not a list: this walks the shipped source and fails on ANY new
+# `^...$` validator, because enumerating the thirteen would not stop a
+# fourteenth. \Z is the anchor that means what these all intend.
+# ===========================================================================
+import re as _re2
+
+_TOOLS = ["gs_common.py", "gs_wake_proto.py", "GhostSpiral", "airgap_tx_signer",
+          "broadcast_signed_xmr", "thor_swap_preparer", "receive_watch",
+          "create_receive_wallet", "gs_console", "gs_doorbell", "gs_wake_agent",
+          "gs_wake_keys", "exit_strategy_simulator"]
+_DOLLAR = _re2.compile('re[.](?:compile|match|fullmatch)[(]\\s*r?"\\^[^"]*[$]"')
+_offenders = []
+for _t in _TOOLS:
+    _fp = os.path.join(REPO, _t)
+    if not os.path.exists(_fp):
+        continue
+    for _i, _l in enumerate(open(_fp, encoding="utf-8").read().splitlines(), 1):
+        if _DOLLAR.search(_l):
+            _offenders.append(f"{_t}:{_i}")
+check("no shipped validator anchors with $ where it means \\Z "
+      f"(offenders: {_offenders[:4]})", _offenders == [])
+# NON-VACUITY: the detector must actually detect one.
+check("...and that check is not vacuous — it flags a $-anchored validator",
+      bool(_DOLLAR.search('X = re.compile(r"^[a-z]+$")')))
+check("...while leaving a correctly anchored one alone",
+      not _DOLLAR.search('X = re.compile(r"^[a-z]+\\Z")'))
 
 
 _finished()

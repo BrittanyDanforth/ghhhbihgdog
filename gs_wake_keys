@@ -279,7 +279,7 @@ def _validate(args) -> None:
         # refuses the obviously-wrong now rather than at 3am on a woken box.
         # Decimal, not float: the regex already blocks inf and 1e9, but this
         # repo has paid for a float on a money path once.
-        if not re.match(r"^\d+(\.\d+)?$", a) or Decimal(a) <= 0:
+        if not re.match(r"^\d+(\.\d+)?\Z", a) or Decimal(a) <= 0:
             sys.exit(f"[!] --amount-ladder entry {a!r} is not a positive "
                      f"decimal BTC amount.")
     if len(args.amount_ladder) > MAX_LADDER:

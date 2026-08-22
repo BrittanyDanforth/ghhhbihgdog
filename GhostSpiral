@@ -243,7 +243,7 @@ FANOUT_SPEND_FRACTION = Decimal("0.9")
 # change destination "the wallet's identity address", which the account rotation
 # stopped being true: these are per-run accounts, and _run_change_sweep records
 # the verification that the wallet's real primary address is spent zero times.)
-BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
 SWAPKIT_API = "https://api.swapkit.dev"
 
 #: How far each --split chunk may stray from the equal share, either way.

@@ -69,9 +69,10 @@ from pathlib import Path
 from typing import Dict
 
 from gs_common import (
+    wipe_will_erase,
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, shutdown_requested,
-    env_or_argv, wipe_covers, decimal_arg,
+    env_or_argv, decimal_arg,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -392,7 +393,9 @@ def main():
     # gs_common.wipe_covers, not a fourth inline copy of the root list: this
     # logic was here and GhostSpiral's --output had no equivalent, so the two
     # tools disagreed about the same question and a wrong answer is silent.
-    if not wipe_covers(_out):
+    # wipe_will_erase: --outfile is free-form and the sweep matches the NAME
+    # too, so a covered directory is only half the answer.
+    if not wipe_will_erase(_out):
         # _dir is computed HERE. Replacing the old inline coverage test with
         # wipe_covers deleted the local this message interpolated, so the
         # warning path raised NameError -- the branch that exists to stop a

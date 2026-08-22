@@ -60,7 +60,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gs_wake_proto as proto                                # noqa: E402
 
-MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
+MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
 
 #: How long the vault has to boot, bootstrap Tor and come and collect. Measured
 #: on the Pi's own monotonic clock -- it is always on, NTP-synced through
@@ -742,7 +742,7 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
             f"the pair in a way that looks exactly like a dead switch or a "
             f"hostile WOL. If you really are re-keying, move it aside and "
             f"re-pair BOTH boxes in the same sitting.")
-    if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", args.vault):
+    if not re.match(r"^(\d{1,3}\.){3}\d{1,3}\Z", args.vault):
         # A hostname would mean a DNS lookup on a box whose whole point is that
         # it does not make unexpected lookups, and the vault printed an address.
         raise Doorbell(f"{args.vault!r} is not an IPv4 address. Use the one "

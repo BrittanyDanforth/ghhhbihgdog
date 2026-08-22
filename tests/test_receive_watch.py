@@ -711,10 +711,51 @@ def _instr(pairs, dest):
         return "REFUSED:" + str(e)
 
 
-_good = [{"btc_in": "0.05", "deposit": "bc1qxy", "expected_xmr": "1.0",
+# A REAL bech32 address, not "bc1qxy": the deposit address is re-validated
+# before these instructions are printed (a tampered one sends the BTC where
+# ThorChain never sees it, and the memo check cannot catch that), so a
+# placeholder here would refuse for the wrong reason and stop this block
+# testing the MEMO property it is about.
+_REAL_DEP = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+_good = [{"btc_in": "0.05", "deposit": _REAL_DEP, "expected_xmr": "1.0",
           "memo": f"=:XMR.XMR:{_DEST}:0/1/0"}]
-_bad = [{"btc_in": "0.05", "deposit": "bc1qxy", "expected_xmr": "1.0",
+_bad = [{"btc_in": "0.05", "deposit": _REAL_DEP, "expected_xmr": "1.0",
          "memo": f"=:XMR.XMR:{_OTHER}:0/1/0"}]
+# ---------------------------------------------------------------------------
+# AND THE ADDRESS THE BITCOIN ACTUALLY GOES TO IS RE-VALIDATED TOO.
+#
+# This function's own docstring argues that thor_swap_preparer checking a value
+# once is not enough, because "between the two runs the file is an ordinary
+# 0600 JSON that can be edited, truncated or swapped, and this is the copy the
+# operator actually pastes to the sender". It then applied that to the memo
+# only. A tampered DEPOSIT address is worse and quieter: the BTC leaves and
+# ThorChain never sees it, so no swap is routed at all -- and the memo check
+# cannot fire, because the memo can stay perfectly honest.
+# ---------------------------------------------------------------------------
+_REALDEP = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+_okmemo = f"=:XMR.XMR:{_DEST}:0/1/0"
+check("an honest pair still prints",
+      _instr([{"btc_in": "0.05", "deposit": _REALDEP, "expected_xmr": "1.0",
+               "memo": _okmemo}], _DEST) == "PRINTED")
+for _label, _dep in (
+        ("one character flipped (only the checksum catches this)",
+         _REALDEP[:-1] + ("q" if _REALDEP[-1] != "q" else "p")),
+        ("an attacker's plausible-looking string", "bc1qEVILEVILEVILEVILEVILEVILEVIL"),
+        ("not an address at all", "send-to-me-please"),
+        ("empty", ""),
+        ("missing entirely", None)):
+    check(f"a deposit address that is {_label} is refused",
+          _instr([{"btc_in": "0.05", "deposit": _dep, "expected_xmr": "1.0",
+                   "memo": _okmemo}], _DEST).startswith("REFUSED"))
+check("...and the refusal explains that the memo check cannot catch it",
+      "memo can be honest" in
+      _instr([{"btc_in": "0.05", "deposit": "nope", "expected_xmr": "1.0",
+               "memo": _okmemo}], _DEST))
+check("the address is checked even with no --dest to bind the memo against, "
+      "because it is a different question",
+      _instr([{"btc_in": "0.05", "deposit": "nope", "expected_xmr": "1.0",
+               "memo": _okmemo}], "").startswith("REFUSED"))
+
 check("a memo naming our address still prints", _instr(_good, _DEST) == "PRINTED")
 check("a memo naming SOMEONE ELSE'S address is refused",
       _instr(_bad, _DEST).startswith("REFUSED"))
