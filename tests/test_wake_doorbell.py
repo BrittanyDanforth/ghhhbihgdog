@@ -361,6 +361,16 @@ check("...and reports as failed", b2.pending.outcome() == "failed")
 b2.close()
 
 
+def _at(bell, dt):
+    """finished() as it would read dt seconds from now, without advancing."""
+    keep = bell.t[0]
+    bell.t[0] = keep + dt
+    try:
+        return bell.pending.finished()
+    finally:
+        bell.t[0] = keep
+
+
 print("\n== windows, on the Pi's own monotonic clock ==")
 b3 = Bell()
 check("before collection the job is not finished", not b3.pending.finished())
@@ -377,7 +387,14 @@ b4 = Bell()
 b4.post("/wake", m1_for(eph, chal, b4.pending.window))
 check("a collected job is not finished while its budget runs",
       not b4.pending.finished())
-b4.t[0] += P.JOBS["receive_and_quote"]["budget_s"] + 1
+# result_budget_s, NOT budget_s. The property is unchanged -- a collected job
+# with no result eventually reports collected_no_result -- but the deadline
+# moved, because budget_s was never the whole wait. See below.
+check("a collected job is STILL not finished at the old budget_s deadline, "
+      "because the vault has not even started work by then",
+      not (b4.t[0] + P.JOBS["receive_and_quote"]["budget_s"] + 1
+           and _at(b4, P.JOBS["receive_and_quote"]["budget_s"] + 1)))
+b4.t[0] += P.result_budget_s("receive_and_quote") + 1
 check("a collected job with no result reports collected_no_result — the "
       "operator is told to CHECK THE VAULT before poking again",
       b4.pending.finished() and b4.pending.outcome() == "collected_no_result")
@@ -697,6 +714,96 @@ try:
           "m1_stale_window" not in _wb.pending.events)
 finally:
     _wb.close()
+
+# ===========================================================================
+# THE FETCH WINDOW WAS BEING SPENT WHILE THE VAULT WAS SWITCHED OFF.
+#
+# Pending.opened is set in __init__, and run_wake constructs the Pending, then
+# sleeps a random 0..PRE_WOL_MAX_S (900) before sending the magic packet. So
+# the 600 s the vault has to collect its job was already running while the
+# vault was still powered down. Driven through the REAL run_wake with an
+# injected clock, at HEAD~ (before the fix):
+#
+#   pre_wol_delay=700 -> status=SOCKET-GONE (ConnectionRefusedError)
+#                        fetch_open=False finished=True
+#                        outcome=expired_uncollected
+#
+# The Pi sent the magic packet and then IMMEDIATELY tore down its listener,
+# because finished() is `not fetch_open()` while collected_at is None and
+# run_wake's loop is `while not pending.finished()`. The vault boots into
+# nothing, prints its no-job line -- "that is what a magic packet from anyone
+# on the switch looks like" -- and powers off.
+#
+# Measured: the pre-WOL delay alone closes the window 33.2% of the time, and
+# 46.7% once 120 s of real boot is allowed for. OPSEC_SETUP.md section 5 step 3
+# already specifies the right order: "waits a random 0-15 min, THEN sends the
+# magic packet and holds one job for 10 min".
+# ===========================================================================
+print("\n== the fetch window starts at the magic packet, not before it ==")
+check("Pending can be armed", hasattr(DB.Pending, "arm"))
+_ba = Bell()
+_ba.t[0] += DB.PRE_WOL_MAX_S           # the whole pre-WOL delay elapses
+check("...and without arming, that delay has already closed the window "
+      "(this is the defect)", not _ba.pending.fetch_open())
+_ba.pending.arm()
+check("arming at the magic packet reopens the full window",
+      _ba.pending.fetch_open() and not _ba.pending.finished())
+check("...and the vault can still collect after a maximum pre-WOL delay",
+      _ba.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                               _ba.pending.window))[0] == 200)
+_ba.close()
+# NON-VACUITY: arming must not make the window infinite.
+_bb = Bell()
+_bb.pending.arm()
+_bb.t[0] += DB.FETCH_WINDOW_S + 1
+check("an armed window STILL expires on time, so this is not a window that "
+      "never closes",
+      not _bb.pending.fetch_open()
+      and _bb.pending.outcome() == "expired_uncollected")
+_bb.close()
+check("run_wake arms it where the packet actually goes out",
+      "pending.arm()" in open(os.path.join(REPO, "gs_doorbell")).read())
+
+# ===========================================================================
+# THE RESULT WINDOW IGNORED THE VAULT'S JITTER AND ITS PER-STEP BUDGET.
+#
+# The doorbell waited budget_s for a result. The vault sleeps up to
+# VAULT_JITTER_HI_S (1200 s) BEFORE it starts, and _dispatch spends budget_s
+# PER STEP (tests/test_wake_agent.py: "the budget is PER STEP, not per job").
+# So the true worst case is jitter + len(tools) * budget_s, and EVERY job
+# could report into a socket the Pi had already closed:
+#
+#   job                tools  budget   old window   vault worst case
+#   receive_new            1     900          900               2100
+#   receive_and_quote      2    1800         1800               4800
+#   watch                  1    7200         7200               8400
+#
+# The operator is then told "collected_no_result" for a job that ran fine.
+# ===========================================================================
+print("\n== the result window covers the jitter and every step ==")
+for _job in P.JOBS:
+    _spec = P.JOBS[_job]
+    _worst = P.VAULT_JITTER_HI_S + len(_spec["tools"]) * _spec["budget_s"]
+    check(f"{_job}: the Pi waits for the vault's true worst case",
+          P.result_budget_s(_job) >= _worst)
+    check(f"{_job}: ...which is strictly longer than the old budget_s",
+          P.result_budget_s(_job) > _spec["budget_s"])
+_bc = Bell("receive_new")
+_bc.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                         _bc.pending.window))
+_bc.t[0] += P.VAULT_JITTER_HI_S        # the jitter alone, no work done yet
+check("receive_new is STILL open after the maximum jitter — before the fix "
+      "its 900 s window had closed and the vault had not started",
+      _bc.pending.result_open() and not _bc.pending.finished())
+_bc.t[0] += P.result_budget_s("receive_new")
+check("NON-VACUITY: it does still close eventually",
+      _bc.pending.finished()
+      and _bc.pending.outcome() == "collected_no_result")
+_bc.close()
+check("the vault reads its jitter from the protocol module, so the two boxes "
+      "cannot disagree about it again",
+      "proto.VAULT_JITTER_LO_S" in open(os.path.join(REPO,
+                                                     "gs_wake_agent")).read())
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

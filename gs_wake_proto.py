@@ -1134,6 +1134,45 @@ JOBS = {
     },
 }
 
+#: THE VAULT'S MANDATORY JITTER, DECLARED WHERE BOTH BOXES CAN SEE IT.
+#:
+#: gs_wake_agent sleeps a random VAULT_JITTER_LO_S..VAULT_JITTER_HI_S after it
+#: has collected a job and BEFORE it starts any of the job's work
+#: (OPSEC_SETUP.md section 5 step 4: "a random 5-20 min"). It lived only in
+#: gs_wake_agent, so the Pi -- which has to decide how long to wait for a
+#: result -- was sizing its window as though that sleep did not exist.
+VAULT_JITTER_LO_S, VAULT_JITTER_HI_S = 300, 1200
+
+
+def result_budget_s(job: str) -> int:
+    """How long the Pi must hold the line for a result, worst case.
+
+    NOT budget_s. Three things stack up on the vault between collecting a job
+    and reporting on it, and the doorbell's window counted only the last one:
+
+      * the mandatory jitter above, up to VAULT_JITTER_HI_S, before any work;
+      * budget_s PER STEP, not per job -- gs_wake_agent's _dispatch passes the
+        same budget to run_child for every tool in the job, so a two-tool job
+        is allowed twice it (tests/test_wake_agent.py says so in as many
+        words: "the budget is PER STEP, not per job");
+      * the work itself, which is what budget_s bounds.
+
+    Measured against the shipped constants, every job could report late:
+
+        job                tools  budget   old window   vault worst case
+        receive_new            1     900          900               2100
+        receive_and_quote      2    1800         1800               4800
+        watch                  1    7200         7200               8400
+
+    Past the window Pending.finished() goes true, do_wake's `while not
+    pending.finished()` loop exits and the server is shut down -- so the vault
+    reports into a closed socket and the operator is told
+    "collected_no_result" for a job that in fact ran to completion.
+    """
+    spec = JOBS[job]
+    return len(spec["tools"]) * spec["budget_s"] + VAULT_JITTER_HI_S
+
+
 #: Named so a test can assert they are unreachable rather than merely absent.
 #: The mix needs a physically-present spend USB and must never be driven by a
 #: pager -- OPSEC_SETUP.md §8.

@@ -1036,6 +1036,62 @@ MUTATIONS = [
   "            pass",
   ["test_wake_doorbell"]),
 
+ # THE PI DID NOT ACTUALLY WORK, and these two are why.
+ #
+ # The fetch window was spent while the vault was still switched off: the Pi
+ # sends the magic packet and then, if its own pre-WOL delay ran past the
+ # window, immediately tears the listener down. Driven at HEAD~: delay 700 s
+ # -> ConnectionRefusedError, outcome=expired_uncollected. 33.2% of pokes, or
+ # 46.7% once real boot time is allowed for.
+ ("the fetch window is burned before the magic packet is sent", "gs_doorbell",
+  "        pending.arm()\n",
+  "",
+  ["test_wake_doorbell"]),
+
+ # The result window ignored the vault's 300-1200 s jitter AND the fact that
+ # budget_s is spent PER STEP, so every job could report into a closed socket
+ # and be recorded as collected_no_result after running fine.
+ ("the result window forgets the vault's jitter and its per-step budget",
+  "gs_doorbell",
+  "        return (self.clock() - self.collected_at) < self.result_budget_s",
+  "        return (self.clock() - self.collected_at) < self.budget_s",
+  ["test_wake_doorbell"]),
+
+ # ProtectHome=yes hides a `pip install --user` dependency set, gs_common
+ # imports requests at module scope, StandardError=null discards the
+ # traceback, and OnFailure powers the machine off. The vault boots, dies and
+ # shuts down with nothing anywhere saying why.
+ ("a missing dependency goes back to being a silent poweroff",
+  "systemd/gs-wake-agent.service",
+  "ExecStartPre=",
+  "#ExecStartPre=",
+  ["test_wake_agent"]),
+
+ # wipe_covers resolves against cwd and $HOME; the unit sets both and a shell
+ # does not, so the "confirm the pairing works" command refused on the shipped
+ # default and told a correct install it was broken.
+ ("the wipe-root refusal stops naming the by-hand case", "gs_wake_agent",
+  "                      f\"      paranoia_mode's sweep is anchored on cwd and \"\n"
+  "                      f\"$HOME. If you are running this BY HAND to check a \"\n"
+  "                      f\"pairing, run it the way the unit does:\\n\"\n",
+  "",
+  ["test_wake_agent"]),
+
+ # ...and the pairing tool printed that same unusable command as the next step.
+ ("the pairing tool goes back to printing a command that cannot run",
+  "gs_wake_keys",
+  "    if not wipe_covers(_ad):",
+  "    if False:",
+  ["test_wake_agent"]),
+
+ # --phase create securely (UNRECOVERABLY) erases whatever --outdir names,
+ # after the Tor and RPC checks succeed, with no confirmation anywhere. A typo
+ # or a stale path destroyed the operator's own files.
+ ("--outdir erases a directory this tool did not create", "airgap_tx_signer",
+  "        _ours = _staging_strays(outdir)",
+  "        _ours = []",
+  ["test_signer_schema"]),
+
  # ---- fixes that shipped in 9da2e24 with NO anchor at all --------------
  # Reverting either of these left all 33 suites green, so nothing stopped a
  # later edit from quietly undoing them.

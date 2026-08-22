@@ -221,6 +221,12 @@ class Pending:
         self.clock = clock
         self.opened = clock()
         self.budget_s = proto.JOBS[job]["budget_s"]
+        #: NOT budget_s. The vault sleeps up to VAULT_JITTER_HI_S BEFORE it
+        #: starts, and _dispatch spends budget_s PER STEP -- so waiting only
+        #: budget_s closed this socket while the job was still legitimately
+        #: running. Every job was affected, worst case short by 1200-3000 s.
+        #: See proto.result_budget_s for the measured table.
+        self.result_budget_s = proto.result_budget_s(job)
         #: (eph_pk, challenge) -> the exact M2 bytes already returned.
         #: THE RETRY AND THE REPLAY ARE THE SAME REQUEST, and answering both
         #: from a cache is what makes this at-most-once without a counter: a
@@ -266,13 +272,35 @@ class Pending:
         self.events = []
 
     # -- windows ----------------------------------------------------------
+    def arm(self) -> None:
+        """(Re)start the fetch window, at the moment the vault is told to boot.
+
+        `opened` is set in __init__, but do_wake constructs this and THEN
+        sleeps a random 0..PRE_WOL_MAX_S before sending the magic packet. The
+        600 s the vault has to collect its job was therefore being spent while
+        the vault was still switched off, and a delay over FETCH_WINDOW_S shut
+        the window before the packet that opens it was even sent. Measured on
+        the shipped constants: the pre-WOL delay alone closes it 33.2% of the
+        time, and 46.7% once 120 s of real boot is allowed for.
+
+        The vault then collects nothing, is told 204, and prints its no-job
+        line -- "that is what a magic packet from anyone on the switch looks
+        like" -- so a third of ordinary pokes looked to the operator like an
+        intruder on the LAN rather than a bug here.
+
+        OPSEC_SETUP.md section 5 step 3 already describes the intended order:
+        "waits a random 0-15 min, THEN sends the magic packet and holds one job
+        for 10 min". This makes the code do what that sentence says.
+        """
+        self.opened = self.clock()
+
     def fetch_open(self) -> bool:
         return (self.clock() - self.opened) < FETCH_WINDOW_S
 
     def result_open(self) -> bool:
         if self.collected_at is None:
             return False
-        return (self.clock() - self.collected_at) < self.budget_s
+        return (self.clock() - self.collected_at) < self.result_budget_s
 
     def finished(self) -> bool:
         if self.result is not None:
@@ -886,6 +914,9 @@ def run_wake(args, key: dict, job: str, params: dict,
         sent = send_wol(key["target_mac"], key.get("wol_broadcast",
                                                    "255.255.255.255"),
                         int(key.get("wol_port", 9)), sock_factory=sock_factory)
+        # THE WINDOW STARTS HERE, not when Pending was constructed: everything
+        # above this line happened with the vault powered off. See Pending.arm.
+        pending.arm()
         pending.events.append("wake_sent")
         print(f"  [+] Magic packet sent ({sent} bytes). Waiting up to "
               f"{FETCH_WINDOW_S // 60} min for the vault to collect job "
@@ -966,7 +997,7 @@ def report(pending: Pending) -> int:
               f"poking again is safe.")
         return 1
     print(f"  [!] Job {pending.job} was collected but the vault never reported "
-          f"back within {pending.budget_s // 60} min.")
+          f"back within {pending.result_budget_s // 60} min.")
     print(f"      It may have finished and powered off before answering. "
           f"CHECK THE VAULT before poking again: this job may already be done.")
     return 1

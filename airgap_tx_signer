@@ -265,6 +265,30 @@ OUTPUTS_EXPORT_NAME = "outputs_export.hex"
 #: see _ensure_offline_accounts.
 ACCOUNTS_COUNT_NAME = "accounts_count.txt"
 
+#: Everything --phase create is allowed to find in a staging directory it is
+#: about to securely erase. Anything else means --outdir names a directory this
+#: tool did not create, and erasing it would destroy the operator's own files.
+_STAGING_OK_EXACT = frozenset({
+    "signed", "unsigned_manifest.json",
+    OUTPUTS_EXPORT_NAME, ACCOUNTS_COUNT_NAME,
+})
+
+
+def _staging_strays(outdir) -> list:
+    """Names in `outdir` that --phase create does not write. Empty == ours.
+
+    Conservative in the safe direction: anything unreadable or unexpected
+    counts as a stray, because the consequence of guessing wrong is an
+    unrecoverable wipe of somebody's files.
+    """
+    try:
+        names = sorted(p.name for p in Path(outdir).iterdir())
+    except OSError:
+        return ["<could not list this directory>"]
+    return [n for n in names
+            if n not in _STAGING_OK_EXACT
+            and not re.fullmatch(r"tx_\d+\.unsigned", n)]
+
 
 def _canonical_plan(plan: List[dict]) -> list:
     """Normalise a plan to the fields that constitute its IDENTITY.
@@ -625,6 +649,36 @@ def phase_create(args, plan: List[dict], meta: dict = None):
         # existing --outdir would otherwise merely unlink a previous attempt's
         # tx_*.unsigned AND signed/tx_*.signed -- a recovered signed blob is a
         # relayable transaction. Mirrors the finally-block cleanup below.
+        #
+        # BUT ONLY A DIRECTORY THAT IS OURS.
+        #
+        # This ran unconditionally on whatever --outdir names, and
+        # secure_delete_tree is deliberately UNRECOVERABLE -- it overwrites
+        # every file before unlinking it. So `--outdir ~/Documents`, or a
+        # stale path, or a plain typo, silently destroyed every file in that
+        # directory, with no confirmation prompt anywhere in this tool. It is
+        # reachable in ordinary use: it sits after the Tor and RPC checks
+        # succeed, which on the online machine that runs `--phase create` is
+        # the normal case.
+        #
+        # A re-run into our own staging directory must stay frictionless, so
+        # the test is "does this directory contain anything we did not put
+        # there". If it does, refuse and name it: the operator can delete it
+        # themselves, having seen what it was.
+        _ours = _staging_strays(outdir)
+        if _ours:
+            integrity_log("signer", "outdir_not_ours")
+            sys.exit(
+                f"[!] {outdir} is not a staging directory this tool created.\n"
+                f"    It holds {len(_ours)} file(s)/dir(s) that --phase create "
+                f"does not write:\n"
+                + "".join(f"        {n}\n" for n in _ours[:10])
+                + (f"        ... and {len(_ours) - 10} more\n"
+                   if len(_ours) > 10 else "")
+                + f"    Refusing: this step ERASES --outdir, overwriting every\n"
+                  f"    file in it so it cannot be recovered. Point --outdir at "
+                  f"a new\n    or empty directory, or delete that one yourself "
+                  f"if you meant to.")
         if not secure_delete_tree(outdir):
             print(f"  [!] Could not securely erase the existing {outdir}; "
                   f"a previous attempt's signed transactions may remain recoverable.")
