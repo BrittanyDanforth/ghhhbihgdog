@@ -927,8 +927,26 @@ def main():
     #
     # That is worse here than there. GhostSpiral's gate decides what a run
     # plans against; this one is what TELLS THE OPERATOR the money has landed.
+    # THE COUNT IS ALREADY KNOWN, AND IT WAS BEING THROWN AWAY. `chunks` fell
+    # back to 1 whenever the per-chunk breakdown was empty -- which is exactly
+    # what --expect-xmr does, three lines up, by design ("an explicit total
+    # replaces the quotes, so it replaces the per-chunk breakdown too").
+    #
+    # With chunks=1 the second term of the floor collapses to a piconero and
+    # the slippage tolerance stands alone, so the gate opens at
+    # total * (1 - tolerance). Twelve swaps under --pairs with --expect-xmr 12
+    # and the default 10% tolerance: floor 10.8, and eleven arrivals totalling
+    # 11.0 report FUNDED with a whole swap missing. That is verbatim the
+    # failure swap_arrival_floor's own docstring says it exists to stop,
+    # reached through the one door it did not cover.
+    #
+    # `matched` is the swap pairs routed to THIS address. It is the real count
+    # whether or not their individual amounts were readable, so it is the right
+    # fallback: with it, chunks=12 assumes equal chunks and floors at 11.0 + 1
+    # piconero, which the eleven-arrival case does not clear.
     floor_, _tightened = swap_arrival_floor(
-        target, args.tolerance, _chunk_amounts, len(_chunk_amounts) or 1)
+        target, args.tolerance, _chunk_amounts,
+        len(_chunk_amounts) or len(matched) or 1)
     if _tightened:
         print(f"  [*] Arrival gate tightened to {fmt(floor_)} XMR, above what "
               f"the {args.tolerance * 100:.0f}% tolerance alone would allow: "

@@ -639,9 +639,10 @@ def test_summary_lists_outstanding_operator_actions():
     are not caveats about what cannot be done, they are outstanding ACTIONS.
     """
     src = code_only(os.path.join(REPO, "paranoia_mode"))
-    # the summary block, not the phases
+    # The summary block, not the phases. Anchored on the START of the summary
+    # and run to the end of it, because the two branches inside it are no
+    # longer in a fixed order -- see the reachability check below.
     seg = src[src.index("paranoia_mode complete"):]
-    seg = seg[:seg.index("paranoia_mode FINISHED WITH FAILURES")]
     check("summary: names the shell-history action",
           "Close every terminal" in seg)
     check("summary: explains WHY (history lives in memory until the shell exits)",
@@ -652,6 +653,52 @@ def test_summary_lists_outstanding_operator_actions():
           "if _still:" in seg)
     check("summary: the wallet caveat is still there too",
           "THE WALLET IS STILL HERE" in src)
+
+    # AND IT MUST BE REACHABLE ON A RUN THAT FAILED. All of it used to live
+    # under `elif not bad:` -- so a run with one failed phase printed none of
+    # it. A non-root run always fails the MAC spoof, and the summary's own
+    # failure text tells the operator to use sudo, so in practice the wallet
+    # warning and the two outstanding actions were unreachable on exactly the
+    # runs that needed them most. A wipe that half-worked needs the caveats
+    # MORE than one that worked.
+    #
+    # Structural, because the alternative is running a real wipe to find out.
+    _fail_at = src.index("paranoia_mode FINISHED WITH FAILURES")
+    for _what, _text in (("the wallet caveat", "THE WALLET IS STILL HERE"),
+                         ("the outstanding actions", "Close every terminal"),
+                         ("the env-unset reminder", "_envleft")):
+        check(f"summary: {_what} is printed AFTER the failure branch, so a run "
+              f"with failures still gets it", src.index(_text) > _fail_at)
+
+    # AND ITS GUARD MUST NOT MENTION `bad`. Source ORDER alone is not the
+    # property -- the mutation sweep proved it, by changing the condition to
+    # `not args.dry_run and not bad` and leaving every ordering check above
+    # green while the block went unreachable again on exactly the runs that
+    # need it. Read the actual `if` this time.
+    import ast as _ast6
+    _tree6 = _ast6.parse(open(os.path.join(REPO, "paranoia_mode")).read())
+    _guards = []
+    for _n6 in _ast6.walk(_tree6):
+        if not isinstance(_n6, _ast6.If):
+            continue
+        _body6 = "".join(
+            c.value for c in _ast6.walk(_n6)
+            if isinstance(c, _ast6.Constant) and isinstance(c.value, str))
+        if "THE WALLET IS STILL HERE" in _body6:
+            _guards.append(_ast6.unparse(_n6.test))
+    check("summary: exactly one `if` encloses the wallet caveat",
+          len(_guards) == 1)
+    check("summary: ...and its condition does not depend on whether the run "
+          "had failures"
+          + (f" (got `{_guards[0]}`)" if _guards else ""),
+          bool(_guards) and "bad" not in _guards[0])
+    check("summary: ...it is gated only on this being a real run, not a dry "
+          "one", bool(_guards) and "dry_run" in _guards[0])
+    check("summary: the env-unset list comes from what the scrub phase "
+          "RECORDED, not from os.environ -- which that phase has already "
+          "emptied, so the reminder could never fire",
+          "_envleft = sorted(SCRUBBED)" in src
+          and "SCRUBBED.append(key)" in src)
 
 
 def run_all():

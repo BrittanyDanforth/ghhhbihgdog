@@ -84,3 +84,11 @@ gs_wake_*.key
 gs_wake_state.json
 gs_wake_handles.json
 .gs_wake_inhibit
+# A woken job's children write here instead of to the systemd journal. It holds
+# whatever thor_swap_preparer printed, which includes the BTC deposit address
+# and the ThorChain memo -- and the memo names the destination XMR address.
+gs_wake_job.log
+# integrity_log_once's run-scoped dedupe marker. It holds one line per
+# chain event kind -- redacted now, but still the run's event vocabulary,
+# and it is written next to the plans.
+.chain_once_*

@@ -265,8 +265,21 @@ with contextlib.redirect_stdout(io.StringIO()):
 para._wipe_targeted_temp_roots = _real_helper
 check("wipe_tmp_files calls the targeted sweep", "args" in called)
 check("...passing the dry flag through", called.get("args", (None,))[0] is True)
-check("...and telling it which roots were already blanket-swept",
-      set(called.get("args", (0, 0, []))[2]) == {"/tmp", "/var/tmp"})
+# WHICH ROOTS WERE ACTUALLY BLANKET-SWEPT, not which ones it hoped to sweep.
+# This is now conditional, and the condition matters: when the blanket sweep is
+# skipped (root with no SUDO_UID), /tmp must NOT be reported as already done,
+# or the targeted prefix sweep skips it too and this toolchain's own scratch --
+# .gs_pw_*, gs_sign_*, a plaintext wallet password and a signed transaction --
+# survives the wipe entirely. The message printed in that case promises exactly
+# the opposite.
+_done = set(called.get("args", (0, 0, []))[2])
+if os.geteuid() == 0 and not os.environ.get("SUDO_UID"):
+    check("with the blanket sweep skipped, /tmp is NOT reported as already "
+          "done, so the prefix sweep still reaches this toolchain's scratch "
+          "there", _done == set())
+else:
+    check("...and telling it which roots were already blanket-swept",
+          _done == {"/tmp", "/var/tmp"})
 
 # THE SUITE MUST NOT REACH INTO THE HOST'S REAL /dev/shm.
 #
@@ -445,6 +458,127 @@ for _f2 in ("GhostSpiral", "gs_common.py", "airgap_tx_signer",
     _bare = _re2.findall(r"^\s*secure_delete_file\(", _src2, _re2.M)
     check(f"wipe-warn: {_f2} has no bare secure_delete_file() whose result is "
           f"thrown away", not _bare)
+
+
+# ===========================================================================
+# $HISTFILE IS A SHELL VARIABLE, NOT AN ENVIRONMENT VARIABLE.
+#
+# _shell_histories read os.environ["HISTFILE"] to cover "an operator who moved
+# their history anywhere". bash sets HISTFILE and does not export it --
+# `declare -p HISTFILE` shows `declare --`, no -x -- so a child process sees
+# None and that branch never fired, in exactly the case its own docstring names
+# as the reason it exists. The stake is in that docstring too: a
+# --wallet-password typed at a shell sits in that file verbatim.
+import tempfile as _tf5, pathlib as _pl5                      # noqa: E402
+import subprocess as _sp5                                     # noqa: E402
+
+check("bash really does not export HISTFILE, so os.environ was always going "
+      "to be empty -- the premise, measured",
+      _sp5.run(["bash", "-ic", "declare -p HISTFILE"], capture_output=True,
+               text=True).stdout.strip().startswith("declare --"))
+
+# dir="/tmp" explicitly: an earlier section of this suite monkeypatches
+# tempfile.gettempdir to a sandbox that no longer exists by now, and a
+# mkdtemp that inherits it fails with FileNotFoundError -- a test file
+# breaking a later part of itself.
+_h5 = _tf5.mkdtemp(prefix="gs_hist_", dir="/tmp")
+_saved_home = os.environ.get("HOME")
+try:
+    os.environ["HOME"] = _h5
+    _pl5.Path(_h5, ".bashrc").write_text(
+        "# a comment\nHISTFILE=$HOME/.moved_history\nexport HISTSIZE=1000\n")
+    _pl5.Path(_h5, ".zshrc").write_text(
+        'export HISTFILE="/var/log/zsh_hist"\nHISTFILE=$(mktemp)\n')
+    _found5 = [str(x) for x in para._shell_histories()]
+    check("an UNEXPORTED HISTFILE= in .bashrc is found, which is the case the "
+          "environment lookup could never see",
+          any(".moved_history" in f for f in _found5))
+    check("...and an exported one in .zshrc too",
+          any("zsh_hist" in f for f in _found5))
+    check("a HISTFILE built by command substitution is SKIPPED rather than "
+          "guessed at -- wiping the wrong file and reporting success is worse "
+          "than missing it",
+          not any("mktemp" in f or "$(" in f for f in _found5))
+    check("...and the ordinary candidates are still there",
+          any(f.endswith(".bash_history") for f in _found5)
+          and any("fish_history" in f for f in _found5))
+finally:
+    if _saved_home is not None:
+        os.environ["HOME"] = _saved_home
+    _shutil5 = __import__("shutil")
+    _shutil5.rmtree(_h5, ignore_errors=True)
+
+
+# ===========================================================================
+# THE BLANKET /tmp SWEEP IS SCOPED TO THE OPERATOR, NOT TO ROOT.
+#
+# `uid = os.getuid()` under `sudo paranoia_mode` -- which this tool's own
+# failure summary tells the operator to use -- resolves to ROOT. The
+# "blanket uid-scoped sweep" then removed every root-owned entry in /tmp and
+# /var/tmp: systemd-private-* belonging to running units, .X11-unix,
+# .ICE-unix, and whatever any root daemon has open. Found by running it: a real
+# wipe on the machine this was written on removed unrelated tooling's working
+# files out of /tmp mid-session.
+#
+# This file argues the point already, about /dev/shm, and the reasoning was
+# never carried across: "wiping it wholesale breaks running software".
+import io as _io3, contextlib as _cl3, tempfile as _tf3                # noqa: E402
+
+_marker = _tf3.NamedTemporaryFile(prefix="gs_root_marker_", dir="/tmp",
+                                  delete=False)
+_marker.write(b"x")
+_marker.close()
+try:
+    _saved = os.environ.pop("SUDO_UID", None)
+    _buf3 = _io3.StringIO()
+    with _cl3.redirect_stdout(_buf3):
+        para.wipe_tmp_files(True)          # DRY. Never a real wipe in a test.
+    _out3 = _buf3.getvalue()
+    if os.geteuid() == 0:
+        check("as root with no SUDO_UID, the blanket /tmp sweep does NOT list "
+              "a root-owned file -- those belong to running services, not to "
+              "the operator's session",
+              _marker.name not in _out3)
+        check("...and it says so, rather than silently doing less than the "
+              "phase name implies",
+              "NOT swept wholesale" in _out3)
+        os.environ["SUDO_UID"] = "0"
+        _buf4 = _io3.StringIO()
+        with _cl3.redirect_stdout(_buf4):
+            para.wipe_tmp_files(True)
+        check("...and SUDO_UID=0 does not re-enable it: sudo from root is "
+              "still root", _marker.name not in _buf4.getvalue())
+        # AND SUDO_UID MUST ACTUALLY BE READ. The mutation sweep caught the two
+        # checks above passing with the SUDO_UID lookup deleted -- because with
+        # no SUDO_UID the uid stays 0 either way and the blanket sweep is
+        # skipped for the same reason. The behaviour that DIFFERS is a non-root
+        # SUDO_UID: `sudo paranoia_mode` from a normal login must sweep that
+        # login's temp files, not root's and not none.
+        os.environ["SUDO_UID"] = "1000"
+        _buf6 = _io3.StringIO()
+        with _cl3.redirect_stdout(_buf6):
+            para.wipe_tmp_files(True)
+        check("under sudo from a normal login, the blanket sweep RUNS, scoped "
+              "to that login rather than to root",
+              "NOT swept wholesale" not in _buf6.getvalue())
+        check("...and it still does not offer root's own /tmp entries",
+              _marker.name not in _buf6.getvalue())
+    else:
+        # Not root: the blanket sweep is the operator's own uid and SHOULD see
+        # a file it owns. The marker above is ours in that case too.
+        check("as a normal user the blanket sweep does list this process's own "
+              "temp file", _marker.name in _out3)
+    check("the sweep is DRY here and deleted nothing",
+          os.path.exists(_marker.name))
+finally:
+    if _saved is not None:
+        os.environ["SUDO_UID"] = _saved
+    else:
+        os.environ.pop("SUDO_UID", None)
+    try:
+        os.unlink(_marker.name)
+    except OSError:
+        pass
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAIL:

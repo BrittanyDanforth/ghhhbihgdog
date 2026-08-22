@@ -250,6 +250,10 @@ def _exit_chain_lines(n_outputs):
         ghost.integrity_log = lambda stage, msg: gsc.integrity_log(
             stage, msg, log_path=log)
         args = types.SimpleNamespace(
+            # The exit and change-sweep plans are written to args.output now,
+            # not to Path(staging_dir).parent (the shell's cwd). A real args
+            # namespace always has this; these fixtures stood in for one.
+            output=tempfile.mkdtemp(prefix="exit_out_"),
             rpc_primary="http://127.0.0.1:18083", tor_proxy=None,
             rpc_daemon="http://127.0.0.1:18081", wallet_file="w",
             wallet_password="", fee_priority=1, allow_clearnet_relay=False,
@@ -301,6 +305,10 @@ def _exit_with_residual():
         ghost.integrity_log = lambda stage, msg: gsc.integrity_log(
             stage, msg, log_path=log)
         args = types.SimpleNamespace(
+            # The exit and change-sweep plans are written to args.output now,
+            # not to Path(staging_dir).parent (the shell's cwd). A real args
+            # namespace always has this; these fixtures stood in for one.
+            output=tempfile.mkdtemp(prefix="exit_out_"),
             rpc_primary="x", tor_proxy=None, rpc_daemon="y", wallet_file="w",
             wallet_password="", fee_priority=1, allow_clearnet_relay=False,
             exit_to=[A1])
@@ -360,6 +368,10 @@ def _sweep_chain_lines(n_jobs):
         ghost.integrity_log = lambda stage, msg: gsc.integrity_log(
             stage, msg, log_path=log)
         args = types.SimpleNamespace(
+            # The exit and change-sweep plans are written to args.output now,
+            # not to Path(staging_dir).parent (the shell's cwd). A real args
+            # namespace always has this; these fixtures stood in for one.
+            output=tempfile.mkdtemp(prefix="exit_out_"),
             rpc_primary="x", tor_proxy=None, rpc_daemon="y", wallet_file="w",
             wallet_password="", fee_priority=1, allow_clearnet_relay=False)
         jobs = [(a, 0, f"DST{a}", a * 10) for a in range(5, 5 + n_jobs)]
@@ -415,6 +427,10 @@ def _round_chain_lines(role, n_rounds):
             stage, msg, log_path=log)
         ghost._ROUND_EVENTS_LOGGED.clear()
         args = types.SimpleNamespace(
+            # The exit and change-sweep plans are written to args.output now,
+            # not to Path(staging_dir).parent (the shell's cwd). A real args
+            # namespace always has this; these fixtures stood in for one.
+            output=tempfile.mkdtemp(prefix="exit_out_"),
             rpc_primary="x", tor_proxy="socks5h://127.0.0.1:9050",
             rpc_daemon="y", wallet_file="w", wallet_password="",
             fee_priority=1, allow_clearnet_relay=False)
@@ -1265,6 +1281,103 @@ for _bad in ("create_fail", "TAMPER_DETECTED", "DOUBLE_SPEND",
     check("chain-once: " + _bad + " still chains every time",
           'integrity_log_once("signer", f"' + _bad not in _sg_src
           and 'integrity_log_once("broadcast", f"' + _bad not in _bc_src)
+
+
+# ===========================================================================
+# A MAC AND A BECH32 ADDRESS ARE IDENTIFIERS, AND NEITHER HAD A RULE.
+#
+# Measured on the shipped function before this:
+#
+#   mac=de:ad:be:ef:ca:fe  ->  mac=de:ad:be:ef:ca:fe        (untouched)
+#   a4:c3:f0:1b:de:ad      ->  a#:c#:f#:#b:de:ad            (two octets intact)
+#   bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
+#     ->  bc#qar#srrr#xfkvy#l#lydnw#re#gtzzwf#mdq           (most of it)
+#
+# The first has no digits, so the digit rule never fired. The others left the
+# value in order with the gap widths shown -- a search key, not a redaction.
+# A MAC survives reinstalling the machine, and the BTC entry address is what
+# the ThorChain memo publishes in a public Bitcoin OP_RETURN.
+for _v, _why in (
+        ("mac=de:ad:be:ef:ca:fe", "an all-letters MAC, which the digit rule "
+                                  "cannot touch at all"),
+        ("mac=02:1a:4c:9b:7e:31", "a mixed MAC"),
+        ("spoofed to a4-c3-f0-1b-de-ad", "a dash-separated MAC"),
+        ("MAC A4:C3:F0:1B:DE:AD", "an upper-case MAC"),
+        ("btc_entry:bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+         "a bech32 v0 address"),
+        ("bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297",
+         "a bech32m taproot address"),
+        ("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "a testnet address")):
+    _got = gsc.chain_safe(_v)
+    _tail = _v.split(":")[-1].split(" ")[-1]
+    check(f"chain_safe removes {_why}",
+          ("<mac>" in _got or "<addr>" in _got) and _tail not in _got)
+
+# AND IT MUST NOT EAT THE PAYLOADS THIS CHAIN IS MADE OF. Two colons and hex
+# digits are ordinary here.
+for _v, _want in (("withdrawn:4/1", "withdrawn:#/#"),
+                  ("spend_source_ok:acct=3:idx=1",
+                   "spend_source_ok:acct=#:idx=#"),
+                  ("job_accepted:receive_and_quote",
+                   "job_accepted:receive_and_quote"),
+                  ("refused:no_deadman", "refused:no_deadman"),
+                  ("quotes_unreadable:2_of_5", "quotes_unreadable:#_of_#")):
+    check(f"chain_safe leaves {_v!r} alone", gsc.chain_safe(_v) == _want)
+
+
+# ===========================================================================
+# THE DEDUPE MARKER IS A SECOND COPY OF EVERY CHAIN PAYLOAD.
+#
+# integrity_log_once keys its run-scoped marker file on the RAW (stage, kind)
+# and writes that line to disk -- so a payload carrying an address or a MAC was
+# stored verbatim beside the chain, while the chain one line below stored
+# chain_safe's version. The redactor was bypassed by the deduplicator that
+# feeds it. Driven with the real kinds the signer and broadcaster emit.
+import tempfile as _tfm, os as _osm                          # noqa: E402
+_md = _tfm.mkdtemp(prefix="gs_marker_")
+_marker = _osm.path.join(_md, ".chain_once_test")
+_mlog = Path(_md) / "chain.log"
+_saved_env = os.environ.get("GS_CHAIN_RUN_ONCE")
+try:
+    os.environ["GS_CHAIN_RUN_ONCE"] = _marker
+    gsc._CARDINAL_EVENTS_LOGGED.clear()
+    gsc.integrity_log_once("signer", "using_account_index:7", log_path=_mlog)
+    gsc._CARDINAL_EVENTS_LOGGED.clear()
+    gsc.integrity_log_once("paranoia", "spoofed:a4:c3:f0:1b:de:ad",
+                           log_path=_mlog)
+    _mtext = open(_marker).read()
+    check("the dedupe marker carries the REDACTED payload, not the raw one",
+          "using_account_index:#" in _mtext
+          and "using_account_index:7" not in _mtext)
+    check("...including a MAC, which the chain itself now removes too",
+          "a4:c3:f0:1b:de:ad" not in _mtext and "<mac>" in _mtext)
+    check("...and it is 0600, not whatever the umask says",
+          oct(_osm.stat(_marker).st_mode)[-3:] == "600")
+finally:
+    if _saved_env is None:
+        os.environ.pop("GS_CHAIN_RUN_ONCE", None)
+    else:
+        os.environ["GS_CHAIN_RUN_ONCE"] = _saved_env
+    gsc._CARDINAL_EVENTS_LOGGED.clear()
+
+# It must also be erased and never committed. It was in neither list: an
+# incomplete run keeps its marker by design (report_completion exits before
+# _wipe_spent_plans), so the wipe walked straight past it.
+_pm = open(os.path.join(REPO, "paranoia_mode")).read()
+_gi = open(os.path.join(REPO, ".gitignore")).read()
+check("the marker is on paranoia_mode's wipe list", '".chain_once_*"' in _pm)
+check("...and in .gitignore, in lockstep as this repo requires",
+      ".chain_once_*" in _gi)
+
+# And the surviving-plans report must not name a destination those files do
+# not contain: the three registered plans are the fan-out, the veil and the
+# DAG round, whose destinations are mix subaddresses and carriers.
+_gsrc = open(os.path.join(REPO, "GhostSpiral")).read()
+_rep = _gsrc[_gsrc.index("unsigned plan file(s) are STILL ON DISK"):][:400]
+check("the surviving-plans report no longer claims those files hold "
+      "--exit-to", "--exit-to destination" not in _rep)
+check("...and still says what they DO hold",
+      "mix graph" in _rep and "account index" in _rep)
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

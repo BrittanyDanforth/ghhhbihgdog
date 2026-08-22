@@ -37,5 +37,18 @@ StandardError=null
 # so an unattended trigger converts the sealed keyfile back into a plaintext
 # one. A doorbell poked by a person who types the passphrase does not.
 #EnvironmentFile=/etc/gs-wake.env
-# The job goes in on STDIN, never on argv: /proc/<pid>/cmdline is mode 0444.
-ExecStart=/bin/sh -c 'echo "{\"job\":\"receive_and_quote\",\"amount_slot\":2}" | /usr/bin/python3 /opt/ghostspiral/gs_doorbell wake --key /etc/gs_wake_pi.key'
+# THE JOB GOES IN ON STDIN, NEVER ON ARGV -- and the line that used to be here
+# said exactly that while doing the opposite:
+#
+#   ExecStart=/bin/sh -c 'echo "{...}" | python3 gs_doorbell wake --key ...'
+#
+# /proc/<pid>/cmdline is mode 0444 and EVERY LOCAL ACCOUNT CAN READ IT. That
+# shell's argv held the whole job -- the job name and the amount slot -- for
+# as long as the poke lasted, two lines under a comment promising it did not.
+# gs_doorbell has no --job flag precisely so this cannot happen, and the
+# example smuggled one back in through a shell.
+#
+# systemd can open the file itself. No shell, no pipeline, nothing on an argv:
+#   /etc/gs-wake-job.json   root:root 0600   {"job":"receive_and_quote","amount_slot":2}
+StandardInput=file:/etc/gs-wake-job.json
+ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_doorbell wake --key /etc/gs_wake_pi.key

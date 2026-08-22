@@ -233,13 +233,22 @@ try:
     ghost.tor_recheck = lambda *a, **k: None
     ghost.integrity_log = lambda *a, **k: None
     ghost.secure_delay = lambda *a, **k: None
+    import tempfile as _tf
+    _outdir = _tf.mkdtemp(prefix="exitwd_")
     _args = types.SimpleNamespace(
         rpc_primary="http://127.0.0.1:18083", tor_proxy=None,
         rpc_daemon="http://127.0.0.1:18081", wallet_file="w",
         wallet_password="", fee_priority=1, allow_clearnet_relay=False,
-        exit_to=[A1, A2])
-    import tempfile as _tf
-    _stg = os.path.join(_tf.mkdtemp(prefix="exitwd_"), "tx_staging")
+        exit_to=[A1, A2],
+        # THE PLANS GO WHERE THE OPERATOR SAID. They used to be written to
+        # Path(staging_dir).parent, i.e. the shell's cwd, while every other
+        # plan went to args.output -- so the two that name the FINAL exit
+        # destination and the change destinations landed outside the 0700
+        # directory and outside the one _stage5_cleanup erases. This fixture
+        # had no `output` at all, which is how it stood in for a real args
+        # namespace that always has one.
+        output=_outdir)
+    _stg = os.path.join(_outdir, "tx_staging")
     os.makedirs(_stg, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()):
         relayed, failed, skipped, held, unclean = ghost._run_exit_withdrawals(
@@ -523,7 +532,12 @@ _wargs = types.SimpleNamespace(
     rpc_daemon="http://127.0.0.1:18081", wallet_file="w",
     wallet_password="", fee_priority=1, allow_clearnet_relay=False,
     exit_to=[A1], entry_veil=True, dag_mixing=False, peel=False,
-    output="./unsigned")
+    # A REAL DIRECTORY, not "./unsigned" relative to whatever cwd the suite
+    # happens to have. The exit and change-sweep plans are written here now
+    # rather than to Path(staging_dir).parent -- i.e. the shell's cwd -- so
+    # this fixture decides where the two plans naming the FINAL destination
+    # land, and it should not be the repository.
+    output=tempfile.mkdtemp(prefix="exitout_"))
 
 
 def _drive_stage5(args_ns, recorder):
@@ -1015,7 +1029,9 @@ try:
         exit_to="8" + "A" * 94, wallet_password="x",
         rpc="http://127.0.0.1:18083", rpc_primary="http://127.0.0.1:18083",
         tor_proxy="socks5h://127.0.0.1:9050", hop_delay=None, dry_run=False,
-        wallet_cli="/bin/true", split=1)
+        wallet_cli="/bin/true", split=1,
+        # The exit plan is written to args.output now, not to the cwd.
+        output=tempfile.mkdtemp(prefix="gs_torleak_out_"))
     _buf = io.StringIO()
     _leak_msg = None
     _returned = None
@@ -1277,7 +1293,10 @@ try:
 
     _csargs = types.SimpleNamespace(
         rpc="x", wallet_password="x", tor_proxy="x", hop_delay=None,
-        dry_run=False, rpc_primary="x", wallet_cli="/bin/true", split=1)
+        dry_run=False, rpc_primary="x", wallet_cli="/bin/true", split=1,
+        # The change-sweep plan names where each carrier's change goes, and it
+        # is written to args.output now rather than to the cwd.
+        output=tempfile.mkdtemp(prefix="gs_cs_out_"))
     _jobs = [(3, 0, "8" + "A" * 94, 1), (4, 0, "8" + "B" * 94, 1),
              (5, 0, "8" + "C" * 94, 1), (6, 0, "8" + "D" * 94, 1)]
     _buf3 = io.StringIO()
@@ -1711,6 +1730,78 @@ check("exitdests: the warning is raised before stage 0, while it is still "
 check("exitdests: ...and long before anything is spent",
       _ed_calls.get("resolve_exit_destinations", 10**9)
       < _ed_calls.get("_stage5_run", 0))
+
+
+# ===========================================================================
+# THE TWO PLANS THAT NAME THE FINAL DESTINATION GO WHERE THE OPERATOR SAID.
+#
+# They were written to `Path(staging_dir).parent`, and staging_dir is the bare
+# string "tx_staging", so its parent is "." -- the shell's working directory.
+# Every other plan a run writes goes to args.output, which secure_mkdir creates
+# 0700 and which _stage5_cleanup sweeps for stale unsigned_*.json.
+#
+# These are the worst two to misplace: the exit plan names the operator's FINAL
+# destination -- the address the whole pipeline exists to keep unlinked from
+# the public ThorChain memo -- and the change-sweep plan names where each
+# carrier's change goes. The contents were 0600, but the FILENAMES were
+# listable, "unsigned_exit_*.json" in a directory dates a withdrawal, and
+# sitting outside args.output meant the cleanup never saw them: a run that
+# tidied up after itself left exactly these behind.
+import tempfile as _tf9                                      # noqa: E402
+from srcutil import code_only as _code_only9                  # noqa: E402
+_g9 = open(os.path.join(REPO, "GhostSpiral")).read()
+# code_only: the comments explaining the fix quote the old expression, and a
+# raw substring search would match the explanation and call it a regression.
+check("neither plan is written relative to the working directory any more",
+      "Path(staging_dir).parent" not in _code_only9(
+          os.path.join(REPO, "GhostSpiral")))
+for _name in ("unsigned_exit_", "unsigned_changesweep_"):
+    _at = _g9.index(f'f"{_name}')
+    _line_start = _g9.rindex("\n", 0, _at)
+    check(f"{_name}*.json is written under args.output",
+          "args.output" in _g9[_line_start - 200:_at])
+
+# Driven: the real writer must put the file in the directory it was given, and
+# nothing in the working directory it was NOT given.
+_od9 = _tf9.mkdtemp(prefix="gs_where_")
+_cwd9 = os.getcwd()
+_scratch9 = _tf9.mkdtemp(prefix="gs_cwd_")
+_wrote9 = []
+_saved9 = (ghost._run_round, ghost.relay_gates, ghost.integrity_log,
+           ghost.secure_delay, ghost._wait_for_change_settled)
+ghost._run_round = lambda *a, **k: _wrote9.append(str(a[1]))
+ghost.relay_gates = lambda *a, **k: None
+ghost.integrity_log = lambda *a, **k: None
+ghost.secure_delay = lambda *a, **k: None
+# The change must be settled or the writer returns before writing anything --
+# which is how the first version of this check passed while exercising nothing.
+ghost._wait_for_change_settled = lambda *a, **k: (True, Decimal("1"))
+try:
+    os.chdir(_scratch9)
+    _a9 = types.SimpleNamespace(
+        rpc="x", wallet_password="x", tor_proxy="x", hop_delay=None,
+        dry_run=False, rpc_primary="x", wallet_cli="/bin/true", split=1,
+        output=_od9)
+    with contextlib.redirect_stdout(io.StringIO()):
+        # Keyword arguments: the positional tail is
+        # (label, seq, delay_window, outcomes) and passing (60, 120) into
+        # `label` put a tuple where hop_delay expected a window.
+        ghost._run_change_sweep(_a9, 3, 0, "8" + "A" * 94, 1,
+                                "tx_staging", {"http": "x"}, {},
+                                label="change sweep", seq=1,
+                                delay_window=(60, 120))
+finally:
+    (ghost._run_round, ghost.relay_gates, ghost.integrity_log,
+     ghost.secure_delay, ghost._wait_for_change_settled) = _saved9
+    os.chdir(_cwd9)
+check("the writer actually ran, so this check is not passing on an early "
+      "return", bool(_wrote9))
+check("the change-sweep plan lands in --output, not in the shell's cwd",
+      bool(_wrote9) and _wrote9[0].startswith(_od9))
+check("...and nothing was written into the working directory",
+      not [f for f in os.listdir(_scratch9) if f.startswith("unsigned_")])
+check("...and the directory it landed in is owner-only",
+      oct(os.stat(_od9).st_mode)[-3:] == "700")
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

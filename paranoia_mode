@@ -18,7 +18,7 @@ OPSEC hardening:
   - All actions idempotent and safe to re-run
 """
 from __future__ import annotations
-import argparse, glob, os, random, shutil, socket, subprocess, sys, tempfile, time
+import argparse, glob, os, random, re, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 from gs_common import (
@@ -65,10 +65,45 @@ def _shell_histories() -> list:
         home / ".wget-hsts",
         home / ".viminfo",
     ]
-    # Wherever the operator actually pointed it.
+    # WHEREVER THE OPERATOR ACTUALLY POINTED IT -- and os.environ was the wrong
+    # place to look. HISTFILE is a shell VARIABLE, not an environment variable:
+    # bash sets it and does not export it. Measured:
+    #
+    #     $ declare -p HISTFILE
+    #     declare -- HISTFILE="/root/.bash_history"      <- no -x
+    #     $ python3 -c 'import os; print(os.environ.get("HISTFILE"))'
+    #     None
+    #
+    # So this branch never fired, in the one case the docstring above names as
+    # the reason it exists: "an operator who moved their history anywhere kept
+    # it through every wipe". The stake is in that docstring too -- a
+    # `--wallet-password` typed at a shell sits in that file verbatim.
+    #
+    # A child process cannot read its parent's shell variables at all. What it
+    # CAN read is where the operator wrote the assignment, so the startup files
+    # are parsed for a literal HISTFILE=. Deliberately literal-only: anything
+    # with a command substitution or another variable in it is not resolvable
+    # here, and guessing at one would produce a path that is wiped instead of
+    # the real one -- worse than missing it, because the summary would then
+    # report success over the wrong file.
     hf = os.environ.get("HISTFILE")
     if hf:
         cands.append(Path(hf).expanduser())
+    for rc in (".bashrc", ".bash_profile", ".profile", ".zshrc", ".zshenv",
+               ".zprofile", ".kshrc"):
+        try:
+            text = (home / rc).read_text(errors="replace")
+        except OSError:
+            continue
+        for hit in re.finditer(r"^\s*(?:export\s+)?HISTFILE=(\S+)\s*$",
+                               text, re.M):
+            v = hit.group(1).strip().strip("\"'")
+            if "$(" in v or "`" in v:
+                continue
+            v = v.replace("$HOME", str(home)).replace("${HOME}", str(home))
+            if "$" in v:
+                continue
+            cands.append(Path(v).expanduser())
     out, seen = [], set()
     for c in cands:
         try:
@@ -605,6 +640,18 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # 24h wake budget; gs_wake_handles.json maps a 4-hex handle to the bundle
     # and slip it names, so it is a direct index into this run's addresses.
     "gs_wake_state.json", "gs_wake_handles.json", ".gs_wake_inhibit",
+    # WHERE A WOKEN JOB'S CHILDREN WRITE, because the alternative was the
+    # systemd journal -- persistent, root-owned, rotated rather than erased,
+    # and outside every root this sweep searches. It holds whatever
+    # thor_swap_preparer printed: the BTC deposit address and the ThorChain
+    # memo, which names the destination XMR address in plain text.
+    "gs_wake_job.log",
+    # integrity_log_once's run-scoped dedupe marker, written into the
+    # --output directory beside the plans. It was in NEITHER this list nor
+    # .gitignore, so an incomplete run -- which keeps its marker by design,
+    # because report_completion exits before _wipe_spent_plans -- left it
+    # behind for the wipe to walk straight past.
+    ".chain_once_*",
     # THE WAKE KEYPAIR. Suffixed "*.key" on purpose: a "gs_wake_*" glob would
     # match the TRACKED scripts gs_wake_keys and gs_wake_agent, and
     # tests/test_gitignore.py's backward check (no tracked file may be
@@ -637,7 +684,14 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # that from here; wiping it is what we can do.
     "monero-wallet-cli.log", "monero-wallet-rpc.log",
     "monerod.log", "bitmonero.log",
-    "renamethis1",
+    # NOTHING TRACKED BY GIT BELONGS ON THIS LIST. "renamethis1" was here and
+    # is a committed file in this repository, so a real wipe shredded a file
+    # git then reported as deleted -- dirtying the working tree of the tool
+    # doing the wiping, for no gain: the file is already published, and
+    # deleting the local copy does not unpublish it. This list is for RUNTIME
+    # artifacts, which are the ones that are private and the ones .gitignore
+    # covers. tests/test_gitignore.py now checks the two lists cannot disagree
+    # about that in either direction.
 ]
 GS_ARTIFACT_DIR_PATTERNS = [
     "signed_blobs", "unsigned", "tx_staging",
@@ -860,10 +914,43 @@ def wipe_tmp_files(dry: bool):
     are swept by PREFIX only -- see _wipe_targeted_temp_roots for why both are
     real gaps and why neither may be wiped wholesale.
     """
+    # WHOSE FILES, EXACTLY. os.getuid() was the answer, and under `sudo
+    # paranoia_mode` -- which the summary's own failure text tells the operator
+    # to use -- that answer is ROOT. So the "blanket uid-scoped sweep" became a
+    # blanket sweep of every root-owned entry in /tmp and /var/tmp:
+    # systemd-private-* directories belonging to running units, .X11-unix,
+    # .ICE-unix, and whatever any root daemon has open. Demonstrated by running
+    # it: a real wipe on this box removed unrelated tooling's working files out
+    # of /tmp mid-session.
+    #
+    # This file already argues the point, about /dev/shm, two functions down:
+    # "wiping it wholesale breaks running software". The same reasoning was not
+    # applied here.
+    #
+    # SUDO_UID is what the operator actually meant: clean up MY session, not
+    # root's. When there is no SUDO_UID and we are root -- a real root login --
+    # there is no such thing as "the operator's own temp files", so the blanket
+    # sweep is skipped entirely and the targeted prefix sweep below is the only
+    # thing that runs. Said out loud rather than silently narrowed.
     uid = os.getuid()
+    try:
+        if uid == 0 and os.environ.get("SUDO_UID"):
+            uid = int(os.environ["SUDO_UID"])
+    except (TypeError, ValueError):
+        pass
     count = 0
     failed = 0
     blanket = ["/tmp", "/var/tmp"]
+    if uid == 0:
+        print("  [!] Running as root with no SUDO_UID, so /tmp and /var/tmp are "
+              "NOT swept wholesale:")
+        print("      every root-owned entry there belongs to a running service, "
+              "not to your session")
+        print("      (systemd-private-*, .X11-unix, .ICE-unix). This "
+              "toolchain's own scratch is still")
+        print("      erased by prefix below. Run this as your normal user, or "
+              "under sudo, to sweep yours.")
+        blanket = []
     for tmpdir in blanket:
         if not os.path.isdir(tmpdir):
             continue
@@ -992,6 +1079,11 @@ def wipe_xdg_traces(dry: bool):
     return failed
 
 
+#: What scrub_env_vars found, kept for the summary. See the note in that
+#: function for why the summary cannot just look at os.environ itself.
+SCRUBBED: list = []
+
+
 def scrub_env_vars(dry: bool):
     """Remove GhostSpiral-related environment variables from the current process.
 
@@ -1005,9 +1097,17 @@ def scrub_env_vars(dry: bool):
     ]
     count = 0
     found = []
+    # RECORDED BEFORE THEY ARE DELETED, and shared with the summary. The
+    # summary's "still to do" list used to rebuild this by scanning os.environ
+    # -- AFTER this phase had emptied it -- so the one reminder that names the
+    # operator's own shell as still holding GS_WALLET_PASSWORD could never fire.
+    # A phase that erases the evidence a later check looks for is a check that
+    # is always green and never true.
+    SCRUBBED.clear()
     for key in list(os.environ.keys()):
         if any(key.upper().startswith(p) for p in sensitive_prefixes):
             found.append(key)
+            SCRUBBED.append(key)
             if dry:
                 print(f"  [dry] would unset env {key}")
             else:
@@ -1152,10 +1252,28 @@ def main():
         print("  [+] paranoia_mode complete — every phase reported success.")
         print("  [i] Best-effort caveats still apply: swap-device bytes and freed")
         print("      RAM are not zeroed, and CoW/SSD filesystems can retain blocks.")
+    else:
+        print("  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT "
+              "known clean.")
+        for name, n in bad.items():
+            print(f"      - {name}: {n} failure(s)")
+        print(f"  [!] {total} item(s)/phase(s) did not complete. Many phases "
+              f"need root")
+        print("      (sudo) — re-run failed steps and verify before assuming "
+              "clean.")
+
+    # OUTSIDE THE SUCCESS BRANCH, and that was the defect. All of this used to
+    # live under `elif not bad:` -- so a run with ONE failed phase printed none
+    # of it. A non-root run always fails the MAC spoof, and non-root is how the
+    # operator is told to run this, so in practice the wallet warning and the
+    # two outstanding actions were unreachable on exactly the runs that needed
+    # them most. A wipe that half-worked needs the caveats MORE than one that
+    # worked, not less.
+    if not args.dry_run:
         # THE BIGGEST THING THIS TOOL DOES NOT DO, said out loud.
         #
-        # "Every phase reported success" reads like "the host is clean of the
-        # mix". It is not, and the gap is not a caveat about block remanence --
+        # A completion line reads like "the host is clean of the mix". It is
+        # not, and the gap is not a caveat about block remanence --
         # it is the wallet, sitting in plain sight. This tool deletes the
         # pipeline's ARTIFACTS; it deliberately never touches the wallet file,
         # because that is the operator's money. A wallet holds the balances,
@@ -1188,8 +1306,9 @@ def main():
                 "`history clear`). A shell holds its history in MEMORY and "
                 "writes it\n        back out when it exits — including any "
                 "command you typed a password or address into.")
-        _envleft = [k for k in os.environ
-                    if k.upper().startswith(("GS_", "GHOSTSPIRAL", "XMR_", "BTC_"))]
+        # From what the scrub phase RECORDED, not from os.environ, which that
+        # phase has already emptied.
+        _envleft = sorted(SCRUBBED)
         if _envleft:
             _still.append(
                 "Run `unset " + " ".join(sorted(_envleft)) + "` in the shell "
@@ -1201,12 +1320,7 @@ def main():
             print("  [!] STILL TO DO — this tool cannot do these for you:")
             for _i, _t in enumerate(_still, 1):
                 print(f"      {_i}. {_t}")
-    else:
-        print(f"  [!] paranoia_mode FINISHED WITH FAILURES — the host is NOT known clean.")
-        for name, n in bad.items():
-            print(f"      - {name}: {n} failure(s)")
-        print(f"  [!] {total} item(s)/phase(s) did not complete. Many phases need root")
-        print(f"      (sudo) — re-run failed steps and verify before assuming clean.")
+    if bad:
         sys.exit(1)
 
 

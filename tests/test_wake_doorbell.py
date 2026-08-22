@@ -24,6 +24,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -119,10 +120,18 @@ class Bell:
         self.srv.server_close()
 
 
-def m1_for(eph, chal):
+def m1_for(eph, chal, window=None):
+    """An M1 bound to a wake window. `window` is the Pending's live nonce.
+
+    Defaulting it to a FRESH random value rather than to the live one, so a
+    test that forgets to pass the real window gets a refusal instead of a
+    silent pass -- the window check is the thing being tested, and a default
+    that happens to satisfy it would test nothing.
+    """
     return P.seal(TP, PI.public_key, P.TAG_M1,
                   {"eph_pk": eph.public_key.encode().hex(),
-                   "challenge": chal.hex()})
+                   "challenge": chal.hex(),
+                   "window": (window or P.new_window()).hex()})
 
 
 print("== the Pi holds nothing, enforced by the import list ==")
@@ -251,22 +260,53 @@ for raw, why in (('{"job":"receive_and_quote","amount_slot":2}', None),
 print("\n== one job, handed over at most once ==")
 b = Bell()
 eph, chal = NP.PrivateKey.generate(), P.new_challenge()
-st, m2 = b.post("/wake", m1_for(eph, chal))
+st, m2 = b.post("/wake", m1_for(eph, chal, b.pending.window))
 check("an authenticated M1 gets the job", st == 200 and len(m2) == P.RECORD_LEN)
 body = P.open_record(eph, PI.public_key, m2, P.TAG_M2)
 check("...the M2 echoes this boot's challenge", body["challenge"] == chal.hex())
 check("...and names the job the operator asked for",
       body["job"] == "receive_and_quote" and body["amount_slot"] == 1)
 
-st2, m2b = b.post("/wake", m1_for(eph, chal))
+st2, m2b = b.post("/wake", m1_for(eph, chal, b.pending.window))
 check("REPLAYING the same M1 returns the SAME M2 and consumes nothing — a "
       "genuine retry and a LAN replay are the same request",
       st2 == 200 and m2b == m2)
 
 eph2 = NP.PrivateKey.generate()
-st3, _ = b.post("/wake", m1_for(eph2, P.new_challenge()))
+st3, _ = b.post("/wake", m1_for(eph2, P.new_challenge(), b.pending.window))
 check("a DIFFERENT authenticated boot gets nothing — queue depth is one",
       st3 == 204)
+
+# ONE CAPTURE USED TO BE A PERMANENT REMOTE DoS. The response cache makes a
+# replay harmless WITHIN a process, and the reasoning was that capturing an M1
+# needs the on-path position, so a replayer could just drop packets instead.
+# That is wrong: capturing needs on-path ONCE. Replaying does not. Afterwards
+# any host on the switch posts that M1 the moment a window opens, takes the
+# job, and leaves the vault to boot, hear "no job" and power off -- for every
+# wake, forever, while the operator reads "somebody sent a stray magic packet".
+wb = Bell()
+_stale = m1_for(NP.PrivateKey.generate(), P.new_challenge(),
+                P.new_window())          # a note from some other window
+_ws, _wbody = wb.post("/wake", _stale)
+check("an M1 written for a DIFFERENT wake window gets nothing", _ws == 204)
+check("...and is recorded as such, not as a bad note",
+      wb.pending.events.count("m1_stale_window") == 1)
+_eph2, _ch2 = NP.PrivateKey.generate(), P.new_challenge()
+_gs, _gm2 = wb.post("/wake", m1_for(_eph2, _ch2, wb.pending.window))
+check("...and CONSUMED NOTHING: the real vault still collects the job "
+      "afterwards, which is the whole point of refusing rather than caching",
+      _gs == 200 and len(_gm2) == P.RECORD_LEN)
+check("the window nonce is served to anyone who asks, because the vault must "
+      "have it before it can seal anything",
+      wb.post("/window", b"")[1] == wb.pending.window)
+check(f"...and it is {P.WINDOW_BYTES} bytes, chosen so M1 still fits one "
+      f"padded block with headroom for the next field",
+      len(wb.pending.window) == P.WINDOW_BYTES)
+wb.close()
+
+wb2 = Bell()
+check("two doorbells never share a window", wb2.pending.window != wb.pending.window)
+wb2.close()
 
 forged = P.seal(NP.PrivateKey.generate(), PI.public_key, P.TAG_M1,
                 {"eph_pk": eph.public_key.encode().hex(),
@@ -311,7 +351,7 @@ b.close()
 b2 = Bell()
 check("a failed/refused result may carry no handle, because there is nothing "
       "to name",
-      b2.post("/wake", m1_for(eph, chal))[0] == 200
+      b2.post("/wake", m1_for(eph, chal, b2.pending.window))[0] == 200
       and b2.post("/result", P.seal(TP, PI.public_key, P.TAG_M3,
                                     {"job_id": b2.pending.job_id,
                                      "challenge": chal.hex(),
@@ -328,12 +368,13 @@ b3.t[0] += DB.FETCH_WINDOW_S + 1
 check("an uncollected job expires after the fetch window",
       b3.pending.finished() and b3.pending.outcome() == "expired_uncollected")
 check("...and a late M1 gets nothing",
-      b3.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge()))[0]
+      b3.post("/wake", m1_for(NP.PrivateKey.generate(),
+                              P.new_challenge(), b3.pending.window))[0]
       == 204)
 b3.close()
 
 b4 = Bell()
-b4.post("/wake", m1_for(eph, chal))
+b4.post("/wake", m1_for(eph, chal, b4.pending.window))
 check("a collected job is not finished while its budget runs",
       not b4.pending.finished())
 b4.t[0] += P.JOBS["receive_and_quote"]["budget_s"] + 1
@@ -407,7 +448,7 @@ os.chdir(scratch)
 try:
     before = sorted(os.listdir("."))
     b5 = Bell()
-    b5.post("/wake", m1_for(eph, chal))
+    b5.post("/wake", m1_for(eph, chal, b5.pending.window))
     b5.post("/result", P.seal(TP, PI.public_key, P.TAG_M3,
                               {"job_id": b5.pending.job_id,
                                "challenge": chal.hex(),
@@ -429,8 +470,8 @@ print("\n== the operator is TOLD when a second boot took the job ==")
 # among the ones being dropped on the floor.
 er = Bell()
 ereph, echal = NP.PrivateKey.generate(), P.new_challenge()
-er.post("/wake", m1_for(ereph, echal))
-er.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge()))
+er.post("/wake", m1_for(ereph, echal, er.pending.window))
+er.post("/wake", m1_for(NP.PrivateKey.generate(), P.new_challenge(), er.pending.window))
 er.close()
 check("a second authenticated ephemeral is RECORDED, not just refused",
       er.pending.events.count("m1_second_ephemeral") == 1)
@@ -462,7 +503,7 @@ check("a junk /result is counted and reported without being called an attack",
 # operator to look at the switch instead of at the vault.
 er3 = Bell()
 er3eph, er3ch = NP.PrivateKey.generate(), P.new_challenge()
-er3.post("/wake", m1_for(er3eph, er3ch))
+er3.post("/wake", m1_for(er3eph, er3ch, er3.pending.window))
 _good = P.seal(TP, PI.public_key, P.TAG_M3,
                {"job_id": er3.pending.job_id, "challenge": er3ch.hex(),
                 "status": "done", "handle": "BEEF"})
@@ -494,6 +535,82 @@ with contextlib.redirect_stdout(_buf3):
 check("...and a clean cycle prints NO event line at all",
       "different boot" not in _buf3.getvalue()
       and "did not authenticate" not in _buf3.getvalue())
+
+
+print("\n== the passphrase floor ==")
+# It was eight characters. Against Argon2id at 256 MiB and somebody holding the
+# SD card, eight characters of anything a person invents is a delay, not a
+# passphrase -- and this passphrase is the ONLY thing between a stolen card and
+# the vault's MAC address.
+for _pw, _ok, _why in (("hunter2", False, "a seven-character classic"),
+                       ("shortpw1", False, "eight characters"),
+                       ("one two three", False, "three words"),
+                       ("correct horse battery staple", True, "four words"),
+                       ("aVeryLongSinglePassword", True, "one long string")):
+    _seq = iter([_pw, _pw, "correct horse battery staple",
+                 "correct horse battery staple"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        _got = DB.new_passphrase(lambda p: next(_seq))
+    check(f"{'accepts' if _ok else 'refuses'} {_why}",
+          (_got.decode() == _pw) is _ok)
+_seq = iter(["correct horse battery staple", "different words entirely here",
+             "correct horse battery staple", "correct horse battery staple"])
+with contextlib.redirect_stdout(io.StringIO()):
+    _got = DB.new_passphrase(lambda p: next(_seq))
+check("a mismatch on the second entry asks again rather than taking the first",
+      _got == b"correct horse battery staple")
+_buf = io.StringIO()
+_seq = iter(["hunter2", "hunter2", "correct horse battery staple",
+             "correct horse battery staple"])
+with contextlib.redirect_stdout(_buf):
+    DB.new_passphrase(lambda p: next(_seq))
+check("...and the refusal says the number is a FLOOR, not a measure of "
+      "strength, because nothing here can tell a dice roll from a memory",
+      "not a measure" in _buf.getvalue())
+
+
+print("\n== the doorbell does not introduce itself ==")
+# The wake port is randomised at pairing so one install does not look like the
+# next. A Server: header saying "BaseHTTP/0.6 Python/3.11.15" hands that back,
+# names the language and the minor version, and DATES the SD image. Date: is
+# worse: it is the Pi's wall clock to the second, and this Pi is the only box
+# here with a correct clock -- so it is the one worth correlating against a Tor
+# circuit or a Bitcoin timestamp.
+hb = Bell()
+_raw = socket.create_connection(("127.0.0.1", hb.port), timeout=10)
+_raw.sendall(b"POST /wake HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+time.sleep(0.4)
+_resp = _raw.recv(8192)
+_raw.close()
+for _tok in (b"Server:", b"Date:", b"Python", b"BaseHTTP"):
+    check(f"no {_tok.decode().rstrip(':')} in the response", _tok not in _resp)
+check("...and it still answers, so this is not a broken server passing by "
+      "saying nothing", _resp.startswith(b"HTTP/1.1 400"))
+check("every response closes the connection: HTTP/1.1 keep-alive would let a "
+      "client hold the socket for the whole window by not sending anything",
+      b"Connection: close" in _resp)
+
+# ANY LAN HOST CAN OPEN A CONNECTION AND SEND NOTHING. ThreadingHTTPServer
+# starts a thread per connection, on a Pi with 1 GB of RAM and Tor resident,
+# and the window is ten minutes long.
+_t0 = time.monotonic()
+_silent = socket.create_connection(("127.0.0.1", hb.port), timeout=90)
+_silent.settimeout(90)
+try:
+    _got = _silent.recv(4096)
+    _held = time.monotonic() - _t0
+    check(f"a connection that sends nothing is dropped ({int(_held)}s), not "
+          f"left holding a thread for the whole wake window",
+          _got == b"" and _held < 60)
+except socket.timeout:
+    check("a connection that sends nothing is dropped, not left holding a "
+          "thread for the whole wake window", False)
+finally:
+    _silent.close()
+check("...on a bound that is stated in the handler rather than inherited",
+      DB.make_handler(hb.pending).timeout is not None
+      and DB.make_handler(hb.pending).timeout <= 60)
+hb.close()
 
 
 print("\n== the doorbell is quiet ==")

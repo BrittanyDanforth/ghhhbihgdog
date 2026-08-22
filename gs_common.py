@@ -24,8 +24,60 @@ from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
 
+import logging
 import requests
 from tenacity import retry, wait_exponential_jitter, stop_after_attempt
+
+
+# ---------------------------------------------------------------------------
+#  THIRD-PARTY LOGGERS DO NOT GET STDERR
+# ---------------------------------------------------------------------------
+def _silence_third_party_logging() -> None:
+    """Keep monero-python's own logging off every stream this toolchain uses.
+
+    THIS WHOLE TOOLCHAIN REDACTS ADDRESSES -- scrub_address on every operator
+    line, chain_safe on every integrity entry, argv kept clear of amounts -- and
+    then imports a library that dumps whole JSON-RPC responses to stderr.
+    monero/backends/jsonrpc/wallet.py, raw_request():
+
+        if "error" in result:
+            if not squelch_error_logging:
+                _log.error("JSON RPC error:\n{result}".format(result=_ppresult))
+
+    with _ppresult being the entire pretty-printed response, and _log.debug one
+    line above it printing the entire PARAMS -- which for a transfer are the
+    destination addresses and the amounts.
+
+    A logger with no handler is not silent. Measured:
+
+        logging.lastResort -> <_StderrHandler <stderr> (WARNING)>
+
+    so an ERROR record with nothing configured goes to stderr anyway. In
+    gs_console that stream is retained per job; in gs_wake_agent it is now the
+    job log; on an operator's terminal it is scrollback. None of those are
+    places an unredacted RPC response belongs, and none of them were chosen for
+    it -- it arrives by default, from a dependency, past every redactor here.
+
+    The exceptions still propagate: _err2exc raises immediately after, so the
+    tool still fails and still says so in its own words. Only the dump goes.
+
+    OPT-IN, not a permanent gag: GS_DEBUG_RPC_LOG=1 puts it back for an
+    operator who is deliberately debugging, on the understanding that they have
+    just turned redaction off.
+    """
+    if os.environ.get("GS_DEBUG_RPC_LOG"):
+        return
+    for name in ("monero", "monero.backends", "monero.backends.jsonrpc",
+                 "monero.backends.jsonrpc.wallet",
+                 "monero.backends.jsonrpc.daemon"):
+        lg = logging.getLogger(name)
+        lg.handlers[:] = [logging.NullHandler()]
+        # propagate=False is what actually stops lastResort: a record that
+        # reaches the root logger with no handlers is handed to it.
+        lg.propagate = False
+
+
+_silence_third_party_logging()
 
 # ---------------------------------------------------------------------------
 #  Constants
@@ -34,6 +86,9 @@ from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 VERSION = "10.5"
 CHECK_TOR_URL = "https://check.torproject.org/api/ip"
 INTEGRITY_LOG = Path("integrity_chain.log")
+#: Chain entries a signal handler wanted to write. See _shutdown_handler for
+#: why a handler must never take the chain lock itself.
+_PENDING_CHAIN: list = []
 
 #: One piconero, the smallest amount Monero represents. Used to put a gate
 #: strictly ABOVE a computed quantity rather than merely at it.
@@ -322,6 +377,17 @@ def _b58_run_is_addressy(run: str) -> bool:
     return flips >= 4 and flips / len(cased) >= 0.35
 
 
+#: Any of the usual separators, upper or lower case. Anchored on non-hex
+#: boundaries so an ordinary hex string is not mistaken for one.
+_CHAIN_MAC_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z])")
+#: bech32 / bech32m, mainnet and testnet, segwit v0 and v1. The data part is
+#: the bech32 charset (no 1, b, i or o), 6+ characters, and in practice 25-87.
+_CHAIN_BECH32_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?:bc|tb|bcrt)1[02-9ac-hj-np-z]{7,87}(?![0-9A-Za-z])",
+    re.I)
+
+
 def chain_safe(msg: str) -> str:
     """Strip every number out of a chain payload, keeping the event.
 
@@ -402,6 +468,34 @@ def chain_safe(msg: str) -> str:
         # branch has no false positives and no misses. The rate rule below is
         # a heuristic and gets ~99% of full addresses on its own -- 1% is not
         # a number to accept for the value that identifies the operator.
+        # A MAC ADDRESS, WHOLE, BEFORE THE DIGIT RULE EVER SEES IT.
+        #
+        # There was no MAC rule at all, and the digit rule is not one. Measured
+        # on the shipped function:
+        #
+        #   mac=de:ad:be:ef:ca:fe   ->  mac=de:ad:be:ef:ca:fe   (untouched)
+        #   a4:c3:f0:1b:de:ad       ->  a#:c#:f#:#b:de:ad
+        #
+        # The first has no digits in it, so nothing fired. The second kept two
+        # octets verbatim and turned the rest into a pattern with the digit
+        # POSITIONS known -- a handful of candidates, not a redaction. A MAC is
+        # the one identifier that survives reinstalling the machine, and this
+        # file's own comment in paranoia_mode says the remedy is to record THAT
+        # a spoof happened and never the value. That remedy only holds if the
+        # redactor can actually remove one when a call site slips.
+        out = _CHAIN_MAC_RE.sub("<mac>", out)
+        # BECH32, likewise. _CHAIN_B58_RUN_RE is base58, which excludes 0, O, I
+        # and l -- and bech32 is a different alphabet entirely, so a bc1
+        # address fell through to the digit rule:
+        #
+        #   bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
+        #     ->  bc#qar#srrr#xfkvy#l#lydnw#re#gtzzwf#mdq
+        #
+        # which is most of the address, in order, with the gaps' widths shown.
+        # That is a search key, not a redaction. The BTC entry address is what
+        # the ThorChain memo publishes; it is the one value tying this operator
+        # to a public Bitcoin transaction.
+        out = _CHAIN_BECH32_RE.sub("<addr>", out)
         out = re.sub(r"[1-9A-HJ-NP-Za-km-z]{90,}", "<addr>", out)
         out = _CHAIN_ADDR_RE.sub("<addr>", out)
         out = _CHAIN_B58_RUN_RE.sub(
@@ -455,12 +549,25 @@ def integrity_log(stage: str, msg: str, log_path: Path = INTEGRITY_LOG) -> str:
             if lines:
                 prev = lines[-1].split(" | ")[0].strip()
         ts = int(time.time()) // 600 * 600  # coarsen to 10-min buckets
-        # REDACTED HERE, at the one place every tool passes through, so a call
-        # site added later cannot reintroduce the leak by being written the
-        # obvious way. See chain_safe.
-        line = f"{ts}|{VERSION}|{stage}|{chain_safe(msg)}"
-        h = hashlib.sha256((prev + line).encode()).hexdigest()
-        _append_chain_line(log_path, h, line)
+        # ANYTHING A SIGNAL HANDLER WANTED TO SAY GOES FIRST, inside this same
+        # lock. See _shutdown_handler: it may not take the lock itself, so it
+        # leaves the record here and the next ordinary call writes it, chained
+        # in order like everything else.
+        pending = []
+        while _PENDING_CHAIN:
+            try:
+                pending.append(_PENDING_CHAIN.pop(0))
+            except IndexError:                               # pragma: no cover
+                break
+        h = None
+        for _stage, _msg in pending + [(stage, msg)]:
+            # REDACTED HERE, at the one place every tool passes through, so a
+            # call site added later cannot reintroduce the leak by being
+            # written the obvious way. See chain_safe.
+            line = f"{ts}|{VERSION}|{_stage}|{chain_safe(_msg)}"
+            h = hashlib.sha256((prev + line).encode()).hexdigest()
+            _append_chain_line(log_path, h, line)
+            prev = h
     finally:
         if lock_fd is not None:
             try:
@@ -730,7 +837,23 @@ def wipe_covers(target) -> bool:
     """
     try:
         res = Path(target).resolve()
-        if res.is_file() or res.suffix:
+        # A DOT IN A DIRECTORY NAME IS NOT A FILE EXTENSION. This was
+        # `if res.is_file() or res.suffix`, so any path whose last component
+        # contains a dot was treated as a file and replaced by its PARENT --
+        # and directories with dots in them are ordinary:
+        #
+        #   $HOME/gs/run.2026    -> checked $HOME/gs   -> "covered" (depth 1)
+        #   $HOME/a/b            -> checked $HOME/a/b  -> not covered (depth 2)
+        #
+        # So `--output ~/gs/run.2026` was reported as inside the wipe when the
+        # sweep never enumerates it, and every tool that asks this question
+        # says "your artifacts will be erased" on the strength of the answer.
+        # The suffix shortcut only exists to turn a FILE path into its
+        # directory, so ask the filesystem when it can answer and fall back to
+        # the suffix heuristic only for a path that does not exist yet.
+        if res.is_file():
+            res = res.parent
+        elif not res.exists() and res.suffix:
             res = res.parent
         # DEPTH 0 AND 1, which is what the paragraph above says and what the
         # sweep actually does. This was `r in res.parents`, which is true at
@@ -782,8 +905,21 @@ def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
     indistinguishable from one who does not, because nobody ever looks.
 
     What this can and cannot show, stated plainly so it is not oversold:
-      * It detects an EDIT or a DELETION in the middle of the file: every link
-        after the change fails recomputation.
+      * It detects an edit or deletion in the middle of the file BY SOMETHING
+        THAT DID NOT RECOMPUTE -- a partial overwrite, a truncating write, a
+        filesystem corruption, an editor, a script that rewrote one line.
+        Every link after the change then fails recomputation.
+      * It does NOT detect an edit by an adversary WHO RECOMPUTES. The chain is
+        unkeyed: each link is sha256(previous_hash + payload) and the hash
+        function is public, so anyone who can write to the file can rewrite a
+        payload and recompute every hash below it in a loop of four lines.
+        Reproduced against this function with its own algorithm. An earlier
+        version of this list said "it detects an EDIT or a DELETION in the
+        middle of the file" without that qualifier, which reads as tamper
+        evidence against a person and is not. Making it so would need a key
+        this process cannot keep from someone holding the disk -- the same
+        problem gs_wake_keys documents for the vault's keyfile -- or an
+        off-machine append-only sink, which is not shipped.
       * It does NOT detect TRUNCATION of the tail, and it cannot. Nothing here
         signs the chain's length or its head, so lopping off the last N lines
         leaves a shorter chain that verifies perfectly. Detecting that needs a
@@ -1000,9 +1136,22 @@ def integrity_log_once(stage: str, kind: str, log_path: Path = INTEGRITY_LOG) ->
         # The chain's own lock serialises this: rounds are sequential and each
         # spawns one child at a time, so a plain read-then-append is enough,
         # and a lost race costs one duplicate line rather than a wrong chain.
-        _line = f"{stage}\t{kind}\n"
+        # REDACTED HERE TOO. This file is a second copy of every chain payload,
+        # written to disk beside the chain and keyed on the RAW value -- so a
+        # `kind` carrying an address or a MAC was stored verbatim in it while
+        # the chain itself, one line below, stored chain_safe's version. The
+        # redactor was bypassed by the deduplicator that feeds it.
+        #
+        # Redacting the key changes nothing about deduplication: chain_safe is
+        # deterministic, so two payloads that redact to the same string were
+        # always going to produce the same chain line, and collapsing them is
+        # what this function is for.
+        _line = f"{chain_safe(stage)}\t{chain_safe(kind)}\n"
         try:
-            with open(_shared, "a+") as _f:
+            # 0600, and set at creation. This is chain material and the default
+            # umask would leave it 0644.
+            _fd = os.open(_shared, os.O_RDWR | os.O_CREAT, 0o600)
+            with os.fdopen(_fd, "a+") as _f:
                 _f.seek(0)
                 if _line in _f.read():
                     return ""
@@ -1712,6 +1861,24 @@ class MoneroRPC:
         from monero.wallet import Wallet as XMRWallet
         from monero.backends.jsonrpc import JSONRPCWallet
         parsed = urlparse(url)
+        # THE SCHEME IS DROPPED HERE, SO SAY SO RATHER THAN SPEAK CLEARTEXT.
+        # Only hostname and port are read; JSONRPCWallet is then constructed
+        # with host= and port= and speaks plain HTTP. An operator who
+        # configures https://wallet:18083 -- because they put the RPC behind a
+        # TLS terminator, which is the ordinary reason to write https -- gets
+        # an unencrypted connection and no indication of it. Refusing is the
+        # only honest answer: this cannot deliver what the URL asked for, and
+        # silently delivering less is the failure mode this whole file is
+        # written against.
+        if (parsed.scheme or "http").lower() not in ("http", ""):
+            sys.exit(
+                f"[!] RPC URL scheme {parsed.scheme!r} is not supported.\n"
+                f"    This client speaks plain HTTP to host:port -- the scheme "
+                f"is not carried through to the connection, so an https:// URL "
+                f"would have been spoken in CLEARTEXT with nothing saying so.\n"
+                f"    Use http:// and put the confidentiality where this "
+                f"toolchain puts it: on the Tor circuit (--tor-proxy) or on "
+                f"loopback.")
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 18083
 
@@ -2143,9 +2310,38 @@ _SHUTDOWN_REQUESTED = False
 
 
 def _shutdown_handler(signum, frame):
+    """Set the flag, say so, and touch NOTHING that can block.
+
+    THIS CALLED integrity_log, AND THAT IS A GUARANTEED DEADLOCK. integrity_log
+    takes an exclusive flock on integrity_chain.log.lock for its whole
+    read-modify-write, and it opens a FRESH descriptor every call. flock
+    conflicts are per open file description, not per process, so a second
+    LOCK_EX from inside a signal handler that interrupted the first one blocks
+    on a lock only the interrupted code can release -- and it cannot, because
+    the handler is on top of it.
+
+    Reproduced, not reasoned about: hold the lock, deliver SIGINT, and the
+    process hangs forever. `timeout` had to kill it.
+
+    What that costs is worse than a hang. Every tool here logs at startup and
+    receive_watch logs once per failed poll for up to 24 hours, so the window is
+    hit in ordinary use -- and an operator whose Ctrl-C does nothing reaches for
+    kill -9, which is the one thing this toolchain must not receive: SIGKILL
+    runs no finally block, so .gs_pw_* (the plaintext wallet password) and the
+    plan files stay on disk. A deadlock here converts an interrupt into a
+    secret left behind.
+
+    So the handler records what it wants said and returns. The next ordinary
+    integrity_log call writes it, inside the lock, chained in order. If the
+    process exits before there is one, the line is lost -- which is the honest
+    trade and is stated rather than hidden: a missing line beats an
+    uninterruptible process.
+    """
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
-    integrity_log("signal", f"shutdown_requested_sig={signum}")
+    # list.append is a single bytecode under the GIL, so it is safe from a
+    # handler; open()/flock() are not.
+    _PENDING_CHAIN.append(("signal", f"shutdown_requested_sig={signum}"))
     print(f"\n[!] Shutdown signal received ({signum}). Finishing current operation...")
 
 

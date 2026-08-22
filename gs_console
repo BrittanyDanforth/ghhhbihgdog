@@ -91,6 +91,9 @@ MAX_JOBS = 200                             # bound the in-memory job table
 # asking two numbers to stay in sync is a hope, not a guarantee.
 JOB_TIMEOUT_FLOOR_S = 86400 + 3600 + 7 * 24 * 3600
 JOB_TIMEOUT_S = JOB_TIMEOUT_FLOOR_S        # overridable with --job-timeout
+#: Did the operator actually pass --job-timeout? See job_timeout_for: without
+#: this the flag was inert for every job the page starts.
+JOB_TIMEOUT_EXPLICIT = False
 
 # Grace period between SIGTERM and SIGKILL. The tools catch SIGTERM, stop at
 # their next checkpoint and run their cleanup; secure_delete overwrites before
@@ -729,6 +732,21 @@ def job_timeout_for(params):
             hi = max(int(parts[0]), int(parts[-1]))
         except ValueError:
             hi = 720
+    # AN EXPLICIT --job-timeout IS AN INSTRUCTION, AND IT WAS BEING IGNORED.
+    # Every job started over HTTP passes timeout_s=job_timeout_for(params), and
+    # this returned max(JOB_TIMEOUT_FLOOR_S, ...) -- a floor that never
+    # consulted JOB_TIMEOUT_S. Measured with --job-timeout 60:
+    #
+    #   job_timeout_for({}) -> 694800   effective 694800
+    #
+    # So the flag did nothing for any job the page could start, which is all of
+    # them, while its help says "kill a job after this long".
+    #
+    # Set: the operator's number wins, in both directions -- that is what an
+    # explicit instruction is. Unset: the per-job estimate below, which is the
+    # reason this function exists.
+    if JOB_TIMEOUT_EXPLICIT:
+        return JOB_TIMEOUT_S
     # x2: the DAG round is the widest, and a run has other rounds after it.
     return max(JOB_TIMEOUT_FLOOR_S, 86400 + 3600 + w * hi * 2)
 
@@ -1628,7 +1646,24 @@ class H(BaseHTTPRequestHandler):
         if not t:                                # allow ?t= for the initial GET
             from urllib.parse import urlparse, parse_qs
             t = (parse_qs(urlparse(self.path).query).get("t") or [""])[0]
-        return hmac.compare_digest(t, TOKEN)
+        # compare_digest RAISES on non-ASCII str operands, and this one comes
+        # off the wire. Reproduced against the running server:
+        #
+        #   curl -H $'X-GS-Token: \xc3\xa9abc' http://127.0.0.1:8799/
+        #   curl: (52) Empty reply from server
+        #
+        # with a TypeError traceback out of do_GET -- the request thread died
+        # BEFORE authentication, so an unauthenticated local process could kill
+        # a handler thread at will and fill the operator's terminal with
+        # tracebacks during a run. Compared as bytes instead: bytes have no
+        # such restriction, the comparison stays constant-time, and a token
+        # that is not valid UTF-8 simply does not match.
+        try:
+            got = t.encode("utf-8", "surrogatepass")
+            want = TOKEN.encode("utf-8", "surrogatepass")
+        except (UnicodeError, AttributeError):
+            return False
+        return hmac.compare_digest(got, want)
 
     def _json_ct_ok(self):
         """POST must be application/json. That content type is NOT CORS-simple,
@@ -1965,6 +2000,23 @@ pre.out .g{color:#5FD3A6}pre.out .r{color:#F58C82}pre.out .y{color:#E6BC6A}pre.o
       <div class="f"><label for="split">Split into</label><input id="split" type="number" min="1" max="8" value="1"></div>
       <label class="chk"><input type="checkbox" id="joinmarket">
         <span>JoinMarket tumble first<span class="d">extra BTC-side mixing before the swap</span></span></label>
+      <!-- THE SAME INPUT THE RECEIVE FLOW USES, AND IT BELONGS HERE TOO.
+           secret_env sends expect_total_xmr in BOTH modes, deliberately: in
+           send mode it is the fallback for when a quote is unreadable and the
+           summed-from-quotes target would silently be built from fewer chunks
+           than were actually paid for. There is a test for that.
+           The input, though, lived only inside #recv-fields -- which is HIDDEN
+           in send mode, not removed. So the browser kept the operator's last
+           RECEIVE value in the DOM and collect() sent it with every send run,
+           where it became GS_EXPECT_TOTAL_XMR: the swap arrival gate. A stale
+           target lower than the real total opens that gate with a swap still
+           in flight, and the run starts mixing. Nothing on the page showed the
+           number, so nothing the operator could look at would have told them.
+           Showing it is the honest fix: the control now matches a capability
+           the code already had. -->
+      <div class="f" style="margin-top:10px"><label for="expect_total_xmr_send">Total XMR expected
+        <span class="d">optional — overrides the total summed from the quotes</span></label>
+        <input id="expect_total_xmr_send" placeholder="4.0"></div>
     </div>
     <div id="recv-fields" hidden>
       <p class="lead"><b>The sender pays Bitcoin. You receive Monero.</b> Three steps, in order —
@@ -2304,7 +2356,12 @@ function collect(){
   // (its container is hidden, not removed) and still reads 1, so keying
   // off it unconditionally would shadow the receive field for good.
   split: mode==='receive' ? (+v('split_recv')||1) : (+v('split')||1),
-  expect_total_xmr:v('expect_total_xmr'),
+  // ONE VALUE, TWO INPUTS, AND THE HIDDEN ONE IS NEVER THE SOURCE. Each mode
+  // reads its own box, so a value the operator cannot see on the page they are
+  // looking at can never reach the run -- the same rule `split` already
+  // followed two lines up, and for the same reason.
+  expect_total_xmr: mode==='receive' ? v('expect_total_xmr')
+                                     : v('expect_total_xmr_send'),
   wallets:+v('wallets')||10, deep:+v('deep')||2, fee_priority:feePriority,
   // THE FIELD EXISTED, THE SCHEMA ACCEPTED IT, THE PRESETS SET IT, AND THIS
   // NEVER SENT IT. --hop-delay was added to SCHEMA so a dashboard run could
@@ -2603,7 +2660,9 @@ $('#rpc_daemon').addEventListener('change',loadFees);
 def main():
     ap = argparse.ArgumentParser(description="GhostSpiral operator console")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--job-timeout", type=int, default=JOB_TIMEOUT_FLOOR_S,
+    # default=None so "not given" is distinguishable from "given the same
+    # number as the default". job_timeout_for needs to know which it was.
+    ap.add_argument("--job-timeout", type=int, default=None,
                     metavar="SECONDS",
                     help=f"kill a job after this long (default {JOB_TIMEOUT_FLOOR_S}s "
                          f"= the swap-arrival wait + fan-out confirm + one maximum "
@@ -2611,8 +2670,13 @@ def main():
                          f"multi-day delays; a job that is still running is usually "
                          f"one that is waiting on money, and stopping it strands funds.")
     a = ap.parse_args()
-    global JOB_TIMEOUT_S
-    JOB_TIMEOUT_S = max(1, int(a.job_timeout))
+    global JOB_TIMEOUT_S, JOB_TIMEOUT_EXPLICIT
+    JOB_TIMEOUT_EXPLICIT = a.job_timeout is not None
+    JOB_TIMEOUT_S = max(1, int(a.job_timeout if JOB_TIMEOUT_EXPLICIT
+                               else JOB_TIMEOUT_FLOOR_S))
+    if JOB_TIMEOUT_EXPLICIT:
+        print(f"  [*] --job-timeout {JOB_TIMEOUT_S}s applies to EVERY job, "
+              f"overriding the per-job estimate.")
     if JOB_TIMEOUT_S < JOB_TIMEOUT_FLOOR_S:
         # Not refused -- an operator running short jobs may genuinely want a
         # tighter bound -- but never silent, because the number that used to be

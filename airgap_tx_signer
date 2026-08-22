@@ -35,6 +35,7 @@ from decimal import Decimal
 from typing import List
 
 from gs_common import (
+    chain_safe,
     integrity_log, integrity_log_once, atomic_write_json, secure_file_perms,
     install_signal_handlers, shutdown_requested, scrub_address,
     redact_addresses, env_or_argv,
@@ -746,7 +747,21 @@ def phase_create(args, plan: List[dict], meta: dict = None):
 
         except Exception as e:
             integrity_log("signer", f"create_fail:idx={idx}:{type(e).__name__}")
-            print(f"  [!] TX {idx} failed: {str(e)[:80]}")
+            # str(e)[:80] PRINTS THE ADDRESS. A wallet-RPC error message quotes
+            # the request that failed, and a transfer request carries a 95-char
+            # destination -- so the first 80 characters of it are 43 characters
+            # of a mix destination, verbatim, on a terminal and in whatever
+            # captured that terminal. Every other operator line in this file
+            # goes through scrub_address; this one did not, and it is the line
+            # that fires when something goes wrong, i.e. the one an operator
+            # copies into a note or a screenshot.
+            # chain_safe, NOT scrub_address: scrub_address elides the middle
+            # of a string it treats as one address, so on a sentence it returns
+            # "Method t... invalid" and the diagnostic is gone. chain_safe
+            # redacts addresses IN PROSE and leaves the words -- measured:
+            #   "...destination 44AFFq5kSi... is invalid"
+            #     -> "Method transfer failed: destination <addr> is invalid"
+            print(f"  [!] TX {idx} failed: {chain_safe(str(e))[:160]}")
             failed += 1
 
     # ---- Output export for MULTI-ROUND cold signing -----------------------

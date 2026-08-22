@@ -439,6 +439,44 @@ def test_missing_manifest_gives_a_clean_error():
     check("missing manifest exits cleanly", code != 0 and "not found" in msg.lower())
 
 
+def test_egress_gate_says_when_it_is_not_running():
+    """The header promises the daemon's relay egress is re-verified before
+    EVERY submit. Without --rpc-daemon -- which has no default -- EgressGate
+    returns before that check on every submit, and said nothing.
+
+    An operator who read the header has a guarantee they do not have, and the
+    one being skipped is the leak-critical one: would this monerod hand this
+    transaction to raw-IP peers?
+    """
+    import io as _io, contextlib as _ctx, types as _t
+    c = load("broadcast_signed_xmr")
+    c.integrity_log = lambda *a, **k: None
+    c.tor_recheck = lambda *a, **k: None
+    c.EgressGate._warned_no_daemon = False
+    g = c.EgressGate.__new__(c.EgressGate)
+    g.proxy = "socks5h://127.0.0.1:9050"
+    g.args = _t.SimpleNamespace(rpc_daemon=None)
+    g.last_tor_check = 0.0
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        g.check("submit-1", False)
+    out = buf.getvalue()
+    check("egress: with no --rpc-daemon the gate SAYS the daemon check is not "
+          "running", "NOT checked" in out and "--rpc-daemon" in out)
+    check("egress: ...and names what is still running, so the operator can "
+          "tell the two checks apart", "Tor exit check" in out)
+    buf2 = _io.StringIO()
+    with _ctx.redirect_stdout(buf2):
+        g.check("submit-2", False)
+        g.check("submit-3", False)
+    check("egress: ...once per process, not once per transaction -- a warning "
+          "on every submit is a warning nobody reads",
+          "NOT checked" not in buf2.getvalue())
+    check("egress: and the header no longer states the guarantee "
+          "unconditionally",
+          "AND ONLY THEN" in open(os.path.join(REPO, "broadcast_signed_xmr")).read())
+
+
 def run_all():
     for fn in sorted([f for n, f in globals().items() if n.startswith("test_")],
                      key=lambda f: f.__name__):

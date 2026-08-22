@@ -534,7 +534,16 @@ try:
     check("plans: files still on disk are REPORTED", "STILL ON DISK" in _txt)
     check("plans: ...by full path, so the operator can act on it",
           str(_pf_a.resolve()) in _txt and str(_pf_b.resolve()) in _txt)
-    check("plans: ...saying what is in them", "--exit-to" in _txt)
+    # NOT "--exit-to". The three plans registered here are the fan-out, the
+    # entry veil and the DAG round; their destinations are mix subaddresses and
+    # carriers. The withdrawal address is only in unsigned_exit_*.json, which
+    # is written later and erased in its own finally. Naming --exit-to here
+    # sent an operator to look for the wrong thing in the right files, and made
+    # the real disclosure -- the whole mix graph -- sound smaller than it is.
+    check("plans: ...saying what is actually in them",
+          "mix graph" in _txt and "account index" in _txt)
+    check("plans: ...and not claiming a destination they do not contain",
+          "--exit-to" not in _txt)
     check("plans: ...and how to erase them",
           "paranoia_mode" in _txt and "shred" in _txt)
 

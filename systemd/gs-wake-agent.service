@@ -26,7 +26,13 @@ Type=oneshot
 # Without these two lines the agent refuses EVERY boot with
 # "outside_wipe_roots" -- correctly, because nothing would ever erase the
 # bundles and slips a woken job writes. Both are set: WorkingDirectory covers
-# the agent, HOME covers a paranoia_mode run started from anywhere.
+# the agent's own wipe_covers check, HOME covers anything run WITH this unit's
+# environment.
+#
+# NEITHER COVERS A paranoia_mode RUN YOU START LATER, and an earlier version of
+# this comment said HOME did. Your shell has your HOME, not this one. Wipe from
+# the artifact directory itself:
+#     cd /var/lib/ghostspiral && python3 /opt/ghostspiral/paranoia_mode
 #
 # The earlier default of --artifact-dir "." was worse than useless here: it
 # resolved against cwd=/ to the ROOT filesystem, which wipe_covers reports as
@@ -38,6 +44,25 @@ Environment=HOME=/var/lib/ghostspiral
 # SHORTER than the deadman, so the ordinary path is bounded by this and the
 # deadman is only the backstop for a wedged or SIGKILLed agent.
 TimeoutStartSec=9000
+# NOTHING TO THE JOURNAL. This is not tidiness. Without these two lines systemd
+# journals everything this unit and its children print, and the children are
+# create_receive_wallet and thor_swap_preparer -- which print the BTC deposit
+# address and the THORCHAIN MEMO. The memo names the destination XMR address
+# in plain text. So the one string this whole toolchain exists to keep off
+# durable storage was being written into /var/log/journal: persistent,
+# root-owned, rotated rather than erased, and outside every path paranoia_mode
+# sweeps. The slip on disk is 0600 and gets wiped; the journal copy was not
+# thought of as a copy.
+#
+# The children now write to <artifact-dir>/gs_wake_job.log at 0600, which IS
+# inside the sweep. Run the agent by hand with --dry-run and you still see
+# everything on your terminal, because systemd is not involved in that.
+#
+# WHAT THIS DOES NOT HIDE, said rather than implied: systemd still records that
+# gs-wake-agent.service started and stopped, and when. That dates a wake. It
+# does not name the job, the amount or any address.
+StandardOutput=null
+StandardError=null
 ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_wake_agent --key /etc/gs_wake_thinkpad.key
 
 # §4: "the auto-job user must NOT be allowed to mount removable disks." These

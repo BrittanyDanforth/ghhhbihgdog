@@ -433,17 +433,20 @@ _PINFO = {"host": "192.168.1.9", "port": 41337}
 
 
 def _ceremony(i_ask=lambda s: True, r_ask=lambda s: True, tamper=None,
-              ipub=None, rpub=None):
+              ipub=None, rpub=None, isk=None, rsk=None):
     a, b = _socket.socketpair()
     a.settimeout(20)
     b.settimeout(20)
-    ip = ipub or _NP.PrivateKey.generate().public_key.encode()
-    rp = rpub or _NP.PrivateKey.generate().public_key.encode()
+    _isk = isk or _NP.PrivateKey.generate()
+    _rsk = rsk or _NP.PrivateKey.generate()
+    ip = ipub or _isk.public_key.encode()
+    rp = rpub or _rsk.public_key.encode()
     res = {}
 
     def responder():
         try:
-            res["r"] = P.pair_responder(b, rp, _VINFO, r_ask, lambda m: None)
+            res["r"] = P.pair_responder(b, _rsk, rp, _VINFO, r_ask,
+                                        lambda m: None)
         except Exception as e:                               # noqa: BLE001
             res["r"] = e
         finally:
@@ -456,7 +459,8 @@ def _ceremony(i_ask=lambda s: True, r_ask=lambda s: True, tamper=None,
     t.start()
     try:
         res["i"] = (tamper(a, ip, i_ask) if tamper else
-                    P.pair_initiator(a, ip, _PINFO, i_ask, lambda m: None))
+                    P.pair_initiator(a, _isk, ip, _PINFO, i_ask,
+                                     lambda m: None))
     except Exception as e:                                   # noqa: BLE001
         res["i"] = e
     finally:
@@ -485,6 +489,33 @@ check("...and NEITHER side sent a secret: the payload keys are exactly the "
       "public key and the non-secret config",
       "secret" not in _json.dumps(_r["i"]) + _json.dumps(_r["r"]))
 
+# NOTHING BUT A PUBLIC KEY CROSSES BEFORE THE HUMANS HAVE CONFIRMED. The vault
+# used to put its MAC and broadcast address in the plaintext `reveal`, which it
+# sends to whoever connects, on a socket bound to every interface, before
+# anybody has authenticated anything -- so any host on the switch could open
+# the pairing port during the ceremony and be handed the exact value the sealed
+# keyfile exists to keep off a stolen SD card.
+_seen = []
+
+
+def _eavesdrop(sock, pub, ask):
+    sock.settimeout(20)
+    P._pair_send(sock, {"t": "commit", "v": P.PAIR_PROTO,
+                        "c": P.pair_commitment(pub).hex()})
+    body = P._pair_step(sock, "reveal")
+    _seen.append(_json.dumps(body))
+    raise P.WakeError("hung up after taking whatever was offered")
+
+
+_r = _ceremony(tamper=_eavesdrop)
+check("a host that connects, takes the reveal and hangs up learns NOTHING "
+      "but a public key — no MAC, no broadcast address, no LAN layout",
+      _seen and all(v not in _seen[0] for v in
+                    ("aa:bb:cc:dd:ee:ff", "192.168.1.255", "mac", "broadcast",
+                     "info")))
+check("...and what it does learn is exactly the one field it is meant to",
+      _seen and set(_json.loads(_seen[0])) == {"t", "v", "pub"})
+
 # THE ATTACK THE COMMITMENT EXISTS FOR. Without it the initiator picks its key
 # AFTER seeing the responder's, so a man in the middle grinds keypairs until
 # the two codes agree -- about 2^20 X25519 keygens for a 40-bit code, which is
@@ -496,10 +527,8 @@ def _grind(sock, pub, ask):
     P._pair_send(sock, {"t": "commit", "v": P.PAIR_PROTO,
                         "c": P.pair_commitment(pub).hex()})
     body = P._pair_step(sock, "reveal")
-    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO,
-                        "pub": other.hex(), "info": _PINFO})
-    return P._pair_finish(sock, other, P._pair_pub(body), P._pair_info(body),
-                          ask, lambda m: None)
+    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO, "pub": other.hex()})
+    return P._pair_finish(sock, other, P._pair_pub(body), ask, lambda m: None)
 
 
 _r = _ceremony(tamper=_grind)
@@ -524,20 +553,32 @@ check("...in the other direction too",
       and "answered no" in str(_r["i"]))
 
 
+# THE CONFIG NOW ARRIVES SEALED AND AFTER CONFIRMATION, so a bad value in it
+# is refused there rather than in the plaintext reveal. It still must not reach
+# a keyfile.
+_evilsk = _NP.PrivateKey.generate()
+
+
 def _hostname(sock, pub, ask):
     sock.settimeout(20)
     P._pair_send(sock, {"t": "commit", "v": P.PAIR_PROTO,
                         "c": P.pair_commitment(pub).hex()})
-    P._pair_step(sock, "reveal")
-    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO, "pub": pub.hex(),
-                        "info": {"host": "evil.example.com", "port": 41337}})
-    return P._pair_step(sock, "confirm")
+    body = P._pair_step(sock, "reveal")
+    peer = P._pair_pub(body)
+    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO, "pub": pub.hex()})
+    P._pair_finish(sock, pub, peer, ask, lambda m: None)
+    return P._pair_config(sock, _evilsk, peer,
+                          {"host": "evil.example.com", "port": 41337},
+                          P.TAG_PC, P.TAG_PV, first=True)
 
 
-_r = _ceremony(tamper=_hostname)
+_r = _ceremony(tamper=_hostname, ipub=_evilsk.public_key.encode())
 check("a HOSTNAME where an address belongs is refused — it would become a "
       "DNS lookup on a box whose whole point is that it makes none",
       isinstance(_r["r"], P.WakeError) and "IPv4" in str(_r["r"]))
+check("...and the vault wrote nothing, because the refusal happens before "
+      "pair_responder returns",
+      not isinstance(_r["r"], dict))
 
 
 # A SOCKET TIMEOUT BOUNDS ONE recv(), NOT ONE MESSAGE. These reads are
@@ -577,8 +618,9 @@ check("a peer that floods the pairing socket is cut off at the size limit "
       "rather than allocating whatever it sends",
       isinstance(_r["r"], P.WakeError) and "size limit" in str(_r["r"]))
 
-_same = _NP.PrivateKey.generate().public_key.encode()
-_r = _ceremony(ipub=_same, rpub=_same)
+_samesk = _NP.PrivateKey.generate()
+_same = _samesk.public_key.encode()
+_r = _ceremony(ipub=_same, rpub=_same, isk=_samesk, rsk=_samesk)
 check("a box offered its OWN public key back refuses — that is a reflection, "
       "not a peer",
       isinstance(_r["r"], P.WakeError) or isinstance(_r["i"], P.WakeError))

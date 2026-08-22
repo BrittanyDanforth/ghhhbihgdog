@@ -45,6 +45,7 @@ list, so §3's "What the Pi must never hold" is a test rather than a paragraph.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import random
@@ -242,6 +243,24 @@ class Pending:
         #: they did not already have. What it must not do is happen SILENTLY,
         #: which is why `report()` prints the event.
         self._issued = {}
+        #: THIS WINDOW, AND ONLY THIS ONE. 32 fresh bytes the vault must echo
+        #: in M1, fetched from /window before it seals anything.
+        #:
+        #: WITHOUT IT ONE CAPTURE BECOMES A PERMANENT REMOTE DoS. The response
+        #: cache below makes a replay harmless WITHIN a process, and an earlier
+        #: comment reasoned that capturing an M1 requires sitting on the
+        #: Pi-vault path, so a replayer could simply drop packets instead and
+        #: gains nothing. That reasoning was wrong, and the error is worth
+        #: naming: capturing needs the on-path position ONCE. Replaying does
+        #: not. Afterwards, any host anywhere on the switch can post that same
+        #: M1 the moment a window opens, take the job, and leave the real vault
+        #: to boot, be told "no job", and power off -- for every wake, forever,
+        #: with the operator reading "somebody sent a stray magic packet".
+        #:
+        #: An old M1 carries an old window, so it does not open a new one. The
+        #: nonce is public and an attacker may fetch it too; it is not a
+        #: secret, it is a statement about WHEN.
+        self.window = proto.new_window()
         self.collected_at = None
         self.result = None
         self.events = []
@@ -278,6 +297,11 @@ class Pending:
         body = proto.open_record(pi_sk, tp_pk, record, proto.TAG_M1)
         eph = proto.eph_pk_of(body)
         chal = proto.challenge_of(body)
+        # compare_digest, and BEFORE the cache: a record for another window is
+        # not a retry of anything, it is a record from another window.
+        if not hmac.compare_digest(proto.window_of(body), self.window):
+            self.events.append("m1_stale_window")
+            raise Doorbell("that note was written for a different wake window")
         cached = self._issued.get((eph, chal))
         if cached is not None:
             self.events.append("m1_retry")
@@ -345,6 +369,25 @@ class Pending:
 def make_handler(pending: Pending):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        #: socketserver applies this to the accepted socket. WITHOUT IT any LAN
+        #: host can open a connection, send nothing, and hold a thread for the
+        #: whole ten-minute wake window -- and ThreadingHTTPServer starts a
+        #: thread per connection, on a Pi with 1 GB of RAM and Tor resident.
+        #: The real Pi's vault sends its 296 bytes immediately.
+        timeout = 20
+
+        #: EMPTY, deliberately. BaseHTTPRequestHandler's default is
+        #: "BaseHTTP/0.6 Python/3.11.15", which it puts in a Server: header on
+        #: every response -- naming the software, the language and the minor
+        #: version of the box that is supposed to hold nothing. The wake port
+        #: is randomised at pairing so that one install does not look like the
+        #: next; a banner that says "this is a Python BaseHTTPServer" hands
+        #: that back, and the version dates the SD image.
+        server_version = ""
+        sys_version = ""
+
+        def version_string(self):
+            return ""
 
         def log_message(self, fmt, *a):                      # noqa: A003
             # SILENT, deliberately. The default writes every request to stderr,
@@ -354,9 +397,20 @@ def make_handler(pending: Pending):
             return
 
         def _reply(self, code, body=b""):
-            self.send_response(code)
+            # send_response_only, NOT send_response: the latter also emits
+            # Server: and Date:. Date: is the Pi's wall clock, to the second,
+            # handed to anyone who connects -- and this Pi is the only box here
+            # with a correct clock, so it is the one whose clock is worth
+            # correlating against a Tor circuit or a Bitcoin timestamp.
+            self.send_response_only(code)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Type", "application/octet-stream")
+            # Answer one request per connection. HTTP/1.1 keep-alive would
+            # otherwise let a client hold the socket open for the whole window
+            # by simply not sending anything more, and the vault has exactly
+            # two requests to make, on its own terms.
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
             if body:
                 self.wfile.write(body)
@@ -373,6 +427,12 @@ def make_handler(pending: Pending):
             return self.rfile.read(n)
 
         def do_POST(self):                                   # noqa: N802
+            if self.path == "/window":
+                # Unauthenticated by necessity: the vault must have this
+                # BEFORE it can seal anything. It is 32 random bytes and a
+                # statement that a window is open right now -- which the open
+                # port already says.
+                return self._reply(200, pending.window)
             if self.path == "/wake":
                 rec = self._read()
                 if rec is None:
@@ -503,6 +563,10 @@ PAIR_PORT = 8769
 #: Randomising it does not make the doorbell secure -- Kerckhoffs, the design
 #: is published -- it makes one install look unlike the next.
 PORT_LO, PORT_HI = 20001, 60000
+#: Or four whitespace-separated words. Was 8, which against Argon2id at 256 MiB
+#: and an attacker holding the SD card is not enough for anything a person
+#: invents. See new_passphrase for why this is a floor and not a measure.
+MIN_PASSPHRASE = 16
 
 
 def ask_match(sas: str, reader=None) -> bool:
@@ -544,6 +608,12 @@ def new_passphrase(getter=None) -> bytes:
     this passphrase survives an imaged SD card is its entropy and the Argon2id
     parameters, and a rule that says 'must contain a digit' produces
     Password1 -- which is worse than the four random words this asks for.
+
+    THE FLOOR IS A FLOOR, NOT A MEASURE, and this says so where the operator
+    reads it. It was eight characters, which against Argon2id at 256 MiB and an
+    attacker holding the card is not enough for anything a person invents.
+    Four words or sixteen characters is still not a guarantee; it is the point
+    below which this refuses to pretend.
     """
     import getpass
     fn = getter or getpass.getpass
@@ -566,9 +636,16 @@ def new_passphrase(getter=None) -> bytes:
                 f"cannot ask for a passphrase: this box has no terminal "
                 f"({type(e).__name__}). Pairing needs one -- run it over SSH "
                 f"rather than from a script.") from e
-        if len(a) < 8:
-            print("  [!] Too short. This is the only thing standing between a")
-            print("      stolen SD card and your vault's MAC address.")
+        if len(a.split()) < 4 and len(a) < MIN_PASSPHRASE:
+            print(f"  [!] Too short. Give four or more words, or at least")
+            print(f"      {MIN_PASSPHRASE} characters. Against Argon2id and "
+                  f"somebody")
+            print("      holding your SD card, anything less is not a")
+            print("      passphrase, it is a delay.")
+            print("      This is a FLOOR, not a measure: four words you chose")
+            print("      because they were easy to remember are weaker than")
+            print("      four a dice roll chose for you, and nothing here can")
+            print("      tell the difference.")
             continue
         b = fn("  Again: ")
         if a != b:
@@ -634,7 +711,7 @@ def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
     my_host = sock.getsockname()[0]
     try:
         agreed = proto.pair_initiator(
-            sock, my_pub, {"host": my_host, "port": port},
+            sock, sk, my_pub, {"host": my_host, "port": port},
             ask or ask_match, print)
     finally:
         try:

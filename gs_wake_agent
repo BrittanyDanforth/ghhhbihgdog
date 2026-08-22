@@ -472,18 +472,54 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
     raise Refused("unknown_job", "no argv template for this job")
 
 
+#: Where a woken job's children write. NOT the journal. 0600, in the artifact
+#: directory, so paranoia_mode wipes it with the rest of the run.
+JOB_LOG = "gs_wake_job.log"
+
+
 def run_child(argv: list, env_extra: dict, budget_s: int,
-              runner=None) -> tuple:
-    """Run one child under a watchdog. Returns (rc, killed_hard)."""
+              runner=None, log_path: Path = None) -> tuple:
+    """Run one child under a watchdog. Returns (rc, killed_hard).
+
+    THE CHILD'S OUTPUT MUST NOT REACH THE JOURNAL, and this is the worst leak
+    this feature has had. gs-wake-agent.service is a systemd unit with no
+    StandardOutput=, so everything its children printed went to
+    /var/log/journal -- and the children are thor_swap_preparer, which prints
+    the BTC deposit address and the THORCHAIN MEMO. The memo names the
+    destination XMR address in plain text. So the one string this entire
+    toolchain exists to keep off durable storage was being written to a
+    persistent, root-owned, journald-rotated file on the vault, which
+    paranoia_mode does not touch and cannot reach.
+
+    The slip on disk is 0600 and gets wiped. Its contents were being copied
+    into a log nobody thought of as a copy.
+
+    So: the unit is silenced, and the children write HERE instead -- 0600, in
+    the artifact directory, inside paranoia_mode's sweep. Diagnostics survive
+    for as long as the artifacts do and no longer.
+    """
     if runner is not None:
         return runner(argv, env_extra, budget_s)
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env.update(env_extra or {})
+    sink = None
+    if log_path is not None:
+        # 0600 at creation, not after: a world-readable window while a memo is
+        # being written to it is a window.
+        fd = os.open(str(log_path),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        sink = os.fdopen(fd, "ab", buffering=0)
     # start_new_session so the watchdog can signal the whole GROUP: a tool that
     # spawns monero-wallet-cli must not leave it behind.
-    p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+    try:
+        p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                             stdout=sink or subprocess.DEVNULL,
+                             stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    finally:
+        if sink is not None:
+            sink.close()
     try:
         return p.wait(timeout=budget_s), False
     except subprocess.TimeoutExpired:
@@ -548,9 +584,22 @@ def run_once(args, deps: dict = None) -> tuple:
     eph = nacl.public.PrivateKey.generate()
     challenge = proto.new_challenge()
 
+    # THE DOORBELL'S CURRENT WINDOW, FETCHED BEFORE ANYTHING IS SEALED. An M1
+    # is otherwise valid forever: capture one on-path ONCE and it can be
+    # replayed from anywhere on the switch at every future wake, taking each
+    # job and leaving this machine to boot, be told "no job", and power off.
+    # Echoing the window binds the note to the wake it was written for.
+    wstat, window = _post(key["doorbell_url"], "/window", b"")
+    if wstat != 200 or len(window) != proto.WINDOW_BYTES:
+        raise Refused("doorbell_unreachable",
+                      "the doorbell did not hand over a wake window, so there "
+                      "is nothing to bind this note to. Nothing was handed "
+                      "over, so the job is still waiting.")
+
     m1 = proto.seal(tp_sk, pi_pk, proto.TAG_M1,
                     {"eph_pk": eph.public_key.encode().hex(),
-                     "challenge": challenge.hex()})
+                     "challenge": challenge.hex(),
+                     "window": window.hex()})
     sent_at = _clock()
     status, m2 = _post(key["doorbell_url"], "/wake", m1)
     # UNREACHABLE AND NO-JOB ARE DIFFERENT FACTS WITH DIFFERENT ACTIONS, and
@@ -839,7 +888,8 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
             handles[handle] = {"bundle": new[0], "minted": 1,
                                "slip": str(artifact_dir /
                                            f"thor_pairs_{handle}.json")}
-        rc, hard = run_child(argv, env_extra, budget, runner=runner)
+        rc, hard = run_child(argv, env_extra, budget, runner=runner,
+                             log_path=artifact_dir / JOB_LOG)
         if rc != 0:
             if hard:
                 print(f"  [!] Step {i + 1} had to be SIGKILLed after its "

@@ -453,6 +453,48 @@ check("F5: ...naming what it discloses",
       "names the receive address and its account/subaddress" in _crw_flat)
 
 
+# ===========================================================================
+# A LIBRARY DOES NOT GET TO WRITE AN UNREDACTED RPC RESPONSE TO STDERR.
+#
+# Everything here redacts: scrub_address on operator lines, chain_safe on the
+# integrity chain, amounts kept off argv. And then monero-python's
+# raw_request() does, on any RPC error:
+#
+#     _log.error("JSON RPC error:\n{result}")     # the WHOLE response
+#     _log.debug("Method: ...\nParams:\n{params}")  # the destinations
+#
+# A logger with no handler is not silent -- logging.lastResort is a
+# StreamHandler on stderr at WARNING, measured -- so that reaches gs_console's
+# retained job output, gs_wake_agent's job log and the operator's scrollback,
+# by default, from a dependency, past every redactor in this repository.
+import logging as _lg                                        # noqa: E402
+import io as _io9, contextlib as _cl9                         # noqa: E402
+
+check("logging.lastResort really is a stderr handler, so 'no handler' is not "
+      "'no output' -- the premise of this section, measured rather than "
+      "assumed",
+      isinstance(_lg.lastResort, _lg.Handler)
+      and _lg.lastResort.level <= _lg.ERROR)
+
+for _name in ("monero", "monero.backends.jsonrpc.wallet",
+              "monero.backends.jsonrpc.daemon"):
+    _l = _lg.getLogger(_name)
+    check(f"{_name} has a NullHandler and does not propagate to root",
+          any(isinstance(h, _lg.NullHandler) for h in _l.handlers)
+          and _l.propagate is False)
+
+_err = _io9.StringIO()
+with _cl9.redirect_stderr(_err):
+    _lg.getLogger("monero.backends.jsonrpc.wallet").error(
+        'JSON RPC error:\n{"dst": "44AAAA_A_REAL_LOOKING_ADDRESS"}')
+check("...so an ERROR record carrying an address reaches no stream",
+      "44AAAA" not in _err.getvalue())
+
+check("the gag is OPT-OUTABLE and the source says so, because a permanent "
+      "one hides the operator's own debugging from them",
+      "GS_DEBUG_RPC_LOG" in open(os.path.join(REPO, "gs_common.py")).read())
+
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:
     print("FAILED:", FAILS)
