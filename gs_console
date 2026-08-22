@@ -745,10 +745,27 @@ def job_timeout_for(params):
     # Set: the operator's number wins, in both directions -- that is what an
     # explicit instruction is. Unset: the per-job estimate below, which is the
     # reason this function exists.
-    if JOB_TIMEOUT_EXPLICIT:
-        return JOB_TIMEOUT_S
     # x2: the DAG round is the widest, and a run has other rounds after it.
-    return max(JOB_TIMEOUT_FLOOR_S, 86400 + 3600 + w * hi * 2)
+    _estimate = max(JOB_TIMEOUT_FLOOR_S, 86400 + 3600 + w * hi * 2)
+    if JOB_TIMEOUT_EXPLICIT:
+        # SAY SO WHEN THE OVERRIDE IS THE SHORTER NUMBER. The old warning only
+        # fired below JOB_TIMEOUT_FLOOR_S, and the floor is not the bound that
+        # matters -- the per-job estimate is. An operator who copies the number
+        # this flag's own help text calls the default (694800) onto the command
+        # line turns a 60-wallet job whose estimate is 31_194_000s (361 days)
+        # into one that is SIGKILLed on day 8, and nothing said a word:
+        # 694800 is not below the floor, it IS the floor.
+        #
+        # Not refused -- an explicit instruction wins in both directions -- but
+        # never silent, because job_timeout_for's own reason for existing is
+        # that "killing a live run strands funds and leaves secrets on disk".
+        if JOB_TIMEOUT_S < _estimate:
+            print(f"  [!] --job-timeout {JOB_TIMEOUT_S}s is SHORTER than this "
+                  f"job's own estimate of {_estimate}s "
+                  f"({_estimate // 86400}d). It will be killed part-way.",
+                  flush=True)
+        return JOB_TIMEOUT_S
+    return _estimate
 
 
 def start(argv, label, action_id=None, extra_env=None, timeout_s=None):
@@ -2664,7 +2681,9 @@ def main():
     # number as the default". job_timeout_for needs to know which it was.
     ap.add_argument("--job-timeout", type=int, default=None,
                     metavar="SECONDS",
-                    help=f"kill a job after this long (default {JOB_TIMEOUT_FLOOR_S}s "
+                    help=f"kill a job after this long. DEFAULT: a per-job "
+                         f"estimate from the wallet count and --hop-delay, "
+                         f"never less than {JOB_TIMEOUT_FLOOR_S}s "
                          f"= the swap-arrival wait + fan-out confirm + one maximum "
                          f"--hop-delay). Raise it if you schedule several hops at "
                          f"multi-day delays; a job that is still running is usually "

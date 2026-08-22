@@ -43,7 +43,8 @@ from gs_common import (
     safe_get, safe_post, connect_rpc, daemon_fee_estimate, require_resources,
     secure_hex, secure_delay, atomic_write_json,
     validate_proxy, install_signal_handlers, shutdown_requested,
-    scrub_address, chain_safe, bech32_checksum_ok, secure_mkdir,
+    scrub_address, terminal_safe, bech32_checksum_ok,
+    secure_mkdir,
     check_daemon_relay_egress, secure_delete_file, secure_delete_or_warn,
     integrity_log_once,
     secure_delete_tree,
@@ -3261,9 +3262,14 @@ def stage1_joinmarket(args, btc_addr: str) -> List[Decimal]:
         # them with an exit code and no way to tell a moved CLI flag from a
         # wallet that would not open.
         #
-        # chain_safe rather than raw: the tumbler echoes destination addresses
+        # Redacted rather than raw: the tumbler echoes destination addresses
         # in its own errors, and this line reaches a terminal.
-        _jm_err = chain_safe((e.stderr or e.stdout or "").strip())[-800:]
+        #
+        # terminal_safe, NOT chain_safe: a tumbler failure is diagnosed from
+        # its line numbers, ports and exit codes, and chain_safe turns every
+        # one of them into '#' -- `File "tumbler.py", line 412` becomes
+        # `line #`. Addresses and MACs are still removed.
+        _jm_err = terminal_safe((e.stderr or e.stdout or "").strip())[-800:]
         sys.exit(f"[!] JoinMarket tumble failed (exit {e.returncode}).\n"
                  f"    Its output was captured, so here it is:\n"
                  f"    {_jm_err or '(the tumbler printed nothing)'}\n"
@@ -7387,7 +7393,13 @@ def _warn_unwiped_outdir(outdir: Path) -> bool:
 
 #: Plan files this run has written that are NOT safe to leave lying around.
 #: Each unsigned_*.json carries every hop's source, destination, amount and
-#: account index -- including --exit-to -- in plaintext.
+#: account index in plaintext.
+#:
+#: NOT "including --exit-to". Only the EXIT plan carries the final
+#: destination; the fan-out, veil and DAG-round plans move funds between this
+#: run's own accounts and never contain it. _report_surviving_plans used to
+#: tell the operator otherwise and was corrected -- this comment, on the very
+#: list that feeds it, kept asserting the same wrong thing to the next reader.
 _SENSITIVE_PLANS = []
 
 

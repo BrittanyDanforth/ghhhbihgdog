@@ -530,6 +530,54 @@ finally:
     os.chdir(_cwd0)
 
 
+# ===========================================================================
+# gs_wake_keys.is_ipv4 HAD NO TEST AT ALL.
+#
+# The mutation sweep proved it: flipping IPV4_RE's \Z back to $ SURVIVED both
+# suites the anchor named, because every trailing-newline check written for
+# this lived in test_wake_protocol and exercised gs_wake_proto._pair_info --
+# a DIFFERENT function in a different file. The regex that validates
+# --wol-broadcast on the way into the keyfile was never driven.
+#
+# `$` also matches just before a trailing newline, and int("255\n") == 255,
+# so the range guard did not catch it either. gs_wake_keys builds
+# f"http://{host}:{port}" from these values, and urllib rejects a control
+# character in a URL at WAKE time -- months after the ceremony that stored it.
+# ===========================================================================
+_KEYS = load("gs_wake_keys")
+for _v, _want, _why in [
+        ("1.2.3.4", True, "an honest dotted quad"),
+        ("255.255.255.255", True, "the broadcast address itself"),
+        ("0.0.0.0", True, "the all-zeros address"),
+        ("1.2.3.4\n", False, "a TRAILING NEWLINE ($ matches before one)"),
+        ("1.2.3.4 ", False, "a trailing space"),
+        (" 1.2.3.4", False, "a leading space"),
+        ("999.1.1.1", False, "an out-of-range octet"),
+        ("256.0.0.1", False, "one over the top of the range"),
+        ("01.02.03.04", False, "leading zeros (inet_aton reads them as octal)"),
+        ("10.0.0.010", False, "one octal-looking octet"),
+        ("1.2.3", False, "three octets"),
+        ("1.2.3.4.5", False, "five octets"),
+]:
+    check(f"is_ipv4 accepts {_why}" if _want else f"is_ipv4 refuses {_why}",
+          _KEYS.is_ipv4(_v) is _want)
+# MAC_RE is the LOAD-BEARING one: gs_wake_keys:166 and :304 match on it
+# directly, with no octet-style guard behind it, so its \Z is the only thing
+# between "de:ad:be:ef:ca:fe\n" and a keyfile.
+check("the MAC regex is anchored the same way, and there is no second guard "
+      "behind it",
+      not _KEYS.MAC_RE.match("de:ad:be:ef:ca:fe\n")
+      and bool(_KEYS.MAC_RE.match("de:ad:be:ef:ca:fe")))
+# IPV4_RE asserted DIRECTLY, because is_ipv4 cannot show it: the octet guard
+# str(int(p)) == p rejects "4\n" on its own, so the regex anchor there is
+# defence in depth with a second layer behind it. Two mutation sweeps reported
+# SURVIVED on it before that was understood -- the harness was right both
+# times. Pinning the layer needs a check on the layer.
+check("IPV4_RE itself refuses a trailing newline, independently of the octet "
+      "guard that also happens to catch it",
+      not _KEYS.IPV4_RE.match("1.2.3.4\n")
+      and bool(_KEYS.IPV4_RE.match("1.2.3.4")))
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILS:

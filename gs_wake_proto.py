@@ -165,8 +165,8 @@ WINDOW_BYTES = 16
 #: the address or the memo. A derived handle would let a seized Pi confirm or
 #: deny candidate addresses read straight off the public Bitcoin OP_RETURNs,
 #: which links a specific BTC deposit to this operator.
-HANDLE_RE = re.compile(r"^[0-9A-F]{4}$")
-_HEX_RE = re.compile(r"^[0-9a-f]+$")
+HANDLE_RE = re.compile(r"^[0-9A-F]{4}\Z")
+_HEX_RE = re.compile(r"^[0-9a-f]+\Z")
 
 
 class WakeError(Exception):
@@ -688,7 +688,12 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
 #
 # See pair_sas for why the commitment step is what lets the string be short.
 
-PAIR_PROTO = 2
+# 3, NOT 2. Bumped when the per-window nonce was added to M1 and the pairing
+# `reveal` lost its plaintext `info` in favour of the sealed post-confirmation
+# config exchange. Both are incompatible wire changes; leaving this at 2 let a
+# new box and an old box agree to pair and then fail at wake time, which is the
+# worst place to discover it.
+PAIR_PROTO = 3
 PAIR_MAX_LINE = 8192
 #: The ceremony runs once, with a human at both ends. Generous, but bounded:
 #: a pairing socket that waits forever is a socket someone can leave open.
@@ -843,16 +848,27 @@ def _pair_info(body: dict) -> dict:
             if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 65535:
                 raise WakeError("pairing info carries a bad port")
         elif k == "mac":
+            # \Z, NOT $ -- see the IPv4 note below; the same hole let
+            # "de:ad:be:ef:ca:fe\n" through into the keyfile.
             if not isinstance(v, str) or not re.match(
-                    r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", v):
+                    r"^([0-9a-f]{2}:){5}[0-9a-f]{2}\Z", v):
                 raise WakeError("pairing info carries a bad MAC")
         else:
             # Dotted-quad only. It is pasted into a URL and into sendto(), and
             # a hostname here would mean a DNS lookup on a box whose whole
             # point is that it does not make unexpected lookups.
+            #
+            # \Z, NOT $. Python's `$` also matches before a trailing newline,
+            # so "10.0.0.1\n" passed the shape check, and int("1\n") == 1 so
+            # the range check passed too. It reaches gs_wake_keys as
+            # f"http://{host}:{port}" -> urllib "URL can't contain control
+            # characters", swallowed by the agent's broad except. This value
+            # comes off the LAN, so it is the one that must not be sloppy.
+            # str(int(p)) == p additionally refuses "010", which inet_aton
+            # reads as octal 8.
             if not isinstance(v, str) or not re.match(
-                    r"^(\d{1,3}\.){3}\d{1,3}$", v) or any(
-                    int(p) > 255 for p in v.split(".")):
+                    r"^(\d{1,3}\.){3}\d{1,3}\Z", v) or any(
+                    str(int(p)) != p or int(p) > 255 for p in v.split(".")):
                 raise WakeError("pairing info carries a bad IPv4 address")
         out[k] = v
     return out
@@ -941,6 +957,28 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
     """
     public, _b = _nacl()
     peer_pub = public.PublicKey(peer_pub_raw)
+    # VALIDATE WHAT WE ARE ABOUT TO SEND, not only what we receive.
+    #
+    # This runs AFTER _pair_finish, so a rejection here lands after both
+    # operators already said yes. With validation only on the receiving side,
+    # the box holding a bad value sent it happily and wrote its keyfile, while
+    # the peer rejected it and wrote nothing -- HALF A PAIRING, the exact state
+    # the passphrase prompt was moved earlier to prevent: "the next attempt
+    # then refused on BOTH boxes for reasons that look nothing like the last
+    # one died halfway". The realistic trigger is not an attacker, it is
+    # sock.getsockname() returning an IPv6 address on an IPv6-routed LAN.
+    #
+    # Checking my own info first makes the failure land on the box that OWNS
+    # the bad value, before anything is sent, and the abort stops the peer --
+    # which is still blocked reading. It also means a peer only ever receives
+    # info that already passed this identical validator.
+    try:
+        _pair_info({"info": my_info})
+    except WakeError as e:
+        _pair_abort(sock, "info")
+        raise WakeError(
+            f"this box's own network configuration is not usable for pairing "
+            f"({e}). Nothing was written on either box.") from e
     rec = seal(my_sk, peer_pub, send_tag, {"info": my_info})
     if first:
         sock.sendall(rec)
@@ -948,7 +986,14 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
     else:
         got = _pair_read_record(sock)
         sock.sendall(rec)
-    return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
+    try:
+        return _pair_info(open_record(my_sk, peer_pub, got, recv_tag))
+    except WakeError:
+        # Best-effort: revives PAIR_ABORT["info"], which this exchange had
+        # otherwise left as dead code. After local pre-validation above, a peer
+        # can only get here by sending something no honest build would send.
+        _pair_abort(sock, "info")
+        raise
 
 
 def pair_initiator(sock, my_sk, my_pub: bytes, my_info: dict, ask,

@@ -621,8 +621,14 @@ MUTATIONS = [
 
  # --job-timeout was inert for every job the page can start.
  ("--job-timeout does nothing for a job started from the page", "gs_console",
-  "    if JOB_TIMEOUT_EXPLICIT:\n        return JOB_TIMEOUT_S",
-  "    if False:\n        return JOB_TIMEOUT_S",
+  # RE-ANCHORED: the branch gained the "shorter than the estimate" warning
+  # between the `if` and the `return`, so the old two-line find matched
+  # nothing and this guarantee was going UNSWEPT. Anchored on the `if` alone.
+  # ...on the RETURN, not the `if`: `if JOB_TIMEOUT_EXPLICIT:` appears twice
+  # in this file (here and in main), and an anchor matching twice does not
+  # apply either. Falling through to the estimate IS the original defect.
+  "        return JOB_TIMEOUT_S",
+  "        pass",
   ["test_console"]),
 
  # The exit plan names the operator's FINAL destination and was written to the
@@ -757,7 +763,9 @@ MUTATIONS = [
  # A regex that counts digits is not a check that the number is a byte. The
  # value goes into the Pi's keyfile and then into sendto().
  ("999.1.1.1 is accepted as a broadcast address", "gs_wake_keys",
-  '    return all(0 <= int(p) <= 255 for p in v.split("."))',
+  # RE-ANCHORED: the return gained the leading-zero guard str(int(p)) == p,
+  # so the old exact find matched nothing and this went UNSWEPT too.
+  '    return all(str(int(p)) == p and 0 <= int(p) <= 255 for p in v.split("."))',
   "    return True",
   ["test_wake_endtoend"]),
 
@@ -921,6 +929,142 @@ MUTATIONS = [
   '    integrity_log("stage4", "fanout_refused:indistinct_amounts")\n'
   "    return amounts",
   ["test_units"]),
+
+ # ---- the audit of 9da2e24's own regressions ----------------------------
+ # Popped is not written: the drain emptied _PENDING_CHAIN before the write
+ # loop, so ONE failed write lost every queued signal line.
+ ("a failed chain write drops the deferred lines", "gs_common.py",
+  "            if _written < len(pending):\n"
+  "                _PENDING_CHAIN[:0] = pending[_written:]",
+  "            pass",
+  ["test_concurrency"]),
+
+ # `$` also matches before a trailing newline, and int("4\n") == 4, so the
+ # range guard did not catch it either. The value composes a URL.
+ ("a MAC with a trailing newline reaches the keyfile", "gs_wake_keys",
+  # RE-AIMED AT MAC_RE, and the reason is worth writing down.
+  #
+  # Anchored on IPV4_RE this SURVIVED twice, and the second time the harness
+  # was right: is_ipv4's octet guard `str(int(p)) == p` ALSO rejects "4\\n",
+  # so flipping that regex back to `$` changes is_ipv4's answer on nothing.
+  # IPV4_RE is used at exactly one call site -- is_ipv4 itself -- so the \\Z
+  # there is genuine defence in depth with a second layer behind it, and a
+  # single-mutation sweep cannot observe it. Pinning it needs a direct
+  # assertion on the regex, which test_wake_endtoend now also makes.
+  #
+  # MAC_RE is the one that is load-bearing: gs_wake_keys:166 and :304 use it
+  # directly, with no octet-style guard behind it, so its \\Z is the ONLY
+  # thing standing between "de:ad:be:ef:ca:fe\\n" and a keyfile.
+  'MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\\Z")',
+  'MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")',
+  ["test_wake_endtoend"]),
+
+ # Same hole on the LAN-facing path, which is the one that matters: this value
+ # comes off the wire and goes straight into a keyfile.
+ ("_pair_info accepts a trailing newline off the wire", "gs_wake_proto.py",
+  '                    r"^(\\d{1,3}\\.){3}\\d{1,3}\\Z", v) or any(',
+  '                    r"^(\\d{1,3}\\.){3}\\d{1,3}$", v) or any(',
+  ["test_wake_protocol"]),
+
+ # An incompatible wire change with no version bump lets two boxes agree to
+ # pair and then fail at wake time.
+ ("PAIR_PROTO is not bumped for the wire break", "gs_wake_proto.py",
+  "PAIR_PROTO = 3",
+  "PAIR_PROTO = 2",
+  ["test_wake_protocol"]),
+
+ # Half a pairing: only the receiver validated, so the box holding a bad value
+ # wrote its keyfile while the peer wrote none.
+ ("_pair_config does not validate the info it sends", "gs_wake_proto.py",
+  '        _pair_info({"info": my_info})',
+  "        pass",
+  ["test_wake_protocol"]),
+
+ # chain_safe strips every digit, and on a terminal line the digits ARE the
+ # diagnosis -- the RPC error code, the port that says which endpoint refused.
+ ("the signer's failure line loses the RPC error code", "airgap_tx_signer",
+  "terminal_safe(str(e))[:160]",
+  "chain_safe(str(e))[:160]",
+  ["test_chain_redaction"]),
+
+ # scrub_address fragments of bech32 escaped: base58 excludes 0 and l, which
+ # bech32's alphabet contains. 39.6% of bc1q fragments leaked in order.
+ ("the scrub fragment rule misses bech32 again", "gs_common.py",
+  '    r"[0-9A-Za-z]{4,}\\.\\.\\.[0-9A-Za-z]{4,}")',
+  '    r"[1-9A-HJ-NP-Za-km-z]{4,}\\.\\.\\.[1-9A-HJ-NP-Za-km-z]{4,}")',
+  ["test_chain_redaction"]),
+
+ # A dry run that errored printed a SUCCESS line and exited 1 with no reason.
+ ("a failed dry run goes back to exiting 1 in silence", "paranoia_mode",
+  # ANCHORED ON THE GUARD, not on the first line of a multi-line print: that
+  # mutation left the remaining lines printing and the sweep SURVIVED, which
+  # is the harness telling the truth about a bad mutation rather than about
+  # the code. `if False:` removes the whole report.
+  "        if bad:",
+  "        if False:",
+  ["test_gapfixes"]),
+
+ # Typing the flag's own advertised default cut a 361-day job to 8 days, and
+ # the only warning fired BELOW the floor -- which that number IS.
+ ("the job-timeout override stops saying it is the shorter number",
+  "gs_console",
+  "        if JOB_TIMEOUT_S < _estimate:",
+  "        if False:",
+  ["test_console"]),
+
+ # StandardOutput=null took the agent's own refusal reasons with it, and
+ # OnFailure powers the machine off. Nothing was left saying why.
+ ("the wake agent's refusal reason stops reaching durable storage",
+  "gs_wake_agent",
+  "        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n"
+  '        with os.fdopen(_fd, "a") as _fh:\n'
+  '            _fh.write(msg.rstrip("\\n") + "\\n")',
+  "        pass",
+  ["test_wake_agent"]),
+
+ # send_error bypassed the banner suppression, so the Pi's wall clock was one
+ # malformed request away.
+ ("the doorbell leaks its clock on the error path again", "gs_doorbell",
+  "    def send_error(self, code, message=None, explain=None):",
+  "    def _unused_send_error(self, code, message=None, explain=None):",
+  ["test_wake_doorbell"]),
+
+ # An M1 with no window field is an old build, not an intruder -- and the
+ # agent told the operator it looked like a stranger's magic packet.
+ ("an old build's M1 goes back to looking like an intruder", "gs_doorbell",
+  '            self.events.append("m1_no_window_field")',
+  "            pass",
+  ["test_wake_doorbell"]),
+
+ # ---- fixes that shipped in 9da2e24 with NO anchor at all --------------
+ # Reverting either of these left all 33 suites green, so nothing stopped a
+ # later edit from quietly undoing them.
+ #
+ # An https:// wallet-RPC was spoken in CLEARTEXT with nothing saying so: the
+ # scheme is not carried through to the connection.
+ ("an https:// wallet-RPC is spoken in cleartext again", "gs_common.py",
+  '        if (parsed.scheme or "http").lower() not in ("http", ""):',
+  "        if False:",
+  ["test_units"]),
+
+ # The chain is UNKEYED, so anyone who can write the file can recompute every
+ # hash below their edit. Claiming it detects a mid-file edit is false.
+ ("verify_integrity_chain claims to catch an adversary who recomputes",
+  "gs_common.py",
+  "        THAT DID NOT RECOMPUTE",
+  "        THAT EDITED IT",
+  ["test_units"]),
+
+ # Three of the four common MAC notations walked through the redactor, two of
+ # them with no digits in them at all so the digit rule never fired either.
+ ("the MAC rule goes back to covering only the colon form", "gs_common.py",
+  '    r"(?<![0-9A-Za-z])(?:0[xX])?(?:"\n'
+  '    r"(?:[0-9A-Fa-f]{2}[:-]){5,}[0-9A-Fa-f]{2}"\n'
+  '    r"|(?:[0-9A-Fa-f]{4}\\.){2}[0-9A-Fa-f]{4}"\n'
+  '    r"|[0-9A-Fa-f]{12}"\n'
+  '    r")(?![0-9A-Za-z])")',
+  '    r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z])")',
+  ["test_chain_redaction"]),
 ]
 
 

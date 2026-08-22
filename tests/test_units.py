@@ -4520,6 +4520,74 @@ finally:
         os.environ["HOME"] = _savedhome
 
 
+# ===========================================================================
+# TWO FIXES THAT SHIPPED WITH NO TEST AT ALL.
+#
+# Reverting either of them left all 33 suites green, so nothing stopped a
+# later edit from quietly undoing them. Anchored here.
+# ===========================================================================
+import gs_common as _gscx
+
+
+def _rpc_refuses(url):
+    try:
+        _gscx.MoneroRPC(url)
+        return False
+    except BaseException as e:                # SystemExit is not an Exception
+        return "scheme" in str(e).lower() or "not supported" in str(e).lower()
+
+
+# An https:// wallet-RPC was spoken in CLEARTEXT with nothing saying so: the
+# scheme is not carried through to the connection, so an operator who put the
+# RPC behind a TLS terminator got plain HTTP to the same host:port.
+check("MoneroRPC refuses an https:// URL rather than silently speaking "
+      "cleartext to it", _rpc_refuses("https://127.0.0.1:18083"))
+check("...case-insensitively, because HTTPS:// is the same mistake",
+      _rpc_refuses("HTTPS://127.0.0.1:18083"))
+check("...and any other scheme it cannot actually speak",
+      _rpc_refuses("socks5://127.0.0.1:18083"))
+def _rpc_gets_past_the_scheme_gate(url):
+    """The constructor DIALS, so with no daemon up the honest outcome is a
+    connection error -- which proves the scheme gate let it through. An
+    https:// URL never gets that far: it exits on the scheme, before any
+    socket. That difference IS the guarantee."""
+    try:
+        _gscx.MoneroRPC(url)
+        return True                                # a daemon happened to be up
+    except SystemExit:
+        return False                               # refused at the gate
+    except BaseException as e:
+        return "scheme" not in str(e).lower()      # got as far as connecting
+
+
+check("NON-VACUITY: plain http:// still gets past the scheme gate and only "
+      "then fails to connect",
+      _rpc_gets_past_the_scheme_gate("http://127.0.0.1:18083"))
+check("NON-VACUITY: a bare host:port does too, so the gate is about the "
+      "scheme and not about the URL shape",
+      _rpc_gets_past_the_scheme_gate("127.0.0.1:18083"))
+check("...while https:// is stopped BEFORE any socket is opened",
+      not _rpc_gets_past_the_scheme_gate("https://127.0.0.1:18083"))
+
+# verify_integrity_chain claimed to detect a mid-file edit. The chain is
+# UNKEYED -- each link is sha256(previous_hash + payload) -- so anyone who can
+# write the file can recompute every hash below their change in four lines. It
+# detects an edit by something that did NOT recompute, and must say which.
+_vic = _gscx.verify_integrity_chain.__doc__ or ""
+# THE EXACT PHRASE, not the word. "RECOMPUT" appears SEVEN times in this
+# docstring, so `"RECOMPUTE" in _vic.upper()` was true no matter what the
+# sentence said -- the sweep reported SURVIVED on a mutation that changed the
+# claim itself. The distinction being made is the whole value of the docstring.
+check("verify_integrity_chain says it detects an editor that did NOT "
+      "recompute, in those words", "THAT DID NOT RECOMPUTE" in _vic)
+check("...and says out loud that it does NOT catch one that does",
+      "does NOT detect" in _vic or "not detect" in _vic.lower())
+check("...naming the reason: the chain is unkeyed",
+      "unkeyed" in _vic.lower())
+check("...so it no longer claims a bare 'detects tampering'",
+      "tamper-EVIDENCE until" in _vic or "is not tamper" in _vic.lower())
+
+
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:

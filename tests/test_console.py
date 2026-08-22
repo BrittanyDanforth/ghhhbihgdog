@@ -6,6 +6,7 @@ action builders, and the real HTTP handler over a real socket on 127.0.0.1.
 Confirmed to FAIL against the pre-fix build.
 """
 import sys, os, json, time, socket, threading, subprocess, tempfile
+import contextlib, io
 import importlib.util, importlib.machinery
 import http.client
 
@@ -1908,6 +1909,53 @@ def test_job_timeout_flag_actually_does_something():
           'ap.add_argument("--job-timeout", type=int, default=None' in _src)
     check("...and setting it says so, because it now overrides an estimate "
           "the operator cannot see", "applies to EVERY job" in _src)
+
+
+def test_job_timeout_override_says_when_it_is_the_shorter_number():
+    """Typing the flag's own advertised default cut a 361-day job to 8 days.
+
+    The help text called JOB_TIMEOUT_FLOOR_S (694800) the "default", and with
+    default=None, typing that number is NOT the same as omitting it -- it
+    became an override. Measured, wallets=60, hop_delay=86400-259200:
+
+        omitted              -> 31_194_000 s = 361 days   (per-job estimate)
+        --job-timeout 694800 ->    694_800 s =   8 days   (override wins)
+
+    and the only warning fired BELOW the floor, so 694800 -- which IS the floor
+    -- said nothing. The job is SIGKILLed on day 8 of a legitimate run, and
+    job_timeout_for's own reason for existing is that "killing a live run
+    strands funds and leaves secrets on disk".
+    """
+    c = load_console()
+    _saved = (c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S)
+    _big = {"wallets": 60, "hop_delay": "86400-259200"}
+    try:
+        c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S = False, 0
+        _est = c.job_timeout_for(_big)
+        c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S = True, c.JOB_TIMEOUT_FLOOR_S
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            _got = c.job_timeout_for(_big)
+        _said = _buf.getvalue()
+        check("the override still wins -- an explicit instruction is one",
+              _got == c.JOB_TIMEOUT_FLOOR_S)
+        check("...but typing the advertised default is NOT silent when it is "
+              "shorter than the job's own estimate", "SHORTER" in _said)
+        check("...and it names both numbers, so the operator can judge",
+              str(c.JOB_TIMEOUT_FLOOR_S) in _said and str(_est) in _said)
+        # NON-VACUITY: it must stay quiet when the override is the longer one.
+        c.JOB_TIMEOUT_S = _est * 2
+        _buf2 = io.StringIO()
+        with contextlib.redirect_stdout(_buf2):
+            c.job_timeout_for(_big)
+        check("a LONGER override says nothing -- this is a warning, not noise",
+              "SHORTER" not in _buf2.getvalue())
+    finally:
+        c.JOB_TIMEOUT_EXPLICIT, c.JOB_TIMEOUT_S = _saved
+    _src2 = open(os.path.join(REPO, "gs_console")).read()
+    check("the help text no longer calls the floor the default, because it "
+          "is not one any more",
+          "DEFAULT: a per-job" in _src2)
 
 
 def test_fee_panel_says_which_chain_the_daemon_is_on():

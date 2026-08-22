@@ -567,9 +567,20 @@ def _hostname(sock, pub, ask):
     peer = P._pair_pub(body)
     P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO, "pub": pub.hex()})
     P._pair_finish(sock, pub, peer, ask, lambda m: None)
-    return P._pair_config(sock, _evilsk, peer,
-                          {"host": "evil.example.com", "port": 41337},
-                          P.TAG_PC, P.TAG_PV, first=True)
+    # SEALED AND SENT DIRECTLY, not via _pair_config.
+    #
+    # _pair_config now validates its OWN info before sending, which is what
+    # stops an HONEST box with a bad local value (an IPv6 address out of
+    # sock.getsockname()) from half-pairing. An ATTACKER simply does not run
+    # that check -- they run their own code -- so driving this through
+    # _pair_config would only ever test our sender-side guard and would leave
+    # the RECEIVER's guard, the one that actually has to hold, unexercised.
+    rec = P.seal(_evilsk, _NP.PublicKey(peer), P.TAG_PC,
+                 {"info": {"host": "evil.example.com", "port": 41337}})
+    sock.sendall(rec)
+    got = P._pair_read_record(sock)
+    return P._pair_info(P.open_record(_evilsk, _NP.PublicKey(peer), got,
+                                      P.TAG_PV))
 
 
 _r = _ceremony(tamper=_hostname, ipub=_evilsk.public_key.encode())
@@ -637,6 +648,55 @@ for _extra in ({"port": 0}, {"port": 70000}, {"mac": "nope"},
         check(f"pairing info refuses {sorted(_extra)[0]}={list(_extra.values())[0]!r}",
               True)
 
+
+# ===========================================================================
+# `$` IS NOT END-OF-STRING IN PYTHON. It also matches just before a trailing
+# newline, so every "^...$" shape check on this wire accepted a value with
+# "\n" glued on -- and the range guard did not catch it either, because
+# int("255\n") is 255. The value is written into a keyfile and then composes
+# f"http://{host}:{port}", which urllib rejects with "URL can't contain
+# control characters" MONTHS LATER, at the one moment a machine must wake.
+# ===========================================================================
+for _bad, _why in [({"broadcast": "192.168.1.255\n"}, "broadcast newline"),
+                   ({"mac": "de:ad:be:ef:ca:fe\n"}, "MAC newline"),
+                   ({"host": "10.0.0.1\n", "port": 8770}, "host newline"),
+                   ({"host": "10.0.0.010", "port": 8770}, "octal-looking host"),
+                   ({"broadcast": "999.1.1.1"}, "out-of-range octet")]:
+    _refused = False
+    try:
+        P._pair_info({"info": _bad})
+    except P.WakeError:
+        _refused = True
+    check(f"_pair_info refuses a {_why} off the wire", _refused)
+check("_pair_info still accepts an honest dotted quad",
+      P._pair_info({"info": {"host": "10.0.0.1", "port": 8770}})
+      == {"host": "10.0.0.1", "port": 8770})
+check("the wire regexes are anchored with \\Z, not $",
+      "$\", v)" not in src and "\\Z" in src)
+
+# ===========================================================================
+# A WIRE BREAK WITHOUT A VERSION BUMP LETS TWO BOXES AGREE TO PAIR AND THEN
+# FAIL AT WAKE TIME, which is the worst place to find out. M1 gained a
+# required `window` field and `reveal` lost its plaintext `info`; both are
+# incompatible, and PAIR_PROTO stayed at 2.
+# ===========================================================================
+check("PAIR_PROTO was bumped past the version that had no per-window nonce",
+      P.PAIR_PROTO >= 3)
+
+# ===========================================================================
+# HALF A PAIRING. _pair_config runs AFTER both operators confirmed, and only
+# the RECEIVING side validated -- so the box holding a bad value (an IPv6
+# address from sock.getsockname() on an IPv6-routed LAN) sent it and wrote its
+# keyfile, while the peer rejected it and wrote nothing.
+# ===========================================================================
+check("_pair_config validates its OWN info before sending it",
+      "_pair_info({\"info\": my_info})" in src)
+_pc_body = src.split("def _pair_config")[1].split("\ndef ")[0]
+check("...and aborts the peer rather than leaving it holding a keyfile "
+      "(both on my own bad info and on the peer's)",
+      _pc_body.count("_pair_abort(sock, \"info\")") == 2)
+check("PAIR_ABORT['info'] is no longer dead code",
+      "_pair_abort(sock, \"info\")" in src and "\"info\":" in src)
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

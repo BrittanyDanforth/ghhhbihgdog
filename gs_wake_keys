@@ -85,8 +85,13 @@ from gs_common import (                                      # noqa: E402
 )
 import gs_wake_proto as proto                                # noqa: E402
 
-MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
-IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+# \Z, NOT $. In Python `$` also matches just before a trailing newline, so
+# `^...$` accepted "192.168.1.255\n" -- and int("255\n") is 255, so the range
+# check below waved it through too. That value is pasted into
+# f"http://{host}:{port}", which urllib then rejects with "URL can't contain
+# control characters" at wake time, months after the ceremony that stored it.
+MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\Z")
+IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}\Z")
 
 
 def is_ipv4(v: str) -> bool:
@@ -97,10 +102,14 @@ def is_ipv4(v: str) -> bool:
     keyfile, and the failure surfaced months later as sendto() refusing an
     address at the one moment the operator needed a machine to wake. A regex
     that checks digit COUNT is not a check that the number is a byte.
+
+    Leading zeros are refused as well: inet_aton reads "010" as OCTAL 8, so
+    "10.0.0.010" is a different host to sendto() than it reads as on screen.
+    str(int(p)) == p rejects that, the empty octet, and any "+1"/" 1" form.
     """
     if not isinstance(v, str) or not IPV4_RE.match(v):
         return False
-    return all(0 <= int(p) <= 255 for p in v.split("."))
+    return all(str(int(p)) == p and 0 <= int(p) <= 255 for p in v.split("."))
 #: amount_slot is validated as int 0..7 on the wire, so a ladder longer than
 #: that has entries no note can ever select. Refuse rather than carry them.
 MAX_LADDER = 8
