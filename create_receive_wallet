@@ -33,11 +33,11 @@ import argparse, stat, sys, time
 from pathlib import Path
 
 from gs_common import (
+    wipe_will_erase,
     integrity_log, integrity_log_once, verify_tor, validate_proxy, connect_rpc,
     require_resources, atomic_write_json,
     install_signal_handlers, newnym, scrub_address, secure_hex, secure_mkdir,
     create_fresh_account,
-    wipe_covers,
 )
 
 
@@ -235,7 +235,10 @@ def mint_one_receive(wallet_rpc, args) -> tuple:
     # WIPE COVERAGE, same helper, same reason. The bundle names the receive
     # address and its (account, subaddress) -- the pair report_holdings refuses
     # to put on disk -- and --output-dir sends it wherever the operator says.
-    if not wipe_covers(fname):
+    # wipe_will_erase: this tool picks the name (wallet_*.json, which the
+    # sweep matches), so only the directory varies -- but asking the question
+    # that is actually being answered keeps it right if either side changes.
+    if not wipe_will_erase(fname):
         integrity_log_once("wallet", "bundle_outside_wipe_roots")
         print(f"  [!] {outdir} is OUTSIDE the directories paranoia_mode "
               f"sweeps, so this bundle will NOT be wiped with the rest of the "

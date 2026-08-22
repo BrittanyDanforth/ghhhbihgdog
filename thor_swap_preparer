@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from gs_common import (
+    wipe_will_erase,
     integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
@@ -43,7 +44,7 @@ from gs_common import (
     validate_xmr_address,
     decimal_env,
     finite_decimal,
-    wipe_covers, fmt_btc,
+    fmt_btc,
     PAIR_SCHEMA,
 )
 
@@ -51,7 +52,7 @@ SWAPKIT_API = "https://api.swapkit.dev"
 # PAIR_SCHEMA is gs_common's now. It was declared here AND in receive_watch --
 # one constant, two copies, held by the writer and the reader, which are exactly
 # the two sides that must agree about it.
-BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}$", re.I)
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
 # (CG_PRICE and _XMR_RE used to live here and nothing read either. CG_PRICE was
 # a second copy of gs_common.CG_PRICE_URL -- the oracle this tool actually calls
 # through btc_per_xmr_oracle -- so a URL edit here would have changed nothing.
@@ -539,7 +540,13 @@ def main():
     # fixed roots (cwd, $HOME, $HOME/ghostspiral, $HOME/GhostSpiral) at depth 0
     # and 1, so anything written outside them is never looked at -- while this
     # tool prints "Saved N pair(s)" identically wherever it wrote.
-    if not wipe_covers(_out):
+    # wipe_will_erase, NOT wipe_covers: the sweep matches on the NAME as well
+    # as the location, and --outfile is free-form. Measured:
+    #   ~/gs/thor_pairs.json   covers=True  name matches  -> erased
+    #   ~/gs/my_notes.json     covers=True  NO match      -> NEVER erased
+    # so the second one printed no warning at all, for the file this comment
+    # calls the single artifact tying the BTC side to the XMR side.
+    if not wipe_will_erase(_out):
         try:
             _wdir = _out.resolve().parent
         except OSError:

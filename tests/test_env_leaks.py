@@ -430,7 +430,13 @@ check("F5: ...and the file really was written there",
 
 # NON-VACUITY: writing somewhere the sweep DOES cover must NOT warn, or the
 # check above would pass on a tool that warns unconditionally.
-_cwd_out = os.path.join(os.getcwd(), "f5_probe_pairs.json")
+#
+# THE NAME IS PART OF "COVERED" NOW. The sweep matches location AND filename,
+# and this control used "f5_probe_pairs.json", which no pattern matches -- so
+# under wipe_will_erase it warns, correctly: that file really would never be
+# erased. Using a name the sweep actually sweeps is what this control meant
+# all along; the old one passed only because the predicate was blind to names.
+_cwd_out = os.path.join(os.getcwd(), "thor_pairs_batch.json")
 try:
     _out_home = _run_thor(_cwd_out)
     check("F5 control: writing under the working directory does NOT warn",
@@ -445,8 +451,9 @@ finally:
 _crw_src = open(os.path.join(REPO, "create_receive_wallet")).read()
 _crw_flat = re.sub(r"\s+", " ", _crw_src)
 _crw_flat = re.sub(r'"\s*f?"', "", _crw_flat)
-check("F5: create_receive_wallet consults wipe_covers on its bundle",
-      "wipe_covers(fname)" in _crw_flat)
+check("F5: create_receive_wallet asks whether its bundle will be ERASED, "
+      "which needs the filename as well as the directory",
+      "wipe_will_erase(fname)" in _crw_flat)
 check("F5: ...and warns that the bundle will not be wiped",
       "will NOT be wiped with the rest of the run" in _crw_flat)
 check("F5: ...naming what it discloses",

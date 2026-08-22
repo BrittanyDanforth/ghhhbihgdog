@@ -48,9 +48,11 @@ OPSEC hardening:
     arming and running a spend stays where the rest of the toolchain puts it.
 """
 from __future__ import annotations
-import argparse, secrets, shlex, sys, time
+import argparse, re, secrets, shlex, sys, time
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
+
+BTC_RE = re.compile(r"^(bc1|tb1)[ac-hj-np-z02-9]{25,59}\Z", re.I)
 
 from gs_common import (
     integrity_log, verify_tor, validate_proxy, connect_rpc,
@@ -62,6 +64,7 @@ from gs_common import (
     decimal_env, XMR_ABSURD_TOTAL,
     progress_line,
     load_pairs, pairs_for_dest,
+    bech32_checksum_ok,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -727,6 +730,34 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
     """
     if not matched:
         return
+    # THE ADDRESS THE BITCOIN ACTUALLY GOES TO, checked for the same reason and
+    # by the same argument the docstring above makes about the memo -- which it
+    # then applied to the memo only.
+    #
+    # A tampered memo pays someone else's XMR address. A tampered DEPOSIT
+    # address is worse and quieter: the BTC leaves and never reaches ThorChain
+    # at all, so no swap is ever routed, and the memo check cannot fire because
+    # the memo can stay perfectly honest. This is the value the operator pastes
+    # to the sender, read back out of an ordinary 0600 JSON hours later.
+    #
+    # The same two checks thor_swap_preparer runs before it will print one:
+    # shape, then the BIP173/BIP350 checksum, which is what actually catches a
+    # single flipped character.
+    _baddr = [i for i, p in enumerate(matched)
+              if not isinstance(p.get("deposit"), str)
+              or not BTC_RE.match(p.get("deposit") or "")
+              or not bech32_checksum_ok(p.get("deposit") or "")]
+    if _baddr:
+        integrity_log("recv", f"deposit_addr_invalid:{len(_baddr)}")
+        sys.exit(
+            f"[!] {len(_baddr)} of {len(matched)} swap pair(s) carry a BTC deposit\n"
+            f"    address that is not a valid bech32 address.\n"
+            f"    That is the address the BITCOIN goes to. Sending to it would put\n"
+            f"    the payment somewhere ThorChain never sees, so no swap is routed\n"
+            f"    and the memo check cannot catch it -- the memo can be honest while\n"
+            f"    the address is not.\n"
+            f"    The pairs file has changed since thor_swap_preparer wrote it.\n"
+            f"    Re-run thor_swap_preparer rather than trusting this file.")
     if dest:
         bad = [i for i, p in enumerate(matched)
                if not memo_binds_destination(p.get("memo") or "", dest)]

@@ -1365,7 +1365,11 @@ finally:
 # _wipe_spent_plans), so the wipe walked straight past it.
 _pm = open(os.path.join(REPO, "paranoia_mode")).read()
 _gi = open(os.path.join(REPO, ".gitignore")).read()
-check("the marker is on paranoia_mode's wipe list", '".chain_once_*"' in _pm)
+# THE LIST, not the source text: the patterns moved to gs_common so the sweep
+# and gs_common.wipe_will_erase cannot disagree about them, and a grep over
+# paranoia_mode stopped seeing them while they were still there and working.
+check("the marker is on paranoia_mode's wipe list",
+      ".chain_once_*" in gsc.GS_ARTIFACT_FILE_PATTERNS)
 check("...and in .gitignore, in lockstep as this repo requires",
       ".chain_once_*" in _gi)
 

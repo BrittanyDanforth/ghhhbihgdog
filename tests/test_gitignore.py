@@ -142,6 +142,58 @@ check("no file tracked by git matches a paranoia_mode wipe pattern"
       + ("" if not _clash else " -- " + "; ".join(_clash[:4])),
       not _clash)
 
+# ===========================================================================
+# "WILL THIS BE WIPED?" HAS TWO HALVES AND ONLY ONE WAS BEING ASKED.
+#
+# The sweep matches on the LOCATION (roots at depth 0 and 1) AND on the file's
+# NAME against GS_ARTIFACT_FILE_PATTERNS. Every tool that tells the operator
+# "this artifact will be wiped with the rest of the run" was calling
+# wipe_covers, which answers the location half only. Measured, with the file in
+# a perfectly ordinary place:
+#
+#     ~/gs/thor_pairs.json   covers=True   name matches   -> erased
+#     ~/gs/my_notes.json     covers=True   NO match       -> NEVER erased
+#
+# and --outfile is free-form, so the second row is one flag away. That file
+# holds every BTC deposit address and every memo, and a memo carries the
+# destination XMR address in full -- and thor_swap_preparer printed no warning
+# for it, because wipe_covers said the directory was fine.
+# ===========================================================================
+import gs_common as _gsc_w
+
+_H = os.path.expanduser("~")
+check("a slip with a swept NAME in a swept place is erased",
+      _gsc_w.wipe_will_erase(f"{_H}/gs/thor_pairs.json"))
+check("...and so is the batch default the tool actually writes",
+      _gsc_w.wipe_will_erase(f"{_H}/gs/thor_pairs_batch.json"))
+check("a custom --outfile NAME in the same swept place is NOT erased, and "
+      "that is the case wipe_covers could not see",
+      _gsc_w.wipe_covers(f"{_H}/gs/my_notes.json")
+      and not _gsc_w.wipe_will_erase(f"{_H}/gs/my_notes.json"))
+check("a swept name OUTSIDE the roots is still not erased",
+      not _gsc_w.wipe_will_erase("/srv/elsewhere/thor_pairs.json"))
+check("NON-VACUITY: the two answers really do differ somewhere, or this "
+      "helper is wipe_covers with extra steps",
+      _gsc_w.wipe_covers(f"{_H}/gs/my_notes.json")
+      != _gsc_w.wipe_will_erase(f"{_H}/gs/my_notes.json"))
+# THE PATTERNS HAVE ONE OWNER NOW, which is what stops the sweep and the
+# prediction drifting apart again.
+check("the patterns live in gs_common",
+      hasattr(_gsc_w, "GS_ARTIFACT_FILE_PATTERNS")
+      and hasattr(_gsc_w, "GS_ARTIFACT_DIR_PATTERNS"))
+check("...and paranoia_mode uses the very same objects, not a copy",
+      para.GS_ARTIFACT_FILE_PATTERNS is _gsc_w.GS_ARTIFACT_FILE_PATTERNS
+      and para.GS_ARTIFACT_DIR_PATTERNS is _gsc_w.GS_ARTIFACT_DIR_PATTERNS)
+# THE CALL SITES that make the promise must ask the right question.
+for _tool, _needle in (("thor_swap_preparer", "wipe_will_erase(_out)"),
+                       ("exit_strategy_simulator", "wipe_will_erase(_out)"),
+                       ("create_receive_wallet", "wipe_will_erase(fname)")):
+    _src = open(os.path.join(REPO, _tool)).read()
+    check(f"{_tool} asks whether the file will actually be ERASED",
+          _needle in _src)
+    check(f"...and {_tool} no longer asks the location-only question",
+          "wipe_covers(" not in _src.replace("# ", ""))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

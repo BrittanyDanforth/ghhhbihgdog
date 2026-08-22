@@ -1020,6 +1020,25 @@ def main():
                 # silent rather than merely useless.
                 newnym(proxy_url=getattr(args, "tor_proxy", ""))
                 secure_delay(5.0, 15.0)
+                # AND RE-VERIFY BEFORE THE NEXT SUBMIT.
+                #
+                # The gate ran ONCE per transaction, above this loop. A
+                # transaction gets --rebroadcast attempts (default 5) across
+                # --timeout-min minutes (default 30), and every attempt after
+                # the first re-submitted on a sample taken before the first --
+                # across a newnym and a 5-15 s delay, which is exactly when
+                # egress state changes. That is the "verified, then assumed"
+                # pattern this gate's own docstring says it exists to close,
+                # reintroduced one loop lower down.
+                #
+                # force=False, deliberately, and it is the same split the
+                # docstring already argues: the DAEMON check is a local RPC
+                # costing nothing and is the leak-critical fact for THIS
+                # submit, so it runs every time; tor_recheck is an external
+                # request whose per-transaction traffic would be its own
+                # pattern, so it stays timer-gated -- and a retry window of up
+                # to 30 minutes crosses TOR_RECHECK_INTERVAL on its own.
+                _egress_gate(f"broadcast_tx_{real_idx}_retry", force=False)
 
         if outcome == "relayed":
             success_count += 1

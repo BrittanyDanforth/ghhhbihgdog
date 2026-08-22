@@ -18,7 +18,7 @@ OPSEC design principles
 """
 from __future__ import annotations
 import argparse
-import contextlib, errno, fcntl, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
+import contextlib, errno, fcntl, fnmatch, hashlib, json, os, re, secrets, shutil, signal, stat as stat_module, sys, time
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional
@@ -114,7 +114,7 @@ PICONERO = Decimal("0.000000000001")
 #: Verified that this Tor really does offer it: a raw SOCKS5 handshake
 #: presenting credentials gets method 0x02 (USERNAME/PASSWORD) and auth status
 #: 0x00 (OK); presenting none gets method 0x00.
-SOCKS_RE = re.compile(r"^socks5h://([^\s:@/]+:[^\s:@/]*@)?[^\s:@/]+:\d{1,5}$")
+SOCKS_RE = re.compile(r"^socks5h://([^\s:@/]+:[^\s:@/]*@)?[^\s:@/]+:\d{1,5}\Z")
 
 #: Per-process salt, so two runs on the same box do not present the same SOCKS
 #: identity for the same tag. Never logged, never written to disk -- it exists
@@ -914,6 +914,141 @@ def paranoia_search_roots() -> list:
     return [Path.cwd().resolve(), Path.home().resolve(),
             (Path.home() / "ghostspiral").resolve(),
             (Path.home() / "GhostSpiral").resolve()]
+
+
+GS_ARTIFACT_FILE_PATTERNS = [
+    "unsigned_*.json", "signer_progress.json",
+    "broadcast_progress.json", "wallet_*.json",
+    # BOTH shapes. "thor_pairs_*.json" requires an underscore after "pairs",
+    # so it never matched the plain "thor_pairs.json" -- which is the DEFAULT
+    # filename gs_console writes ("--outfile", p.get("pairs_file") or
+    # "thor_pairs.json"), the name in receive_watch's own usage line, and the
+    # one OPSEC_SETUP.md lists among the secrets. The most common file in the
+    # whole receive flow survived every wipe, holding BTC deposit addresses,
+    # BTC amounts, and swap memos that carry the full 95-character XMR
+    # destination in plain text.
+    "thor_pairs.json", "thor_pairs.json.gpg",
+    "thor_pairs_*.json", "thor_pairs_*.json.gpg", "thor_pairs_batch.json",
+    "exitplan_*.json", "exitplan_v1.json",
+    "integrity_chain.log", "integrity.log",
+    "*.blob", "*.signed", "*.unsigned",
+    "signed_manifest_v1.json", "unsigned_manifest.json",
+    # The wallet OUTPUT SET the signer exports so the offline wallet can sign
+    # a spend of an earlier round's output. It maps this wallet's outputs --
+    # exactly the holdings picture a forensic reader wants -- so it must not
+    # survive the wipe. Written 0600, but 0600 is not gone.
+    "outputs_export.hex",
+    # The WALLET PASSWORD, in plaintext. airgap_tx_signer cannot hand a
+    # password to monero-wallet-cli on argv (/proc/<pid>/cmdline is mode 444 --
+    # any local user reads it), so it writes one 0600 file and feeds it via
+    # stdin redirection. It is deleted in a finally, but a SIGKILL runs no
+    # finally, and 0600 is not gone. Nothing here matched it before: the name
+    # starts with a dot and none of the patterns above are dotfile globs.
+    ".gs_pw_*",
+    # THE WAKE AGENT'S RUN STATE. gs_wake_state.json is the job ledger and the
+    # 24h wake budget; gs_wake_handles.json maps a 4-hex handle to the bundle
+    # and slip it names, so it is a direct index into this run's addresses.
+    "gs_wake_state.json", "gs_wake_handles.json", ".gs_wake_inhibit",
+    # WHERE A WOKEN JOB'S CHILDREN WRITE, because the alternative was the
+    # systemd journal -- persistent, root-owned, rotated rather than erased,
+    # and outside every root this sweep searches. It holds whatever
+    # thor_swap_preparer printed: the BTC deposit address and the ThorChain
+    # memo, which names the destination XMR address in plain text.
+    "gs_wake_job.log",
+    # integrity_log_once's run-scoped dedupe marker, written into the
+    # --output directory beside the plans. It was in NEITHER this list nor
+    # .gitignore, so an incomplete run -- which keeps its marker by design,
+    # because report_completion exits before _wipe_spent_plans -- left it
+    # behind for the wipe to walk straight past.
+    ".chain_once_*",
+    # THE WAKE KEYPAIR. Suffixed "*.key" on purpose: a "gs_wake_*" glob would
+    # match the TRACKED scripts gs_wake_keys and gs_wake_agent, and
+    # tests/test_gitignore.py's backward check (no tracked file may be
+    # shadowed) would go red -- and worse, a real wipe would delete the tools.
+    #
+    # WIPING THIS BREAKS THE DOORBELL UNTIL BOTH BOXES ARE RE-KEYED, and the
+    # summary says so by name. Without that line the next magic packet produces
+    # a correct fail-closed refusal that is byte-identical to a dead switch, a
+    # BIOS reset and a hostile WOL -- and the operator debugs everything except
+    # the wipe they ran.
+    "gs_wake_*.key",
+    ".ghostspiral.lock",
+    # integrity_log's serialisation lock (integrity_chain.log.lock). Holds no
+    # content, but it is a per-run artifact and its mere presence dates a run.
+    "*.log.lock",
+    # atomic_write_json/_text stage a '<name>.tmp' before renaming. A crash or
+    # Ctrl-C in that window leaves the partial file behind holding the SAME
+    # plaintext (deposit addresses, memos, XMR destinations) -- and none of the
+    # patterns above match a '.tmp' suffix, so it survived every wipe.
+    # gs_common now erases its own partial on failure; this is defence in depth
+    # for a hard kill (SIGKILL) that runs no cleanup at all.
+    "*.json.tmp", "*.tmp",
+    "unsigned_monero_tx", "signed_monero_tx",
+    # Monero's OWN logs. This pipeline requires monerod + monero-wallet-rpc, so
+    # it causes these files even though it does not write them. At the default
+    # log level they were checked and carry no addresses/keys/txids -- but at
+    # --log-level 2 monero-wallet-cli.log contains the FULL wallet address
+    # (verified), which is a deanonymisation link for a mixing tool. monerod's
+    # log is also created world-readable (0644, verified) and we cannot change
+    # that from here; wiping it is what we can do.
+    "monero-wallet-cli.log", "monero-wallet-rpc.log",
+    "monerod.log", "bitmonero.log",
+    # NOTHING TRACKED BY GIT BELONGS ON THIS LIST. "renamethis1" was here and
+    # is a committed file in this repository, so a real wipe shredded a file
+    # git then reported as deleted -- dirtying the working tree of the tool
+    # doing the wiping, for no gain: the file is already published, and
+    # deleting the local copy does not unpublish it. This list is for RUNTIME
+    # artifacts, which are the ones that are private and the ones .gitignore
+    # covers. tests/test_gitignore.py now checks the two lists cannot disagree
+    # about that in either direction.
+]
+GS_ARTIFACT_DIR_PATTERNS = [
+    "signed_blobs", "unsigned", "tx_staging",
+    # airgap_tx_signer's per-TX scratch dir (tempfile.mkdtemp(prefix="gs_sign_")),
+    # which holds unsigned_monero_tx and the signed_monero_tx wallet-cli writes.
+    "gs_sign_*",
+    # airgap_tx_signer's multi-round output-import scratch (prefix="gs_impout_"),
+    # which holds the wallet OUTPUT-SET blob. Normally /dev/shm (RAM) and wiped
+    # in a finally, but a SIGKILL before that -- or a host with no /dev/shm, so
+    # it falls back to $TMPDIR -- would leave the holdings map behind. Neither
+    # of those two locations is a search_root here, which is why the Temp files
+    # phase now sweeps them by prefix (_wipe_targeted_temp_roots); this pattern
+    # only catches a copy left in the cwd or under $HOME.
+    "gs_impout_*",
+]
+
+
+def wipe_will_erase(target) -> bool:
+    """True if paranoia_mode's artifact sweep would actually DELETE `target`.
+
+    wipe_covers answers only half the question. The sweep matches on TWO
+    things -- the location (roots at depth 0 and 1, which is what wipe_covers
+    resolves) AND the file's NAME against GS_ARTIFACT_FILE_PATTERNS. Callers
+    that print "this will be wiped with the rest of the run" were asking
+    wipe_covers, so they were reporting on the location alone. Measured, with
+    the file in a perfectly ordinary place:
+
+        ~/gs/thor_pairs.json     covers=True   name matches   -> erased
+        ~/gs/my_notes.json       covers=True   NO match       -> NEVER erased
+
+    and --outfile is free-form, so the second row is one flag away. That file
+    holds every BTC deposit address and every memo, and a memo carries the
+    destination XMR address in full -- thor_swap_preparer's own comment calls
+    it "the single artifact that ties the BTC side to the XMR side", and it
+    printed no warning for it.
+
+    A directory is judged by the directory patterns, the way the sweep does.
+    """
+    try:
+        res = Path(target).resolve()
+    except OSError:
+        return False
+    if not wipe_covers(res):
+        return False
+    name = res.name
+    pats = (GS_ARTIFACT_DIR_PATTERNS if res.is_dir()
+            else GS_ARTIFACT_FILE_PATTERNS)
+    return any(fnmatch.fnmatch(name, pat) for pat in pats)
 
 
 def wipe_covers(target) -> bool:
