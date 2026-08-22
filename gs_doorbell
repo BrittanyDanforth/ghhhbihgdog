@@ -81,7 +81,44 @@ class Doorbell(Exception):
 # ---------------------------------------------------------------------------
 #  Keyfile
 # ---------------------------------------------------------------------------
-def load_key(path: Path) -> dict:
+#: Read from the ENVIRONMENT, never argv. /proc/<pid>/cmdline is mode 0444 and
+#: every local account can read it; /proc/<pid>/environ is 0400. This exists so
+#: a trigger wrapper can poke the doorbell without a terminal; a human at a
+#: terminal gets prompted instead and nothing is stored.
+PASSPHRASE_ENV = "GS_WAKE_PASSPHRASE"
+
+
+def read_passphrase(prompt: str = "  Passphrase for the doorbell key: ",
+                    getter=None, env=None) -> bytes:
+    """The passphrase, from the environment or the terminal. NEVER from argv.
+
+    getpass reads /dev/tty, not stdin -- which matters here, because stdin is
+    already carrying the job. That is why the job goes in on a pipe and the
+    passphrase does not: they arrive on two different file descriptors and
+    neither can be mistaken for the other.
+    """
+    src = env if env is not None else os.environ
+    v = src.get(PASSPHRASE_ENV)
+    if v:
+        return v.encode()
+    fn = getter
+    if fn is None:
+        import getpass
+        fn = getpass.getpass
+    try:
+        return fn(prompt).encode()
+    except Exception as e:                                   # noqa: BLE001
+        # No terminal and no environment variable. Say both ways out rather
+        # than leaving a headless trigger to fail with an EOF traceback.
+        raise Doorbell(
+            f"no passphrase: this box has no terminal to ask on "
+            f"({type(e).__name__}) and {PASSPHRASE_ENV} is not set. A trigger "
+            f"that pokes the doorbell must set {PASSPHRASE_ENV} in its own "
+            f"environment -- not on the command line, which every local "
+            f"account can read out of /proc.") from e
+
+
+def load_key(path: Path, passphrase: bytes = None) -> dict:
     try:
         st = os.stat(path)
     except OSError as e:
@@ -94,12 +131,26 @@ def load_key(path: Path) -> dict:
             f"{stat.S_IMODE(st.st_mode):04o}). Refusing to use a wake secret "
             f"anyone on this box can read: chmod 0400 it.")
     try:
-        k = json.loads(Path(path).read_text())
+        container = json.loads(Path(path).read_text())
     except Exception as e:                                   # noqa: BLE001
         raise Doorbell(f"{path} is not readable JSON ({type(e).__name__})") from e
-    if k.get("schema") != "gs_wake_v1" or k.get("version") != proto.WIRE_VERSION:
-        raise Doorbell(f"{path} is not a gs_wake_v1 key for wire version "
-                       f"{proto.WIRE_VERSION}")
+    # THE PI'S KEYFILE MUST BE SEALED. An SD card leaves the building in a
+    # pocket and 0400 means nothing to someone mounting it on their own laptop.
+    # This box is poked by somebody who can type, so there is no reason to
+    # accept an unsealed one -- and accepting it "just this once" is how every
+    # install ends up unsealed.
+    if not proto.keyfile_is_sealed(container):
+        raise Doorbell(
+            f"{path} is not passphrase-sealed. The Pi's keyfile must be: its "
+            f"SD card is the one that leaves the building, and mode 0400 is "
+            f"nothing to somebody reading the card on their own machine. "
+            f"Re-pair with `gs_doorbell pair <vault address>`.")
+    if passphrase is None:
+        passphrase = read_passphrase()
+    try:
+        k = proto.unlock_keyfile(container, passphrase)
+    except proto.WakeError as e:
+        raise Doorbell(str(e)) from e
     if k.get("role") != "pi":
         # The ThinkPad's file carries the ThinkPad's SECRET. Loading it here
         # would put the vault's identity on the doorbell, which is the one
@@ -415,8 +466,264 @@ def build_cli() -> argparse.ArgumentParser:
                         "decorrelation between your poke and the power spike.")
     # Deliberately NO --job / --amount / --count flags: the job is read from
     # stdin so it never lands in /proc/<pid>/cmdline. tests/test_cli_flags.py
-    # asserts these flags do not exist.
+    # asserts these flags do not exist. There is NO --passphrase either, for
+    # the same reason and more so.
+    p = sub.add_parser("pair", help="generate this Pi's key and pair with the "
+                                    "vault (run this second)")
+    p.add_argument("vault", help="the ThinkPad's LAN address, as gs_wake_keys "
+                                 "printed it")
+    p.add_argument("--pair-port", type=int, default=PAIR_PORT,
+                   help=f"the port the vault is waiting on (default: "
+                        f"{PAIR_PORT})")
+    p.add_argument("--key", default="/etc/gs_wake_pi.key",
+                   help="where to write this Pi's sealed keyfile")
+    p.add_argument("--port", type=int, default=0,
+                   help="the port this doorbell will answer wakes on. Default "
+                        "0 = pick a random high port, so no two installs of "
+                        "this public repository share one.")
+    p.add_argument("--kdf", default=proto.DEFAULT_KDF,
+                   choices=sorted(proto.KDF_PROFILES),
+                   help=f"passphrase hardening for the keyfile (default: "
+                        f"{proto.DEFAULT_KDF}). 'moderate' needs "
+                        f"{proto.KDF_PROFILES['moderate'][1] // 2**20} MiB of "
+                        f"RAM every time this Pi is poked; 'interactive' needs "
+                        f"{proto.KDF_PROFILES['interactive'][1] // 2**20} MiB "
+                        f"and is weaker. The choice is recorded in the file.")
     return ap
+
+
+# ---------------------------------------------------------------------------
+#  Pairing, from this side
+# ---------------------------------------------------------------------------
+#: The vault's ceremony port. Open for one connection, once, ever.
+PAIR_PORT = 8769
+#: The doorbell's own port is drawn from here at pairing time. A fixed default
+#: in a PUBLIC repository is a fingerprint: anyone who reads this file knows to
+#: look at that port, and finding it open on a home LAN identifies the setup.
+#: Randomising it does not make the doorbell secure -- Kerckhoffs, the design
+#: is published -- it makes one install look unlike the next.
+PORT_LO, PORT_HI = 20001, 60000
+
+
+def ask_match(sas: str, reader=None) -> bool:
+    """Show the code and get a real answer. The security of the whole exchange.
+
+    Deliberately NOT defaulting to yes on a bare Enter. This is the one place
+    a human decision is load-bearing, and a prompt that treats "operator hit
+    return without reading" as consent has thrown that decision away.
+    """
+    bar = "=" * 46
+    print()
+    print(f"  {bar}")
+    print(f"     PAIRING CODE      {sas}")
+    print(f"  {bar}")
+    print()
+    print("  The ThinkPad is showing a code too. They must match EXACTLY.")
+    print("  If they do not, something on your network answered instead of")
+    print("  the ThinkPad. Answer n, and take everything you do not own off")
+    print("  the switch before trying again.")
+    print()
+    fn = reader or input
+    while True:
+        try:
+            a = fn("  Do the two codes match? (yes/no) ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if a in ("yes", "y"):
+            return True
+        if a in ("no", "n"):
+            return False
+        print("  Type yes or no.")
+
+
+def new_passphrase(getter=None) -> bytes:
+    """Ask twice, refuse an empty one, refuse a mismatch.
+
+    NO STRENGTH METER and no rules about symbols. What actually decides whether
+    this passphrase survives an imaged SD card is its entropy and the Argon2id
+    parameters, and a rule that says 'must contain a digit' produces
+    Password1 -- which is worse than the four random words this asks for.
+    """
+    import getpass
+    fn = getter or getpass.getpass
+    print()
+    print("  This passphrase seals the Pi's keyfile. It is asked for again")
+    print("  every time you poke the doorbell, so it has to be one you can")
+    print("  type. Four or five random words beat any amount of punctuation.")
+    print()
+    print("  If you lose it the keyfile is gone and you re-pair both boxes.")
+    print("  There is no recovery and nothing here can help you: that is what")
+    print("  it means for a file to be sealed.")
+    print()
+    while True:
+        try:
+            a = fn("  New passphrase: ")
+        except Exception as e:                               # noqa: BLE001
+            # No terminal. Say the way out rather than letting an EOF traceback
+            # be the operator's first news.
+            raise Doorbell(
+                f"cannot ask for a passphrase: this box has no terminal "
+                f"({type(e).__name__}). Pairing needs one -- run it over SSH "
+                f"rather than from a script.") from e
+        if len(a) < 8:
+            print("  [!] Too short. This is the only thing standing between a")
+            print("      stolen SD card and your vault's MAC address.")
+            continue
+        b = fn("  Again: ")
+        if a != b:
+            print("  [!] They do not match. Again.")
+            continue
+        return a.encode()
+
+
+def do_pair(args, connect=None, ask=None, getpass_fn=None, rng=None) -> int:
+    import nacl.public
+    import random as _random
+
+    keypath = Path(args.key)
+    if keypath.exists():
+        raise Doorbell(
+            f"{keypath} already exists. Refusing to overwrite it: the vault "
+            f"holds the matching half, and replacing this one silently breaks "
+            f"the pair in a way that looks exactly like a dead switch or a "
+            f"hostile WOL. If you really are re-keying, move it aside and "
+            f"re-pair BOTH boxes in the same sitting.")
+    if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", args.vault):
+        # A hostname would mean a DNS lookup on a box whose whole point is that
+        # it does not make unexpected lookups, and the vault printed an address.
+        raise Doorbell(f"{args.vault!r} is not an IPv4 address. Use the one "
+                       f"gs_wake_keys printed on the ThinkPad.")
+    if not 1 <= args.pair_port <= 65535:
+        raise Doorbell("--pair-port is not a port.")
+    r = rng or _random.SystemRandom()
+    port = args.port or r.randint(PORT_LO, PORT_HI)
+    if not 1 <= port <= 65535:
+        raise Doorbell("--port is not a port.")
+
+    sk = nacl.public.PrivateKey.generate()
+    my_pub = sk.public_key.encode()
+
+    # THE PASSPHRASE FIRST, BEFORE ANYTHING IS AGREED. It used to be asked for
+    # after the ceremony, so a typo, a mismatch or a ctrl-C at the prompt left
+    # the ThinkPad holding a keyfile for a pair this box never completed -- and
+    # the next attempt then refused on BOTH boxes for reasons that look nothing
+    # like "the last one died halfway". Nothing between agreement and the write
+    # can now ask a human anything.
+    pw = new_passphrase(getpass_fn)
+
+    print("  [*] This Pi's wake keypair is generated. It stays on this SD")
+    print("      card; only the public half will cross the LAN.")
+    print(f"  [*] Connecting to the ThinkPad at {args.vault}:{args.pair_port}...")
+    if connect is not None:
+        sock = connect()
+    else:
+        try:
+            sock = socket.create_connection((args.vault, args.pair_port),
+                                            timeout=proto.PAIR_TIMEOUT_S)
+        except OSError as e:
+            raise Doorbell(
+                f"cannot reach the ThinkPad at {args.vault}:{args.pair_port} "
+                f"({e.strerror}). Is `gs_wake_keys pair` running over there, "
+                f"and are both boxes on the same switch? Nothing was "
+                f"written.") from e
+    # THIS PI'S OWN ADDRESS, AS THE VAULT WILL SEE IT. Taken from the socket
+    # rather than asked for: an operator-typed listen address that is right for
+    # this box but wrong for the route is a doorbell that binds fine and is
+    # never reachable.
+    my_host = sock.getsockname()[0]
+    try:
+        agreed = proto.pair_initiator(
+            sock, my_pub, {"host": my_host, "port": port},
+            ask or ask_match, print)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    info = agreed["peer_info"]
+    if "mac" not in info or "broadcast" not in info:
+        raise Doorbell("the ThinkPad did not send the MAC to wake. Nothing "
+                       "was written.")
+
+    payload = {
+        "role": "pi",
+        "secret": sk.encode().hex(),
+        "peer_public": agreed["peer_public"],
+        "pair_fingerprint": agreed["sas"],
+        "listen_host": my_host,
+        "listen_port": int(port),
+        "target_mac": info["mac"],
+        "wol_broadcast": info["broadcast"],
+        "wol_port": 9,
+    }
+    print()
+    print(f"  [*] Sealing the keyfile ({args.kdf}). This is deliberately slow.")
+    t0 = time.monotonic()
+    try:
+        container = proto.lock_keyfile(payload, pw, kdf=args.kdf, role="pi")
+    except proto.WakeError as e:
+        raise Doorbell(str(e)) from e
+    took = time.monotonic() - t0
+
+    keypath.parent.mkdir(parents=True, exist_ok=True)
+    tmp = keypath.with_suffix(keypath.suffix + ".tmp")
+    # 0400 BEFORE any content is in the file, not after. A world-readable
+    # window while the bytes are being written is a window.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(container, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, keypath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print()
+        print("  [!] The pairing succeeded and this Pi then FAILED TO WRITE")
+        print(f"      {keypath}. The ThinkPad has already written its own.")
+        print("      Delete the ThinkPad's keyfile before pairing again, or")
+        print("      the two boxes will hold halves of different pairs and")
+        print("      every wake will fail in a way that looks like a network")
+        print("      fault:")
+        print("          shred -u /etc/gs_wake_thinkpad.key    # on the vault")
+        raise
+
+    print(f"      Took {took:.1f} s ON THIS BOX with --kdf {args.kdf}. Every")
+    print(f"      poke pays that again: each poke is a fresh process and has")
+    print(f"      to re-derive the key from your passphrase.")
+    if args.kdf != "interactive":
+        # ONLY OFFER A CHEAPER PROFILE THAT IS ACTUALLY CHEAPER. The first
+        # version printed "re-pair with --kdf interactive" unconditionally, so
+        # an operator who had already chosen interactive was told to go and do
+        # the thing they had just done -- advice that reads as a malfunction
+        # and teaches them to stop reading the output.
+        print(f"      If that is too slow to live with, re-pair with")
+        print(f"      --kdf interactive: "
+              f"{proto.KDF_PROFILES['interactive'][1] // 2**20} MiB instead of "
+              f"{proto.KDF_PROFILES[args.kdf][1] // 2**20} MiB and fewer")
+        print(f"      passes, so a stolen SD card is cheaper to attack.")
+    else:
+        print(f"      This is the WEAKER of the two profiles. --kdf moderate")
+        print(f"      costs more time per poke and more to attack.")
+    print()
+    print(f"  [+] Paired. Code {agreed['sas']}.")
+    print(f"      This Pi : {keypath}  (0400, SEALED)")
+    print(f"      Answers wakes on {my_host}:{port}")
+    print()
+    print("  An imaged SD card now yields the KDF parameters and a salt.")
+    print("  Not the key, not the ThinkPad's MAC, not your LAN layout.")
+    print()
+    print("  Poke it like this - the job goes in on a pipe, the passphrase is")
+    print("  asked for on the terminal, and neither is ever on a command line:")
+    print()
+    print(f"      echo '{{\"job\":\"receive_and_quote\",\"amount_slot\":2}}' | \\")
+    print(f"          python3 gs_doorbell wake --key {keypath}")
+    return 0
 
 
 def run_wake(args, key: dict, job: str, params: dict,
@@ -544,8 +851,20 @@ def main(argv=None):
     args = build_cli().parse_args(argv)
     try:
         proto.require_nacl()
-        key = load_key(Path(args.key))
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+    if args.cmd == "pair":
+        try:
+            return do_pair(args)
+        except (Doorbell, proto.WakeError) as e:
+            sys.exit(f"[!] {e}")
+    try:
+        # THE JOB FIRST, THE KEY SECOND. Reading the job before spending two
+        # seconds on Argon2id means a typo costs the operator nothing, and it
+        # means a wrong passphrase is not the first thing they find out about a
+        # job that was malformed anyway.
         job, params = read_job_from_stdin()
+        key = load_key(Path(args.key))
     except (Doorbell, proto.WakeError) as e:
         sys.exit(f"[!] {e}")
     try:

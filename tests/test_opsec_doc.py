@@ -266,6 +266,104 @@ for n, s in TOOLS.items():
 check("no tool writes a secret to a hard-coded /tmp path",
       not re.search(r'["\']/tmp/[a-z_]*(wallet|pairs|memo|key|seed)', ALL_SRC, re.I))
 
+# ===========================================================================
+# EVERY FLAG THE DOC SHOWS MUST EXIST IN THE TOOL IT IS SHOWN ON.
+#
+# This suite has always claimed to check that the doc matches the code, and it
+# did not check this. The pairing tool's flags were renamed and rewritten and
+# §8 went on printing `--thinkpad-mac` and `--doorbell-host` at the operator,
+# green the whole time. An operator following the doc would have got
+# "unrecognized arguments" at the one moment that requires physical access to
+# both boxes.
+#
+# So: pull every shipped-tool invocation out of the fenced blocks, resolve the
+# subcommand, and ask argparse itself. A doc that names a flag that does not
+# exist is a doc that has stopped describing this repository.
+import subprocess as _sp                                     # noqa: E402
+
+_TOOLS = {"GhostSpiral", "gs_console", "gs_doorbell", "gs_wake_agent",
+          "gs_wake_keys", "airgap_tx_signer", "broadcast_signed_xmr",
+          "create_receive_wallet", "exit_strategy_simulator", "paranoia_mode",
+          "receive_watch", "thor_swap_preparer"}
+_help_cache = {}
+
+
+def _help_for(tool, sub):
+    key = (tool, sub)
+    if key not in _help_cache:
+        argv = [sys.executable, os.path.join(REPO, tool)]
+        if sub:
+            argv.append(sub)
+        argv.append("--help")
+        try:
+            r = _sp.run(argv, capture_output=True, text=True, timeout=120)
+            _help_cache[key] = r.stdout + r.stderr
+        except Exception as e:                               # noqa: BLE001
+            _help_cache[key] = f"<<could not run: {e}>>"
+    return _help_cache[key]
+
+
+#: Join backslash continuations so a wrapped command is one command.
+_blocks = re.findall(r"```(?:bash|sh)?\n(.*?)```", DOC, re.S)
+_cmds = []
+for _b in _blocks:
+    _b = _b.replace("\\\n", " ")
+    for _line in _b.splitlines():
+        _line = _line.split("#", 1)[0].strip()
+        if not _line:
+            continue
+        # One logical command may be piped into another; look at each stage.
+        for _stage in _line.split("|"):
+            _toks = _stage.strip().split()
+            _tool = None
+            for _i, _t in enumerate(_toks):
+                _base = os.path.basename(_t)
+                if _base in _TOOLS:
+                    _tool = _base
+                    _rest = _toks[_i + 1:]
+                    break
+            if not _tool:
+                continue
+            _sub = None
+            if _rest and not _rest[0].startswith("-"):
+                _sub = _rest[0]
+            _flags = sorted({_t.split("=")[0] for _t in _rest
+                             if _t.startswith("--") and len(_t) > 2})
+            _cmds.append((_tool, _sub, _flags, _stage.strip()))
+
+check("the doc actually shows some shipped-tool invocations to check "
+      "(a parser that silently matches nothing would pass this section "
+      "vacuously forever)", len(_cmds) >= 5)
+
+_missing = []
+for _tool, _sub, _flags, _raw in _cmds:
+    _h = _help_for(_tool, _sub)
+    if _h.startswith("<<could not run"):
+        _missing.append(f"{_tool} {_sub or ''}: {_h}")
+        continue
+    for _f in _flags:
+        if _f not in _h:
+            _missing.append(f"{_tool} {_sub or ''} has no {_f}  (doc: {_raw[:60]})")
+check(f"every --flag the doc shows on a shipped tool exists in that tool "
+      f"({len(_cmds)} invocations checked)"
+      + ("" if not _missing else " -- " + "; ".join(_missing[:4])),
+      not _missing)
+
+# And the subcommands themselves.
+_badsub = []
+for _tool, _sub, _flags, _raw in _cmds:
+    if not _sub:
+        continue
+    _h = _help_for(_tool, None)
+    if "<<could not run" in _h:
+        continue
+    if _sub not in _h:
+        _badsub.append(f"{_tool} has no subcommand {_sub!r}")
+check("every subcommand the doc shows exists"
+      + ("" if not _badsub else " -- " + "; ".join(_badsub[:4])),
+      not _badsub)
+
+
 print()
 print("NOT COVERED HERE (operator must verify by hand, per §7):")
 for item in ("rfkill wifi/bt blocked on the Pi",

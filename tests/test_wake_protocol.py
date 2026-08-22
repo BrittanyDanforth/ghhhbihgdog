@@ -338,131 +338,262 @@ check("...and match the shape the doorbell will accept",
 
 
 # ===========================================================================
-print("\n== the pairing tool, run for real ==")
-# gs_wake_keys had NO behavioural test: it was checked for --help and for being
-# named in the doc, and nothing else. It is the one program here whose output
-# every other program depends on, and a keyfile it writes wrong is discovered
-# at 3am on a box that will not wake.
+print("\n== the sealed keyfile container ==")
 import json as _json                                         # noqa: E402
-import subprocess as _sp                                     # noqa: E402
-import tempfile as _tf                                       # noqa: E402
+import socket as _socket                                     # noqa: E402
+import threading as _threading                               # noqa: E402
 import nacl.public as _NP                                    # noqa: E402
 
-_KEYS = os.path.join(REPO, "gs_wake_keys")
+_sk = _NP.PrivateKey.generate()
+_payload = {"role": "pi", "secret": _sk.encode().hex(),
+            "peer_public": "ab" * 32, "target_mac": "aa:bb:cc:dd:ee:ff",
+            "listen_host": "192.168.1.9", "listen_port": 41337}
+_PW = b"four random words please"
+_c = P.lock_keyfile(_payload, _PW, kdf="interactive", role="pi")
+check("a sealed keyfile round-trips", P.unlock_keyfile(_c, _PW) == _payload)
+check("...and reports itself as sealed", P.keyfile_is_sealed(_c))
+
+# THE WHOLE POINT. An imaged SD card is read by someone who is root on their
+# own machine, so mode 0400 is nothing. What must survive that is the file
+# revealing nothing but parameters.
+_blob = _json.dumps(_c)
+for _v, _what in ((_payload["secret"], "the X25519 secret"),
+                  (_payload["target_mac"], "the vault's MAC"),
+                  (_payload["listen_host"], "the LAN address"),
+                  (_payload["peer_public"], "the peer's public key")):
+    check(f"an imaged SD card does NOT yield {_what}", _v not in _blob)
+check("...only the KDF parameters and a salt, which are not secrets",
+      set(_c) == {"schema", "version", "role", "kdf", "profile", "ops", "mem",
+                  "salt", "box"})
+
+try:
+    P.unlock_keyfile(_c, b"wrong")
+    check("a wrong passphrase is refused", False)
+except P.WakeError as e:
+    check("a wrong passphrase is refused", "did not open" in str(e))
+    check("...and does not claim to know WHETHER it was the passphrase or "
+          "tampering, because Poly1305 fails identically for both",
+          "no way to tell which" in str(e))
+_t = dict(_c)
+_t["box"] = ("00" if _c["box"][:2] != "00" else "11") + _c["box"][2:]
+try:
+    P.unlock_keyfile(_t, _PW)
+    check("a tampered body is refused", False)
+except P.WakeError:
+    check("a tampered body is refused", True)
+
+# Both numbers come off a disk an attacker may have written to, and memlimit is
+# an allocation.
+#
+# ASSERT THE REASON, NOT JUST THE REFUSAL. The mutation sweep caught this file
+# passing for the wrong reason: with the bounds check deleted, mem=2**40 sailed
+# through to libsodium, which errored for its OWN reasons, and the test stayed
+# green while the guarantee was gone. "It raised something" is not evidence
+# that the thing you are testing exists.
+for _k, _v, _why in (("ops", 99, "an out-of-range opslimit"),
+                     ("ops", 0, "a zero opslimit"),
+                     ("mem", 2 ** 40, "a memlimit that would OOM the reader"),
+                     ("mem", 4096, "a memlimit far below the floor")):
+    _b = dict(_c)
+    _b[_k] = _v
+    try:
+        P.unlock_keyfile(_b, _PW)
+        check(f"refuses {_why} in a keyfile", False)
+    except P.WakeError as e:
+        check(f"refuses {_why} in a keyfile, BEFORE deriving anything — the "
+              f"message names the parameter, not libsodium's own complaint",
+              "out-of-range" in str(e))
+for _k, _v in (("ops", "3"), ("mem", None), ("ops", True)):
+    _b = dict(_c)
+    _b[_k] = _v
+    try:
+        P.unlock_keyfile(_b, _PW)
+        check(f"refuses a non-integer {_k}", False)
+    except P.WakeError as e:
+        check(f"refuses a non-integer {_k}", "out-of-range" in str(e))
+
+_plain = P.lock_keyfile(_payload, b"", role="thinkpad")
+check("kdf=none stores the payload as PLAIN JSON rather than dressing "
+      "plaintext up as a ciphertext",
+      _plain["kdf"] == "none" and _plain["plain"] == _payload
+      and "box" not in _plain)
+check("...and says it is not sealed", not P.keyfile_is_sealed(_plain))
+check("...and opens with no passphrase", P.unlock_keyfile(_plain) == _payload)
+try:
+    P.unlock_keyfile({"schema": "gs_wake_v1", "version": 1, "role": "pi"})
+    check("the old PLAINTEXT v1 keyfile is not read any more", False)
+except P.WakeError as e:
+    check("the old PLAINTEXT v1 keyfile is not read any more",
+          "pair the two boxes again" in str(e))
 
 
-def _pair(*extra, out=None):
-    d = out or _tf.mkdtemp(prefix="wakepair_")
-    r = _sp.run([sys.executable, _KEYS, "--out", d,
-                 "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                 "--doorbell-host", "10.0.0.9", *extra],
-                capture_output=True, text=True, cwd=d)
-    return d, r
+print("\n== the pairing ceremony: commit, reveal, compare ==")
+_VINFO = {"mac": "aa:bb:cc:dd:ee:ff", "broadcast": "192.168.1.255"}
+_PINFO = {"host": "192.168.1.9", "port": 41337}
 
 
-_d, _r = _pair("--amount-ladder", "0.01", "0.05")
-check("pairing succeeds and writes both keyfiles", _r.returncode == 0)
-_tp = _json.loads(open(os.path.join(_d, "gs_wake_thinkpad.key")).read())
-_pi = _json.loads(open(os.path.join(_d, "gs_wake_pi.key")).read())
-check("...each file holds ONE secret, never both",
-      _tp["secret"] != _pi["secret"]
-      and _tp["peer_public"] == _NP.PrivateKey(
-          bytes.fromhex(_pi["secret"])).public_key.encode().hex()
-      and _pi["peer_public"] == _NP.PrivateKey(
-          bytes.fromhex(_tp["secret"])).public_key.encode().hex())
-check("...both 0400, because the agent runs unattended and only reads them",
-      all(oct(os.stat(os.path.join(_d, f)).st_mode)[-3:] == "400"
-          for f in ("gs_wake_thinkpad.key", "gs_wake_pi.key")))
-check("...and they print the SAME pair fingerprint, which is what the "
-      "operator reads off both boxes",
-      _tp["pair_fingerprint"] == _pi["pair_fingerprint"]
-      and _tp["pair_fingerprint"] in _r.stdout)
+def _ceremony(i_ask=lambda s: True, r_ask=lambda s: True, tamper=None,
+              ipub=None, rpub=None):
+    a, b = _socket.socketpair()
+    a.settimeout(20)
+    b.settimeout(20)
+    ip = ipub or _NP.PrivateKey.generate().public_key.encode()
+    rp = rpub or _NP.PrivateKey.generate().public_key.encode()
+    res = {}
 
-# THE POINT OF THE TOOL: the two files must actually interoperate through the
-# real seal/open path, in both directions, with the ephemeral in the middle.
-_tpsk = _NP.PrivateKey(bytes.fromhex(_tp["secret"]))
-_pisk = _NP.PrivateKey(bytes.fromhex(_pi["secret"]))
-_eph = _NP.PrivateKey.generate()
-_ch = P.new_challenge()
-_m1 = P.seal(_tpsk, _NP.PublicKey(bytes.fromhex(_tp["peer_public"])), P.TAG_M1,
-             {"eph_pk": _eph.public_key.encode().hex(), "challenge": _ch.hex()})
-_b1 = P.open_record(_pisk, _NP.PublicKey(bytes.fromhex(_pi["peer_public"])),
-                    _m1, P.TAG_M1)
-_m2 = P.seal(_pisk, _NP.PublicKey(P.eph_pk_of(_b1)), P.TAG_M2,
-             {"job_id": P.new_job_id(), "challenge": _ch.hex(),
-              "job": "receive_new", "count": 1})
-# The vault opens M2 with its EPHEMERAL secret against the PI's public key --
-# which its own keyfile calls peer_public. Getting this backwards is exactly
-# the confusion the two-file split exists to make impossible, and it failed
-# loudly here rather than quietly passing.
-_b2 = P.open_record(_eph, _NP.PublicKey(bytes.fromhex(_tp["peer_public"])),
-                    _m2, P.TAG_M2)
-check("a freshly minted pair completes a real M1/M2 exchange",
-      P.challenge_of(_b2) == _ch and P.validate_job(_b2)[1] == "receive_new")
+    def responder():
+        try:
+            res["r"] = P.pair_responder(b, rp, _VINFO, r_ask, lambda m: None)
+        except Exception as e:                               # noqa: BLE001
+            res["r"] = e
+        finally:
+            try:
+                b.close()
+            except OSError:
+                pass
 
-check("re-running over an existing pair REFUSES rather than silently "
-      "replacing a keypair the other box still holds",
-      _pair(out=_d)[1].returncode != 0)
+    t = _threading.Thread(target=responder)
+    t.start()
+    try:
+        res["i"] = (tamper(a, ip, i_ask) if tamper else
+                    P.pair_initiator(a, ip, _PINFO, i_ask, lambda m: None))
+    except Exception as e:                                   # noqa: BLE001
+        res["i"] = e
+    finally:
+        t.join(30)
+        try:
+            a.close()
+        except OSError:
+            pass
+    return res
 
-# Everything below is written into a keyfile and only checked when the doorbell
-# next tries to start -- i.e. at the moment the operator needs it to work.
-_d2 = _tf.mkdtemp(prefix="wakepair_")
-_bad = _sp.run([sys.executable, _KEYS, "--out", _d2,
-                "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                "--doorbell-host", "0.0.0.0"],
-               capture_output=True, text=True, cwd=_d2)
-check("an all-interfaces --doorbell-host is refused AT PAIRING, not at the "
-      "doorbell's next start",
-      _bad.returncode != 0 and "all-interfaces" in _bad.stdout + _bad.stderr)
-check("...and no half-pairing is left behind", os.listdir(_d2) == [])
 
-_d3 = _tf.mkdtemp(prefix="wakepair_")
-_bad3 = _sp.run([sys.executable, _KEYS, "--out", _d3,
-                 "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                 "--doorbell-host", "10.0.0.9", "--doorbell-port", "0"],
-                capture_output=True, text=True, cwd=_d3)
-check("port 0 is refused: the Pi would bind a random port while the vault was "
-      "told to fetch from ':0'",
-      _bad3.returncode != 0 and "not a port" in _bad3.stdout + _bad3.stderr)
+_r = _ceremony()
+check("both boxes derive the SAME code from the two public keys",
+      isinstance(_r["i"], dict) and isinstance(_r["r"], dict)
+      and _r["i"]["sas"] == _r["r"]["sas"])
+check("...and it is 8 characters from an alphabet with no I, L, O or U, "
+      "because a human reads one off a Pi and compares it to a laptop",
+      len(_r["i"]["sas"]) == 9 and _r["i"]["sas"][4] == "-"
+      and not (set(_r["i"]["sas"]) & set("ILOU")))
+check("...and each box learned only the OTHER's public key",
+      _r["i"]["peer_public"] != _r["r"]["peer_public"])
+check("...and the config each side needs crossed with it: the Pi got a MAC "
+      "and a broadcast, the vault got an address and a port",
+      _r["i"]["peer_info"] == _VINFO and _r["r"]["peer_info"] == _PINFO)
+check("...and NEITHER side sent a secret: the payload keys are exactly the "
+      "public key and the non-secret config",
+      "secret" not in _json.dumps(_r["i"]) + _json.dumps(_r["r"]))
 
-_d35 = _tf.mkdtemp(prefix="wakepair_")
-_bad35 = _sp.run([sys.executable, _KEYS, "--out", _d35,
-                  "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                  "--doorbell-host", "10.0.0.9", "--artifact-dir", "bay"],
-                 capture_output=True, text=True, cwd=_d35)
-check("a RELATIVE --artifact-dir is refused: the agent runs under systemd, "
-      "whose working directory is '/', and that is mounted read-only",
-      _bad35.returncode != 0
-      and "relative" in _bad35.stdout + _bad35.stderr)
-_d36 = _tf.mkdtemp(prefix="wakepair_")
-_sp.run([sys.executable, _KEYS, "--out", _d36,
-         "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-         "--doorbell-host", "10.0.0.9"],
-        capture_output=True, text=True, cwd=_d36)
-_tp36 = _json.loads(open(os.path.join(_d36, "gs_wake_thinkpad.key")).read())
-check("...and the DEFAULT is the absolute path the shipped unit's "
-      "ReadWritePaths= names",
-      _tp36["artifact_dir"] == "/var/lib/ghostspiral"
-      and "/var/lib/ghostspiral" in open(
-          os.path.join(REPO, "systemd", "gs-wake-agent.service")).read())
+# THE ATTACK THE COMMITMENT EXISTS FOR. Without it the initiator picks its key
+# AFTER seeing the responder's, so a man in the middle grinds keypairs until
+# the two codes agree -- about 2^20 X25519 keygens for a 40-bit code, which is
+# seconds. The short code the operator will actually compare depends entirely
+# on this check.
+def _grind(sock, pub, ask):
+    sock.settimeout(20)
+    other = _NP.PrivateKey.generate().public_key.encode()
+    P._pair_send(sock, {"t": "commit", "v": P.PAIR_PROTO,
+                        "c": P.pair_commitment(pub).hex()})
+    body = P._pair_step(sock, "reveal")
+    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO,
+                        "pub": other.hex(), "info": _PINFO})
+    return P._pair_finish(sock, other, P._pair_pub(body), P._pair_info(body),
+                          ask, lambda m: None)
 
-_d4 = _tf.mkdtemp(prefix="wakepair_")
-_bad4 = _sp.run([sys.executable, _KEYS, "--out", _d4,
-                 "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                 "--doorbell-host", "10.0.0.9",
-                 "--amount-ladder", "0.01", "0", "0.05"],
-                capture_output=True, text=True, cwd=_d4)
-check("a zero rung on the amount ladder is refused",
-      _bad4.returncode != 0)
-_d5 = _tf.mkdtemp(prefix="wakepair_")
-_bad5 = _sp.run([sys.executable, _KEYS, "--out", _d5,
-                 "--thinkpad-mac", "aa:bb:cc:dd:ee:ff",
-                 "--doorbell-host", "10.0.0.9",
-                 "--amount-ladder", *["0.01"] * 9],
-                capture_output=True, text=True, cwd=_d5)
-check("a ladder longer than the wire's slot range is refused, rather than "
-      "carrying rungs no note could ever select",
-      _bad5.returncode != 0 and "unreachable rungs" in _bad5.stdout + _bad5.stderr)
+
+_r = _ceremony(tamper=_grind)
+check("a key that does not match its commitment is REFUSED — this is what "
+      "lets the compare-code be short enough that a human compares it",
+      isinstance(_r["r"], P.WakeError) and "committed to" in str(_r["r"]))
+check("...and the operator at the OTHER screen is told why, rather than "
+      "being shown a broken pipe for a detected attack",
+      isinstance(_r["i"], P.WakeError)
+      and "committed to" in str(_r["i"]))
+
+_r = _ceremony(i_ask=lambda s: False)
+check("answering no on ONE box aborts the pairing on BOTH — neither is left "
+      "holding a keyfile for a peer that wrote none",
+      isinstance(_r["i"], P.WakeError) and isinstance(_r["r"], P.WakeError))
+check("...and each is told which end declined",
+      "you did not confirm" in str(_r["i"])
+      and "answered no" in str(_r["r"]))
+_r = _ceremony(r_ask=lambda s: False)
+check("...in the other direction too",
+      isinstance(_r["i"], P.WakeError) and isinstance(_r["r"], P.WakeError)
+      and "answered no" in str(_r["i"]))
+
+
+def _hostname(sock, pub, ask):
+    sock.settimeout(20)
+    P._pair_send(sock, {"t": "commit", "v": P.PAIR_PROTO,
+                        "c": P.pair_commitment(pub).hex()})
+    P._pair_step(sock, "reveal")
+    P._pair_send(sock, {"t": "reveal", "v": P.PAIR_PROTO, "pub": pub.hex(),
+                        "info": {"host": "evil.example.com", "port": 41337}})
+    return P._pair_step(sock, "confirm")
+
+
+_r = _ceremony(tamper=_hostname)
+check("a HOSTNAME where an address belongs is refused — it would become a "
+      "DNS lookup on a box whose whole point is that it makes none",
+      isinstance(_r["r"], P.WakeError) and "IPv4" in str(_r["r"]))
+
+
+# A SOCKET TIMEOUT BOUNDS ONE recv(), NOT ONE MESSAGE. These reads are
+# byte-at-a-time, so a peer that dribbles one byte per timeout-minus-a-second
+# holds the ceremony open indefinitely while every individual read looks
+# healthy. Driven with a real dribbler rather than reasoned about.
+def _dribble(sock, pub, ask):
+    import time as _t
+    end = _t.monotonic() + 120
+    while _t.monotonic() < end:
+        sock.sendall(b"x")
+        _t.sleep(2)
+    return "still going"
+
+
+_t0 = __import__("time").monotonic()
+_r = _ceremony(tamper=_dribble)
+_elapsed = __import__("time").monotonic() - _t0
+check("a peer that dribbles bytes is cut off on a WHOLE-MESSAGE deadline, "
+      "not left holding the ceremony open one healthy read at a time",
+      isinstance(_r["r"], P.WakeError)
+      and "did not finish sending" in str(_r["r"]))
+check(f"...within the message budget rather than the human one "
+      f"({int(_elapsed)}s elapsed, budget {P.PAIR_MSG_S}s, human step "
+      f"{P.PAIR_TIMEOUT_S}s)",
+      _elapsed < P.PAIR_MSG_S + 15)
+
+
+def _flood(sock, pub, ask):
+    sock.settimeout(20)
+    sock.sendall(b"x" * 40000)
+    return "sent"
+
+
+_r = _ceremony(tamper=_flood)
+check("a peer that floods the pairing socket is cut off at the size limit "
+      "rather than allocating whatever it sends",
+      isinstance(_r["r"], P.WakeError) and "size limit" in str(_r["r"]))
+
+_same = _NP.PrivateKey.generate().public_key.encode()
+_r = _ceremony(ipub=_same, rpub=_same)
+check("a box offered its OWN public key back refuses — that is a reflection, "
+      "not a peer",
+      isinstance(_r["r"], P.WakeError) or isinstance(_r["i"], P.WakeError))
+
+for _extra in ({"port": 0}, {"port": 70000}, {"mac": "nope"},
+               {"broadcast": "999.1.1.1"}, {"outfile": "/srv/x"}):
+    _bad = dict(_PINFO)
+    _bad.update(_extra)
+    try:
+        P._pair_info({"info": _bad})
+        check(f"pairing info refuses {sorted(_extra)[0]}={list(_extra.values())[0]!r}",
+              False)
+    except P.WakeError:
+        check(f"pairing info refuses {sorted(_extra)[0]}={list(_extra.values())[0]!r}",
+              True)
 
 
 _finished()

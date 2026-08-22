@@ -1,5 +1,12 @@
 *.pyc
 __pycache__/
+# coverage.py's data file. It was TRACKED, in a public repository, and it is a
+# SQLite database whose `file` table holds the ABSOLUTE PATH of every measured
+# source file -- so on the operator's own machine it publishes their username
+# and home directory layout, and it dates the run. Untracked and ignored.
+.coverage
+.coverage.*
+htmlcov/
 tests/dashboard_data.json
 tests/status.json
 tests/dashboard.html

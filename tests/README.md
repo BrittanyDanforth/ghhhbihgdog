@@ -101,19 +101,24 @@ python3 tests/test_wake_doorbell.py # THE DOORBELL over a real socket: one job,
                                     #   PRINTS the event meaning "a second
                                     #   authenticated boot took your job" --
                                     #   it was collected and read by nothing
-python3 tests/test_wake_endtoend.py # THE WHOLE WAKE CHANNEL, END TO END: the
-                                    #   keyfiles are minted by running
-                                    #   gs_wake_keys as a SUBPROCESS, the
-                                    #   doorbell binds a real socket in a
-                                    #   thread, and the agent posts to it with
-                                    #   its own urllib. Every other wake suite
+python3 tests/test_wake_endtoend.py # THE WHOLE WAKE CHANNEL, END TO END,
+                                    #   INCLUDING THE PAIRING CEREMONY: the
+                                    #   vault half runs gs_wake_keys as a real
+                                    #   SUBPROCESS, the Pi half runs
+                                    #   gs_doorbell's own do_pair, they talk
+                                    #   over a real TCP socket, and the wake
+                                    #   that follows uses the keyfiles they
+                                    #   actually wrote. Every other wake suite
                                     #   tests one side against a stand-in for
                                     #   the other, so both can be green while
                                     #   the halves do not fit — a swapped key
                                     #   direction, a URL built wrong, a status
-                                    #   code one side never emits. Only the
-                                    #   edges are stubbed: the magic packet,
-                                    #   the child tools, the probes, the sleeps
+                                    #   code one side never emits. It also
+                                    #   asserts the property the ceremony
+                                    #   exists for: NO SECRET EVER CROSSES.
+                                    #   Only the edges are stubbed: the magic
+                                    #   packet, the child tools, the probes,
+                                    #   the sleeps
 python3 tests/test_peel_pipeline.py # THE PEEL CHAIN, THE DAG ROUND AND THE
                                     #   EXIT, driven through the REAL main()
                                     #   against a wallet that MOVES MONEY.
@@ -197,10 +202,18 @@ python3 -m venv --system-site-packages .venv
 
 Everything about the wake path is driven offline: no Pi, no real magic packet,
 no real power-off. Two things are less stubbed than that sounds. The pairing
-tool is run as a real subprocess, because a keyfile written wrong is discovered
-at 3am on a box that will not wake. And `test_wake_endtoend.py` puts the real
-doorbell and the real agent on opposite ends of a real socket, because a suite
-per side can be green while the two sides do not fit.
+ceremony runs for real — a `gs_wake_keys` subprocess on one end of a TCP socket
+and `gs_doorbell`'s own pairing code on the other — because a keyfile written
+wrong is discovered at 3am on a box that will not wake. And the wake that
+follows uses the keyfiles that ceremony wrote, because a suite per side can be
+green while the two sides do not fit.
+
+Three of the defects in this file's history were found by running it rather
+than reading it: a readiness probe that consumed the pairing socket and left
+the real Pi with "connection refused"; `--broadcast 999.1.1.1` passing a regex
+that counted digits without asking whether 999 was a byte; and a keyfile
+parameter check that the mutation sweep proved was passing for the wrong
+reason.
 
 Four things are **claimed by nobody** and must be checked by hand on the
 actual hardware (they are in OPSEC_SETUP.md §7 as checklist items):

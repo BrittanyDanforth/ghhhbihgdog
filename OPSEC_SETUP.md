@@ -91,9 +91,61 @@ systemctl disable wpa_supplicant 2>/dev/null || true
 apt-get update
 apt-get install -y wireguard tor wakeonlan python3
 
-# hostname that is not your name
-hostnamectl set-hostname fuse
+# hostname that is not your name -- and not this one either. Every
+# reader of this public repository knows to look for a host called
+# "fuse" on a home LAN. Pick something that belongs on your network:
+# the name of your router's brand, "printer", "nas". A hostname is
+# broadcast in DHCP requests and answered over mDNS; it is the one
+# identifier you hand out to everything on the switch.
+hostnamectl set-hostname <something boring and yours>
 ```
+
+### The SD card is the leak, and it is a bigger one than the wake key
+
+Take the card out, put it in any laptop, and `chmod 600` means
+nothing — you are root on the machine doing the reading. So the
+question is not whether anyone would think to look. It is what is
+there:
+
+| on the card | what it gives them |
+|---|---|
+| `/etc/wireguard/wg0.conf` | **your Mullvad private key.** Mullvad can map it to your account, and whoever paid for that account. This is your network identity, and it is the single worst thing on the box |
+| `/var/lib/tor/` | the Tor client's state, including its **guard set** — a fingerprint that persists across restarts and links this Pi to circuits seen elsewhere |
+| `/etc/gs_wake_pi.key` | **sealed** with your passphrase since the pairing rewrite. Yields Argon2id parameters and a salt. Before that it yielded the wake key, the ThinkPad's MAC and your LAN layout in one file |
+| the systemd journal | the minute of every poke, and — until the `StandardOutput=null` in `systemd/gs-doorbell.service.example` — the name of every job |
+
+The wake keyfile is sealed. **The other three are not**, and no amount
+of work on the wake channel touches them. If you stop reading here,
+stop having read that.
+
+**The fix is to encrypt the Pi, and it costs you something real.**
+Raspberry Pi OS does not do this out of the box; the standard way is
+LUKS on the root filesystem with `dropbear-initramfs`, so the Pi comes
+up into a tiny SSH server and you unlock it remotely:
+
+```bash
+apt-get install -y cryptsetup-initramfs dropbear-initramfs
+# put your public key in /etc/dropbear/initramfs/authorized_keys,
+# set ip= in /boot/cmdline.txt so initramfs brings the NIC up,
+# then luksFormat the root and rebuild the initramfs.
+```
+
+The cost, stated plainly: **after a power cut the Pi does not come
+back on its own.** No unlock, no doorbell, no wake, until you are
+somewhere you can SSH to it. That is consistent with the rest of this
+layout — the ThinkPad's BIOS is already set to stay off after power
+loss — but it means a blackout while you are away costs you the
+doorbell until you return.
+
+What encrypting the Pi does **not** fix: if it is seized while
+running, the volume is unlocked and the key is in RAM. Full-disk
+encryption protects a card in a pocket, not a box on a shelf with
+power going into it. If that is the threat you care about, the
+doorbell should not exist and you should sit at the ThinkPad.
+
+If you will not do this, then treat the Pi as **public**: use a
+Mullvad account you can burn, and expect to replace it and re-key
+everything if the Pi ever leaves your sight.
 
 `/etc/sysctl.d/99-fuse.conf`:
 
@@ -143,6 +195,20 @@ WOL is a magic packet on the LAN. Anyone on the switch can send one.
 
 Spend key, view key, `wallet_*.json`, `thor_pairs.json`, memo, seed.
 If you find any of those on the SD, the split is already broken.
+
+`gs_doorbell` imports nothing but the standard library and PyNaCl, and
+`tests/test_opsec_doc.py` asserts that — it may not import `gs_common`,
+`monero`, `stem`, `psutil` or `requests`, and may not reference
+`wallet_`, `thor_pairs`, `view_key`, `spend_key`, `mnemonic` or `seed`.
+That is a test, not a paragraph, because a promise about what a file
+does not contain is worth exactly as much as the thing that checks it.
+
+**And it must not hold a record of what it did.** The example unit sets
+`StandardOutput=null` and `StandardError=null`. Without those, systemd
+journals the tool's own output onto the SD card — which names the job
+it dispatched, the handle that came back, and the minute of both. The
+handler's HTTP logging was already silenced; the unit's stdout was not,
+and that is the copy that survives.
 
 
 ## 4. ThinkPad — vault
@@ -640,10 +706,11 @@ same “memo never leaves the machine except to the sender.”
 | ISP “this house runs Tor” | **Yes** — they see Mullvad |
 | Hotspot / SIM / towers | **Yes** — no cellular |
 | VPS host images a wallet | **Yes** — no wallet on Mullvad |
-| Door kick, Pi only | **Partly** — the Pi holds a long-term X25519 secret plus your MAC and LAN address. Recovery is a two-box re-key (`gs_wake_keys`), not a token rotation. Wake traffic recorded off the switch stays sealed: each job note is boxed to a key the vault minted for that boot |
+| Door kick, Pi only | **Depends entirely on whether you encrypted the Pi (§3).** The wake keyfile is sealed with your passphrase, so the card alone no longer yields the wake key, your ThinkPad's MAC or your LAN layout — it yields Argon2id parameters and a salt. But an unencrypted card still hands over `/etc/wireguard/wg0.conf`, which is your **Mullvad private key**, and `/var/lib/tor`, which is your **guard set**. Those are your network identity and no work on the wake channel touches them. Wake traffic recorded off the switch stays sealed either way: each job note is boxed to a key the vault minted for that boot and then powered off with. Recovery is a two-box re-key (two commands, §8), plus a new Mullvad account |
 | Door kick, they take the ThinkPad | **Partly** — view-only if auto-unlock; spend USB elsewhere |
 | Spend USB left in the laptop | **No** — you blew the split |
 | Stolen Telegram / bot token | **Partly** — they can wake and spam quotes, not spend, and the spam is bounded on the ThinkPad rather than on the stolen thing: a 24 h wake budget (12 by default) and an account ceiling (45) that refuses minting jobs once the wallet holds more subaddress accounts than the offline signer derives. Both live in the keyfile, so changing them needs physical access. What they still get is your vault powering on when they say |
+| Somebody on the switch during PAIRING | **Only if you compare the code.** The two boxes have never met, so nothing but you can tell the real peer from an impostor. Each commits to its key before seeing the other's, which is what stops an attacker grinding keys until the two codes agree — so the 8 characters you compare are worth 2^40 and a man in the middle has to guess once, in public, with you looking at it. If you do not actually compare them, this is unauthenticated key agreement and the software cannot tell |
 | Roommate sends WOL | **Yes** for job execution — no authenticated note, no job, boot-sit-shutdown. **No** for the side effects: they still chose when your vault powers on and auto-unlocks, and a no-job boot dwells a random 1–3 min before powering off, so it does not die the instant it learns there is nothing to do. That removes the boot-and-die tell; it does **not** make a no-job boot look like a job boot, which waits 5–20 min of jitter before it starts anything |
 | WOL from the internet | **Yes** if UDP 9 is not forwarded |
 | Power cut | **Yes** if BIOS stays Off |
@@ -667,9 +734,17 @@ same “memo never leaves the machine except to the sender.”
 - [ ] Throwaway Telegram, not the account with your face
 - [ ] A test `/depo` (or a hand-run quote) writes the slip **only**
       on the ThinkPad; chat has no memo
-- [ ] `gs_wake_keys` printed the SAME pair fingerprint on both boxes
-- [ ] The Pi keyfile is `0400` and the ThinkPad's is too; the Pi's copy
-      was `shred -u`'d from the ThinkPad after the pair was confirmed
+- [ ] The pairing code shown on the ThinkPad and the code shown on the
+      Pi were **compared, by you, character for character** — not
+      glanced at. Nothing else authenticates that exchange
+- [ ] `python3 -c 'import json;print(json.load(open("/etc/gs_wake_pi.key"))["kdf"])'`
+      on the Pi says `argon2id`. If it says `none`, that SD card is
+      carrying your ThinkPad's MAC in the clear
+- [ ] Both keyfiles are `0400`, and **no keyfile was ever copied
+      between the boxes** — there is no step in the ceremony that does
+      that, so if you have one on a USB stick something went wrong
+- [ ] You can still open the Pi's keyfile: poke the doorbell once and
+      type the passphrase. There is no recovery if you cannot
 - [ ] `gs-wake-deadman.timer` is **active** — the agent refuses to run a
       job on a box that cannot turn itself off
 - [ ] `sleep.target suspend.target hibernate.target hybrid-sleep.target`
@@ -703,12 +778,56 @@ point a pager at it.
 
 The Pi doorbell + signed note **are shipped now**:
 
-```bash
-# once, at the ThinkPad, with physical access
-python3 gs_wake_keys --thinkpad-mac aa:bb:cc:dd:ee:ff \
-        --doorbell-host 192.168.1.9 --amount-ladder 0.01 0.02 0.05
+Pairing is **two commands and one comparison**, and no secret ever
+moves between the boxes. Each one generates its own keypair in place;
+only public keys cross the LAN.
 
-# on the Pi, one process per poke — the job goes in on STDIN, never argv
+```bash
+# 1. on the ThinkPad. It generates its key, prints the exact command
+#    to run on the Pi, and waits.
+python3 gs_wake_keys pair --amount-ladder 0.01 0.02 0.05
+
+# 2. on the Pi, using the address the ThinkPad just printed
+python3 gs_doorbell pair 192.168.1.20
+```
+
+Both boxes then show the **same 8-character code**:
+
+```
+  ==============================================
+     PAIRING CODE      M404-ADJD
+  ==============================================
+```
+
+Compare them. Character for character, on both screens. **This
+comparison is the entire security of the exchange** — two boxes that
+have never met cannot otherwise tell each other apart from anything
+else on the switch. If the codes differ, answer `no` on either box:
+nothing is written on either, and something on your network answered
+instead of the box you meant.
+
+Then the Pi asks for a passphrase, twice, and seals its keyfile with
+it. Everything else is automatic:
+
+- the ThinkPad's **MAC is detected**, from the interface holding the
+  route to the Pi. It used to be a flag, and a typo in it produced a
+  setup that paired perfectly, said success on both boxes, and then
+  woke nothing forever — a magic packet is not acknowledged, so
+  nothing in this system could ever have told you.
+- the doorbell's **port is drawn at random** and recorded in both
+  keyfiles. A fixed default in a public repository is a fingerprint:
+  anyone who reads this file knows the port to look for, and finding
+  it open on a home LAN identifies the setup. Randomising it does not
+  make the doorbell secure — the design is published — it makes one
+  install look unlike the next.
+- the Pi's **listen address** is taken from the socket, not typed. An
+  address that is right for the box but wrong for the route is a
+  doorbell that binds fine and is never reachable.
+
+```bash
+# on the Pi, one process per poke — the job goes in on STDIN, never
+# argv, and the passphrase is asked for on the terminal, so neither is
+# ever in /proc/<pid>/cmdline
 echo '{"job":"receive_and_quote","amount_slot":2}' | \
     python3 gs_doorbell wake --key /etc/gs_wake_pi.key
 

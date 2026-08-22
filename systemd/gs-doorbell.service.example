@@ -16,5 +16,26 @@ Requires=wg-quick@wg0.service
 
 [Service]
 Type=oneshot
+# NOTHING TO THE JOURNAL. gs_doorbell overrides BaseHTTPRequestHandler's
+# log_message to a no-op so requests are not journalled -- and then this unit
+# journalled the tool's own stdout instead, which names the job ("waiting for
+# the vault to collect job receive_and_quote"), the handle it got back and the
+# minute all of it happened. Straight onto the SD card of the one box that is
+# supposed to hold nothing, in a file that survives the process by design.
+#
+# A refusal is still visible: run the command by hand and you see everything.
+# This only silences the unattended path, which is the one nobody reads and
+# that writes to persistent storage.
+StandardOutput=null
+StandardError=null
+# The passphrase for the sealed keyfile. In the ENVIRONMENT, never on argv:
+# /proc/<pid>/cmdline is mode 0444 and every local account can read it, while
+# /proc/<pid>/environ is 0400. Point this at a root-owned 0400 file:
+#   EnvironmentFile=/etc/gs-wake.env        <- GS_WAKE_PASSPHRASE=...
+# and understand what you have done: that file is on the same unencrypted SD
+# card as everything else unless you have encrypted the Pi (OPSEC_SETUP.md §3),
+# so an unattended trigger converts the sealed keyfile back into a plaintext
+# one. A doorbell poked by a person who types the passphrase does not.
+#EnvironmentFile=/etc/gs-wake.env
 # The job goes in on STDIN, never on argv: /proc/<pid>/cmdline is mode 0444.
 ExecStart=/bin/sh -c 'echo "{\"job\":\"receive_and_quote\",\"amount_slot\":2}" | /usr/bin/python3 /opt/ghostspiral/gs_doorbell wake --key /etc/gs_wake_pi.key'
