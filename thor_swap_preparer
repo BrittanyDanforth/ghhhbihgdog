@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from gs_common import (
-    wipe_will_erase,
+    wipe_will_erase, instruction_field_safe,
     integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
@@ -566,6 +566,25 @@ def main():
     print("  ============================================================")
     print("  SENDER INSTRUCTIONS — copy-paste and give to the BTC sender:")
     print("  ============================================================")
+    # NOTHING WITH A LINE BREAK IN IT GOES INTO THIS BLOCK.
+    #
+    # The block exists to be copied verbatim and paid. Every value in it came
+    # back from a quote, and the memo's own gate reads only fields 0..2 -- so a
+    # newline in any field forged a second "To address:" line here, with an
+    # instruction to use it. Driven through this CLI as a real subprocess
+    # before the fix. The memo is now refused at its gate; this covers the
+    # fields that have no gate of their own.
+    _unsafe = [i for i, p in enumerate(pairs)
+               if not all(instruction_field_safe(p.get(k, ""))
+                          for k in ("btc_in", "deposit", "memo", "expected_xmr"))]
+    if _unsafe:
+        integrity_log("thor", f"instruction_field_unsafe:{len(_unsafe)}")
+        sys.exit(
+            f"[!] {len(_unsafe)} of {len(pairs)} pair(s) carry a line break or control\n"
+            f"    character in a field that gets printed for the sender. That forges\n"
+            f"    extra lines in the block you are about to copy -- a second\n"
+            f"    'To address:' naming someone else, for instance. Refusing to print\n"
+            f"    sender instructions.")
     for i, pair in enumerate(pairs):
         print(f"\n  --- Payment {i+1} of {len(pairs)} ---")
         print(f"  Send exactly: {pair['btc_in']} BTC")

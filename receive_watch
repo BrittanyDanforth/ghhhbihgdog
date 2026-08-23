@@ -65,6 +65,7 @@ from gs_common import (
     progress_line,
     load_pairs, pairs_for_dest,
     bech32_checksum_ok,
+    instruction_field_safe,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -747,6 +748,20 @@ def _print_sender_instructions(matched: list, dest: str = "", echo=print) -> Non
               if not isinstance(p.get("deposit"), str)
               or not BTC_RE.match(p.get("deposit") or "")
               or not bech32_checksum_ok(p.get("deposit") or "")]
+    # ...and every OTHER field in the block, for the same reason the memo is
+    # checked at its own gate: a control character in any of them forges a line
+    # in a block that exists to be copied verbatim and paid.
+    _bfield = [i for i, p in enumerate(matched)
+               if not all(instruction_field_safe(p.get(k, ""))
+                          for k in ("btc_in", "expected_xmr", "deposit", "memo"))]
+    if _bfield:
+        integrity_log("recv", f"instruction_field_unsafe:{len(_bfield)}")
+        sys.exit(
+            f"[!] {len(_bfield)} of {len(matched)} swap pair(s) carry a line break or\n"
+            f"    control character in a field that gets printed for the sender.\n"
+            f"    That forges extra lines in the block you are about to copy --\n"
+            f"    a second 'To address:' naming someone else, for instance.\n"
+            f"    The pairs file has changed since thor_swap_preparer wrote it.")
     if _baddr:
         integrity_log("recv", f"deposit_addr_invalid:{len(_baddr)}")
         sys.exit(
