@@ -66,6 +66,7 @@ from gs_common import (
     load_pairs, pairs_for_dest,
     bech32_checksum_ok,
     instruction_field_safe,
+    atomic_write_json,
 )
 
 ATOMIC = Decimal("1000000000000")          # piconero per XMR
@@ -454,6 +455,41 @@ def wallet_height(rpc):
         return int(h) if isinstance(h, int) and not isinstance(h, bool) else None
     except Exception:                                        # noqa: BLE001
         return None
+
+
+def _write_result_json(args, r: dict) -> None:
+    """Write the outcome somewhere a PROGRAM can read it. Optional, never fatal.
+
+    THE HUMAN OUTPUT IS NOT AN INTERFACE, and this file exists so nothing has
+    to pretend otherwise. This tool distinguishes five outcomes -- funded,
+    stalled, not_syncing, timeout, interrupted -- and collapses them into three
+    exit codes (0, 1, 130). gs_wake_agent then collapsed THAT into `rc != 0`,
+    so "your money has not arrived yet" and "the wallet lost its daemon" and
+    "the tool died on a bad argument" all reached the operator's phone as the
+    same sentence: "the vault ran it and it FAILED".
+
+    `total` as well as `unlocked`, because with a short --timeout-min the
+    interesting distinction is "nothing has arrived" versus "something arrived
+    and is still confirming", and only `total` separates those.
+
+    Decimals as STRINGS: json cannot serialise a Decimal, and float() here
+    would round money on the way out of a tool whose whole job is to say how
+    much arrived.
+    """
+    path = getattr(args, "result_json", "") or ""
+    if not path:
+        return
+    try:
+        atomic_write_json(
+            {"state": r.get("state", ""),
+             "unlocked": str(r.get("unlocked", "")),
+             "total": str(r.get("total", "")),
+             "ticks": int(r.get("ticks", 0) or 0)},
+            Path(path), perms=0o600)
+    except Exception as e:                                   # noqa: BLE001
+        # A result file that could not be written is not a reason to lose the
+        # watch. The human output below is unchanged and still authoritative.
+        print(f"  [!] could not write --result-json ({type(e).__name__}).")
 
 
 def watch(rpc, account: int, sub_idx: int, floor_: Decimal,
@@ -856,6 +892,12 @@ def main():
                          "absorbing swap slippage (default 0.10 = accept 90%%)")
     ap.add_argument("--timeout-min", type=int, default=1440,
                     help="give up after this many minutes (default 1440 = 24h)")
+    ap.add_argument("--result-json", default="",
+                    help="also write the outcome to this file, 0600, as JSON "
+                         "a program can read. The five outcomes this tool "
+                         "distinguishes collapse into three exit codes, and a "
+                         "caller that needs the difference cannot get it from "
+                         "the exit code or from parsing this output.")
     ap.add_argument("--stall-min", type=int, default=STALL_MINUTES_DEFAULT,
                     help="after funds arrive, how long the balance may sit "
                          f"unchanged before reporting a shortfall (default {STALL_MINUTES_DEFAULT})")
@@ -1108,6 +1150,8 @@ def main():
               timeout_s=args.timeout_min * 60,
               stall_s=args.stall_min * 60,
               min_arrival=min_arrival)
+
+    _write_result_json(args, r)
 
     state = r["state"]
     if state == "interrupted":

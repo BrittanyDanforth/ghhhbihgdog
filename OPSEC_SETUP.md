@@ -47,8 +47,21 @@ not fixed by any of this.
 | Mullvad account number | paper / Pi `/etc`, not GitHub | they can use your pipe |
 | mix / `run_pipeline` | ThinkPad, you present, USB plugged in | — |
 
-Telegram never gets: XMR address, memo (the memo **is** the address),
-wallet path, RPC URL, view key.
+Telegram never gets: wallet path, RPC URL, view key, spend key, seed — and by
+default nothing else either, only which job finished and a 4-hex handle.
+
+The XMR address and the memo (the memo **is** the address) are the exception,
+and it is the operator's to make, on the vault, in a 0400 file. Three modes:
+
+| vault keyfile | Telegram gets | you need |
+|---|---|---|
+| neither field | a handle | to reach the vault |
+| `delivery_public` | a sealed blob | `gs_delivery.key` on some machine |
+| `plain_slip: true` | the address and memo, in the clear | a phone |
+
+Nothing on the Pi and nothing in a chat can change which mode is in force.
+§8 has what each costs — including the part of the plaintext cost that is
+about **money** rather than privacy, which you must read before setting it.
 
 
 ## 2. Buy list
@@ -949,6 +962,59 @@ Bounding it: the delivery key lives only on the sending machine, and a slip
 names one already-spent swap — it is not a wallet, not a seed, and cannot move
 anything. Set no delivery key and none of this happens: no slip is sealed and
 `/depo` answers exactly as it did before.
+
+### If you have only a phone: `plain_slip`
+
+The sealed slip still assumes a machine that can run `gs_unseal`. With only a
+phone you have none, so there is a third mode — set `"plain_slip": true` in the
+**vault's** keyfile and the deposit address, the amount and the memo arrive in
+the chat as text. The memo comes in its own message so a tap-and-hold copies it
+alone.
+
+```
+/depo 2                -> Send exactly:  0.05000000 BTC
+                          To address:    bc1q…
+                          Expected out:  ~1.23 XMR
+                          Slip:          A3F1
+                       -> =:XMR.XMR:44AF…:0/1/0      (its own message)
+/check A3F1            -> A3F1: nothing on the address yet. Normal —
+                          ask again in a while.
+```
+
+**Read this before you set it.** Not the privacy cost — the money one.
+
+The ThorChain deposit address is a **shared pooled vault**; it identifies
+nobody. The memo is the *entire* binding between your Bitcoin and your Monero.
+So whoever holds your bot token does not need to touch the deposit line — they
+leave it correct, put **their** address in the memo, and your BTC becomes their
+XMR, irreversibly. The sealed slip refuses anything your vault did not seal.
+This cannot, and no scheme rescues it: you cannot verify a 111-character memo
+by eye, and a code sheet, an HMAC or echoing the memo back all fail against the
+same attacker, because someone holding the token **is** the bot as far as your
+phone can tell — they can suppress the real message and send theirs first.
+
+The mitigation is the token, and only the token. Keep it in
+`/etc/gs-pager.env`, `0400`, root-owned, never on a command line.
+
+The privacy cost is the smaller half and is stated in full in
+`gs_wake_proto.py` under "THE PLAINTEXT SLIP": the destination is a one-shot
+Monero account minted inside the same job and the deposit vault is shared, so
+the transcript publishes no long-lived identity. What it does cost is
+**attribution** — a SIM-bound account tied to a swap — and **archive**, a
+searchable server-side ledger of every run that `paranoia_mode` cannot reach.
+
+**And a phone still cannot finish the payment.** The memo has to go in a
+Bitcoin `OP_RETURN`, and no mainstream mobile wallet can attach one — Electrum
+for Android rejects it in code. Use **Electrum or Sparrow on a desktop**. Any
+desktop, anywhere; the point of this mode is that it no longer has to be *the
+vault*. Two things that look like ways round it and are not:
+
+* a `bitcoin:` URI cannot carry the memo — `message=` is display-only, so it
+  produces a valid-looking payment that broadcasts with **no memo** and strands
+  the funds;
+* ThorChain's "memoless" swaps do not help — they move the routing into an
+  exact-to-the-satoshi amount, still require the memo to be broadcast first
+  from a funded RUNE account, and add a 6-hour single-use fuse.
 
 Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
 a slip, so an old doorbell rejects a new record **on length, before any

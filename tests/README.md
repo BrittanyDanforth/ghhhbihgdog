@@ -106,6 +106,21 @@ python3 tests/test_sealed_slip.py   # THE SLIP MUST REACH THE OPERATOR AND
                                     #   to forget -- a slip is AUTHENTICATED,
                                     #   so whoever holds the bot token cannot
                                     #   hand you a deposit address of theirs
+python3 tests/test_plain_slip.py    # THE PHONE-ONLY PATH. The sealed slip
+                                    #   still assumed a machine that can run
+                                    #   gs_unseal; with only a phone there is
+                                    #   none. So a third mode puts the deposit
+                                    #   address and memo in the chat as text --
+                                    #   OFF unless the VAULT's own keyfile says
+                                    #   otherwise, exactly five fields by
+                                    #   allowlist, one payload per result, and
+                                    #   a status word from a CLOSED set. That
+                                    #   last one is the defect the operator
+                                    #   actually hit: receive_watch exits
+                                    #   non-zero for a timeout, so money still
+                                    #   in flight reached their phone as "the
+                                    #   vault ran it and it FAILED". Also
+                                    #   asserts the DEFAULT still leaks nothing
 python3 tests/test_wake_agent.py    # THE VAULT AGENT: a TABLE asserting the
                                     #   machine powers off on every refusal.
                                     #   Fail-closed elsewhere means sys.exit;

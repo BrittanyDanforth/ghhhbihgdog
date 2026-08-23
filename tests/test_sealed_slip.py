@@ -182,7 +182,8 @@ check("the delivery key cannot open a slip meant for someone else",
 print("\n-- domain separation, both directions --")
 M3 = P.seal(VAULT, DELIVERY.public_key, P.TAG_M3,
             {"job_id": "a" * 32, "challenge": "b" * 64,
-             "status": "done", "handle": "A3F1", "slip": ""})
+             "status": "done", "handle": "A3F1", "slip": "",
+             "plain": {}, "phase": ""})
 check("an M3 is not the right LENGTH for a slip, so it dies before the AEAD",
       bool(refused(lambda: P.open_slip(
           DELIVERY, VAULT.public_key,
@@ -318,10 +319,10 @@ recs = [
             "job": "receive_and_quote", "amount_slot": 7}),
     P.seal(VAULT, DELIVERY.public_key, P.TAG_M3,
            {"job_id": "c" * 32, "challenge": "a" * 64, "status": "done",
-            "handle": "A3F1", "slip": ""}),
+            "handle": "A3F1", "slip": "", "plain": {}, "phase": ""}),
     P.seal(VAULT, DELIVERY.public_key, P.TAG_M3,
            {"job_id": "c" * 32, "challenge": "a" * 64, "status": "done",
-            "handle": "A3F1", "slip": BLOB}),
+            "handle": "A3F1", "slip": BLOB, "plain": {}, "phase": ""}),
 ]
 check("M1, M2, an M3 with no slip and an M3 WITH one are all one length",
       len(set(len(r) for r in recs)) == 1)
@@ -453,7 +454,7 @@ def pending(job="receive_and_quote", params=None):
 
 def m3(pend, **over):
     body = {"job_id": pend.job_id, "challenge": "a" * 64, "status": "done",
-            "handle": "A3F1", "slip": BLOB}
+            "handle": "A3F1", "slip": BLOB, "plain": {}, "phase": ""}
     body.update(over)
     return P.seal(VAULT, PI.public_key, P.TAG_M3, body)
 
@@ -540,7 +541,8 @@ class _Done:
 
 
 _done = _Done()
-_done.result = {"status": "done", "handle": "A3F1", "slip": BLOB}
+_done.result = {"status": "done", "handle": "A3F1", "slip": BLOB,
+                "plain": {}, "phase": ""}
 pg.integrity_log = lambda *a, **k: None
 _pager.args = None
 pg.Pager.poke.__wrapped__ if False else None
@@ -629,7 +631,8 @@ pg.safe_post = lambda url, payload, proxies=None: (
 
 # The no-slip path must be unchanged for anyone who never sets a delivery key.
 _sent.clear()
-_done.result = {"status": "done", "handle": "A3F1", "slip": ""}
+_done.result = {"status": "done", "handle": "A3F1", "slip": "",
+                "plain": {}, "phase": ""}
 _pager.poke(111, "receive_and_quote", {"amount_slot": 2})
 check("with no delivery key the old message is exactly what it was",
       any("Read the address and memo on the vault." in t for t in _sent))

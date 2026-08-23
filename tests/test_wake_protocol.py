@@ -77,7 +77,16 @@ EPH = NP.PrivateKey.generate()     # vault, per boot
 
 SAMPLE = {"receive_new": {"count": 4},
           "receive_and_quote": {"amount_slot": 7},
-          "watch": {"handle": "A3F1"}}
+          "watch": {"handle": "A3F1"},
+          "swap_status": {"handle": "A3F1"}}
+# KEYED ON JOBS, AND CHECKED TO BE. This table is what every per-job check
+# below iterates, so a job added to the protocol without a sample here would
+# not be silently skipped -- it would KeyError and crash the suite, which
+# mutation_sweep scores as NO-RESULT rather than a failure. Asserting the
+# cover explicitly turns that into a readable red line instead.
+assert set(SAMPLE) == set(P.JOBS), (
+    f"SAMPLE does not cover JOBS: missing {sorted(set(P.JOBS) - set(SAMPLE))}, "
+    f"stale {sorted(set(SAMPLE) - set(P.JOBS))}")
 
 
 def m2_for(job, eph_pub=None):

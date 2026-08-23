@@ -394,6 +394,30 @@ class Pending:
             raise Doorbell("this job already reported a result")
         if proto.job_id_of(body) != self.job_id:
             raise Doorbell("result names a different job")
+        # AN EXACT KEY SET, so a HALF-UPGRADED PAIR FAILS LOUDLY.
+        #
+        # gs_wake_proto's header promises that a version mismatch is caught on
+        # LENGTH, before any crypto, and is "loud, immediate and impossible to
+        # misread". That is true of a PAD_BLOCK change and was not true of a
+        # field addition: every field here was read with .get() and no key set
+        # was enforced, while WIRE_VERSION is declared and never read by
+        # anything. So a vault upgraded ahead of its Pi would send deposit
+        # instructions, this box would silently drop them, and the operator
+        # would be told "read the address and memo on the vault" with no error
+        # recorded anywhere -- the exact silent partial upgrade the header says
+        # is the one outcome worth ruling out.
+        #
+        # validate_job already enforces an exact key set on M2. This is the
+        # same rule on the record going the other way.
+        _want = {"job_id", "challenge", "status", "handle", "slip", "plain",
+                 "phase"}
+        if set(body) != _want:
+            missing, extra = sorted(_want - set(body)), sorted(set(body) - _want)
+            raise Doorbell(
+                f"result does not match this protocol version "
+                f"(missing {missing}, unexpected {extra}). The vault and this "
+                f"Pi are running different versions of gs_wake_proto: update "
+                f"both, in the same sitting.")
         status = body.get("status")
         if status not in ("done", "refused", "failed"):
             raise Doorbell("result carries no usable status")
@@ -452,10 +476,46 @@ class Pending:
             # A refused or failed job has nothing to deliver. A slip attached
             # to one is the vault contradicting itself.
             raise Doorbell("a job that did not finish cannot carry a slip")
-        self.result = {"status": status, "handle": handle, "slip": slip}
+        # THE PLAINTEXT SLIP. This box CAN read this one, and that is the whole
+        # cost of the mode -- see gs_wake_proto's "THE PLAINTEXT SLIP".
+        #
+        # It is still checked strictly rather than forwarded on trust, because
+        # the next hop is a chat message a human copies into a wallet: an EXACT
+        # key set (a field this Pi has never heard of must not reach Telegram
+        # unexamined), strings only, bounded, and no control characters, which
+        # would forge a line of the block being copied.
+        plain = body.get("plain", {})
+        if not isinstance(plain, dict):
+            raise Doorbell("result's plain field is not an object")
+        if plain and not proto.plain_slip_is_wellformed(plain):
+            raise Doorbell("result carries something in the plain field that "
+                           "is not a set of deposit instructions")
+        if plain and status != "done":
+            raise Doorbell("a job that did not finish cannot carry deposit "
+                           "instructions")
+        # ONE PAYLOAD, NEVER TWO. Sealed and plaintext are two answers to one
+        # question; an M3 carrying both would put the payload in the transcript
+        # AND in a blob, doubling the exposure for a single delivery. The vault
+        # refuses this at keyfile load; this is the second, independent place.
+        if slip and plain:
+            raise Doorbell("result carries BOTH a sealed and a plaintext slip")
+        # THE STATUS WORD, against a CLOSED SET.
+        #
+        # A membership test, never a substring or a length check: this word is
+        # rendered into a sentence the operator acts on, so an unknown word
+        # must be refused rather than passed through as itself. It is also what
+        # stops the vault gaining a free-text channel into a chat.
+        phase = body.get("phase", "")
+        if not proto.phase_is_known(phase):
+            raise Doorbell("result carries a status word this protocol has no "
+                           "meaning for")
+        self.result = {"status": status, "handle": handle, "slip": slip,
+                       "plain": plain, "phase": phase}
         self.events.append("result_ok")
         if slip:
             self.events.append("slip_carried")
+        if plain:
+            self.events.append("plain_carried")
 
 
 def make_handler(pending: Pending):
@@ -1024,6 +1084,21 @@ def report(pending: Pending) -> int:
     if out == "done":
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")
+        phase = pending.result.get("phase") or ""
+        if phase:
+            print(f"      Swap status: {proto.PHASE_LINES.get(phase, phase)}")
+        plain = pending.result.get("plain") or {}
+        if plain:
+            # Printed here for the same reason the sealed blob is: this is the
+            # Pi's own terminal, it already knows a job ran, and an operator
+            # running the doorbell by hand must see exactly what the chat sees.
+            print(f"      DEPOSIT INSTRUCTIONS, IN THE CLEAR — the vault's own "
+                  f"keyfile asked for this.")
+            print("")
+            for line in proto.plain_lines(plain):
+                print(f"      {line}")
+            print("")
+            return 0
         slip = pending.result.get("slip") or ""
         if not slip:
             print(f"      The deposit address, the memo and the slip stayed on "

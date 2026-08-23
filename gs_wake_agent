@@ -58,6 +58,7 @@ import stat
 import subprocess
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 import traceback
 from pathlib import Path
 
@@ -95,6 +96,10 @@ NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S = 60, 180
 
 STATE_FILE = "gs_wake_state.json"
 HANDLES_FILE = "gs_wake_handles.json"
+#: Where a swap_status probe drops its machine-readable outcome, 0600, in the
+#: artifact directory so paranoia_mode wipes it with everything else. Read once
+#: by _phase_of and never kept.
+STATUS_FILE = "gs_wake_status.json"
 INHIBIT_FILE = ".gs_wake_inhibit"
 DEADMAN_UNIT = "gs-wake-deadman.timer"
 
@@ -306,6 +311,26 @@ def load_key(path: Path) -> dict:
                 f"`gs_delivery_key new` rather than editing it by hand, or "
                 f"remove the field to go back to leaving slips on this "
                 f"machine.")
+    # PLAINTEXT DELIVERY IS A KEYFILE DECISION, WHICH IS TO SAY A PHYSICAL ONE.
+    #
+    # It lives here and nowhere else on purpose: the Pi has no way to ask for
+    # it, so a compromised Pi -- or a stolen bot token -- cannot turn the chat
+    # into a plaintext channel. Changing it means being at the vault.
+    ps = k.get("plain_slip")
+    if ps is not None and not isinstance(ps, bool):
+        raise Refused("plain_slip_malformed",
+                      f"{path} carries a plain_slip that is not true or false.")
+    # ONE MODE, NOT TWO. Sealed and plaintext answer the same question for
+    # different operators, and an M3 carrying both would put the payload in the
+    # transcript AND in a blob -- twice the exposure for one delivery. Refusing
+    # here, at load, is the only place the operator is present to fix it.
+    if ps and (k.get("delivery_public") or "").strip():
+        raise Refused(
+            "delivery_mode_ambiguous",
+            f"{path} sets BOTH plain_slip and delivery_public. Those are two "
+            f"answers to one question and this machine will not guess: sealed "
+            f"delivery puts the payload where only gs_delivery.key can read "
+            f"it, plaintext puts it in the chat. Remove one.")
     return k
 
 
@@ -520,6 +545,21 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
                  # is the only value under which the tool cannot print a mix
                  # command.
                  "--timeout-min", "110"]]
+    if job == "swap_status":
+        # LOOK, DO NOT WAIT. Three minutes inside a 300 s budget: enough for
+        # the wallet to answer, and the vault is off again before the wake is
+        # worth noticing. --result-json is what makes the answer more than a
+        # boolean; without it every outcome but "funded" reaches the operator
+        # as "the vault FAILED".
+        return [[sys.executable, _tool("receive_watch"),
+                 "--tor-proxy", proxy, "--rpc", rpc,
+                 "--receive-wallet", str(bundle),
+                 "--pairs", str(slip),
+                 "--timeout-min", "3",
+                 # stall_min must not exceed timeout_min or the tool warns and
+                 # the stall check can never fire inside the window anyway.
+                 "--stall-min", "3",
+                 "--result-json", str(artifact_dir / STATUS_FILE)]]
     raise Refused("unknown_job", "no argv template for this job")
 
 
@@ -863,10 +903,63 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # this one path having its own copy and the rest having none.
     code, status, handle = _dispatch(job, params, key, artifact_dir,
                                      handle, _child, job_id)
+    # A STATUS PROBE REPORTS THE HANDLE IT WAS ASKED ABOUT, not the fresh one
+    # _run_validated drew. See _dispatch: handles[] is written only for
+    # receive_and_quote and receive_new, and the collision loop guarantees the
+    # drawn handle is absent from the file -- so a watch used to answer
+    # "ready · slip 7C3D" for a label the operator could not look up.
+    if job in ("watch", "swap_status"):
+        handle = params["handle"]
     slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
+    plain = plain_slip_for_chat(key, artifact_dir, status, handle)
+    phase = _phase_of(job, artifact_dir)
     report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
-                poster=d.get("post_record"))
+                plain=plain, phase=phase, poster=d.get("post_record"))
     return code, status, handle
+
+
+#: receive_watch's own outcome word -> the one word this protocol has for it.
+#: Its five outcomes collapse into three exit codes and then, at `if rc != 0`,
+#: into one boolean -- which is why "your money has not arrived yet" reached
+#: the phone as "the vault FAILED". The mapping is restored from the machine
+#: readable result file rather than from stdout, because a tool's human-facing
+#: output is not an interface.
+_PHASE_OF_STATE = {
+    "funded": "landed",
+    "stalled": "short",
+    "not_syncing": "stuck",
+    "timeout": "not_yet",
+    "interrupted": "",
+}
+
+
+def _phase_of(job: str, artifact_dir: Path, reader=None) -> str:
+    """The one word a status probe earned, or "". NEVER raises."""
+    if job != "swap_status":
+        return ""
+    try:
+        out = (reader or _read_json)(Path(artifact_dir) / STATUS_FILE) or {}
+        word = _PHASE_OF_STATE.get(out.get("state"), "")
+        # TIMEOUT SPLITS IN TWO, and the split is the whole point of a THREE
+        # MINUTE probe. receive_watch has no "arriving" state because it is
+        # built to wait for hours, so a payment that is on-chain and still
+        # confirming looks identical to an empty address inside a short
+        # window -- both come back "timeout". `total` is what separates them,
+        # and telling an operator "nothing yet" when their money is two
+        # confirmations away is the same class of wrong answer as telling them
+        # the vault failed.
+        if word == "not_yet":
+            try:
+                if Decimal(str(out.get("total") or "0")) > 0:
+                    word = "arriving"
+            except (InvalidOperation, ValueError):
+                pass                      # unreadable total: stay with not_yet
+        return word if proto.phase_is_known(word) else ""
+    except Exception:                                        # noqa: BLE001
+        # No file, unreadable, or a state word this version has never heard of.
+        # "" is honest: the pager then says the probe ran and told us nothing,
+        # which is true, rather than inventing a reassurance.
+        return ""
 
 
 def _reported(key, d, job_id, challenge, exc):
@@ -919,7 +1012,7 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
                       "things it wipes.")
 
     bundle = slip = None
-    if job == "watch":
+    if job in ("watch", "swap_status"):
         rec = handles.get(params["handle"])
         if not rec:
             raise Refused("unknown_handle",
@@ -1003,6 +1096,22 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
                       f"the artifacts).")
         rc, hard = run_child(argv, env_extra, budget, runner=runner,
                              log_path=None if _watched else _jl)
+        # A STATUS PROBE THAT FINDS NOTHING HAS NOT FAILED, and this branch is
+        # where the opposite used to be decided.
+        #
+        # receive_watch exits non-zero for timeout, stalled AND not_syncing
+        # alike. For `watch` that is defensible -- the operator asked it to
+        # wait for money and it did not come. For `swap_status` it is exactly
+        # backwards: "nothing on the address yet" is the ordinary answer, the
+        # one the operator will get most often, and reporting it as a failed
+        # job is what put "the vault ran it and it FAILED" on their phone while
+        # they were waiting for a payment that was simply still in flight.
+        #
+        # The probe SUCCEEDED as long as it ran and wrote an answer. Only a
+        # hard kill or a missing answer is a real failure.
+        if rc != 0 and job == "swap_status" and not hard:
+            if (artifact_dir / STATUS_FILE).exists():
+                continue
         if rc != 0:
             if hard:
                 print(f"  [!] Step {i + 1} had to be SIGKILLed after its "
@@ -1141,28 +1250,124 @@ def _read_json(path: Path):
     return json.loads(path.read_text())
 
 
-def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
-                handle: str, slip: str = "", poster=None) -> None:
-    """Tell the doorbell: done / refused / failed, a 4-hex label, and a slip.
+#: pair-record field -> plaintext slip key. A SEPARATE, SHORTER allowlist than
+#: SLIP_FIELDS, and the difference is deliberate: the sealed slip carries
+#: dest_xmr so gs_unseal can re-run memo_binds_destination on a second machine,
+#: and it carries ts so it can call a stale quote stale. A phone can do
+#: neither, so both fields would be extra copies of sensitive values in a
+#: transcript, bought for nothing. What is left is exactly what a human needs
+#: to make the payment.
+PLAIN_MAP = (("btc_in", "b"), ("deposit", "d"), ("memo", "m"),
+             ("expected_xmr", "x"))
 
-    NEVER the reason, never a plaintext address, never a plaintext memo, never
-    an amount. The slip is CIPHERTEXT sealed to a key the doorbell does not
-    have and cannot get -- see gs_wake_proto's "THE SEALED SLIP". Everything
-    the doorbell learns is still: a job finished, and a label for it.
+
+def plain_slip_for_chat(key: dict, artifact_dir: Path, status: str,
+                        handle: str, reader=None) -> dict:
+    """The deposit instructions, in the clear, or {}.
+
+    Same contract as seal_slip_for_delivery and for the same reasons: returns
+    empty rather than raising when there is nothing to send or the operator has
+    not turned this on, and NEVER raises -- a job that ran is a job that ran.
     """
+    try:
+        if status != "done" or not key.get("plain_slip"):
+            return {}
+        rec = (_load_handles(artifact_dir) or {}).get(handle) or {}
+        path = rec.get("slip")
+        if not path:
+            return {}                       # receive_new quotes nothing
+        pairs = (reader or _read_json)(Path(path))
+        if not isinstance(pairs, list) or len(pairs) != 1:
+            # The same refusal the sealed path makes. N slips in one transcript
+            # is worse here than there: GhostSpiral calls two or more
+            # publicly-known outputs the catastrophic case, and a chat is
+            # exactly where they pile up.
+            raise ValueError(
+                f"expected exactly one quoted pair, found "
+                f"{len(pairs) if isinstance(pairs, list) else 'a non-list'}")
+        pair = pairs[0]
+        body = {}
+        for src, short in PLAIN_MAP:
+            v = pair.get(src)
+            if v is None:
+                raise ValueError(f"the quoted pair has no {src!r}")
+            body[short] = str(v)
+        body["h"] = handle
+        # Checked against the SAME predicate the doorbell will use, here, where
+        # the operator can be told. Otherwise a control character in a memo
+        # would be refused by the Pi and the vault would have powered off
+        # believing it delivered.
+        if not proto.plain_slip_is_wellformed(body):
+            raise ValueError("the quoted pair does not fit the plaintext slip "
+                             "format (a field is empty, too long, or carries a "
+                             "control character)")
+        integrity_log("wake", "plain_slip_sent")
+        return body
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("wake", "plain_slip_failed")
+        agent_say(f"  [!] The job finished but its deposit instructions could "
+                  f"NOT be sent ({terminal_safe(str(e))[:160]}).")
+        agent_say(f"      They are on THIS machine, unchanged.")
+        return {}
+
+
+def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
+                handle: str, slip: str = "", plain: dict = None,
+                phase: str = "", poster=None) -> None:
+    """Tell the doorbell the outcome, a 4-hex label, and at most ONE payload.
+
+    Never the reason a job was refused. The payload is either a SEALED slip --
+    ciphertext for a key the doorbell does not have -- or, when the operator's
+    own keyfile says so, the deposit instructions in the clear. Never both:
+    see gs_wake_proto's "THE PLAINTEXT SLIP" for what each costs.
+    """
+    plain = plain or {}
+    done = status == "done"
+    body = {"job_id": job_id, "challenge": challenge_hex, "status": status,
+            "handle": handle if done else "",
+            "slip": slip if done else "",
+            "plain": plain if done else {},
+            "phase": phase if done else ""}
     try:
         import nacl.public
         tp_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
         pi_pk = nacl.public.PublicKey(bytes.fromhex(key["peer_public"]))
-        m3 = proto.seal(tp_sk, pi_pk, proto.TAG_M3,
-                        {"job_id": job_id, "challenge": challenge_hex,
-                         "status": status,
-                         "handle": handle if status == "done" else "",
-                         "slip": slip if status == "done" else ""})
+        m3 = proto.seal(tp_sk, pi_pk, proto.TAG_M3, body)
+    except proto.WakeError as e:
+        # A RECORD THAT WILL NOT FIT IS NOT A DELIVERY PROBLEM, and treating it
+        # as one is how a successful job becomes silence.
+        #
+        # This whole function used to sit under one bare `except Exception`
+        # whose comment said "an undeliverable result is not a failure of the
+        # job". True for a dead socket. NOT true for seal() refusing an
+        # oversized record: that is a bug in what we just built, the operator
+        # is told "collected but never reported back" for a job that fully
+        # succeeded, and the vault powers off before anyone can look. Retry
+        # WITHOUT the payload so the outcome and the handle still arrive --
+        # they are what lets the operator find the job on the vault.
+        integrity_log("wake", "result_too_large")
+        agent_say(f"  [!] The result record would not fit the wire "
+                  f"({terminal_safe(str(e))[:120]}).")
+        agent_say(f"      Reporting the outcome WITHOUT the deposit "
+                  f"instructions; they are on this machine.")
+        try:
+            import nacl.public
+            m3 = proto.seal(
+                nacl.public.PrivateKey(bytes.fromhex(key["secret"])),
+                nacl.public.PublicKey(bytes.fromhex(key["peer_public"])),
+                proto.TAG_M3,
+                dict(body, slip="", plain={}))
+        except Exception:                                    # noqa: BLE001
+            integrity_log("wake", "result_undeliverable")
+            return
+    except Exception:                                        # noqa: BLE001
+        integrity_log("wake", "result_undeliverable")
+        return
+    try:
         (poster or post_record)(key["doorbell_url"], "/result", m3)
     except Exception:                                        # noqa: BLE001
-        # An undeliverable result is not a failure of the job. The job either
-        # happened or did not, and the record of it is here.
+        # THIS one really is a delivery problem. The job either happened or did
+        # not, and the record of it is here.
         integrity_log("wake", "result_undeliverable")
 
 

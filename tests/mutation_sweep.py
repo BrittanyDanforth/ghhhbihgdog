@@ -1332,6 +1332,75 @@ MUTATIONS = [
   "                ok = self.send(chat_id, slip)\n",
   "",
   ["test_sealed_slip"]),
+
+ # ---- THE PHONE-ONLY PATH ---------------------------------------------
+ # Plaintext delivery exists because two designs failed on the same
+ # assumption -- that the operator can reach a machine. Everything here is a
+ # bound on what that costs.
+
+ # THE DEFECT THE OPERATOR ACTUALLY HIT. receive_watch exits non-zero for
+ # timeout, stalled and not_syncing alike; without this branch a probe that
+ # finds nothing is a "failed job", and the phone is told the vault FAILED
+ # while the money is simply still in flight.
+ ("money still in flight goes back to being reported as a failed vault",
+  "gs_wake_agent",
+  '        if rc != 0 and job == "swap_status" and not hard:',
+  "        if False:",
+  ["test_plain_slip"]),
+
+ # The switch is a keyfile field on the vault, so a stolen bot token cannot
+ # ask for plaintext. Two answers to one question would put the payload in
+ # the transcript AND in a blob.
+ ("a vault can be configured for BOTH delivery modes at once",
+  "gs_wake_agent",
+  '    if ps and (k.get("delivery_public") or "").strip():',
+  "    if False:",
+  ["test_plain_slip"]),
+
+ ("the doorbell relays a result carrying both payloads", "gs_doorbell",
+  "        if slip and plain:",
+  "        if False:",
+  ["test_plain_slip"]),
+
+ # The status word is rendered into a sentence the operator acts on. An
+ # unknown word must be refused, not passed through as itself -- and the
+ # closed set is also what stops the vault gaining a free-text channel into
+ # a chat.
+ ("the vault gains a free-text channel into a chat window", "gs_doorbell",
+  "        if not proto.phase_is_known(phase):",
+  "        if False:",
+  ["test_plain_slip"]),
+
+ # gs_wake_proto's header promises a version mismatch is caught before any
+ # crypto and is "impossible to misread". Without an exact key set that was
+ # true of a PAD_BLOCK change and false of a field addition.
+ ("a half-upgraded pair goes back to silently dropping the payload",
+  "gs_doorbell",
+  "        if set(body) != _want:",
+  "        if False:",
+  ["test_wake_doorbell"]),
+
+ # These strings are pasted into a message a human copies into a wallet. A
+ # newline in the memo forges a line of it.
+ ("the Pi relays deposit instructions it has not checked the shape of",
+  "gs_doorbell",
+  "        if plain and not proto.plain_slip_is_wellformed(plain):",
+  "        if False:",
+  ["test_plain_slip"]),
+
+ ("the vault stops checking what the Pi will reject, so it powers off "
+  "believing it delivered", "gs_wake_agent",
+  "        if not proto.plain_slip_is_wellformed(body):",
+  "        if False:",
+  ["test_plain_slip"]),
+
+ # An EXACT key set, not a superset: a field this Pi has never heard of must
+ # not be forwarded to Telegram unexamined.
+ ("a field the Pi has never heard of rides along into the chat",
+  "gs_wake_proto.py",
+  "    if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):",
+  "    if not isinstance(obj, dict):",
+  ["test_plain_slip"]),
 ]
 
 
