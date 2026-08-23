@@ -684,6 +684,130 @@ def min_hop_fundable(fee_xmr: Decimal) -> Decimal:
     return amt
 
 
+def exit_is_fundable(fanout_amt: Decimal, fee_xmr: Decimal,
+                     dag_enabled: bool) -> bool:
+    """Can this output pay for its hop AND THE EXIT SWEEP THAT MUST FOLLOW?
+
+    hop_is_fundable answers a question one transaction wide. A fan-out output
+    is spent TWICE: the DAG round sweeps it to its neighbour, and then
+    _run_exit_withdrawals issues ONE sweep_all PER FUNDED SUBADDRESS to the
+    operator's destination. Both are transactions and both pay a fee. The
+    fan-out floor reserved one of them.
+
+    REPRODUCED AGAINST THE SHIPPED CODE, not argued from the arithmetic. At the
+    default --wallets 10 with a 0.0024 XMR fee:
+
+        min_hop_fundable(0.0024)                 = 0.0038   the old floor
+        compute_hop_amount(0.0038, 0.0024)       = 0.0002   what survives the hop
+        the exit's own dust rule, amt <= fee_per_round where
+        fee_per_round == hop_fee_reserve         = 0.00360  -> NOT WITHDRAWN
+
+    So the floor's guarantee ended one transaction before the money did.
+    Driving compute_fee_budget -> compute_fanout_amounts -> compute_hop_amount
+    -> the exit's filter, over settings the CLI accepts. The draw is random, so
+    these are the MEDIAN over 200 seeds with the range beside them -- a single
+    seed's count would read like a property and is not one:
+
+        0.2 XMR / --wallets 10   10 of 10 unwithdrawable (7-10)  THE DEFAULTS
+        1   XMR / --wallets 60   28 of 60                (25-32)
+        0.8 XMR / --wallets 40   11 of 40                (6-16)
+        0.5 XMR / --wallets 20    4 of 20                (0-8)
+
+    Not one of those 200 draws came back empty at any of those settings, so
+    this is what the planner emitted, not what it refused.
+
+    The operator is told about it -- the exit prints "smaller than the ... XMR
+    it would cost to move them, so they were NOT withdrawn" -- but it is told
+    at the END, after the fan-out, the hop round and hours of delays have all
+    executed on chain and paid their fees. That is the same shape as the
+    failure hop_is_fundable exists to prevent, one step further down: a
+    planning number that is checked after the money has already moved.
+
+    And it is not recoverable by hand afterwards. Every output lives on its own
+    subaddress, and this pipeline refuses to sweep two of them together (see
+    _run_exit_withdrawals, "ONE TRANSACTION PER (ACCOUNT, SUBADDRESS)") because
+    that is permanent public proof they share an owner. So the only spend that
+    would rescue the dust is the one spend the whole run exists to prevent.
+
+    WITH --dag-mixing OFF THE FLOOR RESERVED NOTHING AT ALL. That branch was
+    `DUST_XMR * 2` -- 0.0002 XMR, against an exit sweep costing 0.0036 -- so
+    EVERY output sitting on it was unwithdrawable. That branch matters more
+    than its size suggests: "disable --dag-mixing" is one of the three remedies
+    main() prints when the floor cannot be funded, so the advice for "these
+    outputs are too small" pointed at the setting with no floor.
+
+    RESERVED EVEN WITHOUT --exit-to, and that is deliberate rather than an
+    oversight in the signature. Without an exit nothing sweeps these outputs to
+    a destination, so the operator holds them -- and an output worth less than
+    the fee to spend it is unspendable BY ANYONE, so all skipping the reserve
+    would buy is the same dead output with nobody to report it. The reserve is
+    one transaction's fee out of a plan that already reserves one per
+    transaction it makes; it is not worth a fourth boolean here to shave.
+
+    ONE PREDICATE, and it implies hop_is_fundable rather than restating it:
+    x - 2R > DUST gives x - R > DUST + R > DUST. build_dag_plan keeps calling
+    hop_is_fundable, because it asks about an amount this function never
+    sized -- an output whose value moved between planning and the round.
+    """
+    after_hop = (compute_hop_amount(fanout_amt, fee_xmr) if dag_enabled
+                 else fanout_amt)
+    return compute_hop_amount(after_hop, fee_xmr) > DUST_XMR
+
+
+def min_exit_fundable(fee_xmr: Decimal, dag_enabled: bool) -> Decimal:
+    """The smallest DUST-grid amount exit_is_fundable() accepts.
+
+    CLOSED FORM FIRST, THEN CHECKED AGAINST THE PREDICATE, exactly as
+    min_hop_fundable does it -- and the first version of this function did NOT,
+    which is worth recording because it looked like the safer design.
+
+    It started at min_hop_fundable and stepped up until the predicate agreed,
+    on the reasoning that starting from the sibling floor keeps the two tied by
+    construction and avoids a third copy of compute_hop_amount's inversion. The
+    reasoning was fine; the step budget was nonsense. The gap between the two
+    floors is a WHOLE EXTRA FEE RESERVE -- 36 grid ticks at a 0.0024 XMR fee,
+    360 at 0.024 -- not the tick or two of quantise drift the bound was sized
+    for. Driven over fees 0.0001-0.05: it ran out of steps and returned an
+    amount its own predicate REJECTS at 495 of 1000 settings, so the floor
+    meant to guarantee withdrawability would itself have produced unwithdrawable
+    outputs. Caught by driving the function, not by reading it.
+
+    So: the inversion, doubled for the hop when the DAG round is on. The
+    stepping loop stays, now doing the job it is actually sized for: absorbing
+    the at-most-one-tick each of the two ROUND_DOWN quantises can cost.
+
+    Measured over fees 0.0001-0.05 in 0.0001 steps, both branches: the loop
+    needs at most 1 step, the answer satisfies the predicate at all 1000
+    settings, and one tick below it does not.
+
+    NEVER BELOW min_hop_fundable, and NOT BY A max() HERE. The caller's outputs
+    still have to clear build_dag_plan's gate, and a floor that dropped under
+    it would recreate the one-tick bug hop_is_fundable documents -- so this
+    line read `amt = max(amt, min_hop_fundable(fee_xmr))` for exactly that
+    reason.
+
+    It never fired. Over 2000 fees, both branches, min_hop_fundable is never
+    above the closed form: with the DAG round on the reserve is doubled, and
+    with it off the two expressions are THE SAME inversion, equal at all 2000.
+    A mutation deleting the max() therefore SURVIVED the whole suite -- the
+    signature of an equivalent mutant, and this file already answers that one
+    way (see compute_fanout_amounts: "the honest response is to delete the code
+    rather than write a test that cannot fail").
+
+    So the relationship is pinned where it can actually fail: test_units checks
+    min_exit_fundable >= min_hop_fundable across the fee range directly. If a
+    change to either inversion ever breaks it, that goes red and names it,
+    which a max() silently absorbing the difference would not.
+    """
+    amt = (hop_fee_reserve(fee_xmr) * (2 if dag_enabled else 1)
+           + DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP)
+    for _ in range(4):
+        if exit_is_fundable(amt, fee_xmr, dag_enabled):
+            return amt
+        amt += DUST_XMR
+    return amt
+
+
 def compute_fanout_amount(usable: Decimal, fanout_count: int) -> Decimal:
     """Per-destination fan-out amount.
 
@@ -715,10 +839,12 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     rather than one split.
 
     Guarantees, so the plan is always fundable and never over-budget:
-      * every amount >= min_each, where min_each reserves this output's own hop
-        fee when DAG mixing is on (so no hop later fails "not enough money"
-        AFTER the fan-out already executed on-chain), or a dust margin when it
-        is off;
+      * every amount >= min_each, where min_each reserves EVERY fee this output
+        will pay before it reaches the operator -- its own hop when DAG mixing
+        is on, and the exit's per-subaddress sweep_all either way (so no hop
+        fails "not enough money", and no output survives the mix only to sit
+        below the cost of moving it, both AFTER the fan-out has already
+        executed on-chain). See exit_is_fundable;
       * the sum never exceeds usable * FANOUT_SPEND_FRACTION (each share is
         ROUND_DOWN, and the fixed min_each floor is reserved before the random
         remainder is distributed);
@@ -744,13 +870,22 @@ def compute_fanout_amounts(usable: Decimal, fanout_count: int, fee_xmr: Decimal,
     # change to sweep, not more safety margin.
     budget = usable * (FANOUT_SPEND_FRACTION if spend_fraction is None
                        else spend_fraction)
-    # min_hop_fundable, NOT a second spelling of the rule. This was
-    # `hop_fee_reserve(fee_xmr) + DUST_XMR` rounded up, which is exactly one
-    # tick BELOW what build_dag_plan's fundability test accepts -- so the floor
-    # whose entire job is "no hop later fails" produced outputs that could not
-    # hop at all. See hop_is_fundable for the measurements.
-    min_each = (min_hop_fundable(fee_xmr) if dag_enabled
-                else (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP))
+    # min_exit_fundable, NOT a second spelling of the rule. Two versions of
+    # this line have now been a transaction short of the truth:
+    #
+    #   * `hop_fee_reserve(fee_xmr) + DUST_XMR` rounded up is one tick BELOW
+    #     what build_dag_plan's fundability test accepts, so the floor whose
+    #     job is "no hop later fails" produced outputs that could not hop at
+    #     all (see hop_is_fundable);
+    #   * min_hop_fundable reserves the HOP and stops there, so the output
+    #     hopped and then could not pay for the exit sweep that spends it --
+    #     9 of 10 outputs unwithdrawable at the default --wallets 10 on a
+    #     0.2 XMR balance, and with --dag-mixing off the branch below this
+    #     reserved nothing at all (see exit_is_fundable).
+    #
+    # An output is spent by every stage that touches it, so the floor is sized
+    # against the LAST one, not the next one.
+    min_each = min_exit_fundable(fee_xmr, dag_enabled)
     floor_total = min_each * Decimal(fanout_count)
     if budget < floor_total:
         return []                       # cannot fund this many viable outputs
@@ -5661,9 +5796,27 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
         # "The smallest chunk" is only KNOWN when the quotes are. With a total
         # and a count alone the size is assumed equal, and this said otherwise
         # — asserting a measured fact about the operator's swaps that nothing
-        # here measured. Say which of the two it is.
-        _basis = ("The smallest quoted chunk is" if chunk_amounts
-                  else f"Split equally, each of the {n_chunks} chunks would be")
+        # here measured. Say which of the THREE it is.
+        #
+        # The third was missing and is reached the same way the second is. When
+        # --expect-total-xmr covers a swap whose quote could not be read,
+        # swap_expected_total returns amounts for the READABLE ones only and
+        # the rescale above scales that partial set onto the operator's total.
+        # chunk_amounts is then truthy, so this printed "The smallest quoted
+        # chunk is" about a set that does not include every swap in the target
+        # -- the exact claim the paragraph above says the line must not make,
+        # through the door it did not check. Measured over 4000 random shapes
+        # (2-8 swaps, 1..N-1 quotes unreadable): 1007 of them printed it.
+        #
+        # The rescale itself STAYS. Over those same 4000 it opened a gate the
+        # count-only fallback would have held zero times, so it is not the
+        # looser answer -- only the less certain one, which is what the wording
+        # now carries.
+        _basis = (f"Split equally, each of the {n_chunks} chunks would be"
+                  if not chunk_amounts
+                  else ("The smallest chunk this target implies is"
+                        if len(chunk_amounts) != n_chunks
+                        else "The smallest quoted chunk is"))
         print(f"  [*] Arrival gate tightened to {floor_} XMR, above what the "
               f"{args.swap_tolerance * 100:.0f}% slippage tolerance alone "
               f"would allow. {_basis} worth less than that tolerance, so at "
@@ -5674,6 +5827,12 @@ def stage4_await_swap(args, rpc, entry_pair_list: list,
                   f"they were not, the smallest one may be smaller than this "
                   f"gate allows for — pass --pairs, or check the arrival "
                   f"yourself before the run plans.")
+        elif len(chunk_amounts) != n_chunks:
+            print(f"      {n_chunks - len(chunk_amounts)} of your {n_chunks} "
+                  f"swaps carried no readable quote, so their size is inferred "
+                  f"from the others rather than read. If one of those is the "
+                  f"smallest, this gate may be looser than it looks — check "
+                  f"that swap's arrival yourself before the run plans.")
         integrity_log("stage4", "arrival_gate_tightened_for_smallest_chunk")
     # NO CHUNK COUNT, NO GUARANTEE. In manual mode swap_deposits is empty, so
     # n_chunks falls back to --split -- which is 1 by default and does nothing

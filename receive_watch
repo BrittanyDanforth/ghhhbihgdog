@@ -967,6 +967,11 @@ def main():
     # the NameError class that shipped three always-fatal defects in
     # this toolchain past a fully green suite.
     _chunk_amounts: list = []
+    # Bound here for the same reason as _chunk_amounts above: it is read by the
+    # gate report below on every path and set on one. True means the breakdown
+    # the gate is keyed on does not cover every swap in the target, so the
+    # "smallest chunk" it found is an inference and not a reading.
+    _shape_partial = False
     if args.pairs:
         try:
             allp = load_pairs(args.pairs)
@@ -980,19 +985,96 @@ def main():
                 f"    Watching it would wait for a payment that is going somewhere else.")
         target, _unreadable, _chunk_amounts = sum_quoted_xmr(matched)
         if _unreadable:
+            # BOTH SENTENCES BELOW ARE ABOUT A TARGET --expect-xmr MAY BE ABOUT
+            # TO REPLACE. "they contribute NOTHING to the target" and "the
+            # target below is built from N pair(s) only" are true of the quoted
+            # sum and false of an operator-supplied total, which covers every
+            # swap including the ones whose quote could not be read. Printed
+            # unconditionally they told an operator who passed --expect-xmr
+            # that the watch would finish without the unreadable swaps -- the
+            # opposite of what the gate then did.
             print(f"  [!] {_unreadable} of {len(matched)} swap pair(s) carry no "
-                  f"readable expected_xmr, so they contribute NOTHING to the "
-                  f"target.")
-            print(f"  [!] The target below is built from {len(matched) - _unreadable} "
-                  f"pair(s) only — the watch will report success once THOSE have "
-                  f"landed, even if the others never do.")
+                  f"readable expected_xmr.")
+            if args.expect_xmr is None:
+                print(f"  [!] They contribute NOTHING to the target: it is "
+                      f"built from {len(matched) - _unreadable} pair(s) only, "
+                      f"so the watch will report success once THOSE have "
+                      f"landed, even if the others never do.")
+            else:
+                print(f"  [!] Your --expect-xmr total covers all {len(matched)} "
+                      f"of them, so the gate below sizes the unreadable one(s) "
+                      f"from the quotes it could read rather than from a quote "
+                      f"of their own.")
             integrity_log("recv", f"quotes_unreadable:{_unreadable}_of_{len(matched)}")
     if args.expect_xmr is not None:
-        # An explicit total replaces the quotes, so it replaces the per-chunk
-        # breakdown too: there is no way to know how the operator's swaps were
-        # sized.
+        # AN EXPLICIT TOTAL REPLACES THE TOTAL. It does not replace the SHAPE,
+        # and this line used to throw the shape away with the comment "there is
+        # no way to know how the operator's swaps were sized" -- which is true
+        # only when there are no quotes to read. With --pairs there are: the
+        # per-chunk amounts came out of the pairs file two branches up, and
+        # --expect-xmr's own --help says it "overrides the total from --pairs",
+        # not the pairs.
+        #
+        # What the discard costs is the guard swap_arrival_floor exists for.
+        # Without a breakdown that function assumes EQUAL chunks (total/N) --
+        # the assumption its own docstring names as the one the JoinMarket
+        # path breaks, "arbitrarily unequal ... quotes of 0.50/0.30/0.15/0.05".
+        # REPRODUCED on exactly that shape, 10% tolerance:
+        #
+        #   --pairs alone                     floor 0.950000000001  (tightened)
+        #   --pairs --expect-xmr 1            floor 0.9
+        #
+        # Same four swaps, same total, and the second one reports PAID on the
+        # 0.95 XMR that arrives with the 0.05 chunk entirely missing. The
+        # operator did not lower the target -- they restated it -- and the gate
+        # that had been protecting the smallest swap silently stopped.
+        #
+        # It is not a combination an operator has to go looking for either:
+        # --expect-xmr's help steers them to GS_EXPECT_XMR in the environment,
+        # which is exactly the kind of value that survives in a shell and
+        # weakens the NEXT run's gate without appearing on its command line.
+        #
+        # RESCALED, not reused as-is. The override means the same swaps landed
+        # somewhere other than their quote -- slippage, a re-quote, an operator
+        # who knows better -- so the proportions are what carries over and the
+        # magnitudes do not. Keying on a 0.05 chunk of a 1.00 quote while
+        # waiting for 2.00 would guard the wrong amount.
+        #
+        # THE SAME ANSWER GhostSpiral's stage4_await_swap ALREADY GIVES, line
+        # for line -- `if _quoted_sum > 0 and chunk_amounts` around the same
+        # scale. These two are the pipeline's two arrival gates and this file
+        # has already paid for them drifting once: sum_quoted_xmr's own
+        # docstring records that swap_expected_total and expected_total "were
+        # the same function written twice; a fix to the first left the second
+        # holding every defect it started with". This was that again, one
+        # branch further in -- GhostSpiral got the rescale and receive_watch
+        # kept the discard.
+        #
+        # A PARTIAL SHAPE IS STILL SCALED, and that was the harder call.
+        # sum_quoted_xmr returns amounts for the READABLE quotes only, so with
+        # an unreadable one the list covers 3 of 4 swaps while --expect-xmr
+        # covers all 4, and scaling the part onto the whole inflates every
+        # known chunk -- which raises the assumed smallest and LOWERS the
+        # guard. The first version of this refused to scale there for exactly
+        # that reason.
+        #
+        # Measured instead of argued: 4000 random shapes, 2-8 swaps, 1 to N-1
+        # quotes unreadable, override 80-120% of the true total. The partial
+        # rescale opened a gate the count-only fallback would have held ZERO
+        # times. It is not the looser answer, and refusing it would have been a
+        # second answer to a question the sibling already answers.
+        #
+        # What the partial case DOES cost is the right to call the result
+        # measured, and the tightening message below says which of the two it
+        # is rather than asserting a smallest chunk nothing here read.
+        _quoted_sum = sum(_chunk_amounts, Decimal(0))
+        _shape_partial = len(_chunk_amounts) != len(matched)
+        if _chunk_amounts and _quoted_sum > 0:
+            _chunk_amounts = [c * args.expect_xmr / _quoted_sum
+                              for c in _chunk_amounts]
+        else:
+            _chunk_amounts = []
         target = args.expect_xmr
-        _chunk_amounts = []
     if args.any:
         target = Decimal(0)
         _chunk_amounts = []
@@ -1016,9 +1098,11 @@ def main():
     # That is worse here than there. GhostSpiral's gate decides what a run
     # plans against; this one is what TELLS THE OPERATOR the money has landed.
     # THE COUNT IS ALREADY KNOWN, AND IT WAS BEING THROWN AWAY. `chunks` fell
-    # back to 1 whenever the per-chunk breakdown was empty -- which is exactly
-    # what --expect-xmr does, three lines up, by design ("an explicit total
-    # replaces the quotes, so it replaces the per-chunk breakdown too").
+    # back to 1 whenever the per-chunk breakdown was empty -- which is what
+    # --expect-xmr used to do unconditionally. It now rescales the breakdown
+    # instead of discarding it (see the block above), so this fallback is
+    # reached only where there genuinely is no shape: --expect-xmr with no
+    # --pairs, or with a quote in the set that could not be read.
     #
     # With chunks=1 the second term of the floor collapses to a piconero and
     # the slippage tolerance stands alone, so the gate opens at
@@ -1036,21 +1120,65 @@ def main():
         target, args.tolerance, _chunk_amounts,
         len(_chunk_amounts) or len(matched) or 1)
     if _tightened:
+        # WHICH SMALLEST. "The smallest quoted chunk" is a measured fact only
+        # when every swap in the target was quoted readably. With --expect-xmr
+        # covering a swap whose quote could not be read, the breakdown scaled
+        # onto that total covers the others and INFERS this one -- so the
+        # sentence stays true about arithmetic and stops claiming a reading.
+        # GhostSpiral's copy of this line already draws the same distinction
+        # for its count-only case ("Split equally, each of the N chunks would
+        # be"); this is the third case neither of them named.
+        _basis = ("the smallest chunk this target implies is"
+                  if _shape_partial else "the smallest quoted chunk is")
         print(f"  [*] Arrival gate tightened to {fmt(floor_)} XMR, above what "
               f"the {args.tolerance * 100:.0f}% tolerance alone would allow: "
-              f"the smallest quoted chunk is worth less than that tolerance, "
+              f"{_basis} worth less than that tolerance, "
               f"so at the wider figure it could be missing entirely and this "
               f"watch would still report PAID.")
+        if _shape_partial:
+            # COUNTED, not spelled "One". Two unreadable quotes are as ordinary
+            # as one, and `_unreadable` is bound only inside the --pairs branch
+            # -- referencing it here would be the conditionally-bound local this
+            # file's own comment above _chunk_amounts calls "the NameError class
+            # that shipped three always-fatal defects in this toolchain past a
+            # fully green suite". The two lists in hand give the same number.
+            _inferred = len(matched) - len(_chunk_amounts)
+            print(f"      {_inferred} of the {len(matched)} swaps carried no "
+                  f"readable quote, so "
+                  f"{'its size is' if _inferred == 1 else 'their sizes are'} "
+                  f"inferred from the others rather than read. If the smallest "
+                  f"swap is one of "
+                  f"{'them' if _inferred > 1 else 'those'}, this gate may be "
+                  f"looser than it looks — check that arrival yourself.")
         integrity_log("recv", "arrival_gate_tightened_for_smallest_chunk")
-    elif target > 0 and not _chunk_amounts:
-        # --expect-xmr with no --pairs: a total and no idea how many swaps
-        # make it up, so a missing one is undetectable. Say so.
+    elif target > 0 and not _chunk_amounts and not matched:
+        # A total and no idea how many swaps make it up, so a missing one is
+        # undetectable. Say so.
         print(f"  [!] The number of swaps behind this target is UNKNOWN "
               f"(--expect-xmr without --pairs), so this watch can only check "
               f"the TOTAL: any single swap worth less than "
               f"{args.tolerance * 100:.0f}% of it could be missing and still "
               f"count as paid.")
         integrity_log("recv", "arrival_chunk_count_unknown")
+    elif target > 0 and not _chunk_amounts:
+        # THE COUNT IS KNOWN AND THE SHAPE IS NOT, which is a different
+        # statement and used to print the one above -- "(--expect-xmr without
+        # --pairs)" on a run that passed --pairs. Reached when --expect-xmr
+        # supplies the total and NOT ONE quote in the matched set could be
+        # read, so there is no breakdown to scale onto it. A partially readable
+        # set takes the rescale instead, and says so in the gate line.
+        #
+        # Worth its own line rather than silence: EQUAL CHUNKS IS AN
+        # ASSUMPTION, and swap_arrival_floor's docstring names the two shipped
+        # paths that break it. Under it, a swap smaller than its equal share
+        # can be missing and still clear the gate.
+        print(f"  [!] The {len(matched)} swap(s) behind this target are assumed "
+              f"EQUAL: none of them carried a readable quote, so there is no "
+              f"per-swap breakdown to size the gate against. If they are not "
+              f"equal, one worth less than "
+              f"{fmt(target / Decimal(len(matched)))} XMR could be missing and "
+              f"still count as paid.")
+        integrity_log("recv", "arrival_chunk_shape_assumed_equal")
 
     if args.min_arrival is not None and args.min_arrival < 0:
         sys.exit("[!] --min-arrival cannot be negative.")

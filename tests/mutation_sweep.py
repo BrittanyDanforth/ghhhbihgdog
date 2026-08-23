@@ -1525,6 +1525,117 @@ MUTATIONS = [
   "    def close_request(self, request):",
   "    def _unused_close_request(self, request):",
   ["test_listed_bugs"]),
+
+ # ---- the last two off that same list ----------------------------------
+
+ # A fan-out output is spent TWICE -- the DAG round sweeps it onward, the exit
+ # sweeps that subaddress to the operator -- and min_hop_fundable reserves one
+ # fee. This restores the floor that hopped and then could not pay to leave.
+ ("the fan-out floor goes back to reserving the hop and not the exit sweep",
+  "GhostSpiral",
+  "    min_each = min_exit_fundable(fee_xmr, dag_enabled)",
+  "    min_each = (min_hop_fundable(fee_xmr) if dag_enabled\n"
+  "                else (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP))",
+  ["test_listed_bugs"]),
+
+ # The predicate itself, not just the caller: doubling the reserve is what
+ # makes the floor cover the second sweep, so halving it back is the defect
+ # with the call site left intact.
+ ("the exit-fundability predicate goes back to counting one sweep",
+  "GhostSpiral",
+  "    after_hop = (compute_hop_amount(fanout_amt, fee_xmr) if dag_enabled\n"
+  "                 else fanout_amt)\n"
+  "    return compute_hop_amount(after_hop, fee_xmr) > DUST_XMR",
+  "    return compute_hop_amount(fanout_amt, fee_xmr) > DUST_XMR",
+  ["test_listed_bugs"]),
+
+ # The DAG-OFF branch reserved nothing for the exit at all, and it is where
+ # main() SENDS an operator whose fan-out was refused ("disable --dag-mixing").
+ #
+ # RE-ANCHORED. This first appended the old expression AFTER the closed form,
+ # and SURVIVED -- because the next line was `amt = max(amt,
+ # min_hop_fundable(fee_xmr))`, which put it straight back. The dag-off floor
+ # and min_hop_fundable are the same inversion, equal at all 2000 fees
+ # measured, so the max() was doing the whole job and the mutation changed
+ # nothing. That max() is gone now (see min_exit_fundable: it never fired at
+ # any fee, on either branch, which is what an equivalent mutant looks like),
+ # so this anchor replaces the closed form outright and the defect is real.
+ ("the DAG-off floor goes back to a bare dust margin the exit cannot sweep",
+  "GhostSpiral",
+  "    amt = (hop_fee_reserve(fee_xmr) * (2 if dag_enabled else 1)\n"
+  "           + DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP)",
+  "    amt = (hop_fee_reserve(fee_xmr) * 2\n"
+  "           + DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP)\n"
+  "    if not dag_enabled:\n"
+  "        amt = (DUST_XMR * 2).quantize(DUST_XMR, rounding=ROUND_UP)",
+  ["test_listed_bugs"]),
+
+ # NO ANCHOR FOR "the exit floor may drop below the hop floor". There was one,
+ # against `amt = max(amt, min_hop_fundable(fee_xmr))`, and it SURVIVED: the
+ # closed form is at or above min_hop_fundable at every fee on both branches,
+ # so the max() could not change an answer. The line is deleted rather than
+ # anchored -- the same call compute_fanout_amounts' staircase guard got -- and
+ # the relationship is checked directly in test_units, where it CAN fail.
+
+ # --expect-xmr overrides the TOTAL. Discarding the breakdown with it drops
+ # swap_arrival_floor back to assuming equal chunks, which is the assumption
+ # its own docstring names as the one the JoinMarket path breaks.
+ ("--expect-xmr goes back to discarding the per-chunk breakdown",
+  "receive_watch",
+  "            _chunk_amounts = [c * args.expect_xmr / _quoted_sum\n"
+  "                              for c in _chunk_amounts]",
+  "            _chunk_amounts = []",
+  ["test_listed_bugs"]),
+
+ # RE-ANCHORED. This first read "an incomplete breakdown is rescaled onto the
+ # override anyway", against a completeness guard that refused to scale a
+ # partial shape. The guard is gone: measured over 4000 random shapes the
+ # partial rescale never opened a gate the count-only fallback would have held,
+ # and refusing it was a SECOND answer to a question GhostSpiral's copy of this
+ # gate already answers -- the drift sum_quoted_xmr's docstring exists to stop.
+ #
+ # What survived the guard is the honesty of the report: with a partial shape
+ # the "smallest chunk" is inferred, not read, and the line used to claim
+ # otherwise. That is what is anchored now.
+ ("the gate goes back to calling an INFERRED smallest chunk a quoted one",
+  "receive_watch",
+  '        _basis = ("the smallest chunk this target implies is"\n'
+  '                  if _shape_partial else "the smallest quoted chunk is")',
+  '        _basis = "the smallest quoted chunk is"',
+  ["test_listed_bugs"]),
+
+ # The same distinction in GhostSpiral's copy of the gate, which had it for the
+ # count-only case and not for the partial-shape one -- so it printed "The
+ # smallest quoted chunk is" about a set that does not cover every swap in the
+ # target. Measured: 1007 of 4000 random shapes with an unreadable quote.
+ ("GhostSpiral's gate goes back to calling an inferred chunk a quoted one",
+  "GhostSpiral",
+  '        _basis = (f"Split equally, each of the {n_chunks} chunks would be"\n'
+  "                  if not chunk_amounts\n"
+  '                  else ("The smallest chunk this target implies is"\n'
+  "                        if len(chunk_amounts) != n_chunks\n"
+  '                        else "The smallest quoted chunk is"))',
+  '        _basis = ("The smallest quoted chunk is" if chunk_amounts\n'
+  '                  else f"Split equally, each of the {n_chunks} chunks would be")',
+  ["test_listed_bugs"]),
+
+ # "They contribute NOTHING to the target" and "the target below is built from
+ # N pair(s) only" are true of the QUOTED sum and false of --expect-xmr, which
+ # covers every swap. Printed unconditionally they told an operator the watch
+ # would finish without the unreadable swaps -- the opposite of what it does.
+ ("the unreadable-quote note goes back to describing a replaced target",
+  "receive_watch",
+  "            if args.expect_xmr is None:",
+  "            if True:",
+  ["test_listed_bugs"]),
+
+ # It told an operator who passed --pairs that they had not. The count IS
+ # known there; only the shape is missing, and those are different warnings.
+ ("the gate goes back to saying 'without --pairs' on a run that passed them",
+  "receive_watch",
+  "    elif target > 0 and not _chunk_amounts and not matched:",
+  "    elif target > 0 and not _chunk_amounts:",
+  ["test_listed_bugs"]),
 ]
 
 

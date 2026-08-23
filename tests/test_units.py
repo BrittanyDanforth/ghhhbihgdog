@@ -2787,10 +2787,40 @@ for _fb in ("0.2", "0.5", "1", "2", "5", "12"):
                 _unf += 1
 check(f"hop floor: no fan-out draw produces an output the hop round calls "
       f"unfundable ({_unf} of {_drawn} draws)", _drawn > 0 and _unf == 0)
+# RE-ANCHORED. The second half named the fan-out's floor EXPRESSION, and that
+# expression changed: min_hop_fundable reserved the hop and nothing for the
+# exit sweep that spends the output afterwards, so the floor is now
+# min_exit_fundable (see test_listed_bugs, defect 5). What this check is FOR is
+# unchanged -- both call sites ask a shared predicate instead of spelling out
+# an inequality of their own, which is what let them drift by a tick before --
+# so it is re-anchored on the current names rather than deleted.
 check("hop floor: build_dag_plan asks the shared predicate, not its own "
       "inequality",
       "if not hop_is_fundable(fanout_by_addr[s], fee_xmr):" in _pf_src2
-      and "min_each = (min_hop_fundable(fee_xmr) if dag_enabled" in _pf_src2)
+      and "min_each = min_exit_fundable(fee_xmr, dag_enabled)" in _pf_src2)
+# ...and the two floors stay tied: the fan-out's can never sit BELOW the one
+# build_dag_plan gates on, or the one-tick disagreement comes straight back.
+#
+# CHECKED HERE BECAUSE IT CANNOT BE CHECKED IN THE CODE. min_exit_fundable used
+# to end with `amt = max(amt, min_hop_fundable(fee_xmr))` for exactly this, and
+# a mutation deleting that max SURVIVED the whole suite -- it never fires,
+# because the two are the same inversion with the reserve doubled on one
+# branch. The line is gone; this is what replaced it, and unlike the max it
+# goes RED and says so if either inversion ever moves.
+_mx_bad = [(str(Decimal(_i) * Decimal("0.0001")), _dg)
+           for _i in range(1, 2001) for _dg in (True, False)
+           if ghost.min_exit_fundable(Decimal(_i) * Decimal("0.0001"), _dg)
+           < ghost.min_hop_fundable(Decimal(_i) * Decimal("0.0001"))]
+check(f"hop floor: the fan-out floor is never below the hop floor, over 2000 "
+      f"fees on both branches ({len(_mx_bad)} violations)", not _mx_bad)
+# NON-VACUITY: the two are not the same number everywhere, so the check above
+# is comparing something. With the DAG round on the fan-out floor is strictly
+# higher -- that IS the fix -- and with it off they coincide by construction.
+check("NON-VACUITY: with --dag-mixing the fan-out floor is strictly ABOVE the "
+      "hop floor (the extra reserve is the exit sweep)",
+      all(ghost.min_exit_fundable(Decimal(_i) * Decimal("0.0001"), True)
+          > ghost.min_hop_fundable(Decimal(_i) * Decimal("0.0001"))
+          for _i in range(1, 201)))
 # The closed form in min_hop_fundable is an INVERSION of compute_hop_amount,
 # and an inversion is a copy -- the copy this replaced drifted by one tick. The
 # re-check makes them agree by construction; it is correct today, so no fee
