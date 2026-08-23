@@ -10,10 +10,26 @@ WHAT THIS IS ALLOWED TO DO, taken from the design it has to fit rather than
 invented here:
 
   * §8: "Do not 'just run a Telegram bot' that prints the memo — that throws
-    away the only reason to have a Pi." So this NEVER sends an address, a
-    memo, a slip or an amount to a chat. The most it ever says is which job
-    finished and a 4-hex handle, which is exactly what §5 step 5 describes:
-    "Telegram gets `depo ready · slip A3F1`".
+    away the only reason to have a Pi." By DEFAULT this sends no address, no
+    memo, no slip and no amount: the most it says is which job finished and a
+    4-hex handle, exactly as §5 step 5 describes — "Telegram gets `depo ready
+    · slip A3F1`".
+
+    WHAT THIS PARAGRAPH USED TO CLAIM WITHOUT QUALIFICATION, and no longer
+    can: that nothing readable is EVER sent here. The vault's own keyfile can
+    now say otherwise, because "read it on the vault" is not an OPSEC property
+    for an operator who cannot reach the vault — it is a quoted swap they have
+    no way to pay. Three modes, and this box picks NONE of them:
+
+        neither field set     a handle. What §8 describes, and the default.
+        delivery_public       a sealed blob only gs_unseal can open.
+        plain_slip            the deposit address and memo, in the clear.
+
+    The choice lives in the VAULT's keyfile and nowhere else, so a stolen bot
+    token or a compromised Pi cannot ask for plaintext — changing it means
+    standing at the vault. What plaintext costs, including the part that is
+    about money rather than privacy, is argued in gs_wake_proto's "THE
+    PLAINTEXT SLIP". Read it before turning it on.
   * §8: "The only acceptable remote trigger is inbound over Tor to a Pi onion
     service: no port forward, and no WAN path to WOL." Long-polling satisfies
     that constraint more simply than an onion service does: the Pi makes an
@@ -112,12 +128,16 @@ HELP = (
     "GhostSpiral pager\n"
     "/recv [n]   mint n receive subaddresses (1-4, default 1)\n"
     "/depo <s>   quote a swap to ladder slot s (0-7)\n"
-    "/watch <h>  watch handle h (4 hex)\n"
+    "/check <h>  has my payment arrived? (~5 min, then it powers off)\n"
+    "/watch <h>  wait up to 110 min for it (blocks everything else)\n"
     "/status     counters only\n"
     "\n"
-    "Nothing readable is ever sent here. A quoted swap comes back as a "
-    "SEALED slip — ciphertext this box has no key for. Open it with "
-    "gs_unseal on the machine you send the BTC from."
+    "WHAT COMES BACK depends on the VAULT's keyfile, not on this box:\n"
+    "nothing readable, a SEALED slip for gs_unseal, or the deposit\n"
+    "address and memo in the clear.\n"
+    "\n"
+    "The memo needs an OP_RETURN. No phone wallet can do that —\n"
+    "use Electrum or Sparrow on a desktop. Any desktop; not the vault."
 )
 
 
@@ -304,6 +324,10 @@ def parse_command(text: str) -> tuple:
         if not HANDLE_RE.match(arg):
             return "", {}, "handle must be 4 hex characters"
         return "watch", {"handle": arg.upper()}, ""
+    if cmd == "/check":
+        if not HANDLE_RE.match(arg):
+            return "", {}, "handle must be 4 hex characters"
+        return "swap_status", {"handle": arg.upper()}, ""
     return "", {}, "unknown command"
 
 
@@ -397,6 +421,39 @@ class Pager:
             res = pending.result or {}
             h = res.get("handle") or "----"
             slip = res.get("slip") or ""
+            plain = res.get("plain") or {}
+            phase = res.get("phase") or ""
+            if phase:
+                # A STATUS PROBE ANSWERS IN ONE SENTENCE and says nothing else.
+                # The sentence comes from the protocol's own table so this box
+                # cannot invent a reassurance, and the word it renders was
+                # checked against a closed set by the doorbell before it got
+                # here.
+                self.send(chat_id, f"{h}: {proto.PHASE_LINES.get(phase, phase)}")
+                return
+            if plain:
+                # THE DEPOSIT INSTRUCTIONS, IN THE CLEAR, because the operator's
+                # own vault keyfile asked for it. gs_wake_proto's "THE PLAINTEXT
+                # SLIP" is where that trade is argued; this branch only renders
+                # it. Two messages: the memo must be copied alone (see below).
+                lines = proto.plain_lines(plain)
+                body, memo = lines[:-1], lines[-1]
+                self.send(chat_id, f"{job} ready · slip {h}\n\n"
+                                   + "\n".join(body).rstrip())
+                # THE MEMO ALONE IN ITS OWN MESSAGE. Tap-and-hold copies a
+                # WHOLE Telegram message, and this string has to reach a wallet
+                # character-for-character or ThorChain cannot route the swap
+                # and the money is stranded. Anything sharing the message would
+                # be pasted with it.
+                if not self.send(chat_id, memo):
+                    time.sleep(SLIP_RETRY_S)
+                    if not self.send(chat_id, memo):
+                        integrity_log("pager", "memo_undelivered")
+                        self.send(chat_id,
+                                  f"The MEMO did not get through, twice. Do "
+                                  f"NOT send the BTC without it — it would be "
+                                  f"unroutable. Poke /depo again.")
+                return
             if not slip:
                 # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
                 # this is still the original vocabulary: §5 step 5, "Telegram

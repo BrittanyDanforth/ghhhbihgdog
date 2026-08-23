@@ -321,11 +321,17 @@ check("an unknown path is refused", b.post("/nope", b"x" * P.RECORD_LEN)[0] == 4
 
 
 print("\n== the result ==")
-def m3(status, handle, job_id=None, chall=None):
-    return P.seal(TP, PI.public_key, P.TAG_M3,
-                  {"job_id": job_id or b.pending.job_id,
-                   "challenge": (chall or chal).hex(),
-                   "status": status, "handle": handle})
+def m3(status, handle, job_id=None, chall=None, **over):
+    # THE FULL KEY SET, because on_m3 now enforces one. A result that is
+    # missing a field this protocol version defines means the vault and the Pi
+    # are on different versions, and the whole point of the check is that such
+    # a record is refused loudly rather than half-read.
+    body = {"job_id": job_id or b.pending.job_id,
+            "challenge": (chall or chal).hex(),
+            "status": status, "handle": handle,
+            "slip": "", "plain": {}, "phase": ""}
+    body.update(over)
+    return P.seal(TP, PI.public_key, P.TAG_M3, body)
 
 
 check("a 60-character 'handle' is refused — the doorbell may learn a label, "
@@ -341,7 +347,42 @@ check("a result for a different job is refused",
 check("a well-formed result is accepted",
       b.post("/result", m3("done", "A3F1"))[0] == 200
       and b.pending.result == {"status": "done", "handle": "A3F1",
-                               "slip": ""})
+                               "slip": "", "plain": {}, "phase": ""})
+# A HALF-UPGRADED PAIR MUST FAIL LOUDLY, NOT QUIETLY DROP THE PAYLOAD.
+# gs_wake_proto's header promises a version mismatch is caught before any
+# crypto and is "impossible to misread". That was true of a PAD_BLOCK change
+# and false of a field addition: every field was read with .get() and no key
+# set was enforced, so a vault running ahead of its Pi would send deposit
+# instructions and this box would silently drop them.
+#
+# ON A FRESH DOORBELL, and with a GENUINELY old-shaped record. Both halves of
+# that were wrong in the first version and the mutation sweep caught it: posted
+# to a bell that had already recorded a result it was refused by the
+# at-most-one rule instead, and a later bulk edit "fixed" the fixture by adding
+# the very fields whose absence was the point. Deleting the key-set check left
+# the suite green.
+_bs = Bell()
+_bs.post("/wake", m1_for(eph, chal, _bs.pending.window))
+_stale = P.seal(TP, PI.public_key, P.TAG_M3,
+                {"job_id": _bs.pending.job_id, "challenge": chal.hex(),
+                 "status": "done", "handle": "BEEF"})
+check("an M3 from an older protocol version is REFUSED, not half-read",
+      _bs.post("/result", _stale)[0] == 204 and _bs.pending.result is None)
+check("...NON-VACUITY: the same record with this version's fields IS accepted, "
+      "so the refusal is about the key set and nothing else",
+      _bs.post("/result", P.seal(
+          TP, PI.public_key, P.TAG_M3,
+          {"job_id": _bs.pending.job_id, "challenge": chal.hex(),
+           "status": "done", "handle": "BEEF",
+           "slip": "", "plain": {}, "phase": ""}))[0] == 200)
+check("...and an M3 with an EXTRA field is refused too — a Pi running behind "
+      "its vault must not half-read a record either",
+      Bell().post("/result", P.seal(
+          TP, PI.public_key, P.TAG_M3,
+          {"job_id": "0" * 32, "challenge": chal.hex(), "status": "done",
+           "handle": "BEEF", "slip": "", "plain": {}, "phase": "",
+           "from_the_future": "x"}))[0] == 204)
+_bs.close()
 check("a SECOND result is refused — the outcome the operator sees must not "
       "depend on which note arrived last",
       b.post("/result", m3("failed", ""))[0] == 204
@@ -357,7 +398,8 @@ check("a failed/refused result may carry no handle, because there is nothing "
                                     {"job_id": b2.pending.job_id,
                                      "challenge": chal.hex(),
                                      "status": "failed",
-                                     "handle": ""}))[0] == 200)
+                                     "handle": "", "slip": "",
+                                     "plain": {}, "phase": ""}))[0] == 200)
 check("...and reports as failed", b2.pending.outcome() == "failed")
 b2.close()
 
@@ -470,7 +512,8 @@ try:
     b5.post("/result", P.seal(TP, PI.public_key, P.TAG_M3,
                               {"job_id": b5.pending.job_id,
                                "challenge": chal.hex(),
-                               "status": "done", "handle": "BEEF"}))
+                               "status": "done", "handle": "BEEF",
+                               "slip": "", "plain": {}, "phase": ""}))
     b5.close()
     after = sorted(os.listdir("."))
 finally:
@@ -524,7 +567,8 @@ er3eph, er3ch = NP.PrivateKey.generate(), P.new_challenge()
 er3.post("/wake", m1_for(er3eph, er3ch, er3.pending.window))
 _good = P.seal(TP, PI.public_key, P.TAG_M3,
                {"job_id": er3.pending.job_id, "challenge": er3ch.hex(),
-                "status": "done", "handle": "BEEF"})
+                "status": "done", "handle": "BEEF",
+                "slip": "", "plain": {}, "phase": ""})
 _st_a = er3.post("/result", _good)[0]
 _st_b = er3.post("/result", _good)[0]
 _st_c = er3.post("/result", b"\x00" * P.RECORD_LEN)[0]

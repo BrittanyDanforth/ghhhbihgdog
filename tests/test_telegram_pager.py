@@ -329,7 +329,12 @@ def _vault(handle):
     time.sleep(0.2)
     post("/result", P.seal(_TP, _PI.public_key, P.TAG_M3,
                            {"job_id": pend.job_id, "status": "done",
-                            "handle": handle}))
+                            "handle": handle, "challenge": "",
+                            # THE DEFAULT VAULT: no delivery key, no
+                            # plain_slip. Empty is the configuration §8
+                            # describes, and it is what this end-to-end case
+                            # exists to hold the line on.
+                            "slip": "", "plain": {}, "phase": ""}))
 
 
 _sent.clear()

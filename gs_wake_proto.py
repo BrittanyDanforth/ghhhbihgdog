@@ -214,6 +214,86 @@ if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
         "length-checks every inbound slip against SLIP_B64_LEN — so the "
         "mismatch would present as every slip being rejected as malformed.")
 
+# ---------------------------------------------------------------------------
+#  THE PLAINTEXT SLIP, AND WHY IT EXISTS ALONGSIDE THE SEALED ONE
+#
+#  The sealed slip solved "the operator cannot walk to the vault" by moving the
+#  payload to a THIRD machine holding a delivery key. That assumed a third
+#  machine. An operator with only a phone has none, and told us so.
+#
+#  So there is a second mode: the vault puts the deposit instructions in M3 in
+#  the clear, the Pi relays them to the chat, and the operator reads them on
+#  their phone. The wire itself is unchanged -- M3 is still boxed between the
+#  vault and the Pi, so nothing on the LAN sees this -- but the Pi sees it in
+#  RAM and Telegram keeps a copy for ever.
+#
+#  WHAT THIS COSTS, AND IT IS NOT ONLY PRIVACY.
+#
+#  The privacy half is the smaller half. The ThorChain deposit address is a
+#  SHARED pooled inbound vault (thor_swap_preparer says so) and the destination
+#  is a one-shot Monero account minted inside the same job, so the transcript
+#  is not publishing a long-lived identity. The real privacy loss is
+#  ATTRIBUTION -- a SIM-bound account and a phone are now tied to a swap -- and
+#  ARCHIVE, a searchable server-side ledger of every run that paranoia_mode
+#  cannot reach.
+#
+#  THE MONEY HALF IS WORSE AND MUST BE READ BEFORE TURNING THIS ON. Because
+#  the deposit address is shared, the memo is the ENTIRE binding between the
+#  operator's Bitcoin and their Monero. The sealed slip was AUTHENTICATED:
+#  gs_unseal refuses anything the vault did not seal. This is not. Whoever
+#  holds the bot token can leave the deposit line correct, substitute their own
+#  address into the memo, and the operator's BTC becomes their XMR,
+#  irreversibly.
+#
+#  That is not fixable here and this comment will not pretend otherwise. A
+#  human cannot verify a 111-character memo by eye, and every scheme that looks
+#  like it helps -- a one-time code sheet, an HMAC, echoing the memo back for
+#  confirmation -- fails against the same attacker, because someone holding the
+#  token IS the bot as far as the phone can tell: they can suppress the real
+#  message and send theirs first. The mitigation is the token, and only the
+#  token.
+#
+#  So: OFF unless the vault's own keyfile turns it on, which needs physical
+#  access to the vault. A compromised Pi cannot ask for plaintext.
+# ---------------------------------------------------------------------------
+
+#: The ONLY fields a plaintext slip may carry, and the length each may have.
+#:
+#: An allowlist with bounds, not "whatever the pair record holds", for the same
+#: reason the sealed slip has one: the pair is written by another tool and the
+#: next field somebody adds there must not ride along into a chat window.
+#: The bounds are generous enough for a 106-character integrated Monero
+#: address and a taproot deposit address, and tight enough that no field can
+#: become a channel.
+PLAIN_FIELDS = {
+    "b": 24,      # btc_in, as a decimal string
+    "d": 100,     # the ThorChain inbound deposit address
+    "m": 220,     # the swap memo
+    "x": 32,      # expected_xmr
+    "h": 4,       # the handle
+}
+#: dest_xmr is DELIBERATELY ABSENT. The sealed slip carries it so gs_unseal can
+#: re-check memo_binds_destination on a second machine. A phone cannot run that
+#: check, so the field would be a second copy of the destination in the
+#: transcript buying nothing. `ts` is absent for the same reason: the operator
+#: reads the message's own timestamp.
+
+#: The one word an M3 may carry about how a swap is going.
+#:
+#: A CLOSED SET, not free text, and that is the whole design. The operator
+#: needs "has my money arrived?" answered on their phone; the vault must not
+#: gain a free-text channel to the Pi and onward to Telegram while answering
+#: it. Each word maps to one fixed sentence on the pager side.
+#:
+#:   ""         nothing to say (every job that is not a status probe)
+#:   not_yet    the address is empty. Normal. This is NOT a failure, and
+#:              reporting it as one is the defect this vocabulary exists for.
+#:   arriving   something landed and is still confirming
+#:   landed     at or over the expected amount, unlocked and spendable
+#:   short      money arrived, stopped growing, and is under what was quoted
+#:   stuck      the wallet is not scanning; says NOTHING about the money
+PHASES = ("", "not_yet", "arriving", "landed", "short", "stuck")
+
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
 #: The doorbell's per-window nonce. SIXTEEN, not thirty-two, and the reason is
@@ -568,6 +648,79 @@ def open_slip(recipient_secret, sender_public, blob: str) -> dict:
     if not hmac.compare_digest(inner[:TAG_LEN], TAG_SL):
         raise WakeError("that is not a slip — it is a different kind of record")
     return parse_body(inner[TAG_LEN:])
+
+
+def plain_slip_is_wellformed(obj) -> bool:
+    """Is this the right SHAPE for a plaintext slip? Nothing about correctness.
+
+    The doorbell relays this to a chat, so it checks what it can: an EXACT key
+    set (not a superset -- a field the Pi does not know about must not be
+    forwarded to Telegram unexamined), string values only, non-empty, within
+    the declared bound, and no control characters.
+
+    Control characters matter here more than anywhere else in this file: the
+    pager pastes these values into a message a human reads and copies into a
+    wallet, and a newline in the memo forges a line of it.
+    """
+    if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):
+        return False
+    for k, cap in PLAIN_FIELDS.items():
+        v = obj[k]
+        if not isinstance(v, str) or not v or len(v) > cap:
+            return False
+        if any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in v):
+            return False
+    return True
+
+
+def phase_is_known(word) -> bool:
+    """Is this one of the words this protocol has? Never a substring test."""
+    return isinstance(word, str) and word in PHASES
+
+
+#: One word -> one sentence, and the sentences live HERE, next to the
+#: vocabulary, for the same reason VAULT_JITTER_LO_S does: two boxes render
+#: this and they must not drift into disagreeing about what a word means.
+#:
+#: Every line says what is TRUE and what to do next. "not_yet" in particular
+#: is written to read as ordinary, because it is the answer the operator will
+#: get most often and the old code delivered it as "the vault ran it and it
+#: FAILED" while their money was simply still in flight.
+PHASE_LINES = {
+    "not_yet": "nothing on the address yet. Normal — ask again in a while.",
+    "arriving": "something arrived and is still confirming. Ask again shortly.",
+    "landed": "landed and spendable. The swap is done.",
+    "short": "money arrived but it is UNDER what was quoted, and it has "
+             "stopped growing. Check it on the vault before mixing.",
+    "stuck": "the vault's wallet is not scanning, so this says NOTHING about "
+             "your money. Check the vault.",
+}
+
+
+def plain_lines(plain: dict) -> list:
+    """The deposit instructions as lines a human reads and copies. No I/O.
+
+    Shared so the doorbell's terminal and the pager's chat message cannot
+    drift: an operator running the doorbell by hand must see exactly what the
+    chat would have shown, or the by-hand path stops being a way to check the
+    automated one.
+
+    THE MEMO IS ON ITS OWN LINE, LAST, AND UNDECORATED. It is the field that
+    has to be copied character-for-character into a wallet, and anything
+    wrapped around it -- a bullet, a trailing note, a closing bracket -- ends
+    up in the paste.
+    """
+    return [
+        f"Send exactly:  {plain.get('b', '')} BTC",
+        f"To address:    {plain.get('d', '')}",
+        f"Expected out:  ~{plain.get('x', '')} XMR",
+        f"Slip:          {plain.get('h', '')}",
+        "",
+        "The memo below MUST go in an OP_RETURN in the same transaction.",
+        "A payment without it is one ThorChain cannot route.",
+        "",
+        plain.get("m", ""),
+    ]
 
 
 def slip_is_wellformed(blob) -> bool:
@@ -1376,6 +1529,31 @@ JOBS = {
         "schema": {"handle": _handle_field},
         "tools": ("receive_watch",),
         "budget_s": 7200,
+    },
+    # LOOK ONCE, ANSWER IN ONE WORD, POWER OFF. The operator's question is
+    # "has my money arrived?" and `watch` answers it terribly:
+    #
+    #   * it holds the Pi's one-job lock for up to 9900 s -- 900 s pre-WOL
+    #     jitter + a 600 s fetch window + an 8400 s result budget -- so for the
+    #     better part of three hours every other command is refused with
+    #     "a wake is already running";
+    #   * it keeps the vault powered on, with its disk auto-unlocked, for over
+    #     two of those hours, which is the power and network signature the
+    #     whole design exists to avoid;
+    #   * and when the money has simply not arrived yet, receive_watch exits
+    #     non-zero and the chat is told the vault FAILED.
+    #
+    # A NEW JOB NAME rather than a parameter on `watch`, and that is forced
+    # rather than chosen: validate_job enforces an EXACT key set, so adding a
+    # `minutes` field to watch's schema would make a half-upgraded pair refuse
+    # every watch. A new name fails cleanly on an old vault instead -- "wake
+    # note names a job this machine does not run".
+    "swap_status": {
+        "schema": {"handle": _handle_field},
+        "tools": ("receive_watch",),
+        # Five minutes of looking. Long enough for the wallet to answer, short
+        # enough that the vault is off again before it is worth noticing.
+        "budget_s": 300,
     },
 }
 

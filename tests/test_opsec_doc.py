@@ -206,8 +206,36 @@ for _forbidden in ("dest_xmr", "deposit", "expected_xmr", "btc_in",
           f'"{_forbidden}"' not in _PAGER and f"'{_forbidden}'" not in _PAGER)
 check("the pager cannot name a destination: no job it sends takes one",
       "--exit-to" not in _PAGER and "--dest" not in _PAGER)
-check("the pager reports only a handle, and says where the address really is",
+# THE DEFAULT REPLY, which is what §5 step 5 describes and what an operator who
+# sets nothing gets. Named "by default" now rather than "only", because the
+# vault's keyfile can ask for more and the previous wording would have been a
+# confident lie the moment it did. The behavioural half -- that with plaintext
+# OFF no address, memo or amount reaches a chat on any outcome -- is driven in
+# tests/test_plain_slip.py and tests/test_telegram_pager.py.
+check("by default the pager reports a handle and says where the address is",
       "slip {h}" in _PAGER and "on the vault" in _PAGER)
+
+# THE THREE MODES: the doc's table and the code must name the same fields, and
+# the choice must live on the VAULT. A doc that offered a mode the code did not
+# have -- or a mode the Pi could switch on -- is exactly the drift this file
+# exists to catch.
+check("§1's table names the two keyfile fields that select a delivery mode",
+      "`delivery_public`" in DOC and "`plain_slip: true`" in DOC)
+_AGENT = src("gs_wake_agent")
+for _f in ("delivery_public", "plain_slip"):
+    check(f"...and the VAULT is what reads {_f}", f'"{_f}"' in _AGENT)
+    check(f"...and the PI never writes {_f}",
+          f'"{_f}"' not in _PAGER and f"'{_f}'" not in _PAGER)
+check("the two modes are mutually exclusive, refused where the operator is "
+      "standing", "delivery_mode_ambiguous" in _AGENT)
+check("the doc states the MONEY cost of plaintext, not only the privacy one",
+      "shared pooled vault" in DOC and "irreversibly" in DOC)
+check("...and that a phone still cannot attach an OP_RETURN, so the doc does "
+      "not promise a payment it cannot deliver",
+      "OP_RETURN" in DOC and "Sparrow" in DOC)
+check("...and kills the two lookalike workarounds by name, because both fail "
+      "SILENTLY and cost the money",
+      "message=" in DOC and "memoless" in DOC)
 check("the pager's token never has a CLI flag, since argv is world-readable",
       '"--token"' not in _PAGER and "--token-file" in _PAGER)
 check("the pager is fail-closed on Tor, as section 4 requires",
