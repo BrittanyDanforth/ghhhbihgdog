@@ -73,6 +73,7 @@ import json
 import os
 import re
 import sys
+import random
 import threading
 import time
 from pathlib import Path
@@ -114,6 +115,91 @@ MAX_POLL_FAILURES = 12
 #: -- and therefore the next poke -- for anything an operator would notice.
 SLIP_RETRY_S = 20
 
+# ---------------------------------------------------------------------------
+#  THE /depo WIZARD
+#
+#  `/depo 2` works and always will. This exists because "2" is a number an
+#  operator has to remember the meaning of, and the one command in this bot
+#  that spends the wake budget and quotes real money should not be a single
+#  unconfirmed keystroke away.
+#
+#  WHAT IT CANNOT DO, BY CONSTRUCTION RATHER THAN BY DISCIPLINE.
+#
+#  The wizard asks for a ladder SLOT and never for an amount, and it could not
+#  offer amounts if it wanted to: the ladder lives in the ThinkPad's keyfile
+#  and the Pi's holds secret, peer_public, target_mac, wol_broadcast, wol_port,
+#  listen_host and listen_port -- no ladder, no amounts. So this box can say
+#  "slot 2" and is structurally incapable of saying "0.05". That is the
+#  property, not a rule someone has to keep following.
+#
+#  What reaches the wire after all the conversation is byte-identical to what
+#  `/depo 2` produces today: ("receive_and_quote", {"amount_slot": N}). No new
+#  job, no new schema field, no new keyfile field, so no re-pairing and no
+#  half-upgraded pair.
+#
+#  IN MEMORY, NEVER ON THE CARD. The --state file holds Limits and lives on the
+#  same SD card as the sealed keyfile; a half-finished /depo does not belong
+#  there. A restart drops every conversation, which is the correct loss: the
+#  operator retypes two characters.
+# ---------------------------------------------------------------------------
+
+#: How long a half-finished /depo may sit. Short, because the only thing it
+#: costs to expire is retyping, and a conversation that outlives the operator's
+#: attention is one that gets answered by whoever picks the phone up next.
+CONVO_TTL_S = 180
+
+#: At most one live conversation per chat, and at most this many chats mid-flow
+#: at once. The pager is a 1 GB Pi with Tor resident; nothing else bounds this
+#: dict, so it is bounded here rather than left to the allowlist's length.
+MAX_CONVOS = 16
+
+#: The confirm gate's choices. THREE, and the reason it is not more is that
+#: this is not a security control and pretending otherwise by widening it would
+#: be the dishonest part. See CONFIRM_NOTE.
+CONFIRM_CHOICES = 3
+
+CONFIRM_NOTE = (
+    "This gate stops a pocket-dial and a message pasted into the wrong "
+    "chat. It is NOT a security control: anyone holding this phone can read "
+    "the question and answer it. The bounds that matter are the vault's 24h "
+    "wake budget and account ceiling, which live in a keyfile and need "
+    "physical access to change."
+)
+
+#: What the wizard says when asked about the two knobs it does not have. These
+#: are ANSWERS, not apologies: each names where the thing is really decided.
+#:
+#: Checked against the code rather than assumed. thor_swap_preparer's quote
+#: request is {sellAsset, buyAsset, sellAmount, destinationAddress} and nothing
+#: else -- there is no streaming, slippage or fee parameter to set, and the
+#: memo's <limit>/<interval>/<qty> tail comes back from the API already
+#: decided. So a "speed" or "fee" knob here would be a control wired to
+#: nothing, which is worse than not offering one.
+#: DELIBERATELY WITHOUT THE FLAG NAMES. An earlier draft answered these by
+#: naming the environment variable, the CLI flag, the tool and the memo field
+#: each one lives in -- accurate, useful to somebody standing at the vault
+#: with the source open, and a map of the vault's control surface typed into a
+#: chat transcript that is assumed to leak. These say WHERE, which is what the
+#: operator on a phone actually needs, and stop. The detail is in
+#: OPSEC_SETUP.md, which lives on the machine that has it.
+FEE_ANSWER = (
+    "Fee: your sending wallet's choice — the vault never sends BTC, it only "
+    "quotes. The swap's own price protection is a refusal threshold set at "
+    "the vault, deliberately not settable from here: loosening it is how a "
+    "bad-price route gets accepted."
+)
+SPEED_ANSWER = (
+    "Speed: not settable, by anyone, today. The quote comes back with its "
+    "routing already fixed, so there is nothing here or at the vault to turn. "
+    "Making it selectable is a change to how quotes are requested, not a chat "
+    "setting."
+)
+EXIT_ANSWER = (
+    "Exit route: set at the vault, when you run the mix. This channel cannot "
+    "name or select a destination — that is the whole reason the channel "
+    "exists, and the one rule it does not bend."
+)
+
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
 #: phone from queueing pokes faster than a human would.
@@ -126,11 +212,14 @@ HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
 
 HELP = (
     "GhostSpiral pager\n"
+    "/depo       quote a swap — asks which slot, then confirms\n"
+    "/depo <s>   same, in one shot, slot 0-7\n"
     "/recv [n]   mint n receive subaddresses (1-4, default 1)\n"
-    "/depo <s>   quote a swap to ladder slot s (0-7)\n"
     "/check <h>  has my payment arrived? (~5 min, then it powers off)\n"
     "/watch <h>  wait up to 110 min for it (blocks everything else)\n"
+    "/cancel     drop a half-finished /depo\n"
     "/status     counters only\n"
+    "/fee /speed /exit   where those are really set — not settable here\n"
     "\n"
     "WHAT COMES BACK depends on the VAULT's keyfile, not on this box:\n"
     "nothing readable, a SEALED slip for gs_unseal, or the deposit\n"
@@ -314,12 +403,28 @@ def parse_command(text: str) -> tuple:
             return "", {}, "count must be 1-4"
         return "receive_new", {"count": n}, ""
     if cmd == "/depo":
+        # NO ARGUMENT STARTS THE WIZARD. `/depo 2` is unchanged and always
+        # will be -- the wizard exists because "2" is a number whose meaning
+        # has to be remembered, not because the one-shot form is wrong.
+        if not arg:
+            return "", {}, "depo_wizard"
         if not arg.isdigit():
             return "", {}, "give a ladder SLOT 0-7, not an amount"
         s = int(arg)
         if not 0 <= s <= 7:
             return "", {}, "slot must be 0-7"
         return "receive_and_quote", {"amount_slot": s}, ""
+    if cmd in ("/cancel", "/stop"):
+        return "", {}, "cancel"
+    # THE THREE QUESTIONS THAT ARE NOT KNOBS. Each answers where the thing is
+    # really decided, rather than offering a control wired to nothing. See
+    # FEE_ANSWER / SPEED_ANSWER / EXIT_ANSWER for why each is not settable.
+    if cmd == "/fee":
+        return "", {}, "fee"
+    if cmd == "/speed":
+        return "", {}, "speed"
+    if cmd == "/exit":
+        return "", {}, "exit"
     if cmd == "/watch":
         if not HANDLE_RE.match(arg):
             return "", {}, "handle must be 4 hex characters"
@@ -329,6 +434,56 @@ def parse_command(text: str) -> tuple:
             return "", {}, "handle must be 4 hex characters"
         return "swap_status", {"handle": arg.upper()}, ""
     return "", {}, "unknown command"
+
+
+class Convo:
+    """One chat's half-finished /depo. Process memory only, never a file.
+
+    THREE FIELDS AND NOT ONE STRING AMONG THEM, which is the enforceable form
+    of the SD-card rule. A struct with no string field cannot hold an address,
+    a memo, a slip or an amount however the prompts around it are later
+    edited, and that is one assertion to test rather than a comment somebody
+    has to keep honouring.
+
+    `step` is DERIVED, not stored: awaiting the slot iff slot is None. That is
+    not brevity -- it makes "at the confirm step with no slot" unrepresentable
+    rather than merely untested.
+    """
+
+    __slots__ = ("slot", "expect", "deadline")
+
+    def __init__(self, clock):
+        self.slot = None
+        self.expect = None
+        #: ABSOLUTE, from creation, and never refreshed by an answer. A
+        #: per-step refresh puts no upper bound on total lifetime -- a chat
+        #: answering every 179 s keeps an entry alive for ever, which is
+        #: precisely the "half-finished command sitting for ever" this exists
+        #: to prevent. The cost of being slow is retyping two characters.
+        self.deadline = clock() + CONVO_TTL_S
+
+    def alive(self, clock) -> bool:
+        return clock() < self.deadline
+
+    def awaiting_slot(self) -> bool:
+        return self.slot is None
+
+
+def _confirm_question(rng):
+    """A small sum. Returns (text, expected_int).
+
+    FREE-FORM, NOT MULTIPLE CHOICE. Offering three options made a wrong answer
+    a one-in-three guess, which is the only sense in which the number of
+    choices meant anything -- and it is no easier for the operator to pick from
+    a list than to type a sum they can already do. Typing the answer costs the
+    same and is not guessable.
+
+    SystemRandom for the same reason everything else here uses it: this is a
+    one-shot value and there is no reason to draw it from a predictable stream,
+    even for something explicitly not load-bearing.
+    """
+    a, b = rng.randrange(2, 10), rng.randrange(2, 10)
+    return f"{a} + {b} = ?   reply with the answer", a + b
 
 
 class Pager:
@@ -343,6 +498,149 @@ class Pager:
         self.busy = threading.Lock()
         self.ignored = 0
         self.poll_failures = 0
+        #: chat_id -> Convo. IN MEMORY. Never written to args.state: that file
+        #: is Limits and sits on the SD card next to the sealed keyfile.
+        self.convos = {}
+        self.clock = time.monotonic
+        self.rng = random.SystemRandom()
+
+    # -- the /depo wizard -----------------------------------------------
+    def _reap(self) -> None:
+        """Drop expired conversations. Called before any use of the dict.
+
+        Cheap and unconditional rather than on a timer, because the dict is
+        touched only on an allowlisted message and is capped at MAX_CONVOS.
+        """
+        dead = [c for c, v in self.convos.items() if not v.alive(self.clock)]
+        for c in dead:
+            del self.convos[c]
+
+    def begin_convo(self, chat_id: int) -> None:
+        self._reap()
+        # DO NOT START ONE THAT CANNOT FINISH.
+        #
+        # A wake holds `busy` for up to 9900 s and a conversation lives 180 s,
+        # so a conversation begun while a job runs is GUARANTEED to expire
+        # before the lock frees. Without this the operator walks the whole
+        # wizard over Tor -- two round trips on a phone -- to be told "a wake
+        # is already running" at the end, having achieved nothing.
+        #
+        # Advisory only: it creates nothing, charges nothing and reserves
+        # nothing, and start_job re-checks both authoritatively at the poke.
+        # The strings are the same ones `/depo 2` already answers with, so the
+        # two paths cannot drift into describing the same refusal differently.
+        if self.busy.locked():
+            self.send(chat_id, "no: a wake is already running")
+            return
+        why = self.limits.why_not()
+        if why:
+            self.send(chat_id, f"no: {why}")
+            return
+        # BOUNDED. The dict is keyed by chat_id and only an allowlisted chat
+        # ever reaches here, so len(convos) <= len(allow) is already
+        # structural. MAX_CONVOS is the second bound, and it is a BUG DETECTOR
+        # rather than a policy: if it ever fires, something is creating
+        # conversations that nothing is clearing.
+        if (chat_id not in self.convos) and len(self.convos) >= MAX_CONVOS:
+            integrity_log("pager", "convo_cap_hit")
+            self.send(chat_id, "no: too many conversations in flight. Try "
+                               "again in a few minutes, or use /depo <slot>.")
+            return
+        self.convos[chat_id] = Convo(self.clock)
+        self.send(chat_id,
+                  "Which ladder SLOT? Reply 0-7.\n"
+                  "\n"
+                  "A slot, not an amount: the ladder lives on the vault and "
+                  "this box has never held it, so it cannot show you the "
+                  "sizes. /cancel to stop.")
+
+    def step_convo(self, chat_id: int, text: str) -> bool:
+        """Advance a live conversation. True if this message was consumed.
+
+        NEVER RAISES, and that is not defensive habit -- it is the fix for a
+        reproduced bug. `"²".isdigit()` is True and `int("²")` raises, so a
+        slot step guarded by isdigit() let a ValueError escape: no reply was
+        sent AND the conversation stayed live, so the operator's next
+        unrelated message was silently eaten as a slot answer. Any escape from
+        here has that shape, so the conversation is dropped on any of them.
+        """
+        try:
+            return self._step_convo(chat_id, text)
+        except Exception as e:                               # noqa: BLE001
+            self.convos.pop(chat_id, None)
+            integrity_log("pager", "convo_error")
+            self.send(chat_id, f"no: that went wrong — cancelled, nothing was "
+                               f"woken ({_redact(e)[:60]}).")
+            return True
+
+    def _step_convo(self, chat_id: int, text: str) -> bool:
+        self._reap()
+        c = self.convos.get(chat_id)
+        if c is None:
+            return False
+        word = text.strip().lower()
+        # ANY COMMAND ABANDONS THE CONVERSATION rather than being eaten by it,
+        # and /cancel is simply the command that does nothing else. There is
+        # deliberately NO second cancel vocabulary here: the first version
+        # matched "/cancel" and "/stop" literally, so the group form this file
+        # explicitly supports -- "/cancel@mybot" -- fell through to this
+        # branch, and the one command whose whole job is to confirm nothing is
+        # armed replied "nothing to cancel" having just cancelled something.
+        # One vocabulary, in parse_command, where every other command's lives.
+        if word.startswith("/"):
+            del self.convos[chat_id]
+            return False
+        if c.awaiting_slot():
+            # isdecimal, not isdigit: isdecimal is the predicate that matches
+            # what int() accepts. See the docstring above.
+            if not word.isdecimal() or not 0 <= int(word) <= 7:
+                del self.convos[chat_id]
+                self.send(chat_id, "no: a slot is 0-7. Cancelled — start "
+                                   "again with /depo.")
+                return True
+            c.slot = int(word)
+            # DEADLINE UNTOUCHED. See Convo: it is absolute from creation, so
+            # answering slowly does not buy another full window.
+            q, c.expect = _confirm_question(self.rng)
+            self.send(chat_id, f"slot {c.slot} — this will WAKE THE VAULT and "
+                               f"quote a swap.\n\n{q}")
+            return True
+        # ONE ATTEMPT PER QUESTION, and the comment says per QUESTION because
+        # that is all it is: a wrong answer cancels, and nothing stops the
+        # operator -- or whoever holds the phone -- typing /depo again for a
+        # fresh sum. Questions are unlimited and free. The number bounds a
+        # pocket-dial, which is what CONFIRM_NOTE claims and all it claims.
+        # Logged so a burst of failures is at least visible in the chain.
+        slot, expect = c.slot, c.expect
+        del self.convos[chat_id]
+        if not word.isdecimal() or int(word) != expect:
+            integrity_log("pager", "convo_confirm_failed")
+            self.send(chat_id, "no: wrong answer. Cancelled — nothing was "
+                               "woken. Start again with /depo.")
+            return True
+        self.commit_convo(chat_id, slot)
+        return True
+
+    def commit_convo(self, chat_id: int, slot: int) -> None:
+        """Turn a finished conversation into a job. THE ONLY WAY IT BECOMES ONE.
+
+        "Byte-identical to /depo N" is made a TAUTOLOGY rather than a promise:
+        the wizard composes the same TEXT an operator would have typed and
+        hands it to the same parse_command, so there is no second place where
+        a slot becomes a job and no second place for the two to drift.
+
+        The result is then compared against the literal it must be. An
+        explicit comparison and not `assert`, because python -O removes
+        asserts and this one is the last thing standing between a conversation
+        and a wake.
+        """
+        job, params, err = parse_command(f"/depo {slot}")
+        if err or (job, params) != ("receive_and_quote", {"amount_slot": slot}):
+            integrity_log("pager", "convo_commit_mismatch")
+            self.send(chat_id, "no: internal check failed, nothing was woken. "
+                               "Use /depo <slot>.")
+            return
+        self.start_job(chat_id, job, params)
 
     # -- telegram -------------------------------------------------------
     def _url(self, method: str) -> str:
@@ -549,7 +847,38 @@ class Pager:
         # a reply to something nobody typed.
         if not isinstance(msg.get("text"), str):
             return
+        # A LIVE CONVERSATION GETS FIRST REFUSAL on the message, because a bare
+        # "2" is an answer and not a command. It hands back anything starting
+        # with "/" (and drops itself when it does), so a real command is never
+        # eaten by a half-finished /depo.
+        # WHETHER ONE WAS LIVE, READ BEFORE step_convo TOUCHES IT. /cancel is
+        # the one command whose entire job is to confirm nothing is armed, so
+        # it must report on the pop that ACTUALLY happened. The first version
+        # matched "/cancel" literally inside step_convo, which meant the group
+        # form this file supports -- "/cancel@mybot" -- was cancelled by the
+        # "/" branch and then answered "nothing to cancel".
+        self._reap()
+        had_convo = cid in self.convos
+        if self.step_convo(cid, msg["text"]):
+            return
         job, params, err = parse_command(msg["text"])
+        if err == "depo_wizard":
+            self.begin_convo(cid)
+            return
+        if err == "cancel":
+            self.convos.pop(cid, None)
+            self.send(cid, "cancelled. Nothing was woken." if had_convo
+                      else "nothing to cancel.")
+            return
+        if err == "fee":
+            self.send(cid, FEE_ANSWER)
+            return
+        if err == "speed":
+            self.send(cid, SPEED_ANSWER)
+            return
+        if err == "exit":
+            self.send(cid, EXIT_ANSWER)
+            return
         if err == "help":
             self.send(cid, HELP)
             return
@@ -560,8 +889,32 @@ class Pager:
                            f"busy: {self.busy.locked()}")
             return
         if err:
+            # A BARE NUMBER WITH NO LIVE CONVERSATION is the commonest way to
+            # get here, and "unknown command" plus the whole help text is the
+            # wrong answer to it. It means the operator walked away, came back
+            # past the TTL, and typed the slot they had already decided on.
+            # Tell them that, rather than making them work it out.
+            if msg["text"].strip().isdigit():
+                self.send(cid, "no live /depo — it expired or was cancelled. "
+                               "Start again with /depo, or /depo <slot>.")
+                return
             self.send(cid, f"no: {err}\n\n{HELP}")
             return
+        self.start_job(cid, job, params)
+
+    def start_job(self, cid: int, job: str, params: dict) -> None:
+        """Every path to a wake goes through here. THE ONLY ONE.
+
+        Factored out so the wizard and `/depo 2` cannot drift: the rate limit,
+        the one-job lock and the argument that reaches the wire are the same
+        code for both. A second copy of this in the wizard is how a wizard ends
+        up not being rate limited.
+
+        The rate limit is charged HERE, at the poke, and not when a
+        conversation starts -- otherwise abandoning a half-typed /depo would
+        spend a poke, and starting conversations would be a way to exhaust the
+        day's budget without ever waking anything.
+        """
         why = self.limits.why_not()
         if why:
             self.send(cid, f"no: {why}")

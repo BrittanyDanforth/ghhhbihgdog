@@ -1401,6 +1401,83 @@ MUTATIONS = [
   "    if not isinstance(obj, dict) or set(obj) != set(PLAIN_FIELDS):",
   "    if not isinstance(obj, dict):",
   ["test_plain_slip"]),
+
+ # A probe reads whatever status file is on disk. Nothing else removes it, so
+ # without this a probe whose child dies reports the PREVIOUS run's outcome --
+ # an old "funded" becomes "landed and spendable" about money that never
+ # arrived, and the operator stops watching for it.
+ ("a probe goes back to reporting the previous probe's answer",
+  "gs_wake_agent",
+  '    if job == "swap_status":\n        try:\n'
+  '            (artifact_dir / STATUS_FILE).unlink()\n',
+  '    if False:\n        try:\n'
+  '            (artifact_dir / STATUS_FILE).unlink()\n',
+  ["test_plain_slip"]),
+
+ # ---- THE /depo WIZARD -------------------------------------------------
+ # Conversation state is the risky part of making a command interactive, not
+ # the asking. Each of these is a bound on it.
+
+ ("conversation state grows without limit on a 1 GB box",
+  "gs_telegram_pager",
+  "        if (chat_id not in self.convos) and len(self.convos) >= MAX_CONVOS:",
+  "        if False:",
+  ["test_depo_wizard"]),
+
+ ("a half-finished /depo never expires, so the next stray message answers a "
+  "question the operator has forgotten", "gs_telegram_pager",
+  "        dead = [c for c, v in self.convos.items() "
+  "if not v.alive(self.clock)]",
+  "        dead = []",
+  ["test_depo_wizard"]),
+
+ # One attempt is what makes three choices mean three choices.
+ ("the confirm gate can be guessed at until it is right",
+  "gs_telegram_pager",
+  "            slot, answer = c.slot, c.answer\n"
+  "            del self.convos[chat_id]\n",
+  "            slot, answer = c.slot, c.answer\n",
+  ["test_depo_wizard"]),
+
+ # A real command typed mid-flow must not be swallowed as an answer.
+ ("a command typed mid-conversation is eaten by the wizard",
+  "gs_telegram_pager",
+  '        if word.startswith("/"):',
+  "        if False:",
+  ["test_depo_wizard"]),
+
+ ("the wizard accepts a slot outside the ladder", "gs_telegram_pager",
+  "            if not word.isdecimal() or not 0 <= int(word) <= 7:",
+  "            if not word.isdecimal():",
+  ["test_depo_wizard"]),
+
+ # REPRODUCED: "²".isdigit() is True and int("²") raises. Guarded by isdigit
+ # the ValueError escaped step_convo -- no reply sent AND the conversation
+ # left live, so the operator's next unrelated message was eaten as a slot
+ # answer. isdecimal is the predicate that matches what int() accepts.
+ ("a superscript digit goes back to escaping the slot check and leaving a "
+  "conversation live and armed", "gs_telegram_pager",
+  "            if not word.isdecimal() or not 0 <= int(word) <= 7:",
+  "            if not word.isdigit() or not 0 <= int(word) <= 7:",
+  ["test_depo_wizard"]),
+
+ # REPRODUCED: /cancel@mybot -- the group form this file supports -- cancelled
+ # the conversation via the "/" branch and then replied "nothing to cancel".
+ # The one command whose job is to confirm nothing is armed said the opposite.
+ ("/cancel goes back to reporting on a pop it did not perform",
+  "gs_telegram_pager",
+  "        had_convo = cid in self.convos",
+  "        had_convo = False",
+  ["test_depo_wizard"]),
+
+ # The ladder bound checked only the top end, so a negative slot indexed from
+ # the far end -- ladder[-1] is the largest rung. The only thing stopping it
+ # was a range check in another file.
+ ("a negative amount slot goes back to selecting the ladder's last rung",
+  "gs_wake_agent",
+  "        if not 0 <= slot < len(ladder):",
+  "        if slot >= len(ladder):",
+  ["test_depo_wizard", "test_wake_agent"]),
 ]
 
 

@@ -121,6 +121,19 @@ python3 tests/test_plain_slip.py    # THE PHONE-ONLY PATH. The sealed slip
                                     #   in flight reached their phone as "the
                                     #   vault ran it and it FAILED". Also
                                     #   asserts the DEFAULT still leaks nothing
+python3 tests/test_depo_wizard.py   # INTERACTIVE /depo. `/depo 2` still works;
+                                    #   the wizard exists because "2" is a
+                                    #   number whose meaning has to be
+                                    #   remembered. The risky part is the
+                                    #   conversation state, so that is what is
+                                    #   tested: in memory only (the --state
+                                    #   file is on the SD card), capped,
+                                    #   expiring, holding no lock and spending
+                                    #   no budget until the poke, and emitting
+                                    #   a job byte-identical to the one-shot
+                                    #   form. Plus: it CANNOT name an amount,
+                                    #   because the Pi has never held the
+                                    #   ladder
 python3 tests/test_wake_agent.py    # THE VAULT AGENT: a TABLE asserting the
                                     #   machine powers off on every refusal.
                                     #   Fail-closed elsewhere means sys.exit;

@@ -670,10 +670,24 @@ Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
 `gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
 doorbell, so anything it does you can do from a terminal.
 
-1. Phone: `/recv` then `/depo 2` to the throwaway account. **A SLOT, not
+1. Phone: `/recv` then `/depo` to the throwaway account. **A SLOT, not
    an amount**: the ladder lives on the ThinkPad and the Pi's keyfile does not
    contain it, so the Pi cannot turn "0.05" into a slot and is never given the
    chance to send a number (§8).
+
+   `/depo` on its own asks which slot and then confirms, because the one
+   command that spends a wake and quotes real money should not be a single
+   keystroke. `/depo 2` still works in one shot. The confirm is a small sum —
+   it stops a pocket-dial or a message pasted into the wrong chat, and it is
+   **not** a security control: anyone holding the phone can read it and answer
+   it. The bounds that matter are the 24 h wake budget and the account
+   ceiling, both in a keyfile that needs physical access to change.
+
+   Three things the chat will not set, and where each really lives:
+
+   | `/fee` | the BTC network fee is your sending wallet's; `--max-slippage` is a vault-side refusal threshold |
+   | `/speed` | not settable by anyone today — `thor_swap_preparer` does not request streaming, so the memo's `limit/interval/qty` tail comes back already fixed |
+   | `/exit` | `GS_EXIT_TO`, at the vault, at mix time — this channel can never name or select a destination |
 2. Pi checks Tor, allowlisted chat id, rate limit.
 3. `gs_doorbell wake` binds its LAN socket **first**, waits a random
    0–15 min, then sends the magic packet and holds one job for 10 min.

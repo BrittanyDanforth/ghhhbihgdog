@@ -391,6 +391,39 @@ _cw, _sw, _ = AG._dispatch(
 check("...and a real /watch exiting non-zero DOES still fail: the excuse is "
       "scoped to the probe", _sw == "failed")
 
+# LAST WEEK'S ANSWER MUST NOT BE REPORTED AS THIS WEEK'S.
+#
+# Found by driving the tool rather than by reading it. Nothing removed the
+# status file between probes, and _phase_of reads whatever is on disk -- so a
+# probe whose child died before writing (an RPC that will not answer, a
+# SIGKILL past the budget, a wallet that never opens) reported the PREVIOUS
+# probe's outcome. The worst available failure: an old "funded" becomes
+# "landed and spendable, the swap is done" about money that never arrived, and
+# the operator's next move is to stop watching for it.
+#
+# It also fed the branch above, which treats "the file exists" as proof the
+# probe answered -- a stale file satisfies that for free.
+_stale = bay()
+(_stale / AG.STATUS_FILE).write_text(json.dumps(
+    {"state": "funded", "total": "9.9", "unlocked": "9.9", "ticks": 99}))
+check("a stale status file is a REAL hazard: read directly it does say landed",
+      AG._phase_of("swap_status", _stale) == "landed")
+_bc = io.StringIO()
+import contextlib as _cl
+with _cl.redirect_stdout(_bc):
+    _sc, _ss, _ = AG._dispatch(
+        "swap_status", {"handle": "A3F1"},
+        {"tor_proxy": "socks5h://127.0.0.1:9050",
+         "rpc_primary": "http://127.0.0.1:18083"}, _stale, "ZZZZ",
+        lambda a, e, b: (1, False), "job" * 8)
+check("...but a probe whose child writes nothing is a FAILURE, not an "
+      "inherited success", _ss == "failed")
+check("...and the phase reported is empty, so the chat says the probe told us "
+      "nothing rather than announcing a swap that never happened",
+      AG._phase_of("swap_status", _stale) == "")
+check("...because the previous answer is deleted BEFORE the probe runs",
+      not (_stale / AG.STATUS_FILE).exists())
+
 # ===========================================================================
 # 6. THE PROBE IS SHORT, AND THAT IS THE POINT.
 # ===========================================================================
