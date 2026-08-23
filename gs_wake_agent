@@ -516,7 +516,13 @@ def build_argv(job: str, params: dict, key: dict, artifact_dir: Path,
     if job == "receive_and_quote":
         ladder = key.get("amount_ladder") or []
         slot = int(params["amount_slot"])
-        if slot >= len(ladder):
+        # BOTH ENDS. This read `slot >= len(ladder)`, so a NEGATIVE slot indexed
+        # from the far end -- ladder[-1] is the largest rung -- and the refusal
+        # never fired. Nothing in this file stopped it; the only thing that did
+        # was _int_range(0, 7) two files away in the job schema, which is a
+        # real check and is also somebody else's. A bounds check that only
+        # bounds one side is the kind that reads as complete.
+        if not 0 <= slot < len(ladder):
             raise Refused("empty_slot",
                           f"the note asked for amount slot {slot} and this "
                           f"machine's ladder has {len(ladder)} rung(s). The "
@@ -1046,6 +1052,37 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
                 f"handle {params['handle']} names a receive bundle with no "
                 f"swap quote, so there is no expected amount to watch for. "
                 f"Only a receive_and_quote handle can be watched.")
+
+    # DELETE LAST TIME'S ANSWER BEFORE ASKING AGAIN.
+    #
+    # Nothing else removes this file, and _phase_of reads whatever is there.
+    # So a probe whose child dies before writing -- an RPC that will not
+    # answer, a SIGKILL past the budget, a wallet that never opens -- reported
+    # the PREVIOUS probe's outcome as this one's. The failure mode is the worst
+    # available: last week's answer was "funded", so the operator is told
+    # "landed and spendable, the swap is done" about money that never arrived,
+    # and the one thing they would do next is stop watching for it.
+    #
+    # It also decides the branch below: that branch treats "the file exists" as
+    # proof the probe answered, which a stale file satisfies for free.
+    #
+    # Missing is already handled correctly everywhere -- _phase_of returns ""
+    # and the pager says the probe told us nothing -- so removing it first
+    # makes "no answer" the honest default rather than a lie inherited from a
+    # previous run.
+    if job == "swap_status":
+        try:
+            (artifact_dir / STATUS_FILE).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            # Cannot clear it, so cannot trust it. Refuse rather than risk
+            # reporting a stale "landed".
+            raise Refused(
+                "status_file_stuck",
+                f"could not clear the previous status answer "
+                f"({e.strerror}). Refusing to run a probe that might report "
+                f"the last one's result.")
 
     steps = build_argv(job, params, key, artifact_dir, bundle=bundle,
                        slip=slip, handle=handle)

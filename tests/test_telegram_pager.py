@@ -101,10 +101,23 @@ for _hostile in (f"/depo 2 --exit-to {XMR}",
     check(f"refuses {_hostile[:38]!r}", _j == "" and _e)
 
 for _bad in ("/recv 0", "/recv 5", "/recv -1", "/recv abc",
-             "/depo 8", "/depo -1", "/depo 0.05", "/depo",
+             "/depo 8", "/depo -1", "/depo 0.05",
              "/watch ZZZZ", "/watch A3F", "/watch A3F12", "", "   "):
     _j, _p, _e = pg.parse_command(_bad)
     check(f"refuses out-of-range {_bad!r}", _j == "")
+
+# BARE /depo WAS IN THAT LIST AND STILL PASSED, WHICH IS WORSE THAN FAILING.
+# It asserted "refuses '/depo'" and the assertion was `_j == ""` -- true both
+# when a command is refused and when it is routed somewhere that is not a job.
+# Bare /depo now starts the wizard, so the check went on passing while
+# asserting the opposite of the behaviour. Named for what it does, and pinned
+# to the specific err so it cannot drift into meaning "refused" again.
+_j, _p, _e = pg.parse_command("/depo")
+check("bare /depo starts the wizard rather than being refused",
+      _j == "" and _p == {} and _e == "depo_wizard")
+check("...and it is a DIFFERENT outcome from a refusal, so the two cannot be "
+      "confused by a check that only looks at the job name",
+      pg.parse_command("/depo 8")[2] != "depo_wizard")
 
 # STRUCTURAL: no accepted command can produce anything but a bounded int or a
 # 4-hex handle, whatever the input. Enumerating hostile strings would not stop
@@ -120,9 +133,68 @@ for _t in ["/recv", "/recv 2", "/depo 0", "/depo 7", "/watch A3F1",
             _long += 1
 check("every parameter is an int or a 4-char handle, never a longer string",
       _types <= {"int", "str"} and _long == 0)
-check("the jobs it can ask for are exactly the three the protocol allows",
-      {pg.parse_command(t)[0] for t in ("/recv", "/depo 1", "/watch A3F1")}
-      == {"receive_new", "receive_and_quote", "watch"})
+check("the jobs it can ask for are exactly the ones the protocol allows",
+      {pg.parse_command(t)[0] for t in ("/recv", "/depo 1", "/watch A3F1",
+                                        "/check A3F1")} <= set(P.JOBS))
+
+# THE SAME GUARANTEE, THROUGH THE WIZARD, because parse_command is no longer
+# the only producer of params. A structural check that covers one of two
+# producers is a check that will be read as covering both.
+_wiz = []
+
+
+def _wizard_params(answers):
+    """Drive a whole conversation through the real handle(); collect params."""
+    import threading as _th
+    import types as _ty
+    p = pg.Pager.__new__(pg.Pager)
+    p.proxies, p.token, p.key, p.args = {}, "x", {}, _ty.SimpleNamespace()
+    p.allow = {1}
+    p.busy = _th.Lock()
+    p.ignored = 0
+    p.convos = {}
+    p.clock = lambda: 1000.0
+    p.rng = __import__("random").SystemRandom()
+    p.limits = _ty.SimpleNamespace(why_not=lambda: "", record=lambda: None,
+                                   recent=lambda: [], daily_cap=12)
+    seen = []
+    p.send = lambda c, t: (seen.append(t), True)[1]
+    p.start_job = lambda c, j, pa: _wiz.append((j, pa))
+    for a in answers:
+        if a == "<confirm>":
+            import re as _re
+            m = _re.search(r"(\d+) \+ (\d+) = \?", "\n".join(seen))
+            a = str(int(m.group(1)) + int(m.group(2))) if m else "0"
+        p.handle({"update_id": 1, "message": {"chat": {"id": 1}, "text": a}})
+    return seen
+
+
+for _slot in range(8):
+    _wizard_params(["/depo", str(_slot), "<confirm>"])
+for _hostile in (XMR, MEMO, BTC, "0.05", "-1", "8", "2 3", "²", "٢",
+                 "2; /depo 7", "‮2", "٧", "2\n7", "x" * 500):
+    _wizard_params(["/depo", _hostile, "<confirm>"])
+    _wizard_params(["/depo", "2", _hostile])
+# NOT "exactly eight jobs": '٢' is Arabic-Indic two, isdecimal() accepts it and
+# int() reads it as 2, so it legitimately produces slot 2. The first version of
+# this check listed it as hostile and went red on correct behaviour. The real
+# invariant is that EVERY job the wizard can produce is one key holding an
+# in-range slot, and that all eight are reachable.
+check("every job the wizard produces is a single in-range slot, whatever was "
+      "typed at it",
+      all(set(pa) == {"amount_slot"} and pa["amount_slot"] in range(8)
+          for _, pa in _wiz))
+check("...and all eight slots are reachable, so nothing above is vacuous",
+      {pa["amount_slot"] for _, pa in _wiz} == set(range(8)))
+check("...every wizard-produced job is receive_and_quote",
+      {j for j, _ in _wiz} == {"receive_and_quote"})
+check("...and every value is a plain int, never a string or a bool",
+      all(isinstance(v, int) and not isinstance(v, bool)
+          for _, pa in _wiz for v in pa.values()))
+for _j, _pa in _wiz:
+    P.validate_job({"job_id": P.new_job_id(),
+                    "challenge": P.new_challenge().hex(), "job": _j, **_pa})
+check("...and every one passes the REAL job schema", True)
 # ...and the protocol itself agrees, rather than this file asserting it alone.
 for _t in ("/recv 2", "/depo 3", "/watch A3F1"):
     _j, _p, _e = pg.parse_command(_t)

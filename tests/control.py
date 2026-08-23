@@ -66,6 +66,7 @@ ACTIONS = {
     "pager":       {**suite("test_telegram_pager", "may trigger, never carry: no destination can be typed"), "group": "Wake channel"},
     "sealedslip":  {**suite("test_sealed_slip", "the slip reaches you and reads to nobody else"), "group": "Wake channel"},
     "plainslip":   {**suite("test_plain_slip", "the phone-only path: real address in chat, honest status"), "group": "Wake channel"},
+    "depowizard":  {**suite("test_depo_wizard", "interactive /depo: conversation state that stays bounded"), "group": "Wake channel"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},
