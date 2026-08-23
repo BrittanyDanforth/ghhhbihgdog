@@ -5,8 +5,12 @@
 # that would just move the 24/7 socket from the vault to the doorbell, which is
 # the thing this whole feature exists to stop.
 #
-# The trigger INTO the Pi (phone, onion service, whatever) is out of scope, as
-# OPSEC_SETUP.md §8 says. Do NOT wire a Telegram bot that prints the memo.
+# The trigger INTO the Pi is now shipped: gs_telegram_pager, and
+# systemd/gs-telegram-pager.service.example. The warning it was written under
+# still stands and is the reason that tool has no word for an address, a memo
+# or an amount -- OPSEC_SETUP.md §8: do NOT wire a Telegram bot that prints the
+# memo. A trigger that reports a 4-hex handle is a trigger; one that reports a
+# memo has thrown away the reason to own a Pi.
 #
 # If you wrap a trigger, it must run AFTER the tunnel, and fail with it:
 [Unit]

@@ -173,8 +173,45 @@ for marker in ("api.telegram.org", "sendMessage", "bot_token", "TELEGRAM_TOKEN",
 # this file's docstring names -- "the document becomes a confident lie ...
 # worse than having no document, because it is invisible" -- committed by the
 # test written to prevent it.
-check("the doc is honest that the TELEGRAM PAGER is still not shipped",
-      "not in this repo yet" in DOC or "is **not** in this repo" in DOC)
+# THE PAGER SHIPPED, SO THIS CHECK HAD TO CHANGE -- and the point of the essay
+# above is that changing it is the ONLY honest move. gs_telegram_pager landed;
+# a doc still saying "not in this repo yet" would be the confident lie this
+# file exists to catch, and a test still asserting that sentence would be
+# holding the doc to a claim the repo had already broken.
+check("the doc is honest that the TELEGRAM PAGER now IS shipped",
+      "**is** now in this repo" in DOC and "gs_telegram_pager" in DOC)
+check("...and the pager the doc names actually exists on disk",
+      os.path.isfile(os.path.join(REPO, "gs_telegram_pager")))
+check("...and the doc no longer calls steps 1-2 unshipped procedure",
+      "no trigger is shipped" not in DOC)
+
+# THE SPLIT IS NOW THE GUARANTEE, not the absence. One tool may talk to
+# Telegram; what none of them may do is carry the secret across.
+_PAGER = src("gs_telegram_pager")
+# NOT a substring hunt for the word "memo": it appears throughout the pager's
+# own docstring explaining what it refuses to do, so any such check is either
+# false or -- as the first draft of this line was -- rescued by an `or` that
+# made it true no matter what. The real guarantee is behavioural and is driven
+# in tests/test_telegram_pager.py, which runs every outcome path and asserts
+# no address, memo or deposit address reaches the chat. What belongs HERE is
+# the structural half: the pager never reads a field that holds one.
+check("the pager's replies are built from a fixed vocabulary, not from job "
+      "output: the only interpolations are the job name and the handle",
+      _PAGER.count("self.send(") >= 5
+      and "slip {h}" in _PAGER
+      and "pending.result" in _PAGER)
+for _forbidden in ("dest_xmr", "deposit", "expected_xmr", "btc_in",
+                   "thor_pairs", "unsigned_"):
+    check(f"the pager never reads a field named {_forbidden}",
+          f'"{_forbidden}"' not in _PAGER and f"'{_forbidden}'" not in _PAGER)
+check("the pager cannot name a destination: no job it sends takes one",
+      "--exit-to" not in _PAGER and "--dest" not in _PAGER)
+check("the pager reports only a handle, and says where the address really is",
+      "slip {h}" in _PAGER and "on the vault" in _PAGER)
+check("the pager's token never has a CLI flag, since argv is world-readable",
+      '"--token"' not in _PAGER and "--token-file" in _PAGER)
+check("the pager is fail-closed on Tor, as section 4 requires",
+      "verify_tor(proxy)" in _PAGER)
 check("...and does NOT still call the doorbell operator procedure, now that "
       "it ships",
       "operator procedure" not in DOC and "not a\nshipped binary" not in DOC)

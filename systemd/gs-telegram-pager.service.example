@@ -1,0 +1,83 @@
+# The phone-to-Pi trigger. EXAMPLE, not an install -- read every line first.
+#
+# This is the one piece OPSEC_SETUP.md §5 always described as procedure with no
+# tool behind it: "Phone: /recv then /depo 0.05. Pi checks Tor, allowlisted
+# chat id, rate limit." gs_telegram_pager is that, and nothing else: it pokes
+# gs_doorbell and reports a 4-hex handle back. It has no word for an address,
+# a memo, a slip or an amount, which is the whole reason it is allowed to
+# exist -- §8: "Do not 'just run a Telegram bot' that prints the memo — that
+# throws away the only reason to have a Pi."
+#
+# UNLIKE gs-doorbell.service.example THIS IS A DAEMON, and that difference is
+# the cost. gs_doorbell is one process per poke with no always-listening
+# socket. The pager holds a long-poll to Telegram over Tor for as long as it
+# runs. It listens on NOTHING -- the connection is outbound, so there is no
+# port to forward and no WAN path to WOL, which is what §8 asks for -- but it
+# is a process that is always up, and a stolen phone or bot token can reach it
+# whenever it is. §7 already scores that: they can wake and spam quotes, not
+# spend. The bound that matters is the vault's 24 h wake budget and account
+# ceiling, both in a keyfile that needs physical access to change.
+[Unit]
+Description=EXAMPLE ONLY - GhostSpiral Telegram pager (Pi side)
+# FAIL WITH THE TUNNEL, not after it. §4: "If Mullvad is down, nothing else
+# leaves the ethernet" and "If Tor is down, the bot does not start."
+After=wg-quick@wg0.service tor.service
+Requires=wg-quick@wg0.service tor.service
+
+[Service]
+Type=simple
+# NOTHING TO THE JOURNAL, for the same reason as the doorbell's unit: the
+# pager's own stdout names the job it is running and the handle it got back,
+# and the journal is persistent storage on the SD card of the box that is
+# supposed to hold nothing. Run it by hand and you still see everything.
+StandardOutput=null
+StandardError=null
+
+# DEPENDENCIES MUST BE SYSTEM-WIDE OR IN A VENV. NEVER `pip install --user`.
+# ProtectHome=yes below makes /root and /home inaccessible, and Python derives
+# its per-user site directory from $HOME -- so a --user install is invisible
+# here, gs_common's module-scope `import requests` fails, and with
+# StandardError=null the traceback goes nowhere. Same failure the vault's unit
+# has an ExecStartPre for; same fix.
+ExecStartPre=/bin/sh -c '/usr/bin/python3 -c "import requests, tenacity, nacl, socks" 2>>/var/lib/ghostspiral/pager.log || { echo "gs-telegram-pager: a Python dependency is missing or not visible under ProtectHome=yes -- see requirements.txt" >>/var/lib/ghostspiral/pager.log; exit 1; }'
+
+# THE TOKEN AND THE PASSPHRASE, IN THE ENVIRONMENT, NEVER ON ARGV.
+# /proc/<pid>/cmdline is mode 0444 and every local account can read it;
+# /proc/<pid>/environ is 0400. Point this at a root-owned 0400 file holding:
+#     GS_TG_BOT_TOKEN=123456:AA...
+#     GS_WAKE_PASSPHRASE=...
+# and understand what that costs, because it is the same trade the doorbell's
+# unit spells out: an unattended trigger turns the SEALED Pi keyfile back into
+# an effectively plaintext one, since the passphrase now sits on the same
+# unencrypted SD card. A pager you start by hand, typing the passphrase, does
+# not. If the card leaves the building in a pocket, this is the line that
+# decides what the finder gets.
+#EnvironmentFile=/etc/gs-pager.env
+
+# --chat-id is YOUR chat id, and it is not a secret -- it is an allowlist, so
+# it is fine on argv. The token is not, and there is deliberately no --token
+# flag to put it there.
+#ExecStart=/usr/bin/python3 /opt/ghostspiral/gs_telegram_pager \
+#    --key /etc/gs_wake_pi.key \
+#    --chat-id 123456789 \
+#    --state /var/lib/ghostspiral/pager_state.json
+
+Restart=on-failure
+RestartSec=30
+# A crash loop must not become a rate-limit bypass: the counters are persisted
+# to --state, so a restart reloads them rather than starting from zero.
+
+# Hardening. ProtectHome interacts with the dependency note above -- read it.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ghostspiral
+# The pager needs the LAN to send the magic packet and to serve the one job,
+# and Tor on loopback. It needs nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

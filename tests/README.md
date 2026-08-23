@@ -13,6 +13,16 @@ python3 tests/test_cli_flags.py     # every script: --help, argparse validation,
                                      # pre-network runtime checks
 python3 tests/test_ipleak.py        # IP-LEAK defences: proxy scheme, empty-dict
                                      # egress guards, localhost spoofing, fail-closed
+python3 tests/test_telegram_pager.py
+                                    # THE PAGER MAY TRIGGER, NEVER CARRY: that
+                                    #   no chat message can name a destination,
+                                    #   that a non-allowlisted chat gets NO
+                                    #   reply at all, that the token never
+                                    #   reaches argv or an error string, and --
+                                    #   driven against a REAL doorbell with a
+                                    #   fake vault -- that a finished job sends
+                                    #   back a 4-hex handle and no address,
+                                    #   memo or deposit address
 python3 tests/test_gitignore.py     # ENFORCES .gitignore covers every artifact
                                      # paranoia_mode wipes (OPSEC leak guard)
 python3 tests/test_broadcast.py     # relay loop: planned delays, shutdown mid-delay,

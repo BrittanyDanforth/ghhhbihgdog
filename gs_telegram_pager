@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""GhostSpiral Telegram pager — the phone-to-Pi trigger, and nothing more.
+
+OPSEC_SETUP.md §5 steps 1–2 have always been procedure with no tool behind
+them: "Phone: /recv then /depo 0.05 to the throwaway account. Pi checks Tor,
+allowlisted chat id, rate limit." This is that tool. Step 3 onward is
+unchanged — it pokes `gs_doorbell`, which does what it already did.
+
+WHAT THIS IS ALLOWED TO DO, taken from the design it has to fit rather than
+invented here:
+
+  * §8: "Do not 'just run a Telegram bot' that prints the memo — that throws
+    away the only reason to have a Pi." So this NEVER sends an address, a
+    memo, a slip or an amount to a chat. The most it ever says is which job
+    finished and a 4-hex handle, which is exactly what §5 step 5 describes:
+    "Telegram gets `depo ready · slip A3F1`".
+  * §8: "The only acceptable remote trigger is inbound over Tor to a Pi onion
+    service: no port forward, and no WAN path to WOL." Long-polling satisfies
+    that constraint more simply than an onion service does: the Pi makes an
+    OUTBOUND connection to Telegram and listens on nothing at all. There is no
+    inbound port to forward, so there is no WAN path to WOL either.
+  * §4: "The bot (when it exists) talks to Telegram ONLY via
+    socks5h://127.0.0.1:9050. If Tor is down, the bot does not start. Same
+    fail-closed as gs_console." Enforced at startup and on every request:
+    safe_get/safe_post abort on a falsy proxies dict, which is why they are
+    used here instead of requests directly.
+  * §8: the wake channel takes three jobs and no others, "every parameter is a
+    bounded integer or a 4-hex handle", and "there is deliberately no job that
+    takes an XMR destination". This composes params from the operator's digits
+    only; the job schema in gs_wake_proto validates them again.
+
+WHY /depo TAKES A SLOT AND NOT AN AMOUNT. §8: "the amount is an INDEX into a
+ladder that lives on the ThinkPad, so the Pi never sends a number". The Pi's
+own keyfile does not contain the ladder — checked: it holds secret,
+peer_public, target_mac, wol_broadcast, wol_port, listen_host, listen_port and
+nothing else — so the Pi genuinely cannot turn "0.05" into a slot, and a
+pager that accepted an amount would have to either carry the ladder (putting
+it on the SD card) or send a number (breaking the rule). `/depo 2` it is.
+
+WHAT A STOLEN PHONE OR BOT TOKEN GETS, stated plainly because §7 already
+scores it: they can wake the vault and spam quotes. They cannot spend, cannot
+name a destination, and cannot read a memo — the reply vocabulary here has no
+word for one. The real bound is on the ThinkPad and needs physical access to
+change: a 24 h wake budget and an account ceiling in the keyfile. The rate
+limit below is courtesy, not the backstop, and says so.
+
+NOT A DAEMON THAT HOLDS SECRETS. The keyfile passphrase is read once at
+startup from GS_WAKE_PASSPHRASE (gs_doorbell.read_passphrase's own documented
+path for a headless trigger) and the bot token from GS_TG_BOT_TOKEN or a 0400
+file. Neither is ever an argument: /proc/<pid>/cmdline is 0444 and every local
+account can read it, which is the same reason the wallet password and the BTC
+entry address were moved off command lines elsewhere in this repo.
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gs_common import (                                      # noqa: E402
+    integrity_log, install_signal_handlers, shutdown_requested,
+    isolated_proxy, safe_get, safe_post, validate_proxy, verify_tor,
+    atomic_write_json, terminal_safe,
+)
+import gs_wake_proto as proto                                # noqa: E402
+
+#: The token env var. Never a flag: see the module docstring.
+TOKEN_ENV = "GS_TG_BOT_TOKEN"
+
+#: Telegram holds the request open this long when there is nothing to say.
+#: Deliberately under gs_common.safe_get's own 20 s client timeout, so the
+#: audited helper can be reused rather than hand-rolling a request that would
+#: also have to re-implement its fail-closed proxy check.
+POLL_HOLD_S = 10
+
+#: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
+#: in a keyfile that needs physical access to change; this only stops a stolen
+#: phone from queueing pokes faster than a human would.
+DEFAULT_MIN_INTERVAL_S = 300
+DEFAULT_DAILY_CAP = 12
+
+#: A handle as gs_wake_proto defines it, anchored with \Z rather than $ because
+#: `$` also matches before a trailing newline (see gs_common's validators).
+HANDLE_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
+
+HELP = (
+    "GhostSpiral pager\n"
+    "/recv [n]   mint n receive subaddresses (1-4, default 1)\n"
+    "/depo <s>   quote a swap to ladder slot s (0-7)\n"
+    "/watch <h>  watch handle h (4 hex)\n"
+    "/status     counters only\n"
+    "\n"
+    "Addresses, memos and slips are never sent here. Read them on the vault."
+)
+
+
+#: gs_doorbell, loaded ONCE, BY PATH.
+#:
+#: Python cannot `import gs_doorbell`: the shipped tools are extensionless on
+#: purpose -- they are commands, not modules -- so the import system will not
+#: find one by name. Driving this end to end is how that turned up; tests/ load
+#: them the same way. Cached because two loads would mean two module objects
+#: with two copies of its state.
+_DOORBELL = [None]
+
+
+def doorbell():
+    import importlib.machinery
+    import importlib.util
+    if _DOORBELL[0] is None:
+        path = str(Path(__file__).resolve().parent / "gs_doorbell")
+        ld = importlib.machinery.SourceFileLoader("gs_doorbell", path)
+        spec = importlib.util.spec_from_loader(ld.name, ld)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("gs_doorbell", mod)
+        ld.exec_module(mod)
+        _DOORBELL[0] = mod
+    return _DOORBELL[0]
+
+
+def _redact(text: str) -> str:
+    """Strip anything token-shaped out of a string before it is printed.
+
+    Telegram puts the bot token in the URL PATH -- there is no header form --
+    so the token is inside every request URL and therefore inside the text of
+    any exception requests raises about one. This runs over everything that
+    reaches a terminal or the journal.
+    """
+    out = re.sub(r"\bbot\d{6,}:[A-Za-z0-9_-]{20,}", "bot<token>", str(text))
+    out = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "<token>", out)
+    return terminal_safe(out)
+
+
+def load_token(token_file: str = "") -> str:
+    """The bot token, from the environment or a 0400 file. NEVER from argv."""
+    v = os.environ.get(TOKEN_ENV, "")
+    if v:
+        return v.strip()
+    if token_file:
+        p = Path(token_file)
+        try:
+            st = p.stat()
+        except OSError as e:
+            sys.exit(f"[!] --token-file {p}: {e.strerror}")
+        if st.st_mode & 0o077:
+            sys.exit(
+                f"[!] {p} is mode {oct(st.st_mode & 0o777)}. A bot token that "
+                f"other local accounts can read is a token they can use to "
+                f"wake your vault. chmod 400 it.")
+        return p.read_text(encoding="utf-8").strip()
+    sys.exit(
+        f"[!] No bot token. Set {TOKEN_ENV} in this process's environment, or "
+        f"pass --token-file pointing at a 0400 file.\n"
+        f"    NOT on the command line: /proc/<pid>/cmdline is world-readable, "
+        f"so a token there is readable by every local account.")
+
+
+class Limits:
+    """Rate state that survives a restart, so a crash loop is not a bypass."""
+
+    def __init__(self, path: Path, min_interval: int, daily_cap: int):
+        self.path = path
+        self.min_interval = min_interval
+        self.daily_cap = daily_cap
+        self.offset = 0            # Telegram update_id cursor
+        self.last_poke = 0.0
+        self.pokes = []            # wall-clock stamps, pruned to 24 h
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            d = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(d, dict):
+            return
+        self.offset = int(d.get("offset") or 0)
+        self.last_poke = float(d.get("last_poke") or 0)
+        self.pokes = [float(x) for x in (d.get("pokes") or [])
+                      if isinstance(x, (int, float))]
+
+    def save(self) -> None:
+        atomic_write_json(
+            {"offset": self.offset, "last_poke": self.last_poke,
+             "pokes": self.pokes[-200:]}, self.path, perms=0o600)
+
+    def recent(self) -> list:
+        now = time.time()
+        self.pokes = [t for t in self.pokes if now - t < 86400]
+        return self.pokes
+
+    def why_not(self) -> str:
+        """'' if a poke is allowed, else the reason to send back."""
+        now = time.time()
+        gap = now - self.last_poke
+        if gap < self.min_interval:
+            return (f"rate limited, {int(self.min_interval - gap)}s left "
+                    f"(courtesy limit; the vault's own 24h budget is the "
+                    f"real one)")
+        if len(self.recent()) >= self.daily_cap:
+            return (f"{self.daily_cap} pokes already in the last 24h "
+                    f"(courtesy limit)")
+        return ""
+
+    def record(self) -> None:
+        now = time.time()
+        self.last_poke = now
+        self.pokes.append(now)
+        self.save()
+
+
+def parse_command(text: str) -> tuple:
+    """(job, params, error). Digits only -- never a destination, never a flag.
+
+    Telegram message text is attacker-controlled the moment the phone or the
+    token is: this reads a fixed vocabulary and a bounded integer and refuses
+    everything else, rather than passing anything through to a command line.
+    Nothing here can name an XMR address, because no job accepts one.
+    """
+    raw = (text or "").strip()
+    # A command may arrive as "/depo@mybot 2" in a group.
+    parts = raw.split()
+    if not parts:
+        return "", {}, "empty"
+    cmd = parts[0].split("@", 1)[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+    if len(parts) > 2:
+        return "", {}, "too many arguments"
+
+    if cmd in ("/help", "/start"):
+        return "", {}, "help"
+    if cmd == "/status":
+        return "", {}, "status"
+    if cmd == "/recv":
+        n = 1
+        if arg:
+            if not arg.isdigit():
+                return "", {}, "count must be a number 1-4"
+            n = int(arg)
+        if not 1 <= n <= 4:
+            return "", {}, "count must be 1-4"
+        return "receive_new", {"count": n}, ""
+    if cmd == "/depo":
+        if not arg.isdigit():
+            return "", {}, "give a ladder SLOT 0-7, not an amount"
+        s = int(arg)
+        if not 0 <= s <= 7:
+            return "", {}, "slot must be 0-7"
+        return "receive_and_quote", {"amount_slot": s}, ""
+    if cmd == "/watch":
+        if not HANDLE_RE.match(arg):
+            return "", {}, "handle must be 4 hex characters"
+        return "watch", {"handle": arg.upper()}, ""
+    return "", {}, "unknown command"
+
+
+class Pager:
+    def __init__(self, args, token: str, key: dict, proxies: dict):
+        self.args = args
+        self.token = token
+        self.key = key
+        self.proxies = proxies
+        self.limits = Limits(Path(args.state), args.min_interval,
+                             args.daily_cap)
+        self.allow = set(int(c) for c in args.chat_id)
+        self.busy = threading.Lock()
+        self.ignored = 0
+
+    # -- telegram -------------------------------------------------------
+    def _url(self, method: str) -> str:
+        return f"https://api.telegram.org/bot{self.token}/{method}"
+
+    def send(self, chat_id: int, text: str) -> None:
+        """One reply. Never carries an address, a memo or an amount."""
+        try:
+            safe_post(self._url("sendMessage"),
+                      {"chat_id": chat_id, "text": text,
+                       "disable_web_page_preview": True},
+                      proxies=self.proxies)
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [!] reply failed: {_redact(e)}")
+
+    def updates(self) -> list:
+        url = (f"{self._url('getUpdates')}?timeout={POLL_HOLD_S}"
+               f"&offset={self.limits.offset}&allowed_updates=%5B%22message%22%5D")
+        try:
+            d = safe_get(url, proxies=self.proxies)
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [!] poll failed: {_redact(e)}")
+            time.sleep(5)
+            return []
+        if not isinstance(d, dict) or not d.get("ok"):
+            return []
+        out = d.get("result")
+        return out if isinstance(out, list) else []
+
+    # -- the poke -------------------------------------------------------
+    def poke(self, chat_id: int, job: str, params: dict) -> None:
+        """Run one wake, in this process, and report only its OUTCOME.
+
+        gs_doorbell is imported rather than shelled out to: its human-facing
+        stdout is not an interface (this repo says so about JoinMarket's, and
+        about parsing a tool's output to identify a bundle), and going through
+        the module means the outcome and handle are read as values instead of
+        scraped out of prose.
+        """
+        db = doorbell()
+        try:
+            pending = db.run_wake(self.args, self.key, job, params)
+        except BaseException as e:                           # noqa: BLE001
+            integrity_log("pager", f"wake_failed:{job}")
+            self.send(chat_id, f"{job}: failed to start — {_redact(e)[:160]}")
+            return
+        out = pending.outcome()
+        integrity_log("pager", f"outcome:{job}:{out}")
+        if out == "done":
+            h = (pending.result or {}).get("handle") or "----"
+            # THE WHOLE REPLY VOCABULARY. §5 step 5: "Telegram gets
+            # `depo ready · slip A3F1`". No address, no memo, no amount.
+            self.send(chat_id, f"{job} ready · slip {h}\n"
+                               f"Read the address and memo on the vault.")
+        elif out == "refused":
+            self.send(chat_id, f"{job}: vault REFUSED. Reason is on the vault.")
+        elif out == "failed":
+            self.send(chat_id, f"{job}: vault ran it and it FAILED. "
+                               f"Reason is on the vault.")
+        elif out == "expired_uncollected":
+            self.send(chat_id, f"{job}: nothing collected it. Vault may be "
+                               f"off or without Tor. Nothing was handed over.")
+        else:
+            self.send(chat_id, f"{job}: collected but never reported back. "
+                               f"CHECK THE VAULT before poking again.")
+
+    def _worker(self, chat_id: int, job: str, params: dict) -> None:
+        try:
+            self.poke(chat_id, job, params)
+        finally:
+            self.busy.release()
+
+    # -- loop -----------------------------------------------------------
+    def handle(self, upd: dict) -> None:
+        msg = upd.get("message")
+        if not isinstance(msg, dict):
+            return
+        chat = msg.get("chat") or {}
+        cid = chat.get("id")
+        if not isinstance(cid, int) or cid not in self.allow:
+            # NOT replied to. Answering an unknown chat confirms the bot is
+            # alive to whoever found it, and the token is the only thing
+            # standing between a stranger and this loop.
+            self.ignored += 1
+            integrity_log("pager", "chat_not_allowlisted")
+            return
+        job, params, err = parse_command(msg.get("text") or "")
+        if err == "help":
+            self.send(cid, HELP)
+            return
+        if err == "status":
+            self.send(cid, f"pokes in last 24h: {len(self.limits.recent())}/"
+                           f"{self.limits.daily_cap}\n"
+                           f"ignored messages: {self.ignored}\n"
+                           f"busy: {self.busy.locked()}")
+            return
+        if err:
+            self.send(cid, f"no: {err}\n\n{HELP}")
+            return
+        why = self.limits.why_not()
+        if why:
+            self.send(cid, f"no: {why}")
+            return
+        # ONE AT A TIME. gs_doorbell binds a fixed LAN port for the window, so
+        # a second concurrent wake cannot bind and would fail confusingly --
+        # and two vaults woken at once is not a thing this design has.
+        if not self.busy.acquire(blocking=False):
+            self.send(cid, "no: a wake is already running")
+            return
+        self.limits.record()
+        integrity_log("pager", f"poke:{job}")
+        self.send(cid, f"{job}: waking the vault. This takes a while.")
+        threading.Thread(target=self._worker, args=(cid, job, params),
+                         daemon=True).start()
+
+    def run(self) -> int:
+        print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s), "
+              f"Tor only, one wake at a time.")
+        while not shutdown_requested():
+            for upd in self.updates():
+                uid = upd.get("update_id")
+                if isinstance(uid, int):
+                    # Advance the cursor BEFORE acting: a message that crashes
+                    # the handler must not be replayed on every restart.
+                    self.limits.offset = max(self.limits.offset, uid + 1)
+                    self.limits.save()
+                try:
+                    self.handle(upd)
+                except Exception as e:                       # noqa: BLE001
+                    print(f"  [!] update dropped: {_redact(e)[:200]}")
+        print("  [*] Shutdown requested.")
+        return 0
+
+
+def build_cli():
+    ap = argparse.ArgumentParser(
+        description="GhostSpiral Telegram pager (Pi side). Triggers a wake; "
+                    "never carries an address, a memo or an amount.")
+    ap.add_argument("--key", required=True,
+                    help="this Pi's keyfile, as gs_doorbell wake takes it")
+    ap.add_argument("--chat-id", action="append", required=True, type=int,
+                    help="allowlisted Telegram chat id. Repeatable. Anything "
+                         "from another chat is ignored without a reply.")
+    ap.add_argument("--token-file", default="",
+                    help=f"0400 file holding the bot token. Or set "
+                         f"{TOKEN_ENV} in this process's environment. NEVER "
+                         f"on the command line.")
+    ap.add_argument("--tor-proxy", default="socks5h://127.0.0.1:9050",
+                    help="this Pi's own Tor. OPSEC_SETUP.md section 4: the "
+                         "bot talks to Telegram ONLY through this, and does "
+                         "not start if it is down.")
+    ap.add_argument("--state", default="/var/lib/ghostspiral/pager_state.json",
+                    help="0600 file holding the update cursor and rate "
+                         "counters, so a restart is not a bypass")
+    ap.add_argument("--min-interval", type=int,
+                    default=DEFAULT_MIN_INTERVAL_S,
+                    help="courtesy seconds between pokes")
+    ap.add_argument("--daily-cap", type=int, default=DEFAULT_DAILY_CAP,
+                    help="courtesy pokes per 24h. The vault's own keyfile "
+                         "budget is the real bound.")
+    ap.add_argument("--no-jitter", action="store_true",
+                    help="passed through to the wake: skip the pre-WOL delay")
+    return ap
+
+
+def main(argv=None) -> int:
+    install_signal_handlers()
+    args = build_cli().parse_args(argv)
+    try:
+        proto.require_nacl()
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+
+    # FAIL CLOSED ON TOR, BEFORE ANYTHING ELSE. OPSEC_SETUP.md section 4: "If
+    # Tor is down, the bot does not start."
+    proxy = validate_proxy(args.tor_proxy)
+    verify_tor(proxy)
+    proxies = isolated_proxy(args.tor_proxy, "pager")
+
+    token = load_token(args.token_file)
+    key = doorbell().load_key(Path(args.key))
+
+    st = Path(args.state)
+    try:
+        st.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"[!] cannot create {st.parent}: {e.strerror}")
+
+    integrity_log("pager", "start")
+    return Pager(args, token, key, proxies).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
