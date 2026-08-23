@@ -55,6 +55,17 @@ ACTIONS = {
     "concurrency": {**suite("test_concurrency", "hash chain under parallel writers; console hangs, stdin, buffering"), "group": "Offline suites"},
     "exitland":    {**suite("test_exit_landing", "the exit must not read a wallet the last round is still landing on"), "group": "Offline suites"},
 
+    # -- the wake channel. NONE of these were reachable from this panel, so it
+    #    offered no way to run the half of the repo that decides whether a
+    #    magic packet on the switch can start a job. Added as one family
+    #    rather than adding only the newest and leaving the gap next to it. --
+    "wakeproto":   {**suite("test_wake_protocol", "the wire: replay, domain tags, one record length"), "group": "Wake channel"},
+    "wakebell":    {**suite("test_wake_doorbell", "the Pi: at-most-once handover, windows, what it may learn"), "group": "Wake channel"},
+    "wakeagent":   {**suite("test_wake_agent", "the vault: refuse before collecting, budgets, power-off"), "group": "Wake channel"},
+    "wakee2e":     {**suite("test_wake_endtoend", "both boxes, real sockets, real pairing"), "group": "Wake channel"},
+    "pager":       {**suite("test_telegram_pager", "may trigger, never carry: no destination can be typed"), "group": "Wake channel"},
+    "sealedslip":  {**suite("test_sealed_slip", "the slip reaches you and reads to nobody else"), "group": "Wake channel"},
+
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},
     "flags":       {**suite("real_flags_testnet", "fee-priority 1-4 + multi-dest fan-out", VENV_PY), "group": "Real binaries"},

@@ -50,7 +50,7 @@ and crypto_kx would add client/server role semantics to the keyfile and drop
 this file from `nacl.public` to `nacl.bindings` for a property already held.
 
 --------------------------------------------------------------------------
-EVERY RECORD IS EXACTLY 296 BYTES
+EVERY RECORD IS EXACTLY 1064 BYTES
 --------------------------------------------------------------------------
 `Box.encrypt()` is length-preserving: it returns the 24-byte nonce prepended to
 the ciphertext and its 16-byte MAC, so the wire size is len(plaintext) + 40.
@@ -63,14 +63,23 @@ real vocabulary:
 
 An observer on the switch reads the job off the length without touching the
 crypto. So every plaintext is padded with `sodium_pad` (ISO/IEC 7816-4) to
-exactly one 256-byte block, making every record on the wire 296 bytes:
+exactly one PAD_BLOCK block, making every record on the wire 1064 bytes:
 
-    24 (nonce) + 256 (padded plaintext) + 16 (MAC) = 296
+    24 (nonce) + 1024 (padded plaintext) + 16 (MAC) = 1064
 
-Verified for every inner length 0..255: the set of resulting record sizes is
-exactly {296}. sodium_pad always adds at least one byte, so an inner of 256
-would pad to 512 -- which is why `seal` REFUSES an inner over 255 rather than
+Verified for every inner length 0..1023: the set of resulting record sizes is
+exactly {1064}. sodium_pad always adds at least one byte, so an inner of 1024
+would pad to 2048 -- which is why `seal` REFUSES an inner over 1023 rather than
 silently emitting a double-length record that is itself a signal.
+
+1064, NOT THE 296 THIS SECTION SAID FOR MOST OF ITS LIFE. The block went from
+256 to 1024 to carry a sealed slip (see "THE SEALED SLIP" below), and this
+paragraph is rewritten rather than left standing, because a header that
+confidently states a number the code no longer uses is worse than no header:
+the next person sizes a field against 255 and finds out on a woken box in the
+field. The property never changed and is not smallness -- it is that there is
+exactly ONE length, so an M1, an M2, an M3 with no slip and an M3 carrying one
+are indistinguishable on the switch.
 
 What this hides and what it does not: a passive observer learns that an
 exchange happened, when, and between which two addresses. It does not learn
@@ -112,6 +121,8 @@ wipeable disk can deliver. The round trip is bounded by the ThinkPad's OWN
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import json
 import re
@@ -121,7 +132,15 @@ import time
 #: Wire version. A peer that does not recognise a tag REFUSES. There is no
 #: negotiation and no "try v1 if v2 fails" -- a downgrade path is a way to be
 #: talked back to the version whose flaw you are patching.
-WIRE_VERSION = 1
+#:
+#: 2: M3 may carry a SEALED SLIP, which took PAD_BLOCK from 256 to 1024. Both
+#: boxes must be updated together and there is no compatibility mode: an old
+#: doorbell rejects a new record on LENGTH, before any crypto, with "wake
+#: record is 1064 bytes, not 296" -- loud, immediate and impossible to
+#: misread. That is the intended failure. A silent partial upgrade, where the
+#: vault seals a slip the Pi cannot carry, is the one outcome worth ruling
+#: out, because it fails at the moment money is waiting on it.
+WIRE_VERSION = 2
 
 #: Fixed-width so the tag never changes the padded length, and so the compare
 #: is constant-length. NUL-padded to 16.
@@ -135,26 +154,80 @@ TAG_M3 = b"GSWAKE-v1-M3".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "it is done"
 #: being replayed as the other.
 TAG_PC = b"GSWAKE-v2-PC".ljust(TAG_LEN, b"\0")   # Pi -> ThinkPad   "my address"
 TAG_PV = b"GSWAKE-v2-PV".ljust(TAG_LEN, b"\0")   # ThinkPad -> Pi   "my MAC"
+#: The sealed slip. NOT a record on the wire -- it is a payload that TRAVELS
+#: inside M3 and then onward through the Pi and Telegram to a machine that
+#: holds a key neither of them has. It gets its own tag for the same reason M1
+#: and M3 do: it is sealed under a static-static box, and only a domain tag
+#: stops one kind of message being opened as another.
+TAG_SL = b"GSWAKE-v3-SL".ljust(TAG_LEN, b"\0")   # ThinkPad -> delivery machine
 
-#: One 256-byte block. See the header for why every record is the same size.
-PAD_BLOCK = 256
+#: One 1024-byte block. See the header for why every record is the same size.
+#:
+#: WAS 256, AND THE REASON IT MOVED IS THE SLIP. An M3 carrying a sealed slip
+#: measures 750 bytes of inner (tag + JSON), against 148 for the M3 that
+#: carries only a status and a handle. 256 cannot hold it and neither can 512;
+#: 1024 holds it with 273 bytes to spare, which is the same headroom argument
+#: WINDOW_BYTES makes one screen down.
+#:
+#: THE SECURITY PROPERTY IS UNIFORMITY, NOT SMALLNESS. Every record on the
+#: switch is still exactly one length, so a watcher still cannot tell an M1
+#: from an M2 from an M3, nor a job that produced a slip from one that did
+#: not -- an M3 with no slip pads to the same 1064 bytes as one with. What is
+#: given up is 768 bytes per record on a LAN that carries at most five records
+#: per wake. That is not a cost worth protecting.
+PAD_BLOCK = 1024
 #: 24-byte nonce + 16-byte MAC, measured, not assumed.
 BOX_OVERHEAD = 40
 #: The only length any record may have. Checked BEFORE any crypto runs.
-RECORD_LEN = PAD_BLOCK + BOX_OVERHEAD            # 296
+RECORD_LEN = PAD_BLOCK + BOX_OVERHEAD            # 1064
 
 #: The largest inner (tag + body) that still pads to ONE block.
 MAX_INNER = PAD_BLOCK - 1
+
+#: THE SLIP'S OWN BLOCK, and it is padded for a different reason than the
+#: records are.
+#:
+#: A record is padded so the LAN cannot tell the messages apart. A slip is
+#: padded so that the length of the base64 blob -- which travels through
+#: Telegram, in a chat, in the clear as far as Telegram is concerned -- says
+#: nothing about what is inside it. Unpadded, the blob's length is a direct
+#: readout of the memo's length, and the memo's length distinguishes a
+#: 95-character standard XMR address from a 106-character integrated one; the
+#: amount's digit count leaks the same way. Padded, every slip this repo ever
+#: emits is exactly SLIP_B64_LEN characters, whatever it holds.
+#:
+#: 384 against a measured 346-byte worst case (tag + a payload carrying a
+#: 95-char destination, a 111-char memo, a 42-char deposit address, both
+#: amounts, a timestamp and a handle).
+SLIP_PAD = 384
+#: The largest inner (tag + body) a slip may carry.
+SLIP_MAX_INNER = SLIP_PAD - 1
+#: Exactly one length, always: base64(SLIP_PAD + BOX_OVERHEAD) = base64(424).
+#: Asserted at import rather than trusted, because this number is what the
+#: doorbell length-checks an inbound slip against before it does anything else
+#: with it, and a wrong constant there is a check that passes nothing.
+SLIP_B64_LEN = 568
+if len(base64.b64encode(b"\0" * (SLIP_PAD + BOX_OVERHEAD))) != SLIP_B64_LEN:
+    raise RuntimeError(                                      # pragma: no cover
+        "SLIP_B64_LEN does not match SLIP_PAD + BOX_OVERHEAD. One of these "
+        "three numbers was edited without the others, and the doorbell "
+        "length-checks every inbound slip against SLIP_B64_LEN — so the "
+        "mismatch would present as every slip being rejected as malformed.")
 
 CHALLENGE_BYTES = 32
 JOB_ID_BYTES = 16
 #: The doorbell's per-window nonce. SIXTEEN, not thirty-two, and the reason is
 #: arithmetic rather than taste: M1 already carries a 32-byte ephemeral public
 #: key and a 32-byte challenge, each 64 hex characters, and at 32 bytes this
-#: took the inner record to 248 of the 255 that fit in one padded block. seal()
-#: refuses a longer one rather than emitting a visibly different 512-byte
+#: took the inner record to 248 of the 255 that fit in one padded block at the
+#: time. seal() refuses a longer one rather than emitting a visibly different
 #: record -- correct, but it means the next field anybody adds fails on a woken
 #: box in the field. 16 bytes leaves real headroom.
+#:
+#: PAD_BLOCK is 1024 now, so that particular squeeze is long gone and the 16
+#: is no longer load-bearing. It stays at 16 because there is nothing to gain
+#: from 32 -- see the paragraph below -- and because re-widening it would be
+#: another incompatible wire change for no property.
 #:
 #: Nothing is lost. This value is not a key and does not need to resist search:
 #: forging an M1 needs the vault's static secret, so the nonce only has to be
@@ -363,6 +436,155 @@ def open_record(recipient_secret, sender_public, record: bytes,
 
 
 # ---------------------------------------------------------------------------
+#  THE SEALED SLIP
+#
+#  WHAT THIS IS FOR, because it looks like a hole in the design until you know.
+#
+#  Every other line in this repo works to keep the deposit address and the memo
+#  ON THE VAULT. OPSEC_SETUP.md section 8 is blunt about it: "Do not 'just run a
+#  Telegram bot' that prints the memo -- that throws away the only reason to
+#  have a Pi." That rule is right, and it is not what this is.
+#
+#  The rule assumes the operator can WALK TO THE VAULT and read the slip off
+#  its screen. When they cannot -- and the vault is meant to live somewhere
+#  far away and hard to reach, which is the entire point of it -- then "read it
+#  on the vault" is not an OPSEC property, it is a dead end: the operator is
+#  told a swap is quoted and given no way to pay it. A quote they cannot act on
+#  is a quote that expires.
+#
+#  So the payload travels, and it travels SEALED TO A KEY THAT NEITHER THE PI
+#  NOR TELEGRAM HAS:
+#
+#    * sealed with Box(vault_static_secret, delivery_public) -- authenticated,
+#      so the delivery machine knows the vault wrote it and not whoever holds
+#      the bot token. NOT SealedBox: an anonymous box would let anyone who
+#      learned the delivery public key hand the operator a deposit address of
+#      their choosing, and "where do I send the BTC" is the single field in
+#      this whole system that must be authenticated.
+#    * the delivery SECRET never exists on the Pi and never exists on the
+#      vault after setup -- gs_delivery_key writes it to removable media and
+#      the operator carries it to the machine that will send the BTC.
+#    * so a seized Pi, a stolen SD card, a stolen phone, a stolen bot token
+#      and Telegram itself all get the same thing: 568 characters of base64
+#      that decrypt to nothing without a key that was never near any of them.
+#
+#  What is genuinely given up, stated plainly rather than buried: the ciphertext
+#  now exists off the vault, so an adversary who later obtains the delivery key
+#  can read any blob they kept. That is strictly more than "the slip never
+#  left", and it is the trade the operator is choosing when they set
+#  delivery_public. With no delivery_public set, nothing is sealed, nothing
+#  travels, and the old behaviour is exactly what it was.
+# ---------------------------------------------------------------------------
+def seal_slip(sender_secret, recipient_public, body: dict) -> str:
+    """Seal one slip for a machine that is not on the wake channel.
+
+    Returns base64, always exactly SLIP_B64_LEN characters.
+    """
+    public, bindings = _nacl()
+    # SYMMETRIC WITH THE READER, deliberately. open_slip goes through
+    # parse_body, which calls _refuse_floats -- so without this the vault can
+    # seal a slip that the delivery machine will refuse to open, and it fails
+    # at the machine holding the money, for a swap already quoted, on a box
+    # 500 km from the one that made the mistake. Failing HERE means the vault
+    # says so on its own terminal, seal_slip_for_delivery reports no slip, and
+    # the chat says so honestly.
+    #
+    # Nothing in a slip is fractional today: both amounts are strings (fmt_btc
+    # and str(Decimal)) and the timestamp is an int. This is about the field
+    # somebody changes the type of later, in the other tool that writes the
+    # pair record.
+    _refuse_floats(body)
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    inner = TAG_SL + raw
+    if len(inner) > SLIP_MAX_INNER:
+        # Same refusal as seal(), for a related reason: a slip twice the length
+        # of every other slip is a slip that announces something about itself
+        # in a chat window.
+        raise WakeError(
+            f"slip is {len(inner)} bytes and the format carries at most "
+            f"{SLIP_MAX_INNER}; a longer one would be visibly different in "
+            f"the chat, which is what the padding exists to prevent")
+    padded = bindings.sodium_pad(inner, SLIP_PAD)
+    box = bytes(public.Box(sender_secret, recipient_public).encrypt(padded))
+    blob = base64.b64encode(box).decode("ascii")
+    if len(blob) != SLIP_B64_LEN:                            # pragma: no cover
+        raise WakeError(
+            f"sealed slip is {len(blob)} characters, not {SLIP_B64_LEN}; "
+            f"refusing to emit a distinguishable slip")
+    return blob
+
+
+def open_slip(recipient_secret, sender_public, blob: str) -> dict:
+    """Open one sealed slip. The ONLY slip decrypt path.
+
+    Same order as open_record and for the same reasons: length first, so a
+    pasted-in blob of garbage never reaches the AEAD; then the box; then the
+    unpad; then the tag under compare_digest; then the hardened parse.
+    """
+    public, bindings = _nacl()
+    if not isinstance(blob, str):
+        raise WakeError("slip is not text")
+    blob = blob.strip()
+    if len(blob) != SLIP_B64_LEN:
+        raise WakeError(
+            f"slip is {len(blob)} characters, not {SLIP_B64_LEN}. A slip is "
+            f"one line and is never truncated, wrapped or re-typed by hand — "
+            f"paste the whole thing.")
+    try:
+        # validate=True, so base64 does not silently DISCARD characters it does
+        # not recognise. Without it a blob with a space, a newline or a chat
+        # client's smart quote in the middle decodes to something shorter and
+        # then fails at the AEAD with "it was not written by the expected
+        # peer" -- an alarming message for what is really a copy/paste fault.
+        box = base64.b64decode(blob, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise WakeError(
+            "slip is not valid base64 — something rewrote it in transit. "
+            "Copy it again straight from the message.") from e
+    # THE DECODED LENGTH, not just the encoded one. 568 characters can decode
+    # to 424, 425 or 426 bytes depending on how many "=" the tail carries, and
+    # only 424 is a slip. Without this the odd ones reach the AEAD and fail as
+    # "it was not sealed by your vault — DO NOT SEND ANY BITCOIN", which tells
+    # an operator their vault may be compromised when a character got mangled
+    # in a chat client. slip_is_wellformed already checks this; open_slip
+    # checking something weaker than the doorbell's shape test is backwards.
+    if len(box) != SLIP_PAD + BOX_OVERHEAD:
+        raise WakeError(
+            "slip decodes to the wrong size — something rewrote it in "
+            "transit. Copy it again straight from the message.")
+    try:
+        padded = public.Box(recipient_secret, sender_public).decrypt(box)
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError(
+            "slip failed to authenticate: it was not sealed by your vault, or "
+            "it was altered. DO NOT SEND ANY BITCOIN ON THE STRENGTH OF IT."
+        ) from e
+    try:
+        inner = bindings.sodium_unpad(padded, SLIP_PAD)
+    except Exception as e:                                   # noqa: BLE001
+        raise WakeError("slip padding is malformed") from e
+    if len(inner) < TAG_LEN:
+        raise WakeError("slip carries no tag")
+    if not hmac.compare_digest(inner[:TAG_LEN], TAG_SL):
+        raise WakeError("that is not a slip — it is a different kind of record")
+    return parse_body(inner[TAG_LEN:])
+
+
+def slip_is_wellformed(blob) -> bool:
+    """Is this the RIGHT SHAPE for a slip? Says nothing about whether it opens.
+
+    The doorbell needs this: it must decide whether to carry a blob it has no
+    key for, and the only honest thing it can check is the shape.
+    """
+    if not isinstance(blob, str) or len(blob) != SLIP_B64_LEN:
+        return False
+    try:
+        return len(base64.b64decode(blob, validate=True)) == SLIP_PAD + BOX_OVERHEAD
+    except (binascii.Error, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 #  Field helpers
 # ---------------------------------------------------------------------------
 def new_challenge() -> bytes:
@@ -458,6 +680,27 @@ def job_id_of(body: dict) -> str:
 #: of them.
 KEYFILE_SCHEMA = "gs_wake_v2"
 
+#: ...AND THIS IS THE NUMBER THAT ACTUALLY MAKES IT SEPARATE.
+#:
+#: The paragraph above has claimed since the format landed that the keyfile is
+#: "versioned SEPARATELY from WIRE_VERSION", and the code did not do it:
+#: lock_keyfile stamped WIRE_VERSION into the file and unlock_keyfile demanded
+#: an exact match. While WIRE_VERSION sat at 1 forever, nothing showed. The
+#: moment it moved to 2 for the sealed slip, every keyfile on both boxes became
+#: unreadable -- not because the FILE format changed (it did not; a keyfile
+#: written yesterday is byte-identical to one written today) but because a
+#: number describing the wire was being used to describe a file.
+#:
+#: The concrete cost of leaving it: upgrading both machines would demand a full
+#: re-pairing ceremony, which needs physical access to a vault that is supposed
+#: to be far away and hard to reach -- to fix nothing.
+#:
+#: 1, and it stays 1 until the FILE format changes. Existing files say
+#: "version": 1 because WIRE_VERSION was 1 when they were written, so they keep
+#: opening; that is luck, and it is why this is fixed now rather than at the
+#: next bump, when it would not be.
+KEYFILE_VERSION = 1
+
 #: Argon2id profiles, by name, recorded IN the file. A file derived under one
 #: profile must always be derived under that profile, so the reader takes the
 #: parameters from the file rather than from this table -- the table only says
@@ -550,7 +793,7 @@ def lock_keyfile(payload: dict, passphrase: bytes, kdf: str = DEFAULT_KDF,
     import nacl.utils
     if not isinstance(payload, dict):
         raise WakeError("keyfile payload must be an object")
-    head = {"schema": KEYFILE_SCHEMA, "version": WIRE_VERSION, "role": role}
+    head = {"schema": KEYFILE_SCHEMA, "version": KEYFILE_VERSION, "role": role}
     if not passphrase:
         head["kdf"] = "none"
         head["plain"] = payload
@@ -599,9 +842,9 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
             f"The v1 format was plaintext on disk and is not read any more: "
             f"pair the two boxes again, which generates a fresh key on each "
             f"of them and carries no secret between machines.")
-    if container.get("version") != WIRE_VERSION:
-        raise WakeError(f"keyfile is for wire version "
-                        f"{container.get('version')!r}, not {WIRE_VERSION}")
+    if container.get("version") != KEYFILE_VERSION:
+        raise WakeError(f"keyfile is format version "
+                        f"{container.get('version')!r}, not {KEYFILE_VERSION}")
     kdf = container.get("kdf")
     if kdf == "none":
         payload = container.get("plain")
@@ -688,12 +931,13 @@ def unlock_keyfile(container: dict, passphrase: bytes = b"") -> dict:
 #
 # See pair_sas for why the commitment step is what lets the string be short.
 
-# 3, NOT 2. Bumped when the per-window nonce was added to M1 and the pairing
-# `reveal` lost its plaintext `info` in favour of the sealed post-confirmation
-# config exchange. Both are incompatible wire changes; leaving this at 2 let a
-# new box and an old box agree to pair and then fail at wake time, which is the
-# worst place to discover it.
-PAIR_PROTO = 3
+# 4, NOT 3. Bumped at 3 when the per-window nonce was added to M1 and the
+# pairing `reveal` lost its plaintext `info` in favour of the sealed
+# post-confirmation config exchange; bumped again at 4 when PAD_BLOCK went from
+# 256 to 1024 to make room for the sealed slip. All three are incompatible wire
+# changes; leaving this number alone let a new box and an old box agree to pair
+# and then fail at wake time, which is the worst place to discover it.
+PAIR_PROTO = 4
 PAIR_MAX_LINE = 8192
 #: The ceremony runs once, with a human at both ends. Generous, but bounded:
 #: a pairing socket that waits forever is a socket someone can leave open.
@@ -949,8 +1193,9 @@ def _pair_config(sock, my_sk, peer_pub_raw: bytes, my_info: dict,
 
     Now nothing but a public key crosses before the two operators have compared
     the code, and the configuration crosses after, boxed to the key that
-    comparison authenticated. It reuses seal/open_record, so it is the same 296
-    bytes as every other record on this wire and carries a domain tag.
+    comparison authenticated. It reuses seal/open_record, so it is the same
+    RECORD_LEN bytes as every other record on this wire and carries a domain
+    tag.
 
     `first` decides who speaks: one side sends then reads, the other reads then
     sends, or they deadlock.

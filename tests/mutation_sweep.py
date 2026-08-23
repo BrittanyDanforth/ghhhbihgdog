@@ -1198,6 +1198,140 @@ MUTATIONS = [
   '    r")(?![0-9A-Za-z])")',
   '    r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z])")',
   ["test_chain_redaction"]),
+
+ # ---- THE SEALED SLIP -------------------------------------------------
+ # The slip is the one payload in this system that deliberately LEAVES the
+ # vault, so every gate around it is load-bearing in a way the rest of the
+ # wake channel's are not: what stops it is not that it stays put.
+
+ # A slip and an M3 are sealed under the same static-static box in the
+ # ThinkPad->Pi case. Only the domain tag separates them.
+ ("open_slip stops checking the domain tag, so any record of the right size "
+  "opens as a slip", "gs_wake_proto.py",
+  "    if not hmac.compare_digest(inner[:TAG_LEN], TAG_SL):",
+  "    if False:",
+  ["test_sealed_slip"]),
+
+ # The Pi has no key for a slip, so SHAPE is the only check it can make --
+ # and it has to make it, or a mangled blob reaches a chat window where the
+ # failure looks like the vault's fault.
+ ("the doorbell relays a malformed slip instead of refusing it on the "
+  "vault's own channel", "gs_doorbell",
+  "        if slip and not proto.slip_is_wellformed(slip):",
+  "        if False:",
+  ["test_sealed_slip"]),
+
+ # A refused or failed job quoted nothing. A slip attached to one is the
+ # vault contradicting itself.
+ ("the doorbell accepts a slip on a job that did not finish", "gs_doorbell",
+  "        if slip and status != \"done\":",
+  "        if False:",
+  ["test_sealed_slip"]),
+
+ # ...and the same rule on the side that WRITES it, because the doorbell's
+ # copy is the second defence, not the first.
+ ("the vault seals a slip for a job that failed or was refused",
+  "gs_wake_agent",
+  "        if status != \"done\":\n            return \"\"\n",
+  "",
+  ["test_sealed_slip"]),
+
+ # One ladder slot goes in, so one quoted pair comes out. Picking one of
+ # several deposit addresses to send money to is not a guess worth making.
+ ("the vault seals whichever quoted pair happens to be first", "gs_wake_agent",
+  "        if not isinstance(pairs, list) or len(pairs) != 1:",
+  "        if not isinstance(pairs, list) or not pairs:",
+  ["test_sealed_slip"]),
+
+ # The whole point of the feature: without this line the operator is told a
+ # swap is ready and still handed no way to pay it.
+ ("the pager never actually sends the slip it was given",
+  "gs_telegram_pager",
+  "            self.send(chat_id, slip)",
+  "            pass",
+  ["test_sealed_slip"]),
+
+ # gs_unseal is the LAST gate before real Bitcoin moves, on a different
+ # machine from the one that built the quote.
+ ("gs_unseal stops re-checking that the memo names its own destination",
+  "gs_unseal",
+  "    if not memo_binds_destination(memo, dest):",
+  "    if False:",
+  ["test_sealed_slip"]),
+
+ ("gs_unseal prints a field that can forge a line in the block being copied",
+  "gs_unseal",
+  "    if bad:",
+  "    if False:",
+  ["test_sealed_slip"]),
+
+ # The keyfile format and the wire are versioned separately -- the comment
+ # said so for months while the code stamped WIRE_VERSION into every file.
+ # Putting it back makes a wire bump silently unreadable every keyfile on
+ # both boxes, which is repaired only by a re-pairing ceremony at a vault
+ # that is deliberately far away.
+ ("the keyfile is stamped with the WIRE version again, so a wire bump bricks "
+  "every existing pairing", "gs_wake_proto.py",
+  "    head = {\"schema\": KEYFILE_SCHEMA, \"version\": KEYFILE_VERSION, "
+  "\"role\": role}",
+  "    head = {\"schema\": KEYFILE_SCHEMA, \"version\": WIRE_VERSION, "
+  "\"role\": role}",
+  ["test_sealed_slip"]),
+
+ # send() swallowing its failure was survivable while every reply was a status
+ # line. It stopped being survivable when a reply started carrying the slip:
+ # the operator sees a promise with nothing behind it, on a box they cannot
+ # walk to, and the only record is a print() the unit routes to /dev/null.
+ ("the pager treats a dropped reply as a delivered one again",
+  "gs_telegram_pager",
+  "            return False",
+  "            return True",
+  ["test_sealed_slip"]),
+
+ # `if slip and not wellformed(slip)` reads as a complete gate and is not:
+ # 0, [] and {} are falsy, so each skips validation and is stored.
+ ("the doorbell's slip gate goes back to truthiness with no type check",
+  "gs_doorbell",
+  "        if not isinstance(slip, str):",
+  "        if False:",
+  ["test_sealed_slip"]),
+
+ # terminal_safe redacts IDENTIFIERS and passes control characters through --
+ # correct for its job, not enough for a Telegram username, which is a string
+ # its owner chose and which --whoami prints to a terminal and a journal.
+ ("a sender-chosen username goes back to reaching the terminal with its "
+  "escape sequences intact", "gs_telegram_pager",
+  '_CTRL_RE = re.compile(r"[\\x00-\\x1f\\x7f-\\x9f]")',
+  '_CTRL_RE = re.compile(r"(?!x)x")',
+  ["test_telegram_pager"]),
+
+ # open_slip refuses floats (via parse_body). Without the same check on the
+ # way out, the vault can seal a slip the delivery machine will not open --
+ # and that lands at the machine holding the money, for a swap already quoted.
+ ("seal_slip and open_slip stop refusing the same things", "gs_wake_proto.py",
+  "    _refuse_floats(body)",
+  "    pass",
+  ["test_sealed_slip"]),
+
+ # 568 characters decode to 424, 425 or 426 bytes depending on the "=" tail,
+ # and only 424 is a slip. Without this the odd ones fail at the AEAD as "your
+ # vault did not seal this", sending the operator after a compromise that did
+ # not happen when a chat client mangled a character.
+ ("a mangled paste goes back to reporting itself as a compromised vault",
+  "gs_wake_proto.py",
+  "    if len(box) != SLIP_PAD + BOX_OVERHEAD:",
+  "    if False:",
+  ["test_sealed_slip"]),
+
+ # One lost POST over Tor is ordinary. Sending the operator to a vault they
+ # cannot reach because of one is the outcome this whole feature exists to
+ # avoid, and the blob is already in hand.
+ ("a single lost POST goes back to costing the whole delivery",
+  "gs_telegram_pager",
+  "            if not ok:\n                time.sleep(SLIP_RETRY_S)\n"
+  "                ok = self.send(chat_id, slip)\n",
+  "",
+  ["test_sealed_slip"]),
 ]
 
 

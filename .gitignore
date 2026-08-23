@@ -67,6 +67,19 @@ signed_blobs/
 tx_staging/
 .venv/
 
+# WAKE AND DELIVERY KEYFILES. Not artifacts -- paranoia_mode deliberately does
+# NOT sweep these, because wiping the operator's only delivery key destroys
+# every future slip and a wake pairing is a two-box ceremony to rebuild. So
+# they are here on their own footing rather than by the lockstep rule above.
+#
+# The reason they need an entry at all: gs_delivery_key's --out defaults to a
+# BARE RELATIVE NAME, so an operator who runs it from a checkout writes a
+# sealed X25519 secret into the working tree. It is Argon2id-sealed, which is
+# not a reason to publish it.
+gs_delivery.key
+gs_wake_*.key
+*.key
+
 # The wallet password, written 0600 by airgap_tx_signer because a password on
 # argv is world-readable via /proc/<pid>/cmdline. Deleted in a finally; a
 # SIGKILL leaves it, and it must never be committed if it does.

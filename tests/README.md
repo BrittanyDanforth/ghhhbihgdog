@@ -85,8 +85,27 @@ python3 tests/test_wake_protocol.py # THE WAKE WIRE FORMAT: the Pi->vault job
                                     #   M2 is sealed to a per-boot ephemeral,
                                     #   M1/M3 are separated by a domain tag,
                                     #   and every record is padded to exactly
-                                    #   296 bytes so the job cannot be read off
-                                    #   the wire by length (76/91/100 before)
+                                    #   1064 bytes so the job cannot be read
+                                    #   off the wire by length (76/91/100
+                                    #   before). 1064, not the 296 this line
+                                    #   used to say: the block went 256->1024
+                                    #   to fit a sealed slip, and uniformity
+                                    #   rather than smallness is the property
+python3 tests/test_sealed_slip.py   # THE SLIP MUST REACH THE OPERATOR AND
+                                    #   READ TO NOBODY ELSE. "Read it on the
+                                    #   vault" assumes you can get to the
+                                    #   vault; when you cannot, a quote you
+                                    #   cannot pay just expires. So the payload
+                                    #   travels sealed to a key neither the Pi
+                                    #   nor Telegram has. Driven both ways: it
+                                    #   opens on the delivery machine with
+                                    #   every field intact, and the doorbell's
+                                    #   whole state and the entire chat are
+                                    #   SEARCHED for the address, the memo and
+                                    #   the amount. Plus the one that is easy
+                                    #   to forget -- a slip is AUTHENTICATED,
+                                    #   so whoever holds the bot token cannot
+                                    #   hand you a deposit address of theirs
 python3 tests/test_wake_agent.py    # THE VAULT AGENT: a TABLE asserting the
                                     #   machine powers off on every refusal.
                                     #   Fail-closed elsewhere means sys.exit;
