@@ -3003,6 +3003,22 @@ def accept_floor(target: Decimal, tolerance: Decimal) -> Decimal:
 #  Swap-memo binding: the ONLY thing tying a BTC deposit to your XMR address
 # ---------------------------------------------------------------------------
 
+def instruction_field_safe(value) -> bool:
+    """True if `value` can be printed into a copy-paste instruction block.
+
+    Everything in the SENDER INSTRUCTIONS block is attacker-influenced: the
+    deposit address, the memo, the amounts and the expected return all come
+    back from a quote and are re-read later out of an ordinary JSON file. A
+    control character in ANY of them forges a line in a block whose whole
+    purpose is to be copied verbatim and paid.
+
+    The memo hole is closed at its own gate (see _memo_fields_bind); this is
+    the same rule for the fields that have no gate of their own, so a second
+    field cannot be used the way the memo was.
+    """
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in str(value))
+
+
 def memo_binds_destination(memo: str, dest: str) -> bool:
     """Does this swap memo actually route the output to `dest`?
 
@@ -3081,7 +3097,32 @@ def _memo_fields_bind(memo: str, dest: str) -> bool:
     block a real swap, while accepting a non-XMR asset is how the BTC.BTC case
     above got through.
     """
-    parts = str(memo).strip().split(":")
+    raw = str(memo)
+    # ONE LINE OF PRINTABLE ASCII, CHECKED BEFORE ANY FIELD IS READ.
+    #
+    # This function splits on ':' and reads fields 0, 1 and 2. EVERYTHING after
+    # the destination field is unexamined -- so a memo that binds perfectly can
+    # carry its own forged continuation, and every caller prints the memo
+    # verbatim into a copy-paste block it tells the operator to hand to a BTC
+    # sender. Driven through the real thor_swap_preparer CLI:
+    #
+    #   =:XMR.XMR:<OURS>:0/1/0\n  [!] CORRECTION - the vault above rotated.
+    #     Use this instead:\n    To address:   <attacker BTC>\n
+    #     With memo:    =:XMR.XMR:<attacker XMR>:0/1/0\n    Ignore the
+    #     previous block.
+    #
+    # -> binds True, and the operator is looking at two "To address:" lines
+    # with an instruction to use the second. The newline sits in parts[3],
+    # which nothing here ever looked at.
+    #
+    # Nothing legitimate is refused: this value goes into a Bitcoin OP_RETURN,
+    # which cannot carry a control character in the first place. My own first
+    # attempt at this attack put the newline directly after the destination,
+    # which breaks the bind -- that is why an earlier pass concluded, wrongly,
+    # that the memo could not be used to inject.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw):
+        return False
+    parts = raw.strip().split(":")
     if len(parts) < 3:
         return False
     if parts[0].strip().lower() not in _THOR_SWAP_OPS:

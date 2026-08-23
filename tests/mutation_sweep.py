@@ -1127,6 +1127,26 @@ MUTATIONS = [
   "    _baddr = [] and [i for i, p in enumerate(matched)",
   ["test_receive_watch"]),
 
+ # _memo_fields_bind reads fields 0..2, so a newline in field 3 rides through a
+ # PERFECT bind and forges a second "To address:" line in the copy-paste block
+ # every caller prints. Driven through the real thor CLI as a subprocess.
+ ("a memo that binds can still forge the sender instructions", "gs_common.py",
+  "    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw):\n"
+  "        return False\n",
+  "",
+  ["test_opsec_guarantees"]),
+
+ # The manifest hash is unkeyed and sits beside the blob it covers, so it
+ # cannot catch a tampered blob; wallet-cli decodes the blob and is the only
+ # decoder available offline, and its confirmation is auto-answered "y".
+ ("the signer stops cross-checking what wallet-cli says it signed",
+  "airgap_tx_signer",
+  "            _check_wallet_cli_agrees(\n"
+  '                (result.stdout or "") + (result.stderr or ""),\n'
+  "                _plan_destinations(plan, idx), idx)",
+  "            pass",
+  ["test_signer_schema"]),
+
  # ---- fixes that shipped in 9da2e24 with NO anchor at all --------------
  # Reverting either of these left all 33 suites green, so nothing stopped a
  # later edit from quietly undoing them.

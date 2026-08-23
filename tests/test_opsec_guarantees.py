@@ -292,6 +292,59 @@ for _label, _memo in (("a plain other address", f"=:XMR.XMR:{_ATK}:0/1/0"),
 check("memo: the destination is matched EXACTLY, not by prefix",
       gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}extra:0", _OURS) is False)
 
+# ---------------------------------------------------------------------------
+# A MEMO THAT BINDS CORRECTLY COULD STILL FORGE THE SENDER INSTRUCTIONS.
+#
+# _memo_fields_bind splits on ':' and reads fields 0, 1 and 2. EVERYTHING after
+# the destination is unexamined -- so a newline in field 3 rides through a
+# perfect bind and into the copy-paste block every caller prints. Driven
+# through the real thor_swap_preparer CLI as a subprocess before the fix, the
+# operator saw:
+#
+#     To address:   <honest>
+#     With memo:    =:XMR.XMR:<OURS>:0/1/0
+#     [!] CORRECTION - the vault above rotated. Use this instead:
+#     To address:   <attacker BTC>
+#     With memo:    =:XMR.XMR:<attacker XMR>:0/1/0
+#     Ignore the previous block.
+#
+# An earlier pass concluded this was impossible because it put the newline
+# directly AFTER the destination, which breaks the bind. Field 3 is the hole.
+# Nothing legitimate is lost: the value goes into a Bitcoin OP_RETURN, which
+# cannot carry a control character.
+# ---------------------------------------------------------------------------
+_INJ = (f"=:XMR.XMR:{_OURS}:0/1/0\n  [!] CORRECTION - the vault above rotated. "
+        f"Use this instead:\n    To address:   bc1qEVIL\n    Ignore the previous "
+        f"block.")
+check("memo: a memo that BINDS but carries a newline in a trailing field is "
+      "refused", gs.memo_binds_destination(_INJ, _OURS) is False)
+check("memo: ...and so is its hex-encoded form, which decodes to the same "
+      "thing", gs.memo_binds_destination(_INJ.encode().hex(), _OURS) is False)
+for _lbl, _ch in (("carriage return", "\r"), ("tab", "\t"),
+                  ("vertical tab", "\x0b"), ("form feed", "\x0c"),
+                  ("NUL", "\x00"), ("DEL", "\x7f")):
+    check(f"memo: refuses a {_lbl} in a trailing field",
+          gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}:0/1/0{_ch}x", _OURS)
+          is False)
+# NON-VACUITY: the ordinary memos must still bind, or this refuses every swap.
+check("memo: NON-VACUITY - the ordinary memo still binds",
+      gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}:0/1/0", _OURS) is True)
+check("memo: NON-VACUITY - the bare form still binds",
+      gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}", _OURS) is True)
+check("memo: NON-VACUITY - the hex form still binds",
+      gs.memo_binds_destination(f"=:XMR.XMR:{_OURS}:0/1/0".encode().hex(),
+                                _OURS) is True)
+
+# The fields with no gate of their own get the same rule at the print sites.
+check("instruction_field_safe accepts an ordinary value",
+      gs.instruction_field_safe("0.05") is True)
+check("...and refuses one carrying a line break",
+      gs.instruction_field_safe("0.05\n  To address: bc1qEVIL") is False)
+for _tool, _needle in (("thor_swap_preparer", "instruction_field_safe"),
+                       ("receive_watch", "instruction_field_safe")):
+    check(f"{_tool} checks every field it prints for the sender",
+          _needle in open(os.path.join(REPO, _tool)).read())
+
 # THE ASSET CHECK NEEDS OUR OWN ADDRESS IN THE DEST FIELD TO BE EXERCISED AT
 # ALL. The "wrong asset" case above puts the ATTACKER there, so the
 # destination comparison rejects it whether or not the asset is checked --

@@ -901,6 +901,87 @@ def phase_create(args, plan: List[dict], meta: dict = None):
     print(f"  [+] Unsigned TXs ready in {outdir}/ — run phase sign to continue.")
 
 
+def _plan_destinations(plan: List[dict], idx: int) -> list:
+    """Every address THIS plan entry is supposed to pay, in full form.
+
+    The manifest's own "dst" is scrub_address()'d, so it cannot be used for
+    this: the PLAN carries the full addresses, and the plan is what
+    plan_fingerprint covers.
+    """
+    if not isinstance(plan, list) or idx < 0 or idx >= len(plan):
+        return []
+    tx = plan[idx] if isinstance(plan[idx], dict) else {}
+    out = []
+    dests = tx.get("destinations")
+    if isinstance(dests, list):
+        out += [d.get("address", "") for d in dests if isinstance(d, dict)]
+    elif tx.get("dst"):
+        out.append(tx.get("dst"))
+    ct = tx.get("consume_to")
+    if isinstance(ct, str) and ct:
+        out.append(ct)
+    return [a for a in out if isinstance(a, str) and a]
+
+
+#: A Monero address as it appears in wallet-cli's own output: 95 standard or
+#: subaddress, 106 integrated.
+_XMR_ADDR_IN_TEXT = re.compile(r"[1-9A-HJ-NP-Za-km-z]{95,106}")
+
+
+def _check_wallet_cli_agrees(out_text: str, expected: list, idx: int) -> None:
+    """Refuse if wallet-cli says it is paying somewhere the PLAN does not.
+
+    THE ONE THING THAT CAN DECODE THE BLOB IS WALLET-CLI ITSELF.
+
+    The unsigned tx set is opaque hex here. The only value covering it is the
+    manifest entry's sha256 -- which is UNKEYED and stored in the same
+    directory as the file it covers, so anyone who can write that directory
+    rewrites both and both checks still pass. plan_fingerprint does not help:
+    it covers plan.json, which such an attacker need not touch. Demonstrated
+    end to end against this tool: blob swapped, entry hash recomputed,
+    plan.json untouched, fingerprint unchanged -- and it signed.
+
+    wallet-cli decodes the set and prints the destinations before it asks "Is
+    this okay?", a prompt this tool auto-answers "y". So its output is a
+    decoder we already have: whatever the blob really pays, wallet-cli names
+    it. Cross-checking that against the fingerprint-covered plan closes the
+    loop the hash cannot.
+
+    Fail-closed only on a POSITIVE disagreement -- addresses were found and
+    ours is not among them. If no full address appears at all (a wallet-cli
+    build that abbreviates, or a format this does not recognise) that is not
+    evidence of tampering, so it warns and records instead of refusing: a
+    check that bricks legitimate signing on a formatting change would be
+    removed by the next operator who hits it, and then nothing would be left.
+    """
+    if not expected:
+        return
+    seen = set(_XMR_ADDR_IN_TEXT.findall(out_text or ""))
+    if not seen:
+        integrity_log_once("signer", "wallet_cli_dest_unparsed")
+        print(f"  [!] TX {idx}: could not read a destination out of "
+              f"monero-wallet-cli's output, so what it signed was NOT "
+              f"cross-checked against the plan.")
+        print(f"      The manifest hash detects corruption, not tampering -- "
+              f"it sits next to the file it covers. Treat the staging "
+              f"directory as trusted media.")
+        return
+    missing = [a for a in expected if a not in seen]
+    if missing:
+        integrity_log("signer", "wallet_cli_dest_mismatch")
+        sys.exit(
+            f"[!] TX {idx}: monero-wallet-cli decoded this unsigned transaction "
+            f"and did NOT\n"
+            f"    name the destination the plan says it pays.\n"
+            f"    plan expects : {', '.join(scrub_address(a) for a in missing)}\n"
+            f"    wallet-cli saw: "
+            f"{', '.join(scrub_address(a) for a in sorted(seen))}\n"
+            f"    The unsigned blob does not match the plan it was created from.\n"
+            f"    Its manifest hash cannot catch this -- the hash is stored beside\n"
+            f"    the blob, so anything that rewrote one rewrote the other.\n"
+            f"    REFUSING TO SIGN. Re-run --phase create from the plan.")
+
+
 def _load_signing_manifest(outdir, plan: list) -> list:
     """Load the unsigned manifest and prove it still describes THIS plan.
 
@@ -1406,6 +1487,13 @@ def phase_sign(args, plan: List[dict]):
                 timeout=120, cwd=work_dir,
                 input=f"{args.wallet_password or ''}\n" + "y\n" * 3,
             )
+
+            # WHAT WALLET-CLI SAYS IT SIGNED, against what the plan says.
+            # See _check_wallet_cli_agrees: the manifest hash cannot catch a
+            # blob swap, and this is the only decoder available offline.
+            _check_wallet_cli_agrees(
+                (result.stdout or "") + (result.stderr or ""),
+                _plan_destinations(plan, idx), idx)
 
             # sign_transfer creates signed_monero_tx in the working directory
             signed_out = Path(work_dir) / "signed_monero_tx"

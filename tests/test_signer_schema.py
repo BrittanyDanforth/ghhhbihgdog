@@ -345,4 +345,73 @@ ck("...and its refusal is reachable, i.e. the result is actually branched on",
 ck("...and the refusal says the erase is unrecoverable",
    "cannot be recovered" in _src)
 
+# ===========================================================================
+# THE MANIFEST HASH CANNOT CATCH A TAMPERED BLOB, AND NOTHING ELSE LOOKED.
+#
+# The unsigned tx set is opaque hex to this tool. The only value covering it is
+# the manifest entry's sha256 -- UNKEYED and stored in the same directory as
+# the file it covers -- so anyone who can write that directory rewrites both
+# and both checks still pass. plan_fingerprint does not help: it covers
+# plan.json, which such an attacker need not touch. Demonstrated end to end:
+# blob swapped, entry hash recomputed, plan.json untouched, fingerprint
+# unchanged, and it signed. wallet-cli's own spend confirmation, the last place
+# a human could see the real destination, is auto-answered with "y\n" * 3.
+#
+# wallet-cli DECODES the set and prints the destinations before that prompt, so
+# its output is a decoder we already have. Cross-checking it against the
+# fingerprint-covered plan closes the loop the hash cannot.
+# ===========================================================================
+_HON = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+_EVIL = "47BDEBFVTx8DwkcmD3isorD69HXCwxk8WU56eb9dp9k9hE1sjbYgFHV2rtXChvDWDFhhYYxBGWqxRZz4g7BBFCVqHUhQ5Fe"
+_plan1 = [{"src_index": 3, "dst": _HON, "amt": "1.5"}]
+
+ck("the full destination is taken from the PLAN, not the scrubbed manifest",
+   a._plan_destinations(_plan1, 0) == [_HON])
+ck("...and a multi-destination fan-out yields every address",
+   sorted(a._plan_destinations(
+       [{"destinations": [{"address": _HON}, {"address": _EVIL}]}], 0))
+   == sorted([_HON, _EVIL]))
+ck("...and consume_to is included, because it is paid too",
+   _EVIL in a._plan_destinations([{"dst": _HON, "consume_to": _EVIL}], 0))
+ck("an out-of-range idx yields nothing rather than raising",
+   a._plan_destinations(_plan1, 99) == [])
+
+
+def _agrees(out_text, plan=_plan1, idx=0):
+    import io, contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            a._check_wallet_cli_agrees(out_text, a._plan_destinations(plan, idx), idx)
+        return "ALLOWED", buf.getvalue()
+    except SystemExit as e:
+        return "REFUSED", str(e)
+
+
+ck("wallet-cli naming the plan's own destination signs",
+   _agrees(f"Sending 1.500000000000 XMR to {_HON}\nIs this okay?  (Y/Yes/N/No): ")[0]
+   == "ALLOWED")
+ck("wallet-cli naming SOMEONE ELSE -- the tampered blob -- is REFUSED",
+   _agrees(f"Sending 1.500000000000 XMR to {_EVIL}\nIs this okay?")[0] == "REFUSED")
+ck("...and the refusal says the manifest hash cannot catch it",
+   "stored beside" in _agrees(f"Sending to {_EVIL}")[1])
+# A change address alongside ours must not be mistaken for a mismatch.
+ck("ours plus a change address still signs",
+   _agrees(f"Sending to {_HON}, change to {_EVIL}")[0] == "ALLOWED")
+# FAIL-OPEN ONLY WHERE IT MUST: an unrecognised format is not evidence.
+_st, _msg = _agrees("Transaction successfully signed to file signed_monero_tx")
+ck("an output with no full address does NOT refuse, because a formatting "
+   "change must not brick signing", _st == "ALLOWED")
+ck("...but it says the signature was not cross-checked", "NOT" in _msg)
+ck("...and it tells the operator the hash detects corruption, not tampering",
+   "corruption, not tampering" in _msg)
+ck("an entry the plan has no destinations for is not second-guessed",
+   _agrees(f"Sending to {_EVIL}", plan=[{}], idx=0)[0] == "ALLOWED")
+_sg = open(os.path.join(REPO, "airgap_tx_signer")).read()
+ck("the cross-check is actually wired into the signing loop",
+   "_check_wallet_cli_agrees(" in _sg
+   and _sg.count("_check_wallet_cli_agrees(") >= 2)
+ck("...and it reads BOTH streams, since wallet-cli's prompt may be on either",
+   "(result.stdout or \"\") + (result.stderr or \"\")" in _sg)
+
 print(f"\n{P} passed, {F} failed"); sys.exit(1 if F else 0)
