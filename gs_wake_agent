@@ -232,12 +232,59 @@ def post_record(url: str, path: str, record: bytes, timeout: int = 30) -> tuple:
     req.add_header("Content-Type", "application/octet-stream")
     req.add_header("Content-Length", str(len(record)))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _no_redirect_opener().open(req, timeout=timeout) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, b""
     except Exception:                                        # noqa: BLE001
         return 0, b""
+
+
+_OPENER = [None]
+
+
+def _no_redirect_opener():
+    """An opener that REFUSES redirects instead of following them.
+
+    THE VAULT TALKS TO THE DOORBELL ON THE LAN AND TO NOTHING ELSE, and
+    post_record was the hole in that. urllib.request.urlopen installs a
+    HTTPRedirectHandler by default and this request carries no proxy -- so a
+    doorbell answering 302 (a compromised Pi, or whatever answers on that
+    address) sent the vault off to any host it named, off the LAN entirely and
+    outside the Mullvad-then-Tor path §4 exists to enforce.
+
+    WHAT IT DOES AND DOES NOT DO, measured rather than assumed, because the
+    first description of this defect overstated it. urllib turns a redirected
+    POST into a GET, so the RECORD IS NOT RE-SENT -- driven against a real
+    redirector, the second server saw a zero-length request. The record is
+    also a sealed box, so its content would not open even if it did arrive.
+
+    What actually leaks is the contact itself: this machine exists, it is
+    awake right now, and it will reach out to an address a third party chose.
+    From a box whose whole design is to be off, unreachable, and to speak to
+    exactly one peer on the LAN, that is worth closing on its own -- and
+    /window is a request whose ANSWER this code then trusts as a wake window,
+    which a redirected fetch would let someone else supply.
+
+    Refusing rather than ignoring: a doorbell that redirects is not a doorbell
+    this protocol has, and post_record's caller already reads a non-200 as
+    "unreachable", which is the correct reading of one.
+
+    Built lazily, INSIDE the function, because the class has to subclass
+    something from urllib and this module keeps urllib out of its import path
+    on purpose. The first version put the class at module scope and referenced
+    a helper defined below it -- a NameError at import, which py_compile does
+    not catch and which would have bricked every wake.
+    """
+    if _OPENER[0] is None:
+        import urllib.request
+
+        class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        _OPENER[0] = urllib.request.build_opener(_RefuseRedirect)
+    return _OPENER[0]
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +777,46 @@ def run_once(args, deps: dict = None) -> tuple:
                       "is nothing to bind this note to. Nothing was handed "
                       "over, so the job is still waiting.")
 
+    # --dry-run STOPS HERE, AND THE REASON IS THAT M1 IS NOT A QUESTION.
+    #
+    # Driven, before this existed: `--dry-run` sent a real M1, the doorbell
+    # handed the job over -- consuming its at-most-once handover -- and the
+    # agent went on to run create_receive_wallet and thor_swap_preparer FOR
+    # REAL, minting a wallet and quoting a live swap over Tor. Its own --help
+    # said "do everything except run a job and power off", and OPSEC_SETUP
+    # tells the operator to use it to confirm the pairing before relying on
+    # the machine. The one command described as safe was the one that spent a
+    # wake and a job.
+    #
+    # There is no way to ask the doorbell "would you hand me a job?" without
+    # taking it: at-most-once is a property of the handover, and that is
+    # correct. So the dry run stops one line before the question.
+    #
+    # WHAT IT STILL PROVES, and this is most of what actually breaks: the
+    # keyfile loads and is 0400, preflight passes (deadman armed, no removable
+    # disk, disk and RAM fine, inside the wipe roots), Tor is up, the doorbell
+    # is reachable at the address in the keyfile, and it answered with a
+    # well-formed wake window.
+    #
+    # WHAT IT DOES NOT PROVE, said out loud rather than implied: that the two
+    # keyfiles are a matched pair. That takes a real M1, which takes a real
+    # job. The first genuine poke is the test of that, and it is one the
+    # operator can watch.
+    if args.dry_run:
+        agent_say("  [+] Dry run: keyfile, preflight, Tor and the doorbell "
+                  "all check out.")
+        agent_say(f"      The doorbell answered at {key['doorbell_url']} with "
+                  f"a {len(window)}-byte wake window.")
+        agent_say("      NOT proven: that the two keyfiles are a matched "
+                  "pair. Testing that needs a real")
+        agent_say("      note, and a real note TAKES THE JOB — the handover "
+                  "is at-most-once. So this")
+        agent_say("      stops here rather than spending your poke to tell "
+                  "you it worked.")
+        raise Refused("dry_run",
+                      "dry run complete; nothing was collected and nothing "
+                      "ran.", power=False)
+
     m1 = proto.seal(tp_sk, pi_pk, proto.TAG_M1,
                     {"eph_pk": eph.public_key.encode().hex(),
                      "challenge": challenge.hex(),
@@ -756,16 +843,19 @@ def run_once(args, deps: dict = None) -> tuple:
         # boot-and-die tell. It does NOT make this look like a job boot -- a
         # real job waits 5-20 min of jitter before it starts anything -- and
         # neither this comment nor the table in OPSEC_SETUP.md claims it does.
-        # Skipped under --dry-run: that is run by hand, and three minutes of
-        # silence in front of an operator reads as a hang, not as opsec.
         #
         # This block is the fix for a defect in the first version of this
         # file: NO_JOB_DWELL_LO_S/HI_S were declared, documented in the doc's
         # threat table, and never called. Dead constants that look like a
         # feature are worse than no feature, because the operator plans around
         # them.
-        if not args.dry_run:
-            _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))
+        #
+        # THERE IS NO --dry-run GUARD HERE ANY MORE, and its absence is the
+        # point. It read `if not args.dry_run:` -- correct when a dry run
+        # reached this line, and unreachable now that a dry run stops before
+        # M1 is ever sent. A dead guard is the same defect as a dead constant
+        # in the other direction: it reads as a case that is handled.
+        _sleep(_rng.randint(NO_JOB_DWELL_LO_S, NO_JOB_DWELL_HI_S))
         raise Refused("no_job",
                       "the doorbell answered, and it has no job for this boot. "
                       "That is what a magic packet from anyone on the switch "
@@ -1131,6 +1221,30 @@ def _dispatch(job, params, key, artifact_dir, handle, runner, job_id) -> tuple:
         else:
             agent_say(f"  [i] Step {i + 1} output -> {_jl} (0600, wiped with "
                       f"the artifacts).")
+        # SOMEBODY SAT DOWN. Checked BETWEEN steps, not only at preflight.
+        #
+        # The inhibit file means "a person is using this machine", and the
+        # moment a person reaches for it is the moment they walk up to a
+        # running vault -- which is to say, mid-job. Read once at preflight it
+        # could only ever catch someone who was already there before the wake,
+        # so the case it was written for was the one it could not see: the job
+        # ran to completion and powered the box off under them.
+        #
+        # Between steps rather than mid-step: a tool that is already running
+        # gets to finish, because killing thor_swap_preparer halfway leaves a
+        # quote nobody knows about. What it does not get is the NEXT tool, or
+        # the power-off -- Refused(power=False) skips that and disarms the
+        # deadman, exactly as preflight's copy does.
+        _inh = artifact_dir / INHIBIT_FILE
+        if _inh.exists():
+            integrity_log("wake", "inhibited_mid_job")
+            _save_handles(artifact_dir, handles)
+            raise Refused(
+                "inhibited",
+                f"{_inh} appeared while this job was running, so somebody is "
+                f"at the machine. Stopping before step {i + 1} and NOT "
+                f"powering off. Anything already finished is in the artifact "
+                f"directory; remove the file when you are done.", power=False)
         rc, hard = run_child(argv, env_extra, budget, runner=runner,
                              log_path=None if _watched else _jl)
         # A STATUS PROBE THAT FINDS NOTHING HAS NOT FAILED, and this branch is
@@ -1413,9 +1527,12 @@ def build_cli() -> argparse.ArgumentParser:
         description="Collect one job from the doorbell, run it, power off.")
     ap.add_argument("--key", required=True, help="the ThinkPad keyfile (0400)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="do everything except run a job and power off. Use "
-                         "this once, by hand, to confirm the pairing before "
-                         "you rely on the machine turning itself off.")
+                    help="check the keyfile, preflight, Tor and that the "
+                         "doorbell answers — then STOP, without asking for a "
+                         "job and without powering off. It cannot ask: the "
+                         "handover is at-most-once, so asking takes the job. "
+                         "It therefore does not prove the two keyfiles are a "
+                         "matched pair; the first real poke does that.")
     return ap
 
 

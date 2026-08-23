@@ -67,6 +67,7 @@ ACTIONS = {
     "sealedslip":  {**suite("test_sealed_slip", "the slip reaches you and reads to nobody else"), "group": "Wake channel"},
     "plainslip":   {**suite("test_plain_slip", "the phone-only path: real address in chat, honest status"), "group": "Wake channel"},
     "depowizard":  {**suite("test_depo_wizard", "interactive /depo: conversation state that stays bounded"), "group": "Wake channel"},
+    "listedbugs":  {**suite("test_listed_bugs", "four defects that were found, listed, and then not fixed"), "group": "Wake channel"},
 
     # -- suites that drive real monero binaries on an isolated testnet --
     "roundtrip":   {**suite("real_roundtrip_testnet", "full cold-signing round-trip", VENV_PY), "group": "Real binaries"},

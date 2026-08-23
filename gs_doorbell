@@ -62,6 +62,7 @@ import re
 import socket
 import stat
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -86,6 +87,90 @@ PRE_WOL_MAX_S = 900
 
 class Doorbell(Exception):
     """Refusal. The message reaches a terminal and the Pi's journal."""
+
+
+#: How many connections may be open at once. THE THREAD COUNT, not the request
+#: rate: ThreadingHTTPServer starts a thread per connection and this box is a
+#: 1 GB Pi with Tor already resident.
+#:
+#: The 20 s socket timeout on the handler bounds how LONG each connection
+#: lives and says nothing about how MANY exist -- so any host on the switch
+#: could open connections faster than they time out and hold a thread stack
+#: apiece, for the whole ten-minute wake window, against a machine whose only
+#: job is to survive until the vault collects.
+#:
+#: Eight is far above what this protocol uses. One wake is one vault making
+#: three sequential requests (/window, /wake, /result), so the honest working
+#: set is ONE; eight leaves room for a retry racing a stale connection and for
+#: the operator's own curl, and still bounds the damage at eight threads.
+MAX_CONNECTIONS = 8
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that refuses rather than growing without limit.
+
+    Over the cap the connection is CLOSED IMMEDIATELY, without a response and
+    without starting a thread. A 503 would be a courtesy to whoever is doing
+    this and a second thing to write; the vault reads any failure to reach the
+    doorbell as "unreachable" and retries the whole wake, which is the correct
+    behaviour on its side and does not need help from here.
+
+    daemon_threads so a stuck connection can never hold the process open past
+    the wake window -- the window is the thing that bounds a poke, and a
+    non-daemon thread would outlive it.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._live = 0
+        self._live_lock = threading.Lock()
+        #: Counted, so report() can tell the operator this happened rather
+        #: than leaving a silent refusal that reads as a flaky network.
+        self.refused_connections = 0
+
+    def process_request(self, request, client_address):
+        with self._live_lock:
+            over = self._live >= MAX_CONNECTIONS
+            if not over:
+                self._live += 1
+        if over:
+            self.refused_connections += 1
+            # THE SOCKET IS CLOSED DIRECTLY, not through shutdown_request.
+            # shutdown_request calls close_request, which is where the
+            # decrement lives -- so routing the over-cap path through it would
+            # decrement a counter this connection never incremented, and the
+            # cap would leak upward one refused connection at a time until it
+            # bounded nothing.
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # The thread never started, so close_request will never run for
+            # this one. Give the slot back here or the cap ratchets down.
+            with self._live_lock:
+                self._live -= 1
+            raise
+
+    def close_request(self, request):
+        # Runs at the end of EVERY handled connection: ThreadingMixIn's
+        # process_request_thread calls shutdown_request in its finally, and
+        # that calls this. So it sees the clean exit and the crashed one
+        # alike, which is why the decrement lives here and not in the handler.
+        try:
+            super().close_request(request)
+        finally:
+            with self._live_lock:
+                self._live -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +1079,7 @@ def run_wake(args, key: dict, job: str, params: dict,
     # proven you can answer: a vault that boots, finds nobody listening and
     # shuts down has burned a boot and told the operator nothing useful.
     factory = server_factory or (
-        lambda addr, handler: ThreadingHTTPServer(addr, handler))
+        lambda addr, handler: BoundedHTTPServer(addr, handler))
     try:
         srv = factory((key["listen_host"], int(key["listen_port"])),
                       make_handler(pending))

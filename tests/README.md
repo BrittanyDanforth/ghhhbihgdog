@@ -134,6 +134,23 @@ python3 tests/test_depo_wizard.py   # INTERACTIVE /depo. `/depo 2` still works;
                                     #   form. Plus: it CANNOT name an amount,
                                     #   because the Pi has never held the
                                     #   ladder
+python3 tests/test_listed_bugs.py   # FOUR DEFECTS THAT WERE FOUND, WRITTEN
+                                    #   DOWN, AND THEN NOT FIXED. What they
+                                    #   have in common is not a subsystem —
+                                    #   it is that a known defect sits in a
+                                    #   repo indefinitely if nothing red ever
+                                    #   points at it. post_record followed
+                                    #   redirects off the LAN; --dry-run sent
+                                    #   a real M1, TOOK the doorbell's
+                                    #   at-most-once job and ran the tools for
+                                    #   real while --help said it would not;
+                                    #   the inhibit file was read once at
+                                    #   preflight, so somebody sitting down
+                                    #   mid-job was the one case it could not
+                                    #   see; and the doorbell started an
+                                    #   unbounded thread per connection.
+                                    #   Every one reproduced first, and every
+                                    #   check has a non-vacuity partner
 python3 tests/test_wake_agent.py    # THE VAULT AGENT: a TABLE asserting the
                                     #   machine powers off on every refusal.
                                     #   Fail-closed elsewhere means sys.exit;
