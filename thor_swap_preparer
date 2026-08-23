@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from gs_common import (
-    wipe_will_erase, instruction_field_safe,
+    wipe_will_erase, wipe_miss_reason, instruction_field_safe,
     integrity_log, verify_tor, validate_proxy, newnym, isolated_proxy,
     safe_get, safe_post, secure_delay, atomic_write_json,
     install_signal_handlers, shutdown_requested, scrub_address,
@@ -551,14 +551,44 @@ def main():
             _wdir = _out.resolve().parent
         except OSError:
             _wdir = _out.parent
-        integrity_log("thor", "outfile_outside_wipe_roots")
-        print(f"  [!] {_wdir} is OUTSIDE the directories paranoia_mode sweeps, "
-              f"so this file will NOT be wiped with the rest of the run.")
+        # WHICH HALF FAILED. The comment above already MEASURES the name case
+        # ("~/gs/my_notes.json covers=True NO match -> NEVER erased") and then
+        # this printed a sentence about the DIRECTORY and a remedy about the
+        # DIRECTORY. `--outfile my_notes.json` in the cwd is the live case: the
+        # directory is swept, the name is not, and "write it under the working
+        # directory" is advice the operator has already followed.
+        _why = wipe_miss_reason(_out)
+        integrity_log("thor", f"outfile_not_wiped:{_why}")
+        if _why == "name":
+            print(f"  [!] {_out.name} sits in a directory paranoia_mode DOES "
+                  f"sweep, but its NAME matches none of the artifact patterns, "
+                  f"so the sweep walks past it.")
+        elif _why == "location":
+            print(f"  [!] {_wdir} is OUTSIDE the directories paranoia_mode "
+                  f"sweeps, so this file will NOT be wiped with the rest of "
+                  f"the run.")
+        else:
+            # "OUTSIDE" in caps, matching the location branch above. The
+            # emphasis is this file's convention for the sentence that says a
+            # secret will survive the wipe, and dropping it in the both-case
+            # made the two branches read as different severities. Caught by
+            # test_env_leaks, which asserts on the capitalised form.
+            print(f"  [!] {_out} is OUTSIDE the directories paranoia_mode "
+                  f"sweeps AND its name matches no artifact pattern. Both "
+                  f"halves of the test fail.")
         print(f"      It holds every deposit address and every memo, and a "
               f"memo contains the destination XMR address in full — it is the "
               f"single artifact that ties the BTC side to the XMR side.")
-        print(f"      Delete it yourself, or write it under the working "
-              f"directory or $HOME so the sweep can find it.")
+        if _why == "name":
+            print(f"      Delete it yourself, or name it thor_pairs*.json — "
+                  f"moving it will NOT help, this directory is already swept.")
+        elif _why == "location":
+            print(f"      Delete it yourself, or write it under the working "
+                  f"directory or $HOME so the sweep can find it.")
+        else:
+            print(f"      Delete it yourself, or name it thor_pairs*.json AND "
+                  f"write it under the working directory or $HOME — either one "
+                  f"alone is not enough.")
     integrity_log("thor", f"saved:{_out.name}:pairs={len(pairs)}")
     print(f"\n  [+] Saved {len(pairs)} pair(s) -> {_out}")
 

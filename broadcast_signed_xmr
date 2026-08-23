@@ -87,6 +87,38 @@ PROGRESS_SCHEMA = "broadcast_progress_v2"
 MAX_PLANNED_DELAY = 7 * 24 * 3600
 
 
+def delay_is_sane(value, cap: bool = True) -> bool:
+    """Is this a per-TX delay this relay will honour? ONE rule, TWO readers.
+
+    The manifest path validated strictly -- "a float, a bool or a negative
+    index means it was tampered with or corrupted, and coercing it would
+    silently mis-key a transaction's delay" -- and the fallback that recovers
+    delays from an unsigned plan did `int(tx["delay"])` inside a
+    try/except (TypeError, ValueError). int() COERCES, so that except never
+    fired for the values the manifest rule exists to catch. Driven, same value
+    down both paths:
+
+        True        manifest REFUSED          plan accepted as 1
+        3600.9      manifest REFUSED          plan accepted as 3600
+        -500        manifest REFUSED          plan accepted as -500
+        "604800"    manifest REFUSED          plan accepted as 604800
+        10**12      manifest REFUSED (cap)    plan accepted as 10**12
+
+    The last one is the expensive one: 10**12 seconds is ~31,700 years, and
+    MAX_PLANNED_DELAY's own refusal says why that matters -- "a manifest that
+    stalls the relay indefinitely leaves signed transactions sitting
+    unbroadcast". The unsigned plan is read off local disk and is not signed at
+    all, so it is a WEAKER trust boundary than the manifest, and it was the one
+    validated less.
+
+    cap=False for the manifest reader, which reports the over-cap case with its
+    own sentence naming MAX_PLANNED_DELAY; everything else takes the whole rule.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return False
+    return not cap or value <= MAX_PLANNED_DELAY
+
+
 def _blob_sort_key(p: Path) -> int:
     """Extract the TX's real manifest index from tx_N.signed's filename.
 
@@ -181,7 +213,7 @@ def _items_from_manifest(entries: list, mdir: Path) -> List[TxItem]:
                 sys.exit(f"[!] Manifest entry {pos}: 'hash' must be a 64-char sha256 hex "
                          f"digest. Refusing to relay against an unusable hash.")
             delay = e.get("delay", 0)
-            if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
+            if not delay_is_sane(delay, cap=False):
                 sys.exit(f"[!] Manifest entry {pos}: 'delay' must be a non-negative int, "
                          f"got {delay!r}.")
             if delay > MAX_PLANNED_DELAY:
@@ -692,11 +724,21 @@ def main():
             by_idx = {}
             for pos, tx in enumerate(txs):
                 if isinstance(tx, dict) and "delay" in tx:
-                    try:
-                        by_idx[pos] = int(tx["delay"])
-                    except (TypeError, ValueError):
+                    # THE SAME RULE THE MANIFEST GETS. This was
+                    # `int(tx["delay"])` in a try/except (TypeError,
+                    # ValueError) -- but int() coerces, so a bool, a float, a
+                    # numeric string and a negative all sailed through the
+                    # except and became a delay. See delay_is_sane.
+                    #
+                    # DISCARD THE CANDIDATE rather than exit: this is a
+                    # best-effort recovery from whatever plans happen to be in
+                    # ./unsigned, and a stray malformed one must not stop a
+                    # relay whose own manifest is fine. Same shape the old
+                    # except had.
+                    if not delay_is_sane(tx["delay"]):
                         by_idx = {}
                         break
+                    by_idx[pos] = tx["delay"]
             if by_idx:
                 candidates.append((pf_path, by_idx))
         if len(candidates) == 1:

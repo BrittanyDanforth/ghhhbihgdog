@@ -949,6 +949,21 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # 24h wake budget; gs_wake_handles.json maps a 4-hex handle to the bundle
     # and slip it names, so it is a direct index into this run's addresses.
     "gs_wake_state.json",
+    # THE FOURTH FILE gs_wake_agent WRITES INTO artifact_dir, and the only one
+    # of the four that was missing. gs_wake_state.json, gs_wake_handles.json
+    # and gs_wake_job.log were all here; gs_wake_status.json landed with the
+    # phone-only status flow and went into neither this list nor .gitignore.
+    #
+    # Driven against the real sweep with all four side by side in the artifact
+    # directory: three "WOULD BE ERASED", this one "SURVIVES THE WIPE".
+    #
+    # It is receive_watch --result-json's outcome, and it carries `unlocked`
+    # and `total` as exact decimal strings -- the amount that arrived from the
+    # swap, to the piconero. This file strips amounts out of the integrity
+    # chain on the reasoning that "the amount deanonymises the hop it is meant
+    # to hide", and then left the arrival total in a JSON file in the operator's
+    # working directory.
+    "gs_wake_status.json",
     #: The pager's update cursor and poke timestamps. Not a secret in itself,
     #: but it is a dated record of every time you woke the vault from a phone
     #: -- which is exactly the correlation the jitters exist to break.
@@ -1122,6 +1137,41 @@ def wipe_covers(target) -> bool:
                    for r in paranoia_search_roots())
     except OSError:
         return False
+
+
+def wipe_miss_reason(target) -> str:
+    """WHY wipe_will_erase said no: "", "location", "name", or "both".
+
+    The sweep matches on two things and the callers only ever spoke about one.
+    Every tool that warns "this will not be wiped" printed a sentence of the
+    form "<dir> is OUTSIDE the directories paranoia_mode sweeps" and a remedy
+    of the form "write it under $HOME" or "pass --search-dir <dir>". Both are
+    about LOCATION. But --outfile is free-form, and the name is half the test:
+
+        exit_strategy_simulator --outfile myplan.json   (in the cwd)
+            wipe_covers(location) True    wipe_will_erase False
+
+    -- so the operator was told their file was outside the searched directories
+    when it was sitting in one of them, and handed a remedy (add a root) that
+    cannot fix a name that will never match. They re-run the wipe, believe it
+    is handled, and the holding size or the deposit-address bundle is still
+    there. Two of the three call sites had this; create_receive_wallet does
+    not, because it picks the name itself (wallet_<hex>.json, which matches) so
+    only the directory can vary -- and its comment already says exactly that.
+    """
+    if wipe_will_erase(target):
+        return ""
+    loc = wipe_covers(target)
+    try:
+        res = Path(target).resolve()
+    except OSError:
+        res = Path(target)
+    named = any(fnmatch.fnmatch(res.name, p) for p in GS_ARTIFACT_FILE_PATTERNS)
+    if loc and not named:
+        return "name"
+    if named and not loc:
+        return "location"
+    return "both"
 
 
 def verify_integrity_chain(log_path: Path = INTEGRITY_LOG) -> tuple:
@@ -2602,8 +2652,32 @@ def disable_core_dumps() -> bool:
 def install_signal_handlers():
     """Install handlers for SIGINT and SIGTERM, and forbid core dumps.
 
-    Core-dump suppression lives here because every script calls this at
-    startup, so it is the one hook that reliably covers them all.
+    Core-dump suppression rides along here because every script that WANTS THE
+    HANDLERS calls this at startup.
+
+    THAT IS NOT EVERY SCRIPT, and this docstring used to say it was -- "the one
+    hook that reliably covers them all". Two programs never call it, and they
+    are the two long-lived servers: gs_console, which holds the wallet spend
+    password in its environment for its whole lifetime, and gs_doorbell, which
+    decrypts the Pi's X25519 secret and holds it for the life of the server.
+    Measured under `ulimit -c unlimited`: RLIMIT_CORE was still infinite at the
+    instant each had its secret in memory.
+
+    They cannot simply be added to the list either, which is why the coverage
+    gap survived. Both end in a blocking loop wrapped in
+    `except KeyboardInterrupt`, and installing these handlers replaces SIGINT's
+    default disposition with a flag-setter -- so KeyboardInterrupt stops being
+    raised and Ctrl-C stops working. Driven, not reasoned: with the handlers
+    installed a delivered SIGINT raises nothing. exit_strategy_simulator's own
+    comment names this trap from the other side ("a tool that installs it and
+    never checks the flag has SWALLOWED Ctrl-C outright").
+
+    So each of those two calls disable_core_dumps' logic locally -- gs_doorbell
+    is forbidden from importing this module at all, and gs_console is
+    stdlib-only while this module imports requests -- and
+    tests/test_listed_bugs.py pins all three against each other. The sentence
+    above is now the true one: this hook covers the scripts that take the
+    handlers, and the other two are named rather than assumed.
     """
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
@@ -3020,8 +3094,30 @@ def instruction_field_safe(value) -> bool:
     The memo hole is closed at its own gate (see _memo_fields_bind); this is
     the same rule for the fields that have no gate of their own, so a second
     field cannot be used the way the memo was.
+
+    C1 AS WELL AS C0, because the sibling gate for this exact job already said
+    so and this one did not. gs_wake_proto.plain_slip_is_wellformed guards the
+    PLAINTEXT slip -- the same deposit address, memo and amount, going to the
+    same human to be copied into the same wallet -- with
+
+        ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f
+
+    while this read `ord(ch) == 0x7f` and let the whole C1 block through. Two
+    gates in one repo answering one question two ways is the drift this file
+    keeps being rewritten to remove.
+
+    It is not only tidiness. U+009B is the single-character CSI: ECMA-48 allows
+    every ESC-Fe sequence to be written as one C1 byte instead, so a terminal
+    that honours 8-bit controls treats U+009B exactly as ESC [ -- and ESC is
+    blocked here while U+009B was not. Whether a given emulator honours them
+    varies (xterm, VTE and the Linux console have each done so in some
+    configuration), so this is a hazard that DEPENDS ON THE TERMINAL rather
+    than a universal exploit, and it is not worth leaving open to find out: the
+    values guarded here are a BTC deposit address, a swap memo and an amount,
+    all base58/bech32/ASCII, so nothing legitimate is refused by widening this.
     """
-    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in str(value))
+    return not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
+                   for ch in str(value))
 
 
 def memo_binds_destination(memo: str, dest: str) -> bool:
@@ -3387,6 +3483,54 @@ def secure_delete_file(path: Path) -> bool:
 
     try:
         fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    except PermissionError:
+        # A 0400 FILE THIS TOOLCHAIN WROTE ITSELF, and it could not erase one.
+        #
+        # O_WRONLY on a read-only file fails with EACCES for everyone except
+        # root, and the two most secret files here are minted 0400 ON PURPOSE:
+        # gs_wake_keys._write_key ("a writable keyfile is a keyfile something
+        # can rewrite between boots") and gs_delivery_key's
+        # atomic_write_json(..., perms=0o400). Both hold an X25519 SECRET, and
+        # "gs_wake_*.key" is in GS_ARTIFACT_FILE_PATTERNS -- the wipe list.
+        #
+        # Driven as an ordinary (non-root) owner, which is who runs this:
+        #     paranoia_mode._secure_delete_file(gs_wake_thinkpad.key) -> False
+        #       still on disk: True, secret still readable: True
+        #     gs_delivery_key shred                                   -> printed
+        #       "[+] ... destroyed.", rc 0, file still there
+        # So the sweep could not erase the keypair it lists, and the one
+        # command whose entire job is getting the delivery secret off the vault
+        # failed every single time. Every run as root hid it.
+        #
+        # THE OWNER CAN ALWAYS chmod. Reopened read-only first so the mode
+        # change happens through a FILE DESCRIPTOR (fchmod) rather than a path:
+        # os.chmod cannot take follow_symlinks=False on Linux, so a path-based
+        # chmod is a TOCTOU an attacker could aim at another file. fstat on
+        # that same descriptor re-confirms regular-and-mine on the object we
+        # actually hold, not on what the name pointed at a moment ago.
+        #
+        # ONLY the caller's own file, and only to 0600. Somebody else's 0400
+        # file still returns False -- this widens nothing it did not already
+        # own, and the file is destroyed microseconds later.
+        fd = -1
+        try:
+            rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return False
+        try:
+            rst = os.fstat(rfd)
+            if (not stat_module.S_ISREG(rst.st_mode)
+                    or rst.st_uid != os.geteuid()):
+                return False
+            os.fchmod(rfd, 0o600)
+        except OSError:
+            return False
+        finally:
+            os.close(rfd)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+        except OSError:
+            return False
     except OSError:
         return False
     try:

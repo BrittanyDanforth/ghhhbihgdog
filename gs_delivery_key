@@ -84,17 +84,75 @@ import gs_wake_proto as proto                                # noqa: E402
 ROLE = "delivery"
 
 
-def _refuse_existing(path: Path, vault_names_one: bool) -> None:
+def _file_delivery_public(path: Path) -> str:
+    """The delivery PUBLIC key recorded beside a sealed delivery keyfile.
+
+    Stored in the container HEAD, unencrypted, because it is not a secret --
+    the vault's own keyfile already holds it in plaintext, which is the whole
+    premise of sealing slips to it. Keeping a copy here is what lets
+    _refuse_existing tell "this is the vault's delivery key" apart from "this
+    is A delivery key" WITHOUT the passphrase for the file, which the operator
+    may well not have to hand when they are being warned about it.
+
+    "" when the field is absent, which is every keyfile minted before this
+    existed. The caller must treat that as UNKNOWN and say so, never as a
+    match: guessing here is the exact defect this function was added to fix.
+    """
+    try:
+        head = json.loads(path.read_text())
+        v = (head or {}).get("delivery_public") or ""
+        return v if isinstance(v, str) and len(bytes.fromhex(v)) == 32 else ""
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
+def _refuse_existing(path: Path, vault_names_one: bool,
+                     vault_public: str = "") -> None:
     """Refuse to overwrite a delivery key, and say which situation this is.
 
-    Two states reach here and they need different sentences. Saying "the
-    vault's keyfile names the matching public key" unconditionally would be a
-    confident lie in the second case -- which is this repo's named recurring
-    defect, a message that contradicts what actually happened.
+    THREE states reach here, and the first version of this handled two. Saying
+    "the vault's keyfile names the matching public key" unconditionally would
+    be a confident lie -- this repo's named recurring defect -- and that is
+    what it did in the state it did not have a branch for.
+
+    The missing one: a file exists at --out, the vault DOES name a delivery
+    key, and they are DIFFERENT keys. A stale copy, or one belonging to another
+    vault. `bool(existing)` cannot tell that apart from a match, and nothing
+    here ever read the key out of the file. Driven: a vault sealing to A with B
+    sitting at --out printed "already exists and the vault seals to it", which
+    is false, about the one file that decides whether any slip can ever be
+    opened. The operator's next move is to trust it.
     """
     if not path.exists():
         return
     if vault_names_one:
+        _file_pub = _file_delivery_public(path)
+        if _file_pub and vault_public and _file_pub != vault_public:
+            sys.exit(
+                f"[!] {path} already exists, and it is NOT the delivery key "
+                f"this vault seals to.\n"
+                f"    the vault seals to : {vault_public[:16]}...\n"
+                f"    this file holds    : {_file_pub[:16]}...\n"
+                f"    Nothing here can open a slip from this vault as things "
+                f"stand. That file\n"
+                f"    belongs to a different vault, or it is a stale copy from "
+                f"before a re-key.\n"
+                f"    Move it aside; then `new --replace` mints a key this "
+                f"vault will seal to,\n"
+                f"    or restore the real one if you still have it.")
+        if not _file_pub:
+            sys.exit(
+                f"[!] {path} already exists and this vault names a delivery "
+                f"key, but this\n"
+                f"    file records no public key, so whether they are the SAME "
+                f"key CANNOT be\n"
+                f"    checked from here -- it was minted before that field "
+                f"existed, and the\n"
+                f"    secret inside is sealed.\n"
+                f"    Confirm it with `show --key {path}` and compare against "
+                f"the vault, or move\n"
+                f"    it aside and run `new --replace`. Refusing to overwrite "
+                f"it either way.")
         sys.exit(
             f"[!] {path} already exists and the vault seals to it.\n"
             f"    Refusing to overwrite it: replacing this file makes every\n"
@@ -169,7 +227,10 @@ def cmd_new(args) -> int:
     # true depends on whether the vault already names a delivery key.
     key = load_vault_key(vault_path)
     existing = (key.get("delivery_public") or "").strip()
-    _refuse_existing(out, bool(existing))
+    # The vault's OWN delivery_public goes in, so the refusal can compare it
+    # against the key actually inside the file at --out instead of asserting a
+    # match from `bool(existing)`.
+    _refuse_existing(out, bool(existing), existing)
 
     if existing and not args.replace:
         sys.exit(
@@ -208,6 +269,13 @@ def cmd_new(args) -> int:
          "delivery_secret": bytes(dk).hex(),
          "vault_public": vault_pub},
         p1, kdf=args.kdf, role=ROLE)
+    # THE PUBLIC KEY GOES IN THE HEAD, unencrypted and deliberately so. It is
+    # not a secret -- the vault's keyfile stores it in plaintext, which is what
+    # sealing to it means -- and recording it here is what lets a later
+    # `new` tell "this is THE delivery key" from "this is A delivery key"
+    # without the passphrase. unlock_keyfile reads the head by name and ignores
+    # fields it does not know, so this does not change how the file opens.
+    container["delivery_public"] = dpub
     atomic_write_json(container, out, perms=0o400)
 
     # THE VAULT'S KEYFILE IS REWRITTEN LAST, and only once the delivery file is
@@ -283,7 +351,33 @@ def cmd_shred(args) -> int:
     if ans.strip() != "shred it":
         print("  Nothing was destroyed.")
         return 1
-    secure_delete_file(path)
+    # THE RETURN VALUE IS THE ANSWER, and this line discarded it.
+    #
+    # secure_delete_file returns bool and every other caller in the toolchain
+    # -- fourteen of them, across GhostSpiral, paranoia_mode, thor_swap_preparer
+    # and gs_common -- checks it. This one did not, and it is the one whose
+    # entire job is confirming that the delivery secret has LEFT THE VAULT.
+    # cmd_new's own last line says so: "Until step 3 the delivery secret is on
+    # the vault, which is the one place it is not supposed to live." Step 3 is
+    # this command.
+    #
+    # It was not a rare failure either. cmd_new writes this file 0400, and
+    # secure_delete_file opened it O_WRONLY -- EACCES for any non-root owner.
+    # Driven end to end as an ordinary user, on the file cmd_new had just
+    # minted: "[+] ... destroyed.", rc 0, and the sealed X25519 secret still
+    # sitting there. Every run as root hid it. secure_delete_file now chmods
+    # its own 0400 file before overwriting, so the success path works; this
+    # check is what makes the failure path honest.
+    if not secure_delete_file(path):
+        integrity_log("delivery", "key_shred_FAILED")
+        sys.exit(
+            f"[!] {path} could NOT be destroyed, and it is still there.\n"
+            f"    Nothing was overwritten. The delivery secret is still on "
+            f"this machine,\n"
+            f"    which is the one place it is not supposed to live.\n"
+            f"    Check that you own the file and can write to its directory, "
+            f"then run this again.\n"
+            f"    If the media is read-only, destroy the media.")
     integrity_log("delivery", "key_shredded")
     print(f"  [+] {path} destroyed.")
     return 0

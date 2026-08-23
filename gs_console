@@ -2674,7 +2674,57 @@ $('#rpc_daemon').addEventListener('change',loadFees);
 </script></body></html>"""
 
 
+def no_core_dumps() -> bool:
+    """Forbid this process from writing a core file. True if enforced.
+
+    A core dump is a copy of process memory written to DISK, and the WALLET
+    SPEND PASSWORD lives in this process's environment for its whole lifetime:
+    the module header's own rule is "The wallet password is taken from the
+    GS_WALLET_PASSWORD environment ... forwarded ONLY to the signing child".
+    Forwarded only to the child, and RESIDENT here the entire time. A core file
+    of this server is that password in plaintext, and nothing in the toolchain
+    wipes /var/lib/systemd/coredump or wherever kernel.core_pattern points.
+
+    EVERY OTHER TOOL GETS THIS FROM gs_common.install_signal_handlers, whose
+    docstring says core-dump suppression lives there because "every script
+    calls this at startup, so it is the one hook that reliably covers them
+    all". Two do not, and they are the two long-lived servers: this and
+    gs_doorbell. Measured -- with `ulimit -c unlimited`, importing this module
+    with GS_WALLET_PASSWORD set left RLIMIT_CORE infinite.
+
+    IT ALSO COVERS THE CHILDREN, because rlimits are inherited across fork and
+    exec. The tools this spawns set it themselves; this makes it true from the
+    moment they start rather than from the moment they get around to it.
+
+    A LOCAL COPY rather than gs_common.disable_core_dumps, for a reason that is
+    not style: gs_common imports `requests` and `tenacity` at module level, and
+    this console is stdlib-only and spawns every network-touching tool as a
+    child. Importing it for four lines would make a missing HTTP library stop
+    the operator's dashboard from starting. tests/test_listed_bugs.py pins this
+    against gs_common.disable_core_dumps so the two cannot drift.
+
+    NOT install_signal_handlers(). That would also have suppressed core dumps,
+    and it would have broken this program: it replaces SIGINT's default
+    disposition with a flag-setter, so KeyboardInterrupt stops being raised --
+    and main() below ends in `srv.serve_forever()` inside
+    `except KeyboardInterrupt`, which is how Ctrl-C stops the console. Driven:
+    with the handlers installed a delivered SIGINT raises nothing, so that
+    clause would never run and Ctrl-C would stop working entirely. This is the
+    trap exit_strategy_simulator's own comment names -- "a tool that installs
+    it and never checks the flag has SWALLOWED Ctrl-C outright".
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        return resource.getrlimit(resource.RLIMIT_CORE)[0] == 0
+    except (ImportError, ValueError, OSError):
+        return False
+
+
 def main():
+    # FIRST. GS_WALLET_PASSWORD is already in this process's environment by the
+    # time main() runs, so there is no later point that is early enough.
+    no_core_dumps()
     ap = argparse.ArgumentParser(description="GhostSpiral operator console")
     ap.add_argument("--port", type=int, default=8765)
     # default=None so "not given" is distinguishable from "given the same

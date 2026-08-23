@@ -96,6 +96,14 @@ outputs_export.hex
 gs_wake_*.key
 gs_wake_state.json
 gs_wake_handles.json
+# receive_watch --result-json's outcome, written into the same artifact_dir as
+# the two above by the wake agent's swap_status job. It carries `unlocked` and
+# `total` as exact decimals -- how much of the swap has arrived, to the
+# piconero. It was in neither this file nor the wipe list, and it is the fourth
+# of four files gs_wake_agent writes to that directory; the other three were in
+# both. tests/test_gitignore.py could not catch it, because it enforces
+# "everything the wipe erases is ignored" and this was in NEITHER list.
+gs_wake_status.json
 .gs_wake_inhibit
 # A woken job's children write here instead of to the systemd journal. It holds
 # whatever thor_swap_preparer printed, which includes the BTC deposit address

@@ -1636,6 +1636,196 @@ MUTATIONS = [
   "    elif target > 0 and not _chunk_amounts and not matched:",
   "    elif target > 0 and not _chunk_amounts:",
   ["test_listed_bugs"]),
+
+ # ---- found by auditing the least-anchored files -----------------------
+
+ # The two long-lived servers never called install_signal_handlers, so the
+ # core-dump suppression it carries never ran on the two processes that hold
+ # the wallet spend password and the Pi's X25519 secret for their lifetimes.
+ ("gs_doorbell goes back to dumping the Pi's secret into a core file",
+  "gs_doorbell",
+  "    no_core_dumps()\n    args = build_cli().parse_args(argv)",
+  "    args = build_cli().parse_args(argv)",
+  ["test_listed_bugs"]),
+
+ ("gs_console goes back to dumping the wallet password into a core file",
+  "gs_console",
+  "    no_core_dumps()\n    ap = argparse.ArgumentParser(",
+  "    ap = argparse.ArgumentParser(",
+  ["test_listed_bugs"]),
+
+ # secure_delete_file opened O_WRONLY on files this toolchain mints 0400 on
+ # purpose -- the wake keypair and the delivery key, an X25519 secret each --
+ # so for any non-root owner the wipe could not erase what it listed.
+ ("the wipe goes back to being unable to erase a 0400 keyfile it owns",
+  "gs_common.py",
+  "    except PermissionError:",
+  "    except PermissionError:\n        return False",
+  ["test_listed_bugs"]),
+
+ # ...and the retry must stay scoped to the caller's OWN file. Without the
+ # ownership test it would widen, and then destroy, a 0400 file belonging to
+ # somebody else that the caller could not otherwise touch.
+ ("the 0400 retry goes back to widening a file the caller does NOT own",
+  "gs_common.py",
+  "            if (not stat_module.S_ISREG(rst.st_mode)\n"
+  "                    or rst.st_uid != os.geteuid()):",
+  "            if not stat_module.S_ISREG(rst.st_mode):",
+  ["test_listed_bugs"]),
+
+ # The only one of fifteen callers that threw the return value away, in the
+ # command whose whole job is confirming the delivery secret left the vault.
+ ("gs_delivery_key shred goes back to claiming success it never checked",
+  "gs_delivery_key",
+  "    if not secure_delete_file(path):",
+  "    secure_delete_file(path)\n    if False:",
+  ["test_listed_bugs"]),
+
+ # gs_wake_status.json holds the arrived swap amount to the piconero and was
+ # in NEITHER the wipe list nor .gitignore, while its three siblings in the
+ # same artifact_dir were in both.
+ ("the arrival amount goes back to surviving the wipe",
+  "gs_common.py",
+  '    "gs_wake_status.json",',
+  '    "gs_wake_status_NOT_SWEPT.json",',
+  ["test_gitignore"]),
+
+ # The sweep matches location AND name; the warnings spoke only about
+ # location. `--outfile myplan.json` in the cwd got "is outside every directory
+ # paranoia_mode searches" -- false -- and a remedy that cannot fix a name.
+ ("the wipe warning goes back to blaming the location whatever failed",
+  "exit_strategy_simulator",
+  '        _why = wipe_miss_reason(_out)\n        if _why == "name":',
+  '        _why = "location"\n        if False:',
+  ["test_listed_bugs"]),
+
+ ("thor_swap_preparer's wipe warning goes back to blaming the location",
+  "thor_swap_preparer",
+  '        _why = wipe_miss_reason(_out)',
+  '        _why = "location"',
+  ["test_listed_bugs"]),
+
+ # The classifier must agree with the predicate it explains: "" exactly when
+ # the sweep would erase the file, or it explains a different question.
+ ("wipe_miss_reason goes back to answering about the location alone",
+  "gs_common.py",
+  "    if loc and not named:\n"
+  '        return "name"\n'
+  "    if named and not loc:\n"
+  '        return "location"\n'
+  '    return "both"',
+  '    return "location"',
+  ["test_listed_bugs"]),
+
+ # The sealed path (gs_unseal) and the plaintext path (the pager) gate the
+ # SAME deposit address for the same human, and only one of them refused the
+ # C1 block. U+009B is the single-character CSI, so a terminal honouring 8-bit
+ # controls reads it as ESC [ -- which this gate blocks in its C0 form.
+ ("the sealed path goes back to letting C1 controls through",
+  "gs_common.py",
+  "    return not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f\n"
+  "                   for ch in str(value))",
+  "    return not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in str(value))",
+  ["test_listed_bugs"]),
+
+ # ...and it must not over-refuse either: 0xA0 up is printable text, and a
+ # gate that ate those would reject legitimate values instead.
+ ("the control gate goes back to eating printable text above 0x9f",
+  "gs_common.py",
+  "    return not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f\n"
+  "                   for ch in str(value))",
+  "    return not any(ord(ch) < 0x20 or ord(ch) >= 0x7f for ch in str(value))",
+  ["test_listed_bugs"]),
+
+ # exit_strategy_simulator had NO anchor at all, which is how it kept two
+ # defects its own comments had already written down.
+
+ # "1e400" is named in the comment above the guard and is FINITE, so the
+ # is_finite/positive pair passed it and quantize raised InvalidOperation --
+ # a traceback out of main(), after Tor and the oracle round trip.
+ ("the off-ramp amount goes back to a hand-rolled parse with no bound",
+  "exit_strategy_simulator",
+  '    args.amount = decimal_env("GS_EXIT_AMOUNT", _amt, positive=True,\n'
+  "                              max_value=XMR_ABSURD_TOTAL)",
+  "    args.amount = Decimal(str(_amt))\n"
+  "    if not args.amount.is_finite() or args.amount <= 0:\n"
+  '        sys.exit("[!] Amount must be a positive finite number")',
+  ["test_listed_bugs"]),
+
+ # The block that exists to name the ACTUAL failure only saw failures that
+ # RAISE, so a 200 that parsed and carried no XMR market was reported as a Tor
+ # problem -- with _bisq_err never bound.
+ ("a Bisq reply with no XMR market goes back to being blamed on Tor",
+  "exit_strategy_simulator",
+  "        _bisq_err = ValueError(",
+  "        _unused_bisq_err = ValueError(",
+  ["test_listed_bugs"]),
+
+ # ...and the remedy must follow the diagnosis. It said "did not fail on the
+ # network" and then "Check Tor connectivity and retry" in the same message.
+ ("the oracle remedy goes back to saying 'check Tor' after 'not the network'",
+  "exit_strategy_simulator",
+  '        + ("    Check Tor connectivity and retry." if _network else\n'
+  '           "    Tor is not the problem; retry, or check whether the oracle\'s\\n"\n'
+  '           "    response format has changed.")',
+  '        + "    Check Tor connectivity and retry."',
+  ["test_listed_bugs"]),
+
+ # A rate of 1e-9 passes `price > 0`, and main() returned NORMALLY printing
+ # "Value: 0.00 USD / Prices from: bisq_oracle (live)" and wrote the plan.
+ ("a live rate that values the holding at nothing is reported anyway",
+  "exit_strategy_simulator",
+  "    if fiat_rate <= 0 or fiat_val <= 0:",
+  "    if False:",
+  ["test_listed_bugs"]),
+
+ # oracle_prices is coarsened so the timestamp cannot be inverted from a spot
+ # rate; amount_out_fiat sat beside it at cent precision and handed the same
+ # rate straight back.
+ ("the fiat value goes back to inverting the coarsened oracle price",
+  "exit_strategy_simulator",
+  '        "amount_out_fiat": str(fiat_val.quantize(Decimal("1"))),',
+  '        "amount_out_fiat": str(fiat_val),',
+  ["test_listed_bugs"]),
+
+ # `bool(existing)` cannot tell "the vault's delivery key" from "A delivery
+ # key", and nothing read the key out of the file before asserting a match.
+ ("the delivery refusal goes back to asserting a match it never checked",
+  "gs_delivery_key",
+  "        if _file_pub and vault_public and _file_pub != vault_public:",
+  "        if False:",
+  ["test_listed_bugs"]),
+
+ # ...and the comparison is only possible because the PUBLIC key is recorded
+ # in the head at mint time. Without it every file is the UNKNOWN case.
+ ("the minted delivery key goes back to recording no public key",
+  "gs_delivery_key",
+  '    container["delivery_public"] = dpub',
+  "    pass",
+  ["test_listed_bugs"]),
+
+ # The relay validated its per-TX delay strictly from the signed manifest and
+ # COERCED it from the unsigned plan -- int() swallows bools, floats, numeric
+ # strings and negatives, and the fallback had no cap at all.
+ ("the relay goes back to coercing a delay out of an unsigned plan",
+  "broadcast_signed_xmr",
+  '                    if not delay_is_sane(tx["delay"]):\n'
+  "                        by_idx = {}\n"
+  "                        break\n"
+  '                    by_idx[pos] = tx["delay"]',
+  "                    try:\n"
+  '                        by_idx[pos] = int(tx["delay"])\n'
+  "                    except (TypeError, ValueError):\n"
+  "                        by_idx = {}\n"
+  "                        break",
+  ["test_listed_bugs"]),
+
+ # ...and the rule itself must keep both halves: the type/sign test AND the cap.
+ ("the delay rule goes back to accepting a 31,700-year stall",
+  "broadcast_signed_xmr",
+  "    return not cap or value <= MAX_PLANNED_DELAY",
+  "    return True",
+  ["test_listed_bugs"]),
 ]
 
 

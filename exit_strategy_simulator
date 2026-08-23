@@ -69,10 +69,10 @@ from pathlib import Path
 from typing import Dict
 
 from gs_common import (
-    wipe_will_erase,
+    wipe_will_erase, wipe_miss_reason,
     integrity_log, verify_tor, validate_proxy, safe_get,
     atomic_write_json, install_signal_handlers, shutdown_requested,
-    env_or_argv, decimal_arg,
+    env_or_argv, decimal_arg, decimal_env, XMR_ABSURD_TOTAL,
 )
 
 CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=monero,bitcoin&vs_currencies=usd,eur"
@@ -162,6 +162,24 @@ def fetch_prices(proxy):
                 out["btc_eur"] = prices["btc_eur"].quantize(Decimal("0.01"))
             integrity_log("exit", "bisq_price_oracle_ok")
             return out
+        # ANSWERED, PARSED, AND SIMPLY DID NOT CARRY THE MARKET.
+        #
+        # The block below exists to "Name the ACTUAL failure" instead of always
+        # blaming Tor -- but it only ever sees failures that RAISE. This path
+        # does not raise: Bisq returns HTTP 200, the JSON parses, the loop runs
+        # clean, and the `if` above is simply False because no XMR entry (or no
+        # USD entry) was in it. Control falls out of the try with _bisq_err
+        # never bound, so the operator is told "Check Tor connectivity and
+        # retry" about a request that completed successfully over a working
+        # Tor circuit. Driven with a payload holding only USD and EUR.
+        #
+        # A renamed currencyCode key is exactly how this arrives in practice,
+        # and it sends the operator to debug the one thing that is fine.
+        _bisq_err = ValueError(
+            f"Bisq answered and the response parsed, but it carried no "
+            f"{'XMR' if 'xmr_btc' not in prices else 'USD'} market "
+            f"(got: {', '.join(sorted(prices)) or 'no usable markets at all'})")
+        integrity_log("exit", "bisq_oracle_missing_market")
     except Exception as e:
         integrity_log("exit", f"bisq_oracle_fail:{type(e).__name__}")
         _bisq_err = e
@@ -175,15 +193,28 @@ def fetch_prices(proxy):
         _e = _bisq_err
     except NameError:
         _e = None
-    if _e is not None and not isinstance(
-            _e, (OSError, ConnectionError, TimeoutError)):
+    _network = _e is None or isinstance(
+        _e, (OSError, ConnectionError, TimeoutError))
+    if not _network:
+        # 200, NOT 60. The message is built here to name the missing market
+        # and what DID come back ("got: USD, EUR"), and a 60-character clip cut
+        # it at "carried no XMR" -- throwing away the half that tells the
+        # operator what to look at. It is a diagnostic sentence this file
+        # composed itself, not attacker-controlled text needing a tight bound.
         _why = (f"\n    The Bisq fallback did not fail on the network: it failed "
-                f"parsing the\n    response ({type(_e).__name__}: {str(_e)[:60]}). "
+                f"on the\n    response ({type(_e).__name__}: {str(_e)[:200]}). "
                 f"That is a payload/format\n    problem, not a connectivity one.")
     sys.exit(
         "[!] All price oracles failed (CoinGecko + Bisq).\n"
         "    Cannot generate exit plan without prices." + _why + "\n"
-        "    Check Tor connectivity and retry."
+        # ...AND THEN IT SAID "CHECK TOR" ANYWAY. The two lines contradicted
+        # each other in the same message -- "did not fail on the network"
+        # followed by "check Tor connectivity" -- so the paragraph that exists
+        # to stop the operator debugging Tor ended by telling them to. The
+        # remedy now follows the diagnosis.
+        + ("    Check Tor connectivity and retry." if _network else
+           "    Tor is not the problem; retry, or check whether the oracle's\n"
+           "    response format has changed.")
     )
 
 
@@ -253,26 +284,35 @@ def main():
     # No allow_empty: an empty GS_EXIT_AMOUNT is a shell unsetting a variable,
     # not a request to off-ramp nothing.
     _amt = env_or_argv("GS_EXIT_AMOUNT", args.amount, "The off-ramp amount")
-    if _amt is not None:
-        try:
-            args.amount = Decimal(str(_amt))
-        except Exception:                                    # noqa: BLE001
-            sys.exit(f"[!] The off-ramp amount is not a number: {str(_amt)[:40]!r}")
-    else:
-        args.amount = None
-
-    if args.amount is None:
+    if _amt is None:
         sys.exit("[!] No amount. Set GS_EXIT_AMOUNT=<xmr> (preferred) or pass it "
                  "as the positional argument.")
-    # Decimal ACCEPTS "NaN", "Infinity" and "1e400". NaN then makes the
-    # positivity test below raise InvalidOperation (a raw traceback instead of
-    # a message), and Infinity sails past it into the fee/net arithmetic and
-    # produces a plan file full of garbage. Reject them by name first.
-    if not args.amount.is_finite():
-        sys.exit(f"[!] Amount must be a finite number (got {args.amount}). "
-                 f"'NaN' and 'Infinity' parse as Decimals but are not amounts.")
-    if args.amount <= 0:
-        sys.exit("[!] Amount must be positive")
+    # decimal_env, NOT a hand-rolled parse, and this is the fourth time that
+    # sentence has had to be written in this repo -- its own docstring names
+    # the other three (GS_EXPECT_XMR, GS_SWAP_AMOUNTS, GS_BTC_AMOUNT) and says
+    # it exists "so the next caller cannot half-apply the lesson". GS_EXIT_AMOUNT
+    # was the caller that half-applied it: a bare Decimal(), then a local
+    # is_finite/positive pair that covered two of the three cases the comment
+    # here NAMED.
+    #
+    # THE THIRD ONE WAS "1e400", written down and not checked. It is FINITE and
+    # POSITIVE, so both local guards passed it, and the crash landed further
+    # down where nothing was catching:
+    #
+    #     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
+    #     decimal.InvalidOperation
+    #
+    # -- a raw traceback out of the middle of main(), AFTER Tor was verified
+    # and the price oracle had been queried over it. No plan file is written
+    # (the crash precedes it), so nothing is left behind; what it costs is a
+    # stack trace instead of a sentence, from the tool whose whole design rule
+    # is that it never shows the operator something it did not check.
+    #
+    # max_value is what closes it: XMR_ABSURD_TOTAL is 100,000,000 XMR against
+    # a ~18.4M supply, so no real holding is refused and no arithmetic below
+    # can overflow the Decimal context.
+    args.amount = decimal_env("GS_EXIT_AMOUNT", _amt, positive=True,
+                              max_value=XMR_ABSURD_TOTAL)
 
     if not args.tor_proxy:
         sys.exit(
@@ -332,6 +372,43 @@ def main():
     fiat_rate = prices[rate_key]
     fiat_val = (net * fiat_rate).quantize(Decimal("0.01"))
 
+    # A VALUATION THAT ROUNDS TO NOTHING IS NOT A VALUATION.
+    #
+    # The header of this file promises "The PRICE is fetched live ... or the
+    # tool aborts. It never serves a made-up price." It did serve one. The Bisq
+    # branch gates each entry on `price > 0`, which 1e-9 satisfies, and the
+    # derived xmr_usd = xmr_btc * btc_usd inherits it; nothing between there
+    # and here looks at the magnitude. Driven end to end through main() with a
+    # payload quoting 1e-9 for both markets:
+    #
+    #     Net         : 13.3299 XMR
+    #     Value       : 0.00 USD
+    #     Prices from : bisq_oracle (live)
+    #
+    # -- and main() RETURNED NORMALLY and wrote exitplan_v1.json with
+    # amount_out_fiat "0.00". An off-ramp reference telling an operator their
+    # holding is worth nothing, labelled "live", is the worst single output
+    # this tool can produce, and it is exactly the shape of the inversion bug
+    # the Bisq comment above already records ("the product came out ~9 orders
+    # of magnitude too small and quantized to 0.00").
+    #
+    # NO PLAUSIBILITY BAND. This file's whole discipline is that it does not
+    # invent numbers, so it does not get to decide what a "reasonable" XMR
+    # price is -- that would be the liquidity_estimate() mistake again. The
+    # only thing asserted here is arithmetic: a positive amount times a real
+    # rate cannot round to zero, so if it did, one of the two was not real.
+    if fiat_rate <= 0 or fiat_val <= 0:
+        sys.exit(
+            f"[!] The {prices.get('source', '?')} rate values {net} XMR at "
+            f"{fiat_val} {args.currency.upper()}.\n"
+            f"    A positive holding at a real rate cannot round to zero, so "
+            f"the rate\n"
+            f"    ({fiat_rate} {args.currency.upper()}/XMR) is not a real one. "
+            f"Refusing to report it as live.\n"
+            f"    Re-run to get a fresh quote; if it persists, the oracle's "
+            f"response format has changed."
+        )
+
     # Depth is stated as NOT KNOWN rather than guessed. This is a constant, so
     # unlike the old size-bucketed guidance it cannot leak the magnitude that
     # --redact masks on the same screen.
@@ -356,7 +433,43 @@ def main():
                                 else "not_supplied_assumed_zero"),
         "net_xmr": str(net.quantize(Decimal("0.0001"))),
         "currency": args.currency,
-        "amount_out_fiat": str(fiat_val),
+        # COARSENED TOO, AND THIS IS THE FIELD THAT UNDID THE ONE BELOW.
+        #
+        # oracle_prices is rounded to whole units so the 10-minute timestamp
+        # bucket cannot be inverted from a full-precision spot rate. This field
+        # was written at CENT precision beside amount_in_xmr, fee_pct and
+        # slippage_pct -- all at full precision -- and net is a pure function
+        # of those three. So the rate came straight back out:
+        #
+        #     rate = amount_out_fiat / (gross - gross*fee_pct - gross*slip_pct)
+        #
+        # Driven on 13.37 XMR at 164.8317: oracle_prices said 165, the
+        # inversion returned 164.8318. The coarsening two lines down was
+        # decorative for whichever currency the run actually used.
+        #
+        # WHAT ROUNDING THIS BUYS, MEASURED, NOT ASSERTED. Cent precision
+        # recovers the rate to 0.005/net; whole units, to 0.5/net:
+        #
+        #     gross      recovery err @ cents    @ whole units
+        #     0.05 XMR   0.100                   10.03    <- worse than +/-0.5
+        #     0.5  XMR   0.010                    1.00    <- worse than +/-0.5
+        #     13.37 XMR  0.000375                 0.0375
+        #     100  XMR   0.000050                 0.0050
+        #     1000 XMR   0.000005                 0.0005
+        #
+        # So this closes it outright for holdings under ~1 XMR and costs two
+        # orders of magnitude everywhere else -- but it does NOT close it for a
+        # large holding, where 0.0005 still separates minutes. Saying so is the
+        # point: the note below used to claim a protection this file defeated
+        # in the next field, and a claim is worse than a measured limit.
+        #
+        # The operator loses nothing: the exact figure is still PRINTED. This
+        # is the audit record, and "which venue and rate the plan assumed" is
+        # answered to the whole unit either way.
+        "amount_out_fiat": str(fiat_val.quantize(Decimal("1"))),
+        "amount_out_fiat_precision": "whole units; the exact figure is printed, "
+                                     "not stored -- cents would re-establish "
+                                     "the coarsened rate below",
         # COARSENED to whole currency units, to match the coarsened timestamp
         # above. `timestamp` is floored to a 10-minute bucket specifically to
         # blur when this plan was made -- and then this field recorded four
@@ -367,8 +480,16 @@ def main():
         # the plan assumed.
         "oracle_prices": {k: str(Decimal(str(v)).quantize(Decimal("1")))
                           for k, v in prices.items() if k != "source"},
-        "oracle_prices_note": "rounded to whole units: full precision would "
-                              "re-establish the timestamp this plan coarsens",
+        # STATED AS A LIMIT, NOT A GUARANTEE. The old wording -- "full
+        # precision would re-establish the timestamp this plan coarsens" --
+        # read as a closed protection while amount_out_fiat above was handing
+        # the same rate back at cent precision. Both fields are coarsened now
+        # and the residual is named rather than implied.
+        "oracle_prices_note": "rounded to whole units, as is amount_out_fiat, "
+                              "so neither hands back a full-precision spot "
+                              "rate; a large holding can still narrow the rate "
+                              "from the whole-unit fiat value, so treat the "
+                              "10-minute timestamp bucket as approximate",
         "price_source": prices.get("source", "unknown"),
         # Was "liquidity_guidance", carrying a size-bucketed guess. A consumer
         # reading that key got an invented verdict in the same shape as the
@@ -406,11 +527,38 @@ def main():
             _dir = _out.resolve().parent
         except OSError:
             _dir = _out.parent
-        print(f"  [!] {_out} is outside every directory paranoia_mode searches.")
-        print(f"  [!] This file holds the holding size, its fiat value and the "
-              f"venue. The wipe will NOT find it — erase it yourself, or pass "
-              f"--search-dir {_dir} to paranoia_mode.")
-        integrity_log("exit", "outfile_outside_wipe_roots")
+        # WHICH HALF FAILED. This said "is outside every directory
+        # paranoia_mode searches" and prescribed --search-dir, unconditionally
+        # -- both statements about LOCATION, while the test it just failed is
+        # location AND name. `--outfile myplan.json` in the CURRENT DIRECTORY
+        # trips it: the directory is searched, the name never matches, and the
+        # operator was told the opposite and handed a remedy (add a root) that
+        # cannot fix a name. They add the root, re-run the wipe, and the file
+        # with their holding size and its fiat value is still there.
+        _why = wipe_miss_reason(_out)
+        if _why == "name":
+            print(f"  [!] {_out} sits in a directory paranoia_mode DOES search, "
+                  f"but its NAME matches none of the artifact patterns, so the "
+                  f"sweep walks past it.")
+            print(f"  [!] This file holds the holding size, its fiat value and "
+                  f"the venue. Name it exitplan_*.json and the sweep will find "
+                  f"it — --search-dir will NOT help, the directory is already "
+                  f"searched.")
+        elif _why == "location":
+            print(f"  [!] {_out} is outside every directory paranoia_mode "
+                  f"searches.")
+            print(f"  [!] This file holds the holding size, its fiat value and "
+                  f"the venue. The wipe will NOT find it — erase it yourself, "
+                  f"or pass --search-dir {_dir} to paranoia_mode.")
+        else:
+            print(f"  [!] {_out} is outside every directory paranoia_mode "
+                  f"searches, AND its name matches none of the artifact "
+                  f"patterns. Both halves fail.")
+            print(f"  [!] This file holds the holding size, its fiat value and "
+                  f"the venue. Erase it yourself, or name it exitplan_*.json "
+                  f"AND pass --search-dir {_dir} to paranoia_mode — either one "
+                  f"alone is not enough.")
+        integrity_log("exit", f"outfile_not_wiped:{_why}")
     atomic_write_json(plan, _out)
 
     kyc_tag = "KYC" if cfg["kyc"] else "NoKYC"
