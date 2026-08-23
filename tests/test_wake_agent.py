@@ -544,7 +544,7 @@ check("a replayed job_id is refused", outr1 is None
       and errr1.code == "job_replayed")
 check("...and the DOORBELL is told 'refused', instead of timing out and "
       "sending the operator to check a vault that ran nothing",
-      bellr1.result == {"status": "refused", "handle": ""}
+      bellr1.result == {"status": "refused", "handle": "", "slip": ""}
       and any(pth == "/result" for pth, _r in dpr1["_posted"]))
 check("...and no child ran", dpr1["_ran"] == [])
 
@@ -559,7 +559,7 @@ outr15, errr15, _t = run(kfr15, dpr15)
 check("an answer outside the round-trip window is refused", outr15 is None
       and errr15.code == "slow_answer")
 check("...and it is REPORTED, because the job is off the doorbell either way",
-      bellr15.result == {"status": "refused", "handle": ""})
+      bellr15.result == {"status": "refused", "handle": "", "slip": ""})
 check("...and the message never says 'expired': the job is current, the round "
       "trip is not, and those send the operator to different places",
       "expired" not in errr15.msg.lower())
@@ -579,7 +579,7 @@ check("a spent wake budget is refused", outr2 is None
       and errr2.code == "wake_budget")
 check("...and reported too — the boundary is 'the job left the doorbell', "
       "not 'the job reached a child process'",
-      bellr2.result == {"status": "refused", "handle": ""})
+      bellr2.result == {"status": "refused", "handle": "", "slip": ""})
 
 # The reason NEVER crosses: a doorbell that learns WHY learns about this wallet.
 _m3s = [r for pth, r in dpr2["_posted"] if pth == "/result"]
@@ -590,9 +590,15 @@ _b3 = (P.open_record(NP.PrivateKey(PI.encode()), TP.public_key, _m3s[0],
                      P.TAG_M3) if _m3s else {})
 check("...and the M3 carries status and job_id ONLY: no reason, no handle, "
       "no amount, no address",
-      set(_b3) == {"job_id", "challenge", "status", "handle"}
+      set(_b3) == {"job_id", "challenge", "status", "handle", "slip"}
       and _b3["status"] == "refused" and _b3["handle"] == ""
       and "budget" not in json.dumps(_b3))
+# A REFUSED JOB HAS NOTHING TO DELIVER, and the slip field must not become a
+# way for one to carry something anyway. Checked here rather than only in
+# gs_doorbell's on_m3, because this is the side that WRITES it: the doorbell
+# refusing a slip on a refusal is a second defence, not the first.
+check("...and its slip is empty, because a refusal quotes nothing",
+      _b3["slip"] == "")
 
 
 print("\n== a four-character handle collides, and the file does not grow forever ==")

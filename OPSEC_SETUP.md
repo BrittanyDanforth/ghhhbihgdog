@@ -679,6 +679,19 @@ doorbell, so anything it does you can do from a terminal.
    jitter is the floor because a pwned Pi can zero its own.
 5. Slip stays on the ThinkPad (`0600`). Telegram gets `depo ready · slip A3F1`.
 6. You copy BTC address + memo from the bay (or the file). Not from chat.
+
+   **Unless you cannot get to the bay**, which is the case this design
+   assumes and then never handled. A vault that is far away and hard to
+   reach is the point of having one, and "read it on the vault" is not an
+   OPSEC property when you cannot — it is a quote you are told about and
+   cannot pay, which expires. So set up a **delivery key** (§4a below) and
+   the slip travels **sealed**: Telegram carries 568 characters of base64,
+   the Pi holds no key for it, and you open it with `gs_unseal` on the
+   machine you send the BTC from — the one that already runs Electrum or
+   Sparrow for the OP_RETURN.
+
+   Set up no delivery key and nothing changes: no slip is sealed, none
+   travels, and step 6 is exactly what it was.
 7. ThinkPad `receive_watch` until landed **or 2 h** (`--timeout-min 110`,
    inside a 7200 s budget — the doc and the code say the same number),
    then **power off**. Power-off is three independent root-owned paths:
@@ -881,6 +894,66 @@ constraint this paragraph has always stated. Do not “just run a Telegram bot�
 that prints the memo: that throws away the only reason to have a Pi. The pager
 therefore has no word for an address, a memo, a slip or an amount. The most it
 ever says is `depo ready · slip A3F1`, which is step 5 below.
+
+Do not have a chat id yet? You cannot get one out of this bot by asking it —
+an unallowlisted chat is ignored in silence, on purpose, because a reply
+confirms the bot is alive to whoever found it. Run `gs_telegram_pager --whoami`
+once: it needs no `--key` and no `--chat-id`, arms nothing, wakes nothing,
+prints the chat id of the next message it sees and exits.
+
+### The slip travels sealed, or it does not travel
+
+“Read it on the vault” is the right rule and it has one assumption: that you
+can get to the vault. If you cannot, the rule delivers nothing — you are told a
+swap is quoted and handed no way to pay it, and quotes expire. And you cannot
+work around it by having the Pi read the slip, because that is exactly the
+Telegram bot this section forbids.
+
+So the payload travels as **ciphertext neither carrier can open**:
+
+| holds | gets out of a slip |
+|---|---|
+| the vault | it sealed it; it has the plaintext anyway |
+| the Pi / SD card / bot token | 568 characters of base64 |
+| Telegram | the same 568 characters |
+| **`gs_delivery.key`** | the deposit address, the memo and the amount |
+
+Sealed with `Box(vault_secret, delivery_public)` — **authenticated**, not just
+encrypted. Whoever holds the bot token owns that chat and could otherwise hand
+you a deposit address of their choosing; `gs_unseal` refuses any slip your
+vault did not seal, and says so in those words.
+
+```bash
+# ON THE VAULT, once. Writes the delivery key and tells the vault to use it.
+python3 gs_delivery_key new --vault-key /etc/gs_wake_thinkpad.key \
+                            --out /media/usb/gs_delivery.key
+
+# ON THE MACHINE YOU SEND BTC FROM. Check it opens BEFORE shredding the copy.
+python3 gs_unseal --key gs_delivery.key --self-test
+
+# ON THE VAULT again, once the above worked.
+python3 gs_delivery_key shred --key /media/usb/gs_delivery.key
+
+# THEN, WHENEVER A SLIP ARRIVES IN THE CHAT:
+python3 gs_unseal --key gs_delivery.key      # paste the blob at the prompt
+```
+
+`gs_unseal` re-checks, on that second machine, that the memo names your own
+destination — the one failure that silently pays a stranger — and refuses to
+print anything at all if it does not.
+
+**What this costs, and it is not nothing.** Before, the ciphertext did not
+exist off the vault. Now it does and Telegram keeps a copy forever, so an
+adversary who gets the delivery key **later** can read any blob they kept.
+Bounding it: the delivery key lives only on the sending machine, and a slip
+names one already-spent swap — it is not a wallet, not a seed, and cannot move
+anything. Set no delivery key and none of this happens: no slip is sealed and
+`/depo` answers exactly as it did before.
+
+Both boxes must be updated together for this — `PAD_BLOCK` went 256→1024 to fit
+a slip, so an old doorbell rejects a new record **on length, before any
+crypto**, with `wake record is 1064 bytes, not 296`. Your existing keyfiles
+still open; the pairing survives.
 
 “No port forward, and no WAN path to WOL” is met more simply than by an onion
 service: the pager **long-polls outward** over Tor and listens on nothing at

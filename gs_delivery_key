@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""gs_delivery_key - mint the key that lets a quoted swap REACH YOU.
+
+    ThinkPad, once:   python3 gs_delivery_key new --vault-key /etc/gs_wake_tp.key
+    anywhere:         python3 gs_delivery_key show --key gs_delivery.key
+
+--------------------------------------------------------------------------
+WHY THIS EXISTS
+--------------------------------------------------------------------------
+OPSEC_SETUP.md section 8 says, correctly: "Do not 'just run a Telegram bot'
+that prints the memo -- that throws away the only reason to have a Pi." The
+whole wake channel is built so the deposit address and the memo stay on the
+vault and the Pi learns a four-character label and nothing else.
+
+That rule quietly assumes the operator can WALK TO THE VAULT. When they cannot
+-- and a vault that lives somewhere far away and hard to reach is the design,
+not an accident -- "read it on the vault" is not an OPSEC property. It is a
+dead end. The operator is told a swap is quoted and handed no way to pay it,
+and a ThorChain quote that nobody acts on is a quote that expires.
+
+So the payload travels, and it travels sealed to a key that exists on NEITHER
+of the two machines that carry it. This tool mints that key.
+
+    the vault      seals the slip to delivery_public.  Holds no secret for it.
+    the Pi         relays 568 characters of base64.    Holds no key at all.
+    Telegram       carries the same base64.            Holds no key at all.
+    THIS FILE      opens it.                           Never touches either box.
+
+A seized Pi, a stolen SD card, a stolen phone, a stolen bot token and Telegram
+itself all get exactly the same thing out of a slip: nothing.
+
+--------------------------------------------------------------------------
+WHAT IT COSTS, SAID PLAINLY RATHER THAN BURIED
+--------------------------------------------------------------------------
+Before this, the ciphertext did not exist anywhere off the vault. Now it does,
+and Telegram has a copy forever. If the delivery key is obtained LATER, every
+blob that was kept can be read. That is a real reduction and it is the trade
+being made on purpose, in exchange for being able to use the system at all.
+
+Two things bound it, and neither is rhetoric:
+
+  * The delivery key is only ever on the machine that sends the BTC. It is not
+    on the Pi, and after `new` finishes it is not on the vault either -- the
+    file is written to removable media and the copy here is shredded.
+  * A slip names one deposit address, one memo and one amount, and it is spent
+    the moment the BTC is sent. It is not a wallet, not a seed, and not a key
+    to anything. Reading a two-month-old slip tells an attacker about a swap
+    that already happened.
+
+What it is NOT is a way to move money. Nothing here can spend: section 8's
+other rule -- the mix needs a physically present spend USB -- is untouched, and
+FORBIDDEN_TOOLS still names every tool a wake may not run.
+
+--------------------------------------------------------------------------
+WHY Box AND NOT SealedBox
+--------------------------------------------------------------------------
+An anonymous sealed box would encrypt to delivery_public without proving who
+wrote it. Anyone who learned that public key -- and it is stored in plaintext
+in the vault's keyfile, so a seized vault yields it -- could then hand the
+operator a slip naming any deposit address they liked, through a bot token they
+had already stolen. "Where do I send the Bitcoin" is the one field in this
+entire system that must be authenticated. So: Box(vault_secret,
+delivery_public), and gs_unseal refuses any slip the vault did not seal.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gs_common import (                                      # noqa: E402
+    atomic_write_json, integrity_log, install_signal_handlers,
+    secure_delete_file, terminal_safe,
+)
+import gs_wake_proto as proto                                # noqa: E402
+
+#: The delivery keyfile's role, checked on read so a wake keyfile handed to
+#: gs_unseal is refused by name rather than failing as a decrypt error.
+ROLE = "delivery"
+
+
+def _refuse_existing(path: Path, vault_names_one: bool) -> None:
+    """Refuse to overwrite a delivery key, and say which situation this is.
+
+    Two states reach here and they need different sentences. Saying "the
+    vault's keyfile names the matching public key" unconditionally would be a
+    confident lie in the second case -- which is this repo's named recurring
+    defect, a message that contradicts what actually happened.
+    """
+    if not path.exists():
+        return
+    if vault_names_one:
+        sys.exit(
+            f"[!] {path} already exists and the vault seals to it.\n"
+            f"    Refusing to overwrite it: replacing this file makes every\n"
+            f"    future slip unopenable, and it fails at the moment a swap is\n"
+            f"    quoted and money is waiting on it.\n"
+            f"    To re-key deliberately: move this aside and run `new "
+            f"--replace`.\n"
+            f"    Slips already sent become unreadable either way.")
+    sys.exit(
+        f"[!] {path} already exists, but this vault does NOT name a delivery\n"
+        f"    key -- so an earlier `new` wrote the file and stopped before it\n"
+        f"    told the vault, or this file belongs to a different vault.\n"
+        f"    Nothing here can open a slip as things stand. Move it aside and\n"
+        f"    run `new` again; if it IS this vault's, you lose nothing by\n"
+        f"    re-keying, because no slip has been sealed to it.")
+
+
+def read_passphrase(prompt: str, getter=None) -> bytes:
+    """From the terminal. NEVER from argv, and NEVER from the environment.
+
+    gs_doorbell's read_passphrase honours GS_WAKE_PASSPHRASE because a headless
+    trigger has no terminal to ask on. This one deliberately does not have an
+    equivalent: nothing unattended ever opens a delivery key, so an env var
+    here would exist only to be left set in somebody's shell profile.
+    """
+    fn = getter
+    if fn is None:
+        import getpass
+        fn = getpass.getpass
+    try:
+        return fn(prompt).encode()
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] no terminal to read a passphrase on ({type(e).__name__}). "
+                 f"Run this by hand, on a real console.")
+
+
+def load_vault_key(path: Path) -> dict:
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        sys.exit(f"[!] no keyfile at {path} ({e.strerror}). Run this on the "
+                 f"VAULT, and point --vault-key at the file gs_wake_keys "
+                 f"wrote there.")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        sys.exit(f"[!] {path} is group- or world-accessible (mode "
+                 f"{stat.S_IMODE(st.st_mode):04o}); chmod 0400 it.")
+    try:
+        container = json.loads(path.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {path} is not readable JSON ({type(e).__name__}).")
+    if proto.keyfile_is_sealed(container):
+        sys.exit(f"[!] {path} is passphrase-sealed, which makes it the PI's "
+                 f"keyfile.\n"
+                 f"    The delivery key is minted on the VAULT, because only "
+                 f"the vault's\n"
+                 f"    secret can seal a slip. Run this there.")
+    try:
+        k = proto.unlock_keyfile(container)
+    except proto.WakeError as e:
+        sys.exit(f"[!] {path}: {e}")
+    if k.get("role") != "thinkpad":
+        sys.exit(f"[!] {path} is the {k.get('role')!r} keyfile, not the "
+                 f"vault's. Run this on the ThinkPad.")
+    return k
+
+
+def cmd_new(args) -> int:
+    import nacl.public
+    out = Path(args.out).expanduser()
+    vault_path = Path(args.vault_key).expanduser()
+    # The vault is read BEFORE the overwrite refusal, because which refusal is
+    # true depends on whether the vault already names a delivery key.
+    key = load_vault_key(vault_path)
+    existing = (key.get("delivery_public") or "").strip()
+    _refuse_existing(out, bool(existing))
+
+    if existing and not args.replace:
+        sys.exit(
+            f"[!] {vault_path} already names a delivery key "
+            f"({existing[:16]}...).\n"
+            f"    A vault seals to ONE delivery key. Minting a second without\n"
+            f"    saying so would leave you holding a file that opens nothing.\n"
+            f"    Pass --replace if the old delivery key is genuinely gone --\n"
+            f"    slips already sent under it stay unreadable either way.")
+
+    # The vault's own public key, DERIVED rather than stored: gs_unseal needs
+    # it to verify who sealed a slip, and deriving it from the secret that
+    # will do the sealing means the two cannot drift apart.
+    vault_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
+    vault_pub = bytes(vault_sk.public_key).hex()
+
+    dk = nacl.public.PrivateKey.generate()
+    dpub = bytes(dk.public_key).hex()
+
+    print()
+    print("  This file is the only thing that can ever read a slip.")
+    print("  Give it a passphrase you will still have in six months, and one")
+    print("  that is not the vault's -- a single passphrase covering both")
+    print("  means a shoulder-surfed unlock at the vault also opens this.")
+    p1 = read_passphrase("  Passphrase for the delivery key: ",
+                         getter=args._getpass)
+    p2 = read_passphrase("  Again: ", getter=args._getpass)
+    if p1 != p2:
+        sys.exit("[!] The two passphrases differ. Nothing was written.")
+    if not p1:
+        sys.exit("[!] An empty passphrase would store the delivery secret in "
+                 "plaintext on removable media. Refusing.")
+
+    container = proto.lock_keyfile(
+        {"role": ROLE,
+         "delivery_secret": bytes(dk).hex(),
+         "vault_public": vault_pub},
+        p1, kdf=args.kdf, role=ROLE)
+    atomic_write_json(container, out, perms=0o400)
+
+    # THE VAULT'S KEYFILE IS REWRITTEN LAST, and only once the delivery file is
+    # safely on disk. The other order loses: a vault that names a delivery key
+    # whose file was never written seals every future slip to nothing, and the
+    # failure does not surface until a swap is quoted.
+    key["delivery_public"] = dpub
+    _rewrite_vault_key(vault_path, key)
+
+    integrity_log("delivery", "key_minted")
+    print()
+    print(f"  [+] Delivery key written: {out} (0400)")
+    print(f"  [+] {vault_path} now seals slips to {dpub[:16]}...")
+    print()
+    print("  NOW DO THESE THREE THINGS, IN THIS ORDER:")
+    print(f"    1. Copy {out} to the machine you will SEND THE BITCOIN from.")
+    print(f"       That machine already needs Electrum or Sparrow for the")
+    print(f"       OP_RETURN, so it already has what gs_unseal needs.")
+    print(f"    2. Check it opens there:  python3 gs_unseal --key <file> --self-test")
+    print(f"    3. Come back and shred the copy here:")
+    print(f"         python3 gs_delivery_key shred --key {out}")
+    print()
+    print("  Until step 3 the delivery secret is on the vault, which is the")
+    print("  one place it is not supposed to live.")
+    return 0
+
+
+def _rewrite_vault_key(path: Path, payload: dict) -> None:
+    """Put delivery_public into the vault's keyfile, atomically, still 0400."""
+    container = proto.lock_keyfile(payload, b"", role=payload.get("role", ""))
+    try:
+        # atomic_write_json replaces by rename, so there is no window where the
+        # vault's keyfile is truncated or half-written. A wake that starts
+        # mid-rewrite reads either the old file or the new one.
+        atomic_write_json(container, path, perms=0o400)
+    except OSError as e:
+        sys.exit(f"[!] could not rewrite {path} ({e.strerror}).\n"
+                 f"    The delivery key WAS written, but the vault does not "
+                 f"know about it yet,\n"
+                 f"    so slips will not be sealed. Fix the permissions and "
+                 f"run `new --replace` again.")
+
+
+def cmd_show(args) -> int:
+    path = Path(args.key).expanduser()
+    payload = _open_delivery(path, args)
+    import nacl.public
+    dpub = bytes(nacl.public.PrivateKey(
+        bytes.fromhex(payload["delivery_secret"])).public_key).hex()
+    print(f"  delivery public : {dpub}")
+    print(f"  vault public    : {terminal_safe(payload['vault_public'])}")
+    print()
+    print("  The vault's keyfile must name that delivery public key, or slips")
+    print("  it seals will not open here.")
+    return 0
+
+
+def cmd_shred(args) -> int:
+    path = Path(args.key).expanduser()
+    if not path.exists():
+        sys.exit(f"[!] no file at {path}. Nothing to shred.")
+    # OPEN IT FIRST. Shredding a file the operator cannot open elsewhere is
+    # destroying the only copy of the only key that reads their slips, and
+    # "I already copied it" is exactly the thing people are wrong about at 2am.
+    print("  Confirming this file opens before destroying it.")
+    _open_delivery(path, args)
+    print()
+    print(f"  This opened. If the copy on your sending machine ALSO opens,")
+    print(f"  this one is safe to destroy. If it does not, you lose every")
+    print(f"  future slip and there is no recovery.")
+    ans = (args._input or input)(
+        "  Type EXACTLY 'shred it' to destroy this copy: ")
+    if ans.strip() != "shred it":
+        print("  Nothing was destroyed.")
+        return 1
+    secure_delete_file(path)
+    integrity_log("delivery", "key_shredded")
+    print(f"  [+] {path} destroyed.")
+    return 0
+
+
+def _open_delivery(path: Path, args) -> dict:
+    try:
+        container = json.loads(path.read_text())
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {path} is not readable JSON ({type(e).__name__}).")
+    if not proto.keyfile_is_sealed(container):
+        sys.exit(f"[!] {path} is not passphrase-sealed. A delivery key that is "
+                 f"not sealed is a plaintext secret on removable media.")
+    p = read_passphrase("  Passphrase for the delivery key: ",
+                        getter=args._getpass)
+    try:
+        payload = proto.unlock_keyfile(container, p)
+    except proto.WakeError as e:
+        sys.exit(f"[!] {path}: {e}")
+    if payload.get("role") != ROLE:
+        sys.exit(f"[!] {path} is the {payload.get('role')!r} keyfile, not a "
+                 f"delivery key.")
+    for f in ("delivery_secret", "vault_public"):
+        v = payload.get(f)
+        try:
+            ok = isinstance(v, str) and len(bytes.fromhex(v)) == 32
+        except ValueError:
+            ok = False
+        if not ok:
+            sys.exit(f"[!] {path} carries no usable {f}.")
+    return payload
+
+
+def build_cli() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Mint and manage the key that opens a sealed slip.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    n = sub.add_parser("new", help="mint a delivery key (run on the VAULT)")
+    n.add_argument("--vault-key", required=True,
+                   help="the ThinkPad's wake keyfile, as gs_wake_agent takes it")
+    n.add_argument("--out", default="gs_delivery.key",
+                   help="where to write the delivery key (0400). Put this on "
+                        "removable media, not on the vault's disk.")
+    n.add_argument("--kdf", default=proto.DEFAULT_KDF,
+                   choices=sorted(proto.KDF_PROFILES),
+                   help="Argon2id profile, recorded in the file")
+    n.add_argument("--replace", action="store_true",
+                   help="the vault already names a delivery key and you mean "
+                        "to abandon it")
+    n.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("show", help="print the two public keys in a delivery key")
+    s.add_argument("--key", required=True)
+    s.set_defaults(fn=cmd_show)
+
+    d = sub.add_parser("shred", help="destroy the vault's copy, after checking "
+                                     "it opens")
+    d.add_argument("--key", required=True)
+    d.set_defaults(fn=cmd_shred)
+    return ap
+
+
+def main(argv=None) -> int:
+    install_signal_handlers()
+    # ARGS FIRST, NACL SECOND -- see gs_unseal's main() for why: --help must
+    # work on a box that has not installed anything yet.
+    args = build_cli().parse_args(argv)
+    try:
+        proto.require_nacl()
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+    args._getpass = getattr(args, "_getpass", None)
+    args._input = getattr(args, "_input", None)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -543,6 +543,25 @@ def do_pair(args) -> int:
         print(f"      cwd and $HOME and would never reach {_ad}.)")
     else:
         print(f"      python3 gs_wake_agent --key {tp_path} --dry-run")
+    # THE ONE DECISION THAT IS EASIEST TO MAKE BY NOT KNOWING IT EXISTS.
+    #
+    # Without a delivery key, a quoted swap reports "ready · slip A3F1" and
+    # the deposit address stays here -- correct, and useless to an operator
+    # who cannot walk to this machine. That is the normal case for a vault
+    # kept somewhere far away, which is the whole reason to have one. The
+    # operator finds out at the moment they need the address and cannot get
+    # it, unless something says so while they are still standing here.
+    print()
+    print("  Will you be able to walk to this machine when a swap is quoted?")
+    print("  If not, set up a DELIVERY KEY now, while you are sitting at it:")
+    print()
+    print(f"      python3 gs_delivery_key new --vault-key {tp_path} \\")
+    print(f"          --out /media/usb/gs_delivery.key")
+    print()
+    print("  The slip then travels sealed to a key that lives only on the")
+    print("  machine you send BTC from -- not on this one, and never on the")
+    print("  Pi. Skip it and nothing changes: the slip stays here, and you")
+    print("  read it here. OPSEC_SETUP.md section 8 has the trade in full.")
     return 0
 
 

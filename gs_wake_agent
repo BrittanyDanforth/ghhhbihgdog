@@ -282,6 +282,30 @@ def load_key(path: Path) -> dict:
                       f"{path} is the {k.get('role')!r} keyfile. The Pi's file "
                       f"holds the DOORBELL's secret; this machine needs its "
                       f"own.")
+    # THE DELIVERY KEY IS OPTIONAL, AND A MALFORMED ONE IS NOT.
+    #
+    # Checked HERE, at load, and not where it is used. If a mistyped hex string
+    # first failed inside seal_slip_for_delivery, it would fail after the swap
+    # was quoted -- and that function deliberately never raises, so the operator
+    # would get a completed job, no slip, and a line on a terminal that is
+    # 500 km away. A keyfile that cannot do what it says it will do should
+    # refuse at the top, while the machine has done nothing yet.
+    dp = k.get("delivery_public")
+    if dp is not None:
+        ok = isinstance(dp, str)
+        if ok and dp != "":
+            try:
+                ok = len(bytes.fromhex(dp)) == 32
+            except ValueError:
+                ok = False
+        if not ok:
+            raise Refused(
+                "delivery_public_malformed",
+                f"{path} carries a delivery_public that is not 64 hex "
+                f"characters (a 32-byte X25519 public key). Re-run "
+                f"`gs_delivery_key new` rather than editing it by hand, or "
+                f"remove the field to go back to leaving slips on this "
+                f"machine.")
     return k
 
 
@@ -839,7 +863,8 @@ def _run_validated(d, key, artifact_dir, state_deps) -> tuple:
     # this one path having its own copy and the rest having none.
     code, status, handle = _dispatch(job, params, key, artifact_dir,
                                      handle, _child, job_id)
-    report_back(key, job_id, challenge.hex(), status, handle,
+    slip = seal_slip_for_delivery(key, artifact_dir, status, handle)
+    report_back(key, job_id, challenge.hex(), status, handle, slip=slip,
                 poster=d.get("post_record"))
     return code, status, handle
 
@@ -1032,12 +1057,98 @@ def _save_handles(d: Path, h: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
-                handle: str, poster=None) -> None:
-    """Tell the doorbell only: done / refused / failed, and a 4-hex label.
+#: The slip fields that travel, and NOTHING ELSE from the pair record.
+#:
+#: An allowlist rather than "the pair minus a few keys", because the pair is
+#: written by another tool and the next field somebody adds to it would ride
+#: along uninspected. Short keys because 384 bytes is the budget and a 95-char
+#: address plus a 111-char memo is most of it.
+#:
+#: `a` (dest_xmr) is here even though the memo already contains it, and that is
+#: deliberate: it lets the delivery machine re-run memo_binds_destination
+#: LOCALLY, against a field sealed by the same key, before the operator sends
+#: anything. It cannot catch a hostile vault -- a vault that lies can lie in
+#: both fields -- but a swap whose memo does not name its own destination is
+#: the one failure that silently pays a stranger, and checking it twice on two
+#: machines costs 100 bytes.
+SLIP_FIELDS = (("btc_in", "b"), ("deposit", "d"), ("memo", "m"),
+               ("dest_xmr", "a"), ("expected_xmr", "x"), ("ts", "t"))
 
-    NEVER the reason, never an address, never the memo, never an amount. The
-    slip stays here; the doorbell learns a label it can read back to a human.
+
+def seal_slip_for_delivery(key: dict, artifact_dir: Path, status: str,
+                           handle: str, reader=None) -> str:
+    """Seal this job's deposit instructions for the delivery machine, or "".
+
+    Returns "" -- not an error -- whenever there is nothing to seal or no key
+    to seal it to. The operator who has not set up a delivery key gets exactly
+    the behaviour they had before, and the slip stays on this machine.
+
+    NEVER RAISES. A job that ran is a job that ran; a slip that could not be
+    sealed does not un-mint an address or un-quote a swap, and turning a
+    completed job into a reported failure would send the operator to check a
+    vault that has already powered off. It is loud on this terminal and in the
+    integrity log instead, and the operator learns from the chat that no slip
+    came back -- which is a true statement of what happened.
+    """
+    try:
+        if status != "done":
+            return ""
+        dpub = (key.get("delivery_public") or "").strip()
+        if not dpub:
+            return ""
+        rec = (_load_handles(artifact_dir) or {}).get(handle) or {}
+        path = rec.get("slip")
+        if not path:
+            # receive_new mints addresses and quotes nothing. There is no
+            # deposit address to deliver and this is not a fault.
+            return ""
+        pairs = (reader or _read_json)(Path(path))
+        if not isinstance(pairs, list) or len(pairs) != 1:
+            # ONE amount goes in (a single ladder slot), so one pair comes out.
+            # Any other count means something is not what this code thinks it
+            # is, and picking one of several deposit addresses to send money to
+            # is not a guess worth making.
+            raise ValueError(
+                f"expected exactly one quoted pair, found "
+                f"{len(pairs) if isinstance(pairs, list) else 'a non-list'}")
+        pair = pairs[0]
+        body = {}
+        for src, short in SLIP_FIELDS:
+            v = pair.get(src)
+            if v is None:
+                raise ValueError(f"the quoted pair has no {src!r}")
+            body[short] = v
+        body["h"] = handle
+        import nacl.public
+        tp_sk = nacl.public.PrivateKey(bytes.fromhex(key["secret"]))
+        blob = proto.seal_slip(tp_sk,
+                               nacl.public.PublicKey(bytes.fromhex(dpub)),
+                               body)
+        integrity_log("wake", "slip_sealed")
+        return blob
+    except Exception as e:                                   # noqa: BLE001
+        integrity_log("wake", "slip_seal_failed")
+        # terminal_safe: this quotes a message that can contain a filename and
+        # a field name, and this line reaches a terminal.
+        agent_say(f"  [!] The job finished but its slip could NOT be sealed "
+                  f"for delivery ({terminal_safe(str(e))[:160]}).")
+        agent_say(f"      The deposit address and memo are on THIS machine, "
+                  f"unchanged. Nothing was sent anywhere.")
+        return ""
+
+
+def _read_json(path: Path):
+    return json.loads(path.read_text())
+
+
+def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
+                handle: str, slip: str = "", poster=None) -> None:
+    """Tell the doorbell: done / refused / failed, a 4-hex label, and a slip.
+
+    NEVER the reason, never a plaintext address, never a plaintext memo, never
+    an amount. The slip is CIPHERTEXT sealed to a key the doorbell does not
+    have and cannot get -- see gs_wake_proto's "THE SEALED SLIP". Everything
+    the doorbell learns is still: a job finished, and a label for it.
     """
     try:
         import nacl.public
@@ -1046,7 +1157,8 @@ def report_back(key: dict, job_id: str, challenge_hex: str, status: str,
         m3 = proto.seal(tp_sk, pi_pk, proto.TAG_M3,
                         {"job_id": job_id, "challenge": challenge_hex,
                          "status": status,
-                         "handle": handle if status == "done" else ""})
+                         "handle": handle if status == "done" else "",
+                         "slip": slip if status == "done" else ""})
         (poster or post_record)(key["doorbell_url"], "/result", m3)
     except Exception:                                        # noqa: BLE001
         # An undeliverable result is not a failure of the job. The job either

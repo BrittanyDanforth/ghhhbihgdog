@@ -12,7 +12,12 @@ SCRIPTS = ["GhostSpiral", "airgap_tx_signer", "broadcast_signed_xmr",
            # PyNaCl import: a top-level `import nacl` would make --help red on
            # a clean install, and --help is how an operator finds out what a
            # program wants before they have installed anything.
-           "gs_wake_keys", "gs_doorbell", "gs_wake_agent"]
+           "gs_wake_keys", "gs_doorbell", "gs_wake_agent",
+           # The trigger and the delivery half. gs_telegram_pager was missing
+           # here when it shipped, so nothing held it to the rule above; the
+           # two delivery tools are added with it rather than after the same
+           # omission is noticed twice.
+           "gs_telegram_pager", "gs_delivery_key", "gs_unseal"]
 PROXY = "socks5h://127.0.0.1:9050"
 
 PASS = 0; FAIL = 0; FAILS = []

@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""gs_unseal - open a sealed slip on the machine that will send the Bitcoin.
+
+    python3 gs_unseal --key gs_delivery.key
+    (paste the 568-character blob, press Enter)
+
+Run it NOWHERE ELSE. Not on the Pi, which has no key for a slip and is not
+supposed to. Not on the vault, which already has the plaintext and does not
+need one. This belongs on the machine holding the wallet that pays the swap --
+which already runs Electrum or Sparrow to write the OP_RETURN, so it already
+has everything this needs.
+
+--------------------------------------------------------------------------
+WHAT IT CHECKS BEFORE IT SHOWS YOU ANYTHING
+--------------------------------------------------------------------------
+1. THE SLIP IS AUTHENTIC. It was sealed by YOUR VAULT'S static key, verified
+   here, not merely encrypted to your public key. Whoever holds the bot token
+   can put any 568 characters they like into that chat; only the vault can
+   produce ones that open. A blob that fails this is not shown at all -- not
+   even partially -- because the fields inside a forged slip are exactly the
+   fields designed to be read and acted on.
+
+2. THE MEMO BINDS TO YOUR OWN DESTINATION. The BTC goes to a SHARED ThorChain
+   inbound vault; the memo is the only thing saying where the XMR comes out. A
+   memo naming a different address pays whoever owns it, irreversibly, and the
+   transaction that does it looks completely normal. thor_swap_preparer already
+   refuses on this, on the vault. It is checked AGAIN here, on a second machine,
+   from a field sealed under the same key -- because the cost is one function
+   call and the failure it catches is total and unrecoverable.
+
+   Stated honestly: this cannot catch a vault that lies in both fields at once.
+   It catches a corrupted or truncated quote, and it means the machine actually
+   sending the money has verified the one invariant that matters rather than
+   trusting a note it was handed.
+
+3. THE QUOTE IS NOT STALE. ThorChain quotes expire, and a swap sent against an
+   expired one can be refunded minus fees or, worse, filled at a rate nobody
+   agreed to. The slip carries the time it was quoted (coarsened to ten
+   minutes, so it is not a fingerprint) and this says how old it is.
+
+--------------------------------------------------------------------------
+THE BLOB COMES IN ON STDIN, AND THERE IS NO --slip FLAG
+--------------------------------------------------------------------------
+The same rule the bot token, the wallet password and the BTC entry address all
+follow in this repo: /proc/<pid>/cmdline is mode 0444 and every local account
+on the box can read it. A deposit address and a memo on a command line are
+readable by any process that cares to look, and the shell writes them to
+~/.bash_history on the way. Paste it at the prompt.
+
+--------------------------------------------------------------------------
+AND IT WRITES NOTHING. NO INTEGRITY LOG, DELIBERATELY.
+--------------------------------------------------------------------------
+Every other tool here chains its events into integrity_chain.log, and the
+first version of this one did too. That is right for the vault and wrong here,
+because of WHERE THIS RUNS. gs_common writes that file to the CURRENT WORKING
+DIRECTORY, and this is the only tool in the repo whose home is a machine
+paranoia_mode never sweeps -- an ordinary laptop with Electrum on it. Four
+lines of tamper-evidence nobody will ever recompute, in exchange for a
+permanent file on the one box in the design that has no wipe, naming this
+toolchain and dating the swap.
+
+So: no log, no state, no cache, no temp file. It reads a key, reads a line,
+prints, and exits. The operator is sitting in front of it -- refusals go to
+the terminal they are already reading, which is the whole interaction.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gs_common import (                                      # noqa: E402
+    install_signal_handlers, instruction_field_safe,
+    memo_binds_destination, terminal_safe,
+)
+import gs_wake_proto as proto                                # noqa: E402
+
+ROLE = "delivery"
+
+#: How old a quote may be before this says so loudly. ThorChain's own quotes
+#: are good for a matter of minutes; the slip's timestamp is coarsened to a
+#: 10-minute bucket, so anything under one bucket is indistinguishable from
+#: fresh and the first honest threshold is the next one up.
+STALE_WARN_S = 20 * 60
+
+
+def read_passphrase(prompt: str, getter=None) -> bytes:
+    fn = getter
+    if fn is None:
+        import getpass
+        fn = getpass.getpass
+    try:
+        return fn(prompt).encode()
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] no terminal to read a passphrase on "
+                 f"({type(e).__name__}). Run this by hand, on a console.")
+
+
+def open_delivery_key(path: Path, getter=None) -> dict:
+    try:
+        container = json.loads(path.read_text())
+    except OSError as e:
+        sys.exit(f"[!] no delivery key at {path} ({e.strerror}).\n"
+                 f"    This is the file gs_delivery_key wrote on the vault and "
+                 f"you carried here.")
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] {path} is not readable JSON ({type(e).__name__}).")
+    if not proto.keyfile_is_sealed(container):
+        sys.exit(f"[!] {path} is not passphrase-sealed. A delivery key that is "
+                 f"not sealed is a plaintext secret sitting on a USB stick.")
+    p = read_passphrase("  Passphrase for the delivery key: ", getter=getter)
+    try:
+        payload = proto.unlock_keyfile(container, p)
+    except proto.WakeError as e:
+        sys.exit(f"[!] {path}: {e}")
+    if payload.get("role") != ROLE:
+        sys.exit(f"[!] {path} is the {payload.get('role')!r} keyfile, not a "
+                 f"delivery key. The wake keyfiles do not open slips.")
+    return payload
+
+
+def read_blob(reader=None) -> str:
+    """The slip, from stdin. Never argv -- see the module docstring."""
+    print("  Paste the sealed slip and press Enter "
+          f"({proto.SLIP_B64_LEN} characters, one line):")
+    try:
+        line = (reader or sys.stdin.readline)()
+    except Exception as e:                                   # noqa: BLE001
+        sys.exit(f"[!] could not read the slip ({type(e).__name__}).")
+    if not line:
+        sys.exit("[!] nothing was pasted.")
+    return line.strip()
+
+
+def show(body: dict, now: float = None) -> int:
+    """Print the deposit instructions, after checking them. Returns an exit code."""
+    dest = str(body.get("a", ""))
+    memo = str(body.get("m", ""))
+    dep = str(body.get("d", ""))
+    btc = str(body.get("b", ""))
+    xmr = str(body.get("x", ""))
+    handle = str(body.get("h", ""))
+    ts = body.get("t")
+
+    # NOT terminal_safe. THIS IS THE ONE PLACE THE ADDRESS IS SUPPOSED TO APPEAR.
+    #
+    # The first version of this function ran every field through terminal_safe
+    # before printing it, on the reflex that "this string reaches a terminal".
+    # terminal_safe REDACTS ADDRESSES -- it rewrites a Bitcoin address to
+    # "<addr>" and the memo to "=:XMR.XMR:<addr>:<path>/0" -- which is exactly
+    # right for a log line on the Pi and exactly wrong here. The operator was
+    # shown a slip with the deposit address scrubbed out of it, which is the
+    # whole payload, and the suite caught it on the check that the deposit
+    # address is actually printed.
+    #
+    # What still has to be true is that none of these fields can forge a line
+    # in a block meant to be copied and paid. That is instruction_field_safe's
+    # job, the same gate thor_swap_preparer puts in front of its own SENDER
+    # INSTRUCTIONS block, and it refuses control characters without touching
+    # the value itself.
+    bad = [n for n, v in (("deposit address", dep), ("memo", memo),
+                          ("amount", btc), ("destination", dest),
+                          ("expected", xmr), ("handle", handle))
+           if not instruction_field_safe(v)]
+    if bad:
+        sys.exit(
+            f"[!] This slip's {', '.join(bad)} contains a control character.\n"
+            f"    A control character in a block meant to be copied and paid "
+            f"can forge a line\n"
+            f"    of it -- a second 'To address:' the eye skips over. The slip "
+            f"authenticated,\n"
+            f"    so this is your VAULT producing something malformed, not a "
+            f"stranger.\n"
+            f"    DO NOT SEND ANYTHING. Read the slip on the vault instead.")
+
+    if not memo_binds_destination(memo, dest):
+        sys.exit(
+            "[!] THE MEMO IN THIS SLIP DOES NOT NAME ITS OWN DESTINATION.\n"
+            "    The memo is the only thing telling ThorChain where to deliver\n"
+            "    the XMR. Sending BTC against this pays whoever the memo does\n"
+            "    name, and it cannot be undone or recalled.\n"
+            "    DO NOT SEND ANYTHING. Go to the vault and check the slip there.")
+
+    age = None
+    if isinstance(ts, int) and not isinstance(ts, bool):
+        age = int((now if now is not None else time.time()) - ts)
+
+    bar = "=" * 62
+    print()
+    print(f"  {bar}")
+    print(f"  SLIP {handle}   -- verified sealed by your vault")
+    print(f"  {bar}")
+    print(f"  Send exactly:  {btc} BTC")
+    print(f"  To address:    {dep}")
+    print(f"  With memo:     {memo}")
+    print(f"  {bar}")
+    print(f"  Expected out:  ~{xmr} XMR")
+    print(f"  Delivered to:  {dest}")
+    if age is not None:
+        mins = age // 60
+        print(f"  Quoted:        ~{mins} min ago")
+    print(f"  {bar}")
+    print()
+    print("  The memo goes in an OP_RETURN output, in the same transaction, in")
+    print("  PUBLIC and forever. Electrum: Tools -> Pay to many / OP_RETURN.")
+    print("  A payment without the memo is a payment ThorChain cannot route.")
+    if age is not None and age > STALE_WARN_S:
+        print()
+        print(f"  [!] THIS QUOTE IS ~{age // 60} MINUTES OLD and quotes expire.")
+        print(f"      Poke /depo again for a fresh one rather than sending")
+        print(f"      against this. A late swap can be refunded minus fees, or")
+        print(f"      filled at a rate you did not agree to.")
+        return 1
+    return 0
+
+
+def cmd_self_test(payload: dict) -> int:
+    """Prove this file opens and can do its job, without needing a real slip.
+
+    gs_delivery_key tells the operator to run this on the sending machine
+    BEFORE shredding the vault's copy, so it has to be honest about what it
+    proves: that the passphrase works here and that both keys are present and
+    well-formed. It cannot prove the vault seals to this key, because it has
+    no slip yet -- so it does not claim to.
+    """
+    import nacl.public
+    dk = nacl.public.PrivateKey(bytes.fromhex(payload["delivery_secret"]))
+    dpub = bytes(dk.public_key).hex()
+    vpub = payload["vault_public"]
+    # A REAL ROUND TRIP through the same seal/open pair a live slip takes,
+    # with this key on the receiving end -- not a claim that it would work.
+    # This is what catches a libsodium that is present but broken, or a
+    # PyNaCl too old for sodium_pad, on a machine that has never opened a slip
+    # and is about to be the only one that can.
+    sender = nacl.public.PrivateKey.generate()
+    probe = proto.seal_slip(sender, dk.public_key, {"probe": "self-test"})
+    if proto.open_slip(dk, sender.public_key, probe) != {"probe": "self-test"}:
+        sys.exit("[!] a sealed slip did not survive a round trip on this "
+                 "machine. Do not rely on it to open a real one.")
+    print(f"  [+] A sealed slip round-trips on this machine.")
+    print(f"  [+] The passphrase opens this file.")
+    print(f"  [+] delivery public : {dpub}")
+    print(f"  [+] vault public    : {terminal_safe(str(vpub))}")
+    print()
+    print(f"  That is as much as can be checked without a slip. It does NOT")
+    print(f"  prove the vault seals to this key -- confirm that by poking")
+    print(f"  /depo once and opening the slip it sends back, BEFORE you shred")
+    print(f"  the vault's copy of this file.")
+    return 0
+
+
+def build_cli() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Open a sealed slip. The blob is read from stdin, never "
+                    "from the command line.")
+    ap.add_argument("--key", required=True,
+                    help="the delivery keyfile gs_delivery_key wrote")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check this file opens here, then exit. Reads no slip.")
+    return ap
+
+
+def main(argv=None, getter=None, reader=None) -> int:
+    install_signal_handlers()
+    # ARGS FIRST, NACL SECOND. --help exits inside parse_args, and --help is
+    # how an operator finds out what a program wants BEFORE they have
+    # installed anything. tests/test_cli_flags.py holds every tool here to
+    # that; require_nacl() ahead of it would make --help red on a clean box.
+    args = build_cli().parse_args(argv)
+    try:
+        proto.require_nacl()
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+    payload = open_delivery_key(Path(args.key).expanduser(), getter=getter)
+    if args.self_test:
+        return cmd_self_test(payload)
+
+    import nacl.public
+    dk = nacl.public.PrivateKey(bytes.fromhex(payload["delivery_secret"]))
+    vpub = nacl.public.PublicKey(bytes.fromhex(payload["vault_public"]))
+    blob = read_blob(reader=reader)
+    try:
+        body = proto.open_slip(dk, vpub, blob)
+    except proto.WakeError as e:
+        sys.exit(f"[!] {e}")
+    return show(body)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

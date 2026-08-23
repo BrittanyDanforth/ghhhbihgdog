@@ -23,11 +23,20 @@ fall out for free rather than being maintained:
     working directory is byte-identical after a full cycle;
   * a crashed doorbell leaves no state to be stale.
 
-The trigger INTO the Pi -- phone, Telegram, whatever -- is still out of scope,
-exactly as OPSEC_SETUP.md §8 says. Do not "just run a Telegram bot that prints
-the memo": that throws away the only reason to have a Pi. The one acceptable
-remote trigger is inbound over Tor to a Pi onion service. No port forward, and
-no WAN path to WOL.
+The trigger INTO the Pi is gs_telegram_pager, and it pokes this program the
+same way a terminal does. This paragraph used to say the trigger was "still out
+of scope" and that "the one acceptable remote trigger is inbound over Tor to a
+Pi onion service"; both were true when written and neither is now. The pager
+long-polls OUTWARD over Tor and listens on nothing, which meets the same
+requirement -- no port forward, no WAN path to WOL -- without an onion service.
+
+OPSEC_SETUP.md §8's actual rule is unchanged and still binding: do not "just
+run a Telegram bot that prints the memo", because that throws away the only
+reason to have a Pi. This program still learns a status and a 4-hex label and
+nothing else. It may now also CARRY a sealed slip -- ciphertext for a delivery
+key that exists on neither this box nor its SD card -- which is a different
+thing from printing a memo, and gs_wake_proto's "THE SEALED SLIP" is where the
+difference is argued rather than asserted.
 
 THE JOB COMES IN ON STDIN, NEVER ON argv.
 /proc/<pid>/cmdline is mode 0444 and every local account can read it. This repo
@@ -391,9 +400,15 @@ class Pending:
         handle = body.get("handle", "")
         if not isinstance(handle, str):
             raise Doorbell("result handle is not a string")
-        # A 95-character "handle" is an address wearing a hat. The wire format
-        # already refuses one (an M3 that long will not fit the single padded
-        # block, measured), so this is the second of two independent defences.
+        # A 95-character "handle" is an address wearing a hat.
+        #
+        # THIS USED TO BE THE SECOND OF TWO DEFENCES AND IT IS NOW THE ONLY
+        # ONE. The comment here said the wire format already refused a long
+        # handle because an M3 that size would not fit the single padded
+        # block -- true when PAD_BLOCK was 256 and MAX_INNER 255. PAD_BLOCK is
+        # 1024 now (gs_wake_proto, "THE SEALED SLIP"), and a 95-character
+        # handle fits an M3 with room to spare. The backstop the sentence was
+        # counting on is gone, so this check is load-bearing on its own.
         #
         # EMPTY IS ONLY LEGAL WHEN THERE IS NOTHING TO NAME. The first version
         # read `if handle and not HANDLE_RE.match(...)`, so an empty string
@@ -408,8 +423,39 @@ class Pending:
                                "worked and given nothing to find")
         elif handle and not proto.HANDLE_RE.match(handle):
             raise Doorbell("result handle is not a 4-character label")
-        self.result = {"status": status, "handle": handle}
+        # THE SEALED SLIP, WHICH THIS BOX CANNOT READ AND MUST NOT TRY TO.
+        #
+        # The Pi has no delivery key -- that is the whole design -- so the only
+        # honest check available here is SHAPE, and shape is checked strictly
+        # rather than waved through: exactly SLIP_B64_LEN characters that
+        # base64-decode to exactly one padded box. Anything else is refused
+        # outright instead of being relayed onward, because the operator's next
+        # move after receiving a slip is to send Bitcoin, and a mangled blob
+        # must fail HERE, on the vault's own channel, and not later in a chat
+        # window where the failure looks like the vault's fault.
+        #
+        # A blob of the right shape is still opaque: it is carried, logged as
+        # present, and never parsed. gs_doorbell holds no key that opens it.
+        slip = body.get("slip", "")
+        # A TYPE CHECK BEFORE THE TRUTHINESS ONE. `if slip and not
+        # wellformed(slip)` reads as a complete gate and is not: 0, [] and {}
+        # are all falsy, so each would skip validation entirely and be stored
+        # as this job's slip. Nothing downstream would crash -- the pager does
+        # `res.get("slip") or ""` -- which is exactly what makes it worth
+        # closing here rather than discovering it as a silently missing slip.
+        if not isinstance(slip, str):
+            raise Doorbell("result's slip field is not text")
+        if slip and not proto.slip_is_wellformed(slip):
+            raise Doorbell("result carries something in the slip field that is "
+                           "not a sealed slip")
+        if slip and status != "done":
+            # A refused or failed job has nothing to deliver. A slip attached
+            # to one is the vault contradicting itself.
+            raise Doorbell("a job that did not finish cannot carry a slip")
+        self.result = {"status": status, "handle": handle, "slip": slip}
         self.events.append("result_ok")
+        if slip:
+            self.events.append("slip_carried")
 
 
 def make_handler(pending: Pending):
@@ -419,7 +465,7 @@ def make_handler(pending: Pending):
         #: host can open a connection, send nothing, and hold a thread for the
         #: whole ten-minute wake window -- and ThreadingHTTPServer starts a
         #: thread per connection, on a Pi with 1 GB of RAM and Tor resident.
-        #: The real Pi's vault sends its 296 bytes immediately.
+        #: The real vault sends its one RECORD_LEN-byte record immediately.
         timeout = 20
 
         #: EMPTY, deliberately. BaseHTTPRequestHandler's default is
@@ -978,8 +1024,21 @@ def report(pending: Pending) -> int:
     if out == "done":
         h = pending.result.get("handle") or "(none)"
         print(f"  [+] Vault finished job {pending.job}. Handle {h}.")
-        print(f"      The deposit address, the memo and the slip stayed on the "
-              f"vault. Read them there — never from a chat window.")
+        slip = pending.result.get("slip") or ""
+        if not slip:
+            print(f"      The deposit address, the memo and the slip stayed on "
+                  f"the vault. Read them there — never from a chat window.")
+            return 0
+        # SEALED, AND THIS BOX CANNOT READ IT. Printing it here is not a leak:
+        # it is the same ciphertext the pager relays, and this terminal is the
+        # Pi's, which already knows a job ran and what its handle was.
+        print(f"      A SEALED SLIP came back with it. This box has no key for "
+              f"it and never will.")
+        print(f"      Open it with gs_unseal on the machine that holds "
+              f"gs_delivery.key — the one you send the BTC from.")
+        print(f"")
+        print(slip)
+        print(f"")
         return 0
     if out == "refused":
         print(f"  [!] Vault REFUSED job {pending.job}. It did not say why, "

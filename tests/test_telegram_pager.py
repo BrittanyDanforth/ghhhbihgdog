@@ -22,9 +22,11 @@ Driven against the real module. The end-to-end case runs a REAL gs_doorbell
 server on loopback with a fake vault speaking the real M1/M3 protocol; only
 Telegram itself is stubbed, at the pager's own safe_get/safe_post.
 """
+import contextlib
 import http.client
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -356,6 +358,65 @@ check("...no memo", MEMO not in _chat)
 check("...and no BTC deposit address", BTC not in _chat)
 check("...and it tells the operator where the address actually is",
       "on the vault" in _chat)
+
+
+# ===========================================================================
+# --whoami: THE ONLY WAY TO LEARN THE NUMBER --chat-id WANTS.
+#
+# The bot ignores unallowlisted chats in silence, on purpose -- so pressing
+# Start in Telegram produces nothing and there is no path from "I have a bot
+# token" to "I have my chat id". The tool was unusable from a standing start.
+# What matters as much as it working is what it must NOT do: it runs before
+# the operator has a keyfile, so it must arm nothing.
+# ===========================================================================
+print("\n== --whoami, the bootstrap ==")
+_wargs = pg.build_cli().parse_args(["--whoami"])
+check("--whoami parses with NO --key and NO --chat-id, which is the whole "
+      "point: it runs before either exists",
+      _wargs.whoami is True and not _wargs.key and not _wargs.chat_id)
+_perr = []
+try:
+    pg.build_cli().parse_args([])
+except SystemExit:
+    _perr.append("argparse")
+check("...but a bare invocation still parses, so the refusal can name BOTH "
+      "missing flags in one sentence instead of argparse naming one",
+      not _perr)
+
+_updates = [{"update_id": 1, "message": {"chat": {"id": 424242},
+                                         "from": {"username": "someone"},
+                                         "text": "hi"}}]
+pg.safe_get = lambda url, proxies=None: {"ok": True, "result": _updates}
+_wout = io.StringIO()
+with contextlib.redirect_stdout(_wout):
+    _wrc = pg.whoami("123456:TOKEN", {"https": "socks5h://x"})
+_wtext = _wout.getvalue()
+check("--whoami prints the chat id of the next message", "424242" in _wtext)
+check("...and the exact flag to pass it to", "--chat-id 424242" in _wtext)
+check("...and returns 0", _wrc == 0)
+check("...and says a chat id is not a secret, so it is fine on argv",
+      "not a secret" in _wtext.lower() or "NOT a secret" in _wtext)
+
+# A USERNAME IS A STRING ITS OWNER CHOSE, and this line reaches a terminal and,
+# under systemd, a journal. Anyone can message a bot they find.
+_updates[:] = [{"update_id": 2,
+                "message": {"chat": {"id": 7},
+                            "from": {"username": "a\x1b[31mb\x07c"},
+                            "text": "hi"}}]
+_wout2 = io.StringIO()
+with contextlib.redirect_stdout(_wout2):
+    pg.whoami("123456:TOKEN", {"https": "socks5h://x"})
+check("a sender's username cannot put an escape sequence on the terminal",
+      "\x1b" not in _wout2.getvalue() and "\x07" not in _wout2.getvalue())
+
+_wsrc = open(os.path.join(REPO, "gs_telegram_pager"), encoding="utf-8").read()
+_wbody = _wsrc.split("def whoami")[1].split("\ndef ")[0]
+for _armed in ("run_wake", "load_key", "Pager(", "sendMessage"):
+    check(f"--whoami never reaches {_armed}: it arms nothing and wakes nothing",
+          _armed not in _wbody)
+check("...and main() returns from the --whoami branch BEFORE the keyfile is "
+      "read",
+      _wsrc.index("return whoami(") < _wsrc.index("doorbell().load_key("))
 
 
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")

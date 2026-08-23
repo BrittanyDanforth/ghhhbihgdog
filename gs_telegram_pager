@@ -79,6 +79,25 @@ TOKEN_ENV = "GS_TG_BOT_TOKEN"
 #: also have to re-implement its fail-closed proxy check.
 POLL_HOLD_S = 10
 
+#: FAIL-CLOSED IS NOT ONLY A STARTUP PROPERTY.
+#:
+#: §4 says "If Tor is down, the bot does not start" -- and the first version
+#: enforced that at startup and then, if Tor died an hour later, sat in a
+#: 5-second retry loop forever. That is fail-OPEN in the only way that
+#: matters: the operator believes a poke will work, and the bot has quietly
+#: been unable to reach anything since. Consecutive failures are counted and
+#: the process exits, so systemd's Restart= re-runs the startup verify_tor and
+#: the bot stays down until Tor is genuinely back.
+#:
+#: Not 1: a single blip on a Tor circuit is ordinary and must not stop a
+#: pager. At 5 s a retry this is about a minute of sustained failure.
+MAX_POLL_FAILURES = 12
+
+#: Seconds before the ONE retry of a sealed slip that did not send. Long enough
+#: for a Tor circuit to be rebuilt, short enough that it does not hold `busy`
+#: -- and therefore the next poke -- for anything an operator would notice.
+SLIP_RETRY_S = 20
+
 #: Courtesy limits. The REAL bound is the vault's 24 h wake budget, which lives
 #: in a keyfile that needs physical access to change; this only stops a stolen
 #: phone from queueing pokes faster than a human would.
@@ -96,7 +115,9 @@ HELP = (
     "/watch <h>  watch handle h (4 hex)\n"
     "/status     counters only\n"
     "\n"
-    "Addresses, memos and slips are never sent here. Read them on the vault."
+    "Nothing readable is ever sent here. A quoted swap comes back as a "
+    "SEALED slip — ciphertext this box has no key for. Open it with "
+    "gs_unseal on the machine you send the BTC from."
 )
 
 
@@ -124,6 +145,29 @@ def doorbell():
     return _DOORBELL[0]
 
 
+#: Every character a terminal treats as an instruction rather than as text.
+#: C0, DEL and C1 -- the last of these matters because a lone 0x9b IS a CSI
+#: introducer on a terminal in 8-bit mode, so stripping only ESC would leave a
+#: working escape sequence behind.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _no_ctrl(text: str) -> str:
+    """Remove control characters. NOT what terminal_safe does.
+
+    terminal_safe redacts IDENTIFIERS -- addresses, MACs, bech32, paths -- and
+    passes control characters through untouched, which is correct for its job
+    and not enough for this one. A Telegram username is a string its owner
+    chose, and anyone can message a bot they find; --whoami prints one to a
+    terminal and, under systemd, to a journal. Measured before this existed:
+    terminal_safe("a\\x1b[31mb\\x07c") returns it unchanged, escape and bell
+    intact. gs_unseal hit the same gap from the other direction and uses
+    instruction_field_safe to REFUSE; here the value is cosmetic, so it is
+    stripped and the chat id still gets printed.
+    """
+    return _CTRL_RE.sub("", str(text))
+
+
 def _redact(text: str) -> str:
     """Strip anything token-shaped out of a string before it is printed.
 
@@ -134,7 +178,10 @@ def _redact(text: str) -> str:
     """
     out = re.sub(r"\bbot\d{6,}:[A-Za-z0-9_-]{20,}", "bot<token>", str(text))
     out = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{20,}", "<token>", out)
-    return terminal_safe(out)
+    # An exception's text is not always this program's words: a server can
+    # shape a chunk of it, and requests puts response detail into some of
+    # them. Same one-line rule as the username, for the same reason.
+    return _no_ctrl(terminal_safe(out))
 
 
 def load_token(token_file: str = "") -> str:
@@ -271,20 +318,33 @@ class Pager:
         self.allow = set(int(c) for c in args.chat_id)
         self.busy = threading.Lock()
         self.ignored = 0
+        self.poll_failures = 0
 
     # -- telegram -------------------------------------------------------
     def _url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
-    def send(self, chat_id: int, text: str) -> None:
-        """One reply. Never carries an address, a memo or an amount."""
+    def send(self, chat_id: int, text: str) -> bool:
+        """One reply. Never carries a plaintext address, memo or amount.
+
+        RETURNS WHETHER IT LANDED, and that is not decoration. This used to
+        return None and swallow the failure into a print() -- which under the
+        shipped unit goes to StandardOutput=null, i.e. nowhere. That was
+        survivable while every reply was a status line the operator could
+        infer from the next one. It stopped being survivable when a reply
+        started carrying the sealed slip: a dropped send left the operator
+        looking at "Sealed slip below" with nothing below it, on a box they
+        cannot walk to, for a quote that expires while they wait.
+        """
         try:
             safe_post(self._url("sendMessage"),
                       {"chat_id": chat_id, "text": text,
                        "disable_web_page_preview": True},
                       proxies=self.proxies)
+            return True
         except Exception as e:                               # noqa: BLE001
             print(f"  [!] reply failed: {_redact(e)}")
+            return False
 
     def updates(self) -> list:
         url = (f"{self._url('getUpdates')}?timeout={POLL_HOLD_S}"
@@ -292,9 +352,23 @@ class Pager:
         try:
             d = safe_get(url, proxies=self.proxies)
         except Exception as e:                               # noqa: BLE001
-            print(f"  [!] poll failed: {_redact(e)}")
+            self.poll_failures += 1
+            print(f"  [!] poll failed ({self.poll_failures}/"
+                  f"{MAX_POLL_FAILURES}): {_redact(e)}")
+            if self.poll_failures >= MAX_POLL_FAILURES:
+                integrity_log("pager", "poll_failed_giving_up")
+                sys.exit(
+                    f"[!] {MAX_POLL_FAILURES} consecutive poll failures. "
+                    f"Tor or the network is down.\n"
+                    f"    Stopping rather than looping: a pager that cannot "
+                    f"reach Telegram but keeps\n"
+                    f"    running is one you believe is listening when it is "
+                    f"not. It does not start\n"
+                    f"    without Tor (section 4); it should not keep running "
+                    f"without it either.")
             time.sleep(5)
             return []
+        self.poll_failures = 0
         if not isinstance(d, dict) or not d.get("ok"):
             return []
         out = d.get("result")
@@ -320,11 +394,66 @@ class Pager:
         out = pending.outcome()
         integrity_log("pager", f"outcome:{job}:{out}")
         if out == "done":
-            h = (pending.result or {}).get("handle") or "----"
-            # THE WHOLE REPLY VOCABULARY. §5 step 5: "Telegram gets
-            # `depo ready · slip A3F1`". No address, no memo, no amount.
-            self.send(chat_id, f"{job} ready · slip {h}\n"
-                               f"Read the address and memo on the vault.")
+            res = pending.result or {}
+            h = res.get("handle") or "----"
+            slip = res.get("slip") or ""
+            if not slip:
+                # NO DELIVERY KEY IS CONFIGURED, so there is nothing to send and
+                # this is still the original vocabulary: §5 step 5, "Telegram
+                # gets `depo ready · slip A3F1`". No address, no memo, no
+                # amount.
+                self.send(chat_id, f"{job} ready · slip {h}\n"
+                                   f"Read the address and memo on the vault.")
+                return
+            # A SEALED SLIP CAME BACK. This process cannot read it: it is
+            # sealed to the delivery key, which exists on neither this box nor
+            # this SD card. See gs_wake_proto's "THE SEALED SLIP" for why that
+            # is not the thing §8 forbids.
+            #
+            # THE BLOB GOES FIRST, AND THE CAPTION DESCRIBES WHAT ACTUALLY
+            # HAPPENED. Sending the caption first meant promising a slip
+            # before knowing one could be delivered: a dropped second send
+            # left "Sealed slip below" with nothing below it, and the only
+            # record of the failure was a print() that the shipped unit sends
+            # to StandardOutput=null. Now the caption is written after the
+            # fact and tells the truth either way.
+            #
+            # The blob is sent ALONE, with nothing else in the message, and
+            # that is a usability decision with a security consequence:
+            # tap-and-hold on a Telegram message copies the WHOLE message, so
+            # a caption sharing the message would be pasted into gs_unseal
+            # along with the slip. open_slip's length check would catch it,
+            # but being caught is worse than not happening.
+            # ONE RETRY BEFORE GIVING UP. The blob is already in hand and a
+            # Tor circuit failing for one request is ordinary; telling the
+            # operator to go to the vault because a single POST lost a race is
+            # advice this whole feature exists to avoid having to give. One,
+            # not a loop: a wake holds `busy` while this runs, and a retry
+            # storm against a dead circuit would hold it for the rate limit's
+            # entire window.
+            ok = self.send(chat_id, slip)
+            if not ok:
+                time.sleep(SLIP_RETRY_S)
+                ok = self.send(chat_id, slip)
+            if ok:
+                self.send(chat_id, f"{job} ready · slip {h}\n"
+                                   f"↑ sealed slip. gs_unseal it on the "
+                                   f"machine you send the BTC from.")
+            else:
+                integrity_log("pager", "slip_undelivered")
+                # NOT "/watch {h}". That was the first version of this line and
+                # it is wrong: watch waits for a payment to LAND on a bundle,
+                # so it cannot hand back a deposit address the operator never
+                # received -- it would sit for two hours waiting for money that
+                # was never sent. The quote is unpayable from here, and a
+                # ThorChain quote expires anyway, so the honest instruction is
+                # to ask for a new one.
+                self.send(chat_id,
+                          f"{job} ready · slip {h}\n"
+                          f"The sealed slip did NOT get through, twice. The "
+                          f"job ran and the quote is on the vault — but it is "
+                          f"unpayable from here, and quotes expire. Poke "
+                          f"/depo again for a fresh one.")
         elif out == "refused":
             self.send(chat_id, f"{job}: vault REFUSED. Reason is on the vault.")
         elif out == "failed":
@@ -357,7 +486,13 @@ class Pager:
             self.ignored += 1
             integrity_log("pager", "chat_not_allowlisted")
             return
-        job, params, err = parse_command(msg.get("text") or "")
+        # A PHOTO IS NOT A COMMAND. Without this, every sticker, image or
+        # voice note in an allowlisted chat drew the whole help text back --
+        # noise in the one channel that is supposed to be almost silent, and
+        # a reply to something nobody typed.
+        if not isinstance(msg.get("text"), str):
+            return
+        job, params, err = parse_command(msg["text"])
         if err == "help":
             self.send(cid, HELP)
             return
@@ -383,8 +518,19 @@ class Pager:
         self.limits.record()
         integrity_log("pager", f"poke:{job}")
         self.send(cid, f"{job}: waking the vault. This takes a while.")
-        threading.Thread(target=self._worker, args=(cid, job, params),
-                         daemon=True).start()
+        # RELEASE IT IF THE THREAD NEVER STARTS. The worker releases `busy` in
+        # its own finally, so a Thread.start() that raises leaves the lock held
+        # by nobody -- and every later poke answers "a wake is already running"
+        # for the life of the process. Reproduced with a Thread whose start()
+        # raises RuntimeError("can't start new thread"), which is exactly what
+        # a 1 GB Pi under memory pressure does.
+        try:
+            threading.Thread(target=self._worker, args=(cid, job, params),
+                             daemon=True).start()
+        except BaseException as e:                           # noqa: BLE001
+            self.busy.release()
+            integrity_log("pager", "worker_start_failed")
+            self.send(cid, f"{job}: could not start the wake — {_redact(e)[:120]}")
 
     def run(self) -> int:
         print(f"  [+] Pager up. {len(self.allow)} allowlisted chat(s), "
@@ -405,15 +551,72 @@ class Pager:
         return 0
 
 
+def whoami(token: str, proxies: dict, waits: int = 30) -> int:
+    """Print the chat id of the next message, then stop. Arms nothing.
+
+    Long-polls the same way the pager does, over the same Tor proxy, and
+    reports the id and nothing that could be mistaken for a command having
+    been run.
+    """
+    print("  [*] Waiting for a message. Open Telegram, find your bot, and "
+          "send it anything.")
+    print("      Ctrl-C to stop. This does not wake anything.")
+    seen = set()
+    for _ in range(waits):
+        if shutdown_requested():
+            break
+        url = (f"https://api.telegram.org/bot{token}/getUpdates"
+               f"?timeout={POLL_HOLD_S}&allowed_updates=%5B%22message%22%5D")
+        try:
+            d = safe_get(url, proxies=proxies)
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [!] poll failed: {_redact(e)}")
+            time.sleep(5)
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("result"), list):
+            time.sleep(2)
+            continue
+        for upd in d["result"]:
+            msg = (upd or {}).get("message") or {}
+            cid = (msg.get("chat") or {}).get("id")
+            if not isinstance(cid, int) or cid in seen:
+                continue
+            seen.add(cid)
+            # Every one of these is a string the sender chose, and this line
+            # goes to a terminal and, under systemd, a journal. _no_ctrl as
+            # well as terminal_safe: see _no_ctrl for what the second one does
+            # that the first does not.
+            who = _no_ctrl(terminal_safe(
+                str((msg.get("from") or {}).get("username")
+                    or (msg.get("chat") or {}).get("title") or "?")))[:40]
+            print(f"\n  [+] chat id: {cid}   (from: {who})")
+            print(f"      Start the pager with --chat-id {cid}")
+            print(f"      A chat id is NOT a secret -- it is an allowlist "
+                  f"entry, so it is fine on a command line. The token is not.")
+        if seen:
+            return 0
+    print("  [!] No message arrived. The bot token may belong to a different "
+          "bot than the one you are messaging.")
+    return 1
+
+
 def build_cli():
     ap = argparse.ArgumentParser(
         description="GhostSpiral Telegram pager (Pi side). Triggers a wake; "
                     "never carries an address, a memo or an amount.")
-    ap.add_argument("--key", required=True,
+    # NOT required=True, because --whoami exists to be run BEFORE you have
+    # either of them. Enforced after parsing instead, where the rule can say
+    # which mode it is talking about.
+    ap.add_argument("--key", default="",
                     help="this Pi's keyfile, as gs_doorbell wake takes it")
-    ap.add_argument("--chat-id", action="append", required=True, type=int,
+    ap.add_argument("--chat-id", action="append", default=None, type=int,
                     help="allowlisted Telegram chat id. Repeatable. Anything "
                          "from another chat is ignored without a reply.")
+    ap.add_argument("--whoami", action="store_true",
+                    help="print the chat id of the next message this bot "
+                         "receives, then exit. Arms nothing, wakes nothing, "
+                         "needs no --key and no --chat-id. This is how you "
+                         "find the number --chat-id wants.")
     ap.add_argument("--token-file", default="",
                     help=f"0400 file holding the bot token. Or set "
                          f"{TOKEN_ENV} in this process's environment. NEVER "
@@ -451,6 +654,26 @@ def main(argv=None) -> int:
     proxies = isolated_proxy(args.tor_proxy, "pager")
 
     token = load_token(args.token_file)
+
+    # THE BOOTSTRAP, AND THE REASON IT HAD TO EXIST.
+    #
+    # --chat-id wants a number the operator has no way to know. The bot ignores
+    # every chat that is not already on the allowlist -- deliberately, in
+    # silence, because a reply confirms the bot is alive to whoever found it --
+    # so pressing Start in Telegram produces nothing at all, and there is no
+    # path from "I have a bot token" to "I have my chat id". The tool was
+    # unusable from a standing start and only somebody who already knew to go
+    # read getUpdates by hand could get past it.
+    #
+    # This arms nothing: no keyfile is read, no doorbell is built, no magic
+    # packet can be sent from this branch. It prints a number and exits.
+    if args.whoami:
+        return whoami(token, proxies)
+
+    if not args.key or not args.chat_id:
+        sys.exit("[!] --key and --chat-id are both required to run the pager.\n"
+                 "    Run with --whoami first (it needs neither) to find the "
+                 "chat id.")
     key = doorbell().load_key(Path(args.key))
 
     st = Path(args.state)

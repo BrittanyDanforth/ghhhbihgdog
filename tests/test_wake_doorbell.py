@@ -340,7 +340,8 @@ check("a result for a different job is refused",
       b.post("/result", m3("done", "BEEF", job_id=P.new_job_id()))[0] == 204)
 check("a well-formed result is accepted",
       b.post("/result", m3("done", "A3F1"))[0] == 200
-      and b.pending.result == {"status": "done", "handle": "A3F1"})
+      and b.pending.result == {"status": "done", "handle": "A3F1",
+                               "slip": ""})
 check("a SECOND result is refused — the outcome the operator sees must not "
       "depend on which note arrived last",
       b.post("/result", m3("failed", ""))[0] == 204

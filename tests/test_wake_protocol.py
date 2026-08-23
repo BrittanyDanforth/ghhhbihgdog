@@ -299,17 +299,47 @@ check("...and nothing in the module passes an explicit nonce to encrypt()",
 
 
 print("\n== the seal-side length gate ==")
+# WHAT THIS BLOCK USED TO CLAIM, AND WHY IT NO LONGER CAN.
+#
+# It sealed an M3 whose "handle" was a 95-character XMR address, watched
+# seal() refuse it, and concluded that "an address can never be smuggled out
+# as a 'handle'" -- calling that the second of TWO independent defences behind
+# gs_doorbell's HANDLE_RE check. That was true when PAD_BLOCK was 256 and
+# MAX_INNER 255: the record simply would not fit.
+#
+# PAD_BLOCK is 1024 now, so the sealed slip fits (gs_wake_proto, "THE SEALED
+# SLIP"), and so does a 95-character handle. The backstop is GONE. Asserting
+# the old sentence would leave a green check standing over a defence that no
+# longer exists, which is worse than having neither -- so this now proves the
+# two things that ARE true: the length gate still exists and still refuses
+# what actually overflows, and the handle check is now load-bearing ALONE.
+_addr_handle = {"job_id": P.new_job_id(),
+                "challenge": P.new_challenge().hex(),
+                "status": "done", "handle": "4" + "A" * 94}
 try:
+    P.seal(TP, PI.public_key, P.TAG_M3, _addr_handle)
+    _fits = True
+except P.WakeError:
+    _fits = False
+check("an address-as-handle now FITS the wire — the size backstop that used "
+      "to catch it is gone, and this records that rather than hiding it",
+      _fits)
+check("...so gs_doorbell's HANDLE_RE check is the only thing left, and it is "
+      "still there",
+      "HANDLE_RE.match(handle)" in
+      open(os.path.join(REPO, "gs_doorbell"), encoding="utf-8").read())
+try:
+    # What DOES overflow: a body bigger than one padded block.
     P.seal(TP, PI.public_key, P.TAG_M3,
-           {"job_id": P.new_job_id(), "challenge": P.new_challenge().hex(),
-            "status": "done", "handle": "4" + "A" * 94})
+           {"job_id": P.new_job_id(), "status": "done",
+            "handle": "A" * P.PAD_BLOCK})
     check("a note too long for one padded block is refused at seal time", False)
 except P.WakeError as e:
-    check("a note too long for one padded block is refused at seal time — so "
-          "an address can never be smuggled out as a 'handle'",
-          "255" in str(e) or "carries at most" in str(e))
-check("...which is why the handle limit has TWO independent defences",
-      P.MAX_INNER == P.PAD_BLOCK - 1)
+    check("a note too long for one padded block is refused at seal time — "
+          "rather than emitting a record twice the size of every other one",
+          "carries at most" in str(e))
+check("...and the ceiling is one byte under the block, so padding always adds "
+      "at least one", P.MAX_INNER == P.PAD_BLOCK - 1)
 
 try:
     P.seal(TP, PI.public_key, b"NOPE".ljust(16, b"\0"), {"a": 1})
