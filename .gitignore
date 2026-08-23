@@ -92,3 +92,5 @@ gs_wake_job.log
 # chain event kind -- redacted now, but still the run's event vocabulary,
 # and it is written next to the plans.
 .chain_once_*
+pager_state.json
+pager.log

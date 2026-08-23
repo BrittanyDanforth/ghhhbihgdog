@@ -948,7 +948,12 @@ GS_ARTIFACT_FILE_PATTERNS = [
     # THE WAKE AGENT'S RUN STATE. gs_wake_state.json is the job ledger and the
     # 24h wake budget; gs_wake_handles.json maps a 4-hex handle to the bundle
     # and slip it names, so it is a direct index into this run's addresses.
-    "gs_wake_state.json", "gs_wake_handles.json", ".gs_wake_inhibit",
+    "gs_wake_state.json",
+    #: The pager's update cursor and poke timestamps. Not a secret in itself,
+    #: but it is a dated record of every time you woke the vault from a phone
+    #: -- which is exactly the correlation the jitters exist to break.
+    "pager_state.json",
+    "pager.log", "gs_wake_handles.json", ".gs_wake_inhibit",
     # WHERE A WOKEN JOB'S CHILDREN WRITE, because the alternative was the
     # systemd journal -- persistent, root-owned, rotated rather than erased,
     # and outside every root this sweep searches. It holds whatever

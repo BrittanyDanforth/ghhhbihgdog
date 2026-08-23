@@ -4,8 +4,11 @@ This is the hardware/network layout for running GhostSpiral **without**
 leaving the spend key on a box that stays online, and **without** the
 home ISP seeing Tor guards.
 
-The Telegram **pager** — the phone-to-Pi trigger — is
-not in this repo yet, and deliberately so (§8).
+The Telegram **pager** — the phone-to-Pi trigger — **is** now in this repo:
+`gs_telegram_pager`. It triggers and it does not carry: the only things it can
+ask for are the three wake jobs, the only parameters it can send are a bounded
+integer or a 4-hex handle, and the only thing it can say back is which job
+finished and that handle (§8).
 The **wake channel** between the Pi and
 the ThinkPad *is* shipped: `gs_wake_keys`, `gs_doorbell` and
 `gs_wake_agent`. So the vault can sit powered off for weeks and be woken
@@ -650,10 +653,14 @@ there is no doorbell. Stop here and use the console by hand.
 
 ## 5. Job cycle
 
-Steps 1–2 are still procedure (no trigger is shipped). Step 3 onward is
-`gs_doorbell` and `gs_wake_agent`.
+Steps 1–2 are `gs_telegram_pager`. Step 3 onward is `gs_doorbell` and
+`gs_wake_agent`. You can still do steps 1–2 by hand — the pager only pokes the
+doorbell, so anything it does you can do from a terminal.
 
-1. Phone: `/recv` then `/depo 0.05` to the throwaway account.
+1. Phone: `/recv` then `/depo 2` to the throwaway account. **A SLOT, not
+   an amount**: the ladder lives on the ThinkPad and the Pi's keyfile does not
+   contain it, so the Pi cannot turn "0.05" into a slot and is never given the
+   chance to send a number (§8).
 2. Pi checks Tor, allowlisted chat id, rate limit.
 3. `gs_doorbell wake` binds its LAN socket **first**, waits a random
    0–15 min, then sends the magic packet and holds one job for 10 min.
@@ -869,10 +876,24 @@ destroys it on every wipe and says so ("DESTROYED the WAKE PAIRING"),
 and recovery is a two-box re-key with `gs_wake_keys` — not a token
 rotation.
 
-What is still **not** shipped is the trigger INTO the Pi. Do not “just
-run a Telegram bot” that prints the memo — that throws away the only
-reason to have a Pi. The only acceptable remote trigger is inbound over
-Tor to a Pi onion service: no port forward, and no WAN path to WOL.
+The trigger INTO the Pi is now shipped — `gs_telegram_pager` — under the
+constraint this paragraph has always stated. Do not “just run a Telegram bot”
+that prints the memo: that throws away the only reason to have a Pi. The pager
+therefore has no word for an address, a memo, a slip or an amount. The most it
+ever says is `depo ready · slip A3F1`, which is step 5 below.
+
+“No port forward, and no WAN path to WOL” is met more simply than by an onion
+service: the pager **long-polls outward** over Tor and listens on nothing at
+all, so there is no inbound port to forward. If Tor is down it does not start
+(§4). A stolen phone or bot token can wake the vault and spam quotes — §7
+already scores that — and cannot spend, cannot name a destination, and cannot
+read a memo. The bound that matters is the vault's 24 h wake budget and
+account ceiling, which live in a keyfile and need physical access to change.
+
+The one real cost, stated plainly: to run unattended it needs
+`GS_WAKE_PASSPHRASE` in its environment, which puts the passphrase on the same
+SD card as the sealed keyfile and effectively unseals it. A pager you start by
+hand, typing the passphrase, does not. That is the trade; make it knowingly.
 
 The wake channel can ask for three jobs and no others — `receive_new`,
 `receive_and_quote`, `watch`. There is deliberately no job that takes an

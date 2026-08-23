@@ -1147,6 +1147,28 @@ MUTATIONS = [
   "            pass",
   ["test_signer_schema"]),
 
+ # ---- the Telegram pager: it may TRIGGER, it may never CARRY ------------
+ # Any chat that reaches the wake channel can wake the vault. The allowlist is
+ # the only thing between a stranger who found the bot and a poke.
+ ("the pager answers any chat, not just the allowlisted one",
+  "gs_telegram_pager",
+  "        if not isinstance(cid, int) or cid not in self.allow:",
+  "        if False:",
+  ["test_telegram_pager"]),
+
+ # OPSEC_SETUP.md section 8: "there is deliberately no job that takes an XMR
+ # destination". Trailing arguments are how one would arrive.
+ ("the pager accepts trailing arguments on a command", "gs_telegram_pager",
+  "    if len(parts) > 2:\n        return \"\", {}, \"too many arguments\"\n",
+  "",
+  ["test_telegram_pager"]),
+
+ # section 4: "If Tor is down, the bot does not start."
+ ("the pager starts without proving Tor is up", "gs_telegram_pager",
+  "    verify_tor(proxy)",
+  "    pass",
+  ["test_telegram_pager"]),
+
  # ---- fixes that shipped in 9da2e24 with NO anchor at all --------------
  # Reverting either of these left all 33 suites green, so nothing stopped a
  # later edit from quietly undoing them.
