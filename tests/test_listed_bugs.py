@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FOUR DEFECTS THAT WERE FOUND, WRITTEN DOWN, AND THEN NOT FIXED.
+"""SIX DEFECTS THAT WERE FOUND, WRITTEN DOWN, AND THEN NOT FIXED.
 
 Each of these was reported to the operator in a list of "real findings" and
 then left alone across several commits. This file is the fix landing, and it
@@ -42,6 +42,26 @@ check here has a NON-VACUITY partner: the normal path must still work, or
      starts a thread per connection; the 20 s socket timeout bounds how LONG
      each lives and says nothing about how MANY, on a 1 GB Pi with Tor
      resident.
+
+  5. THE FAN-OUT FLOOR RESERVED THE HOP AND NOT THE EXIT SWEEP. An output is
+     spent twice -- the DAG round sweeps it to its neighbour, the exit sweeps
+     that subaddress to the operator -- and min_hop_fundable reserved one fee.
+     An output on the floor cleared every planning gate, hopped, and then sat
+     below the cost of moving it: over 200 seeded draws at 0.2 XMR with the
+     default --wallets 10, the median plan left ALL TEN unwithdrawable (range
+     7-10, and not one draw came back empty). At 1 XMR / --wallets 60 it is 28
+     of 60. With --dag-mixing off the floor was DUST_XMR * 2 and
+     reserved nothing at all -- and "disable --dag-mixing" is one of the three
+     remedies main() prints when the floor cannot be funded.
+
+  6. --expect-xmr THREW AWAY THE PER-CHUNK BREAKDOWN. swap_arrival_floor keys
+     the arrival gate on the SMALLEST chunk; with no breakdown it assumes EQUAL
+     chunks, which is the assumption its own docstring names as the one the
+     JoinMarket path breaks. --expect-xmr's --help says it overrides "the total
+     from --pairs" -- the total, not the pairs -- and it discarded the pairs,
+     so on 0.50/0.30/0.15/0.05 the gate dropped from 0.950000000001 to 0.9 and
+     reported PAID with a whole swap missing. It also printed "(--expect-xmr
+     without --pairs)" on a run that passed --pairs.
 """
 import contextlib
 import http.server
@@ -394,6 +414,397 @@ check("...and the live count is back to zero", _srv._live == 0)
 _srv.shutdown()
 for _s in _SERVERS:
     _s.shutdown()
+
+
+# ===========================================================================
+#  5. THE FAN-OUT FLOOR RESERVED THE HOP AND NOT THE EXIT SWEEP
+# ===========================================================================
+#
+# A fan-out output is spent TWICE before the operator sees it: the DAG round
+# sweeps it to its neighbour, and _run_exit_withdrawals issues one sweep_all
+# per funded subaddress to the destination. Both pay a fee. min_hop_fundable
+# reserves ONE, so an output on the floor cleared every planning gate, hopped,
+# and then sat below the cost of moving it.
+#
+# It is not recoverable afterwards either. Each output has its own subaddress
+# and this pipeline REFUSES to sweep two together -- that is permanent public
+# proof of common ownership -- so the one spend that would rescue the dust is
+# the one the whole run exists to prevent.
+#
+# Every number below comes from driving the shipped functions, and the
+# NON-VACUITY partners are the ones that matter: an over-refusing floor would
+# make "no unwithdrawable output" true by emitting no plans at all.
+G = load("GhostSpiral")
+_D = __import__("decimal").Decimal
+import random as _r5                                         # noqa: E402
+
+_f5 = _D("0.0024")
+
+# The exit's OWN rule, not a restatement of it: _run_exit_withdrawals reads
+# meta["fee_per_round"], which _stage4 writes as str(hop_fee_reserve(fee_xmr)),
+# and drops every target whose balance is <= that.
+_exit_floor = G.hop_fee_reserve(_f5)
+check("exit floor: the meta field the exit filters on is hop_fee_reserve",
+      '"fee_per_round": str(hop_fee_reserve(fee_xmr)),'
+      in Path(os.path.join(REPO, "GhostSpiral")).read_text()
+      and "_dust = [t for t in targets if t[2] <= _floor]"
+      in Path(os.path.join(REPO, "GhostSpiral")).read_text())
+
+# THE BUG, stated as the old floor and driven through the real hop formula.
+_old_floor = G.min_hop_fundable(_f5)
+check("exit floor: REPRODUCED -- an output on the OLD floor hops fine...",
+      G.hop_is_fundable(_old_floor, _f5))
+check("...and what survives that hop is below the exit's own dust threshold, "
+      f"so it is never withdrawn ({G.compute_hop_amount(_old_floor, _f5)} "
+      f"<= {_exit_floor})",
+      G.compute_hop_amount(_old_floor, _f5) <= _exit_floor)
+
+# THE FIX. The new floor clears it, and is MINIMAL -- one tick less does not,
+# so the guarantee is not bought with an arbitrary safety pad.
+_new_floor = G.min_exit_fundable(_f5, True)
+check("exit floor: the new floor funds the hop AND the exit sweep",
+      G.exit_is_fundable(_new_floor, _f5, True))
+check("exit floor: ...and is MINIMAL -- one tick less cannot",
+      not G.exit_is_fundable(_new_floor - G.DUST_XMR, _f5, True))
+check("exit floor: it never drops below the hop floor build_dag_plan gates on",
+      _new_floor >= _old_floor and G.hop_is_fundable(_new_floor, _f5))
+
+# --dag-mixing OFF reserved NOTHING for the exit: the branch was DUST_XMR * 2,
+# 0.0002 XMR against a 0.0036 sweep. That branch is where main() SENDS an
+# operator whose fan-out was refused ("disable --dag-mixing"), so the remedy
+# for "these outputs are too small" pointed at the setting with no floor.
+check("exit floor: REPRODUCED -- the old DAG-OFF floor was below the exit's "
+      "own dust threshold, so every output on it was unwithdrawable",
+      (G.DUST_XMR * 2) <= _exit_floor)
+check("exit floor: the DAG-off floor now clears the exit sweep",
+      G.exit_is_fundable(G.min_exit_fundable(_f5, False), _f5, False))
+check("exit floor: ...and is minimal there too",
+      not G.exit_is_fundable(G.min_exit_fundable(_f5, False) - G.DUST_XMR,
+                             _f5, False))
+
+# END TO END, through compute_fee_budget -> compute_fanout_amounts ->
+# compute_hop_amount -> the exit's filter, over settings the CLI accepts.
+_bad = _plans = _outs = 0
+for _b5 in ("0.2", "0.3", "0.5", "0.8", "1", "2", "5", "20"):
+    for _w5 in (4, 10, 20, 40, 60):
+        for _dag5 in (True, False):
+            _u5 = G.compute_fee_budget(_D(_b5), _f5, _w5, peel=False,
+                                       dag_mixing=_dag5, exit_set=True)[0]
+            if _u5 <= G.DUST_XMR:
+                continue
+            for _s5 in range(6):
+                _a5 = G.compute_fanout_amounts(_u5, _w5, _f5, _dag5,
+                                               rng=_r5.Random(_s5))
+                if not _a5:
+                    continue
+                _plans += 1
+                _outs += len(_a5)
+                for _x5 in _a5:
+                    _held = (G.compute_hop_amount(_x5, _f5) if _dag5 else _x5)
+                    if _held <= _exit_floor:
+                        _bad += 1
+check(f"exit floor: no plan the planner emits contains an output the exit "
+      f"cannot withdraw ({_bad} of {_outs} outputs across {_plans} plans)",
+      _bad == 0)
+# NON-VACUITY, and this is the check that makes the one above mean something:
+# a floor so high it refused everything would also score 0.
+check(f"NON-VACUITY: the planner still emits plans at all ({_plans} of them, "
+      f"{_outs} outputs)", _plans > 100 and _outs > 1000)
+
+# NON-VACUITY the other way: put the OLD floor back and the same sweep must
+# find the defect, or the sweep above is not looking where the bug lived.
+_saved_min = G.min_exit_fundable
+G.min_exit_fundable = lambda fee_xmr, dag: (
+    G.min_hop_fundable(fee_xmr) if dag
+    else (G.DUST_XMR * 2).quantize(G.DUST_XMR, rounding=G.ROUND_UP))
+_oldbad = _oldplans = 0
+for _b5 in ("0.2", "0.3", "0.5", "0.8", "1", "2", "5", "20"):
+    for _w5 in (4, 10, 20, 40, 60):
+        for _dag5 in (True, False):
+            _u5 = G.compute_fee_budget(_D(_b5), _f5, _w5, peel=False,
+                                       dag_mixing=_dag5, exit_set=True)[0]
+            if _u5 <= G.DUST_XMR:
+                continue
+            for _s5 in range(6):
+                _a5 = G.compute_fanout_amounts(_u5, _w5, _f5, _dag5,
+                                               rng=_r5.Random(_s5))
+                if not _a5:
+                    continue
+                _oldplans += 1
+                for _x5 in _a5:
+                    _held = (G.compute_hop_amount(_x5, _f5) if _dag5 else _x5)
+                    if _held <= _exit_floor:
+                        _oldbad += 1
+G.min_exit_fundable = _saved_min
+check(f"NON-VACUITY: with the OLD floor restored the SAME sweep finds the "
+      f"defect ({_oldbad} unwithdrawable outputs across {_oldplans} plans)",
+      _oldbad > 500)
+
+# The refusals this costs are exactly the plans that were broken -- measured,
+# not asserted. A floor that refused a WORKING plan would be a regression.
+_lost = _lostbad = 0
+for _b5 in range(2, 101):
+    _bal5 = _D(_b5) * _D("0.1")
+    for _w5 in (4, 6, 10, 12, 20, 30, 40, 60):
+        for _dag5 in (True, False):
+            _u5 = G.compute_fee_budget(_bal5, _f5, _w5, peel=False,
+                                       dag_mixing=_dag5, exit_set=True)[0]
+            if _u5 <= G.DUST_XMR:
+                continue
+            _bud5 = _u5 * G.FANOUT_SPEND_FRACTION
+            _om = G.min_hop_fundable(_f5) if _dag5 else G.DUST_XMR * 2
+            if _bud5 >= _om * _w5 and _bud5 < G.min_exit_fundable(_f5, _dag5) * _w5:
+                _lost += 1
+                _oheld = G.compute_hop_amount(_om, _f5) if _dag5 else _om
+                if _oheld <= _exit_floor:
+                    _lostbad += 1
+check(f"exit floor: every setting the new floor refuses ({_lost}) is one whose "
+      f"old plan had an unwithdrawable floor output ({_lostbad})",
+      _lost > 0 and _lost == _lostbad)
+
+# ...and the refusal message's three remedies all actually work on the setting
+# it refuses. "disable --dag-mixing" is one of them, which is why the DAG-off
+# branch had to be fixed too.
+_rem = {}
+for _lbl, _b5, _w5, _dag5 in (("fewer wallets", "0.2", 4, True),
+                              ("no dag-mixing", "0.2", 10, False),
+                              ("more funds", "0.3", 10, True)):
+    _u5 = G.compute_fee_budget(_D(_b5), _f5, _w5, peel=False,
+                               dag_mixing=_dag5, exit_set=True)[0]
+    _a5 = G.compute_fanout_amounts(_u5, _w5, _f5, _dag5, rng=_r5.Random(5))
+    _rem[_lbl] = bool(_a5) and not any(
+        (G.compute_hop_amount(_x, _f5) if _dag5 else _x) <= _exit_floor
+        for _x in _a5)
+check("exit floor: the refused setting's own remedies all produce a plan with "
+      f"no unwithdrawable output ({_rem})", all(_rem.values()))
+check("exit floor: NON-VACUITY -- the setting they are remedies FOR is "
+      "genuinely refused",
+      not G.compute_fanout_amounts(
+          G.compute_fee_budget(_D("0.2"), _f5, 10, peel=False,
+                               dag_mixing=True, exit_set=True)[0],
+          10, _f5, True, rng=_r5.Random(5)))
+
+# The stepping loop is sized for QUANTISE DRIFT, and the first version of
+# min_exit_fundable was not: it started at min_hop_fundable and stepped, but
+# the gap between the two floors is a whole extra fee reserve -- 36 grid ticks
+# at this fee -- so it ran out of steps and returned an amount its own
+# predicate REJECTS. Driven across the fee range, both branches.
+_viol = _worst = 0
+for _i5 in range(1, 501):
+    _fx = _D(_i5) * _D("0.0001")
+    for _dag5 in (True, False):
+        _m5 = G.min_exit_fundable(_fx, _dag5)
+        if not G.exit_is_fundable(_m5, _fx, _dag5):
+            _viol += 1
+        if G.exit_is_fundable(_m5 - G.DUST_XMR, _fx, _dag5):
+            _viol += 1
+        if _m5 < G.min_hop_fundable(_fx):
+            _viol += 1
+check(f"exit floor: over 500 fees x 2 branches the floor satisfies its own "
+      f"predicate, is minimal, and never drops below the hop floor "
+      f"({_viol} violations)", _viol == 0)
+check("exit floor: REPRODUCED -- the step-from-the-hop-floor version this "
+      "replaced runs out of steps and returns a REJECTED amount",
+      not G.exit_is_fundable(
+          # what that version returned: min_hop_fundable + at most 8 ticks
+          G.min_hop_fundable(_D("0.0024")) + G.DUST_XMR * 8, _D("0.0024"), True))
+
+
+# ===========================================================================
+#  6. --expect-xmr THREW AWAY THE PER-CHUNK BREAKDOWN
+# ===========================================================================
+#
+# swap_arrival_floor keys the arrival gate on the SMALLEST chunk, because a
+# tolerance charged against the summed total also covers a whole chunk as soon
+# as one chunk is worth less than it. Without a breakdown it falls back to
+# assuming EQUAL chunks -- the assumption its own docstring names as the one
+# the JoinMarket path breaks ("arbitrarily unequal ... 0.50/0.30/0.15/0.05").
+#
+# --expect-xmr discarded the breakdown, so it walked an operator who passed
+# --pairs straight back into that fallback. Its --help says it "overrides the
+# total from --pairs" -- the total, not the pairs.
+from gs_common import swap_arrival_floor, sum_quoted_xmr    # noqa: E402
+
+_JM = [{"expected_xmr": s} for s in ("0.50", "0.30", "0.15", "0.05")]
+_q, _unread, _chunks = sum_quoted_xmr(_JM)
+_tol = _D("0.10")
+_keep, _kt = swap_arrival_floor(_q, _tol, _chunks, len(_chunks))
+_drop, _dt = swap_arrival_floor(_q, _tol, [], len(_JM))
+# Everything except the smallest chunk: what arrives when one swap never lands.
+_partial = _q - min(_chunks)
+check("expect-xmr: --pairs alone tightens the gate above the partial arrival",
+      _kt and _partial < _keep)
+check(f"expect-xmr: REPRODUCED -- discarding the breakdown drops the gate to "
+      f"{_drop}, and the {_partial} XMR that arrives with a whole swap missing "
+      f"clears it", (not _dt) and _partial >= _drop)
+
+# THE FIX, driven through the SHIPPED CLI rather than a copy of its arithmetic:
+# receive_watch computes the gate before it touches Tor, so a real invocation
+# reaches the line and then aborts.
+import subprocess                                            # noqa: E402
+
+_addr5 = "4" + "A" * 94
+with tempfile.TemporaryDirectory() as _td5:
+    _rw = os.path.join(_td5, "recv.json")
+    _pj = os.path.join(_td5, "pairs.json")
+    _pb = os.path.join(_td5, "pairs_bad.json")
+    _pn = os.path.join(_td5, "pairs_none.json")
+    _p2 = os.path.join(_td5, "pairs_two.json")
+    json.dump({"schema": "gs_receive_wallet_v1", "address": _addr5,
+               "account_index": 1, "subaddress_index": 3,
+               "rpc_endpoint": "http://127.0.0.1:18083"}, open(_rw, "w"))
+    json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _addr5,
+                "expected_xmr": s}
+               for s in ("0.50", "0.30", "0.15", "0.05")], open(_pj, "w"))
+    # THE UNREADABLE ONE IS THE LARGEST. With a small quote unreadable the
+    # rescaled gate does not tighten at all, so the line under test is never
+    # printed and the check would pass on an empty string -- which is how the
+    # first version of this fixture "passed". Driven: 0.50/0.30/0.15/0.05 with
+    # the 0.50 unreadable scales to 0.60/0.30/0.10 against a 1.0 total, guard
+    # 0.900000000001 over a 0.9 tolerance floor, so it tightens.
+    json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _addr5,
+                "expected_xmr": s}
+               for s in ("NaN", "0.30", "0.15", "0.05")], open(_pb, "w"))
+    # EVERY quote unreadable. This is the ONLY way _chunk_amounts is empty
+    # while --pairs was given, so it is the only case that separates "the swap
+    # count is unknown" from "the count is known and the shape is not". A
+    # mutation collapsing those two branches SURVIVED the first version of this
+    # file, because nothing here drove the case that tells them apart.
+    json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _addr5,
+                "expected_xmr": s}
+               for s in ("NaN", "Infinity", "0", "nonsense")], open(_pn, "w"))
+    # TWO unreadable, and the message counts rather than saying "One".
+    #
+    # The readable pair has to be LOPSIDED or the gate never tightens and the
+    # line under test is never printed. First attempt used 0.30/0.10: rescaled
+    # onto a 1.0 total that is 0.75/0.25, guard 0.75, under the 0.9 tolerance
+    # floor -- no tightening, and every check about the wording would have
+    # passed against an empty string. Caught by the non-vacuity partner below,
+    # which is the only reason it is not still in here. 0.90/0.05 rescales to
+    # ~0.947/~0.053, guard ~0.947, which clears 0.9.
+    json.dump([{"schema": "thor_pairs_v1", "dest_xmr": _addr5,
+                "expected_xmr": s}
+               for s in ("NaN", "Infinity", "0.90", "0.05")], open(_p2, "w"))
+
+    def _rw_run(*extra):
+        _e = dict(os.environ)
+        _e["PYTHONPATH"] = REPO
+        return subprocess.run(
+            [sys.executable, os.path.join(REPO, "receive_watch"),
+             "--receive-wallet", _rw, "--tor-proxy",
+             "socks5h://127.0.0.1:9"] + list(extra),
+            capture_output=True, text=True, timeout=120,
+            env=_e, cwd=_td5).stdout
+
+    _o_pairs = _rw_run("--pairs", _pj)
+    _o_both = _rw_run("--pairs", _pj, "--expect-xmr", "1")
+    _o_alone = _rw_run("--expect-xmr", "1")
+    _o_bad = _rw_run("--pairs", _pb, "--expect-xmr", "1")
+    _o_badonly = _rw_run("--pairs", _pb)
+    _o_none = _rw_run("--pairs", _pn, "--expect-xmr", "1")
+    _o_two = _rw_run("--pairs", _p2, "--expect-xmr", "1")
+
+_TIGHT = "Arrival gate tightened to 0.950000000001 XMR"
+check("expect-xmr: the shipped CLI tightens the gate on --pairs alone",
+      _TIGHT in _o_pairs)
+check("expect-xmr: ...and --expect-xmr restating the SAME total no longer "
+      "loses that tightening", _TIGHT in _o_both)
+check("expect-xmr: REPRODUCED -- the shipped CLI used to answer that "
+      "combination with 'the number of swaps is UNKNOWN (--expect-xmr without "
+      "--pairs)' on a run that PASSED --pairs",
+      "without --pairs" not in _o_both)
+# NON-VACUITY: that message is still printed where it is TRUE, so the check
+# above is not passing because the message was deleted.
+check("NON-VACUITY: --expect-xmr with no --pairs still says the swap count is "
+      "unknown", "without --pairs" in _o_alone
+      and "UNKNOWN" in _o_alone)
+# A PARTIAL SHAPE IS STILL SCALED -- the same answer GhostSpiral's
+# stage4_await_swap gives, so the pipeline's two arrival gates do not drift --
+# but the wording stops calling the result a reading. One unreadable quote
+# means the breakdown covers 3 of 4 swaps while the override covers all 4.
+check("expect-xmr: a partially readable set is still rescaled (it does not "
+      "fall back to assuming equal chunks)", "assumed EQUAL" not in _o_bad)
+check("expect-xmr: ...and the gate line stops claiming a MEASURED smallest "
+      "chunk when one of the swaps was never quoted readably",
+      "the smallest chunk this target implies is" in _o_bad
+      and "the smallest quoted chunk is" not in _o_bad)
+check("expect-xmr: ...and says how many swaps it is inferring",
+      "1 of the 4 swaps carried no readable quote" in _o_bad
+      and "its size is inferred" in _o_bad)
+# NON-VACUITY: the fixture must actually REACH the tightening line, or every
+# check above it passes against an empty string.
+check("NON-VACUITY: the partial-shape fixture really does tighten the gate",
+      "Arrival gate tightened" in _o_bad)
+# The two lines ABOVE the gate describe a target --expect-xmr replaced. They
+# said the watch would finish without the unreadable swaps; with an override
+# covering all of them, that is the opposite of what the gate then does.
+check("expect-xmr: the unreadable-quote note no longer tells an operator who "
+      "passed --expect-xmr that those swaps are excluded from the target",
+      "contribute NOTHING" not in _o_bad
+      and "covers all 4 of them" in _o_bad)
+check("NON-VACUITY: without the override it still says exactly that",
+      "contribute NOTHING" in _o_badonly
+      and "built from 3 pair(s) only" in _o_badonly)
+# NON-VACUITY: the fully readable set still says "quoted", so the check above
+# is not passing because the phrase was deleted from the file.
+check("NON-VACUITY: a fully readable set still reports a MEASURED smallest "
+      "chunk", "the smallest quoted chunk is" in _o_both
+      and "implies is" not in _o_both)
+check("expect-xmr: neither says 'without --pairs' on a run that passed them",
+      "without --pairs" not in _o_bad)
+
+# NO QUOTE AT ALL READABLE, WITH --pairs. The count is known and the shape is
+# not, which is a THIRD statement -- and the branch that says it is only
+# reachable here. Without this case a mutation collapsing it into the
+# no---pairs branch survives the whole suite.
+check("expect-xmr: with --pairs and not one readable quote, the gate says the "
+      "SHAPE is unknown, not that --pairs was absent",
+      "none of them carried a readable quote" in _o_none
+      and "without --pairs" not in _o_none)
+check("expect-xmr: ...and it names the real swap count from --pairs, not 1",
+      "The 4 swap(s) behind this target are assumed EQUAL" in _o_none)
+check("expect-xmr: with TWO unreadable quotes the note counts them and reads "
+      "as plural -- it does not say 'One'",
+      "2 of the 4 swaps carried no readable quote" in _o_two
+      and "their sizes are inferred" in _o_two)
+check("NON-VACUITY: the two-unreadable fixture reaches the tightening line, so "
+      "the check above is not passing vacuously",
+      "Arrival gate tightened" in _o_two)
+check("NON-VACUITY: the count-unknown wording is still reserved for the run "
+      "that really has no --pairs",
+      "without --pairs" in _o_alone
+      and "none of them carried a readable quote" not in _o_alone)
+
+# THE SAME THREE-WAY DISTINCTION IN GhostSpiral's COPY. Its rescale was already
+# right; its message was not -- with a partial shape chunk_amounts is truthy,
+# so it printed "The smallest quoted chunk is" about a set that does not cover
+# every swap in the target. Measured over 4000 random shapes (2-8 swaps, 1..N-1
+# unreadable): 1007 printed it. The rescale STAYS -- over those same 4000 it
+# opened a gate the count-only fallback would have held zero times.
+_gsrc = Path(os.path.join(REPO, "GhostSpiral")).read_text()
+check("expect-xmr: GhostSpiral's gate line distinguishes all THREE bases -- "
+      "quoted, inferred, and assumed-equal",
+      '"The smallest chunk this target implies is"' in _gsrc
+      and '"The smallest quoted chunk is"' in _gsrc
+      and 'f"Split equally, each of the {n_chunks} chunks would be"' in _gsrc)
+check("expect-xmr: ...and it is keyed on the SHAPE covering every swap, not "
+      "merely on the breakdown being non-empty",
+      "if len(chunk_amounts) != n_chunks" in _gsrc)
+check("expect-xmr: GhostSpiral still RESCALES a partial shape rather than "
+      "discarding it (the two gates give one answer)",
+      "        if _quoted_sum > 0 and chunk_amounts:\n"
+      "            _scale = args.expect_total_xmr / _quoted_sum" in _gsrc)
+
+# The rescale keys on PROPORTIONS, so an override that really does change the
+# total still guards the smallest swap at its new size.
+for _ex5 in (_D("0.95"), _D("1.10"), _D("2")):
+    _scaled = [c * _ex5 / _q for c in _chunks]
+    _fs, _ts = swap_arrival_floor(_ex5, _tol, _scaled, len(_scaled))
+    _fd, _td_ = swap_arrival_floor(_ex5, _tol, [], len(_JM))
+    _miss = _ex5 - min(_scaled)
+    check(f"expect-xmr: at --expect-xmr {_ex5} the rescaled gate refuses the "
+          f"partial arrival ({_miss} XMR) and the discard accepts it",
+          _miss < _fs and _miss >= _fd)
 
 _finished()
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
