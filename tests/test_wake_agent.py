@@ -300,16 +300,27 @@ check("...and that is the ONLY wait on a no-job boot: it never reaches the "
       "5-20 min job jitter, because there is no job",
       len(slept6) == 1 and slept6[0] < A.JITTER_LO_S)
 
-# --dry-run is the pairing check, run by hand. Three minutes of silence in
-# front of an operator reads as a hang, not as opsec.
+# --dry-run IS THE PAIRING CHECK, AND IT NO LONGER REACHES THIS BRANCH AT ALL.
+#
+# This used to assert that a dry run got as far as "no job" and skipped the
+# dwell -- true, and it meant a dry run had already SENT A REAL M1 by then. If
+# a job had been waiting, the doorbell would have handed it over (consuming
+# its at-most-once handover) and the agent would have run the tools for real,
+# while --help said "do everything except run a job". A dry run now stops one
+# line before that question, because there is no way to ask it without taking
+# the answer. So the dwell guard it was testing is gone, and this asserts what
+# a dry run does instead.
 d6c, kf6c, _k, bell6c = new_env()
 slept6c = []
 dp6c = deps_for(d6c, bell6c,
                 post_record=stub_post(bell6c),
                 sleep=slept6c.append)
 out6c, err6c, _t = run(kf6c, dp6c, dry_run=True)
-check("...and --dry-run skips the dwell",
-      out6c is None and err6c.code == "no_job" and slept6c == [])
+check("--dry-run stops before asking for a job, so it never reaches the "
+      "no-job dwell", out6c is None and err6c.code == "dry_run")
+check("...and sleeps nothing: an operator is watching it",
+      slept6c == [])
+check("...and does not power the box off", not err6c.power)
 
 d7, kf7, _k, bell7 = new_env()
 dp7 = deps_for(d7, bell7, post_record=lambda u, p, r, timeout=30: (0, b""))

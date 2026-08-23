@@ -1478,6 +1478,53 @@ MUTATIONS = [
   "        if not 0 <= slot < len(ladder):",
   "        if slot >= len(ladder):",
   ["test_depo_wizard", "test_wake_agent"]),
+
+ # ---- FOUR DEFECTS THAT WERE LISTED AND THEN NOT FIXED -----------------
+ # Each was reported to the operator, reproduced against the real code, and
+ # then left alone across several commits. Anchored so that cannot repeat.
+
+ # urllib follows 302 by default and this call carries no proxy, so a doorbell
+ # answering a redirect made the vault POST its record to any host it named --
+ # off the LAN entirely, outside the path section 4 exists to enforce.
+ ("the vault goes back to following wherever the doorbell redirects it",
+  "gs_wake_agent",
+  "        with _no_redirect_opener().open(req, timeout=timeout) as r:",
+  "        with urllib.request.urlopen(req, timeout=timeout) as r:",
+  ["test_listed_bugs"]),
+
+ # --dry-run sent a real M1, which TAKES the job -- the handover is
+ # at-most-once -- and then ran create_receive_wallet and thor_swap_preparer
+ # for real, while --help said "do everything except run a job".
+ ("--dry-run goes back to spending a wake and running the real job",
+  "gs_wake_agent",
+  "    if args.dry_run:\n        agent_say(",
+  "    if False:\n        agent_say(",
+  ["test_listed_bugs"]),
+
+ # The inhibit file means "a person is at this machine", and the moment they
+ # reach for it is mid-job. Read only at preflight, the case it was written
+ # for was the one case it could not see.
+ ("somebody sitting down mid-job goes back to being invisible",
+  "gs_wake_agent",
+  "        if _inh.exists():",
+  "        if False:",
+  ["test_listed_bugs"]),
+
+ # ThreadingHTTPServer starts a thread per connection; the socket timeout
+ # bounds how LONG each lives, not how MANY, on a 1 GB Pi with Tor resident.
+ ("the doorbell goes back to starting a thread per connection, unbounded",
+  "gs_doorbell",
+  "            over = self._live >= MAX_CONNECTIONS",
+  "            over = False",
+  ["test_listed_bugs"]),
+
+ # A cap that never releases is worse than no cap: the doorbell would stop
+ # answering after one flood and the vault would never collect a job again.
+ ("the connection cap goes back to ratcheting shut instead of releasing",
+  "gs_doorbell",
+  "    def close_request(self, request):",
+  "    def _unused_close_request(self, request):",
+  ["test_listed_bugs"]),
 ]
 
 
