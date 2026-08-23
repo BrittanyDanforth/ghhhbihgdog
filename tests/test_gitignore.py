@@ -194,6 +194,87 @@ for _tool, _needle in (("thor_swap_preparer", "wipe_will_erase(_out)"),
     check(f"...and {_tool} no longer asks the location-only question",
           "wipe_covers(" not in _src.replace("# ", ""))
 
+# ===========================================================================
+#  THE OTHER DIRECTION, WHICH NOTHING ASKED.
+# ===========================================================================
+#
+# Everything above enforces WIPE-LIST -> .gitignore: "anything on that list is,
+# by definition, something that must never be committed". Both lists are
+# checked against each other, and a file that is in NEITHER is invisible to
+# every check in this file.
+#
+# That is not hypothetical. gs_wake_status.json -- receive_watch's
+# --result-json outcome, written by the wake agent's swap_status job into the
+# SAME artifact_dir as gs_wake_state.json, gs_wake_handles.json and
+# gs_wake_job.log -- landed in neither list. All three siblings were in both.
+# Driven against the real sweep with the four side by side: three "WOULD BE
+# ERASED", it "SURVIVES THE WIPE", holding `unlocked` and `total` as exact
+# decimals -- the amount that arrived from the swap, to the piconero.
+#
+# So this asks the missing question: of the filenames the tools actually WRITE,
+# is each one erased, or inside a directory that is erased, or exempt for a
+# stated reason? A new artifact now lands here as a red check until somebody
+# classifies it, which is the point the last one slipped past.
+print()
+import fnmatch as _fn                                        # noqa: E402
+import re as _re                                             # noqa: E402
+
+_TOOLS = ("GhostSpiral", "gs_console", "airgap_tx_signer", "receive_watch",
+          "paranoia_mode", "broadcast_signed_xmr", "thor_swap_preparer",
+          "create_receive_wallet", "exit_strategy_simulator", "gs_delivery_key",
+          "gs_unseal", "gs_doorbell", "gs_wake_agent", "gs_wake_keys",
+          "gs_telegram_pager")
+
+#: Artifacts that are NOT matched by name, each with the reason it is allowed.
+#: Nothing gets in here without one.
+_EXEMPT = {
+    # Deliberately never swept: .gitignore says so at length -- "wiping the
+    # operator's only delivery key destroys every future slip".
+    "gs_delivery.key": "deliberately never wiped; losing it loses every slip",
+    # Written as {staging_dir}/bcast_progress.json, and staging_dir is
+    # "tx_staging" -- a GS_ARTIFACT_DIR_PATTERNS entry, so the whole tree goes.
+    # Matched by DIRECTORY, not by name; that is why the name check misses it.
+    "bcast_progress.json": "lives under tx_staging/, erased as a directory",
+}
+
+
+def _erased_by_name(name):
+    return any(_fn.fnmatch(name, p) for p in _gsc_w.GS_ARTIFACT_FILE_PATTERNS)
+
+
+_seen, _unaccounted = {}, []
+for _t in _TOOLS:
+    _src = open(os.path.join(REPO, _t)).read()
+    # Only literals that look like a written artifact, and only where the file
+    # is a NAME rather than a URL path or a doc reference.
+    for _m in _re.finditer(r'"([a-z0-9_]+\.(?:json|log|hex|key))"', _src):
+        _seen.setdefault(_m.group(1), set()).add(_t)
+for _name, _who in sorted(_seen.items()):
+    if _erased_by_name(_name) or _name in _EXEMPT:
+        continue
+    _unaccounted.append((_name, sorted(_who)))
+check(f"every artifact filename the tools write is erased by name, erased as "
+      f"part of a directory, or exempt with a reason "
+      f"(unaccounted: {_unaccounted or 'none'})", not _unaccounted)
+# NON-VACUITY: the scan must actually be finding filenames, or "none
+# unaccounted" is what an empty scan looks like.
+check(f"NON-VACUITY: the scan found artifact filenames to check "
+      f"({len(_seen)} of them)", len(_seen) >= 10)
+check("NON-VACUITY: ...including the one that was missing, which is now "
+      "erased by name", "gs_wake_status.json" in _seen
+      and _erased_by_name("gs_wake_status.json"))
+# ...and every exemption must still be a real artifact somebody writes, or the
+# list becomes a place to hide things.
+check(f"every exemption still corresponds to a filename in the source "
+      f"({sorted(set(_EXEMPT) - set(_seen)) or 'all present'})",
+      not (set(_EXEMPT) - set(_seen)))
+# The four files gs_wake_agent writes into artifact_dir travel together. Naming
+# them is what makes the next addition to that directory visible.
+for _f in ("gs_wake_state.json", "gs_wake_handles.json", "gs_wake_job.log",
+           "gs_wake_status.json"):
+    check(f"artifact_dir: {_f} is erased by name", _erased_by_name(_f))
+    check(f"artifact_dir: ...and {_f} is git-ignored", is_ignored(_f))
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 if FAILURES:
     print("FAILED:", FAILURES)

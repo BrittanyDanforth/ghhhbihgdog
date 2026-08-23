@@ -421,8 +421,16 @@ def _run_thor(outfile):
 import tempfile as _tf5
 _away = os.path.join(_tf5.mkdtemp(prefix="f5_away_"), "pairs.json")
 _out_away = _run_thor(_away)
+# THIS FIXTURE IS THE "BOTH" CASE, and saying so is the point. /tmp is not a
+# search root AND "pairs.json" matches no artifact pattern, so both halves of
+# the sweep's test fail. The warning names which half now, so a check that only
+# looked for the location sentence would pass on a message that blamed the
+# wrong thing -- see the two cases added below.
 check("F5: thor WARNS when its outfile is outside the wipe roots",
       "OUTSIDE the directories" in _out_away)
+check("F5: ...and names BOTH halves, because this fixture fails both",
+      "matches no artifact pattern" in _out_away
+      and "Both halves" in _out_away)
 check("F5: ...and says what the file holds (the memo carries the XMR address)",
       "memo contains the destination XMR address" in _out_away)
 check("F5: ...and the file really was written there",
